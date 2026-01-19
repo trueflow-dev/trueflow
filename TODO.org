@@ -1,0 +1,34 @@
+#+title: Project Vet TODOs
+#+STARTUP: content hidestars
+
+* Emacs Package (vet.el)
+** TODO [High] Basic Infrastructure
+   - [ ] Define `vet-mode` and basic buffer setup.
+   - [ ] Implement `vet-core.el` wrapper for CLI calls (`vet diff`, `vet mark`, `vet sync`).
+   - [ ] Define customization groups (executable path, faces).
+
+** TODO [High] Status View (`vet-status`)
+   - [ ] Render "Unreviewed Hunks" section.
+   - [ ] Implement `vet-refresh` to parse JSON from CLI.
+   - [ ] Bind `g` to refresh, `q` to quit window.
+
+** TODO [High] Review Actions
+   - [ ] Implement `a` (Approve) command.
+   - [ ] Implement `c` (Comment) command with minibuffer prompt.
+   - [ ] Implement `x` (Reject) command.
+   - [ ] Wiring: Execute `vet mark`, then refresh UI.
+
+** TODO [Medium] Iterative Review Mode
+   - [ ] Command `vet-review-start` (bound to `r`).
+   - [ ] Walk through hunks one by one.
+   - [ ] Implement side-by-side view (Diff vs New Content).
+
+** TODO [High] Inline Editing
+   - [ ] Bind `e` to jump to file location.
+   - [ ] **Complex:** Implement true inline editing where changes in the review buffer apply to the file.
+     - *Draft Plan:* Use `ediff` or a custom overlay that writes back to file on `C-c C-c`.
+     - *Alternative:* Use `recursive-edit` in the file buffer.
+
+* CLI Improvements (vet-cli)
+** TODO [Medium] `vet check`
+   - [ ] Implement CI gate logic (exit 1 if unreviewed hunks exist).
