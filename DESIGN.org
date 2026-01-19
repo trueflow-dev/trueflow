@@ -1,0 +1,224 @@
+#+title: Design
+#+TITLE: Project Vet: Engineering Plan
+#+AUTHOR: Architecture Team
+#+DATE: 2026-01-18
+#+STATUS: DRAFT
+#+STARTUP: content hidestars
+
+* 1. Overview
+  **Vet** is a semantic code review system designed for the era of
+  Agent-generated code. Unlike standard git tools that review *commits* (linear
+  history), Vet reviews *hunks* (logical units of work).  It decouples the
+  review status from the commit hash, allowing for "Drift-Resistant" reviews
+  that survive rebases, squashes, and minor agent edits.
+
+  It consists of three components:
+  1. *The Core:* ~vet-cli~ (Rust) - Handles git plumbing, hashing, storage, and
+     graph logic.
+  2. *The UI:* ~vet.el~ (Emacs) - A Magit-style Transient interface for rapid
+     triage.
+  3. *The Storage:* An orphan git branch (~vet-db~) storing an append-only JSONL
+     database.
+
+* 2. Architecture & Decisions
+** 2.1 Storage Strategy: The "Shadow Branch"
+   - *Decision:* Store review data in an orphan git branch named ~refs/heads/vet-db~.
+   - *Format:* Append-only JSONL (~reviews.jsonl~).
+   - *Rationale:*
+     - *Performance:* Text appending is O(1). Reading is fast (Rust parses 100MB
+       JSON in <200ms).
+     - *Distribution:* Travels with the repo (~git push origin vet-db~) but
+       doesn't pollute the file system.
+     - *Mergeable:* Git's standard text merge handles JSONL conflicts reasonably
+       well (union merge strategy works for append-only logs).
+
+** 2.2 The Drift Resistance: "Contextual Hashing"
+   - *Problem:* Agents constantly tweak code. Line numbers are useless. Commit
+     hashes are volatile.
+   - *Solution:* Identify hunks by a content-based hash.
+   - *Algorithm:*
+     #+BEGIN_SRC rust
+     struct HunkFingerprint {
+         // Identity is purely content-based to allow file moves.
+         content_hash: Sha256(whitespace_normalized_body),
+         // Context anchors the change to its surroundings (interactions matter).
+         context_hash: Sha256(whitespace_normalized(3_lines_pre + 3_lines_post)),
+     }
+     #+END_SRC
+   - *Handling Duplicate Hunks:* If identical hunks appear in multiple places (boilerplate),
+     we rely on `path_hint` and `line_start_hint` stored in the record to disambiguate
+     during the matching phase, but the *identity* remains content-based to support moves.
+   - *State:*
+     - If `(fingerprint, check)` matches a valid "approved" record, it is "Reviewed."
+     - If the Agent changes 1 char, the hash changes -> becomes "Unreviewed."
+
+** 2.3 Smart Ordering: Dependency Topology
+   - *Problem:* Agents dump 50 files. Where do I start?
+
+   - *Flow:*
+     1. Build DAG (Directed Acyclic Graph) (using agents <- "smart DAG" of "easy to review order")
+     2. Topological Sort (Leaves first -> Roots last).
+     3. Present "Utility" changes before "Business Logic" changes.
+
+* 3. Data Model
+   The ~reviews.jsonl~ file is an **event log**. State is derived by replaying the log.
+   This allows for "latest wins" logic, independent votes, and audit trails.
+
+   #+BEGIN_SRC json
+   {
+     "id": "uuid-v4",
+     "fingerprint": "sha256_hash_of_hunk_and_context",
+     
+     // The "Check" being performed.
+     // Default: "review" (general code review).
+     // Others: "security", "style", "performance".
+     "check": "review",
+
+     // The verdict of this review event.
+     // - "approved": No further action needed.
+     // - "question": Reviewer needs clarification.
+     // - "comment": Reviewer is making a request/note.
+     // - "rejected": Explicit blocking disapproval.
+     "verdict": "approved",
+
+     "author": "user_email",
+     "timestamp": 1715000000,
+     
+     // Metadata hints (non-authoritative for identity, but useful for UI/disambiguation)
+     "path_hint": "src/main.rs",
+     "line_hint": 42,
+     
+     // Optional annotations
+     "note": "LGTM, but watch out for concurrency issues.",
+     "tags": ["auto-generated", "critical-path"]
+   }
+   #+END_SRC
+
+   *State Reconstruction:*
+   1. Load all records.
+   2. Group by ~(fingerprint, check)~.
+   3. Sort by ~timestamp~.
+   4. Apply "Latest Wins" logic per author (independent votes) or globally (single source of truth).
+      *MVP Decision:* Independent votes are preserved in data, but UI surfaces the aggregate state (e.g., if *any* reviewer rejects, it is rejected).
+
+* 4. Implementation Plan: The First Dozen
+
+** Phase 1: The Rust Core (`vet-cli`)
+   Target: Functional CLI that can diff, hash, and store state locally.
+
+*** TODO [01] Project Scaffolding
+    - Init ~cargo new vet~.
+    - Dependencies: ~clap~ (CLI), ~git2~ (libgit2 bindings), ~serde_json~,
+      ~sha2~, ~dirs~.
+    - Create the ~vet-db~ branch logic (ensure it exists or create orphan).
+
+*** TODO [02] The "Shadow" Plumbing
+    - Implement ~store::read()~: Use ~git2~ to read blob from
+      ~vet-db:reviews.jsonl~ into ~Vec<Record>~.
+    - Implement ~store::append(Record)~:
+      1. Create new blob from string.
+      2. Update tree.
+      3. Create commit on ~vet-db~.
+    - *Constraint:* Do NOT check out the branch to the working directory.
+
+*** TODO [03] The Hashing Engine
+    - Implement ~hashing::compute_fingerprint(hunk)~.
+    - Logic: Strip whitespace, grab N lines of context from the Git patch object, SHA256 sum.
+    - Verify identical hashes are produced for the same code in different file locations.
+
+*** TODO [04] Command: `vet diff` (The Brain)
+    - Load DB into ~HashMap<(Fingerprint, Check), Status>~.
+    - Get diff ~HEAD~ vs ~main~ (using ~git2~).
+    - Iterate over hunks:
+      - Compute Hash.
+      - Check Map for "review" check.
+      - If exists && verdict == "approved", skip (or mark as hidden).
+    - Output: JSON stream of unreviewed hunks.
+
+*** TODO [05] Command: `vet mark`
+    - Args: ~--fingerprint <HASH>~, ~--verdict <VERDICT>~, ~--check <CHECK>~, ~--note <TEXT>~.
+    - Logic: Construct ~Record~ with the provided hash and status.
+    - Call ~store::append~.
+    - *Note:* The frontend (Emacs) provides the hash it received from ~vet diff~.
+
+*** TODO [06] Command: `vet sync`
+    - Wrapper around:
+      - ~git fetch origin vet-db:vet-db~
+      - ~git push origin vet-db~
+
+** Phase 2: The Emacs Frontend (`vet.el`)
+   Target: Visual interaction identical to Magit.
+
+*** TODO [07] Basic Mode Definition
+    - Define ~vet-mode~ derived from ~magit-section-mode~.
+    - Create buffer ~*vet-status*~.
+
+*** TODO [08] The Renderer
+    - Function ~vet-refresh~:
+      - Call ~vet diff --json~.
+      - ~json-parse-buffer~.
+      - Loop through files/hunks.
+      - Use ~magit-insert-section~ to draw headers and diff content.
+      - Apply distinct faces for "High Priority" (Unreviewed) vs "Low Priority".
+
+*** TODO [09] The Transient Dispatch
+    - Define ~(transient-define-prefix vet-dispatch ...)~.
+    - Bind "a" -> Approve.
+    - Bind "x" -> Reject.
+    - Bind "c" -> Comment.
+    - Bind "n"/"p" -> Next/Prev hunk.
+
+*** TODO [10] Wiring Actions
+    - Implement ~vet-approve-region~:
+      - Get current section from point.
+      - Extract ~hunk_hash~ metadata from the section.
+      - Call process ~vet mark --hash <HASH> --status approved~.
+      - ~vet-refresh~.
+
+** Phase 3: Intelligence & Agents
+   Target: Smart sorting and LLM integration.
+
+*** TODO [11] Dependency Graphing (Rust)
+    - Add ~tree-sitter~ and language crates (Rust, Py, TS).
+    - Implement ~graph::build(files)~.
+    - Parse imports.
+    - Sort ~vet diff~ output list by topological depth.
+
+*** TODO [12] Agent XML Export
+    - Command ~vet export-agent~.
+    - Generate XML wrapping unreviewed code (optimized for LLM reading).
+    - Command ~vet ingest~.
+    - Parse XML response -> Convert to ~vet mark~ calls.
+
+* 6. FAQ / Design Questions
+
+** How do we handle identical hunks (boilerplate)?
+   - *Issue:* Identical code blocks appearing in multiple files produce the same fingerprint.
+   - *Decision:* By default, they share the same review status (approving one approves all).
+   - *Override:* If they require separate context, the ~path_hint~ metadata helps the reviewer
+     identify the location. Future iterations could add a ~unique_salt~ to the fingerprint
+     if strictly separate reviews are required for identical content.
+
+** What counts as "whitespace normalization"?
+   - All leading/trailing whitespace on lines is trimmed.
+   - Consecutive internal whitespace is collapsed to a single space.
+   - Empty lines are ignored for the body hash? (TBD: probably keep them but normalized).
+   - *Goal:* `int x = 1;` and `int x=1;` should NOT match, but indentation changes should match.
+
+** Conflict Resolution
+   - *Scenario:* Two users push to ~vet-db~ simultaneously.
+   - *Strategy:* Git handles the text merge of JSONL (union).
+   - *Logical Conflict:* User A approves, User B rejects.
+   - *Resolution:* Both records exist. The UI aggregates them.
+     ("One rejection blocks approval" or "Latest vote wins"). MVP: Latest timestamp wins.
+
+** Compaction
+   - *Issue:* ~reviews.jsonl~ grows indefinitely.
+   - *Plan:* A future ~vet compact~ command will rewrite the branch, squashing history
+     into a snapshot of current valid state + recent history, archiving the rest.
+
+** CI Integration
+   - *MVP:* ~vet check~ binary runs in CI.
+   - *Logic:* Fetches ~vet-db~, computes local hashes of ~src/~.
+   - *Fail:* If any hunk in the PR (base..HEAD) is not "approved" in the DB.
+   - *Trusted:* Start informational. Later, enforce GPG signatures on review records.
