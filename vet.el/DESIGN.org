@@ -1,0 +1,55 @@
+#+title: Vet Emacs UX Design
+#+DATE: 2026-01-18
+#+STARTUP: content hidestars
+
+* Emacs User Experience (UX)
+
+** 1. Entry Point: `vet-status`
+   - Invoked via `M-x vet` or `M-x vet-status`.
+   - **Auto-Sync:** Runs `vet sync` asynchronously on startup to ensure latest state.
+   - **Buffer:** `*vet-status*` (derived from `magit-section-mode`).
+   - **Content:**
+     - Header: "Vet Status: [Repo Name]"
+     - Section 1: "Unreviewed Hunks (N)" (collapsible).
+     - Section 2: "Reviewed Hunks" (optional/hidden by default).
+   - **Navigation:**
+     - `n`/`p`: Next/Previous hunk.
+     - `TAB`: Toggle section visibility (show diff content inline).
+     - `RET` or `r`: Enter **Review Mode** (starts iterating unreviewed hunks).
+
+** 2. Review Mode (Iterative Flow)
+   - **Goal:** Focus on one change at a time.
+   - **Layout:** Reuses `*vet-status*` buffer but narrows/zooms to the current item, or uses a dedicated Transient layout.
+   - **View:** 
+     - Split pane (ideal) or inline diff.
+     - Pane A: The Diff (+/- view).
+     - Pane B: The Resulting File Content (read-only preview of new state).
+   - **Keybindings:**
+     - `a`: **Approve** (mark as approved, auto-advance to next).
+     - `c`: **Comment** (prompt for note, mark as comment, auto-advance).
+     - `x`: **Reject** (mark as rejected, auto-advance).
+     - `e`: **Edit Inline** (see below).
+     - `n`/`p`: Skip/Go back without marking.
+     - `q`: Quit review mode (return to full status list).
+
+** 3. Inline Editing (The "Edit" Action)
+   - **Trigger:** Press `e` on a hunk.
+   - **Behavior:**
+     - Jumps to the source file at the hunk's location (`path_hint` + `line_hint`).
+     - User edits the file (standard buffer).
+     - **On Save:**
+       - Trigger `vet-refresh`.
+       - Re-compute fingerprints.
+       - If the current hunk was modified, it disappears from the unreviewed list (or updates its fingerprint).
+       - If the hunk matches a known reviewed state (e.g. reverted to old code), status updates.
+
+** 4. Handling Stale Data
+   - **Scenario:** User edits file outside of Vet.
+   - **Reaction:** `vet-refresh` runs (hooked to `after-save-hook` in project files? or manual `g`).
+   - **Missing Hunks:** If a hunk fingerprint is no longer found in `vet diff` output, it is silently dropped from the UI.
+
+** 5. Package Structure
+   - Follows MELPA conventions.
+   - `vet.el`: Main entry point and mode definitions.
+   - `vet-core.el`: Process wrappers for `vet` CLI.
+   - `vet-ui.el`: Rendering logic (Magit sections).
