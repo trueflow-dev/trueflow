@@ -1,6 +1,12 @@
 #+title: Project Vet TODOs
 #+STARTUP: content hidestars
 
+* TODO [High] Review Chain Of Trust
+  Reviews can be signed by known PGP keys, and this can extend/scale into a network
+  of trusted code. For example, open source libraries could accumulate layers of
+  reviews from many individuals (across companies), and we can cryptographically
+  verify who reviewed what.
+
 * Emacs Package (vet.el)
 ** TODO [High] Basic Infrastructure
    - [ ] Define `vet-mode` and basic buffer setup.

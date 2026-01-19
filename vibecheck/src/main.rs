@@ -10,8 +10,8 @@ mod diff_logic;
 
 
 #[derive(Parser)]
-#[command(name = "vet")]
-#[command(about = "Semantic code review for the agent era", long_about = None)]
+#[command(name = "vibecheck")]
+#[command(about = "Semantic review for the agent era", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

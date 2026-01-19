@@ -1,0 +1,9 @@
+#+title: TODO
+
+* Eventually, I would like to have deep semantic diffs, like "this function was
+  moved to this file". This would be a few layer above the actual set of
+  "change" objects that we have hashed and stored in vibecheck. Then, if a user
+  approves one of these changes, it can approve all the underlying "changes",
+  e.g. the delete in one file and the add in the other. This can be accomplished
+  via a smart mix of LLMs and also deterministic methods like LSPs, treesitter,
+  etc.
