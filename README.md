@@ -109,11 +109,30 @@ key to perform a review action on the block.
 
 After performing a review, all progress is saved to a database in a local file.
 This file is an append-only database of `review` objects that point to the
-block's sha256 w/ other metadata, including reviewer `identity`, and review
-`label`. The idea behind labels is two fold:
+block's sha256 w/ other metadata.
 
-1. We can have agent reviewers use this system, e.g. `code-simplifier` could be
-   an agent label.
-2. We can have specialized reviews, e.g. `security`, `legal`, `code`, `general`,
-   `product`. Then you can understand the review posture of your code
-   interdisciplinarily.
+``` shell
+trueflow feedback
+```
+
+Generates an Agent-optimized prompt output to feedback into the agent, to close
+the loop from review back into executing on the requested changes (or questions,
+etc.)
+
+Naturally, we have plans to also enable modal `feedback`, e.g. `feedback
+--github` to post as comments on a PR or something, should the need arise.
+
+
+## Metadata
+
+The append-only database of reviews includes metadata.
+
+- Reviewer `identity` (e.g. email, pgp key, signature)
+- Review `label`. (e.g. `security`, `general`, `legal`)
+
+The idea behind labels:
+
+We can have agent reviewers use this system, e.g. `code-simplifier` could be an
+agent label. 2. We can have specialized human reviews, e.g. `security`, `legal`,
+`code`, `general`, `product`. Then you can understand the review posture of your
+code interdisciplinarily.
