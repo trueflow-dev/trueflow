@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use log::info;
 use regex::Regex;
 use tree_sitter::Parser;
-use tree_sitter19 as tree_sitter_md;
+use tree_sitter_md;
 
 pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
     info!(
@@ -18,6 +18,7 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
 
     let blocks = match lang {
         Language::Markdown => split_markdown(block)?,
+        Language::Text => split_text(block)?,
         Language::Rust if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_rust_function(block)?
         }
@@ -95,9 +96,9 @@ fn split_code(block: &Block) -> Result<Vec<Block>> {
 
 fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = tree_sitter_md::Parser::new();
+    let mut parser = Parser::new();
     parser
-        .set_language(tree_sitter_markdown::language())
+        .set_language(&tree_sitter_md::LANGUAGE.into())
         .context("Failed to load markdown grammar")?;
 
     let tree = parser
@@ -211,6 +212,10 @@ fn split_markdown(block: &Block) -> Result<Vec<Block>> {
         BlockKind::Paragraph | BlockKind::ListItem => split_markdown_sentences(block),
         _ => split_markdown_tree(block),
     }
+}
+
+fn split_text(block: &Block) -> Result<Vec<Block>> {
+    split_markdown_sentences(block)
 }
 
 fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
@@ -413,7 +418,7 @@ struct MarkdownSpan {
     kind: BlockKind,
 }
 
-fn collect_markdown_spans(node: tree_sitter_md::Node<'_>, spans: &mut Vec<MarkdownSpan>) {
+fn collect_markdown_spans(node: tree_sitter::Node<'_>, spans: &mut Vec<MarkdownSpan>) {
     if let Some(kind) = markdown_kind(node.kind()) {
         spans.push(MarkdownSpan {
             start: node.start_byte(),

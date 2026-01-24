@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+
 pub enum Language {
     Rust,
     Elisp,
@@ -10,6 +11,7 @@ pub enum Language {
     Python,
     Shell,
     Markdown,
+    Text,
     #[default]
     Unknown,
 }
@@ -66,7 +68,11 @@ pub fn analyze_file(path: &Path) -> FileType {
                     language: Language::Markdown,
                 });
             }
-            "org" | "txt" => return FileType::Markup,
+            "org" | "txt" => {
+                return FileType::Code(CodeFile {
+                    language: Language::Text,
+                })
+            }
             _ => {} // Fallthrough to binary check
         }
     }

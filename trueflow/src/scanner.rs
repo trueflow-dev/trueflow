@@ -94,7 +94,7 @@ fn process_file(path: &Path) -> Result<FileState> {
                 }
             }
         }
-        _ => (Language::Unknown, chunk_content(&content)), // Fallback for Markup/Text
+        _ => (Language::Unknown, chunk_content(&content)), // Fallback for non-code files
     };
 
     // Compute file hash (Merkle root of block hashes)

@@ -1179,16 +1179,6 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.19.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad726ec26496bf4c083fff0f43d4eb3a2ad1bba305323af5ff91383c0b6ecac0"
-dependencies = [
- "cc",
- "regex",
-]
-
-[[package]]
-name = "tree-sitter"
 version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "974d205cc395652cfa8b37daa053fe56eebd429acf8dc055503fee648dae981e"
@@ -1208,7 +1198,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cebb4c0029a4b3942c8cfab42ae38f774855ad4c16fd06ad8e7ad07a8347c616"
 dependencies = [
  "cc",
- "tree-sitter 0.26.3",
+ "tree-sitter",
 ]
 
 [[package]]
@@ -1238,23 +1228,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ae62f7eae5eb549c71b76658648b72cc6111f2d87d24a1e31fa907f4943e3ce"
 
 [[package]]
-name = "tree-sitter-markdown"
-version = "0.7.1"
+name = "tree-sitter-md"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7c1cfe0396b0e500cc99067bcd2d48720eb08a077e2690194f0c3a3d105f9a0"
+checksum = "2c96068626225a758ddb1f7cfb82c7c1fab4e093dd3bde464e2a44e8341f58f5"
 dependencies = [
  "cc",
- "tree-sitter 0.19.5",
-]
-
-[[package]]
-name = "tree-sitter-org"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42e2dded20dfb07f8c40eb47108e697f90f895a8689e98dd2d9ca478109deb0c"
-dependencies = [
- "cc",
- "tree-sitter 0.19.5",
+ "tree-sitter",
+ "tree-sitter-language",
 ]
 
 [[package]]
@@ -1305,13 +1286,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tree-sitter 0.19.5",
- "tree-sitter 0.26.3",
+ "tree-sitter",
  "tree-sitter-asciidoc",
  "tree-sitter-bash",
  "tree-sitter-javascript",
- "tree-sitter-markdown",
- "tree-sitter-org",
+ "tree-sitter-md",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",

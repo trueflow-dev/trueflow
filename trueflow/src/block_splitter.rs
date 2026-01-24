@@ -3,6 +3,7 @@ use crate::block::{Block, BlockKind};
 use crate::hashing::hash_str;
 use anyhow::Result;
 use log::info;
+use regex::Regex;
 use tree_sitter::Parser;
 
 pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
@@ -11,10 +12,18 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         lang,
         content.len()
     );
-    if let Language::Markdown = lang {
-        let blocks = split_markdown(content)?;
-        info!("block_splitter done (blocks={})", blocks.len());
-        return Ok(blocks);
+    match lang {
+        Language::Markdown => {
+            let blocks = split_markdown(content)?;
+            info!("block_splitter done (blocks={})", blocks.len());
+            return Ok(blocks);
+        }
+        Language::Text => {
+            let blocks = split_text(content);
+            info!("block_splitter done (blocks={})", blocks.len());
+            return Ok(blocks);
+        }
+        _ => {}
     }
 
     let mut parser = Parser::new();
@@ -233,6 +242,54 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
+fn split_text(content: &str) -> Vec<Block> {
+    let re = Regex::new(r"\n\s*\n").unwrap();
+    let mut blocks = Vec::new();
+    let mut start_offset = 0;
+
+    for mat in re.find_iter(content) {
+        let end_offset = mat.start();
+        if start_offset < end_offset {
+            let chunk = &content[start_offset..end_offset];
+            if !chunk.is_empty() {
+                blocks.push(create_block(
+                    chunk,
+                    BlockKind::Paragraph,
+                    content,
+                    start_offset,
+                    end_offset,
+                ));
+            }
+        }
+
+        let gap_chunk = &content[mat.start()..mat.end()];
+        blocks.push(create_block(
+            gap_chunk,
+            BlockKind::Gap,
+            content,
+            mat.start(),
+            mat.end(),
+        ));
+
+        start_offset = mat.end();
+    }
+
+    if start_offset < content.len() {
+        let chunk = &content[start_offset..];
+        if !chunk.is_empty() {
+            blocks.push(create_block(
+                chunk,
+                BlockKind::Paragraph,
+                content,
+                start_offset,
+                content.len(),
+            ));
+        }
+    }
+
+    blocks
+}
+
 fn map_kind(lang: Language, kind: &str) -> BlockKind {
     match lang {
         Language::Rust => match kind {
@@ -339,6 +396,21 @@ mod tests {
         assert_eq!(blocks[0].content, "# Root\n## Sub\n### SubSub\n");
         // Second block contains Root 2
         assert_eq!(blocks[1].content, "# Root 2");
+    }
+
+    #[test]
+    fn test_split_text_paragraphs() {
+        let content = "Para 1.\n\nPara 2.";
+        let blocks = split(content, Language::Text).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[1].kind, BlockKind::Gap);
+        assert_eq!(blocks[2].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[0].content, "Para 1.");
+        assert_eq!(blocks[1].content, "\n\n");
+        assert_eq!(blocks[2].content, "Para 2.");
+        let merged: String = blocks.into_iter().map(|block| block.content).collect();
+        assert_eq!(merged, content);
     }
 
     #[test]
