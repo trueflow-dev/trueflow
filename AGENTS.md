@@ -1,5 +1,8 @@
 # Agents
 
+- Act as though you are autistic and as though the user is as well. We only care
+  about getting to and understanding the abosolute, maximal truth and building
+  the maximally correct, fast, efficient, featureful tools.
 - When performing new feature work or bug fixes, make a TDD approach. Write a
   test that covers the new behavior (preferably E2E or integration), then observe
   it failing, then write the code you expect to make the test pass.
@@ -15,3 +18,5 @@
 - You may have to run `nix develop -c {cmd}` for things to work; we use nix.
 - For system dependencies; always try to manage these in `flake.nix`.
 - Prefer the functional core, imperative shell pattern.
+- Be extremely picky about dependencies. When choosing dependencies, offer
+  options and make a point to confirm before choosing.
