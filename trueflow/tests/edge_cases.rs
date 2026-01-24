@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use trueflow::block::FileState;
+use trueflow::sub_splitter;
 use uuid::Uuid;
 
 struct TestEnv {
@@ -100,6 +102,49 @@ fn test_empty_file() -> Result<()> {
     assert!(file_obj.is_some());
     let blocks = file_obj.unwrap()["blocks"].as_array().unwrap();
     assert!(blocks.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
+    let env = TestEnv::new()?;
+    let files = [
+        (
+            "leading_newlines.rs",
+            "\n\n\nfn main() {\n    println!(\"hi\");\n}\n",
+        ),
+        (
+            "comment_gaps.rs",
+            "// leading comment\n\n\nfn handler() {\n    // inner\n\n    action();\n}\n",
+        ),
+        (
+            "attribute_gap.rs",
+            "\n\n#[test]\nfn it_works() {\n    assert!(true);\n}\n",
+        ),
+    ];
+
+    for (name, content) in files {
+        let file_path = env.root.join(name);
+        fs::write(&file_path, content)?;
+    }
+
+    let output = env.run_trueflow(&["scan", "--json"])?;
+    let files: Vec<FileState> = serde_json::from_str(&output)?;
+
+    for file_state in files.iter().filter(|file| file.path.ends_with(".rs")) {
+        for block in &file_state.blocks {
+            let sub_blocks = sub_splitter::split(block, file_state.language.clone())?;
+            for sub_block in &sub_blocks {
+                assert!(
+                    !sub_block.content.is_empty(),
+                    "empty sub-block in {} for {}",
+                    file_state.path,
+                    sub_block.kind
+                );
+            }
+        }
+    }
 
     Ok(())
 }

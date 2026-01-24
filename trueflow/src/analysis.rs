@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum Language {
     Rust,
     Elisp,
@@ -11,10 +10,22 @@ pub enum Language {
     Python,
     Shell,
     Markdown,
+    Toml,
+    Nix,
+    Just,
     Text,
     #[default]
     Unknown,
 }
+
+// TODO: add Language::Go, Language::Java, Language::Cpp once tree-sitter support is wired.
+
+impl Language {
+    pub fn uses_text_fallback(&self) -> bool {
+        matches!(self, Language::Text | Language::Toml | Language::Nix | Language::Just)
+    }
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeFile {
@@ -66,6 +77,21 @@ pub fn analyze_file(path: &Path) -> FileType {
             "md" | "markdown" => {
                 return FileType::Code(CodeFile {
                     language: Language::Markdown,
+                });
+            }
+            "toml" => {
+                return FileType::Code(CodeFile {
+                    language: Language::Toml,
+                });
+            }
+            "nix" => {
+                return FileType::Code(CodeFile {
+                    language: Language::Nix,
+                });
+            }
+            "just" => {
+                return FileType::Code(CodeFile {
+                    language: Language::Just,
                 });
             }
             "org" | "txt" => {

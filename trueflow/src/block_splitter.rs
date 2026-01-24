@@ -18,7 +18,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             info!("block_splitter done (blocks={})", blocks.len());
             return Ok(blocks);
         }
-        Language::Text => {
+        _ if lang.uses_text_fallback() => {
             let blocks = split_text(content);
             info!("block_splitter done (blocks={})", blocks.len());
             return Ok(blocks);
@@ -376,6 +376,20 @@ mod tests {
         }
     }
 
+    fn assert_paragraph_split(language: Language) {
+        let content = "Para 1.\n\nPara 2.";
+        let blocks = split(content, language).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[1].kind, BlockKind::Gap);
+        assert_eq!(blocks[2].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[0].content, "Para 1.");
+        assert_eq!(blocks[1].content, "\n\n");
+        assert_eq!(blocks[2].content, "Para 2.");
+        let merged: String = blocks.into_iter().map(|block| block.content).collect();
+        assert_eq!(merged, content);
+    }
+
     #[test]
     fn test_split_markdown_headers() {
         let content = "# Section 1\nText.\n# Section 2\nMore text.";
@@ -400,17 +414,22 @@ mod tests {
 
     #[test]
     fn test_split_text_paragraphs() {
-        let content = "Para 1.\n\nPara 2.";
-        let blocks = split(content, Language::Text).unwrap();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
-        assert_eq!(blocks[1].kind, BlockKind::Gap);
-        assert_eq!(blocks[2].kind, BlockKind::Paragraph);
-        assert_eq!(blocks[0].content, "Para 1.");
-        assert_eq!(blocks[1].content, "\n\n");
-        assert_eq!(blocks[2].content, "Para 2.");
-        let merged: String = blocks.into_iter().map(|block| block.content).collect();
-        assert_eq!(merged, content);
+        assert_paragraph_split(Language::Text);
+    }
+
+    #[test]
+    fn test_split_toml_paragraphs() {
+        assert_paragraph_split(Language::Toml);
+    }
+
+    #[test]
+    fn test_split_nix_paragraphs() {
+        assert_paragraph_split(Language::Nix);
+    }
+
+    #[test]
+    fn test_split_just_paragraphs() {
+        assert_paragraph_split(Language::Just);
     }
 
     #[test]

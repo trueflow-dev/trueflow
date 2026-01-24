@@ -84,7 +84,7 @@ fn process_file(path: &Path) -> Result<FileState> {
                             | Language::JavaScript
                             | Language::TypeScript
                             | Language::Shell
-                    ) {
+                    ) || language.uses_text_fallback() {
                         eprintln!(
                             "Failed to parse file {:?}: {}, falling back to lines",
                             path, e

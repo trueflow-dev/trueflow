@@ -18,7 +18,7 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
 
     let blocks = match lang {
         Language::Markdown => split_markdown(block)?,
-        Language::Text => split_text(block)?,
+        _ if lang.uses_text_fallback() => split_text(block)?,
         Language::Rust if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_rust_function(block)?
         }
@@ -650,6 +650,46 @@ mod tests {
             ]
         );
 
+        assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_text_sentences() {
+        let content = "Line one. Line two?";
+        let block = make_block(content, BlockKind::Paragraph);
+        let chunks = split(&block, Language::Text).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].kind, BlockKind::Sentence);
+        assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_toml_sentences() {
+        let content = "key = \"value\"";
+        let block = make_block(content, BlockKind::Paragraph);
+        let chunks = split(&block, Language::Toml).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, BlockKind::Sentence);
+        assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_nix_sentences() {
+        let content = "{ foo = \"bar\"; }";
+        let block = make_block(content, BlockKind::Paragraph);
+        let chunks = split(&block, Language::Nix).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, BlockKind::Sentence);
+        assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_just_sentences() {
+        let content = "build:\n\techo ok";
+        let block = make_block(content, BlockKind::Paragraph);
+        let chunks = split(&block, Language::Just).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, BlockKind::Sentence);
         assert_eq!(merge_blocks(chunks), content);
     }
 
