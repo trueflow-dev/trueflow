@@ -81,3 +81,5 @@
    - [ ] Spin up Vultr infra and document deployment via the org meta repo.
 ** TODO [Low] Performance sweep
    - [ ] Audit for performance improvements and implement top candidates.
+** TODO [Medium] Add mode in review for speed-reading word-by-word SPC -> pause;
+   j back sentence; l forward sentence
