@@ -23,6 +23,8 @@
    - [ ] Implement `c` (Comment) command with minibuffer prompt.
    - [ ] Implement `x` (Reject) command.
    - [ ] Wiring: Execute `trueflow mark`, then refresh UI.
+   - [ ] Add a small "reviewed!" animation in review mode when approving/commenting.
+   - [ ] Show reviewed vs remaining counts in bottom-right (e.g., 5 / 15), with green reviewed and yellow remaining.
 
 ** TODO [Medium] Iterative Review Mode
    - [ ] Command `vet-review-start` (bound to `r`).

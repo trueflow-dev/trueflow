@@ -6,6 +6,9 @@
     - [ ] Pass 2: Merge full-file content if file is new and small (< 64 lines).
   - [ ] Integrate `optimizer::optimize` into `scanner.rs` before returning `FileState`.
 
+* Example repos TODOs
+  - [ ] Add smoke test for example_repos/all_languages review block generation.
+
 * Eventually, I would like to have deep semantic diffs, like "this function was
   moved to this file". This would be a few layer above the actual set of
   "change" objects that we have hashed and stored in trueflow. Then, if a user
