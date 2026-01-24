@@ -1,0 +1,38 @@
+# TRUEFLOW BRAND CONFIGURATION
+# Metaphor: Laminar Flow (Review without resistance)
+
+[meta]
+brand_name = "Trueflow"
+domain = "trueflow.dev"
+
+[typography]
+# "Space Grotesk": Sci-fi industrial, structural. Use for headlines.
+prose_font = "Space Grotesk"
+# "JetBrains Mono": Functional, supports ligatures (->) to reinforce flow.
+code_font = "JetBrains Mono"
+
+[definitions]
+true_def = "Verb: To bring an object into exact shape, alignment, or position."
+flow_def = "Noun: The mental state of being fully immersed in creation."
+trueflow_def = "Being fully immersed in truing shape, alignment, and details."
+
+[iconography]
+checkmark_icon = "||"       # Meaning: The Double Pipe. An open channel; parallel alignment.
+changes_icon = "△"          # Meaning: The Prism. Refraction/Adjustment (not rejection).
+status_icon = "Spirit Level" # Meaning: The Bubble. Centering the build.
+
+[color_palette]
+# Background: The Void. Deeper than slate, softer than black.
+void_navy = "#0B1015"
+
+# Primary: Laminar Mint. High voltage, bioluminescent. Represents success/flow.
+laminar_mint = "#00FFC2"
+
+# Secondary: Structural Violet. High energy. Use for architecture or admin features.
+structural_violet = "#7C3AED"
+
+# Friction: Kinetic Amber. Potential energy. Use for comments. Avoid "Error Red".
+kinetic_amber = "#FFB700"
+
+# Text: High Contrast. Off-white to reduce eye strain against the deep background.
+text_main = "#F0F6FC"

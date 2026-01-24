@@ -1,4 +1,4 @@
-#+title: Project Vet TODOs
+#+title: Project Trueflow TODOs
 #+STARTUP: content hidestars
 
 * TODO [High] Review Chain Of Trust
@@ -10,7 +10,7 @@
 * Emacs Package (vet.el)
 ** TODO [High] Basic Infrastructure
    - [ ] Define `vet-mode` and basic buffer setup.
-   - [ ] Implement `vet-core.el` wrapper for CLI calls (`vet diff`, `vet mark`, `vet sync`).
+   - [ ] Implement `vet-core.el` wrapper for CLI calls (`trueflow diff`, `trueflow mark`, `trueflow sync`).
    - [ ] Define customization groups (executable path, faces).
 
 ** TODO [High] Status View (`vet-status`)
@@ -22,7 +22,7 @@
    - [ ] Implement `a` (Approve) command.
    - [ ] Implement `c` (Comment) command with minibuffer prompt.
    - [ ] Implement `x` (Reject) command.
-   - [ ] Wiring: Execute `vet mark`, then refresh UI.
+   - [ ] Wiring: Execute `trueflow mark`, then refresh UI.
 
 ** TODO [Medium] Iterative Review Mode
    - [ ] Command `vet-review-start` (bound to `r`).
@@ -36,5 +36,46 @@
      - *Alternative:* Use `recursive-edit` in the file buffer.
 
 * CLI Improvements (vet-cli)
-** TODO [Medium] `vet check`
+** TODO [Medium] `trueflow check`
    - [ ] Implement CI gate logic (exit 1 if unreviewed hunks exist).
+
+* Product & Platform Roadmap
+** TODO [High] Review ordering prioritizes tests
+   - [ ] Sort blocks so test code is reviewed first (need reliable test detection).
+** TODO [High] Coverage mode + heatmap
+   - [ ] Add coverage mode to show least-reviewed files.
+   - [ ] Add per-file heatmap (red = unreviewed, blue = well-reviewed).
+** TODO [High] Coverage overlay and branch/path analysis
+   - [ ] Add an overlay/command to show reviewed vs unreviewed lines and coverage.
+   - [ ] Extend coverage to code paths/branches where possible.
+** TODO [High] Semantic coverage by AST/codepath
+   - [ ] Model how well reviewed a codepath is using AST relationships.
+** TODO [High] Cognitive complexity scoring
+   - [ ] Compute a complexity score per block to trigger review thresholds.
+** TODO [High] Language coverage sweep
+   - [ ] Add top 16 languages/markdown variants.
+   - [ ] Add an `all_langs` repo fixture and E2E smoke tests per language.
+** TODO [High] Review types/modes
+   - [ ] Support review types (security, dependencies, performance, readability, data structures, business logic).
+   - [ ] Tag reviews with a type and make modes affect block ordering and filters (e.g., data structures shows structs).
+** TODO [High] GitHub PR integration
+   - [ ] Fetch/check out PRs, map review targets to the right diff, and post feedback as comments.
+** TODO [High] Local LLM context helper
+   - [ ] Call a local model to explain context behind a change.
+** TODO [High] Rust lint/check sweep
+   - [ ] Evaluate high-quality Rust lints (deny, udeps, semver-checks, geiger, nextest) and wire into `just check`.
+** TODO [High] Installation experience
+   - [ ] Formalize a high-quality install plan (cargo install vs curl | sh vs package managers).
+** TODO [Medium] Diff vs new-content investigation
+   - [ ] Define and verify how we present hunks versus reconstructed new content.
+** TODO [Medium] jj integration
+   - [ ] Explore how Jujutsu can improve diffing, review, and syncing flows.
+** TODO [Medium] Website + docs
+   - [ ] Add landing page, user docs, and onboarding guide.
+** TODO [Medium] Static musl build + dependency audit
+   - [ ] Ship a fully static musl build.
+   - [ ] Audit dependencies; prefer pure Rust and reduce OpenSSL/FFI usage.
+** TODO [Medium] Vultr deployment (org meta repo)
+   - [ ] Spin up Vultr infra and document deployment via the org meta repo.
+** TODO [Low] Performance sweep
+   - [ ] Audit for performance improvements and implement top candidates.
