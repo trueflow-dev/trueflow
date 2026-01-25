@@ -1,0 +1,129 @@
+#+title: Jujutsu (jj) Integration Design
+#+DATE: 2026-01-24
+#+STATUS: Draft
+#+STARTUP: content hidestars
+
+* Context
+Trueflow is a CLI-driven semantic code review engine. It tracks review state by
+content-addressed blocks, not by commit history. Git is a transport, not a
+source of identity. Trueflow already supports workflows like:
+- diff: find changed blocks
+- mark: record review verdicts
+- check: gate CI on unreviewed blocks
+
+The question: what does jj (Jujutsu) add, and is it strategically worth
+building first-class integration?
+
+* Summary (TL;DR)
+- jj can become a *better transport layer* for trueflow than git when working
+  locally: immutable history, automatic conflict resolution, and an operation
+  log make review metadata and code changes easier to keep consistent.
+- It does *not* change trueflow’s content-addressed model; it changes how we
+  *move* and *shape* changes for review.
+- Strategic merit is strongest if we want: stacked changes, granular review
+  workflows, or heavy rebasing. It is weaker if users already standardize on
+  GitHub PR flows and want minimal tooling changes.
+
+* What jj is (in the simplest terms)
+- jj is a DVCS with git compatibility.
+- It supports mutable working copies with immutable history, backed by an
+  operation log that makes mistakes recoverable.
+- It can operate in a git repo without forcing teams to switch to jj everywhere.
+
+* Why jj might help trueflow
+** 1. Cleaner incremental review flows
+Trueflow’s blocks are content-addressed, so a block is “approved” regardless of
+rebase or file moves. jj reinforces this by:
+- making rebases/rewrites common and safe (operation log),
+- keeping working-copy mutations predictable,
+- reducing the friction of “repair” operations when review state diverges.
+
+Strategic advantage: trueflow could leverage jj as a *review choreography tool*
+where branches are mutable but review metadata stays stable.
+
+** 2. Stacked changes, better slicing
+jj is popular for stacking small changes. That aligns with trueflow’s block
+model: fewer blocks per change set, smaller review surfaces, more frequent
+approval cycles. This helps:
+- review velocity,
+- accurate coverage metrics,
+- easier automation for review ordering.
+
+** 3. Deterministic diffs against logical parents
+jj has a more explicit notion of a change’s logical parent. For trueflow’s
+=diff= command, this could improve:
+- discovering the right base for a change,
+- avoiding false positives in “diff vs new-content” logic,
+- reducing user time spent understanding why a block is flagged.
+
+* Differences vs git that matter to trueflow
+** Identity vs history
+- Git is history-first: diffs flow from commit graphs.
+- Trueflow is identity-first: diffs are a transport to discover block changes.
+- jj can be treated as a better history *carrier* without forcing trueflow to
+  depend on its model.
+
+** Working-copy ergonomics
+- jj encourages editing without explicit staging.
+- This aligns with trueflow’s content scanning: scan the working copy and
+  compute block hashes regardless of “staged” status.
+
+** Local-first history editing
+- jj makes rewrite/rebase safer (operation log), which reduces the risk of
+  “review drift” where reviewers approved blocks but the git history changed.
+
+* Risks and costs
+- User adoption: jj is less common than git, so first-class integration could
+  be underused.
+- Tooling complexity: new CLI surfaces and edge cases.
+- Documentation and onboarding overhead.
+
+* Strategic merit assessment
+** Strong cases
+- Teams that already use jj or want stacked-change workflows.
+- Environments where “rebase early and often” is normal.
+- High-churn repos where review metadata must survive frequent history edits.
+
+** Weak cases
+- Teams who only use GitHub PRs and avoid local history rewriting.
+- Teams who want the simplest setup with minimal new tools.
+
+* Potential integration model (minimal viable)
+** Phase 1: Detection + optional commands
+- Detect jj repo (via =.jj/= metadata).
+- Add a =--vcs=jj= override and =--vcs=auto= detection.
+- Use jj’s native “base” and “current change” resolution to compute diff roots.
+
+** Phase 2: Review flow improvements
+- Add “stack-aware” diff: review only the current change, not the entire stack.
+- Provide a “next change” review command that advances through the stack.
+
+** Phase 3: Bidirectional metadata syncing
+- Store review metadata in a jj-oplog-aware location or external store.
+- Provide tooling to reconcile review records after history rewriting.
+
+* Non-goals
+- Replacing git as a transport layer for all users.
+- Re-implementing jj features inside trueflow.
+- Constraining users to any specific VCS.
+
+* Decision guidance
+If the product direction emphasizes:
+- stacked changes,
+- aggressive history rewriting,
+- or teams where local review loops dominate,
+then jj integration is strategically compelling.
+
+If the product direction emphasizes:
+- GitHub-first PR review,
+- low-setup adoption,
+- minimal toolchain changes,
+then keep jj support minimal (auto-detect, best-effort diff roots).
+
+* Open questions
+- How should trueflow store/recover review metadata across jj rewrite
+  operations? (Is content-addressed identity enough, or do we need more
+  context hints?)
+- What is the minimal set of jj CLI calls needed to compute the right diff
+  base for a change?
+- Should we allow mixed jj + git operation in the same repo, or enforce one?
