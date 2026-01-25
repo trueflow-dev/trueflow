@@ -11,6 +11,7 @@
   test that covers the new behavior (preferably E2E or integration), then observe
   it failing, then write the code you expect to make the test pass.
 - Prefer enums to strings.
+- Prefer explicit to implicit.
 - If possible, prefer finding a way to structure logic into clean match stmts,
   over big blocks of if/thens, or other control flows.
 - Radical preference for composition of dependencies into structs -- e.g. data,
