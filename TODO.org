@@ -41,10 +41,19 @@
 ** TODO [Medium] `trueflow check`
    - [ ] Implement CI gate logic (exit 1 if unreviewed hunks exist).
 
+* Attestation & Verification
+** TODO [Medium] Add Record::new constructor in store.rs
+   - [ ] Encapsulate generation of `Uuid`, `SystemTime`, and `CURRENT_VERSION` in `Record::new` to simplify `mark.rs`.
+** TODO [Medium] Cache imported pubkeys in Verifier
+   - [ ] Optimize verification by maintaining a `HashSet` of imported key fingerprints to avoid redundant `gpg --import` calls.
+** TODO [Medium] Refactor GPG logic into src/gpg.rs
+   - [ ] Extract `GpgClient` to handle temp dir lifecycle and provide high-level `sign` and `verify` methods.
+
 * Product & Platform Roadmap
 ** TODO [High] Review ordering prioritizes tests
    - [ ] Sort blocks so test code is reviewed first (need reliable test detection).
 ** TODO [High] Coverage mode + heatmap
+   - [ ] Add `trueflow coverage` command that shells out to `cargo llvm-cov` or `just coverage`.
    - [ ] Add coverage mode to show least-reviewed files.
    - [ ] Add per-file heatmap (red = unreviewed, blue = well-reviewed).
 ** TODO [High] Coverage overlay and branch/path analysis
@@ -68,6 +77,44 @@
    - [ ] Evaluate high-quality Rust lints (deny, udeps, semver-checks, geiger, nextest) and wire into `just check`.
 ** TODO [High] Installation experience
    - [ ] Formalize a high-quality install plan (cargo install vs curl | sh vs package managers).
+** TODO [Medium] Add strict cargo clippy lints, apply fixes
+** TODO [Medium] Perform in-depth cargo mutants run, apply fixes
+** TODO [Medium] Add some padding (maybe one line ish) of space between end of
+   code block area and controls in TUI
+** TODO BUG: this output in TUI:
+```
+struct #[derive(Debug, Clone)] in ./example_repos/all_languages/main.rs (hash=a85ccbc9), subblocks:
+                                                  └─ CodeParagraph
+
+
+                                                         #[derive(Debug, Clone)]
+                                                         struct Config {
+                                                             name: String,
+                                                             threshold: i32,
+                                                         }
+```
+Two things:
+  1. struct #[derive(Debug, Clone)] is wrong, should be struct Config
+  2. Let's make the output a little nicer to read:
+     (no ./)
+     example_repos/all_languages/main.rs
+       -> struct Config (hash=a85ccbc9)
+         {directly embed the subblock tree here}
+
+** TODO [READY] TUI UX: no need for Trueflow TUI text/title at the top of the TUI.
+** TODO [READY] TUI UX: need a command to like batch approve a whole file (or module or dir, etc.)
+** TODO [READY] TUI UX: the modal when entering a comment shouldn't obscure the
+   content beneath it, but be side-by-side or below, so all of the content is
+   visible.
+** TODO [READY] WHen the comment modal comes up, it should give command hints on how to submit the comment.
+** TODO When you write a lot into a comment modal in the TUI, it doesn't wrap
+   the text in the box. It just goes invisible off-frame. This is a bug.
+** TODO [READY] There should be a trueflow command to reset the review state for the
+   current user for the current REV. i.e. delete all review records that point
+   to the current rev. (without removing historical reviews, etc.)
+** TODO [READY] There should be a trueflow CLI command to just list records in
+   reverse-chronological order, like a trueflow log command, defaults to say the
+   most recent 16 or something.
 ** TODO [Medium] Diff vs new-content investigation
    - [ ] Define and verify how we present hunks versus reconstructed new content.
 ** TODO [Medium] jj integration

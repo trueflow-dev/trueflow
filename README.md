@@ -82,6 +82,18 @@ review, and it's just too long to digest at once. You can press 's' and
 time. We show you the sub-blocks in order. Trueflow keeps track of what you've
 reviewed, and you can comment independently on any block.
 
+## Development
+
+### Test Coverage
+
+To generate a test coverage report (requires `cargo-llvm-cov`):
+
+```shell
+just coverage
+```
+
+The report will be available at `trueflow/target/llvm-cov/html/index.html`.
+
 ## UX
 
 ### TUI
@@ -104,6 +116,40 @@ key to perform a review action on the block.
  's' => split the block into sub-blocks, and recurse into them
  'q' => quit the review session (all progress is saved)
 ```
+
+## Usage
+
+### Filter block types
+
+You can limit which block kinds appear in `review` and `feedback` by using the
+`--only` or `--exclude` flags. Block kinds are case-insensitive and match the
+semantic kinds shown in JSON output (e.g. `function`, `struct`, `gap`,
+`comment`, `paragraph`).
+
+```shell
+# Review only functions
+trueflow review --all --only function --json
+
+# Exclude gaps and comments from feedback output
+trueflow feedback --exclude gap --exclude comment
+```
+
+### Configure defaults with trueflow.toml
+
+Trueflow looks for a `trueflow.toml` file in the current directory or any parent
+folder. It applies defaults for `review` and `feedback` unless overridden by CLI
+flags.
+
+```toml
+[review]
+only = ["function", "struct"]
+exclude = ["gap", "comment"]
+
+[feedback]
+exclude = ["gap"]
+```
+
+See `trueflow.example.toml` for the default settings.
 
 ## Feedback
 

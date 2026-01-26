@@ -1,5 +1,60 @@
 #+title: TODO
 
+* Roadmap to V1 Prod
+** TUI & Emacs [High]
+   - [X] **TUI: Real Review Queue**
+     - Wire `tui.rs` to use real data from `review --json`.
+     - Implement actions: `[a]pprove`, `[c]omment` (prompt), `[x]reject` calling `trueflow mark`.
+     - Implement `[s]ubdivide` to split blocks in-place and recurse.
+     - Show actual file path, block kind, and syntax-highlighted snippet.
+   - [X] **Emacs: Shippable Workflow**
+     - Core commands: `trueflow-review-list`, `trueflow-review-block`.
+     - Support sub-block splitting/review within Emacs.
+     - Integration: parse JSON output, execute `mark` commands.
+     - Polish: Modeline status (e.g., "3 unreviewed"), quick refresh.
+
+** Team Sync & Data [High]
+   - [X] **Git-based Sync Durability**
+     - Add conflict-safe merge strategy for `reviews.jsonl` (dedupe by `record.id`).
+     - Add file locking for `.trueflow/reviews.jsonl` to prevent concurrent write corruption.
+     - Verify signatures during sync (if present).
+     - Add `sync --dry-run` to preview operations.
+   - [X] **Schema Evolution**
+     - Add a `version` field to review records to support future migrations.
+
+** Config & Filtering [Medium]
+   - [ ] **Configuration (`trueflow.toml`)**
+     - `storage.branch`: Branch ref for sync (default: `trueflow-db`).
+     - `review.only_show`: Allowlist of block kinds (e.g., `["FunctionSignature", "Struct"]`).
+     - `review.exclude`: Block kinds to hide (e.g., `["Comment", "Gap"]`).
+     - `scan.ignore_globs`: Additional ignore patterns beyond `.gitignore`.
+     - `hash.normalization`: Toggle for whitespace/line-ending rules.
+   - [ ] **UI Filtering**
+     - Ensure filtering happens at the UI/Presentation layer (after logic/ordering) to avoid missing critical changes.
+
+** Core & Hashing [High]
+   - [X] **Canonicalization Pipeline**
+     - Implement whitespace normalization (trim trailing, normalize newlines) matching README promise.
+     - Add regression tests for hash stability across formatting changes.
+   - [ ] **OS Support**
+     - Verify and fix path handling for macOS/Linux (e.g., config paths, newlines).
+   - [ ] **Git Ignore Support**
+     - Integrate `.gitignore` parsing into `scanner.rs`.
+
+** Cleanup & Refactors [Medium]
+   - [X] **Rename `Signature` -> `FunctionSignature`**
+     - Rename the `BlockKind` variant `Signature` to `FunctionSignature` for clarity.
+     - Update string serialization and tests.
+   - [ ] **Refactor Test Detection Queries**
+     - Current state: `collect_test_ranges` in `block_splitter.rs` has repetitive logic per language.
+     - Goal: Use the new `Span` and overlap primitives (added in `block.rs`) consistently across all languages.
+     - Goal: Improve query robustness for Python, JS/TS, and Shell (similar to how we fixed Rust).
+     - Pointers:
+       - `src/block_splitter.rs`: `collect_test_ranges` and language-specific helpers.
+       - `src/block.rs`: `Span` struct and `overlaps` method.
+       - Tests: `tests/e2e_languages.rs` (ensure `test_all_languages_test_blocks` keeps passing).
+       - Look at `collect_rust_test_ranges` vs `collect_python_test_ranges` for consolidation opportunities.
+
 * Optimizer TODOs
   - [ ] Implement `trueflow::optimizer::optimize` logic.
     - [ ] Pass 1: Merge adjacent import statements (e.g. `use foo;` `use bar;` -> one block).
@@ -9,10 +64,11 @@
 * Example repos TODOs
   - [ ] Add smoke test for example_repos/all_languages review block generation.
 
-* Eventually, I would like to have deep semantic diffs, like "this function was
-  moved to this file". This would be a few layer above the actual set of
-  "change" objects that we have hashed and stored in trueflow. Then, if a user
-  approves one of these changes, it can approve all the underlying "changes",
-  e.g. the delete in one file and the add in the other. This can be accomplished
-  via a smart mix of LLMs and also deterministic methods like LSPs, treesitter,
-  etc.
+* Future Ideas
+  - Eventually, I would like to have deep semantic diffs, like "this function was
+    moved to this file". This would be a few layer above the actual set of
+    "change" objects that we have hashed and stored in trueflow. Then, if a user
+    approves one of these changes, it can approve all the underlying "changes",
+    e.g. the delete in one file and the add in the other. This can be accomplished
+    via a smart mix of LLMs and also deterministic methods like LSPs, treesitter,
+    etc.
