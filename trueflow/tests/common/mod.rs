@@ -210,7 +210,10 @@ pub fn find_tree_hash(output: &str, path: &str) -> Result<String> {
 fn find_tree_hash_inner(node: &Value, path: &str) -> Option<String> {
     let node_path = node.get("path")?.as_str()?;
     if node_path == path {
-        return node.get("hash").and_then(|value| value.as_str()).map(|value| value.to_string());
+        return node
+            .get("hash")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
     }
 
     let children = node.get("children")?.as_array()?;

@@ -4,6 +4,7 @@ use log::warn;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -203,6 +204,31 @@ impl fmt::Display for BlockState {
 pub trait ReviewStore {
     fn read_history(&self) -> Result<Vec<Record>>;
     fn append(&self, record: Record) -> Result<()>;
+}
+
+pub fn latest_review_verdicts(records: &[Record]) -> HashMap<String, Verdict> {
+    let mut sorted = records.to_vec();
+    sorted.sort_by_key(|record| record.timestamp);
+    let mut verdicts = HashMap::new();
+    for record in sorted {
+        if record.check == "review" {
+            verdicts.insert(record.fingerprint, record.verdict);
+        }
+    }
+    verdicts
+}
+
+pub fn approved_hashes_from_verdicts(verdicts: &HashMap<String, Verdict>) -> HashSet<String> {
+    verdicts
+        .iter()
+        .filter_map(|(hash, verdict)| {
+            if verdict == &Verdict::Approved {
+                Some(hash.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub struct FileStore {

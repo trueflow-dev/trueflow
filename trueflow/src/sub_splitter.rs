@@ -524,11 +524,11 @@ fn create_sub_block_with_kind(
         content: content.to_string(),
         kind,
         tags: parent.tags.clone(),
-        complexity: parent.complexity, // Simplified: inherit complexity or re-calculate? 
-        // Re-calculation might be better if we split functions. 
-        // But for sub-blocks which are just parts of a function (paragraphs), 
+        complexity: parent.complexity, // Simplified: inherit complexity or re-calculate?
+        // Re-calculation might be better if we split functions.
+        // But for sub-blocks which are just parts of a function (paragraphs),
         // maybe we should just split the complexity proportionally or re-calc.
-        // For now, let's inherit. 
+        // For now, let's inherit.
         // Or actually, `create_sub_block` implies it is smaller.
         // Let's set complexity to 0 for sub-blocks for now, as they are "sub-units".
         // Or re-calculate if we passed lang.

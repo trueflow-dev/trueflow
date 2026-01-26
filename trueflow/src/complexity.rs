@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use tree_sitter::{Parser, Node};
+use tree_sitter::{Node, Parser};
 
 pub fn calculate(content: &str, lang: Language) -> u32 {
     if lang == Language::Unknown || lang == Language::Text || lang == Language::Markdown {
@@ -35,10 +35,36 @@ fn calculate_node(node: Node, nesting: u32, lang: &Language) -> u32 {
     let kind = node.kind();
 
     let is_control_flow = match lang {
-        Language::Rust => matches!(kind, "if_expression" | "for_expression" | "while_expression" | "loop_expression" | "match_expression"),
-        Language::JavaScript | Language::TypeScript => matches!(kind, "if_statement" | "for_statement" | "while_statement" | "do_statement" | "switch_statement" | "catch_clause" | "ternary_expression"),
-        Language::Python => matches!(kind, "if_statement" | "for_statement" | "while_statement" | "try_statement" | "except_clause"),
-        Language::Shell => matches!(kind, "if_statement" | "for_statement" | "while_statement" | "case_statement"),
+        Language::Rust => matches!(
+            kind,
+            "if_expression"
+                | "for_expression"
+                | "while_expression"
+                | "loop_expression"
+                | "match_expression"
+        ),
+        Language::JavaScript | Language::TypeScript => matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "do_statement"
+                | "switch_statement"
+                | "catch_clause"
+                | "ternary_expression"
+        ),
+        Language::Python => matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "try_statement"
+                | "except_clause"
+        ),
+        Language::Shell => matches!(
+            kind,
+            "if_statement" | "for_statement" | "while_statement" | "case_statement"
+        ),
         _ => false,
     };
 
@@ -49,7 +75,7 @@ fn calculate_node(node: Node, nesting: u32, lang: &Language) -> u32 {
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
     };
-    
+
     // Check specific logical operators for Python/others if nodes are named "boolean_operator"
     if (matches!(lang, Language::Python) && kind == "boolean_operator") || is_logical_op {
         score += 1;
@@ -69,7 +95,7 @@ fn calculate_node(node: Node, nesting: u32, lang: &Language) -> u32 {
         // If we encounter a nested function, it should probably increment nesting or complexity?
         // Sonar says: "else", "catch" etc don't increment nesting level but pay for it.
         // This is a simplified implementation.
-        
+
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             score += calculate_node(child, nesting, lang);
@@ -78,7 +104,7 @@ fn calculate_node(node: Node, nesting: u32, lang: &Language) -> u32 {
 
     // Special case for 'else' and 'else if' - they pay nesting but don't increment it?
     // Simplified: Just +1 + nesting for now.
-    
+
     score
 }
 

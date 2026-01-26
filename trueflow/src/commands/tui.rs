@@ -1,5 +1,5 @@
 use crate::commands::mark;
-use crate::commands::review::{collect_review_summary, ReviewOptions};
+use crate::commands::review::{ReviewOptions, collect_review_summary};
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::store::Verdict;
@@ -8,16 +8,16 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block as UiBlock, Gauge, Paragraph, Wrap},
-    Frame, Terminal,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Stdout};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -47,6 +47,11 @@ struct ReviewNavigator {
     tree: Tree,
     visible_nodes: HashSet<TreeNodeId>,
     current: TreeNodeId,
+    visible_order: Vec<TreeNodeId>,
+    index_by_node: HashMap<TreeNodeId, usize>,
+    depth_by_node: HashMap<TreeNodeId, usize>,
+    visible_by_depth: BTreeMap<usize, Vec<TreeNodeId>>,
+    first_child_by_node: HashMap<TreeNodeId, TreeNodeId>,
 }
 
 impl ReviewNavigator {
@@ -60,14 +65,53 @@ impl ReviewNavigator {
             }
         }
 
-        // Always include root if there are any visible nodes (or if tree is empty, though that's rare)
         let root = tree.root();
         visible_nodes.insert(root);
+
+        let mut visible_order = Vec::new();
+        let mut index_by_node = HashMap::new();
+        let mut depth_by_node = HashMap::new();
+        let mut visible_by_depth: BTreeMap<usize, Vec<TreeNodeId>> = BTreeMap::new();
+        let mut first_child_by_node = HashMap::new();
+
+        let mut stack = vec![(root, 0)];
+        while let Some((node_id, depth)) = stack.pop() {
+            if !visible_nodes.contains(&node_id) {
+                continue;
+            }
+            let idx = visible_order.len();
+            visible_order.push(node_id);
+            index_by_node.insert(node_id, idx);
+            depth_by_node.insert(node_id, depth);
+            visible_by_depth.entry(depth).or_default().push(node_id);
+
+            let node = tree.node(node_id);
+            let mut children: Vec<TreeNodeId> = node
+                .children
+                .iter()
+                .copied()
+                .filter(|child| visible_nodes.contains(child))
+                .collect();
+            if let Some(first_child) = children.first().copied() {
+                first_child_by_node.insert(node_id, first_child);
+            }
+
+            // stack is LIFO; push in reverse to preserve order
+            children.reverse();
+            for child in children {
+                stack.push((child, depth + 1));
+            }
+        }
 
         Ok(Self {
             tree,
             visible_nodes,
             current: root,
+            visible_order,
+            index_by_node,
+            depth_by_node,
+            visible_by_depth,
+            first_child_by_node,
         })
     }
 
@@ -81,10 +125,12 @@ impl ReviewNavigator {
         }
     }
 
+    fn jump_root(&mut self) {
+        self.current = self.tree.root();
+    }
+
     fn descend(&mut self) {
-        let node = self.tree.node(self.current);
-        // Find first visible child
-        if let Some(child) = node.children.iter().find(|&&c| self.visible_nodes.contains(&c)) {
+        if let Some(child) = self.first_child_by_node.get(&self.current) {
             self.current = *child;
         }
     }
@@ -97,81 +143,59 @@ impl ReviewNavigator {
         }
     }
 
-    // Move to next sibling (or wrap to cousin)
+    // Move to next sibling (or wrap to cousin) at same depth
     fn move_next(&mut self) {
-        let order = self.get_level_order();
-        if let Some(pos) = order.iter().position(|&id| id == self.current) {
-            if pos + 1 < order.len() {
-                self.current = order[pos + 1];
-            } else {
-                // If we are at the end, find the next node in depth-first traversal of visible nodes?
-                // Or "next relative". For now, stop at end of current level list.
-                // To implement true "next relative", we'd need a full flattened list of visible nodes.
-                // But the requirement was "left/right across a depth -> ... traversing parents".
-                // My `get_level_order` flattens the *entire* depth level across parents.
-                // So order[pos+1] IS the next relative at the same depth.
-            }
+        let depth = self.depth_of(self.current);
+        if let Some(nodes) = self.visible_by_depth.get(&depth)
+            && let Some(pos) = nodes.iter().position(|&id| id == self.current)
+            && pos + 1 < nodes.len()
+        {
+            self.current = nodes[pos + 1];
         }
     }
 
-    // Move to prev sibling
+    // Move to prev sibling at same depth
     fn move_prev(&mut self) {
-        let order = self.get_level_order();
-        if let Some(pos) = order.iter().position(|&id| id == self.current)
+        let depth = self.depth_of(self.current);
+        if let Some(nodes) = self.visible_by_depth.get(&depth)
+            && let Some(pos) = nodes.iter().position(|&id| id == self.current)
             && pos > 0
         {
-            self.current = order[pos - 1];
+            self.current = nodes[pos - 1];
         }
     }
 
-    // Get all visible nodes at the current depth, ordered by tree traversal
-    fn get_level_order(&self) -> Vec<TreeNodeId> {
-        let depth = self.depth(self.current);
-        let mut order = Vec::new();
-        self.collect_level(self.tree.root(), 0, depth, &mut order);
-        order
-    }
-
-    fn collect_level(
-        &self,
-        id: TreeNodeId,
-        current_depth: usize,
-        target_depth: usize,
-        out: &mut Vec<TreeNodeId>,
-    ) {
-        if !self.visible_nodes.contains(&id) {
-            return;
-        }
-        if current_depth == target_depth {
-            out.push(id);
-            return;
-        }
-        let node = self.tree.node(id);
-        for child in &node.children {
-            self.collect_level(*child, current_depth + 1, target_depth, out);
+    fn move_next_visible(&mut self) {
+        if let Some(current_idx) = self.index_by_node.get(&self.current)
+            && current_idx + 1 < self.visible_order.len()
+        {
+            self.current = self.visible_order[current_idx + 1];
         }
     }
 
-    fn depth(&self, id: TreeNodeId) -> usize {
-        let mut d = 0;
-        let mut curr = id;
-        while let Some(p) = self.tree.parent(curr) {
-            d += 1;
-            curr = p;
+    fn move_prev_visible(&mut self) {
+        if let Some(current_idx) = self.index_by_node.get(&self.current)
+            && *current_idx > 0
+        {
+            self.current = self.visible_order[current_idx - 1];
         }
-        d
+    }
+
+    fn depth_of(&self, id: TreeNodeId) -> usize {
+        self.depth_by_node.get(&id).copied().unwrap_or(0)
     }
 
     // For minimap: find logical neighbors in the level order
     fn neighbors(&self) -> (Option<TreeNodeId>, Option<TreeNodeId>) {
-        let order = self.get_level_order();
-        let pos = order.iter().position(|&id| id == self.current).unwrap_or(0);
-        let left = if pos > 0 { Some(order[pos - 1]) } else { None };
-        let right = if pos + 1 < order.len() {
-            Some(order[pos + 1])
-        } else {
-            None
-        };
+        let depth = self.depth_of(self.current);
+        let nodes = self.visible_by_depth.get(&depth);
+        let pos = nodes
+            .and_then(|list| list.iter().position(|&id| id == self.current))
+            .unwrap_or(0);
+        let left = nodes
+            .and_then(|list| list.get(pos.wrapping_sub(1)).copied())
+            .filter(|_| pos > 0);
+        let right = nodes.and_then(|list| list.get(pos + 1).copied());
         (left, right)
     }
 
@@ -181,10 +205,7 @@ impl ReviewNavigator {
             NodeKey::Directory(p) | NodeKey::File(p) => self.tree.find_by_path(p),
             NodeKey::Block(h) => {
                 for file_node in self.tree.file_nodes() {
-                    if let Some(id) = self
-                        .tree
-                        .node_by_path_and_hash(&file_node.path, h)
-                    {
+                    if let Some(id) = self.tree.node_by_path_and_hash(&file_node.path, h) {
                         return Some(id);
                     }
                 }
@@ -193,7 +214,6 @@ impl ReviewNavigator {
         }
     }
 }
-
 // --- Application Logic ---
 
 #[derive(Clone, PartialEq)]
@@ -258,8 +278,13 @@ impl PendingAction {
 enum InputMode {
     #[default]
     Normal,
-    Editing { action: PendingAction },
-    ConfirmBatch { action: PendingAction, count: usize },
+    Editing {
+        action: PendingAction,
+    },
+    ConfirmBatch {
+        action: PendingAction,
+        count: usize,
+    },
 }
 
 struct AppState {
@@ -331,6 +356,8 @@ fn run_app(
                     KeyCode::Char('p') => state.navigator.ascend(),
                     KeyCode::Char('j') | KeyCode::Right => state.navigator.move_next(),
                     KeyCode::Char('k') | KeyCode::Left => state.navigator.move_prev(),
+                    KeyCode::Char('n') => state.navigator.move_next_visible(),
+                    KeyCode::Char('b') => state.navigator.move_prev_visible(),
                     KeyCode::Char('a') => {
                         handle_action(terminal, context, &mut state, Verdict::Approved)?
                     }
@@ -338,6 +365,7 @@ fn run_app(
                         handle_action(terminal, context, &mut state, Verdict::Rejected)?
                     }
                     KeyCode::Char('c') => handle_comment_action(&mut state)?,
+                    KeyCode::Char('g') => state.navigator.jump_root(),
                     _ => {}
                 },
                 InputMode::Editing { .. } => match key.code {
@@ -369,11 +397,8 @@ fn handle_action(
     state: &mut AppState,
     verdict: Verdict,
 ) -> Result<()> {
-    let action = PendingAction::from_node(
-        &state.navigator.tree,
-        state.navigator.current_id(),
-        verdict,
-    );
+    let action =
+        PendingAction::from_node(&state.navigator.tree, state.navigator.current_id(), verdict);
 
     if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
         let count = count_descendant_blocks(&state.navigator, state.navigator.current_id());
@@ -540,15 +565,15 @@ fn load_review_state(context: &TrueflowContext) -> Result<crate::commands::revie
 
 fn refresh_state(context: &TrueflowContext, state: &mut AppState) -> Result<()> {
     let summary = load_review_state(context)?;
-    let current_key = NodeKey::from_node(
-        &state.navigator.tree,
-        state.navigator.current_id(),
-    );
+    let current_key = NodeKey::from_node(&state.navigator.tree, state.navigator.current_id());
 
     state.navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
-    state.remaining_blocks = state.navigator.visible_nodes.iter().filter(|&&id| {
-         matches!(state.navigator.tree.node(id).kind, TreeNodeKind::Block)
-    }).count();
+    state.remaining_blocks = state
+        .navigator
+        .visible_nodes
+        .iter()
+        .filter(|&&id| matches!(state.navigator.tree.node(id).kind, TreeNodeKind::Block))
+        .count();
 
     // Try to restore position
     if let Some(id) = state.navigator.find_node_by_key(&current_key) {
@@ -564,7 +589,8 @@ fn detect_repo_name(context: &TrueflowContext) -> String {
     if let Ok(path) = context.trueflow_dir() {
         // Try to get parent of .trueflow
         if let Some(parent) = path.parent() {
-             return parent.file_name()
+            return parent
+                .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "repo".to_string());
         }
@@ -582,7 +608,7 @@ fn count_descendant_blocks(navigator: &ReviewNavigator, id: TreeNodeId) -> usize
         }
         for child in &node.children {
             if navigator.visible_nodes.contains(child) {
-                 stack.push(*child);
+                stack.push(*child);
             }
         }
     }
@@ -656,10 +682,14 @@ fn render_minimap(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiP
     let current_id = state.navigator.current_id();
     let parent_id = state.navigator.tree.parent(current_id);
     let (left_id, right_id) = state.navigator.neighbors();
-    
+
     // Child: first visible child
     let node = state.navigator.tree.node(current_id);
-    let child_id = node.children.iter().find(|&&c| state.navigator.visible_nodes.contains(&c)).copied();
+    let child_id = node
+        .children
+        .iter()
+        .find(|&&c| state.navigator.visible_nodes.contains(&c))
+        .copied();
 
     // 1. Parent Line (Top Center)
     if let Some(pid) = parent_id {
@@ -674,9 +704,13 @@ fn render_minimap(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiP
     let w_side = 9;
     let w_mid = inner_area.width as usize - (w_side * 2);
 
-    let left_text = left_id.map(|id| format_node_label(&state.navigator.tree, id, &state.repo_name)).unwrap_or_else(|| "␀".to_string());
+    let left_text = left_id
+        .map(|id| format_node_label(&state.navigator.tree, id, &state.repo_name))
+        .unwrap_or_else(|| "␀".to_string());
     let curr_text = format_node_label(&state.navigator.tree, current_id, &state.repo_name);
-    let right_text = right_id.map(|id| format_node_label(&state.navigator.tree, id, &state.repo_name)).unwrap_or_else(|| "␀".to_string());
+    let right_text = right_id
+        .map(|id| format_node_label(&state.navigator.tree, id, &state.repo_name))
+        .unwrap_or_else(|| "␀".to_string());
 
     let spans = vec![
         // Left
@@ -687,7 +721,10 @@ fn render_minimap(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiP
         // Current (highlighted)
         Span::styled(
             format_column(&curr_text, w_mid, Alignment::Center),
-            Style::default().fg(palette.add).bg(palette.bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette.add)
+                .bg(palette.bg)
+                .add_modifier(Modifier::BOLD),
         ),
         // Right
         Span::styled(
@@ -717,17 +754,28 @@ fn format_node_label(tree: &Tree, id: TreeNodeId, repo_name: &str) -> String {
         TreeNodeKind::Root => repo_name.to_string(),
         TreeNodeKind::Directory => format!("{}/", node.name),
         TreeNodeKind::File => node.name.clone(),
-        TreeNodeKind::Block => node.name.split(':').next().unwrap_or(&node.name).to_string(), // Just "function"
+        TreeNodeKind::Block => node
+            .name
+            .split(':')
+            .next()
+            .unwrap_or(&node.name)
+            .to_string(), // Just "function"
     }
 }
 
 fn format_center_line(text: &str, width: usize, palette: &UiPalette, bold: bool) -> Line<'static> {
     let style = if bold {
-        Style::default().fg(palette.add).bg(palette.bg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(palette.add)
+            .bg(palette.bg)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(palette.dim).bg(palette.bg)
     };
-    Line::from(Span::styled(format_column(text, width, Alignment::Center), style))
+    Line::from(Span::styled(
+        format_column(text, width, Alignment::Center),
+        style,
+    ))
 }
 
 fn format_column(text: &str, width: usize, align: Alignment) -> String {
@@ -738,11 +786,13 @@ fn format_column(text: &str, width: usize, align: Alignment) -> String {
         let mut w = 0;
         for c in text.chars() {
             let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > width { break; }
+            if w + cw > width {
+                break;
+            }
             trunc.push(c);
             w += cw;
         }
-        return trunc; 
+        return trunc;
     }
 
     let padding = width - text_width;
@@ -759,7 +809,7 @@ fn format_column(text: &str, width: usize, align: Alignment) -> String {
 
 fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
     let node = state.navigator.tree.node(state.navigator.current_id());
-    
+
     // Header
     let mut header_lines = Vec::new();
     let title = match node.kind {
@@ -768,34 +818,41 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
         TreeNodeKind::File => format!("File: {}", node.name),
         TreeNodeKind::Block => format!("Block: {}", node.name),
     };
-    
+
     header_lines.push(Line::from(Span::styled(
         title,
-        Style::default().fg(palette.fg).bg(palette.bg).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(palette.fg)
+            .bg(palette.bg)
+            .add_modifier(Modifier::BOLD),
     )));
-    
+
     if !node.path.is_empty() {
         header_lines.push(Line::from(Span::styled(
             format!("Path: {}", node.path),
             Style::default().fg(palette.dim).bg(palette.bg),
         )));
     }
-    
+
     header_lines.push(Line::from(Span::styled(
         format!("Hash: {}", &node.hash[..node.hash.len().min(12)]),
         Style::default().fg(palette.dim).bg(palette.bg),
     )));
 
     // Actions Hint
-    let actions_text = "Actions: [a]pprove [x]reject [c]omment [s]descend [p]parent [q]uit";
+    let actions_text = "Actions: [a]pprove [x]reject [c]omment [s]descend [p]parent [n]next [b]prev [g]root [q]uit";
     let actions_line = Line::from(Span::styled(
         actions_text,
-        Style::default().fg(palette.dim).bg(palette.bg).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(palette.dim)
+            .bg(palette.bg)
+            .add_modifier(Modifier::BOLD),
     ));
 
     // Content
     let content_lines = if let Some(block) = &node.block {
-        block.content
+        block
+            .content
             .lines()
             .map(|l| format_code_line(l, palette))
             .collect::<Vec<_>>()
@@ -810,18 +867,22 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
         Constraint::Length(header_lines.len() as u16 + 1),
         Constraint::Min(0),
         Constraint::Length(1),
-    ]).split(area);
+    ])
+    .split(area);
 
     frame.render_widget(Paragraph::new(header_lines), layout[0]);
-    
+
     frame.render_widget(
         Paragraph::new(content_lines)
             .block(UiBlock::default().style(Style::default().bg(palette.code_bg)))
             .wrap(Wrap { trim: false }),
-        layout[1]
+        layout[1],
     );
 
-    frame.render_widget(Paragraph::new(actions_line).alignment(Alignment::Center), layout[2]);
+    frame.render_widget(
+        Paragraph::new(actions_line).alignment(Alignment::Center),
+        layout[2],
+    );
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -880,7 +941,9 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
     ];
 
     frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         popup_area,
     );
 }

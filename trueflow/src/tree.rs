@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::{Block, FileState};
 use crate::hashing::hash_str;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -41,6 +41,10 @@ impl TreeNodeKind {
 
     fn is_hash_entry(&self) -> bool {
         matches!(self, TreeNodeKind::Directory | TreeNodeKind::File)
+    }
+
+    fn sort_key(&self, name: &str) -> String {
+        format!("{}:{}", self.entry_prefix(), name)
     }
 }
 
@@ -265,7 +269,11 @@ impl TreeBuilder {
     }
 
     pub fn finalize(mut self) -> Tree {
-        let root_children = self.children_by_id.get(&self.root).cloned().unwrap_or_default();
+        let root_children = self
+            .children_by_id
+            .get(&self.root)
+            .cloned()
+            .unwrap_or_default();
         self.attach_children(self.root, root_children);
         self.compute_hashes(self.root);
         Tree {
@@ -279,7 +287,14 @@ impl TreeBuilder {
     fn attach_children(&mut self, id: TreeNodeId, mut children: Vec<TreeNodeId>) {
         let kind = self.nodes[id.0].kind.clone();
         if kind.should_sort_children() {
-            children.sort_by(|a, b| self.nodes[a.0].name.cmp(&self.nodes[b.0].name));
+            children.sort_by(|a, b| {
+                let a_node = &self.nodes[a.0];
+                let b_node = &self.nodes[b.0];
+                a_node
+                    .kind
+                    .sort_key(&a_node.name)
+                    .cmp(&b_node.kind.sort_key(&b_node.name))
+            });
         }
         if let Some(node) = self.nodes.get_mut(id.0) {
             node.children = children.clone();
@@ -325,10 +340,6 @@ impl TreeBuilder {
     }
 }
 
-pub fn normalize_path(path: &str) -> &str {
-    path.strip_prefix("./").unwrap_or(path)
-}
-
 fn block_label(block: &Block) -> String {
     let start = block.start_line + 1;
     let end = block.end_line.max(start);
@@ -342,8 +353,7 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
     directories.insert(String::new(), root);
 
     for file in files {
-        let path = normalize_path(&file.path);
-        let parts: Vec<&str> = path.split('/').collect();
+        let parts: Vec<&str> = file.path.split('/').collect();
         let mut current_path = String::new();
         let mut parent = root;
 

@@ -2,10 +2,12 @@ use crate::block::Block;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::scanner;
-use crate::store::{FileStore, Identity, Record, ReviewStore, Verdict};
+use crate::store::{
+    FileStore, Identity, Record, ReviewStore, Verdict, approved_hashes_from_verdicts,
+};
 use crate::tree;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub fn run(
     _context: &TrueflowContext,
@@ -65,7 +67,7 @@ pub fn run(
 
                 if !include_approved
                     && tree
-                        .node_by_path_and_hash(tree::normalize_path(&file.path), &block.hash)
+                        .node_by_path_and_hash(&file.path, &block.hash)
                         .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
                 {
                     continue;
@@ -117,7 +119,7 @@ pub fn run(
 
                 if !include_approved
                     && tree
-                        .node_by_path_and_hash(tree::normalize_path(&file.path), &block.hash)
+                        .node_by_path_and_hash(&file.path, &block.hash)
                         .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
                 {
                     continue;
@@ -174,19 +176,6 @@ fn print_block_xml(block: &Block, reviews: &[Record]) {
     }
     println!("      </reviews>");
     println!("    </block>");
-}
-
-fn approved_hashes_from_verdicts(verdicts: &HashMap<String, Verdict>) -> HashSet<String> {
-    verdicts
-        .iter()
-        .filter_map(|(hash, verdict)| {
-            if verdict == &Verdict::Approved {
-                Some(hash.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn escape_xml(s: &str) -> String {

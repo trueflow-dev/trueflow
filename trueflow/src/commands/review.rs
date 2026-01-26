@@ -3,7 +3,9 @@ use crate::block::{Block, BlockKind};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::scanner;
-use crate::store::{FileStore, ReviewStore, Verdict};
+use crate::store::{
+    FileStore, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
+};
 use crate::sub_splitter;
 use crate::tree;
 use crate::vcs;
@@ -61,17 +63,8 @@ pub fn collect_review_summary(
     let history = store.read_history()?;
     info!("loaded {} review records", history.len());
 
-    // Compute current status for each fingerprint (Last Write Wins by timestamp)
-    let mut sorted_history = history;
-    sorted_history.sort_by_key(|record| record.timestamp);
-
-    let mut fingerprint_status = HashMap::<String, Verdict>::new();
-    for record in sorted_history {
-        if record.check == "review" {
-            fingerprint_status.insert(record.fingerprint, record.verdict);
-        }
-    }
-    let approved_hashes = approved_hashes_from_status(&fingerprint_status);
+    let fingerprint_status = latest_review_verdicts(&history);
+    let approved_hashes = approved_hashes_from_verdicts(&fingerprint_status);
 
     // 2. Scan Directory (Merkle Tree)
     let files = scanner::scan_directory(".")?;
@@ -111,7 +104,7 @@ pub fn collect_review_summary(
 
         let mut unreviewed_blocks = Vec::new();
         for block in reviewable_blocks {
-            let node_id = tree.node_by_path_and_hash(tree::normalize_path(&file.path), &block.hash);
+            let node_id = tree.node_by_path_and_hash(&file.path, &block.hash);
             if let Some(node_id) = node_id
                 && tree.is_node_covered(node_id, &approved_hashes)
             {
@@ -307,19 +300,6 @@ pub fn run(
 
 fn get_dirty_files() -> Result<HashSet<String>> {
     vcs::dirty_files_from_workdir()
-}
-
-fn approved_hashes_from_status(status: &HashMap<String, Verdict>) -> HashSet<String> {
-    status
-        .iter()
-        .filter_map(|(hash, verdict)| {
-            if verdict == &Verdict::Approved {
-                Some(hash.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn kind_rank(block: &Block) -> u8 {

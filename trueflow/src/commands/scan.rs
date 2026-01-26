@@ -1,7 +1,7 @@
 use crate::context::TrueflowContext;
 use crate::scanner;
 use crate::tree;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 pub fn run(_context: &TrueflowContext, json: bool, tree_output: bool) -> Result<()> {
     let files = scanner::scan_directory(".")?;

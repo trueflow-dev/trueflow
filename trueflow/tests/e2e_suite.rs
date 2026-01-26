@@ -179,7 +179,7 @@ fn test_feedback_export() -> Result<()> {
 
     // 5. Assertions
     assert!(xml_output.contains("<trueflow_feedback>"));
-    assert!(xml_output.contains("path=\"./src/lib.rs\"")); // Scanner output has ./
+    assert!(xml_output.contains("path=\"src/lib.rs\""));
     assert!(xml_output.contains("verdict=\"rejected\""));
     assert!(xml_output.contains("<comment>Needs optimization</comment>"));
     assert!(xml_output.contains("<![CDATA[\nfn core() { }\n]]>"));

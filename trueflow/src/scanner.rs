@@ -96,7 +96,7 @@ fn process_file(path: &Path) -> Result<FileState> {
     let file_hash = format!("{:x}", hasher.finalize());
 
     Ok(FileState {
-        path: path.to_string_lossy().to_string(),
+        path: path.to_string_lossy().trim_start_matches("./").to_string(),
         language,
         file_hash,
         blocks,
