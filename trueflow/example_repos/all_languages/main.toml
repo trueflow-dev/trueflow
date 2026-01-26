@@ -1,0 +1,26 @@
+title = "all_languages"
+max_retries = 3
+enabled = true
+keywords = ["example", "toml", "config"]
+
+[owner]
+name = "sample"
+active = true
+
+[database]
+ports = [8001, 8002, 8003]
+temp_targets = { primary = "cache", secondary = "backup" }
+
+[servers.alpha]
+ip = "10.0.0.1"
+role = "primary"
+
+[servers.beta]
+ip = "10.0.0.2"
+role = "replica"
+
+[multiline]
+note = """
+Line one.
+Line two.
+"""

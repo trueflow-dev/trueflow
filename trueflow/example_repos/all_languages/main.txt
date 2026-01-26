@@ -1,0 +1,12 @@
+ALL_LANGUAGES TEXT SAMPLE
+
+Sections:
+- Constant: MAX_RETRIES = 3
+- Struct: Config { name, threshold }
+- Trait: Processor
+- Lambda: value -> value * 2
+- Loops: for, while
+
+Notes:
+  This file is plain text to exercise the Text language path.
+  It is intentionally simple and flat.

@@ -22,10 +22,29 @@ pub enum Language {
 
 impl Language {
     pub fn uses_text_fallback(&self) -> bool {
-        matches!(self, Language::Text | Language::Toml | Language::Nix | Language::Just)
+        matches!(
+            self,
+            Language::Text | Language::Toml | Language::Nix | Language::Just
+        )
+    }
+
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext {
+            "rs" => Some(Language::Rust),
+            "el" => Some(Language::Elisp),
+            "js" => Some(Language::JavaScript),
+            "ts" => Some(Language::TypeScript),
+            "py" => Some(Language::Python),
+            "sh" => Some(Language::Shell),
+            "md" | "markdown" => Some(Language::Markdown),
+            "toml" => Some(Language::Toml),
+            "nix" => Some(Language::Nix),
+            "just" => Some(Language::Just),
+            "org" | "txt" => Some(Language::Text),
+            _ => None,
+        }
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeFile {
@@ -42,65 +61,10 @@ pub enum FileType {
 
 pub fn analyze_file(path: &Path) -> FileType {
     // 1. Check for extension-based Code/Markup
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        match ext {
-            "rs" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Rust,
-                });
-            }
-            "el" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Elisp,
-                });
-            }
-            "js" => {
-                return FileType::Code(CodeFile {
-                    language: Language::JavaScript,
-                });
-            }
-            "ts" => {
-                return FileType::Code(CodeFile {
-                    language: Language::TypeScript,
-                });
-            }
-            "py" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Python,
-                });
-            }
-            "sh" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Shell,
-                });
-            }
-            "md" | "markdown" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Markdown,
-                });
-            }
-            "toml" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Toml,
-                });
-            }
-            "nix" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Nix,
-                });
-            }
-            "just" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Just,
-                });
-            }
-            "org" | "txt" => {
-                return FileType::Code(CodeFile {
-                    language: Language::Text,
-                })
-            }
-            _ => {} // Fallthrough to binary check
-        }
+    if let Some(ext) = path.extension().and_then(|s| s.to_str())
+        && let Some(language) = Language::from_extension(ext)
+    {
+        return FileType::Code(CodeFile { language });
     }
 
     // 2. Check for Binary (Heuristic: Read first 8kb, look for NULL)
@@ -122,4 +86,31 @@ pub fn analyze_file(path: &Path) -> FileType {
 
     // Default to Text
     FileType::Text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_language_from_extension() {
+        // Covers all match arms to ensure no dead code mutants
+        assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
+        assert_eq!(Language::from_extension("el"), Some(Language::Elisp));
+        assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
+        assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("sh"), Some(Language::Shell));
+        assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
+        assert_eq!(
+            Language::from_extension("markdown"),
+            Some(Language::Markdown)
+        );
+        assert_eq!(Language::from_extension("toml"), Some(Language::Toml));
+        assert_eq!(Language::from_extension("nix"), Some(Language::Nix));
+        assert_eq!(Language::from_extension("just"), Some(Language::Just));
+        assert_eq!(Language::from_extension("org"), Some(Language::Text));
+        assert_eq!(Language::from_extension("txt"), Some(Language::Text));
+        assert_eq!(Language::from_extension("unknown_ext"), None);
+    }
 }
