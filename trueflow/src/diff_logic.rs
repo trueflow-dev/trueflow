@@ -1,11 +1,9 @@
 use crate::hashing::compute_fingerprint;
 use crate::store::{FileStore, Record, ReviewStore, Verdict};
-use anyhow::{Context, Result};
-use git2::{DiffOptions, Repository};
+use crate::vcs;
+use anyhow::Result;
 use serde::Serialize;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 #[derive(Serialize)]
 pub struct Change {
@@ -46,85 +44,12 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
     }
 
     // 2. Compute Diff
-    let repo = Repository::discover(".")?;
-
-    // Target: diff main..HEAD
-    let head_commit = repo.head()?.peel_to_commit()?;
-    let head_tree = head_commit.tree()?;
-
-    let main_branch = repo
-        .find_branch("main", git2::BranchType::Local)
-        .or_else(|_| repo.find_branch("master", git2::BranchType::Local))
-        .context("Could not find main or master branch")?;
-    let main_commit = main_branch.get().peel_to_commit()?;
-
-    let base_tree = match repo.merge_base(head_commit.id(), main_commit.id()) {
-        Ok(oid) => repo.find_commit(oid)?.tree()?,
-        Err(_) => main_commit.tree()?,
-    };
-
-    let mut diff_opts = DiffOptions::new();
-    diff_opts.context_lines(3); // Standard 3 lines context
-
-    let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))?;
+    let diff_hunks = vcs::diff_main_to_head()?;
 
     let mut unreviewed_changes = Vec::new();
 
-    // Structure to hold build-in-progress hunk
-    struct ChangeBuilder {
-        lines: Vec<String>,
-        new_start: u32,
-        file_path: String,
-    }
-
-    let changes_found: Rc<RefCell<Vec<ChangeBuilder>>> = Rc::new(RefCell::new(Vec::new()));
-
-    // Create clones for closures
-    let changes_found_hunk = changes_found.clone();
-    let changes_found_line = changes_found.clone();
-
-    diff.foreach(
-        &mut |_delta, _progress| {
-            // File callback
-            true
-        },
-        None, // binary callback
-        Some(&mut |delta, hunk| {
-            // New hunk starting
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-
-            changes_found_hunk.borrow_mut().push(ChangeBuilder {
-                lines: Vec::new(),
-                new_start: hunk.new_start(),
-                file_path: path,
-            });
-            true
-        }),
-        Some(&mut |_delta, _hunk, line| {
-            // Line callback
-            let mut changes = changes_found_line.borrow_mut();
-            if let Some(builder) = changes.last_mut() {
-                let origin = line.origin();
-                let content = String::from_utf8_lossy(line.content());
-                // Prefix with origin char (+, -, space)
-                let prefix = match origin {
-                    '+' | '-' | ' ' => origin,
-                    _ => ' ', // Context often comes as space, sometimes other things?
-                };
-                builder.lines.push(format!("{}{}", prefix, content));
-            }
-            true
-        }),
-    )?;
-
-    // Process gathered hunks
-    for builder in changes_found.borrow().iter() {
-        let (diff_content, new_content, context, hash_body) = parse_hunk_lines(&builder.lines);
+    for hunk in diff_hunks {
+        let (diff_content, new_content, context, hash_body) = parse_hunk_lines(&hunk.lines);
 
         let fp = compute_fingerprint(&hash_body, &context);
         let fp_str = fp.as_string();
@@ -139,8 +64,8 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
         if verdict != Some(&Verdict::Approved) {
             unreviewed_changes.push(Change {
                 fingerprint: fp_str,
-                file: builder.file_path.clone(),
-                line: builder.new_start,
+                file: hunk.file_path.clone(),
+                line: hunk.new_start,
                 diff_content,
                 new_content,
                 context,
