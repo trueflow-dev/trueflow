@@ -1,14 +1,14 @@
 use crate::context::TrueflowContext;
 use crate::store::{FileStore, Record, ReviewStore};
 use anyhow::{Context, Result};
+use log::info;
 use std::collections::HashSet;
-use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 pub fn run(_context: &TrueflowContext) -> Result<()> {
     // 1. Fetch origin/trueflow-db to ensure we have the latest
-    println!("Fetching from origin...");
+    info!("Fetching from origin...");
     let _ = Command::new("git")
         .args(["fetch", "origin", "trueflow-db"])
         .output(); // Ignore error if branch doesn't exist
@@ -55,28 +55,21 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
         file_content.push('\n');
     }
 
-    // We need to write to .trueflow/reviews.jsonl
-    // FileStore uses absolute path logic, let's just reuse the file path logic or simple write
-    // The FileStore::new() logic finds the root.
-    // Let's assume we are in root or can use the store's knowledge if we exposed it?
-    // FileStore doesn't expose path. But we can overwrite the file via store if we had a method?
-    // Easier: Just overwrite .trueflow/reviews.jsonl in current dir?
-    // Actually FileStore searches for .trueflow up the tree. We should respect that.
-    // For now, let's just write to the file we read from?
-    // We can't ask store for path.
-    // Let's just create a new FileStore and write? No, append only.
-    // We need "overwrite".
-    // Let's just use `std::fs::write` to the path found by FileStore logic?
-    // I'll copy the path finding logic briefly or expose it.
-    // Exposing `root_path` from `FileStore` would be best.
-    // But `FileStore` is in `store.rs`.
-
-    // Hack: Assuming `FileStore::new()` worked, we can try to find the file again.
+    // Write content with exclusive lock
+    use fs2::FileExt;
     let db_path = store.db_path();
-    fs::write(&db_path, &file_content)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&db_path)?;
+
+    file.lock_exclusive()?;
+    file.write_all(file_content.as_bytes())?;
+    // Lock releases on drop
 
     // 6. Commit to Orphan Branch (Plumbing)
-    println!("Preparing commit...");
+    info!("Preparing commit...");
     let blob_hash = git_hash_object(&file_content)?;
     let tree_hash = git_mktree(&blob_hash)?;
 
@@ -92,7 +85,7 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
         .context("Failed to update local trueflow-db ref")?;
 
     // 8. Push
-    println!("Pushing to origin...");
+    info!("Pushing to origin...");
     let push_status = Command::new("git")
         .args([
             "push",
@@ -106,7 +99,7 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
         anyhow::bail!("Failed to push trueflow-db to origin (maybe conflict? try syncing again)");
     }
 
-    println!("Sync complete.");
+    info!("Sync complete.");
     Ok(())
 }
 

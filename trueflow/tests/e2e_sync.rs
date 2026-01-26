@@ -45,10 +45,13 @@ impl TestRepo {
 fn record(id: &str, fingerprint: &str, timestamp: i64) -> Value {
     serde_json::json!({
         "id": id,
+        "version": 1,
         "fingerprint": fingerprint,
         "check": "review",
         "verdict": "approved",
         "identity": { "type": "email", "email": "test@example.com" },
+        "repo_ref": { "type": "vcs", "system": "git", "revision": "deadbeef" },
+        "block_state": "committed",
         "timestamp": timestamp,
         "path_hint": null,
         "line_hint": null,
@@ -113,7 +116,14 @@ fn test_vet_sync() -> Result<()> {
     // 3. Create some vet data locally
     local
         .trueflow_cmd()
-        .args(["mark", "--fingerprint", "fp1", "--verdict", "approved"])
+        .args([
+            "mark",
+            "--fingerprint",
+            "fp1",
+            "--verdict",
+            "approved",
+            "--quiet",
+        ])
         .output()?;
 
     // 4. Sync (Push)
