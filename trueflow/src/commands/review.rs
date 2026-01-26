@@ -5,6 +5,7 @@ use crate::context::TrueflowContext;
 use crate::scanner;
 use crate::store::{FileStore, ReviewStore, Verdict};
 use crate::sub_splitter;
+use crate::tree;
 use crate::vcs;
 use anyhow::{Result, anyhow};
 use log::info;
@@ -38,7 +39,10 @@ pub enum ReviewTarget {
 pub struct ReviewSummary {
     pub files: Vec<UnreviewedFile>,
     pub total_blocks: usize,
+    #[allow(dead_code)]
     pub review_state: HashMap<String, Verdict>,
+    pub tree: tree::Tree,
+    pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
 }
 
 pub fn collect_review_summary(
@@ -67,14 +71,17 @@ pub fn collect_review_summary(
             fingerprint_status.insert(record.fingerprint, record.verdict);
         }
     }
+    let approved_hashes = approved_hashes_from_status(&fingerprint_status);
 
     // 2. Scan Directory (Merkle Tree)
     let files = scanner::scan_directory(".")?;
     info!("scanned {} files", files.len());
+    let tree = tree::build_tree_from_files(&files);
 
     // 3. Subtraction (Tree Traversal)
     let mut unreviewed_files = Vec::new();
     let mut total_blocks = 0;
+    let mut unreviewed_block_nodes = HashSet::new();
 
     for file in files {
         if let Some(targets) = &target_paths {
@@ -104,6 +111,13 @@ pub fn collect_review_summary(
 
         let mut unreviewed_blocks = Vec::new();
         for block in reviewable_blocks {
+            let node_id = tree.node_by_path_and_hash(tree::normalize_path(&file.path), &block.hash);
+            if let Some(node_id) = node_id
+                && tree.is_node_covered(node_id, &approved_hashes)
+            {
+                continue;
+            }
+
             // Check status
             if fingerprint_status.get(&block.hash) == Some(&Verdict::Approved) {
                 continue;
@@ -127,6 +141,9 @@ pub fn collect_review_summary(
                 }
             }
 
+            if let Some(node_id) = node_id {
+                unreviewed_block_nodes.insert(node_id);
+            }
             unreviewed_blocks.push(block);
         }
 
@@ -155,6 +172,8 @@ pub fn collect_review_summary(
         files: unreviewed_files,
         total_blocks,
         review_state: fingerprint_status,
+        tree,
+        unreviewed_block_nodes,
     })
 }
 
@@ -288,6 +307,19 @@ pub fn run(
 
 fn get_dirty_files() -> Result<HashSet<String>> {
     vcs::dirty_files_from_workdir()
+}
+
+fn approved_hashes_from_status(status: &HashMap<String, Verdict>) -> HashSet<String> {
+    status
+        .iter()
+        .filter_map(|(hash, verdict)| {
+            if verdict == &Verdict::Approved {
+                Some(hash.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn kind_rank(block: &Block) -> u8 {

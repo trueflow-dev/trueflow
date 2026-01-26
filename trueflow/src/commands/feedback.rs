@@ -3,8 +3,9 @@ use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::scanner;
 use crate::store::{FileStore, Identity, Record, ReviewStore, Verdict};
+use crate::tree;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn run(
     _context: &TrueflowContext,
@@ -18,6 +19,7 @@ pub fn run(
 
     // 1. Scan Directory (Current State)
     let files = scanner::scan_directory(".")?;
+    let tree = tree::build_tree_from_files(&files);
 
     // 2. Load DB
     let store = FileStore::new()?;
@@ -39,6 +41,8 @@ pub fn run(
             .push(record);
     }
 
+    let approved_hashes = approved_hashes_from_verdicts(&latest_verdict);
+
     if format == "json" {
         // Output JSON
         // Structure: List of objects with { path, block, reviews }
@@ -56,6 +60,14 @@ pub fn run(
                     .unwrap_or("unreviewed");
 
                 if !include_approved && verdict == "approved" {
+                    continue;
+                }
+
+                if !include_approved
+                    && tree
+                        .node_by_path_and_hash(tree::normalize_path(&file.path), &block.hash)
+                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
+                {
                     continue;
                 }
 
@@ -100,6 +112,14 @@ pub fn run(
                     .unwrap_or("unreviewed");
 
                 if !include_approved && verdict == "approved" {
+                    continue;
+                }
+
+                if !include_approved
+                    && tree
+                        .node_by_path_and_hash(tree::normalize_path(&file.path), &block.hash)
+                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
+                {
                     continue;
                 }
 
@@ -154,6 +174,19 @@ fn print_block_xml(block: &Block, reviews: &[Record]) {
     }
     println!("      </reviews>");
     println!("    </block>");
+}
+
+fn approved_hashes_from_verdicts(verdicts: &HashMap<String, Verdict>) -> HashSet<String> {
+    verdicts
+        .iter()
+        .filter_map(|(hash, verdict)| {
+            if verdict == &Verdict::Approved {
+                Some(hash.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn escape_xml(s: &str) -> String {

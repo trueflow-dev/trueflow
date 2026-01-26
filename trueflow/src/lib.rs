@@ -15,5 +15,5 @@ pub mod scanner;
 pub mod store;
 pub mod sub_splitter;
 pub mod text_split;
-// pub mod tree;
+pub mod tree;
 pub mod vcs;

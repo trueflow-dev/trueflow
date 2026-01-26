@@ -18,6 +18,7 @@ mod scanner;
 mod store;
 pub mod sub_splitter;
 mod text_split;
+mod tree;
 mod vcs;
 
 use crate::cli::{Cli, Commands};
@@ -58,7 +59,7 @@ fn main() -> Result<()> {
         ),
         Commands::Sync => commands::sync::run(&context),
         Commands::Check => commands::check::run(&context),
-        Commands::Scan { json } => commands::scan::run(&context, *json),
+        Commands::Scan { json, tree } => commands::scan::run(&context, *json, *tree),
         Commands::Review {
             json,
             all,

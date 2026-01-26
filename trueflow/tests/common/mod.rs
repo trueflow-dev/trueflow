@@ -33,6 +33,8 @@ impl TestRepo {
             fs::create_dir_all(&src)?;
         }
 
+        fs::create_dir_all(&path)?;
+
         // Copy contents
         let status = Command::new("cp")
             .arg("-R")

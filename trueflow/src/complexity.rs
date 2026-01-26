@@ -51,9 +51,7 @@ fn calculate_node(node: Node, nesting: u32, lang: &Language) -> u32 {
     };
     
     // Check specific logical operators for Python/others if nodes are named "boolean_operator"
-    if matches!(lang, Language::Python) && kind == "boolean_operator" {
-        score += 1;
-    } else if is_logical_op {
+    if (matches!(lang, Language::Python) && kind == "boolean_operator") || is_logical_op {
         score += 1;
     }
 

@@ -1,9 +1,10 @@
 use crate::hashing::compute_fingerprint;
 use crate::store::{FileStore, Record, ReviewStore, Verdict};
+use crate::tree;
 use crate::vcs;
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Serialize)]
 pub struct Change {
@@ -43,6 +44,9 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
             .push(record);
     }
 
+    let approved_hashes = approved_hashes_from_state(&review_state);
+    let tree = tree::build_tree_from_path(".")?;
+
     // 2. Compute Diff
     let diff_hunks = vcs::diff_main_to_head()?;
 
@@ -61,6 +65,13 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
         // Get all reviews for this hunk
         let reviews = reviews_by_fp.get(&fp_str).cloned().unwrap_or_default();
 
+        if tree
+            .find_by_path(tree::normalize_path(&hunk.file_path))
+            .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
+        {
+            continue;
+        }
+
         if verdict != Some(&Verdict::Approved) {
             unreviewed_changes.push(Change {
                 fingerprint: fp_str,
@@ -76,6 +87,19 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
     }
 
     Ok(unreviewed_changes)
+}
+
+fn approved_hashes_from_state(review_state: &HashMap<String, Verdict>) -> HashSet<String> {
+    review_state
+        .iter()
+        .filter_map(|(hash, verdict)| {
+            if verdict == &Verdict::Approved {
+                Some(hash.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn parse_hunk_lines(lines: &[String]) -> (String, String, String, String) {

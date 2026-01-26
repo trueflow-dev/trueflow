@@ -1,9 +1,19 @@
 use crate::context::TrueflowContext;
 use crate::scanner;
-use anyhow::Result;
+use crate::tree;
+use anyhow::{bail, Result};
 
-pub fn run(_context: &TrueflowContext, json: bool) -> Result<()> {
+pub fn run(_context: &TrueflowContext, json: bool, tree_output: bool) -> Result<()> {
     let files = scanner::scan_directory(".")?;
+    if tree_output {
+        if !json {
+            bail!("Tree output requires --json");
+        }
+        let tree = tree::build_tree_from_files(&files);
+        println!("{}", serde_json::to_string_pretty(&tree.view_json())?);
+        return Ok(());
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&files)?);
     } else {

@@ -69,6 +69,10 @@ pub enum Commands {
         /// Output JSON
         #[arg(long)]
         json: bool,
+
+        /// Output the full Merkle tree
+        #[arg(long)]
+        tree: bool,
     },
     /// Interactive review of unreviewed blocks
     Review {
