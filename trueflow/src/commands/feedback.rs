@@ -1,16 +1,21 @@
-use crate::block::{Block, BlockKind};
+use crate::block::Block;
+use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::scanner;
 use crate::store::{FileStore, Identity, Record, ReviewStore, Verdict};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub fn run(
     _context: &TrueflowContext,
     format: &str,
     include_approved: bool,
+    only: Vec<String>,
     exclude: Vec<String>,
 ) -> Result<()> {
+    let config = load_config()?;
+    let filters = config.feedback.resolve_filters(&only, &exclude);
+
     // 1. Scan Directory (Current State)
     let files = scanner::scan_directory(".")?;
 
@@ -34,11 +39,6 @@ pub fn run(
             .push(record);
     }
 
-    let exclude_set: HashSet<BlockKind> = exclude
-        .iter()
-        .filter_map(|value| value.parse::<BlockKind>().ok())
-        .collect();
-
     if format == "json" {
         // Output JSON
         // Structure: List of objects with { path, block, reviews }
@@ -46,7 +46,7 @@ pub fn run(
 
         for file in files {
             for block in file.blocks {
-                if exclude_set.contains(&block.kind) {
+                if !filters.allows_block(&block.kind) {
                     continue;
                 }
 
@@ -90,7 +90,7 @@ pub fn run(
             let mut blocks_to_print = Vec::new();
 
             for block in file.blocks {
-                if exclude_set.contains(&block.kind) {
+                if !filters.allows_block(&block.kind) {
                     continue;
                 }
 

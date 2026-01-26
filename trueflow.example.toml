@@ -1,0 +1,17 @@
+# trueflow configuration (defaults)
+
+[review]
+# Only include specific block kinds (case-insensitive). Empty means all.
+only = []
+# Exclude block kinds from review output.
+exclude = []
+
+[feedback]
+# Only include specific block kinds (case-insensitive). Empty means all.
+only = []
+# Exclude block kinds from feedback output.
+exclude = []
+
+[tui]
+# Require confirmation modal before batch actions.
+confirm_batch = true

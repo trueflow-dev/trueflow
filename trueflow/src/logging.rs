@@ -12,29 +12,34 @@ pub enum LoggingMode {
     Stderr,
 }
 
-pub fn init_logging(mode: LoggingMode) -> Result<()> {
-    let mut dispatch =
-        fern::Dispatch::new()
-            .level(log::LevelFilter::Info)
-            .format(|out, message, record| {
-                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                let thread_id = format!("{:?}", std::thread::current().id());
-                let module = record.module_path().unwrap_or(record.target());
-                let line = record
-                    .line()
-                    .map(|line| line.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                out.finish(format_args!(
-                    "[{}] [{}] [{}] [{}:{}] [{}]",
-                    record.level(),
-                    timestamp,
-                    thread_id,
-                    module,
-                    line,
-                    message
-                ))
-            });
+pub fn init_logging(mode: LoggingMode, debug: bool) -> Result<()> {
+    let level = if debug {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Warn
+    };
+    let mut dispatch = fern::Dispatch::new()
+        .level(level)
+        .format(|out, message, record| {
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let module = record.module_path().unwrap_or(record.target());
+            let line = record
+                .line()
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            out.finish(format_args!(
+                "[{}] [{}] [{}] [{}:{}] [{}]",
+                record.level(),
+                timestamp,
+                thread_id,
+                module,
+                line,
+                message
+            ))
+        });
 
+    let mut log_warning = None;
     match mode {
         LoggingMode::Stderr => {
             dispatch = dispatch.chain(std::io::stderr());
@@ -44,13 +49,16 @@ pub fn init_logging(mode: LoggingMode) -> Result<()> {
                 dispatch = dispatch.chain(log_file);
             }
             Err(err) => {
-                eprintln!("Failed to open log file: {}", err);
                 dispatch = dispatch.chain(std::io::stderr());
+                log_warning = Some(err);
             }
         },
     }
 
     dispatch.apply()?;
+    if let Some(err) = log_warning {
+        log::warn!("Failed to open log file: {}", err);
+    }
     Ok(())
 }
 

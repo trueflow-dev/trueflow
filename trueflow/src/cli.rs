@@ -9,10 +9,14 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
+    /// Enable verbose debug logging
+    #[arg(long)]
+    pub debug: bool,
+
     #[arg(
         long,
         value_enum,
-        default_value_t = LoggingMode::Stderr,
+        default_value_t = LoggingMode::File,
         hide = true
     )]
     pub logging_mode: LoggingMode,
@@ -51,6 +55,10 @@ pub enum Commands {
         /// Line number hint
         #[arg(long)]
         line: Option<u32>,
+
+        /// Suppress output for UI usage
+        #[arg(long)]
+        quiet: bool,
     },
     /// Sync reviews with remote (fetch & push trueflow-db branch)
     Sync,
@@ -72,6 +80,14 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
+        /// Review targets (file:<path>, rev:<sha>, rev:<start>..<end>)
+        #[arg(long, value_name = "TARGET")]
+        target: Vec<String>,
+
+        /// Only include block types (e.g. "function", "struct")
+        #[arg(long)]
+        only: Vec<String>,
+
         /// Exclude block types (e.g. "gap", "comment", "whitespace")
         #[arg(long)]
         exclude: Vec<String>,
@@ -86,6 +102,10 @@ pub enum Commands {
         #[arg(long)]
         include_approved: bool,
 
+        /// Only include block types
+        #[arg(long)]
+        only: Vec<String>,
+
         /// Exclude block types
         #[arg(long)]
         exclude: Vec<String>,
@@ -99,6 +119,16 @@ pub enum Commands {
         /// Split into sub-blocks
         #[arg(long)]
         split: bool,
+    },
+    /// Verify record attestations
+    Verify {
+        /// Verify all records
+        #[arg(long)]
+        all: bool,
+
+        /// Verify a specific record id
+        #[arg(long)]
+        id: Option<String>,
     },
     /// Launch the TUI
     Tui,

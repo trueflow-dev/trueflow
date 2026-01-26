@@ -7,6 +7,8 @@ mod block;
 mod block_splitter;
 mod cli;
 mod commands;
+mod complexity;
+mod config;
 mod context;
 mod diff_logic;
 mod hashing;
@@ -15,13 +17,15 @@ mod optimizer;
 mod scanner;
 mod store;
 pub mod sub_splitter;
+mod text_split;
+mod vcs;
 
 use crate::cli::{Cli, Commands};
 use crate::context::TrueflowContext;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    logging::init_logging(cli.logging_mode)?;
+    logging::init_logging(cli.logging_mode, cli.debug)?;
     let context = TrueflowContext::new(cli);
     info!("trueflow starting");
     info!("logging mode: {:?}", context.invocation.logging_mode);
@@ -40,29 +44,51 @@ fn main() -> Result<()> {
             note,
             path,
             line,
+            quiet: _,
         } => commands::mark::run(
             &context,
-            fingerprint,
-            verdict,
-            check,
-            note.as_deref(),
-            path.as_deref(),
-            *line,
+            commands::mark::MarkParams {
+                fingerprint: fingerprint.clone(),
+                verdict: verdict.parse()?,
+                check: check.clone(),
+                note: note.clone(),
+                path: path.clone(),
+                line: *line,
+            },
         ),
         Commands::Sync => commands::sync::run(&context),
         Commands::Check => commands::check::run(&context),
         Commands::Scan { json } => commands::scan::run(&context, *json),
-        Commands::Review { json, all, exclude } => {
-            commands::review::run(&context, *json, *all, exclude.clone())
-        }
+        Commands::Review {
+            json,
+            all,
+            target,
+            only,
+            exclude,
+        } => commands::review::run(
+            &context,
+            *json,
+            *all,
+            target.clone(),
+            only.clone(),
+            exclude.clone(),
+        ),
         Commands::Feedback {
             format,
             include_approved,
+            only,
             exclude,
-        } => commands::feedback::run(&context, format, *include_approved, exclude.clone()),
+        } => commands::feedback::run(
+            &context,
+            format,
+            *include_approved,
+            only.clone(),
+            exclude.clone(),
+        ),
         Commands::Inspect { fingerprint, split } => {
             commands::inspect::run(&context, fingerprint, *split)
         }
+        Commands::Verify { all, id } => commands::verify::run(*all, id.clone()),
         Commands::Tui => commands::tui::run(&context),
     }
 }

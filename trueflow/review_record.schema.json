@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "Attestation": {
+      "additionalProperties": false,
+      "properties": {
+        "canonicalization": {
+          "$ref": "#/$defs/Canonicalization"
+        },
+        "kind": {
+          "$ref": "#/$defs/AttestationKind"
+        },
+        "public_key": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "canonicalization",
+        "signature",
+        "public_key"
+      ],
+      "type": "object"
+    },
+    "AttestationKind": {
+      "enum": [
+        "PGP"
+      ],
+      "type": "string"
+    },
+    "BlockState": {
+      "enum": [
+        "committed",
+        "uncommitted",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "Canonicalization": {
+      "enum": [
+        "JCS_V1"
+      ],
+      "type": "string"
+    },
+    "Identity": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "email": {
+              "format": "email",
+              "type": "string"
+            },
+            "type": {
+              "const": "email",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "email"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RepoRef": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "revision": {
+              "pattern": "^[0-9a-f]{7,40}$",
+              "type": "string"
+            },
+            "system": {
+              "$ref": "#/$defs/VcsSystem"
+            },
+            "type": {
+              "const": "vcs",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "system",
+            "revision"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VcsSystem": {
+      "enum": [
+        "git"
+      ],
+      "type": "string"
+    },
+    "Verdict": {
+      "enum": [
+        "approved",
+        "rejected",
+        "question",
+        "comment"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "attestations": {
+      "items": {
+        "$ref": "#/$defs/Attestation"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "block_state": {
+      "$ref": "#/$defs/BlockState"
+    },
+    "check": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "identity": {
+      "$ref": "#/$defs/Identity"
+    },
+    "line_hint": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "path_hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repo_ref": {
+      "$ref": "#/$defs/RepoRef"
+    },
+    "tags": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "timestamp": {
+      "format": "int64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "verdict": {
+      "$ref": "#/$defs/Verdict"
+    },
+    "version": {
+      "default": 0,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "fingerprint",
+    "check",
+    "verdict",
+    "identity",
+    "repo_ref",
+    "block_state",
+    "timestamp",
+    "path_hint",
+    "line_hint",
+    "note",
+    "tags"
+  ],
+  "title": "Record",
+  "type": "object"
+}

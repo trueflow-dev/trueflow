@@ -7,3 +7,4 @@ pub mod review;
 pub mod scan;
 pub mod sync;
 pub mod tui;
+pub mod verify;
