@@ -2,3 +2,9 @@ target/
 .trueflow/
 *vibecheck-log*
 .DS_Store
+**/*.rs.bk
+**/*.rs.bak
+**/*.tmp
+.beads/
+trueflow/mutants.out/
+trueflow/mutants.out.old/

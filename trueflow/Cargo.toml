@@ -5,21 +5,19 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-clap = { version = "=4.4.18", features = ["derive"] }
+clap = { version = "=4.4.18", features = ["derive", "env"] }
 chrono = "0.4.39"
 fern = "0.6.2"
 log = "0.4.29"
 ratatui = "0.26"
 crossterm = "0.27"
 dirs = "6.0.0"
-git2 = { version = "0.18", features = ["vendored-openssl"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 tree-sitter = "0.26.3"
 tree-sitter-bash = "0.25.1"
 regex = "1.10.3"
-pulldown-cmark = "0.9.6"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.0"
@@ -29,6 +27,12 @@ uuid = { version = "1.19.0", features = ["v4", "serde"] }
 walkdir = "2.5.0"
 tree-sitter-asciidoc = "0.6.0"
 tree-sitter-md = { version = "0.5.2", features = ["parser"] }
+fs2 = "0.4.3"
+unicode-width = "0.1.14"
+toml = "0.9.11"
+gix = { version = "0.78.0", default-features = false, features = ["revision", "status"] }
+schemars = { version = "1.2.0" }
+serde_jcs = "0.1.0"
 
 # [dependencies]
 # dioxus = "0.4.3"

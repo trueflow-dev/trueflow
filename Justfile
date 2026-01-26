@@ -12,6 +12,12 @@ fix: fix-clippy fix-fmt fix-audit fix-cargo
 test:
     cd trueflow && cargo test --all-features --all-targets
 
+
+# Run mutation tests
+mutants:
+    cd trueflow && cargo mutants
+
+
 # Run clippy lints
 lint:
     cd trueflow && cargo clippy --all-features --all-targets -- -D warnings
@@ -47,3 +53,8 @@ fix-cargo:
 # Run benchmarks
 bench:
     cd trueflow && cargo bench
+
+# Generate coverage report
+coverage:
+    cd trueflow && cargo llvm-cov --all-targets --html
+    @echo "Coverage report at trueflow/target/llvm-cov/html/index.html"
