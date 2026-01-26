@@ -4,6 +4,7 @@ use crate::block_splitter;
 use crate::hashing::hash_str;
 use crate::optimizer;
 use anyhow::Result;
+use log::warn;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
@@ -18,14 +19,14 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                eprintln!("Skipping unreadable entry: {}", err);
+                warn!("Skipping unreadable entry: {}", err);
                 continue;
             }
         };
         if entry.file_type().is_file() {
             match process_file(entry.path()) {
                 Ok(file_state) => files.push(file_state),
-                Err(e) => eprintln!("Skipping file {:?}: {}", entry.path(), e),
+                Err(e) => warn!("Skipping file {:?}: {}", entry.path(), e),
             }
         }
     }
@@ -76,20 +77,10 @@ fn process_file(path: &Path) -> Result<FileState> {
                 Ok(b) if !b.is_empty() => (language, optimizer::optimize(b)),
                 Ok(_) => (language, chunk_content(&content)), // Fallback if splitter returns empty (not implemented or empty file)
                 Err(e) => {
-                    // Only log if it's a supported language that failed
-                    if matches!(
-                        language,
-                        Language::Rust
-                            | Language::Python
-                            | Language::JavaScript
-                            | Language::TypeScript
-                            | Language::Shell
-                    ) || language.uses_text_fallback() {
-                        eprintln!(
-                            "Failed to parse file {:?}: {}, falling back to lines",
-                            path, e
-                        );
-                    }
+                    warn!(
+                        "Failed to parse file {:?}: {}, falling back to lines",
+                        path, e
+                    );
                     (language, chunk_content(&content))
                 }
             }
@@ -112,7 +103,7 @@ fn process_file(path: &Path) -> Result<FileState> {
     })
 }
 
-fn chunk_content(content: &str) -> Vec<Block> {
+pub(crate) fn chunk_content(content: &str) -> Vec<Block> {
     // Strategy: Fixed line chunks (e.g. 20 lines)
     // This is the MVP strategy. Later we can do tree-sitter or rolling hash.
     const CHUNK_SIZE: usize = 20;
@@ -135,6 +126,8 @@ fn chunk_content(content: &str) -> Vec<Block> {
             hash,
             content: block_content,
             kind: BlockKind::TextBlock,
+            tags: Vec::new(),
+            complexity: 0,
             start_line,
             end_line,
         });

@@ -1,9 +1,9 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::hashing::hash_str;
+use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
 use anyhow::{Context, Result};
 use log::info;
-use regex::Regex;
 use tree_sitter::Parser;
 use tree_sitter_md;
 
@@ -18,7 +18,8 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
 
     let blocks = match lang {
         Language::Markdown => split_markdown(block)?,
-        _ if lang.uses_text_fallback() => split_text(block)?,
+        Language::Text => split_sentences(block)?,
+        Language::Toml | Language::Nix | Language::Just => split_code(block)?,
         Language::Rust if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_rust_function(block)?
         }
@@ -41,56 +42,15 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
 }
 
 fn split_code(block: &Block) -> Result<Vec<Block>> {
-    // Split by double newline (paragraph style)
-    let re = Regex::new(r"\n\s*\n").unwrap();
     let content = &block.content;
-    let mut blocks = Vec::new();
-    let mut start_offset = 0;
-
-    for mat in re.find_iter(content) {
-        let end_offset = mat.start(); // End before the delimiter
-
-        // Code chunk
-        if start_offset < end_offset {
-            let chunk = &content[start_offset..end_offset];
-            if !chunk.is_empty() {
-                blocks.push(create_sub_block_with_kind(
-                    block,
-                    chunk,
-                    start_offset,
-                    end_offset,
-                    classify_code_chunk(chunk),
-                ));
-            }
-        }
-
-        // Gap chunk (the delimiter)
-        let gap_chunk = &content[mat.start()..mat.end()];
-        blocks.push(create_sub_block_with_kind(
-            block,
-            gap_chunk,
-            mat.start(),
-            mat.end(),
-            BlockKind::Gap,
-        ));
-
-        start_offset = mat.end(); // Start after the delimiter
-    }
-
-    // Trailing chunk
-    if start_offset < content.len() {
-        let chunk = &content[start_offset..];
-        if !chunk.is_empty() {
-            blocks.push(create_sub_block_with_kind(
-                block,
-                chunk,
-                start_offset,
-                content.len(),
-                classify_code_chunk(chunk),
-            ));
-        }
-    }
-
+    let blocks = split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+        let block_kind = if is_gap {
+            BlockKind::Gap
+        } else {
+            classify_code_chunk(chunk)
+        };
+        create_sub_block_with_kind(block, chunk, start, end, block_kind)
+    });
     Ok(blocks)
 }
 
@@ -214,31 +174,44 @@ fn split_markdown(block: &Block) -> Result<Vec<Block>> {
     }
 }
 
-fn split_text(block: &Block) -> Result<Vec<Block>> {
+fn split_sentences(block: &Block) -> Result<Vec<Block>> {
     split_markdown_sentences(block)
+}
+
+struct FunctionSplitConfig<'a> {
+    language: tree_sitter::Language,
+    function_kind: &'a str,
+    body_kind: &'a str,
+    signature_end: fn(&str, usize) -> usize,
+    comment_kinds: &'a [&'a str],
+    trim_closing_brace: bool,
 }
 
 fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
-        tree_sitter_rust::LANGUAGE.into(),
-        "function_item",
-        "block",
-        signature_end_offset,
-        &["line_comment", "block_comment"],
-        true,
+        FunctionSplitConfig {
+            language: tree_sitter_rust::LANGUAGE.into(),
+            function_kind: "function_item",
+            body_kind: "block",
+            signature_end: signature_end_offset,
+            comment_kinds: &["line_comment", "block_comment"],
+            trim_closing_brace: true,
+        },
     )
 }
 
 fn split_python_function(block: &Block) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
-        tree_sitter_python::LANGUAGE.into(),
-        "function_definition",
-        "block",
-        signature_end_before_body,
-        &["comment", "line_comment", "block_comment"],
-        false,
+        FunctionSplitConfig {
+            language: tree_sitter_python::LANGUAGE.into(),
+            function_kind: "function_definition",
+            body_kind: "block",
+            signature_end: signature_end_before_body,
+            comment_kinds: &["comment", "line_comment", "block_comment"],
+            trim_closing_brace: false,
+        },
     )
 }
 
@@ -249,52 +222,49 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
     };
     split_function_with_parser(
         block,
-        language,
-        "function_declaration",
-        "statement_block",
-        signature_end_offset,
-        &["comment", "line_comment", "block_comment"],
-        true,
+        FunctionSplitConfig {
+            language,
+            function_kind: "function_declaration",
+            body_kind: "statement_block",
+            signature_end: signature_end_offset,
+            comment_kinds: &["comment", "line_comment", "block_comment"],
+            trim_closing_brace: true,
+        },
     )
 }
 
 fn split_function_with_parser(
     block: &Block,
-    language: tree_sitter::Language,
-    function_kind: &str,
-    body_kind: &str,
-    signature_end: fn(&str, usize) -> usize,
-    comment_kinds: &[&str],
-    trim_closing_brace: bool,
+    config: FunctionSplitConfig<'_>,
 ) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
-    parser.set_language(&language)?;
+    parser.set_language(&config.language)?;
 
     let tree = parser
         .parse(&block.content, None)
         .context("Failed to parse function block")?;
     let root = tree.root_node();
-    let Some(function_node) = find_named_descendant(root, function_kind) else {
+    let Some(function_node) = find_named_descendant(root, config.function_kind) else {
         return split_code(block);
     };
-    let Some(body_node) = find_named_descendant(function_node, body_kind) else {
+    let Some(body_node) = find_named_descendant(function_node, config.body_kind) else {
         return split_code(block);
     };
 
     let mut blocks = Vec::new();
     let content = block.content.as_str();
-    let signature_end = signature_end(content, body_node.start_byte());
+    let signature_end = (config.signature_end)(content, body_node.start_byte());
     if signature_end > 0 {
         blocks.push(create_sub_block_with_kind(
             block,
             &content[..signature_end],
             0,
             signature_end,
-            BlockKind::Signature,
+            BlockKind::FunctionSignature,
         ));
     }
 
-    let nodes = collect_body_nodes(body_node, comment_kinds);
+    let nodes = collect_body_nodes(body_node, config.comment_kinds);
     if nodes.is_empty() {
         return split_code(block);
     }
@@ -311,7 +281,7 @@ fn split_function_with_parser(
         } else {
             ""
         };
-        let gap_has_blank = gap_has_blank_line(gap);
+        let gap_has_blank = paragraph_break_regex().is_match(gap);
         let gap_prefix_len = if gap_has_blank {
             gap_prefix_length(gap)
         } else {
@@ -320,14 +290,14 @@ fn split_function_with_parser(
         let leading_start = last_end + gap_prefix_len;
 
         let mut end = node.end_byte();
-        if trim_closing_brace
+        if config.trim_closing_brace
             && idx == nodes.len().saturating_sub(1)
             && content[end..].trim() == "}"
         {
             end = content.len();
         }
 
-        let node_kind = if comment_kinds.iter().any(|kind| *kind == node.kind()) {
+        let node_kind = if config.comment_kinds.iter().any(|kind| *kind == node.kind()) {
             BlockKind::Comment
         } else {
             BlockKind::CodeParagraph
@@ -394,17 +364,15 @@ fn split_function_with_parser(
 
     if last_end < content.len() {
         let tail = &content[last_end..];
-        if !tail.is_empty() {
-            let kind = classify_code_chunk(tail);
-            if kind != BlockKind::Gap {
-                blocks.push(create_sub_block_with_kind(
-                    block,
-                    tail,
-                    last_end,
-                    content.len(),
-                    kind,
-                ));
-            }
+        let kind = classify_code_chunk(tail);
+        if !tail.is_empty() && kind != BlockKind::Gap {
+            blocks.push(create_sub_block_with_kind(
+                block,
+                tail,
+                last_end,
+                content.len(),
+                kind,
+            ));
         }
     }
 
@@ -513,25 +481,6 @@ fn gap_prefix_length(gap: &str) -> usize {
     gap.rfind('\n').map(|idx| idx + 1).unwrap_or(gap.len())
 }
 
-fn gap_has_blank_line(gap: &str) -> bool {
-    let mut saw_newline = false;
-    let mut has_non_whitespace = false;
-
-    for ch in gap.chars() {
-        if ch == '\n' {
-            if saw_newline && !has_non_whitespace {
-                return true;
-            }
-            saw_newline = true;
-            has_non_whitespace = false;
-        } else if !ch.is_whitespace() {
-            has_non_whitespace = true;
-        }
-    }
-
-    false
-}
-
 fn classify_code_chunk(chunk: &str) -> BlockKind {
     let trimmed = chunk.trim();
     if trimmed.is_empty() {
@@ -574,6 +523,18 @@ fn create_sub_block_with_kind(
         hash: hash_str(content),
         content: content.to_string(),
         kind,
+        tags: parent.tags.clone(),
+        complexity: parent.complexity, // Simplified: inherit complexity or re-calculate? 
+        // Re-calculation might be better if we split functions. 
+        // But for sub-blocks which are just parts of a function (paragraphs), 
+        // maybe we should just split the complexity proportionally or re-calc.
+        // For now, let's inherit. 
+        // Or actually, `create_sub_block` implies it is smaller.
+        // Let's set complexity to 0 for sub-blocks for now, as they are "sub-units".
+        // Or re-calculate if we passed lang.
+        // `create_sub_block_with_kind` doesn't have lang.
+        // We can update it to take lang, or just set 0.
+        // Let's set 0 for MVP to fix compilation.
         start_line,
         end_line,
     }
@@ -590,6 +551,8 @@ mod tests {
             hash: "test".to_string(),
             content: content.to_string(),
             kind,
+            tags: Vec::new(),
+            complexity: 0,
             start_line: 0,
             end_line: content.lines().count(),
         }
@@ -664,32 +627,38 @@ mod tests {
     }
 
     #[test]
-    fn test_split_toml_sentences() {
-        let content = "key = \"value\"";
-        let block = make_block(content, BlockKind::Paragraph);
+    fn test_split_toml_paragraphs_preserve_content() {
+        let content = "key = \"value\"\n\nother = \"value\"";
+        let block = make_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Toml).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].kind, BlockKind::Sentence);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(chunks[1].kind, BlockKind::Gap);
+        assert_eq!(chunks[2].kind, BlockKind::CodeParagraph);
         assert_eq!(merge_blocks(chunks), content);
     }
 
     #[test]
-    fn test_split_nix_sentences() {
-        let content = "{ foo = \"bar\"; }";
-        let block = make_block(content, BlockKind::Paragraph);
+    fn test_split_nix_paragraphs_preserve_content() {
+        let content = "{ foo = \"bar\"; }\n\n{ baz = \"qux\"; }";
+        let block = make_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Nix).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].kind, BlockKind::Sentence);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(chunks[1].kind, BlockKind::Gap);
+        assert_eq!(chunks[2].kind, BlockKind::CodeParagraph);
         assert_eq!(merge_blocks(chunks), content);
     }
 
     #[test]
-    fn test_split_just_sentences() {
-        let content = "build:\n\techo ok";
-        let block = make_block(content, BlockKind::Paragraph);
+    fn test_split_just_paragraphs_preserve_content() {
+        let content = "build:\n\techo ok\n\ntest:\n\techo ok";
+        let block = make_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Just).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].kind, BlockKind::Sentence);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(chunks[1].kind, BlockKind::Gap);
+        assert_eq!(chunks[2].kind, BlockKind::CodeParagraph);
         assert_eq!(merge_blocks(chunks), content);
     }
 

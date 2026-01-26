@@ -30,7 +30,7 @@ fn test_rust_function_subblock_types() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks/src/lib.rs");
     let expected = vec![
-        BlockKind::Signature,
+        BlockKind::FunctionSignature,
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
         BlockKind::Comment,
@@ -45,7 +45,7 @@ fn test_python_function_subblock_types() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks_py/src/lib.py");
     let expected = vec![
-        BlockKind::Signature,
+        BlockKind::FunctionSignature,
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
         BlockKind::Comment,
@@ -60,7 +60,7 @@ fn test_js_function_subblock_types() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks_js/src/lib.js");
     let expected = vec![
-        BlockKind::Signature,
+        BlockKind::FunctionSignature,
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
         BlockKind::Comment,
@@ -75,7 +75,7 @@ fn test_ts_function_subblock_types() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks_ts/src/lib.ts");
     let expected = vec![
-        BlockKind::Signature,
+        BlockKind::FunctionSignature,
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
         BlockKind::Comment,

@@ -109,7 +109,7 @@ fn test_empty_file() -> Result<()> {
 #[test]
 fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
     let env = TestEnv::new()?;
-    let files = [
+    let test_cases = [
         (
             "leading_newlines.rs",
             "\n\n\nfn main() {\n    println!(\"hi\");\n}\n",
@@ -124,17 +124,40 @@ fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
         ),
     ];
 
-    for (name, content) in files {
+    for &(name, content) in &test_cases {
         let file_path = env.root.join(name);
         fs::write(&file_path, content)?;
     }
 
     let output = env.run_trueflow(&["scan", "--json"])?;
-    let files: Vec<FileState> = serde_json::from_str(&output)?;
+    let file_states: Vec<FileState> = serde_json::from_str(&output)?;
 
-    for file_state in files.iter().filter(|file| file.path.ends_with(".rs")) {
+    for &(name, _) in &test_cases {
+        let file_state = file_states
+            .iter()
+            .find(|file| file.path.ends_with(name))
+            .unwrap_or_else(|| panic!("missing scan output for {}", name));
+
+        assert!(
+            !file_state.blocks.is_empty(),
+            "expected blocks for {}",
+            file_state.path
+        );
+
         for block in &file_state.blocks {
+            assert!(
+                !block.content.is_empty(),
+                "empty block in {} for {}",
+                file_state.path,
+                block.kind
+            );
             let sub_blocks = sub_splitter::split(block, file_state.language.clone())?;
+            assert!(
+                !sub_blocks.is_empty(),
+                "expected sub-blocks for {} block {}",
+                file_state.path,
+                block.kind
+            );
             for sub_block in &sub_blocks {
                 assert!(
                     !sub_block.content.is_empty(),

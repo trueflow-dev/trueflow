@@ -1,10 +1,11 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
+use crate::complexity;
 use crate::hashing::hash_str;
-use anyhow::Result;
+use crate::text_split::split_by_paragraph_breaks;
+use anyhow::{Context, Result};
 use log::info;
-use regex::Regex;
-use tree_sitter::Parser;
+use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
     info!(
@@ -19,7 +20,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             return Ok(blocks);
         }
         _ if lang.uses_text_fallback() => {
-            let blocks = split_text(content);
+            let blocks = split_paragraphs(content, lang);
             info!("block_splitter done (blocks={})", blocks.len());
             return Ok(blocks);
         }
@@ -35,7 +36,6 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
-        Language::Markdown => None,
         _ => None,
     };
 
@@ -54,6 +54,8 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
     let mut cursor = root.walk();
     let mut last_end_byte = 0;
 
+    let test_ranges = collect_test_ranges(&lang, &tree, content)?;
+
     // State for pending attributes/comments that should be attached to the next node
     let mut pending_start: Option<usize> = None;
     let mut pending_end: usize = 0;
@@ -63,6 +65,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         let start_byte = child.start_byte();
         let end_byte = child.end_byte();
         let ts_kind = child.kind();
+        let is_test = is_test_span(&test_ranges, crate::block::Span::new(start_byte, end_byte));
 
         // Check if this node is an attribute or comment that should be grouped
         let is_attribute = match lang {
@@ -87,6 +90,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
                             content,
                             last_end_byte,
                             start_byte,
+                            &lang,
                         ));
                     }
                 }
@@ -112,6 +116,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
                         content,
                         last_end_byte,
                         start_byte,
+                        &lang,
                     ));
                 }
             }
@@ -119,15 +124,18 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         };
 
         let node_content = &content[block_start..end_byte];
-        let friendly_kind = map_kind(lang.clone(), ts_kind);
-
-        blocks.push(create_block(
+        let mut block = create_block(
             node_content,
-            friendly_kind,
+            map_kind(lang.clone(), ts_kind),
             content,
             block_start,
             end_byte,
-        ));
+            &lang,
+        );
+        if is_test {
+            block.tags.push("test".to_string());
+        }
+        blocks.push(block);
 
         last_end_byte = end_byte;
         pending_start = None;
@@ -143,6 +151,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             content,
             start,
             pending_end,
+            &lang,
         ));
         last_end_byte = pending_end;
     }
@@ -157,6 +166,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
                 content,
                 last_end_byte,
                 content.len(),
+                &lang,
             ));
         }
     }
@@ -166,62 +176,61 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
 }
 
 fn split_markdown(content: &str) -> Result<Vec<Block>> {
-    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_md::LANGUAGE.into())
+        .context("Failed to load markdown grammar")?;
+
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse markdown")?;
+    let root = tree.root_node();
+
+    let mut headings = Vec::new();
+    collect_markdown_headings(root, content, &mut headings);
+    headings.sort_by_key(|heading| heading.start);
 
     let mut blocks = Vec::new();
     let mut section_start = 0;
-    let mut current_level = 0; // 0 = preamble
+    let mut current_level = 0;
 
-    // Iterate events
-    // We only care about Heading Start to trigger splits.
-    let parser = Parser::new(content).into_offset_iter();
-
-    for (event, range) in parser {
-        if let Event::Start(Tag::Heading(level, _, _)) = event {
-            let level_val = match level {
-                HeadingLevel::H1 => 1,
-                HeadingLevel::H2 => 2,
-                HeadingLevel::H3 => 3,
-                HeadingLevel::H4 => 4,
-                HeadingLevel::H5 => 5,
-                HeadingLevel::H6 => 6,
-            };
-
-            // If new header is same or higher level (numerically lower or equal)
-            if current_level > 0 && level_val <= current_level {
-                let chunk = &content[section_start..range.start];
+    for heading in headings {
+        if current_level == 0 {
+            if heading.start > section_start {
+                let chunk = &content[section_start..heading.start];
                 if !chunk.trim().is_empty() {
                     blocks.push(create_block(
                         chunk,
-                        BlockKind::Section,
+                        BlockKind::Preamble,
                         content,
                         section_start,
-                        range.start,
+                        heading.start,
+                        &Language::Markdown,
                     ));
                 }
-                section_start = range.start;
-                current_level = level_val;
-            } else if current_level == 0 {
-                // End preamble
-                if range.start > section_start {
-                    let chunk = &content[section_start..range.start];
-                    if !chunk.trim().is_empty() {
-                        blocks.push(create_block(
-                            chunk,
-                            BlockKind::Preamble,
-                            content,
-                            section_start,
-                            range.start,
-                        ));
-                    }
-                }
-                section_start = range.start;
-                current_level = level_val;
             }
+            section_start = heading.start;
+            current_level = heading.level;
+            continue;
+        }
+
+        if heading.level <= current_level {
+            let chunk = &content[section_start..heading.start];
+            if !chunk.trim().is_empty() {
+                blocks.push(create_block(
+                    chunk,
+                    BlockKind::Section,
+                    content,
+                    section_start,
+                    heading.start,
+                    &Language::Markdown,
+                ));
+            }
+            section_start = heading.start;
+            current_level = heading.level;
         }
     }
 
-    // Flush
     if section_start < content.len() {
         let chunk = &content[section_start..];
         if !chunk.trim().is_empty() {
@@ -235,6 +244,7 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
                 content,
                 section_start,
                 content.len(),
+                &Language::Markdown,
             ));
         }
     }
@@ -242,52 +252,65 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_text(content: &str) -> Vec<Block> {
-    let re = Regex::new(r"\n\s*\n").unwrap();
-    let mut blocks = Vec::new();
-    let mut start_offset = 0;
+fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
+    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+        let kind = if is_gap {
+            BlockKind::Gap
+        } else {
+            BlockKind::Paragraph
+        };
+        create_block(chunk, kind, content, start, end, &lang)
+    })
+}
 
-    for mat in re.find_iter(content) {
-        let end_offset = mat.start();
-        if start_offset < end_offset {
-            let chunk = &content[start_offset..end_offset];
-            if !chunk.is_empty() {
-                blocks.push(create_block(
-                    chunk,
-                    BlockKind::Paragraph,
-                    content,
-                    start_offset,
-                    end_offset,
-                ));
+#[derive(Debug, Clone)]
+struct MarkdownHeading {
+    start: usize,
+    level: u8,
+}
+
+fn collect_markdown_headings(
+    node: tree_sitter::Node<'_>,
+    content: &str,
+    headings: &mut Vec<MarkdownHeading>,
+) {
+    if let Some(level) = markdown_heading_level(node.kind(), node.start_byte(), content) {
+        headings.push(MarkdownHeading {
+            start: node.start_byte(),
+            level,
+        });
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_markdown_headings(child, content, headings);
+    }
+}
+
+fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8> {
+    match kind {
+        "atx_heading" => {
+            let line = content.get(start..)?.lines().next()?;
+            let level = line.chars().take_while(|ch| *ch == '#').count();
+            if level > 0 {
+                Some(level.min(6) as u8)
+            } else {
+                None
             }
         }
-
-        let gap_chunk = &content[mat.start()..mat.end()];
-        blocks.push(create_block(
-            gap_chunk,
-            BlockKind::Gap,
-            content,
-            mat.start(),
-            mat.end(),
-        ));
-
-        start_offset = mat.end();
-    }
-
-    if start_offset < content.len() {
-        let chunk = &content[start_offset..];
-        if !chunk.is_empty() {
-            blocks.push(create_block(
-                chunk,
-                BlockKind::Paragraph,
-                content,
-                start_offset,
-                content.len(),
-            ));
+        "setext_heading" => {
+            let line = content.get(start..)?.lines().next()?;
+            if line.chars().all(|ch| ch == '=') {
+                Some(1)
+            } else if line.chars().all(|ch| ch == '-') {
+                Some(2)
+            } else {
+                None
+            }
         }
+        _ => None,
     }
-
-    blocks
 }
 
 fn map_kind(lang: Language, kind: &str) -> BlockKind {
@@ -334,8 +357,10 @@ fn create_block(
     full_source: &str,
     start_byte: usize,
     end_byte: usize,
+    lang: &Language,
 ) -> Block {
     let hash = hash_str(text);
+    let complexity = complexity::calculate(text, lang.clone());
 
     // Line mapping (byte -> line index)
     // Reusing the logic from previous implementation
@@ -345,9 +370,215 @@ fn create_block(
         hash,
         content: text.to_string(),
         kind,
+        tags: Vec::new(),
+        complexity,
         start_line,
         end_line,
     }
+}
+
+fn collect_test_ranges(
+    lang: &Language,
+    tree: &tree_sitter::Tree,
+    source: &str,
+) -> Result<Vec<crate::block::Span>> {
+    let mut ranges: Vec<crate::block::Span> = Vec::new();
+    match lang {
+        Language::Rust => {
+            let attr_query =
+                Query::new(&tree_sitter_rust::LANGUAGE.into(), "(attribute_item) @attr")?;
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&attr_query, tree.root_node(), source.as_bytes());
+            while let Some(match_) = matches.next() {
+                for capture in match_.captures {
+                    let name = &attr_query.capture_names()[capture.index as usize];
+                    if *name != "attr" {
+                        continue;
+                    }
+                    let attr_text = capture.node.utf8_text(source.as_bytes())?;
+                    if attr_text.contains("#[test]")
+                        && let Some(function_item) =
+                            next_named_sibling_of_kind(capture.node, "function_item")
+                    {
+                        ranges.push(crate::block::Span::new(
+                            function_item.start_byte(),
+                            function_item.end_byte(),
+                        ));
+                    }
+                    if attr_text.contains("cfg")
+                        && attr_text.contains("test")
+                        && let Some(mod_item) = next_named_sibling_of_kind(capture.node, "mod_item")
+                    {
+                        ranges.push(crate::block::Span::new(
+                            mod_item.start_byte(),
+                            mod_item.end_byte(),
+                        ));
+                    }
+                }
+            }
+        }
+        Language::Python => {
+            let query = Query::new(
+                &tree_sitter_python::LANGUAGE.into(),
+                "(decorated_definition (decorator) @decor (function_definition name: (identifier) @name) @func)",
+            )?;
+            collect_python_test_ranges(&query, tree, source, &mut ranges)?;
+
+            let query = Query::new(
+                &tree_sitter_python::LANGUAGE.into(),
+                "(function_definition name: (identifier) @name) @func",
+            )?;
+            collect_python_test_ranges(&query, tree, source, &mut ranges)?;
+        }
+        Language::JavaScript => {
+            let query = Query::new(
+                &tree_sitter_javascript::LANGUAGE.into(),
+                "(call_expression function: (identifier) @name arguments: (arguments (arrow_function) @fn)) @call",
+            )?;
+            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
+
+            let query = Query::new(
+                &tree_sitter_javascript::LANGUAGE.into(),
+                "(call_expression function: (member_expression object: (identifier) @name)) @call",
+            )?;
+            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
+        }
+        Language::TypeScript => {
+            let query = Query::new(
+                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "(call_expression function: (identifier) @name arguments: (arguments (arrow_function) @fn)) @call",
+            )?;
+            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
+
+            let query = Query::new(
+                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "(call_expression function: (member_expression object: (identifier) @name)) @call",
+            )?;
+            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
+        }
+        Language::Shell => {
+            let query = Query::new(
+                &tree_sitter_bash::LANGUAGE.into(),
+                "(function_definition name: (word) @name) @func",
+            )?;
+            collect_shell_test_ranges(&query, tree, source, &mut ranges)?;
+        }
+        _ => {}
+    }
+
+    Ok(ranges)
+}
+
+fn next_named_sibling_of_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut current = node;
+    while let Some(next) = current.next_named_sibling() {
+        if next.kind() == kind {
+            return Some(next);
+        }
+        current = next;
+    }
+    None
+}
+
+fn collect_python_test_ranges(
+    query: &Query,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    ranges: &mut Vec<crate::block::Span>,
+) -> Result<()> {
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    while let Some(match_) = matches.next() {
+        let mut name = None;
+        let mut func_range = None;
+        let mut decorator_text = None;
+        for capture in match_.captures {
+            let cap_name = &query.capture_names()[capture.index as usize];
+            match *cap_name {
+                "name" => name = Some(capture.node.utf8_text(source.as_bytes())?.to_string()),
+                "func" => func_range = Some((capture.node.start_byte(), capture.node.end_byte())),
+                "decor" => {
+                    decorator_text = Some(capture.node.utf8_text(source.as_bytes())?.to_string())
+                }
+                _ => {}
+            }
+        }
+        if let (Some(name), Some(range)) = (name, func_range)
+            && name.starts_with("test_")
+        {
+            ranges.push(crate::block::Span::new(range.0, range.1));
+            continue;
+        }
+        if let (Some(decor_text), Some(range)) = (decorator_text, func_range)
+            && decor_text.contains("test_")
+        {
+            ranges.push(crate::block::Span::new(range.0, range.1));
+        }
+    }
+    Ok(())
+}
+
+fn collect_js_test_ranges(
+    query: &Query,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    ranges: &mut Vec<crate::block::Span>,
+) -> Result<()> {
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    while let Some(match_) = matches.next() {
+        let mut name = None;
+        let mut call_range = None;
+        for capture in match_.captures {
+            let cap_name = &query.capture_names()[capture.index as usize];
+            match *cap_name {
+                "name" => name = Some(capture.node.utf8_text(source.as_bytes())?.to_string()),
+                "call" => call_range = Some((capture.node.start_byte(), capture.node.end_byte())),
+                _ => {}
+            }
+        }
+        if let (Some(name), Some(range)) = (name, call_range)
+            && matches!(name.as_str(), "describe" | "it" | "test")
+        {
+            ranges.push(crate::block::Span::new(range.0, range.1));
+        }
+    }
+    Ok(())
+}
+
+fn collect_shell_test_ranges(
+    query: &Query,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    ranges: &mut Vec<crate::block::Span>,
+) -> Result<()> {
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    while let Some(match_) = matches.next() {
+        let mut name = None;
+        let mut func_range = None;
+        for capture in match_.captures {
+            let cap_name = &query.capture_names()[capture.index as usize];
+            match *cap_name {
+                "name" => name = Some(capture.node.utf8_text(source.as_bytes())?.to_string()),
+                "func" => func_range = Some((capture.node.start_byte(), capture.node.end_byte())),
+                _ => {}
+            }
+        }
+        if let (Some(name), Some(range)) = (name, func_range)
+            && name.starts_with("test_")
+        {
+            ranges.push(crate::block::Span::new(range.0, range.1));
+        }
+    }
+    Ok(())
+}
+
+fn is_test_span(ranges: &[crate::block::Span], block_span: crate::block::Span) -> bool {
+    ranges.iter().any(|range| range.overlaps(&block_span))
 }
 
 fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
@@ -370,10 +601,31 @@ fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize)
 mod tests {
     use super::*;
 
-    fn assert_block_hashes_match(blocks: &[Block]) {
-        for block in blocks {
-            assert_eq!(block.hash, hash_str(&block.content));
-        }
+    #[test]
+    fn test_rust_test_detection() {
+        let content = "#[test]
+fn test_foo() {}
+";
+        let blocks = split(content, Language::Rust).unwrap();
+        assert!(!blocks.is_empty());
+        let test_block = blocks.iter().find(|b| b.content.contains("fn test_foo"));
+        assert!(test_block.is_some());
+        assert!(test_block.unwrap().tags.contains(&"test".to_string()));
+    }
+
+    #[test]
+    fn test_rust_cfg_test_module_tagging() {
+        let content = "#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_inner() {}
+}
+";
+        let blocks = split(content, Language::Rust).unwrap();
+        assert!(!blocks.is_empty());
+        let module_block = blocks.iter().find(|b| b.content.contains("mod tests"));
+        assert!(module_block.is_some());
+        assert!(module_block.unwrap().tags.contains(&"test".to_string()));
     }
 
     fn assert_paragraph_split(language: Language) {
@@ -388,6 +640,17 @@ mod tests {
         assert_eq!(blocks[2].content, "Para 2.");
         let merged: String = blocks.into_iter().map(|block| block.content).collect();
         assert_eq!(merged, content);
+    }
+
+    fn assert_block_hashes_match(blocks: &[Block]) {
+        for block in blocks {
+            let expected_hash = crate::hashing::hash_str(&block.content);
+            assert_eq!(
+                block.hash, expected_hash,
+                "Hash mismatch for block kind {:?}:\nContent:\n{:?}",
+                block.kind, block.content
+            );
+        }
     }
 
     #[test]

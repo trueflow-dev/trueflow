@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
@@ -9,128 +8,15 @@ use trueflow::block::{Block, BlockKind};
 use trueflow::hashing::hash_str;
 use trueflow::optimizer;
 
-struct TestRepo {
-    path: PathBuf,
-}
-
-impl TestRepo {
-    fn new(name: &str) -> Result<Self> {
-        let path = std::env::temp_dir()
-            .join("trueflow_regressions")
-            .join(name)
-            .join(Uuid::new_v4().to_string());
-        fs::create_dir_all(&path)?;
-
-        Command::new("git")
-            .arg("init")
-            .current_dir(&path)
-            .output()
-            .context("Failed to init git repo")?;
-
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&path)
-            .output()?;
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(&path)
-            .output()?;
-
-        let _ = Command::new("git")
-            .args(["branch", "-m", "main"])
-            .current_dir(&path)
-            .output();
-
-        Ok(Self { path })
-    }
-
-    fn write_file(&self, rel: &str, content: &str) -> Result<()> {
-        let path = self.path.join(rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, content)?;
-        Ok(())
-    }
-
-    fn git(&self, args: &[&str]) -> Result<()> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.path)
-            .output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-
-    fn git_add_commit(&self, msg: &str) -> Result<()> {
-        self.git(&["add", "."])?;
-        self.git(&["commit", "-m", msg])?;
-        Ok(())
-    }
-
-    fn run_trueflow(&self, args: &[&str]) -> Result<String> {
-        let bin = env!("CARGO_BIN_EXE_trueflow");
-        let output = Command::new(bin)
-            .args(args)
-            .current_dir(&self.path)
-            .output()?;
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "trueflow failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        Ok(String::from_utf8(output.stdout)?)
-    }
-
-    fn run_trueflow_in(&self, cwd: &Path, args: &[&str]) -> Result<String> {
-        let bin = env!("CARGO_BIN_EXE_trueflow");
-        let output = Command::new(bin).args(args).current_dir(cwd).output()?;
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "trueflow failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        Ok(String::from_utf8(output.stdout)?)
-    }
-}
+mod common;
+use common::*;
 
 #[test]
 fn test_optimizer_import_merge_preserves_content() {
     let blocks = vec![
-        Block {
-            hash: hash_str("use foo;"),
-            content: "use foo;".to_string(),
-            kind: BlockKind::Import,
-            start_line: 0,
-            end_line: 1,
-        },
-        Block {
-            hash: hash_str("/*comment*/"),
-            content: "/*comment*/".to_string(),
-            kind: BlockKind::Gap,
-            start_line: 1,
-            end_line: 1,
-        },
-        Block {
-            hash: hash_str("use bar;"),
-            content: "use bar;".to_string(),
-            kind: BlockKind::Import,
-            start_line: 1,
-            end_line: 2,
-        },
+        Block::new("use foo;".to_string(), BlockKind::Import, 0, 1),
+        Block::new("/*comment*/".to_string(), BlockKind::Gap, 1, 1),
+        Block::new("use bar;".to_string(), BlockKind::Import, 1, 2),
     ];
 
     let expected: String = blocks.iter().map(|b| b.content.as_str()).collect();
@@ -145,20 +31,24 @@ fn test_optimizer_import_merge_preserves_content() {
 #[test]
 fn test_diff_new_content_matches_post_hunk() -> Result<()> {
     let repo = TestRepo::new("diff_new_content")?;
-    repo.write_file(
+    repo.write(
         "src/main.rs",
         "fn main() {\n    println!(\"Hello\");\n    println!(\"World\");\n}\n",
     )?;
-    repo.git_add_commit("Initial")?;
+    repo.commit_all("Initial")?;
 
-    repo.git(&["checkout", "-b", "feature/update"])?;
-    repo.write_file(
+    Command::new("git")
+        .args(["checkout", "-b", "feature/update"])
+        .current_dir(&repo.path)
+        .output()?;
+
+    repo.write(
         "src/main.rs",
         "fn main() {\n    println!(\"Hello\");\n    println!(\"Trueflow\");\n}\n",
     )?;
-    repo.git_add_commit("Update message")?;
+    repo.commit_all("Update message")?;
 
-    let output = repo.run_trueflow(&["diff", "--json"])?;
+    let output = repo.run(&["diff", "--json"])?;
     let changes: Value = serde_json::from_str(&output)?;
     let change = changes
         .as_array()
@@ -175,15 +65,15 @@ fn test_diff_new_content_matches_post_hunk() -> Result<()> {
 #[test]
 fn test_review_ignores_non_review_checks() -> Result<()> {
     let repo = TestRepo::new("review_check_filter")?;
-    repo.write_file("src/lib.rs", "pub fn core() {}\n")?;
-    repo.git_add_commit("Add lib")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Add lib")?;
 
-    let output = repo.run_trueflow(&["review", "--all", "--json"])?;
+    let output = repo.run(&["review", "--all", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
     let hash = block["hash"].as_str().context("hash")?;
 
-    repo.run_trueflow(&[
+    repo.run(&[
         "mark",
         "--fingerprint",
         hash,
@@ -191,9 +81,10 @@ fn test_review_ignores_non_review_checks() -> Result<()> {
         "approved",
         "--check",
         "security",
+        "--quiet",
     ])?;
 
-    let output = repo.run_trueflow(&["review", "--all", "--json"])?;
+    let output = repo.run(&["review", "--all", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     assert!(!json.as_array().context("Expected array")?.is_empty());
     Ok(())
@@ -202,10 +93,10 @@ fn test_review_ignores_non_review_checks() -> Result<()> {
 #[test]
 fn test_review_latest_timestamp_wins() -> Result<()> {
     let repo = TestRepo::new("review_timestamp")?;
-    repo.write_file("src/lib.rs", "pub fn core() {}\n")?;
-    repo.git_add_commit("Add lib")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Add lib")?;
 
-    let output = repo.run_trueflow(&["review", "--all", "--json"])?;
+    let output = repo.run(&["review", "--all", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
     let hash = block["hash"].as_str().context("hash")?;
@@ -215,27 +106,35 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
 
     let approved = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
+        "version": 1,
         "fingerprint": hash,
         "check": "review",
         "verdict": "approved",
         "identity": { "type": "email", "email": "a@example.com" },
+        "repo_ref": { "type": "vcs", "system": "git", "revision": "deadbeef" },
+        "block_state": "committed",
         "timestamp": 2000,
         "path_hint": null,
         "line_hint": null,
         "note": null,
-        "tags": null
+        "tags": null,
+        "attestations": null
     });
     let rejected = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
+        "version": 1,
         "fingerprint": hash,
         "check": "review",
         "verdict": "rejected",
         "identity": { "type": "email", "email": "b@example.com" },
+        "repo_ref": { "type": "vcs", "system": "git", "revision": "deadbeef" },
+        "block_state": "committed",
         "timestamp": 1000,
         "path_hint": null,
         "line_hint": null,
         "note": null,
-        "tags": null
+        "tags": null,
+        "attestations": null
     });
 
     let file_content = format!(
@@ -245,7 +144,7 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
     );
     fs::write(trueflow_dir.join("reviews.jsonl"), file_content)?;
 
-    let output = repo.run_trueflow(&["review", "--all", "--json"])?;
+    let output = repo.run(&["review", "--all", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     assert!(json.as_array().context("Expected array")?.is_empty());
     Ok(())
@@ -254,18 +153,18 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
 #[test]
 fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
     let repo = TestRepo::new("exclude_gap_case")?;
-    repo.write_file(
+    repo.write(
         "src/main.rs",
         "fn main() {\n    part1();\n\n    part2();\n}\n",
     )?;
-    repo.git_add_commit("Add main")?;
+    repo.commit_all("Add main")?;
 
-    let output = repo.run_trueflow(&["review", "--all", "--json"])?;
+    let output = repo.run(&["review", "--all", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
     let parent_hash = block["hash"].as_str().context("hash")?;
 
-    let output = repo.run_trueflow(&["inspect", "--fingerprint", parent_hash, "--split"])?;
+    let output = repo.run(&["inspect", "--fingerprint", parent_hash, "--split"])?;
     let sub_blocks: Vec<Value> = serde_json::from_str(&output)?;
 
     for sub_block in &sub_blocks {
@@ -274,10 +173,17 @@ fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
             continue;
         }
         let hash = sub_block["hash"].as_str().context("hash")?;
-        repo.run_trueflow(&["mark", "--fingerprint", hash, "--verdict", "approved"])?;
+        repo.run(&[
+            "mark",
+            "--fingerprint",
+            hash,
+            "--verdict",
+            "approved",
+            "--quiet",
+        ])?;
     }
 
-    let output = repo.run_trueflow(&["review", "--all", "--exclude", "gap", "--json"])?;
+    let output = repo.run(&["review", "--all", "--exclude", "gap", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     assert!(json.as_array().context("Expected array")?.is_empty());
     Ok(())
@@ -288,8 +194,8 @@ fn test_scan_skips_unreadable_entries() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let repo = TestRepo::new("scan_unreadable")?;
-    repo.write_file("src/main.rs", "fn main() {}\n")?;
-    repo.git_add_commit("Add main")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.commit_all("Add main")?;
 
     let secret_dir = repo.path.join("secret");
     fs::create_dir_all(&secret_dir)?;
@@ -299,7 +205,7 @@ fn test_scan_skips_unreadable_entries() -> Result<()> {
     perms.set_mode(0o000);
     fs::set_permissions(&secret_dir, perms)?;
 
-    let output = repo.run_trueflow(&["scan", "--json"])?;
+    let output = repo.run(&["scan", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     let files = json.as_array().context("Expected array")?;
     assert!(files.iter().any(|entry| {
@@ -317,9 +223,16 @@ fn test_filestore_uses_repo_root_from_subdir() -> Result<()> {
     let nested = repo.path.join("nested");
     fs::create_dir_all(&nested)?;
 
-    repo.run_trueflow_in(
+    repo.run_in(
+        &[
+            "mark",
+            "--fingerprint",
+            "deadbeef",
+            "--verdict",
+            "approved",
+            "--quiet",
+        ],
         &nested,
-        &["mark", "--fingerprint", "deadbeef", "--verdict", "approved"],
     )?;
 
     assert!(repo.path.join(".trueflow").exists());
@@ -330,20 +243,31 @@ fn test_filestore_uses_repo_root_from_subdir() -> Result<()> {
 #[test]
 fn test_diff_uses_merge_base() -> Result<()> {
     let repo = TestRepo::new("diff_merge_base")?;
-    repo.write_file("src/file1.rs", "fn one() {}\n")?;
-    repo.git_add_commit("Add file1")?;
+    repo.write("src/file1.rs", "fn one() {}\n")?;
+    repo.commit_all("Add file1")?;
 
-    repo.git(&["checkout", "-b", "feature/one"])?;
-    repo.write_file("src/file1.rs", "fn one() { println!(\"feat\"); }\n")?;
-    repo.git_add_commit("Update file1")?;
+    Command::new("git")
+        .args(["checkout", "-b", "feature/one"])
+        .current_dir(&repo.path)
+        .output()?;
 
-    repo.git(&["checkout", "main"])?;
-    repo.write_file("src/file2.rs", "fn two() {}\n")?;
-    repo.git_add_commit("Add file2")?;
+    repo.write("src/file1.rs", "fn one() { println!(\"feat\"); }\n")?;
+    repo.commit_all("Update file1")?;
 
-    repo.git(&["checkout", "feature/one"])?;
+    Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(&repo.path)
+        .output()?;
 
-    let output = repo.run_trueflow(&["diff", "--json"])?;
+    repo.write("src/file2.rs", "fn two() {}\n")?;
+    repo.commit_all("Add file2")?;
+
+    Command::new("git")
+        .args(["checkout", "feature/one"])
+        .current_dir(&repo.path)
+        .output()?;
+
+    let output = repo.run(&["diff", "--json"])?;
     let changes: Value = serde_json::from_str(&output)?;
     let files: Vec<&str> = changes
         .as_array()
@@ -352,23 +276,30 @@ fn test_diff_uses_merge_base() -> Result<()> {
         .filter_map(|entry| entry["file"].as_str())
         .collect();
 
-    assert!(!files.is_empty());
-    assert!(files.iter().all(|file| file.contains("file1.rs")));
+    assert!(files.contains(&"src/file1.rs"));
+    assert!(!files.contains(&"src/file2.rs")); // file2 is on main, not in diff base..head?
+    // main..head(feature) should include changes in feature not in main.
+    // file1 modified. file2 added on main.
+    // merge-base is the split point.
+    // Diff is base..head.
+    // base = split point.
+    // head = feature tip.
+    // So file2 (on main) is NOT in range. Correct.
     Ok(())
 }
 
 #[test]
 fn test_feedback_xml_escapes_cdata_end() -> Result<()> {
     let repo = TestRepo::new("feedback_cdata")?;
-    repo.write_file("src/lib.rs", "pub fn core() { println!(\"]]>\"); }\n")?;
-    repo.git_add_commit("Add lib")?;
+    repo.write("src/lib.rs", "pub fn core() { println!(\"]]>\"); }\n")?;
+    repo.commit_all("Add lib")?;
 
-    let output = repo.run_trueflow(&["review", "--all", "--json"])?;
+    let output = repo.run(&["review", "--all", "--json"])?;
     let json: Value = serde_json::from_str(&output)?;
     let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
     let hash = block["hash"].as_str().context("hash")?;
 
-    repo.run_trueflow(&[
+    repo.run(&[
         "mark",
         "--fingerprint",
         hash,
@@ -376,9 +307,10 @@ fn test_feedback_xml_escapes_cdata_end() -> Result<()> {
         "rejected",
         "--note",
         "Contains CDATA terminator",
+        "--quiet",
     ])?;
 
-    let output = repo.run_trueflow(&["feedback", "--format", "xml"])?;
+    let output = repo.run(&["feedback", "--format", "xml"])?;
     assert!(output.contains("<trueflow_feedback>"));
     assert!(output.contains("]]]]><![CDATA[>"));
     Ok(())
