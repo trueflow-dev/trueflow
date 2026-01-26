@@ -495,7 +495,8 @@
     (define-key map (kbd "a") #'trueflow-focus-approve)
     (define-key map (kbd "x") #'trueflow-focus-reject)
     (define-key map (kbd "c") #'trueflow-focus-comment)
-    (define-key map (kbd "n") #'trueflow-focus-skip)
+    (define-key map (kbd "n") #'trueflow-focus-next)
+    (define-key map (kbd "p") #'trueflow-focus-prev)
     (define-key map (kbd "s") #'trueflow-focus-subdivide)
     (define-key map (kbd "q") #'quit-window)
     (define-key map (kbd "?") #'trueflow-dispatch)
@@ -509,7 +510,10 @@
 (defvar-local trueflow-focus-current-block nil)
 (defvar-local trueflow-focus-status-buffer nil)
 (defvar-local trueflow-focus-subblocks nil)
-(defvar-local trueflow-review-queue nil)
+(defvar-local trueflow-review-items nil
+  "List of all blocks to review.")
+(defvar-local trueflow-review-index 0
+  "Current index in `trueflow-review-items`.")
 (defvar-local trueflow-last-scan-data nil
   "The last data retrieved from trueflow CLI.")
 
@@ -519,7 +523,7 @@
   (unless (eq major-mode 'trueflow-mode)
     (user-error "Not in trueflow-status buffer"))
   
-  (setq trueflow-review-queue
+  (setq trueflow-review-items
         (seq-mapcat
          (lambda (file)
            (let ((path (alist-get 'path file)))
@@ -530,24 +534,42 @@
                   annotated))
               (trueflow--ensure-list (alist-get 'blocks file)))))
          trueflow-last-scan-data))
+  (setq trueflow-review-index 0)
   
-  (if trueflow-review-queue
-      (trueflow-focus-next)
+  (if trueflow-review-items
+      (trueflow-focus-update)
     (message "No blocks to review.")))
 
-(defun trueflow-focus-next ()
-  "Pop the next block from the queue and focus it."
+(defun trueflow-focus-update ()
+  "Focus the block at `trueflow-review-index`."
   (let ((status-buf (if (eq major-mode 'trueflow-mode) (current-buffer) trueflow-focus-status-buffer)))
     (if (and status-buf (buffer-live-p status-buf))
         (with-current-buffer status-buf
-          (let ((block (pop trueflow-review-queue)))
+          (let ((block (nth trueflow-review-index trueflow-review-items))
+                (total (length trueflow-review-items)))
             (if block
-                (trueflow-focus-open block status-buf)
+                (trueflow-focus-open block status-buf (1+ trueflow-review-index) total)
               (message "Review complete! All blocks processed."))))
       (message "Status buffer lost."))))
 
-(defun trueflow-focus-open (block status-buf)
-  "Open the focus buffer for BLOCK."
+(defun trueflow-focus-next ()
+  "Move to the next block."
+  (interactive)
+  (with-current-buffer trueflow-focus-status-buffer
+    (when (< trueflow-review-index (1- (length trueflow-review-items)))
+      (cl-incf trueflow-review-index)
+      (trueflow-focus-update))))
+
+(defun trueflow-focus-prev ()
+  "Move to the previous block."
+  (interactive)
+  (with-current-buffer trueflow-focus-status-buffer
+    (when (> trueflow-review-index 0)
+      (cl-decf trueflow-review-index)
+      (trueflow-focus-update))))
+
+(defun trueflow-focus-open (block status-buf current-idx total-count)
+  "Open the focus buffer for BLOCK. CURRENT-IDX and TOTAL-COUNT show progress."
   (let ((buf (get-buffer-create "*trueflow-focus*")))
     (switch-to-buffer buf)
     (trueflow-focus-mode)
@@ -567,7 +589,7 @@
       (insert "\n\n")
       (trueflow--insert-content (alist-get 'content block))
       (trueflow--insert-actions
-       "Actions: [a]pprove  [x]reject  [c]omment  [n]skip  [q]uit"))
+       (format "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit  (%d / %d)" current-idx total-count)))
     (goto-char (point-min))))
 
 (defun trueflow-focus-subdivide ()
@@ -588,7 +610,7 @@
              (trueflow--insert-block nil block)))
         
         (trueflow--insert-actions
-         "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [q]uit")
+         "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit")
         (goto-char (point-min))))))
 
 (defun trueflow-focus-action (verdict &optional note)
