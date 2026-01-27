@@ -521,7 +521,7 @@ fn execute_action(
             context,
             mark::MarkParams {
                 fingerprint,
-                verdict,
+                verdict: verdict.clone(),
                 check: "review".to_string(),
                 note,
                 path: path_hint,
@@ -530,12 +530,7 @@ fn execute_action(
         )
     })?;
 
-    refresh_state(context, state)?;
-    if let Some(key) = next_key
-        && let Some(node_id) = state.navigator.find_node_by_key(&key)
-    {
-        state.navigator.set_current(node_id);
-    }
+    apply_action_locally(state, node_id, &verdict, next_key);
     Ok(())
 }
 
@@ -569,26 +564,83 @@ fn load_review_state(context: &TrueflowContext) -> Result<crate::commands::revie
     collect_review_summary(context, &options, &filters)
 }
 
-fn refresh_state(context: &TrueflowContext, state: &mut AppState) -> Result<()> {
-    let summary = load_review_state(context)?;
-    let current_key = NodeKey::from_node(&state.navigator.tree, state.navigator.current_id());
+fn apply_action_locally(
+    state: &mut AppState,
+    node_id: TreeNodeId,
+    verdict: &Verdict,
+    next_key: Option<NodeKey>,
+) {
+    let block_ids = collect_block_ids_for_action(state, node_id);
 
-    state.navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
-    state.remaining_blocks = state
+    if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
+        let mut removed = 0;
+        for block_id in block_ids {
+            if state.navigator.visible_nodes.remove(&block_id) {
+                removed += 1;
+                state.remaining_blocks = state.remaining_blocks.saturating_sub(1);
+            }
+        }
+        state.total_blocks = state.total_blocks.saturating_sub(removed);
+    }
+
+    prune_invisible_ancestors(state);
+
+    if let Some(key) = next_key
+        && let Some(node_id) = state.navigator.find_node_by_key(&key)
+    {
+        state.navigator.set_current(node_id);
+    } else {
+        state.navigator.jump_root();
+    }
+}
+
+fn collect_block_ids_for_action(state: &AppState, node_id: TreeNodeId) -> Vec<TreeNodeId> {
+    let node = state.navigator.tree.node(node_id);
+    match node.kind {
+        TreeNodeKind::Block => vec![node_id],
+        _ => node
+            .children
+            .iter()
+            .copied()
+            .filter(|child| {
+                matches!(state.navigator.tree.node(*child).kind, TreeNodeKind::Block)
+                    && state.navigator.visible_nodes.contains(child)
+            })
+            .collect(),
+    }
+}
+
+fn prune_invisible_ancestors(state: &mut AppState) {
+    let mut candidates: Vec<TreeNodeId> = state
         .navigator
         .visible_nodes
         .iter()
-        .filter(|&&id| matches!(state.navigator.tree.node(id).kind, TreeNodeKind::Block))
-        .count();
+        .copied()
+        .filter(|id| matches!(state.navigator.tree.node(*id).kind, TreeNodeKind::Block))
+        .collect();
 
-    // Try to restore position
-    if let Some(id) = state.navigator.find_node_by_key(&current_key) {
-        state.navigator.set_current(id);
-    } else {
-        // Fallback: stay at root (default)
+    while let Some(block_id) = candidates.pop() {
+        let mut current = state.navigator.tree.parent(block_id);
+        while let Some(node_id) = current {
+            if state
+                .navigator
+                .tree
+                .node(node_id)
+                .children
+                .iter()
+                .any(|child| state.navigator.visible_nodes.contains(child))
+            {
+                break;
+            }
+            state.navigator.visible_nodes.remove(&node_id);
+            current = state.navigator.tree.parent(node_id);
+        }
     }
 
-    Ok(())
+    state
+        .navigator
+        .visible_nodes
+        .insert(state.navigator.tree.root());
 }
 
 fn detect_repo_name(context: &TrueflowContext) -> String {
