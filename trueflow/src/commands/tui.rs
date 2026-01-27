@@ -18,8 +18,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block as UiBlock, Gauge, Paragraph, Wrap},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 
 // --- Core Structs ---
 
@@ -241,6 +242,7 @@ struct AppState {
     confirm_batch: bool,
     repo_name: String,
     last_frame: std::time::Instant,
+    file_cache: HashMap<PathBuf, Vec<String>>,
 }
 
 pub fn run(context: &TrueflowContext) -> Result<()> {
@@ -263,6 +265,7 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
         confirm_batch: config.tui.confirm_batch,
         repo_name: detect_repo_name(context),
         last_frame: std::time::Instant::now(),
+        file_cache: HashMap::new(),
     };
 
     let run_result = run_app(context, &mut terminal, state);
@@ -296,7 +299,7 @@ fn run_app(
 
     loop {
         if needs_render || state.last_frame.elapsed().as_millis() >= 250 {
-            terminal.draw(|f| ui(f, &state))?;
+            terminal.draw(|f| ui(f, &mut state))?;
             state.last_frame = std::time::Instant::now();
             needs_render = false;
         }
@@ -620,7 +623,7 @@ fn count_descendant_blocks(navigator: &ReviewNavigator, id: TreeNodeId) -> usize
 
 // --- UI Rendering ---
 
-fn ui(frame: &mut Frame, state: &AppState) {
+fn ui(frame: &mut Frame, state: &mut AppState) {
     let palette = UiPalette::default();
     let area = frame.size();
 
@@ -652,7 +655,7 @@ fn ui(frame: &mut Frame, state: &AppState) {
     }
 }
 
-fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
+fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palette: &UiPalette) {
     let node = state.navigator.tree.node(state.navigator.current_id());
 
     let title = match node.kind {
@@ -685,21 +688,10 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
             .add_modifier(Modifier::BOLD),
     ));
 
-    let content_lines = if let Some(block) = &node.block {
-        let language = node.language.clone();
-        block
-            .content
-            .lines()
-            .map(|line| format_code_line(line, palette, language.as_ref()))
-            .collect::<Vec<_>>()
-    } else {
-        vec![Line::from(Span::styled(
-            "(No content)",
-            Style::default().fg(palette.dim).bg(palette.code_bg),
-        ))]
-    };
-
     let focus_layout = compute_focus_layout(area, header_lines.len() as u16);
+    let node_snapshot = node.clone();
+    let content_lines =
+        build_content_lines(state, &node_snapshot, palette, focus_layout.code.height);
 
     let meta_block = UiBlock::default()
         .borders(ratatui::widgets::Borders::ALL)
@@ -746,6 +738,138 @@ fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPa
         .label(Span::styled(label, Style::default().fg(palette.fg)));
 
     frame.render_widget(gauge, area);
+}
+
+fn build_content_lines(
+    state: &mut AppState,
+    node: &crate::tree::TreeNode,
+    palette: &UiPalette,
+    code_height: u16,
+) -> Vec<Line<'static>> {
+    let Some(block) = &node.block else {
+        return vec![Line::from(Span::styled(
+            "(No content)",
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        ))];
+    };
+
+    let language = node.language.clone();
+    let block_lines: Vec<String> = block.content.lines().map(|line| line.to_string()).collect();
+    let extra_space = code_height.saturating_sub(block_lines.len() as u16) as isize;
+
+    if extra_space < 2 {
+        return block_lines
+            .iter()
+            .map(|line| format_code_line(line, palette, language.as_ref()))
+            .collect();
+    }
+
+    let total_context = (extra_space - 1).max(0) as usize;
+    let mut top_context = total_context / 2 + (total_context % 2);
+    let mut bottom_context = total_context / 2;
+
+    let file_lines = match load_file_lines(state, node) {
+        Some(lines) => lines,
+        None => {
+            return block_lines
+                .iter()
+                .map(|line| format_code_line(line, palette, language.as_ref()))
+                .collect();
+        }
+    };
+
+    let start_line = block.start_line.min(file_lines.len());
+    let end_line = block.end_line.min(file_lines.len());
+
+    let available_top = start_line;
+    let available_bottom = file_lines.len().saturating_sub(end_line);
+
+    if top_context > available_top {
+        let overflow = top_context - available_top;
+        top_context = available_top;
+        bottom_context = (bottom_context + overflow).min(available_bottom);
+    }
+
+    if bottom_context > available_bottom {
+        let overflow = bottom_context - available_bottom;
+        bottom_context = available_bottom;
+        top_context = (top_context + overflow).min(available_top);
+    }
+
+    if top_context + bottom_context < total_context {
+        let missing = total_context - (top_context + bottom_context);
+        let add_top = missing.min(available_top.saturating_sub(top_context));
+        top_context += add_top;
+        let add_bottom = missing
+            .saturating_sub(add_top)
+            .min(available_bottom.saturating_sub(bottom_context));
+        bottom_context += add_bottom;
+    }
+
+    let mut lines = Vec::new();
+    if top_context > 0 {
+        let start = start_line.saturating_sub(top_context);
+        let end = start_line;
+        for line in &file_lines[start..end] {
+            lines.push(format_context_line(line, palette, language.as_ref()));
+        }
+    }
+
+    for line in &block_lines {
+        lines.push(format_code_line(line, palette, language.as_ref()));
+    }
+
+    if bottom_context > 0 {
+        let start = end_line;
+        let end = (end_line + bottom_context).min(file_lines.len());
+        for line in &file_lines[start..end] {
+            lines.push(format_context_line(line, palette, language.as_ref()));
+        }
+    }
+
+    lines
+}
+
+fn load_file_lines(state: &mut AppState, node: &crate::tree::TreeNode) -> Option<Vec<String>> {
+    if node.path.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(&node.path);
+    if let Some(lines) = state.file_cache.get(&path) {
+        return Some(lines.clone());
+    }
+
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let lines = contents
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    state.file_cache.insert(path, lines.clone());
+    Some(lines)
+}
+
+fn format_context_line(
+    line: &str,
+    palette: &UiPalette,
+    language: Option<&Language>,
+) -> Line<'static> {
+    let gutter_left = 4;
+    let gutter_right = 2;
+    let gutter_spacing = " ".repeat(gutter_left + gutter_right + 1);
+    let tokens = highlight_line(line, language);
+    let mut spans = Vec::with_capacity(tokens.len() + 1);
+    spans.push(Span::styled(
+        gutter_spacing,
+        Style::default().fg(palette.context).bg(palette.code_bg),
+    ));
+    for token in tokens {
+        let style = style_for_token(&token.kind, palette)
+            .fg(palette.context)
+            .bg(palette.code_bg);
+        spans.push(Span::styled(token.text, style));
+    }
+    Line::from(spans)
 }
 
 fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -921,6 +1045,7 @@ struct UiPalette {
     code_bg: Color,
     meta_bg: Color,
     meta_border: Color,
+    context: Color,
 }
 
 impl Default for UiPalette {
@@ -938,6 +1063,7 @@ impl Default for UiPalette {
             code_bg: Color::Rgb(240, 240, 238),
             meta_bg: Color::Rgb(244, 244, 242),
             meta_border: Color::Rgb(204, 204, 200),
+            context: Color::Rgb(200, 200, 196),
         }
     }
 }
@@ -1177,9 +1303,10 @@ fn style_for_token(token: &TokenKind, palette: &UiPalette) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::Language;
     use crate::block::{Block, BlockKind};
     use crate::tree::{self, TreeBuilder};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     fn build_block(hash: &str, kind: BlockKind, start_line: usize) -> Block {
         Block {
@@ -1191,6 +1318,67 @@ mod tests {
             start_line,
             end_line: start_line + 1,
         }
+    }
+
+    #[test]
+    fn build_content_lines_with_extra_space_adds_context() {
+        let block = Block {
+            hash: "hash-a".to_string(),
+            content: "line 2\nline 3".to_string(),
+            kind: BlockKind::Function,
+            tags: Vec::new(),
+            complexity: 0,
+            start_line: 1,
+            end_line: 3,
+        };
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "main.rs".to_string(),
+            "main.rs".to_string(),
+            "file-main".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file,
+            block.kind.as_str().to_string(),
+            "main.rs".to_string(),
+            block.clone(),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let mut state = AppState {
+            navigator: ReviewNavigator::new(tree, HashSet::new()).expect("navigator"),
+            total_blocks: 1,
+            remaining_blocks: 1,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            confirm_batch: false,
+            repo_name: "repo".to_string(),
+            last_frame: std::time::Instant::now(),
+            file_cache: HashMap::new(),
+        };
+        state.file_cache.insert(
+            PathBuf::from("main.rs"),
+            vec![
+                "line 1".to_string(),
+                "line 2".to_string(),
+                "line 3".to_string(),
+                "line 4".to_string(),
+                "line 5".to_string(),
+            ],
+        );
+
+        let block_id = state
+            .navigator
+            .tree
+            .node_by_path_and_hash("main.rs", "hash-a")
+            .expect("block");
+        state.navigator.set_current(block_id);
+        let node = state.navigator.tree.node(block_id).clone();
+        let lines = build_content_lines(&mut state, &node, &UiPalette::default(), 6);
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]
