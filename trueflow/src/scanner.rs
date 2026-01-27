@@ -3,6 +3,7 @@ use crate::block::{Block, BlockKind, FileState};
 use crate::block_splitter;
 use crate::hashing::hash_str;
 use crate::optimizer;
+use crate::text_split::split_by_paragraph_breaks;
 use anyhow::Result;
 use log::warn;
 use sha2::{Digest, Sha256};
@@ -75,17 +76,30 @@ fn process_file(path: &Path) -> Result<FileState> {
 
             match blocks {
                 Ok(b) if !b.is_empty() => (language, optimizer::optimize(b)),
-                Ok(_) => (language, chunk_content(&content)), // Fallback if splitter returns empty (not implemented or empty file)
+                Ok(_) => (
+                    language,
+                    fallback_split_blocks(&content, FallbackMode::Code),
+                ), // Fallback if splitter returns empty (not implemented or empty file)
                 Err(e) => {
                     warn!(
-                        "Failed to parse file {:?}: {}, falling back to lines",
+                        "Failed to parse file {:?}: {}, falling back to paragraphs",
                         path, e
                     );
-                    (language, chunk_content(&content))
+                    (
+                        language,
+                        fallback_split_blocks(&content, FallbackMode::Code),
+                    )
                 }
             }
         }
-        _ => (Language::Unknown, chunk_content(&content)), // Fallback for non-code files
+        FileType::Text => (
+            Language::Text,
+            fallback_split_blocks(&content, FallbackMode::Text),
+        ),
+        _ => (
+            Language::Unknown,
+            fallback_split_blocks(&content, FallbackMode::Text),
+        ), // Fallback for non-code files
     };
 
     // Compute file hash (Merkle root of block hashes)
@@ -103,35 +117,127 @@ fn process_file(path: &Path) -> Result<FileState> {
     })
 }
 
-pub(crate) fn chunk_content(content: &str) -> Vec<Block> {
-    // Strategy: Fixed line chunks (e.g. 20 lines)
-    // This is the MVP strategy. Later we can do tree-sitter or rolling hash.
-    const CHUNK_SIZE: usize = 20;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FallbackMode {
+    Code,
+    Text,
+}
 
-    let lines: Vec<&str> = content.lines().collect();
-    let mut blocks = Vec::new();
+pub(crate) fn fallback_split_blocks(content: &str, mode: FallbackMode) -> Vec<Block> {
+    let fallback = split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+        let kind = classify_fallback_chunk(chunk, mode, is_gap);
+        create_fallback_block(content, chunk, kind, start, end)
+    });
 
-    if lines.is_empty() {
-        return blocks;
+    if fallback.is_empty() {
+        return Vec::new();
     }
 
-    for (i, chunk) in lines.chunks(CHUNK_SIZE).enumerate() {
-        let start_line = i * CHUNK_SIZE;
-        let end_line = start_line + chunk.len();
+    fallback
+}
 
-        let block_content = chunk.join("\n");
-        let hash = hash_str(&block_content);
-
-        blocks.push(Block {
-            hash,
-            content: block_content,
-            kind: BlockKind::TextBlock,
-            tags: Vec::new(),
-            complexity: 0,
-            start_line,
-            end_line,
-        });
+fn classify_fallback_chunk(chunk: &str, mode: FallbackMode, is_gap: bool) -> BlockKind {
+    if is_gap {
+        return BlockKind::Gap;
     }
 
-    blocks
+    if chunk.trim().is_empty() {
+        return BlockKind::Gap;
+    }
+
+    match mode {
+        FallbackMode::Code => classify_code_paragraph(chunk),
+        FallbackMode::Text => BlockKind::Paragraph,
+    }
+}
+
+fn classify_code_paragraph(chunk: &str) -> BlockKind {
+    let trimmed = chunk.trim();
+    if trimmed.is_empty() {
+        return BlockKind::Gap;
+    }
+
+    let is_comment = trimmed.lines().all(|line| {
+        let line = line.trim_start();
+        line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+            || line.starts_with('*')
+    });
+
+    if is_comment {
+        BlockKind::Comment
+    } else {
+        BlockKind::CodeParagraph
+    }
+}
+
+fn create_fallback_block(
+    full_source: &str,
+    chunk: &str,
+    kind: BlockKind,
+    start: usize,
+    end: usize,
+) -> Block {
+    let (start_line, end_line) = byte_range_to_lines(full_source, start, end);
+    Block {
+        hash: hash_str(chunk),
+        content: chunk.to_string(),
+        kind,
+        tags: Vec::new(),
+        complexity: 0,
+        start_line,
+        end_line,
+    }
+}
+
+fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
+    let pre = &source[..start];
+    let start_line = pre.lines().count();
+    let start_line = if start > 0 && pre.ends_with('\n') {
+        start_line
+    } else {
+        start_line.saturating_sub(1)
+    };
+
+    let mid = &source[start..end];
+    let new_lines = mid.chars().filter(|&c| c == '\n').count();
+    let end_line = start_line + new_lines + if mid.ends_with('\n') { 0 } else { 1 };
+
+    (start_line, end_line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_merged_blocks(blocks: Vec<Block>, expected: &str) {
+        let merged = blocks
+            .into_iter()
+            .map(|block| block.content)
+            .collect::<String>();
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn fallback_split_text_paragraphs() {
+        let content = "Para 1.\n\nPara 2.";
+        let blocks = fallback_split_blocks(content, FallbackMode::Text);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[1].kind, BlockKind::Gap);
+        assert_eq!(blocks[2].kind, BlockKind::Paragraph);
+        assert_merged_blocks(blocks, content);
+    }
+
+    #[test]
+    fn fallback_split_code_paragraphs() {
+        let content = "fn main() {}\n\n// comment";
+        let blocks = fallback_split_blocks(content, FallbackMode::Code);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(blocks[1].kind, BlockKind::Gap);
+        assert_eq!(blocks[2].kind, BlockKind::Comment);
+        assert_merged_blocks(blocks, content);
+    }
 }

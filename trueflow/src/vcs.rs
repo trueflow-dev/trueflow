@@ -324,7 +324,7 @@ fn split_blocks(content: &str, language: Language) -> Vec<Block> {
         return crate::optimizer::optimize(blocks);
     }
 
-    scanner::chunk_content(content)
+    scanner::fallback_split_blocks(content, scanner::FallbackMode::Text)
 }
 
 #[cfg(test)]

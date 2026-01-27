@@ -1,3 +1,4 @@
+use crate::analysis::Language;
 use crate::commands::mark;
 use crate::commands::review::{ReviewOptions, collect_review_summary};
 use crate::config::load as load_config;
@@ -17,9 +18,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block as UiBlock, Gauge, Paragraph, Wrap},
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // --- Core Structs ---
 
@@ -47,10 +47,8 @@ struct ReviewNavigator {
     tree: Tree,
     visible_nodes: HashSet<TreeNodeId>,
     current: TreeNodeId,
-    visible_order: Vec<TreeNodeId>,
-    index_by_node: HashMap<TreeNodeId, usize>,
-    depth_by_node: HashMap<TreeNodeId, usize>,
-    visible_by_depth: BTreeMap<usize, Vec<TreeNodeId>>,
+    siblings_by_node: HashMap<TreeNodeId, Vec<TreeNodeId>>,
+    sibling_index_by_node: HashMap<TreeNodeId, usize>,
     first_child_by_node: HashMap<TreeNodeId, TreeNodeId>,
 }
 
@@ -68,22 +66,15 @@ impl ReviewNavigator {
         let root = tree.root();
         visible_nodes.insert(root);
 
-        let mut visible_order = Vec::new();
-        let mut index_by_node = HashMap::new();
-        let mut depth_by_node = HashMap::new();
-        let mut visible_by_depth: BTreeMap<usize, Vec<TreeNodeId>> = BTreeMap::new();
+        let mut siblings_by_node: HashMap<TreeNodeId, Vec<TreeNodeId>> = HashMap::new();
+        let mut sibling_index_by_node: HashMap<TreeNodeId, usize> = HashMap::new();
         let mut first_child_by_node = HashMap::new();
 
-        let mut stack = vec![(root, 0)];
-        while let Some((node_id, depth)) = stack.pop() {
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
             if !visible_nodes.contains(&node_id) {
                 continue;
             }
-            let idx = visible_order.len();
-            visible_order.push(node_id);
-            index_by_node.insert(node_id, idx);
-            depth_by_node.insert(node_id, depth);
-            visible_by_depth.entry(depth).or_default().push(node_id);
 
             let node = tree.node(node_id);
             let mut children: Vec<TreeNodeId> = node
@@ -96,10 +87,15 @@ impl ReviewNavigator {
                 first_child_by_node.insert(node_id, first_child);
             }
 
+            for (index, child) in children.iter().enumerate() {
+                siblings_by_node.insert(*child, children.clone());
+                sibling_index_by_node.insert(*child, index);
+            }
+
             // stack is LIFO; push in reverse to preserve order
             children.reverse();
             for child in children {
-                stack.push((child, depth + 1));
+                stack.push(child);
             }
         }
 
@@ -107,10 +103,8 @@ impl ReviewNavigator {
             tree,
             visible_nodes,
             current: root,
-            visible_order,
-            index_by_node,
-            depth_by_node,
-            visible_by_depth,
+            siblings_by_node,
+            sibling_index_by_node,
             first_child_by_node,
         })
     }
@@ -143,60 +137,35 @@ impl ReviewNavigator {
         }
     }
 
-    // Move to next sibling (or wrap to cousin) at same depth
+    // Move to next sibling (same parent)
     fn move_next(&mut self) {
-        let depth = self.depth_of(self.current);
-        if let Some(nodes) = self.visible_by_depth.get(&depth)
-            && let Some(pos) = nodes.iter().position(|&id| id == self.current)
-            && pos + 1 < nodes.len()
-        {
-            self.current = nodes[pos + 1];
+        if let Some(next) = self.sibling_at_offset(self.current, 1) {
+            self.current = next;
         }
     }
 
-    // Move to prev sibling at same depth
+    // Move to prev sibling (same parent)
     fn move_prev(&mut self) {
-        let depth = self.depth_of(self.current);
-        if let Some(nodes) = self.visible_by_depth.get(&depth)
-            && let Some(pos) = nodes.iter().position(|&id| id == self.current)
-            && pos > 0
-        {
-            self.current = nodes[pos - 1];
+        if let Some(prev) = self.sibling_at_offset(self.current, -1) {
+            self.current = prev;
         }
     }
 
-    fn move_next_visible(&mut self) {
-        if let Some(current_idx) = self.index_by_node.get(&self.current)
-            && current_idx + 1 < self.visible_order.len()
-        {
-            self.current = self.visible_order[current_idx + 1];
+    fn sibling_at_offset(&self, node_id: TreeNodeId, offset: isize) -> Option<TreeNodeId> {
+        let siblings = self.siblings_by_node.get(&node_id)?;
+        let index = *self.sibling_index_by_node.get(&node_id)? as isize + offset;
+        if index < 0 {
+            return None;
         }
+        siblings.get(index as usize).copied()
     }
 
-    fn move_prev_visible(&mut self) {
-        if let Some(current_idx) = self.index_by_node.get(&self.current)
-            && *current_idx > 0
-        {
-            self.current = self.visible_order[current_idx - 1];
+    fn next_after_approval_key(&self, node_id: TreeNodeId) -> Option<NodeKey> {
+        let parent = self.tree.parent(node_id)?;
+        if let Some(next_sibling) = self.sibling_at_offset(node_id, 1) {
+            return Some(NodeKey::from_node(&self.tree, next_sibling));
         }
-    }
-
-    fn depth_of(&self, id: TreeNodeId) -> usize {
-        self.depth_by_node.get(&id).copied().unwrap_or(0)
-    }
-
-    // For minimap: find logical neighbors in the level order
-    fn neighbors(&self) -> (Option<TreeNodeId>, Option<TreeNodeId>) {
-        let depth = self.depth_of(self.current);
-        let nodes = self.visible_by_depth.get(&depth);
-        let pos = nodes
-            .and_then(|list| list.iter().position(|&id| id == self.current))
-            .unwrap_or(0);
-        let left = nodes
-            .and_then(|list| list.get(pos.wrapping_sub(1)).copied())
-            .filter(|_| pos > 0);
-        let right = nodes.and_then(|list| list.get(pos + 1).copied());
-        (left, right)
+        Some(NodeKey::from_node(&self.tree, parent))
     }
 
     fn find_node_by_key(&self, key: &NodeKey) -> Option<TreeNodeId> {
@@ -356,8 +325,8 @@ fn run_app(
                     KeyCode::Char('p') => state.navigator.ascend(),
                     KeyCode::Char('j') | KeyCode::Right => state.navigator.move_next(),
                     KeyCode::Char('k') | KeyCode::Left => state.navigator.move_prev(),
-                    KeyCode::Char('n') => state.navigator.move_next_visible(),
-                    KeyCode::Char('b') => state.navigator.move_prev_visible(),
+                    KeyCode::Char('n') => state.navigator.move_next(),
+                    KeyCode::Char('b') => state.navigator.move_prev(),
                     KeyCode::Char('a') => {
                         handle_action(terminal, context, &mut state, Verdict::Approved)?
                     }
@@ -497,6 +466,8 @@ fn execute_action(
         } => (node_id, verdict, note),
     };
 
+    let next_key = state.navigator.next_after_approval_key(node_id);
+
     with_terminal_suspend(terminal, || {
         let node = state.navigator.tree.node(node_id);
         let fingerprint = match node.kind {
@@ -530,6 +501,11 @@ fn execute_action(
     })?;
 
     refresh_state(context, state)?;
+    if let Some(key) = next_key
+        && let Some(node_id) = state.navigator.find_node_by_key(&key)
+    {
+        state.navigator.set_current(node_id);
+    }
     Ok(())
 }
 
@@ -629,181 +605,23 @@ fn ui(frame: &mut Frame, state: &AppState) {
 
     // 2. Main Layout
     let layout = Layout::vertical([
-        Constraint::Min(0),    // Content + Minimap
+        Constraint::Min(0),    // Content
         Constraint::Length(1), // Footer
     ])
     .split(area);
 
-    let main_area = layout[0];
+    let content_area = layout[0];
     let footer_area = layout[1];
 
-    // 3. Content Area (Minimap | Content)
-    let content_layout = Layout::horizontal([
-        Constraint::Length(28), // Fixed minimap width
-        Constraint::Min(0),     // Content
-    ])
-    .split(main_area);
-
-    render_minimap(frame, state, content_layout[0], &palette);
-    render_active_node(frame, state, content_layout[1], &palette);
-
-    // 4. Footer
+    render_active_node(frame, state, content_area, &palette);
     render_footer(frame, state, footer_area, &palette);
 
-    // 5. Input Overlay
+    // 3. Input Overlay
     if matches!(
         state.input_mode,
         InputMode::Editing { .. } | InputMode::ConfirmBatch { .. }
     ) {
         render_input_overlay(frame, state, area, &palette);
-    }
-}
-
-fn render_minimap(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
-    let block = UiBlock::default()
-        .title(" Map ")
-        .borders(ratatui::widgets::Borders::ALL)
-        .style(Style::default().bg(palette.bg).fg(palette.fg));
-
-    let inner_area = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Vertical layout for the cross:
-    // Top: Parent (centered)
-    // Middle: Left | Current | Right
-    // Bottom: Child (centered)
-    // We have 7 lines available (9 height - 2 borders).
-    // Parent at index 1.
-    // Siblings at index 3.
-    // Child at index 5.
-
-    let mut lines = vec![Line::from(""); 7];
-
-    let current_id = state.navigator.current_id();
-    let parent_id = state.navigator.tree.parent(current_id);
-    let (left_id, right_id) = state.navigator.neighbors();
-
-    // Child: first visible child
-    let node = state.navigator.tree.node(current_id);
-    let child_id = node
-        .children
-        .iter()
-        .find(|&&c| state.navigator.visible_nodes.contains(&c))
-        .copied();
-
-    // 1. Parent Line (Top Center)
-    if let Some(pid) = parent_id {
-        let label = format_node_label(&state.navigator.tree, pid, &state.repo_name);
-        lines[1] = format_center_line(&label, inner_area.width as usize, palette, false);
-    } else {
-        lines[1] = format_center_line("␀", inner_area.width as usize, palette, false);
-    }
-
-    // 2. Siblings Line (Middle)
-    // Layout: [ Left (9) ] [ Current (8) ] [ Right (9) ] = 26 chars
-    let w_side = 9;
-    let w_mid = inner_area.width as usize - (w_side * 2);
-
-    let left_text = left_id
-        .map(|id| format_node_label(&state.navigator.tree, id, &state.repo_name))
-        .unwrap_or_else(|| "␀".to_string());
-    let curr_text = format_node_label(&state.navigator.tree, current_id, &state.repo_name);
-    let right_text = right_id
-        .map(|id| format_node_label(&state.navigator.tree, id, &state.repo_name))
-        .unwrap_or_else(|| "␀".to_string());
-
-    let spans = vec![
-        // Left
-        Span::styled(
-            format_column(&left_text, w_side, Alignment::Right),
-            Style::default().fg(palette.dim).bg(palette.bg),
-        ),
-        // Current (highlighted)
-        Span::styled(
-            format_column(&curr_text, w_mid, Alignment::Center),
-            Style::default()
-                .fg(palette.add)
-                .bg(palette.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        // Right
-        Span::styled(
-            format_column(&right_text, w_side, Alignment::Left),
-            Style::default().fg(palette.dim).bg(palette.bg),
-        ),
-    ];
-    lines[3] = Line::from(spans);
-
-    // 3. Child Line (Bottom Center)
-    if let Some(cid) = child_id {
-        let label = format_node_label(&state.navigator.tree, cid, &state.repo_name);
-        lines[5] = format_center_line(&label, inner_area.width as usize, palette, false);
-    } else {
-        lines[5] = format_center_line("␀", inner_area.width as usize, palette, false);
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines).block(UiBlock::default().style(Style::default().bg(palette.bg))),
-        inner_area,
-    );
-}
-
-fn format_node_label(tree: &Tree, id: TreeNodeId, repo_name: &str) -> String {
-    let node = tree.node(id);
-    match node.kind {
-        TreeNodeKind::Root => repo_name.to_string(),
-        TreeNodeKind::Directory => format!("{}/", node.name),
-        TreeNodeKind::File => node.name.clone(),
-        TreeNodeKind::Block => node
-            .name
-            .split(':')
-            .next()
-            .unwrap_or(&node.name)
-            .to_string(), // Just "function"
-    }
-}
-
-fn format_center_line(text: &str, width: usize, palette: &UiPalette, bold: bool) -> Line<'static> {
-    let style = if bold {
-        Style::default()
-            .fg(palette.add)
-            .bg(palette.bg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.dim).bg(palette.bg)
-    };
-    Line::from(Span::styled(
-        format_column(text, width, Alignment::Center),
-        style,
-    ))
-}
-
-fn format_column(text: &str, width: usize, align: Alignment) -> String {
-    let text_width = text.width();
-    if text_width > width {
-        // Truncate
-        let mut trunc = String::new();
-        let mut w = 0;
-        for c in text.chars() {
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > width {
-                break;
-            }
-            trunc.push(c);
-            w += cw;
-        }
-        return trunc;
-    }
-
-    let padding = width - text_width;
-    match align {
-        Alignment::Left => format!("{}{}", text, " ".repeat(padding)),
-        Alignment::Right => format!("{}{}", " ".repeat(padding), text),
-        Alignment::Center => {
-            let left = padding / 2;
-            let right = padding - left;
-            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
-        }
     }
 }
 
@@ -840,7 +658,7 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
     )));
 
     // Actions Hint
-    let actions_text = "Actions: [a]pprove [x]reject [c]omment [s]descend [p]parent [n]next [b]prev [g]root [q]uit";
+    let actions_text = "Actions: [a]pprove [x]reject [c]omment [s]descend [p]parent [n]next sibling [b]prev sibling [g]root [q]uit";
     let actions_line = Line::from(Span::styled(
         actions_text,
         Style::default()
@@ -851,10 +669,11 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
 
     // Content
     let content_lines = if let Some(block) = &node.block {
+        let language = node.language.clone();
         block
             .content
             .lines()
-            .map(|l| format_code_line(l, palette))
+            .map(|line| format_code_line(line, palette, language.as_ref()))
             .collect::<Vec<_>>()
     } else {
         vec![Line::from(Span::styled(
@@ -971,6 +790,9 @@ struct UiPalette {
     dim: Color,
     add: Color,
     del: Color,
+    keyword: Color,
+    string: Color,
+    number: Color,
     code_bg: Color,
 }
 
@@ -983,12 +805,39 @@ impl Default for UiPalette {
             dim: Color::Rgb(146, 131, 116),
             add: Color::Rgb(184, 187, 38),
             del: Color::Rgb(251, 73, 52),
+            keyword: Color::Rgb(69, 133, 136),
+            string: Color::Rgb(215, 153, 33),
+            number: Color::Rgb(177, 98, 134),
             code_bg: Color::Rgb(240, 240, 238),
         }
     }
 }
 
-fn format_code_line(line: &str, palette: &UiPalette) -> Line<'static> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Base,
+    Keyword,
+    String,
+    Number,
+    Comment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HighlightToken {
+    text: String,
+    kind: TokenKind,
+}
+
+impl HighlightToken {
+    fn new(text: impl Into<String>, kind: TokenKind) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+        }
+    }
+}
+
+fn format_code_line(line: &str, palette: &UiPalette, language: Option<&Language>) -> Line<'static> {
     let gutter_left = 4;
     let gutter_right = 2;
     let gutter_spacing = " ".repeat(gutter_left + gutter_right + 1);
@@ -1017,21 +866,239 @@ fn format_code_line(line: &str, palette: &UiPalette) -> Line<'static> {
         ]);
     }
 
+    let gutter_style = Style::default().fg(palette.dim).bg(palette.code_bg);
+    let tokens = highlight_line(line, language);
+    let mut spans = Vec::with_capacity(tokens.len() + 1);
+    spans.push(Span::styled(gutter_spacing, gutter_style));
+    for token in tokens {
+        let style = style_for_token(&token.kind, palette);
+        spans.push(Span::styled(token.text, style));
+    }
+    Line::from(spans)
+}
+
+fn highlight_line(line: &str, language: Option<&Language>) -> Vec<HighlightToken> {
     let trimmed = line.trim_start();
-    let comment_style = if trimmed.starts_with("//")
+    if trimmed.starts_with("//")
         || trimmed.starts_with('#')
         || trimmed.starts_with("/*")
         || trimmed.starts_with('*')
     {
-        Style::default().fg(palette.dim).bg(palette.code_bg)
-    } else {
-        Style::default().fg(palette.code_fg).bg(palette.code_bg)
+        return vec![HighlightToken::new(line.to_string(), TokenKind::Comment)];
+    }
+
+    let mut tokens = Vec::new();
+    let mut buffer = String::new();
+    let mut in_string = false;
+    let mut string_delim = '\0';
+    let chars = line.chars().peekable();
+
+    for ch in chars {
+        if in_string {
+            buffer.push(ch);
+            if ch == string_delim {
+                tokens.push(HighlightToken::new(
+                    std::mem::take(&mut buffer),
+                    TokenKind::String,
+                ));
+                in_string = false;
+            }
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'') {
+            if !buffer.is_empty() {
+                tokens.extend(tokenize_buffer(&buffer, language));
+                buffer.clear();
+            }
+            buffer.push(ch);
+            in_string = true;
+            string_delim = ch;
+            continue;
+        }
+
+        buffer.push(ch);
+    }
+
+    if !buffer.is_empty() {
+        let kind = if in_string {
+            TokenKind::String
+        } else {
+            TokenKind::Base
+        };
+        if in_string {
+            tokens.push(HighlightToken::new(buffer, kind));
+        } else {
+            tokens.extend(tokenize_buffer(&buffer, language));
+        }
+    }
+
+    if tokens.is_empty() {
+        tokens.push(HighlightToken::new(line.to_string(), TokenKind::Base));
+    }
+
+    tokens
+}
+
+fn tokenize_buffer(buffer: &str, language: Option<&Language>) -> Vec<HighlightToken> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in buffer.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else {
+            flush_word_token(&mut tokens, &mut current, language);
+            tokens.push(HighlightToken::new(ch.to_string(), TokenKind::Base));
+        }
+    }
+
+    flush_word_token(&mut tokens, &mut current, language);
+    tokens
+}
+
+fn flush_word_token(
+    tokens: &mut Vec<HighlightToken>,
+    current: &mut String,
+    language: Option<&Language>,
+) {
+    if current.is_empty() {
+        return;
+    }
+
+    let kind = classify_word_token(current, language);
+    tokens.push(HighlightToken::new(std::mem::take(current), kind));
+}
+
+fn classify_word_token(word: &str, language: Option<&Language>) -> TokenKind {
+    if word.chars().all(|ch| ch.is_ascii_digit()) {
+        return TokenKind::Number;
+    }
+
+    let Some(language) = language else {
+        return TokenKind::Base;
     };
-    let gutter_style = Style::default().fg(palette.dim).bg(palette.code_bg);
-    Line::from(vec![
-        Span::styled(gutter_spacing, gutter_style),
-        Span::styled(line.to_string(), comment_style),
-    ])
+
+    let is_keyword = match language {
+        Language::Rust => matches!(
+            word,
+            "fn" | "struct"
+                | "enum"
+                | "impl"
+                | "mod"
+                | "use"
+                | "pub"
+                | "let"
+                | "mut"
+                | "match"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "loop"
+                | "return"
+                | "async"
+                | "await"
+                | "crate"
+                | "super"
+                | "self"
+                | "Self"
+                | "const"
+                | "static"
+                | "trait"
+                | "type"
+        ),
+        Language::Python => matches!(
+            word,
+            "def"
+                | "class"
+                | "import"
+                | "from"
+                | "as"
+                | "if"
+                | "elif"
+                | "else"
+                | "for"
+                | "while"
+                | "return"
+                | "yield"
+                | "async"
+                | "await"
+                | "with"
+                | "try"
+                | "except"
+                | "finally"
+                | "lambda"
+                | "pass"
+                | "break"
+                | "continue"
+        ),
+        Language::JavaScript | Language::TypeScript => matches!(
+            word,
+            "function"
+                | "class"
+                | "import"
+                | "export"
+                | "const"
+                | "let"
+                | "var"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "return"
+                | "async"
+                | "await"
+                | "try"
+                | "catch"
+                | "finally"
+                | "switch"
+                | "case"
+                | "break"
+                | "continue"
+                | "new"
+        ),
+        Language::Shell => matches!(
+            word,
+            "function"
+                | "if"
+                | "then"
+                | "fi"
+                | "for"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "in"
+                | "while"
+                | "until"
+                | "return"
+                | "local"
+        ),
+        Language::Markdown
+        | Language::Text
+        | Language::Toml
+        | Language::Nix
+        | Language::Just
+        | Language::Elisp
+        | Language::Unknown => false,
+    };
+
+    if is_keyword {
+        TokenKind::Keyword
+    } else {
+        TokenKind::Base
+    }
+}
+
+fn style_for_token(token: &TokenKind, palette: &UiPalette) -> Style {
+    match token {
+        TokenKind::Base => Style::default().fg(palette.code_fg).bg(palette.code_bg),
+        TokenKind::Keyword => Style::default().fg(palette.keyword).bg(palette.code_bg),
+        TokenKind::String => Style::default().fg(palette.string).bg(palette.code_bg),
+        TokenKind::Number => Style::default().fg(palette.number).bg(palette.code_bg),
+        TokenKind::Comment => Style::default().fg(palette.dim).bg(palette.code_bg),
+    }
 }
 
 #[cfg(test)]
@@ -1055,9 +1122,10 @@ mod tests {
     }
 
     #[test]
-    fn navigator_moves_across_parents() {
+    fn navigator_moves_within_parent_siblings() {
         let block_a = build_block("hash-a", BlockKind::Function, 0);
-        let block_b = build_block("hash-b", BlockKind::Function, 0);
+        let block_b = build_block("hash-b", BlockKind::Function, 2);
+        let block_c = build_block("hash-c", BlockKind::Function, 4);
         let mut builder = TreeBuilder::new();
         let root = builder.root();
         let dir_a = builder.add_dir(root, "alpha".to_string(), "alpha".to_string());
@@ -1075,6 +1143,13 @@ mod tests {
             block_a,
             Language::Rust,
         );
+        builder.add_block(
+            file_a,
+            block_b.kind.as_str().to_string(),
+            "alpha/a.rs".to_string(),
+            block_b,
+            Language::Rust,
+        );
         let dir_b = builder.add_dir(root, "beta".to_string(), "beta".to_string());
         let file_b = builder.add_file(
             dir_b,
@@ -1085,9 +1160,9 @@ mod tests {
         );
         builder.add_block(
             file_b,
-            block_b.kind.as_str().to_string(),
+            block_c.kind.as_str().to_string(),
             "beta/b.rs".to_string(),
-            block_b,
+            block_c,
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -1100,12 +1175,66 @@ mod tests {
         let mut navigator = ReviewNavigator::new(tree, block_nodes).expect("navigator");
         let block_b_id = navigator
             .tree
-            .node_by_path_and_hash("beta/b.rs", "hash-b")
+            .node_by_path_and_hash("alpha/a.rs", "hash-b")
             .expect("block b");
         navigator.set_current(block_b_id);
         navigator.move_prev();
         let current = navigator.current_id();
         let current_node = navigator.tree.node(current);
         assert_eq!(current_node.hash, "hash-a");
+        navigator.move_prev();
+        let current = navigator.current_id();
+        let current_node = navigator.tree.node(current);
+        assert_eq!(current_node.hash, "hash-a");
+    }
+
+    #[test]
+    fn navigator_next_after_approval_prefers_next_sibling() {
+        let block_a = build_block("hash-a", BlockKind::Function, 0);
+        let block_b = build_block("hash-b", BlockKind::Function, 2);
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let dir_a = builder.add_dir(root, "alpha".to_string(), "alpha".to_string());
+        let file_a = builder.add_file(
+            dir_a,
+            "a.rs".to_string(),
+            "alpha/a.rs".to_string(),
+            "file-a".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file_a,
+            block_a.kind.as_str().to_string(),
+            "alpha/a.rs".to_string(),
+            block_a,
+            Language::Rust,
+        );
+        builder.add_block(
+            file_a,
+            block_b.kind.as_str().to_string(),
+            "alpha/a.rs".to_string(),
+            block_b,
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let block_nodes: HashSet<_> = tree
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == tree::TreeNodeKind::Block)
+            .map(|node| node.id)
+            .collect();
+        let navigator = ReviewNavigator::new(tree, block_nodes).expect("navigator");
+        let block_a_id = navigator
+            .tree
+            .node_by_path_and_hash("alpha/a.rs", "hash-a")
+            .expect("block a");
+        let block_b_id = navigator
+            .tree
+            .node_by_path_and_hash("alpha/a.rs", "hash-b")
+            .expect("block b");
+        let next_from_a = navigator.next_after_approval_key(block_a_id);
+        assert_eq!(next_from_a, Some(NodeKey::Block("hash-b".to_string())));
+        let next_from_b = navigator.next_after_approval_key(block_b_id);
+        assert_eq!(next_from_b, Some(NodeKey::File("alpha/a.rs".to_string())));
     }
 }
