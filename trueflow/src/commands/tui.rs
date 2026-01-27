@@ -254,7 +254,7 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
         .filter(|&&id| matches!(summary.tree.node(id).kind, TreeNodeKind::Block))
         .count();
 
-    let mut state = AppState {
+    let state = AppState {
         navigator: ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?,
         total_blocks: summary.total_blocks,
         remaining_blocks,
@@ -655,8 +655,6 @@ fn ui(frame: &mut Frame, state: &AppState) {
 fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
     let node = state.navigator.tree.node(state.navigator.current_id());
 
-    // Header
-    let mut header_lines = Vec::new();
     let title = match node.kind {
         TreeNodeKind::Root => format!("Root: {}", state.repo_name),
         TreeNodeKind::Directory => format!("Directory: {}/", node.name),
@@ -664,27 +662,20 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
         TreeNodeKind::Block => format!("Block: {}", node.name),
     };
 
-    header_lines.push(Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(palette.fg)
-            .bg(palette.bg)
-            .add_modifier(Modifier::BOLD),
-    )));
+    let mut header_lines = Vec::new();
+    header_lines.push(format_metadata_row("Title", &title, palette, true));
 
     if !node.path.is_empty() {
-        header_lines.push(Line::from(Span::styled(
-            format!("Path: {}", node.path),
-            Style::default().fg(palette.dim).bg(palette.bg),
-        )));
+        header_lines.push(format_metadata_row("Path", &node.path, palette, false));
     }
 
-    header_lines.push(Line::from(Span::styled(
-        format!("Hash: {}", &node.hash[..node.hash.len().min(12)]),
-        Style::default().fg(palette.dim).bg(palette.bg),
-    )));
+    header_lines.push(format_metadata_row(
+        "Hash",
+        &node.hash[..node.hash.len().min(12)],
+        palette,
+        false,
+    ));
 
-    // Actions Hint
     let actions_text = "Actions: [a]pprove [x]reject [c]omment [s]descend [p]parent [n]next sibling [b]prev sibling [g]root [q]uit";
     let actions_line = Line::from(Span::styled(
         actions_text,
@@ -694,7 +685,6 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
             .add_modifier(Modifier::BOLD),
     ));
 
-    // Content
     let content_lines = if let Some(block) = &node.block {
         let language = node.language.clone();
         block
@@ -709,25 +699,30 @@ fn render_active_node(frame: &mut Frame, state: &AppState, area: Rect, palette: 
         ))]
     };
 
-    let layout = Layout::vertical([
-        Constraint::Length(header_lines.len() as u16 + 1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let focus_layout = compute_focus_layout(area, header_lines.len() as u16);
 
-    frame.render_widget(Paragraph::new(header_lines), layout[0]);
+    let meta_block = UiBlock::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(palette.meta_border).bg(palette.meta_bg))
+        .style(Style::default().bg(palette.meta_bg).fg(palette.fg));
+
+    frame.render_widget(
+        Paragraph::new(header_lines)
+            .block(meta_block)
+            .alignment(Alignment::Left),
+        focus_layout.meta,
+    );
 
     frame.render_widget(
         Paragraph::new(content_lines)
             .block(UiBlock::default().style(Style::default().bg(palette.code_bg)))
             .wrap(Wrap { trim: false }),
-        layout[1],
+        focus_layout.code,
     );
 
     frame.render_widget(
         Paragraph::new(actions_line).alignment(Alignment::Center),
-        layout[2],
+        focus_layout.actions,
     );
 }
 
@@ -810,6 +805,109 @@ fn centered_rect(r: Rect, percent_x: u16, percent_y: u16) -> Rect {
     .split(popup_layout[1])[1]
 }
 
+struct FocusLayout {
+    meta: Rect,
+    code: Rect,
+    actions: Rect,
+}
+
+fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
+    let code_width = area.width.min(120);
+    let desired_code_height = area.height.min(32);
+    let padding = ((area.height as f32) * 0.05).round() as u16;
+
+    let available_height = area.height.saturating_sub(padding * 2);
+    let total_height = (header_lines + desired_code_height + 1).min(available_height.max(1));
+    let header_height = header_lines.min(total_height.saturating_sub(1));
+    let remaining = total_height.saturating_sub(header_height + 1);
+    let code_height = desired_code_height.min(remaining.max(1));
+
+    let content_top = area.y + (area.height.saturating_sub(total_height)) / 2;
+    let content_left = area.x + (area.width.saturating_sub(code_width)) / 2;
+
+    let meta = Rect {
+        x: content_left,
+        y: content_top,
+        width: code_width,
+        height: header_height,
+    };
+
+    let code = Rect {
+        x: content_left,
+        y: content_top + header_height,
+        width: code_width,
+        height: code_height,
+    };
+
+    let actions = Rect {
+        x: content_left,
+        y: content_top + header_height + code_height,
+        width: code_width,
+        height: 1,
+    };
+
+    FocusLayout {
+        meta,
+        code,
+        actions,
+    }
+}
+
+#[cfg(test)]
+mod focus_layout_tests {
+    use super::*;
+
+    #[test]
+    fn focus_layout_shrinks_when_area_is_small() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        let layout = compute_focus_layout(area, 3);
+        assert!(layout.code.width <= 80);
+        assert!(layout.code.height <= 20);
+        assert!(layout.meta.y >= area.y);
+    }
+
+    #[test]
+    fn focus_layout_centers_when_space_allows() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
+        let layout = compute_focus_layout(area, 3);
+        assert_eq!(layout.code.width, 120);
+        assert_eq!(layout.actions.height, 1);
+        assert!(layout.code.y > area.y);
+    }
+}
+
+fn format_metadata_row(label: &str, value: &str, palette: &UiPalette, bold: bool) -> Line<'static> {
+    let label_text = format!("{label}:");
+    let label_style = Style::default()
+        .fg(palette.dim)
+        .bg(palette.meta_bg)
+        .add_modifier(Modifier::BOLD);
+    let value_style = if bold {
+        Style::default()
+            .fg(palette.fg)
+            .bg(palette.meta_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.fg).bg(palette.meta_bg)
+    };
+
+    Line::from(vec![
+        Span::styled(label_text, label_style),
+        Span::styled(" ".to_string(), value_style),
+        Span::styled(value.to_string(), value_style),
+    ])
+}
+
 struct UiPalette {
     bg: Color,
     fg: Color,
@@ -821,6 +919,8 @@ struct UiPalette {
     string: Color,
     number: Color,
     code_bg: Color,
+    meta_bg: Color,
+    meta_border: Color,
 }
 
 impl Default for UiPalette {
@@ -836,6 +936,8 @@ impl Default for UiPalette {
             string: Color::Rgb(215, 153, 33),
             number: Color::Rgb(177, 98, 134),
             code_bg: Color::Rgb(240, 240, 238),
+            meta_bg: Color::Rgb(244, 244, 242),
+            meta_border: Color::Rgb(204, 204, 200),
         }
     }
 }
