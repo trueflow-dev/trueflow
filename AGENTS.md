@@ -26,6 +26,7 @@
 - For system dependencies; always try to manage these in `flake.nix`.
 - Always prefer `trash` (from `trash-cli`) to `rm` for deleting files.
 - Prefer the functional core, imperative shell pattern.
-- Use `bd` (beads) for task tracking instead of `todowrite` whenever possible.
+- Push TODOs and nice to haves to todowrite, generally accepting opportunities
+  to improve tests, maintainability, correctness.
 - Be extremely picky about dependencies. When choosing dependencies, offer
   options and make a point to confirm before choosing.
