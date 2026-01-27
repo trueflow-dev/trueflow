@@ -240,6 +240,7 @@ struct AppState {
     input_buffer: String,
     confirm_batch: bool,
     repo_name: String,
+    last_frame: std::time::Instant,
 }
 
 pub fn run(context: &TrueflowContext) -> Result<()> {
@@ -247,18 +248,22 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
     let config = load_config()?;
     let summary = load_review_state(context)?;
 
+    let remaining_blocks = summary
+        .unreviewed_block_nodes
+        .iter()
+        .filter(|&&id| matches!(summary.tree.node(id).kind, TreeNodeKind::Block))
+        .count();
+
     let mut state = AppState {
         navigator: ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?,
         total_blocks: summary.total_blocks,
-        remaining_blocks: summary.total_blocks, // Initial load
+        remaining_blocks,
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
         confirm_batch: config.tui.confirm_batch,
         repo_name: detect_repo_name(context),
+        last_frame: std::time::Instant::now(),
     };
-
-    // Refresh initially to get correct remaining counts
-    refresh_state(context, &mut state)?;
 
     let run_result = run_app(context, &mut terminal, state);
     restore_terminal(&mut terminal)?;
@@ -287,8 +292,14 @@ fn run_app(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     mut state: AppState,
 ) -> Result<()> {
+    let mut needs_render = true;
+
     loop {
-        terminal.draw(|f| ui(f, &state))?;
+        if needs_render || state.last_frame.elapsed().as_millis() >= 250 {
+            terminal.draw(|f| ui(f, &state))?;
+            state.last_frame = std::time::Instant::now();
+            needs_render = false;
+        }
 
         if event::poll(std::time::Duration::from_millis(16))?
             && let Event::Key(key) = event::read()?
@@ -297,36 +308,76 @@ fn run_app(
             match &state.input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('s') => state.navigator.descend(),
-                    KeyCode::Char('p') => state.navigator.ascend(),
-                    KeyCode::Char('j') | KeyCode::Right => state.navigator.move_next(),
-                    KeyCode::Char('k') | KeyCode::Left => state.navigator.move_prev(),
-                    KeyCode::Char('n') => state.navigator.move_next(),
-                    KeyCode::Char('b') => state.navigator.move_prev(),
+                    KeyCode::Char('s') => {
+                        state.navigator.descend();
+                        needs_render = true;
+                    }
+                    KeyCode::Char('p') => {
+                        state.navigator.ascend();
+                        needs_render = true;
+                    }
+                    KeyCode::Char('j') | KeyCode::Right => {
+                        state.navigator.move_next();
+                        needs_render = true;
+                    }
+                    KeyCode::Char('k') | KeyCode::Left => {
+                        state.navigator.move_prev();
+                        needs_render = true;
+                    }
+                    KeyCode::Char('n') => {
+                        state.navigator.move_next();
+                        needs_render = true;
+                    }
+                    KeyCode::Char('b') => {
+                        state.navigator.move_prev();
+                        needs_render = true;
+                    }
                     KeyCode::Char('a') => {
-                        handle_action(terminal, context, &mut state, Verdict::Approved)?
+                        handle_action(terminal, context, &mut state, Verdict::Approved)?;
+                        needs_render = true;
                     }
                     KeyCode::Char('x') => {
-                        handle_action(terminal, context, &mut state, Verdict::Rejected)?
+                        handle_action(terminal, context, &mut state, Verdict::Rejected)?;
+                        needs_render = true;
                     }
-                    KeyCode::Char('c') => handle_comment_action(&mut state)?,
-                    KeyCode::Char('g') => state.navigator.jump_root(),
+                    KeyCode::Char('c') => {
+                        handle_comment_action(&mut state)?;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('g') => {
+                        state.navigator.jump_root();
+                        needs_render = true;
+                    }
                     _ => {}
                 },
                 InputMode::Editing { .. } => match key.code {
-                    KeyCode::Enter => handle_editing_submit(terminal, context, &mut state)?,
-                    KeyCode::Esc => handle_editing_cancel(&mut state),
+                    KeyCode::Enter => {
+                        handle_editing_submit(terminal, context, &mut state)?;
+                        needs_render = true;
+                    }
+                    KeyCode::Esc => {
+                        handle_editing_cancel(&mut state);
+                        needs_render = true;
+                    }
                     KeyCode::Backspace => {
                         state.input_buffer.pop();
+                        needs_render = true;
                     }
                     KeyCode::Char(c) => {
                         state.input_buffer.push(c);
+                        needs_render = true;
                     }
                     _ => {}
                 },
                 InputMode::ConfirmBatch { .. } => match key.code {
-                    KeyCode::Enter => handle_confirm_batch(terminal, context, &mut state)?,
-                    KeyCode::Esc => handle_confirm_cancel(&mut state),
+                    KeyCode::Enter => {
+                        handle_confirm_batch(terminal, context, &mut state)?;
+                        needs_render = true;
+                    }
+                    KeyCode::Esc => {
+                        handle_confirm_cancel(&mut state);
+                        needs_render = true;
+                    }
                     _ => {}
                 },
             }
