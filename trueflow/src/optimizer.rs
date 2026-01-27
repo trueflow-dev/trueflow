@@ -3,6 +3,7 @@ use std::mem;
 
 pub fn optimize(blocks: Vec<Block>) -> Vec<Block> {
     let blocks = optimize_imports(blocks);
+    let blocks = optimize_modules(blocks);
     optimize_code_paragraphs(blocks)
 }
 
@@ -57,6 +58,39 @@ fn optimize_code_paragraphs(blocks: Vec<Block>) -> Vec<Block> {
                 None,
             )
         },
+    )
+}
+
+fn optimize_modules(blocks: Vec<Block>) -> Vec<Block> {
+    optimize_sequence(
+        blocks,
+        |block, buffer| {
+            if !matches!(
+                block.kind,
+                BlockKind::Module | BlockKind::Gap | BlockKind::Comment
+            ) {
+                return Decision::FlushAndEmit;
+            }
+
+            if matches!(block.kind, BlockKind::Gap | BlockKind::Comment) {
+                return Decision::Buffer;
+            }
+
+            let start_line = buffer
+                .iter()
+                .find(|b| b.kind == BlockKind::Module)
+                .map(|b| b.start_line)
+                .unwrap_or(block.start_line);
+            let end_line = block.end_line;
+            let size = end_line.saturating_sub(start_line);
+
+            if size > 48 {
+                Decision::FlushAndBuffer
+            } else {
+                Decision::Buffer
+            }
+        },
+        |buffer| flush_blocks(buffer, BlockKind::Module, BlockKind::Modules, None),
     )
 }
 

@@ -314,7 +314,7 @@ fn kind_rank(block: &Block) -> u8 {
         | BlockKind::Interface
         | BlockKind::Class => 0,
         BlockKind::FunctionSignature => 20,
-        BlockKind::Import | BlockKind::Module | BlockKind::Imports => 25,
+        BlockKind::Import | BlockKind::Module | BlockKind::Modules | BlockKind::Imports => 25,
         BlockKind::Const | BlockKind::Static => 30,
         BlockKind::Impl => 40,
         BlockKind::Function | BlockKind::Method => 50,

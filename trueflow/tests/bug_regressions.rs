@@ -29,6 +29,24 @@ fn test_optimizer_import_merge_preserves_content() {
 }
 
 #[test]
+fn test_optimizer_module_merge_preserves_content() {
+    let blocks = vec![
+        Block::new("mod a;\n".to_string(), BlockKind::Module, 0, 1),
+        Block::new("// comment\n".to_string(), BlockKind::Comment, 1, 2),
+        Block::new("\n".to_string(), BlockKind::Gap, 2, 3),
+        Block::new("mod b;\n".to_string(), BlockKind::Module, 3, 4),
+    ];
+
+    let expected: String = blocks.iter().map(|b| b.content.as_str()).collect();
+    let optimized = optimizer::optimize(blocks);
+
+    assert_eq!(optimized.len(), 1);
+    assert_eq!(optimized[0].kind, BlockKind::Modules);
+    assert_eq!(optimized[0].content, expected);
+    assert_eq!(optimized[0].hash, hash_str(&optimized[0].content));
+}
+
+#[test]
 fn test_diff_new_content_matches_post_hunk() -> Result<()> {
     let repo = TestRepo::new("diff_new_content")?;
     repo.write(

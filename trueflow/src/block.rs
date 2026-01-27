@@ -29,6 +29,8 @@ pub enum BlockKind {
     Impl,
     #[serde(rename = "module")]
     Module,
+    #[serde(rename = "Modules")]
+    Modules,
     #[serde(rename = "import")]
     Import,
     #[serde(rename = "const")]
@@ -93,6 +95,7 @@ impl BlockKind {
             BlockKind::Enum => "enum",
             BlockKind::Impl => "impl",
             BlockKind::Module => "module",
+            BlockKind::Modules => "Modules",
             BlockKind::Import => "import",
             BlockKind::Const => "const",
             BlockKind::Static => "static",
@@ -148,6 +151,7 @@ impl FromStr for BlockKind {
             "enum" => BlockKind::Enum,
             "impl" => BlockKind::Impl,
             "module" => BlockKind::Module,
+            "modules" => BlockKind::Modules,
             "import" => BlockKind::Import,
             "const" => BlockKind::Const,
             "static" => BlockKind::Static,
@@ -275,6 +279,7 @@ mod tests {
             BlockKind::Enum,
             BlockKind::Impl,
             BlockKind::Module,
+            BlockKind::Modules,
             BlockKind::Import,
             BlockKind::Const,
             BlockKind::Static,
