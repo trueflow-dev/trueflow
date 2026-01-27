@@ -18,7 +18,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block as UiBlock, Gauge, Paragraph, Wrap},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 
 // --- Core Structs ---
@@ -47,9 +47,6 @@ struct ReviewNavigator {
     tree: Tree,
     visible_nodes: HashSet<TreeNodeId>,
     current: TreeNodeId,
-    siblings_by_node: HashMap<TreeNodeId, Vec<TreeNodeId>>,
-    sibling_index_by_node: HashMap<TreeNodeId, usize>,
-    first_child_by_node: HashMap<TreeNodeId, TreeNodeId>,
 }
 
 impl ReviewNavigator {
@@ -66,46 +63,10 @@ impl ReviewNavigator {
         let root = tree.root();
         visible_nodes.insert(root);
 
-        let mut siblings_by_node: HashMap<TreeNodeId, Vec<TreeNodeId>> = HashMap::new();
-        let mut sibling_index_by_node: HashMap<TreeNodeId, usize> = HashMap::new();
-        let mut first_child_by_node = HashMap::new();
-
-        let mut stack = vec![root];
-        while let Some(node_id) = stack.pop() {
-            if !visible_nodes.contains(&node_id) {
-                continue;
-            }
-
-            let node = tree.node(node_id);
-            let mut children: Vec<TreeNodeId> = node
-                .children
-                .iter()
-                .copied()
-                .filter(|child| visible_nodes.contains(child))
-                .collect();
-            if let Some(first_child) = children.first().copied() {
-                first_child_by_node.insert(node_id, first_child);
-            }
-
-            for (index, child) in children.iter().enumerate() {
-                siblings_by_node.insert(*child, children.clone());
-                sibling_index_by_node.insert(*child, index);
-            }
-
-            // stack is LIFO; push in reverse to preserve order
-            children.reverse();
-            for child in children {
-                stack.push(child);
-            }
-        }
-
         Ok(Self {
             tree,
             visible_nodes,
             current: root,
-            siblings_by_node,
-            sibling_index_by_node,
-            first_child_by_node,
         })
     }
 
@@ -124,8 +85,15 @@ impl ReviewNavigator {
     }
 
     fn descend(&mut self) {
-        if let Some(child) = self.first_child_by_node.get(&self.current) {
-            self.current = *child;
+        if let Some(child) = self
+            .tree
+            .node(self.current)
+            .children
+            .iter()
+            .copied()
+            .find(|child| self.visible_nodes.contains(child))
+        {
+            self.current = child;
         }
     }
 
@@ -152,8 +120,16 @@ impl ReviewNavigator {
     }
 
     fn sibling_at_offset(&self, node_id: TreeNodeId, offset: isize) -> Option<TreeNodeId> {
-        let siblings = self.siblings_by_node.get(&node_id)?;
-        let index = *self.sibling_index_by_node.get(&node_id)? as isize + offset;
+        let parent = self.tree.parent(node_id)?;
+        let siblings: Vec<TreeNodeId> = self
+            .tree
+            .node(parent)
+            .children
+            .iter()
+            .copied()
+            .filter(|child| self.visible_nodes.contains(child))
+            .collect();
+        let index = siblings.iter().position(|&id| id == node_id)? as isize + offset;
         if index < 0 {
             return None;
         }
@@ -970,6 +946,29 @@ fn flush_word_token(
     tokens.push(HighlightToken::new(std::mem::take(current), kind));
 }
 
+const RUST_KEYWORDS: &[&str] = &[
+    "fn", "struct", "enum", "impl", "mod", "use", "pub", "let", "mut", "match", "if", "else",
+    "for", "while", "loop", "return", "async", "await", "crate", "super", "self", "Self", "const",
+    "static", "trait", "type",
+];
+
+const PYTHON_KEYWORDS: &[&str] = &[
+    "def", "class", "import", "from", "as", "if", "elif", "else", "for", "while", "return",
+    "yield", "async", "await", "with", "try", "except", "finally", "lambda", "pass", "break",
+    "continue",
+];
+
+const JS_KEYWORDS: &[&str] = &[
+    "function", "class", "import", "export", "const", "let", "var", "if", "else", "for", "while",
+    "return", "async", "await", "try", "catch", "finally", "switch", "case", "break", "continue",
+    "new",
+];
+
+const SHELL_KEYWORDS: &[&str] = &[
+    "function", "if", "then", "fi", "for", "do", "done", "case", "esac", "in", "while", "until",
+    "return", "local",
+];
+
 fn classify_word_token(word: &str, language: Option<&Language>) -> TokenKind {
     if word.chars().all(|ch| ch.is_ascii_digit()) {
         return TokenKind::Number;
@@ -979,115 +978,36 @@ fn classify_word_token(word: &str, language: Option<&Language>) -> TokenKind {
         return TokenKind::Base;
     };
 
-    let is_keyword = match language {
-        Language::Rust => matches!(
-            word,
-            "fn" | "struct"
-                | "enum"
-                | "impl"
-                | "mod"
-                | "use"
-                | "pub"
-                | "let"
-                | "mut"
-                | "match"
-                | "if"
-                | "else"
-                | "for"
-                | "while"
-                | "loop"
-                | "return"
-                | "async"
-                | "await"
-                | "crate"
-                | "super"
-                | "self"
-                | "Self"
-                | "const"
-                | "static"
-                | "trait"
-                | "type"
-        ),
-        Language::Python => matches!(
-            word,
-            "def"
-                | "class"
-                | "import"
-                | "from"
-                | "as"
-                | "if"
-                | "elif"
-                | "else"
-                | "for"
-                | "while"
-                | "return"
-                | "yield"
-                | "async"
-                | "await"
-                | "with"
-                | "try"
-                | "except"
-                | "finally"
-                | "lambda"
-                | "pass"
-                | "break"
-                | "continue"
-        ),
-        Language::JavaScript | Language::TypeScript => matches!(
-            word,
-            "function"
-                | "class"
-                | "import"
-                | "export"
-                | "const"
-                | "let"
-                | "var"
-                | "if"
-                | "else"
-                | "for"
-                | "while"
-                | "return"
-                | "async"
-                | "await"
-                | "try"
-                | "catch"
-                | "finally"
-                | "switch"
-                | "case"
-                | "break"
-                | "continue"
-                | "new"
-        ),
-        Language::Shell => matches!(
-            word,
-            "function"
-                | "if"
-                | "then"
-                | "fi"
-                | "for"
-                | "do"
-                | "done"
-                | "case"
-                | "esac"
-                | "in"
-                | "while"
-                | "until"
-                | "return"
-                | "local"
-        ),
+    let keywords = match language {
+        Language::Rust => Some(RUST_KEYWORDS),
+        Language::Python => Some(PYTHON_KEYWORDS),
+        Language::JavaScript | Language::TypeScript => Some(JS_KEYWORDS),
+        Language::Shell => Some(SHELL_KEYWORDS),
         Language::Markdown
         | Language::Text
         | Language::Toml
         | Language::Nix
         | Language::Just
         | Language::Elisp
-        | Language::Unknown => false,
+        | Language::Unknown => None,
     };
 
-    if is_keyword {
+    if keywords.is_some_and(|list| list.contains(&word)) {
         TokenKind::Keyword
     } else {
         TokenKind::Base
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+    use crate::analysis::Language;
+
+    #[test]
+    fn highlight_keywords_from_static_table() {
+        let tokens = highlight_line("fn main()", Some(&Language::Rust));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Keyword));
     }
 }
 
@@ -1104,7 +1024,6 @@ fn style_for_token(token: &TokenKind, palette: &UiPalette) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::Language;
     use crate::block::{Block, BlockKind};
     use crate::tree::{self, TreeBuilder};
     use std::collections::HashSet;
