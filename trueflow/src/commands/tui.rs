@@ -798,6 +798,42 @@ fn build_content_lines(
     palette: &UiPalette,
     code_height: u16,
 ) -> Vec<Line<'static>> {
+    match node.kind {
+        TreeNodeKind::Block => build_block_lines(state, node, palette, code_height),
+        TreeNodeKind::File => build_file_lines(state, node, palette, code_height),
+        TreeNodeKind::Directory => build_directory_lines(state, node, palette, code_height),
+        TreeNodeKind::Root => vec![Line::from(Span::styled(
+            "(Select a node)",
+            Style::default().fg(palette.context).bg(palette.code_bg),
+        ))],
+    }
+}
+
+fn load_file_lines(state: &mut AppState, node: &crate::tree::TreeNode) -> Option<Vec<String>> {
+    if node.path.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(&node.path);
+    if let Some(lines) = state.file_cache.get(&path) {
+        return Some(lines.clone());
+    }
+
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let lines = contents
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    state.file_cache.insert(path, lines.clone());
+    Some(lines)
+}
+
+fn build_block_lines(
+    state: &mut AppState,
+    node: &crate::tree::TreeNode,
+    palette: &UiPalette,
+    code_height: u16,
+) -> Vec<Line<'static>> {
     let Some(block) = &node.block else {
         return vec![Line::from(Span::styled(
             "(No content)",
@@ -882,23 +918,93 @@ fn build_content_lines(
     lines
 }
 
-fn load_file_lines(state: &mut AppState, node: &crate::tree::TreeNode) -> Option<Vec<String>> {
-    if node.path.is_empty() {
-        return None;
-    }
+fn build_file_lines(
+    state: &mut AppState,
+    node: &crate::tree::TreeNode,
+    palette: &UiPalette,
+    code_height: u16,
+) -> Vec<Line<'static>> {
+    let language = node.language.clone();
+    let Some(file_lines) = load_file_lines(state, node) else {
+        return vec![Line::from(Span::styled(
+            "(File missing)",
+            Style::default().fg(palette.context).bg(palette.code_bg),
+        ))];
+    };
 
-    let path = PathBuf::from(&node.path);
-    if let Some(lines) = state.file_cache.get(&path) {
-        return Some(lines.clone());
-    }
-
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let lines = contents
-        .lines()
-        .map(|line| line.to_string())
+    let max_lines = code_height as usize;
+    let mut lines = file_lines
+        .iter()
+        .take(max_lines)
+        .map(|line| format_code_line(line, palette, language.as_ref()))
         .collect::<Vec<_>>();
-    state.file_cache.insert(path, lines.clone());
-    Some(lines)
+
+    if file_lines.len() > max_lines && !lines.is_empty() {
+        let last_idx = lines.len().saturating_sub(1);
+        lines[last_idx] = format_context_line("...", palette, language.as_ref());
+    }
+
+    lines
+}
+
+fn build_directory_lines(
+    state: &AppState,
+    node: &crate::tree::TreeNode,
+    palette: &UiPalette,
+    code_height: u16,
+) -> Vec<Line<'static>> {
+    let mut entries = Vec::new();
+    for child_id in &node.children {
+        if !state.navigator.visible_nodes.contains(child_id) {
+            continue;
+        }
+        let child = state.navigator.tree.node(*child_id);
+        let label = match child.kind {
+            TreeNodeKind::Directory => format!("{}/", child.name),
+            TreeNodeKind::File => child.name.clone(),
+            TreeNodeKind::Block => format!("{}:{}", child.name, child.hash),
+            TreeNodeKind::Root => child.name.clone(),
+        };
+        entries.push(label);
+    }
+    entries.sort();
+
+    if entries.is_empty() {
+        return vec![Line::from(Span::styled(
+            "(Empty)",
+            Style::default().fg(palette.context).bg(palette.code_bg),
+        ))];
+    }
+
+    let max_lines = code_height as usize;
+    let mut lines = entries
+        .iter()
+        .take(max_lines)
+        .map(|entry| format_directory_line(entry, palette))
+        .collect::<Vec<_>>();
+
+    if entries.len() > max_lines && !lines.is_empty() {
+        let last_idx = lines.len().saturating_sub(1);
+        lines[last_idx] = format_directory_line("...", palette);
+    }
+
+    lines
+}
+
+fn format_directory_line(entry: &str, palette: &UiPalette) -> Line<'static> {
+    let gutter_left = 4;
+    let gutter_right = 2;
+    let gutter_spacing = " ".repeat(gutter_left + gutter_right + 1);
+    Line::from(vec![
+        Span::styled(
+            gutter_spacing,
+            Style::default().fg(palette.context).bg(palette.code_bg),
+        ),
+        Span::styled(
+            entry.to_string(),
+            Style::default().fg(palette.context).bg(palette.code_bg),
+        ),
+    ])
 }
 
 fn format_context_line(
