@@ -1158,27 +1158,54 @@ fn build_root_lines(
     }
 
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("Unreviewed blocks: {}", state.remaining_blocks),
-        Style::default().fg(palette.fg).bg(palette.code_bg),
-    )));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("Unreviewed blocks: {}", state.remaining_blocks),
+            Style::default().fg(palette.fg).bg(palette.code_bg),
+        ),
+        Span::styled(
+            " (scope: entire review)",
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        ),
+    ]));
     lines.push(Line::from(Span::styled(
         format!("Files/dirs: {}", root_children.len()),
         Style::default().fg(palette.dim).bg(palette.code_bg),
     )));
 
     let mut kind_counts = count_block_kinds(state);
-    kind_counts.sort_by(|a, b| a.0.cmp(&b.0));
+    kind_counts.sort_by(|a, b| {
+        let parent_a = parent_kind(&a.0);
+        let parent_b = parent_kind(&b.0);
+        if parent_a != parent_b {
+            parent_a.cmp(&parent_b)
+        } else {
+            a.0.cmp(&b.0)
+        }
+    });
+
+    let mut last_parent = "";
     for (kind, count) in kind_counts {
+        let parent = parent_kind(&kind);
+        if parent != last_parent {
+            if !last_parent.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("{}:", parent),
+                Style::default().fg(palette.fg).bg(palette.code_bg),
+            )));
+            last_parent = parent;
+        }
         lines.push(Line::from(Span::styled(
-            format!("{kind}: {count}"),
+            format!("  {kind}: {count}"),
             Style::default().fg(palette.dim).bg(palette.code_bg),
         )));
     }
 
     if !lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "".to_string(),
+            "",
             Style::default().bg(palette.code_bg),
         )));
     }
@@ -1220,6 +1247,20 @@ fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> L
         Style::default().fg(palette.context).bg(palette.code_bg)
     };
     Line::from(Span::styled(entry.to_string(), style)).style(style)
+}
+
+fn parent_kind(kind: &str) -> &'static str {
+    match kind.to_lowercase().as_str() {
+        "function" | "method" | "functionsignature" | "codeparagraph" => "Code Logic",
+        "struct" | "enum" | "class" | "impl" | "macro" | "const" | "static" | "type" => {
+            "Definitions"
+        }
+        "module" | "modules" | "import" | "imports" | "export" | "preamble" => "Module Structure",
+        "comment" | "textblock" | "paragraph" | "listitem" | "header" | "quote" | "section" => {
+            "Documentation"
+        }
+        _ => "Other",
+    }
 }
 
 fn count_block_kinds(state: &AppState) -> Vec<(String, usize)> {
