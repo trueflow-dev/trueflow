@@ -4,14 +4,23 @@ use crate::block_splitter;
 use crate::hashing::hash_str;
 use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
+use crate::vcs;
 use anyhow::Result;
+use dirs::home_dir;
 use log::warn;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
+    let root = root.as_ref();
+    if let Some(cached) = load_cache(root)? {
+        return Ok(cached);
+    }
+
     let mut files = Vec::new();
 
     let walker = WalkDir::new(root).into_iter();
@@ -32,6 +41,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
         }
     }
 
+    write_cache(root, &files)?;
     Ok(files)
 }
 
@@ -48,6 +58,111 @@ fn is_ignored(entry: &walkdir::DirEntry) -> bool {
     name == "target" ||      // rust build
     name == "node_modules" // js dependencies
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheEntry {
+    files: Vec<CachedFile>,
+    repo_revision: Option<String>,
+    root_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedFile {
+    path: String,
+    modified_at: u64,
+    size: u64,
+    file_state: FileState,
+}
+
+fn load_cache(root: &Path) -> Result<Option<Vec<FileState>>> {
+    let cache_path = cache_path(root)?;
+    let contents = match fs::read_to_string(&cache_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    let entry: CacheEntry = serde_json::from_str(&contents)?;
+    if entry.repo_revision != vcs::snapshot_from_workdir().repo_ref_revision {
+        return Ok(None);
+    }
+
+    let root_hash = hash_str(root.to_string_lossy().as_ref());
+    if entry.root_hash != root_hash {
+        return Ok(None);
+    }
+
+    let mut files = Vec::new();
+    for cached in entry.files {
+        let full_path = root.join(&cached.path);
+        let metadata = match fs::metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(None),
+        };
+        let modified = match metadata.modified() {
+            Ok(time) => time,
+            Err(_) => return Ok(None),
+        };
+        let modified_at = system_time_to_epoch(modified);
+        if modified_at != cached.modified_at || metadata.len() != cached.size {
+            return Ok(None);
+        }
+        files.push(cached.file_state);
+    }
+
+    Ok(Some(files))
+}
+
+fn write_cache(root: &Path, files: &[FileState]) -> Result<()> {
+    let cache_path = cache_path(root)?;
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut cached_files = Vec::new();
+    for file in files {
+        let full_path = root.join(&file.path);
+        let metadata = fs::metadata(&full_path)?;
+        let modified = metadata.modified()?;
+        cached_files.push(CachedFile {
+            path: file.path.clone(),
+            modified_at: system_time_to_epoch(modified),
+            size: metadata.len(),
+            file_state: file.clone(),
+        });
+    }
+
+    let entry = CacheEntry {
+        files: cached_files,
+        repo_revision: vcs::snapshot_from_workdir().repo_ref_revision,
+        root_hash: hash_str(root.to_string_lossy().as_ref()),
+    };
+
+    let contents = serde_json::to_string(&entry)?;
+    fs::write(cache_path, contents)?;
+    Ok(())
+}
+
+fn cache_path(root: &Path) -> Result<PathBuf> {
+    let repo_name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
+    let cache_root = home_dir().unwrap_or_else(|| root.to_path_buf());
+    let root_hash = hash_str(root.to_string_lossy().as_ref());
+    Ok(cache_root
+        .join(".trueflow")
+        .join("cache")
+        .join(format!("scan-{}-{}.json", repo_name, root_hash)))
+}
+
+fn system_time_to_epoch(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// TODO: Investigate whether salsa can help incremental review caching.
 
 fn process_file(path: &Path) -> Result<FileState> {
     let file_type = analysis::analyze_file(path);
