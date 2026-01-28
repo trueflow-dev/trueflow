@@ -817,14 +817,31 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     let header_lines = build_header_lines(node, state, palette);
 
-    let actions_text = "Actions: [a]pprove [x]reject [c]omment [k]descend [i]ascend [j]prev [l]next [g]root [q]uit";
-    let actions_line = Line::from(Span::styled(
-        actions_text,
-        Style::default()
-            .fg(palette.dim)
-            .bg(palette.bg)
-            .add_modifier(Modifier::BOLD),
-    ));
+    let actions_top = Line::from(vec![
+        Span::styled(
+            "[a]pprove [x]reject [c]omment",
+            Style::default().fg(palette.dim),
+        ),
+        Span::styled("      ", Style::default()),
+        Span::styled(
+            "[i]ascend",
+            Style::default()
+                .fg(palette.dim)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("       ", Style::default()),
+        Span::styled("[g]root [q]uit", Style::default().fg(palette.dim)),
+    ]);
+
+    let actions_bottom = Line::from(vec![
+        Span::styled("                             ", Style::default()),
+        Span::styled(
+            "[j]prev [k]descend [l]next",
+            Style::default()
+                .fg(palette.dim)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
 
     let focus_layout = compute_focus_layout(area, header_lines.len() as u16);
     let node_snapshot = node.clone();
@@ -850,10 +867,11 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         focus_layout.code,
     );
 
-    frame.render_widget(
-        Paragraph::new(actions_line).alignment(Alignment::Center),
-        focus_layout.actions,
-    );
+    let actions_paragraph = Paragraph::new(vec![actions_top, actions_bottom])
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(palette.bg));
+
+    frame.render_widget(actions_paragraph, focus_layout.actions);
 }
 
 fn build_header_lines(
@@ -1178,7 +1196,7 @@ fn build_root_lines(
         let parent_a = parent_kind(&a.0);
         let parent_b = parent_kind(&b.0);
         if parent_a != parent_b {
-            parent_a.cmp(&parent_b)
+            parent_a.cmp(parent_b)
         } else {
             a.0.cmp(&b.0)
         }
@@ -1413,7 +1431,7 @@ fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
         x: content_left,
         y: content_top + header_height + code_height,
         width: code_width,
-        height: 1,
+        height: 2,
     };
 
     FocusLayout {
@@ -1451,7 +1469,7 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 3);
         assert_eq!(layout.code.width, 120);
-        assert_eq!(layout.actions.height, 1);
+        assert_eq!(layout.actions.height, 2);
         assert!(layout.code.y > area.y);
     }
 }
