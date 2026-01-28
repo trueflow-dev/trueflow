@@ -85,6 +85,27 @@ impl ReviewNavigator {
         self.current = self.tree.root();
     }
 
+    fn jump_to_first_reviewable(&mut self) {
+        let root = self.tree.root();
+        let mut stack = vec![root];
+
+        while let Some(node_id) = stack.pop() {
+            if !self.visible_nodes.contains(&node_id) {
+                continue;
+            }
+
+            let node = self.tree.node(node_id);
+            if matches!(node.kind, TreeNodeKind::Block) {
+                self.current = node_id;
+                return;
+            }
+
+            for child in node.children.iter().rev() {
+                stack.push(*child);
+            }
+        }
+    }
+
     fn descend(&mut self) {
         if let Some(child) = self
             .tree
@@ -354,6 +375,12 @@ fn run_app(
                     }
                     KeyCode::Char('g') => {
                         state.navigator.jump_root();
+                        needs_render = true;
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ')
+                        if state.navigator.current_id() == state.navigator.tree.root() =>
+                    {
+                        state.navigator.jump_to_first_reviewable();
                         needs_render = true;
                     }
                     _ => {}
@@ -1906,5 +1933,54 @@ mod tests {
         assert_eq!(next_from_a, Some(NodeKey::Block("hash-b".to_string())));
         let next_from_b = navigator.next_after_approval_key(block_b_id);
         assert_eq!(next_from_b, Some(NodeKey::File("alpha/a.rs".to_string())));
+    }
+
+    #[test]
+    fn navigator_jump_to_first_reviewable_finds_first_block_dfs() {
+        let block_a = build_block("hash-a", BlockKind::Function, 0);
+        let block_b = build_block("hash-b", BlockKind::Function, 2);
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let dir_a = builder.add_dir(root, "alpha".to_string(), "alpha".to_string());
+        let file_a = builder.add_file(
+            dir_a,
+            "a.rs".to_string(),
+            "alpha/a.rs".to_string(),
+            "file-a".to_string(),
+            Language::Rust,
+        );
+        let block_a_id = builder.add_block(
+            file_a,
+            "block-a".to_string(),
+            "alpha/a.rs".to_string(),
+            block_a,
+            Language::Rust,
+        );
+        let dir_b = builder.add_dir(root, "beta".to_string(), "beta".to_string());
+        let file_b = builder.add_file(
+            dir_b,
+            "b.rs".to_string(),
+            "beta/b.rs".to_string(),
+            "file-b".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file_b,
+            "block-b".to_string(),
+            "beta/b.rs".to_string(),
+            block_b,
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let block_nodes: HashSet<_> = tree
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == tree::TreeNodeKind::Block)
+            .map(|node| node.id)
+            .collect();
+        let mut navigator = ReviewNavigator::new(tree, block_nodes).expect("navigator");
+
+        navigator.jump_to_first_reviewable();
+        assert_eq!(navigator.current_id(), block_a_id);
     }
 }
