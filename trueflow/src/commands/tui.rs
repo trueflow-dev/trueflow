@@ -243,6 +243,7 @@ struct AppState {
     repo_name: String,
     last_frame: std::time::Instant,
     file_cache: HashMap<PathBuf, Vec<String>>,
+    root_cursor: Option<TreeNodeId>,
 }
 
 pub fn run(context: &TrueflowContext) -> Result<()> {
@@ -256,6 +257,9 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
         .filter(|&&id| matches!(summary.tree.node(id).kind, TreeNodeKind::Block))
         .count();
 
+    let root_children = summary.tree.node(summary.tree.root()).children.clone();
+    let root_cursor = root_children.first().copied();
+
     let state = AppState {
         navigator: ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?,
         total_blocks: summary.total_blocks,
@@ -266,6 +270,7 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
         repo_name: detect_repo_name(context),
         last_frame: std::time::Instant::now(),
         file_cache: HashMap::new(),
+        root_cursor,
     };
 
     let run_result = run_app(context, &mut terminal, state);
@@ -311,28 +316,28 @@ fn run_app(
             match &state.input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('s') => {
-                        state.navigator.descend();
+                    KeyCode::Char('k') | KeyCode::Down => {
+                        handle_descend(&mut state);
                         needs_render = true;
                     }
-                    KeyCode::Char('p') => {
-                        state.navigator.ascend();
+                    KeyCode::Char('i') | KeyCode::Up => {
+                        handle_ascend(&mut state);
                         needs_render = true;
                     }
-                    KeyCode::Char('j') | KeyCode::Right => {
-                        state.navigator.move_next();
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        handle_next(&mut state);
                         needs_render = true;
                     }
-                    KeyCode::Char('k') | KeyCode::Left => {
-                        state.navigator.move_prev();
+                    KeyCode::Char('j') | KeyCode::Left => {
+                        handle_prev(&mut state);
                         needs_render = true;
                     }
                     KeyCode::Char('n') => {
-                        state.navigator.move_next();
+                        handle_next(&mut state);
                         needs_render = true;
                     }
                     KeyCode::Char('b') => {
-                        state.navigator.move_prev();
+                        handle_prev(&mut state);
                         needs_render = true;
                     }
                     KeyCode::Char('a') => {
@@ -389,6 +394,79 @@ fn run_app(
 }
 
 // ... helper functions for actions ...
+
+fn handle_ascend(state: &mut AppState) {
+    if state.navigator.current_id() == state.navigator.tree.root() {
+        return;
+    }
+    state.navigator.ascend();
+}
+
+fn handle_descend(state: &mut AppState) {
+    if state.navigator.current_id() == state.navigator.tree.root() {
+        let root = state.navigator.tree.root();
+        state.root_cursor = state
+            .root_cursor
+            .filter(|id| state.navigator.visible_nodes.contains(id))
+            .or_else(|| {
+                state
+                    .navigator
+                    .tree
+                    .node(root)
+                    .children
+                    .iter()
+                    .copied()
+                    .find(|child| state.navigator.visible_nodes.contains(child))
+            });
+
+        if let Some(target) = state.root_cursor {
+            state.navigator.set_current(target);
+        }
+    } else {
+        state.navigator.descend();
+    }
+}
+
+fn handle_prev(state: &mut AppState) {
+    if state.navigator.current_id() == state.navigator.tree.root() {
+        move_root_cursor(state, -1);
+    } else {
+        state.navigator.move_prev();
+    }
+}
+
+fn handle_next(state: &mut AppState) {
+    if state.navigator.current_id() == state.navigator.tree.root() {
+        move_root_cursor(state, 1);
+    } else {
+        state.navigator.move_next();
+    }
+}
+
+fn move_root_cursor(state: &mut AppState, offset: isize) {
+    let root = state.navigator.tree.root();
+    let root_children: Vec<TreeNodeId> = state
+        .navigator
+        .tree
+        .node(root)
+        .children
+        .iter()
+        .copied()
+        .filter(|child| state.navigator.visible_nodes.contains(child))
+        .collect();
+
+    if root_children.is_empty() {
+        state.root_cursor = None;
+        return;
+    }
+
+    let current = state
+        .root_cursor
+        .and_then(|id| root_children.iter().position(|&child| child == id))
+        .unwrap_or(0) as isize;
+    let next = (current + offset).clamp(0, root_children.len() as isize - 1);
+    state.root_cursor = root_children.get(next as usize).copied();
+}
 
 fn handle_action(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
@@ -731,7 +809,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         false,
     ));
 
-    let actions_text = "Actions: [a]pprove [x]reject [c]omment [s]descend [p]parent [n]next sibling [b]prev sibling [g]root [q]uit";
+    let actions_text = "Actions: [a]pprove [x]reject [c]omment [k]descend [i]ascend [j]prev [l]next [g]root [q]uit";
     let actions_line = Line::from(Span::styled(
         actions_text,
         Style::default()
@@ -802,10 +880,7 @@ fn build_content_lines(
         TreeNodeKind::Block => build_block_lines(state, node, palette, code_height),
         TreeNodeKind::File => build_file_lines(state, node, palette, code_height),
         TreeNodeKind::Directory => build_directory_lines(state, node, palette, code_height),
-        TreeNodeKind::Root => vec![Line::from(Span::styled(
-            "(Select a node)",
-            Style::default().fg(palette.context).bg(palette.code_bg),
-        ))],
+        TreeNodeKind::Root => build_root_lines(state, palette, code_height),
     }
 }
 
@@ -989,6 +1064,111 @@ fn build_directory_lines(
     }
 
     lines
+}
+
+fn build_root_lines(
+    state: &mut AppState,
+    palette: &UiPalette,
+    code_height: u16,
+) -> Vec<Line<'static>> {
+    let root = state.navigator.tree.root();
+    let root_children: Vec<TreeNodeId> = state
+        .navigator
+        .tree
+        .node(root)
+        .children
+        .iter()
+        .copied()
+        .filter(|child| state.navigator.visible_nodes.contains(child))
+        .collect();
+
+    if state.root_cursor.is_none() {
+        state.root_cursor = root_children.first().copied();
+    }
+
+    if root_children.is_empty() {
+        state.root_cursor = None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("Unreviewed blocks: {}", state.remaining_blocks),
+        Style::default().fg(palette.fg).bg(palette.code_bg),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Files/dirs: {}", root_children.len()),
+        Style::default().fg(palette.dim).bg(palette.code_bg),
+    )));
+
+    let mut kind_counts = count_block_kinds(state);
+    kind_counts.sort_by(|a, b| a.0.cmp(&b.0));
+    for (kind, count) in kind_counts {
+        lines.push(Line::from(Span::styled(
+            format!("{kind}: {count}"),
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        )));
+    }
+
+    if !lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "".to_string(),
+            Style::default().bg(palette.code_bg),
+        )));
+    }
+
+    let max_lines = code_height.saturating_sub(lines.len() as u16) as usize;
+    if max_lines == 0 {
+        return lines;
+    }
+
+    let mut listing = root_children
+        .iter()
+        .take(max_lines)
+        .map(|id| {
+            let child = state.navigator.tree.node(*id);
+            let name = match child.kind {
+                TreeNodeKind::Directory => format!("  {}/", child.name),
+                TreeNodeKind::File => format!("  {}", child.name),
+                TreeNodeKind::Block => format!("  {}", child.name),
+                TreeNodeKind::Root => child.name.clone(),
+            };
+            let selected = state.root_cursor == Some(*id);
+            format_root_entry_line(&name, palette, selected)
+        })
+        .collect::<Vec<_>>();
+
+    if root_children.len() > max_lines && !listing.is_empty() {
+        let last_idx = listing.len().saturating_sub(1);
+        listing[last_idx] = format_root_entry_line("  ...", palette, false);
+    }
+
+    lines.append(&mut listing);
+    lines
+}
+
+fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> Line<'static> {
+    let style = if selected {
+        Style::default().fg(palette.fg).bg(palette.meta_bg)
+    } else {
+        Style::default().fg(palette.context).bg(palette.code_bg)
+    };
+    Line::from(Span::styled(entry.to_string(), style)).style(style)
+}
+
+fn count_block_kinds(state: &AppState) -> Vec<(String, usize)> {
+    let mut counts = HashMap::new();
+    for id in &state.navigator.visible_nodes {
+        let node = state.navigator.tree.node(*id);
+        if node.kind != TreeNodeKind::Block {
+            continue;
+        }
+        let Some(block) = &node.block else {
+            continue;
+        };
+        let kind = block.kind.as_str().to_string();
+        *counts.entry(kind).or_insert(0) += 1;
+    }
+    counts.into_iter().collect()
 }
 
 fn format_directory_line(entry: &str, palette: &UiPalette) -> Line<'static> {
@@ -1516,6 +1696,7 @@ mod tests {
             repo_name: "repo".to_string(),
             last_frame: std::time::Instant::now(),
             file_cache: HashMap::new(),
+            root_cursor: None,
         };
         state.file_cache.insert(
             PathBuf::from("main.rs"),
