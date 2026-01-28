@@ -788,26 +788,7 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
 fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palette: &UiPalette) {
     let node = state.navigator.tree.node(state.navigator.current_id());
 
-    let title = match node.kind {
-        TreeNodeKind::Root => format!("Root: {}", state.repo_name),
-        TreeNodeKind::Directory => format!("Directory: {}/", node.name),
-        TreeNodeKind::File => format!("File: {}", node.name),
-        TreeNodeKind::Block => format!("Block: {}", node.name),
-    };
-
-    let mut header_lines = Vec::new();
-    header_lines.push(format_metadata_row("Title", &title, palette, true));
-
-    if !node.path.is_empty() {
-        header_lines.push(format_metadata_row("Path", &node.path, palette, false));
-    }
-
-    header_lines.push(format_metadata_row(
-        "Hash",
-        &node.hash[..node.hash.len().min(12)],
-        palette,
-        false,
-    ));
+    let header_lines = build_header_lines(node, state, palette);
 
     let actions_text = "Actions: [a]pprove [x]reject [c]omment [k]descend [i]ascend [j]prev [l]next [g]root [q]uit";
     let actions_line = Line::from(Span::styled(
@@ -846,6 +827,65 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         Paragraph::new(actions_line).alignment(Alignment::Center),
         focus_layout.actions,
     );
+}
+
+fn build_header_lines(
+    node: &crate::tree::TreeNode,
+    state: &AppState,
+    palette: &UiPalette,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    let header_text = match node.kind {
+        TreeNodeKind::Root => format!("Repository (Root node) @ {}", state.repo_name),
+        TreeNodeKind::Directory => format!("Directory @ {}/", node.name),
+        TreeNodeKind::File => format!("File @ {}", node.name),
+        TreeNodeKind::Block => {
+            if let Some(block) = &node.block {
+                let start = block.start_line + 1;
+                let end = block.end_line.max(start);
+                let path = if node.path.is_empty() {
+                    "unknown"
+                } else {
+                    &node.path
+                };
+                format!("{} @ {}:{}-{}", block.kind.as_str(), path, start, end)
+            } else {
+                format!("Block @ {}", node.name)
+            }
+        }
+    };
+
+    lines.push(format_header_row(&header_text, palette, true));
+
+    if !matches!(node.kind, TreeNodeKind::Root)
+        && !node.path.is_empty()
+        && !matches!(node.kind, TreeNodeKind::Block)
+    {
+        lines.push(format_header_row(&node.path, palette, false));
+    }
+
+    if !matches!(node.kind, TreeNodeKind::Root) {
+        lines.push(format_header_row(
+            &format!("Hash: {}", &node.hash[..node.hash.len().min(12)]),
+            palette,
+            false,
+        ));
+    }
+
+    lines
+}
+
+fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'static> {
+    let style = if bold {
+        Style::default()
+            .fg(palette.fg)
+            .bg(palette.meta_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.dim).bg(palette.meta_bg)
+    };
+    Line::from(Span::styled(text.to_string(), style))
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -1346,28 +1386,6 @@ mod focus_layout_tests {
         assert_eq!(layout.actions.height, 1);
         assert!(layout.code.y > area.y);
     }
-}
-
-fn format_metadata_row(label: &str, value: &str, palette: &UiPalette, bold: bool) -> Line<'static> {
-    let label_text = format!("{label}:");
-    let label_style = Style::default()
-        .fg(palette.dim)
-        .bg(palette.meta_bg)
-        .add_modifier(Modifier::BOLD);
-    let value_style = if bold {
-        Style::default()
-            .fg(palette.fg)
-            .bg(palette.meta_bg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.fg).bg(palette.meta_bg)
-    };
-
-    Line::from(vec![
-        Span::styled(label_text, label_style),
-        Span::styled(" ".to_string(), value_style),
-        Span::styled(value.to_string(), value_style),
-    ])
 }
 
 struct UiPalette {
