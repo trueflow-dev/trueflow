@@ -1662,6 +1662,7 @@ mod tests {
     use crate::analysis::Language;
     use crate::block::{Block, BlockKind};
     use crate::tree::{self, TreeBuilder};
+    use std::borrow::Cow;
     use std::collections::{HashMap, HashSet};
 
     fn build_block(hash: &str, kind: BlockKind, start_line: usize) -> Block {
@@ -1736,6 +1737,58 @@ mod tests {
         let node = state.navigator.tree.node(block_id).clone();
         let lines = build_content_lines(&mut state, &node, &UiPalette::default(), 6);
         assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn build_header_lines_formats_correctly() {
+        let block = Block {
+            hash: "hash-a".to_string(),
+            content: "fn foo() {}".to_string(),
+            kind: BlockKind::Function,
+            tags: Vec::new(),
+            complexity: 0,
+            start_line: 10,
+            end_line: 12,
+        };
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "src/main.rs".to_string(),
+            "src/main.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let block_id = builder.add_block(
+            file,
+            "function".to_string(),
+            "src/main.rs".to_string(),
+            block,
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let state = AppState {
+            navigator: ReviewNavigator::new(tree, HashSet::new()).expect("navigator"),
+            total_blocks: 1,
+            remaining_blocks: 1,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            confirm_batch: false,
+            repo_name: "repo".to_string(),
+            last_frame: std::time::Instant::now(),
+            file_cache: HashMap::new(),
+            root_cursor: None,
+        };
+
+        let node = state.navigator.tree.node(block_id);
+        let lines = build_header_lines(node, &state, &UiPalette::default());
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].spans[0].content,
+            Cow::Borrowed("function @ src/main.rs:11-12")
+        );
+        assert!(lines[1].spans[0].content.starts_with("Hash: hash-a"));
     }
 
     #[test]
