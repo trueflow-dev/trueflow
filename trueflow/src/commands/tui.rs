@@ -503,6 +503,7 @@ struct AppState {
     review_order: ReviewOrder,
     total_blocks: usize,
     remaining_blocks: usize,
+    reviewable_nodes: HashSet<TreeNodeId>,
     scope_label: String,
     input_mode: InputMode,
     input_buffer: String,
@@ -541,11 +542,13 @@ fn build_review_state(
     confirm_batch: bool,
     scope_label: String,
 ) -> Result<AppState> {
-    let remaining_blocks = summary
+    let reviewable_nodes: HashSet<TreeNodeId> = summary
         .unreviewed_block_nodes
         .iter()
-        .filter(|&&id| matches!(summary.tree.node(id).kind, TreeNodeKind::Block))
-        .count();
+        .copied()
+        .filter(|&id| matches!(summary.tree.node(id).kind, TreeNodeKind::Block))
+        .collect();
+    let remaining_blocks = reviewable_nodes.len();
 
     let root_children = summary.tree.node(summary.tree.root()).children.clone();
     let root_cursor = root_children.first().copied();
@@ -558,6 +561,7 @@ fn build_review_state(
         review_order,
         total_blocks: summary.total_blocks,
         remaining_blocks,
+        reviewable_nodes,
         scope_label,
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
@@ -1046,14 +1050,15 @@ fn apply_action_locally(
     let block_ids = collect_block_ids_for_action(state, node_id);
 
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
-        let mut removed = 0;
+        let mut removed_reviewable = 0;
         for block_id in block_ids {
             if state.navigator.visible_nodes.remove(&block_id) {
-                removed += 1;
-                state.remaining_blocks = state.remaining_blocks.saturating_sub(1);
+                if state.reviewable_nodes.remove(&block_id) {
+                    removed_reviewable += 1;
+                }
             }
         }
-        state.total_blocks = state.total_blocks.saturating_sub(removed);
+        state.remaining_blocks = state.remaining_blocks.saturating_sub(removed_reviewable);
     }
 
     prune_invisible_ancestors(state);
@@ -1068,16 +1073,43 @@ fn apply_action_locally(
 fn collect_block_ids_for_action(state: &AppState, node_id: TreeNodeId) -> Vec<TreeNodeId> {
     let node = state.navigator.tree.node(node_id);
     match node.kind {
-        TreeNodeKind::Block => vec![node_id],
+        TreeNodeKind::Block => {
+            if node
+                .block
+                .as_ref()
+                .is_some_and(|block| block.kind == BlockKind::Impl)
+            {
+                state.navigator.block_ids_in_subtree(node_id)
+            } else {
+                vec![node_id]
+            }
+        }
         _ => state.navigator.block_ids_in_subtree(node_id),
     }
 }
 
 fn compute_next_review_target(state: &AppState, node_id: TreeNodeId) -> Option<TreeNodeId> {
     let node = state.navigator.tree.node(node_id);
-    let remaining = &state.navigator.visible_nodes;
+    let remaining = &state.reviewable_nodes;
     match node.kind {
-        TreeNodeKind::Block => state.review_order.next_after_blocks(node_id, remaining),
+        TreeNodeKind::Block => {
+            if node
+                .block
+                .as_ref()
+                .is_some_and(|block| block.kind == BlockKind::Impl)
+            {
+                let subtree_blocks: HashSet<_> = state
+                    .navigator
+                    .block_ids_in_subtree(node_id)
+                    .into_iter()
+                    .collect();
+                state
+                    .review_order
+                    .next_after_subtree(&subtree_blocks, remaining)
+            } else {
+                state.review_order.next_after_blocks(node_id, remaining)
+            }
+        }
         _ => {
             let subtree_blocks: HashSet<_> = state
                 .navigator
