@@ -94,6 +94,10 @@ impl BlockFilters {
     pub fn allows_subblock(&self, kind: &BlockKind) -> bool {
         !self.exclude.contains(kind)
     }
+
+    pub fn only_contains(&self, kind: &BlockKind) -> bool {
+        self.only.as_ref().is_some_and(|only| only.contains(kind))
+    }
 }
 
 pub fn load() -> Result<TrueflowConfig> {

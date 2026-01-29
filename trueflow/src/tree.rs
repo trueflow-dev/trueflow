@@ -125,6 +125,7 @@ impl Tree {
         ancestors
     }
 
+    #[allow(dead_code)]
     pub fn file_nodes(&self) -> impl Iterator<Item = &TreeNode> {
         self.nodes
             .iter()

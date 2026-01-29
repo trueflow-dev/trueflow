@@ -82,6 +82,36 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
+    pub fn is_import_like(&self) -> bool {
+        matches!(
+            self,
+            BlockKind::Import | BlockKind::Imports | BlockKind::Module | BlockKind::Modules
+        )
+    }
+
+    pub fn default_review_priority(&self) -> u8 {
+        if self.is_import_like() {
+            return 70;
+        }
+
+        match self {
+            BlockKind::Struct
+            | BlockKind::Enum
+            | BlockKind::Type
+            | BlockKind::Interface
+            | BlockKind::Class => 0,
+
+            BlockKind::Const | BlockKind::Static => 20,
+            BlockKind::FunctionSignature => 30,
+            BlockKind::Impl => 40,
+            BlockKind::Function | BlockKind::Method => 50,
+
+            BlockKind::Gap | BlockKind::Comment => 95,
+
+            _ => 60,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             BlockKind::TextBlock => "TextBlock",

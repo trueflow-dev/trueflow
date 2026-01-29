@@ -11,6 +11,7 @@ pub mod finder;
 pub mod hashing;
 pub mod logging;
 pub mod optimizer;
+pub mod policy;
 pub mod scanner;
 pub mod store;
 pub mod sub_splitter;

@@ -1,9 +1,10 @@
 use crate::block::Block;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
+use crate::policy::should_skip_imports_by_default;
 use crate::scanner;
 use crate::store::{
-    FileStore, Identity, Record, ReviewStore, Verdict, approved_hashes_from_verdicts,
+    approved_hashes_from_verdicts, FileStore, Identity, Record, ReviewStore, Verdict,
 };
 use crate::tree;
 use anyhow::Result;
@@ -53,6 +54,9 @@ pub fn run(
         for file in files {
             for block in file.blocks {
                 if !filters.allows_block(&block.kind) {
+                    continue;
+                }
+                if should_skip_imports_by_default(&file.path, &block, &filters) {
                     continue;
                 }
 
@@ -105,6 +109,9 @@ pub fn run(
 
             for block in file.blocks {
                 if !filters.allows_block(&block.kind) {
+                    continue;
+                }
+                if should_skip_imports_by_default(&file.path, &block, &filters) {
                     continue;
                 }
 

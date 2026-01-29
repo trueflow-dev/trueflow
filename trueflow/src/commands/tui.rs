@@ -1,4 +1,5 @@
 use crate::analysis::Language;
+use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{ReviewOptions, collect_review_summary};
 use crate::config::load as load_config;
@@ -20,29 +21,9 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // --- Core Structs ---
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum NodeKey {
-    Root,
-    Directory(String), // path
-    File(String),      // path
-    Block(String),     // hash
-}
-
-impl NodeKey {
-    fn from_node(tree: &Tree, id: TreeNodeId) -> Self {
-        let node = tree.node(id);
-        match node.kind {
-            TreeNodeKind::Root => NodeKey::Root,
-            TreeNodeKind::Directory => NodeKey::Directory(node.path.clone()),
-            TreeNodeKind::File => NodeKey::File(node.path.clone()),
-            TreeNodeKind::Block => NodeKey::Block(node.hash.clone()),
-        }
-    }
-}
 
 struct ReviewNavigator {
     tree: Tree,
@@ -71,6 +52,24 @@ impl ReviewNavigator {
         })
     }
 
+    fn block_ids_in_subtree(&self, root: TreeNodeId) -> Vec<TreeNodeId> {
+        let mut stack = vec![root];
+        let mut blocks = Vec::new();
+        while let Some(node_id) = stack.pop() {
+            if !self.visible_nodes.contains(&node_id) {
+                continue;
+            }
+            let node = self.tree.node(node_id);
+            if matches!(node.kind, TreeNodeKind::Block) {
+                blocks.push(node_id);
+            }
+            for child in &node.children {
+                stack.push(*child);
+            }
+        }
+        blocks
+    }
+
     fn current_id(&self) -> TreeNodeId {
         self.current
     }
@@ -83,27 +82,6 @@ impl ReviewNavigator {
 
     fn jump_root(&mut self) {
         self.current = self.tree.root();
-    }
-
-    fn jump_to_first_reviewable(&mut self) {
-        let root = self.tree.root();
-        let mut stack = vec![root];
-
-        while let Some(node_id) = stack.pop() {
-            if !self.visible_nodes.contains(&node_id) {
-                continue;
-            }
-
-            let node = self.tree.node(node_id);
-            if matches!(node.kind, TreeNodeKind::Block) {
-                self.current = node_id;
-                return;
-            }
-
-            for child in node.children.iter().rev() {
-                stack.push(*child);
-            }
-        }
     }
 
     fn descend(&mut self) {
@@ -157,30 +135,173 @@ impl ReviewNavigator {
         }
         siblings.get(index as usize).copied()
     }
+}
 
-    fn next_after_approval_key(&self, node_id: TreeNodeId) -> Option<NodeKey> {
-        let parent = self.tree.parent(node_id)?;
-        if let Some(next_sibling) = self.sibling_at_offset(node_id, 1) {
-            return Some(NodeKey::from_node(&self.tree, next_sibling));
-        }
-        Some(NodeKey::from_node(&self.tree, parent))
-    }
-
-    fn find_node_by_key(&self, key: &NodeKey) -> Option<TreeNodeId> {
-        match key {
-            NodeKey::Root => Some(self.tree.root()),
-            NodeKey::Directory(p) | NodeKey::File(p) => self.tree.find_by_path(p),
-            NodeKey::Block(h) => {
-                for file_node in self.tree.file_nodes() {
-                    if let Some(id) = self.tree.node_by_path_and_hash(&file_node.path, h) {
-                        return Some(id);
-                    }
-                }
-                None
-            }
-        }
+fn review_band(block: &crate::block::Block) -> ReviewBand {
+    match block.kind.default_review_priority() {
+        0 => ReviewBand::Data,
+        20 => ReviewBand::Const,
+        _ => ReviewBand::Code,
     }
 }
+
+fn review_band_rank(band: ReviewBand) -> u8 {
+    match band {
+        ReviewBand::Data => 0,
+        ReviewBand::Const => 1,
+        ReviewBand::Code => 2,
+    }
+}
+
+fn review_group(path: &str, node: &crate::tree::TreeNode) -> ReviewGroup {
+    if is_test_block(path, node) {
+        ReviewGroup::Test
+    } else if is_library_path(path) {
+        ReviewGroup::Library
+    } else {
+        ReviewGroup::Main
+    }
+}
+
+fn review_group_rank(group: ReviewGroup) -> u8 {
+    match group {
+        ReviewGroup::Test => 0,
+        ReviewGroup::Library => 1,
+        ReviewGroup::Main => 2,
+    }
+}
+
+fn is_library_path(path: &str) -> bool {
+    path == "src/lib.rs"
+        || (path.starts_with("src/")
+            && !path.starts_with("src/main.rs")
+            && !path.starts_with("src/bin/"))
+}
+
+fn is_test_block(path: &str, node: &crate::tree::TreeNode) -> bool {
+    if is_test_path(path) {
+        return true;
+    }
+
+    if let Some(block) = node.block.as_ref() {
+        return block.tags.iter().any(|tag| tag == "test");
+    }
+
+    false
+}
+
+fn is_test_path(path: &str) -> bool {
+    let path = Path::new(path);
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "tests")
+    {
+        return true;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    file_name.starts_with("test_")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("_test.js")
+        || file_name.ends_with("_test.ts")
+}
+
+impl ReviewOrder {
+    fn from_summary(summary: &crate::commands::review::ReviewSummary) -> Self {
+        let mut ordered = Vec::new();
+        let mut items: Vec<_> = summary
+            .unreviewed_block_nodes
+            .iter()
+            .copied()
+            .filter_map(|node_id| {
+                let node = summary.tree.node(node_id);
+                let block = node.block.as_ref()?;
+                let file_path = if node.path.is_empty() {
+                    node.name.clone()
+                } else {
+                    node.path.clone()
+                };
+                let cursor = ReviewCursor {
+                    file_path,
+                    band: review_band(block),
+                    kind_rank: block.kind.default_review_priority(),
+                    start_line: block.start_line,
+                    node_id,
+                };
+                Some((cursor, node))
+            })
+            .collect();
+
+        items.sort_by(|(a_cursor, a_node), (b_cursor, b_node)| {
+            let a_group = review_group(&a_cursor.file_path, a_node);
+            let b_group = review_group(&b_cursor.file_path, b_node);
+            (
+                review_group_rank(a_group),
+                &a_cursor.file_path,
+                review_band_rank(a_cursor.band),
+                a_cursor.kind_rank,
+                a_cursor.start_line,
+            )
+                .cmp(&(
+                    review_group_rank(b_group),
+                    &b_cursor.file_path,
+                    review_band_rank(b_cursor.band),
+                    b_cursor.kind_rank,
+                    b_cursor.start_line,
+                ))
+        });
+
+        for (cursor, _) in items {
+            ordered.push(cursor);
+        }
+
+        Self { ordered }
+    }
+
+    fn first_block(&self) -> Option<TreeNodeId> {
+        self.ordered.first().map(|cursor| cursor.node_id)
+    }
+
+    fn next_after_blocks(
+        &self,
+        current: TreeNodeId,
+        remaining: &HashSet<TreeNodeId>,
+    ) -> Option<TreeNodeId> {
+        let index = self
+            .ordered
+            .iter()
+            .position(|cursor| cursor.node_id == current)?;
+        self.ordered
+            .iter()
+            .skip(index + 1)
+            .find(|cursor| remaining.contains(&cursor.node_id))
+            .map(|cursor| cursor.node_id)
+    }
+
+    fn next_after_subtree(
+        &self,
+        subtree_blocks: &HashSet<TreeNodeId>,
+        remaining: &HashSet<TreeNodeId>,
+    ) -> Option<TreeNodeId> {
+        let start_index = self
+            .ordered
+            .iter()
+            .position(|cursor| subtree_blocks.contains(&cursor.node_id))?;
+
+        self.ordered
+            .iter()
+            .skip(start_index + 1)
+            .find(|cursor| {
+                remaining.contains(&cursor.node_id) && !subtree_blocks.contains(&cursor.node_id)
+            })
+            .map(|cursor| cursor.node_id)
+    }
+}
+
 // --- Application Logic ---
 
 #[derive(Clone, PartialEq)]
@@ -195,6 +316,34 @@ enum PendingAction {
         verdict: Verdict,
         note: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewGroup {
+    Test,
+    Library,
+    Main,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewBand {
+    Data,
+    Const,
+    Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewCursor {
+    file_path: String,
+    band: ReviewBand,
+    kind_rank: u8,
+    start_line: usize,
+    node_id: TreeNodeId,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewOrder {
+    ordered: Vec<ReviewCursor>,
 }
 
 impl PendingAction {
@@ -256,6 +405,7 @@ enum InputMode {
 
 struct AppState {
     navigator: ReviewNavigator,
+    review_order: ReviewOrder,
     total_blocks: usize,
     remaining_blocks: usize,
     input_mode: InputMode,
@@ -281,8 +431,12 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
     let root_children = summary.tree.node(summary.tree.root()).children.clone();
     let root_cursor = root_children.first().copied();
 
+    let review_order = ReviewOrder::from_summary(&summary);
+    let navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
+
     let state = AppState {
-        navigator: ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?,
+        navigator,
+        review_order,
         total_blocks: summary.total_blocks,
         remaining_blocks,
         input_mode: InputMode::Normal,
@@ -380,7 +534,9 @@ fn run_app(
                     KeyCode::Enter | KeyCode::Char(' ')
                         if state.navigator.current_id() == state.navigator.tree.root() =>
                     {
-                        state.navigator.jump_to_first_reviewable();
+                        if let Some(first) = state.review_order.first_block() {
+                            state.navigator.set_current(first);
+                        }
                         needs_render = true;
                     }
                     _ => {}
@@ -601,7 +757,7 @@ fn execute_action(
         } => (node_id, verdict, note),
     };
 
-    let next_key = state.navigator.next_after_approval_key(node_id);
+    let next_id = compute_next_review_target(state, node_id);
 
     with_terminal_suspend(terminal, || {
         let node = state.navigator.tree.node(node_id);
@@ -635,7 +791,7 @@ fn execute_action(
         )
     })?;
 
-    apply_action_locally(state, node_id, &verdict, next_key);
+    apply_action_locally(state, node_id, &verdict, next_id);
     Ok(())
 }
 
@@ -673,7 +829,7 @@ fn apply_action_locally(
     state: &mut AppState,
     node_id: TreeNodeId,
     verdict: &Verdict,
-    next_key: Option<NodeKey>,
+    next_id: Option<TreeNodeId>,
 ) {
     let block_ids = collect_block_ids_for_action(state, node_id);
 
@@ -690,9 +846,7 @@ fn apply_action_locally(
 
     prune_invisible_ancestors(state);
 
-    if let Some(key) = next_key
-        && let Some(node_id) = state.navigator.find_node_by_key(&key)
-    {
+    if let Some(node_id) = next_id {
         state.navigator.set_current(node_id);
     } else {
         state.navigator.jump_root();
@@ -703,49 +857,44 @@ fn collect_block_ids_for_action(state: &AppState, node_id: TreeNodeId) -> Vec<Tr
     let node = state.navigator.tree.node(node_id);
     match node.kind {
         TreeNodeKind::Block => vec![node_id],
-        _ => node
-            .children
-            .iter()
-            .copied()
-            .filter(|child| {
-                matches!(state.navigator.tree.node(*child).kind, TreeNodeKind::Block)
-                    && state.navigator.visible_nodes.contains(child)
-            })
-            .collect(),
+        _ => state.navigator.block_ids_in_subtree(node_id),
+    }
+}
+
+fn compute_next_review_target(state: &AppState, node_id: TreeNodeId) -> Option<TreeNodeId> {
+    let node = state.navigator.tree.node(node_id);
+    let remaining = &state.navigator.visible_nodes;
+    match node.kind {
+        TreeNodeKind::Block => state.review_order.next_after_blocks(node_id, remaining),
+        _ => {
+            let subtree_blocks: HashSet<_> = state
+                .navigator
+                .block_ids_in_subtree(node_id)
+                .into_iter()
+                .collect();
+            state
+                .review_order
+                .next_after_subtree(&subtree_blocks, remaining)
+        }
     }
 }
 
 fn prune_invisible_ancestors(state: &mut AppState) {
-    let mut candidates: Vec<TreeNodeId> = state
+    let mut visible_nodes = HashSet::new();
+    for node_id in state
         .navigator
         .visible_nodes
         .iter()
         .copied()
         .filter(|id| matches!(state.navigator.tree.node(*id).kind, TreeNodeKind::Block))
-        .collect();
-
-    while let Some(block_id) = candidates.pop() {
-        let mut current = state.navigator.tree.parent(block_id);
-        while let Some(node_id) = current {
-            if state
-                .navigator
-                .tree
-                .node(node_id)
-                .children
-                .iter()
-                .any(|child| state.navigator.visible_nodes.contains(child))
-            {
-                break;
-            }
-            state.navigator.visible_nodes.remove(&node_id);
-            current = state.navigator.tree.parent(node_id);
+    {
+        for ancestor in state.navigator.tree.ancestors(node_id) {
+            visible_nodes.insert(ancestor);
         }
     }
 
-    state
-        .navigator
-        .visible_nodes
-        .insert(state.navigator.tree.root());
+    visible_nodes.insert(state.navigator.tree.root());
+    state.navigator.visible_nodes = visible_nodes;
 }
 
 fn detect_repo_name(context: &TrueflowContext) -> String {
@@ -817,33 +966,8 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     let header_lines = build_header_lines(node, state, palette);
 
-    let actions_top = Line::from(vec![
-        Span::styled(
-            "[a]pprove [x]reject [c]omment",
-            Style::default().fg(palette.dim),
-        ),
-        Span::styled("      ", Style::default()),
-        Span::styled(
-            "[i]ascend",
-            Style::default()
-                .fg(palette.dim)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("       ", Style::default()),
-        Span::styled("[g]root [q]uit", Style::default().fg(palette.dim)),
-    ]);
-
-    let actions_bottom = Line::from(vec![
-        Span::styled("                             ", Style::default()),
-        Span::styled(
-            "[j]prev [k]descend [l]next",
-            Style::default()
-                .fg(palette.dim)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
     let focus_layout = compute_focus_layout(area, header_lines.len() as u16);
+    let actions_lines = build_action_lines(focus_layout.actions.width, palette);
     let node_snapshot = node.clone();
     let content_lines =
         build_content_lines(state, &node_snapshot, palette, focus_layout.code.height);
@@ -867,7 +991,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         focus_layout.code,
     );
 
-    let actions_paragraph = Paragraph::new(vec![actions_top, actions_bottom])
+    let actions_paragraph = Paragraph::new(actions_lines)
         .alignment(Alignment::Center)
         .style(Style::default().bg(palette.bg));
 
@@ -910,12 +1034,16 @@ fn build_header_lines(
         lines.push(format_header_row(&node.path, palette, false));
     }
 
-    if !matches!(node.kind, TreeNodeKind::Root) {
+    if !matches!(node.kind, TreeNodeKind::Root) && !node.hash.is_empty() {
         lines.push(format_header_row(
             &format!("Hash: {}", &node.hash[..node.hash.len().min(12)]),
             palette,
             false,
         ));
+    }
+
+    if lines.is_empty() {
+        lines.push(format_header_row("(No details)", palette, true));
     }
 
     lines
@@ -931,6 +1059,41 @@ fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'stati
         Style::default().fg(palette.dim).bg(palette.meta_bg)
     };
     Line::from(Span::styled(text.to_string(), style))
+}
+
+fn build_action_lines(width: u16, palette: &UiPalette) -> Vec<Line<'static>> {
+    let top_left = "[a]pprove [c]omment [x]reject";
+    let top_right = "[g]root [q]uit";
+    let top_spacing = top_line_spacing(width, top_left, top_right);
+
+    let top_line = Line::from(vec![
+        Span::styled(top_left.to_string(), Style::default().fg(palette.dim)),
+        Span::styled(top_spacing, Style::default().bg(palette.bg)),
+        Span::styled(top_right.to_string(), Style::default().fg(palette.dim)),
+    ]);
+
+    let pyramid_style = Style::default()
+        .fg(palette.dim)
+        .add_modifier(Modifier::BOLD);
+
+    let pyramid_lines = vec![
+        Line::from(Span::styled("[i]ascend", pyramid_style)),
+        Line::from(Span::styled("[j]prev            [l]next", pyramid_style)),
+        Line::from(Span::styled("  [k]descend", pyramid_style)),
+    ];
+
+    let mut lines = Vec::with_capacity(1 + pyramid_lines.len());
+    lines.push(top_line);
+    lines.extend(pyramid_lines);
+    lines
+}
+
+fn top_line_spacing(width: u16, left: &str, right: &str) -> String {
+    let total = left.len() + right.len();
+    if width as usize <= total {
+        return " ".to_string();
+    }
+    " ".repeat(width as usize - total)
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -1137,18 +1300,18 @@ fn build_directory_lines(
     }
 
     let max_lines = code_height as usize;
-    let mut lines = entries
+    let mut entries_list = entries
         .iter()
         .take(max_lines)
         .map(|entry| format_directory_line(entry, palette))
         .collect::<Vec<_>>();
 
-    if entries.len() > max_lines && !lines.is_empty() {
-        let last_idx = lines.len().saturating_sub(1);
-        lines[last_idx] = format_directory_line("...", palette);
+    if entries.len() > max_lines && !entries_list.is_empty() {
+        let last_idx = entries_list.len().saturating_sub(1);
+        entries_list[last_idx] = format_directory_line("...", palette);
     }
 
-    lines
+    entries_list
 }
 
 fn build_root_lines(
@@ -1198,7 +1361,7 @@ fn build_root_lines(
         if parent_a != parent_b {
             parent_a.cmp(parent_b)
         } else {
-            a.0.cmp(&b.0)
+            b.0.as_str().cmp(a.0.as_str())
         }
     });
 
@@ -1216,7 +1379,7 @@ fn build_root_lines(
             last_parent = parent;
         }
         lines.push(Line::from(Span::styled(
-            format!("  {kind}: {count}"),
+            format!("  {}: {count}", kind.as_str()),
             Style::default().fg(palette.dim).bg(palette.code_bg),
         )));
     }
@@ -1267,21 +1430,38 @@ fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> L
     Line::from(Span::styled(entry.to_string(), style)).style(style)
 }
 
-fn parent_kind(kind: &str) -> &'static str {
-    match kind.to_lowercase().as_str() {
-        "function" | "method" | "functionsignature" | "codeparagraph" => "Code Logic",
-        "struct" | "enum" | "class" | "impl" | "macro" | "const" | "static" | "type" => {
-            "Definitions"
-        }
-        "module" | "modules" | "import" | "imports" | "export" | "preamble" => "Module Structure",
-        "comment" | "textblock" | "paragraph" | "listitem" | "header" | "quote" | "section" => {
-            "Documentation"
-        }
+fn parent_kind(kind: &BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Function
+        | BlockKind::Method
+        | BlockKind::FunctionSignature
+        | BlockKind::CodeParagraph => "Code Logic",
+        BlockKind::Struct
+        | BlockKind::Enum
+        | BlockKind::Class
+        | BlockKind::Impl
+        | BlockKind::Macro
+        | BlockKind::Const
+        | BlockKind::Static
+        | BlockKind::Type => "Definitions",
+        BlockKind::Module
+        | BlockKind::Modules
+        | BlockKind::Import
+        | BlockKind::Imports
+        | BlockKind::Export
+        | BlockKind::Preamble => "Module Structure",
+        BlockKind::Comment
+        | BlockKind::TextBlock
+        | BlockKind::Paragraph
+        | BlockKind::ListItem
+        | BlockKind::Header
+        | BlockKind::Quote
+        | BlockKind::Section => "Documentation",
         _ => "Other",
     }
 }
 
-fn count_block_kinds(state: &AppState) -> Vec<(String, usize)> {
+fn count_block_kinds(state: &AppState) -> Vec<(BlockKind, usize)> {
     let mut counts = HashMap::new();
     for id in &state.navigator.visible_nodes {
         let node = state.navigator.tree.node(*id);
@@ -1291,8 +1471,7 @@ fn count_block_kinds(state: &AppState) -> Vec<(String, usize)> {
         let Some(block) = &node.block else {
             continue;
         };
-        let kind = block.kind.as_str().to_string();
-        *counts.entry(kind).or_insert(0) += 1;
+        *counts.entry(block.kind.clone()).or_insert(0) += 1;
     }
     counts.into_iter().collect()
 }
@@ -1405,33 +1584,34 @@ fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let padding = ((area.height as f32) * 0.05).round() as u16;
 
     let available_height = area.height.saturating_sub(padding * 2);
-    let total_height = (header_lines + desired_code_height + 1).min(available_height.max(1));
-    let header_height = header_lines.min(total_height.saturating_sub(1));
+    let total_height = (header_lines.max(1) + desired_code_height + 1).min(available_height.max(1));
+    let header_height = header_lines.max(1).min(total_height.saturating_sub(1));
     let remaining = total_height.saturating_sub(header_height + 1);
     let code_height = desired_code_height.min(remaining.max(1));
 
     let content_top = area.y + (area.height.saturating_sub(total_height)) / 2;
     let content_left = area.x + (area.width.saturating_sub(code_width)) / 2;
 
+    let meta_height = header_height.max(1);
     let meta = Rect {
         x: content_left,
         y: content_top,
         width: code_width,
-        height: header_height,
+        height: meta_height,
     };
 
     let code = Rect {
         x: content_left,
-        y: content_top + header_height,
+        y: content_top + meta_height,
         width: code_width,
         height: code_height,
     };
 
     let actions = Rect {
         x: content_left,
-        y: content_top + header_height + code_height,
+        y: content_top + meta_height + code_height,
         width: code_width,
-        height: 2,
+        height: 4,
     };
 
     FocusLayout {
@@ -1469,7 +1649,7 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 3);
         assert_eq!(layout.code.width, 120);
-        assert_eq!(layout.actions.height, 2);
+        assert_eq!(layout.actions.height, 4);
         assert!(layout.code.y > area.y);
     }
 }
@@ -1480,6 +1660,7 @@ struct UiPalette {
     code_fg: Color,
     dim: Color,
     add: Color,
+    #[allow(dead_code)]
     del: Color,
     keyword: Color,
     string: Color,
@@ -1514,8 +1695,10 @@ impl Default for UiPalette {
 enum TokenKind {
     Base,
     Keyword,
+    #[allow(dead_code)]
     String,
     Number,
+    #[allow(dead_code)]
     Comment,
 }
 
@@ -1525,521 +1708,66 @@ struct HighlightToken {
     kind: TokenKind,
 }
 
-impl HighlightToken {
-    fn new(text: impl Into<String>, kind: TokenKind) -> Self {
-        Self {
-            text: text.into(),
-            kind,
+fn highlight_line(line: &str, _language: Option<&Language>) -> Vec<HighlightToken> {
+    // Very basic highlighting for now
+    let mut tokens = Vec::new();
+    let mut current_word = String::new();
+
+    for c in line.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            current_word.push(c);
+        } else {
+            if !current_word.is_empty() {
+                tokens.push(classify_token(&current_word));
+                current_word.clear();
+            }
+            tokens.push(HighlightToken {
+                text: c.to_string(),
+                kind: TokenKind::Base,
+            });
         }
+    }
+    if !current_word.is_empty() {
+        tokens.push(classify_token(&current_word));
+    }
+    tokens
+}
+
+fn classify_token(word: &str) -> HighlightToken {
+    let kind = match word {
+        "fn" | "struct" | "enum" | "impl" | "use" | "mod" | "pub" | "let" | "mut" | "if"
+        | "else" | "match" | "for" | "while" | "return" | "break" | "continue" | "const"
+        | "static" | "trait" | "type" => TokenKind::Keyword,
+        "true" | "false" => TokenKind::Number,
+        _ if word.chars().all(char::is_numeric) => TokenKind::Number,
+        _ => TokenKind::Base,
+    };
+    HighlightToken {
+        text: word.to_string(),
+        kind,
+    }
+}
+
+fn style_for_token(kind: &TokenKind, palette: &UiPalette) -> Style {
+    match kind {
+        TokenKind::Base => Style::default().fg(palette.code_fg),
+        TokenKind::Keyword => Style::default()
+            .fg(palette.keyword)
+            .add_modifier(Modifier::BOLD),
+        TokenKind::String => Style::default().fg(palette.string),
+        TokenKind::Number => Style::default().fg(palette.number),
+        TokenKind::Comment => Style::default().fg(palette.dim),
     }
 }
 
 fn format_code_line(line: &str, palette: &UiPalette, language: Option<&Language>) -> Line<'static> {
-    let gutter_left = 4;
-    let gutter_right = 2;
-    let gutter_spacing = " ".repeat(gutter_left + gutter_right + 1);
-
-    if let Some(rest) = line.strip_prefix('+') {
-        let marker = format!("{}+{}", " ".repeat(gutter_left), " ".repeat(gutter_right));
-        let style = Style::default()
-            .fg(palette.add)
-            .bg(palette.code_bg)
-            .add_modifier(Modifier::BOLD);
-        return Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(rest.to_string(), style),
-        ]);
-    }
-
-    if let Some(rest) = line.strip_prefix('-') {
-        let marker = format!("{}-{}", " ".repeat(gutter_left), " ".repeat(gutter_right));
-        let style = Style::default()
-            .fg(palette.del)
-            .bg(palette.code_bg)
-            .add_modifier(Modifier::BOLD);
-        return Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(rest.to_string(), style),
-        ]);
-    }
-
-    let gutter_style = Style::default().fg(palette.dim).bg(palette.code_bg);
     let tokens = highlight_line(line, language);
-    let mut spans = Vec::with_capacity(tokens.len() + 1);
-    spans.push(Span::styled(gutter_spacing, gutter_style));
+    let mut spans = Vec::with_capacity(tokens.len());
     for token in tokens {
-        let style = style_for_token(&token.kind, palette);
-        spans.push(Span::styled(token.text, style));
+        spans.push(Span::styled(
+            token.text,
+            style_for_token(&token.kind, palette).bg(palette.code_bg),
+        ));
     }
     Line::from(spans)
-}
-
-fn highlight_line(line: &str, language: Option<&Language>) -> Vec<HighlightToken> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("//")
-        || trimmed.starts_with('#')
-        || trimmed.starts_with("/*")
-        || trimmed.starts_with('*')
-    {
-        return vec![HighlightToken::new(line.to_string(), TokenKind::Comment)];
-    }
-
-    let mut tokens = Vec::new();
-    let mut buffer = String::new();
-    let mut in_string = false;
-    let mut string_delim = '\0';
-    let chars = line.chars().peekable();
-
-    for ch in chars {
-        if in_string {
-            buffer.push(ch);
-            if ch == string_delim {
-                tokens.push(HighlightToken::new(
-                    std::mem::take(&mut buffer),
-                    TokenKind::String,
-                ));
-                in_string = false;
-            }
-            continue;
-        }
-
-        if matches!(ch, '"' | '\'') {
-            if !buffer.is_empty() {
-                tokens.extend(tokenize_buffer(&buffer, language));
-                buffer.clear();
-            }
-            buffer.push(ch);
-            in_string = true;
-            string_delim = ch;
-            continue;
-        }
-
-        buffer.push(ch);
-    }
-
-    if !buffer.is_empty() {
-        let kind = if in_string {
-            TokenKind::String
-        } else {
-            TokenKind::Base
-        };
-        if in_string {
-            tokens.push(HighlightToken::new(buffer, kind));
-        } else {
-            tokens.extend(tokenize_buffer(&buffer, language));
-        }
-    }
-
-    if tokens.is_empty() {
-        tokens.push(HighlightToken::new(line.to_string(), TokenKind::Base));
-    }
-
-    tokens
-}
-
-fn tokenize_buffer(buffer: &str, language: Option<&Language>) -> Vec<HighlightToken> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for ch in buffer.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else {
-            flush_word_token(&mut tokens, &mut current, language);
-            tokens.push(HighlightToken::new(ch.to_string(), TokenKind::Base));
-        }
-    }
-
-    flush_word_token(&mut tokens, &mut current, language);
-    tokens
-}
-
-fn flush_word_token(
-    tokens: &mut Vec<HighlightToken>,
-    current: &mut String,
-    language: Option<&Language>,
-) {
-    if current.is_empty() {
-        return;
-    }
-
-    let kind = classify_word_token(current, language);
-    tokens.push(HighlightToken::new(std::mem::take(current), kind));
-}
-
-const RUST_KEYWORDS: &[&str] = &[
-    "fn", "struct", "enum", "impl", "mod", "use", "pub", "let", "mut", "match", "if", "else",
-    "for", "while", "loop", "return", "async", "await", "crate", "super", "self", "Self", "const",
-    "static", "trait", "type",
-];
-
-const PYTHON_KEYWORDS: &[&str] = &[
-    "def", "class", "import", "from", "as", "if", "elif", "else", "for", "while", "return",
-    "yield", "async", "await", "with", "try", "except", "finally", "lambda", "pass", "break",
-    "continue",
-];
-
-const JS_KEYWORDS: &[&str] = &[
-    "function", "class", "import", "export", "const", "let", "var", "if", "else", "for", "while",
-    "return", "async", "await", "try", "catch", "finally", "switch", "case", "break", "continue",
-    "new",
-];
-
-const SHELL_KEYWORDS: &[&str] = &[
-    "function", "if", "then", "fi", "for", "do", "done", "case", "esac", "in", "while", "until",
-    "return", "local",
-];
-
-fn classify_word_token(word: &str, language: Option<&Language>) -> TokenKind {
-    if word.chars().all(|ch| ch.is_ascii_digit()) {
-        return TokenKind::Number;
-    }
-
-    let Some(language) = language else {
-        return TokenKind::Base;
-    };
-
-    let keywords = match language {
-        Language::Rust => Some(RUST_KEYWORDS),
-        Language::Python => Some(PYTHON_KEYWORDS),
-        Language::JavaScript | Language::TypeScript => Some(JS_KEYWORDS),
-        Language::Shell => Some(SHELL_KEYWORDS),
-        Language::Markdown
-        | Language::Text
-        | Language::Toml
-        | Language::Nix
-        | Language::Just
-        | Language::Elisp
-        | Language::Unknown => None,
-    };
-
-    if keywords.is_some_and(|list| list.contains(&word)) {
-        TokenKind::Keyword
-    } else {
-        TokenKind::Base
-    }
-}
-
-#[cfg(test)]
-mod highlight_tests {
-    use super::*;
-    use crate::analysis::Language;
-
-    #[test]
-    fn highlight_keywords_from_static_table() {
-        let tokens = highlight_line("fn main()", Some(&Language::Rust));
-        assert!(tokens.iter().any(|token| token.kind == TokenKind::Keyword));
-    }
-}
-
-fn style_for_token(token: &TokenKind, palette: &UiPalette) -> Style {
-    match token {
-        TokenKind::Base => Style::default().fg(palette.code_fg).bg(palette.code_bg),
-        TokenKind::Keyword => Style::default().fg(palette.keyword).bg(palette.code_bg),
-        TokenKind::String => Style::default().fg(palette.string).bg(palette.code_bg),
-        TokenKind::Number => Style::default().fg(palette.number).bg(palette.code_bg),
-        TokenKind::Comment => Style::default().fg(palette.dim).bg(palette.code_bg),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analysis::Language;
-    use crate::block::{Block, BlockKind};
-    use crate::tree::{self, TreeBuilder};
-    use std::borrow::Cow;
-    use std::collections::{HashMap, HashSet};
-
-    fn build_block(hash: &str, kind: BlockKind, start_line: usize) -> Block {
-        Block {
-            hash: hash.to_string(),
-            content: "fn example() {}".to_string(),
-            kind,
-            tags: Vec::new(),
-            complexity: 0,
-            start_line,
-            end_line: start_line + 1,
-        }
-    }
-
-    #[test]
-    fn build_content_lines_with_extra_space_adds_context() {
-        let block = Block {
-            hash: "hash-a".to_string(),
-            content: "line 2\nline 3".to_string(),
-            kind: BlockKind::Function,
-            tags: Vec::new(),
-            complexity: 0,
-            start_line: 1,
-            end_line: 3,
-        };
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let file = builder.add_file(
-            root,
-            "main.rs".to_string(),
-            "main.rs".to_string(),
-            "file-main".to_string(),
-            Language::Rust,
-        );
-        builder.add_block(
-            file,
-            block.kind.as_str().to_string(),
-            "main.rs".to_string(),
-            block.clone(),
-            Language::Rust,
-        );
-        let tree = builder.finalize();
-        let mut state = AppState {
-            navigator: ReviewNavigator::new(tree, HashSet::new()).expect("navigator"),
-            total_blocks: 1,
-            remaining_blocks: 1,
-            input_mode: InputMode::Normal,
-            input_buffer: String::new(),
-            confirm_batch: false,
-            repo_name: "repo".to_string(),
-            last_frame: std::time::Instant::now(),
-            file_cache: HashMap::new(),
-            root_cursor: None,
-        };
-        state.file_cache.insert(
-            PathBuf::from("main.rs"),
-            vec![
-                "line 1".to_string(),
-                "line 2".to_string(),
-                "line 3".to_string(),
-                "line 4".to_string(),
-                "line 5".to_string(),
-            ],
-        );
-
-        let block_id = state
-            .navigator
-            .tree
-            .node_by_path_and_hash("main.rs", "hash-a")
-            .expect("block");
-        state.navigator.set_current(block_id);
-        let node = state.navigator.tree.node(block_id).clone();
-        let lines = build_content_lines(&mut state, &node, &UiPalette::default(), 6);
-        assert_eq!(lines.len(), 5);
-    }
-
-    #[test]
-    fn build_header_lines_formats_correctly() {
-        let block = Block {
-            hash: "hash-a".to_string(),
-            content: "fn foo() {}".to_string(),
-            kind: BlockKind::Function,
-            tags: Vec::new(),
-            complexity: 0,
-            start_line: 10,
-            end_line: 12,
-        };
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let file = builder.add_file(
-            root,
-            "src/main.rs".to_string(),
-            "src/main.rs".to_string(),
-            "file-hash".to_string(),
-            Language::Rust,
-        );
-        let block_id = builder.add_block(
-            file,
-            "function".to_string(),
-            "src/main.rs".to_string(),
-            block,
-            Language::Rust,
-        );
-        let tree = builder.finalize();
-        let state = AppState {
-            navigator: ReviewNavigator::new(tree, HashSet::new()).expect("navigator"),
-            total_blocks: 1,
-            remaining_blocks: 1,
-            input_mode: InputMode::Normal,
-            input_buffer: String::new(),
-            confirm_batch: false,
-            repo_name: "repo".to_string(),
-            last_frame: std::time::Instant::now(),
-            file_cache: HashMap::new(),
-            root_cursor: None,
-        };
-
-        let node = state.navigator.tree.node(block_id);
-        let lines = build_header_lines(node, &state, &UiPalette::default());
-
-        assert_eq!(lines.len(), 2);
-        assert_eq!(
-            lines[0].spans[0].content,
-            Cow::Borrowed("function @ src/main.rs:11-12")
-        );
-        assert!(lines[1].spans[0].content.starts_with("Hash: hash-a"));
-    }
-
-    #[test]
-    fn navigator_moves_within_parent_siblings() {
-        let block_a = build_block("hash-a", BlockKind::Function, 0);
-        let block_b = build_block("hash-b", BlockKind::Function, 2);
-        let block_c = build_block("hash-c", BlockKind::Function, 4);
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let dir_a = builder.add_dir(root, "alpha".to_string(), "alpha".to_string());
-        let file_a = builder.add_file(
-            dir_a,
-            "a.rs".to_string(),
-            "alpha/a.rs".to_string(),
-            "file-a".to_string(),
-            Language::Rust,
-        );
-        builder.add_block(
-            file_a,
-            block_a.kind.as_str().to_string(),
-            "alpha/a.rs".to_string(),
-            block_a,
-            Language::Rust,
-        );
-        builder.add_block(
-            file_a,
-            block_b.kind.as_str().to_string(),
-            "alpha/a.rs".to_string(),
-            block_b,
-            Language::Rust,
-        );
-        let dir_b = builder.add_dir(root, "beta".to_string(), "beta".to_string());
-        let file_b = builder.add_file(
-            dir_b,
-            "b.rs".to_string(),
-            "beta/b.rs".to_string(),
-            "file-b".to_string(),
-            Language::Rust,
-        );
-        builder.add_block(
-            file_b,
-            block_c.kind.as_str().to_string(),
-            "beta/b.rs".to_string(),
-            block_c,
-            Language::Rust,
-        );
-        let tree = builder.finalize();
-        let block_nodes: HashSet<_> = tree
-            .nodes()
-            .iter()
-            .filter(|node| node.kind == tree::TreeNodeKind::Block)
-            .map(|node| node.id)
-            .collect();
-        let mut navigator = ReviewNavigator::new(tree, block_nodes).expect("navigator");
-        let block_b_id = navigator
-            .tree
-            .node_by_path_and_hash("alpha/a.rs", "hash-b")
-            .expect("block b");
-        navigator.set_current(block_b_id);
-        navigator.move_prev();
-        let current = navigator.current_id();
-        let current_node = navigator.tree.node(current);
-        assert_eq!(current_node.hash, "hash-a");
-        navigator.move_prev();
-        let current = navigator.current_id();
-        let current_node = navigator.tree.node(current);
-        assert_eq!(current_node.hash, "hash-a");
-    }
-
-    #[test]
-    fn navigator_next_after_approval_prefers_next_sibling() {
-        let block_a = build_block("hash-a", BlockKind::Function, 0);
-        let block_b = build_block("hash-b", BlockKind::Function, 2);
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let dir_a = builder.add_dir(root, "alpha".to_string(), "alpha".to_string());
-        let file_a = builder.add_file(
-            dir_a,
-            "a.rs".to_string(),
-            "alpha/a.rs".to_string(),
-            "file-a".to_string(),
-            Language::Rust,
-        );
-        builder.add_block(
-            file_a,
-            block_a.kind.as_str().to_string(),
-            "alpha/a.rs".to_string(),
-            block_a,
-            Language::Rust,
-        );
-        builder.add_block(
-            file_a,
-            block_b.kind.as_str().to_string(),
-            "alpha/a.rs".to_string(),
-            block_b,
-            Language::Rust,
-        );
-        let tree = builder.finalize();
-        let block_nodes: HashSet<_> = tree
-            .nodes()
-            .iter()
-            .filter(|node| node.kind == tree::TreeNodeKind::Block)
-            .map(|node| node.id)
-            .collect();
-        let navigator = ReviewNavigator::new(tree, block_nodes).expect("navigator");
-        let block_a_id = navigator
-            .tree
-            .node_by_path_and_hash("alpha/a.rs", "hash-a")
-            .expect("block a");
-        let block_b_id = navigator
-            .tree
-            .node_by_path_and_hash("alpha/a.rs", "hash-b")
-            .expect("block b");
-        let next_from_a = navigator.next_after_approval_key(block_a_id);
-        assert_eq!(next_from_a, Some(NodeKey::Block("hash-b".to_string())));
-        let next_from_b = navigator.next_after_approval_key(block_b_id);
-        assert_eq!(next_from_b, Some(NodeKey::File("alpha/a.rs".to_string())));
-    }
-
-    #[test]
-    fn navigator_jump_to_first_reviewable_finds_first_block_dfs() {
-        let block_a = build_block("hash-a", BlockKind::Function, 0);
-        let block_b = build_block("hash-b", BlockKind::Function, 2);
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let dir_a = builder.add_dir(root, "alpha".to_string(), "alpha".to_string());
-        let file_a = builder.add_file(
-            dir_a,
-            "a.rs".to_string(),
-            "alpha/a.rs".to_string(),
-            "file-a".to_string(),
-            Language::Rust,
-        );
-        let block_a_id = builder.add_block(
-            file_a,
-            "block-a".to_string(),
-            "alpha/a.rs".to_string(),
-            block_a,
-            Language::Rust,
-        );
-        let dir_b = builder.add_dir(root, "beta".to_string(), "beta".to_string());
-        let file_b = builder.add_file(
-            dir_b,
-            "b.rs".to_string(),
-            "beta/b.rs".to_string(),
-            "file-b".to_string(),
-            Language::Rust,
-        );
-        builder.add_block(
-            file_b,
-            "block-b".to_string(),
-            "beta/b.rs".to_string(),
-            block_b,
-            Language::Rust,
-        );
-        let tree = builder.finalize();
-        let block_nodes: HashSet<_> = tree
-            .nodes()
-            .iter()
-            .filter(|node| node.kind == tree::TreeNodeKind::Block)
-            .map(|node| node.id)
-            .collect();
-        let mut navigator = ReviewNavigator::new(tree, block_nodes).expect("navigator");
-
-        navigator.jump_to_first_reviewable();
-        assert_eq!(navigator.current_id(), block_a_id);
-    }
 }

@@ -1,7 +1,8 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::Block;
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
+use crate::policy::should_skip_imports_by_default;
 use crate::scanner;
 use crate::store::{
     FileStore, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
@@ -91,6 +92,9 @@ pub fn collect_review_summary(
         let mut reviewable_blocks = Vec::new();
         for block in file.blocks {
             if !filters.allows_block(&block.kind) {
+                continue;
+            }
+            if should_skip_imports_by_default(&file.path, &block, filters) {
                 continue;
             }
             reviewable_blocks.push(block);
@@ -306,26 +310,13 @@ fn kind_rank(block: &Block) -> u8 {
     if block.tags.iter().any(|tag| tag == "test") {
         return 10;
     }
-
-    match block.kind {
-        BlockKind::Struct
-        | BlockKind::Enum
-        | BlockKind::Type
-        | BlockKind::Interface
-        | BlockKind::Class => 0,
-        BlockKind::FunctionSignature => 20,
-        BlockKind::Import | BlockKind::Module | BlockKind::Modules | BlockKind::Imports => 25,
-        BlockKind::Const | BlockKind::Static => 30,
-        BlockKind::Impl => 40,
-        BlockKind::Function | BlockKind::Method => 50,
-        BlockKind::Gap | BlockKind::Comment => 95,
-        _ => 60,
-    }
+    block.kind.default_review_priority()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockKind;
 
     fn make_block(kind: BlockKind, tags: &[&str]) -> Block {
         Block {

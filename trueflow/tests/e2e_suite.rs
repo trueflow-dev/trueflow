@@ -363,3 +363,100 @@ fn test_review_config_only_filters_block_kinds() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_review_hides_imports_outside_lib_by_default() -> Result<()> {
+    let repo = TestRepo::fixture("hide_imports_default")?;
+    repo.write(
+        "src/main.rs",
+        "use std::fmt;\n\nmod helpers;\n\nfn main() {}\n",
+    )?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let blocks = first_file_blocks(&output)?;
+    let kinds: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| block["kind"].as_str())
+        .collect();
+    assert!(!kinds.iter().any(|kind| {
+        kind.eq_ignore_ascii_case("import")
+            || kind.eq_ignore_ascii_case("imports")
+            || kind.eq_ignore_ascii_case("module")
+            || kind.eq_ignore_ascii_case("modules")
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn test_review_keeps_imports_in_lib_rs() -> Result<()> {
+    let repo = TestRepo::fixture("imports_in_lib")?;
+    repo.write(
+        "src/lib.rs",
+        "use std::fmt;\n\nmod helpers;\n\nstruct Alpha;\n\nfn beta() {}\n",
+    )?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let blocks = first_file_blocks(&output)?;
+    let kinds: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| block["kind"].as_str())
+        .collect();
+    assert!(kinds.iter().any(|kind| {
+        kind.eq_ignore_ascii_case("import")
+            || kind.eq_ignore_ascii_case("imports")
+            || kind.eq_ignore_ascii_case("module")
+            || kind.eq_ignore_ascii_case("modules")
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn test_review_only_includes_imports_when_filtered() -> Result<()> {
+    let repo = TestRepo::fixture("imports_only_filter")?;
+    repo.write("src/main.rs", "use std::fmt;\n\nfn main() {}\n")?;
+
+    let output = repo.run(&["review", "--all", "--only", "import", "--json"])?;
+    let blocks = first_file_blocks(&output)?;
+    let kinds: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| block["kind"].as_str())
+        .collect();
+    assert!(!kinds.is_empty());
+    assert!(kinds.iter().all(|kind| kind.eq_ignore_ascii_case("import")));
+
+    Ok(())
+}
+
+#[test]
+fn test_review_orders_imports_after_functions_in_lib() -> Result<()> {
+    let repo = TestRepo::fixture("imports_order")?;
+    repo.write(
+        "src/lib.rs",
+        "use std::fmt;\n\nstruct Alpha;\n\nfn beta() {}\n",
+    )?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let blocks = first_file_blocks(&output)?;
+    let kinds: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| block["kind"].as_str())
+        .collect();
+    let import_pos = kinds
+        .iter()
+        .position(|kind| kind.eq_ignore_ascii_case("import"))
+        .context("expected import")?;
+    let struct_pos = kinds
+        .iter()
+        .position(|kind| kind.eq_ignore_ascii_case("struct"))
+        .context("expected struct")?;
+    let function_pos = kinds
+        .iter()
+        .position(|kind| kind.eq_ignore_ascii_case("function"))
+        .context("expected function")?;
+    assert!(import_pos > struct_pos);
+    assert!(import_pos > function_pos);
+
+    Ok(())
+}
