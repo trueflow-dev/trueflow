@@ -1,11 +1,12 @@
 use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
-use crate::commands::review::{ReviewOptions, collect_review_summary};
-use crate::config::load as load_config;
+use crate::commands::review::{ReviewOptions, ReviewTarget, collect_review_summary};
+use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::store::Verdict;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
+use crate::vcs;
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -24,6 +25,100 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 
 // --- Core Structs ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewScope {
+    All,
+    MainDiff,
+    Commit { id: String, summary: String },
+}
+
+impl ReviewScope {
+    fn label(&self) -> String {
+        match self {
+            ReviewScope::All => "entire review".to_string(),
+            ReviewScope::MainDiff => "diff vs main".to_string(),
+            ReviewScope::Commit { id, summary } => {
+                let short_id = short_commit_id(id);
+                let summary = truncate_text(summary, 32);
+                if summary.is_empty() {
+                    format!("commit {short_id}")
+                } else {
+                    format!("commit {short_id} {summary}")
+                }
+            }
+        }
+    }
+
+    fn to_review_options(&self) -> ReviewOptions {
+        match self {
+            ReviewScope::All => ReviewOptions {
+                all: true,
+                targets: vec![ReviewTarget::All],
+                only: Vec::new(),
+                exclude: Vec::new(),
+            },
+            ReviewScope::MainDiff => ReviewOptions {
+                all: false,
+                targets: vec![ReviewTarget::MainDiff],
+                only: Vec::new(),
+                exclude: Vec::new(),
+            },
+            ReviewScope::Commit { id, .. } => ReviewOptions {
+                all: false,
+                targets: vec![ReviewTarget::Revision(id.clone())],
+                only: Vec::new(),
+                exclude: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScopeOption {
+    label: String,
+    scope: ReviewScope,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeSelector {
+    options: Vec<ScopeOption>,
+    selected: usize,
+}
+
+impl ScopeSelector {
+    fn new(options: Vec<ScopeOption>) -> Self {
+        Self {
+            options,
+            selected: 0,
+        }
+    }
+
+    fn move_next(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1).min(self.options.len() - 1);
+    }
+
+    fn move_prev(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn selected_scope(&self) -> Option<ReviewScope> {
+        self.options
+            .get(self.selected)
+            .map(|option| option.scope.clone())
+    }
+}
+
+enum ScopeSelection {
+    Quit,
+    Selected(ReviewScope),
+}
 
 struct ReviewNavigator {
     tree: Tree,
@@ -408,6 +503,7 @@ struct AppState {
     review_order: ReviewOrder,
     total_blocks: usize,
     remaining_blocks: usize,
+    scope_label: String,
     input_mode: InputMode,
     input_buffer: String,
     confirm_batch: bool,
@@ -420,8 +516,31 @@ struct AppState {
 pub fn run(context: &TrueflowContext) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let config = load_config()?;
-    let summary = load_review_state(context)?;
+    let run_result = (|| {
+        let scope_options = load_scope_options()?;
+        let selection = run_scope_selector(&mut terminal, ScopeSelector::new(scope_options))?;
 
+        match selection {
+            ScopeSelection::Quit => Ok(()),
+            ScopeSelection::Selected(scope) => {
+                let filters = config.review.resolve_filters(&[], &[]);
+                let summary = load_review_state(context, &scope, &filters)?;
+                let state =
+                    build_review_state(context, summary, config.tui.confirm_batch, scope.label())?;
+                run_app(context, &mut terminal, state)
+            }
+        }
+    })();
+    restore_terminal(&mut terminal)?;
+    run_result
+}
+
+fn build_review_state(
+    context: &TrueflowContext,
+    summary: crate::commands::review::ReviewSummary,
+    confirm_batch: bool,
+    scope_label: String,
+) -> Result<AppState> {
     let remaining_blocks = summary
         .unreviewed_block_nodes
         .iter()
@@ -434,23 +553,82 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
     let review_order = ReviewOrder::from_summary(&summary);
     let navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
 
-    let state = AppState {
+    Ok(AppState {
         navigator,
         review_order,
         total_blocks: summary.total_blocks,
         remaining_blocks,
+        scope_label,
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
-        confirm_batch: config.tui.confirm_batch,
+        confirm_batch,
         repo_name: detect_repo_name(context),
         last_frame: std::time::Instant::now(),
         file_cache: HashMap::new(),
         root_cursor,
-    };
+    })
+}
 
-    let run_result = run_app(context, &mut terminal, state);
-    restore_terminal(&mut terminal)?;
-    run_result
+fn load_scope_options() -> Result<Vec<ScopeOption>> {
+    let mut options = vec![
+        ScopeOption {
+            label: "All files".to_string(),
+            scope: ReviewScope::All,
+        },
+        ScopeOption {
+            label: "Diff vs main".to_string(),
+            scope: ReviewScope::MainDiff,
+        },
+    ];
+
+    if let Ok(commits) = vcs::recent_commits(8) {
+        for commit in commits {
+            options.push(commit_scope_option(commit));
+        }
+    }
+
+    Ok(options)
+}
+
+fn commit_scope_option(commit: vcs::CommitInfo) -> ScopeOption {
+    let short_id = short_commit_id(&commit.id);
+    let summary = truncate_text(&commit.summary, 60);
+    let label = if summary.is_empty() {
+        format!("Commit {short_id}")
+    } else {
+        format!("Commit {short_id} {summary}")
+    };
+    ScopeOption {
+        label,
+        scope: ReviewScope::Commit {
+            id: commit.id,
+            summary: commit.summary,
+        },
+    }
+}
+
+fn short_commit_id(id: &str) -> String {
+    id.chars().take(7).collect()
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if max_chars == 0 || trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let cutoff = max_chars.saturating_sub(3).max(1);
+    let mut out = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx >= cutoff {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
@@ -468,6 +646,45 @@ fn restore_terminal(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn run_scope_selector(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    mut selector: ScopeSelector,
+) -> Result<ScopeSelection> {
+    let mut needs_render = true;
+    let mut last_frame = std::time::Instant::now();
+
+    loop {
+        if needs_render || last_frame.elapsed().as_millis() >= 250 {
+            terminal.draw(|f| render_scope_selector(f, &selector))?;
+            last_frame = std::time::Instant::now();
+            needs_render = false;
+        }
+
+        if event::poll(std::time::Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(ScopeSelection::Quit),
+                KeyCode::Char('k') | KeyCode::Up => {
+                    selector.move_prev();
+                    needs_render = true;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    selector.move_next();
+                    needs_render = true;
+                }
+                KeyCode::Enter => {
+                    if let Some(scope) = selector.selected_scope() {
+                        return Ok(ScopeSelection::Selected(scope));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn run_app(
@@ -811,18 +1028,13 @@ where
     result
 }
 
-fn load_review_state(context: &TrueflowContext) -> Result<crate::commands::review::ReviewSummary> {
-    let options = ReviewOptions {
-        all: true,
-        targets: vec![crate::commands::review::ReviewTarget::All],
-        only: Vec::new(),
-        exclude: Vec::new(),
-    };
-    let config = load_config()?;
-    let filters = config
-        .review
-        .resolve_filters(&options.only, &options.exclude);
-    collect_review_summary(context, &options, &filters)
+fn load_review_state(
+    context: &TrueflowContext,
+    scope: &ReviewScope,
+    filters: &BlockFilters,
+) -> Result<crate::commands::review::ReviewSummary> {
+    let options = scope.to_review_options();
+    collect_review_summary(context, &options, filters)
 }
 
 fn apply_action_locally(
@@ -928,6 +1140,62 @@ fn count_descendant_blocks(navigator: &ReviewNavigator, id: TreeNodeId) -> usize
 }
 
 // --- UI Rendering ---
+
+fn render_scope_selector(frame: &mut Frame, selector: &ScopeSelector) {
+    let palette = UiPalette::default();
+    let area = frame.size();
+
+    frame.render_widget(
+        UiBlock::default().style(Style::default().bg(palette.bg)),
+        area,
+    );
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Select review scope",
+        Style::default()
+            .fg(palette.fg)
+            .bg(palette.bg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    for (idx, option) in selector.options.iter().enumerate() {
+        let prefix = if idx == selector.selected { "> " } else { "  " };
+        let style = if idx == selector.selected {
+            Style::default()
+                .fg(palette.fg)
+                .bg(palette.meta_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.dim).bg(palette.bg)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", option.label),
+            style,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[Enter] select  [j/k] move  [q] quit",
+        Style::default().fg(palette.dim).bg(palette.bg),
+    )));
+
+    let block = UiBlock::default()
+        .title(" Review scope ")
+        .borders(ratatui::widgets::Borders::ALL)
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
+
+    let popup_area = centered_rect(area, 70, 60);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false }),
+        popup_area,
+    );
+}
 
 fn ui(frame: &mut Frame, state: &mut AppState) {
     let palette = UiPalette::default();
@@ -1345,7 +1613,7 @@ fn build_root_lines(
             Style::default().fg(palette.fg).bg(palette.code_bg),
         ),
         Span::styled(
-            " (scope: entire review)",
+            format!(" (scope: {})", state.scope_label),
             Style::default().fg(palette.dim).bg(palette.code_bg),
         ),
     ]));
@@ -1583,9 +1851,11 @@ fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let desired_code_height = area.height.min(32);
     let padding = ((area.height as f32) * 0.05).round() as u16;
 
-    let available_height = area.height.saturating_sub(padding * 2);
-    let total_height = (header_lines.max(1) + desired_code_height + 1).min(available_height.max(1));
-    let header_height = header_lines.max(1).min(total_height.saturating_sub(1));
+    let available_height = area.height.saturating_sub(padding * 2).max(1);
+    let min_header_height = 3.min(available_height);
+    let desired_header_height = header_lines.saturating_add(2).max(min_header_height);
+    let total_height = (desired_header_height + desired_code_height + 1).min(available_height);
+    let header_height = desired_header_height.min(total_height.saturating_sub(1).max(1));
     let remaining = total_height.saturating_sub(header_height + 1);
     let code_height = desired_code_height.min(remaining.max(1));
 
@@ -1651,6 +1921,18 @@ mod focus_layout_tests {
         assert_eq!(layout.code.width, 120);
         assert_eq!(layout.actions.height, 4);
         assert!(layout.code.y > area.y);
+    }
+
+    #[test]
+    fn focus_layout_reserves_header_border_space() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = compute_focus_layout(area, 1);
+        assert_eq!(layout.meta.height, 3);
     }
 }
 

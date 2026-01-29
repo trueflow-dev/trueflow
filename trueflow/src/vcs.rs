@@ -27,6 +27,12 @@ pub struct GitConfig {
     pub signing_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub id: String,
+    pub summary: String,
+}
+
 pub fn repo_from_workdir() -> Result<gix::Repository> {
     Ok(gix::discover(".")?)
 }
@@ -138,22 +144,59 @@ pub fn head_blocks_for_path(repo: &gix::Repository, path: &str) -> Result<Vec<Bl
 
 pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
     let repo = repo_from_workdir()?;
-    let head_commit = repo.head_commit()?;
-    let head_tree = head_commit.tree()?;
+    let (base_tree, head_tree) = main_and_head_trees(&repo)?;
+    diff_trees(&repo, &base_tree, &head_tree)
+}
 
-    let mut main_ref = repo
-        .find_reference("main")
-        .or_else(|_| repo.find_reference("master"))
-        .context("Could not find main or master branch")?;
-    let main_commit = main_ref.peel_to_commit()?;
-    let main_id = main_commit.id().detach();
+pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
+    let repo = repo_from_workdir()?;
+    files_changed_main_to_head_in_repo(&repo)
+}
 
-    let base_tree = match repo.merge_base(head_commit.id().detach(), main_id) {
-        Ok(base_id) => repo.find_commit(base_id.detach())?.tree()?,
-        Err(_) => main_commit.tree()?,
+pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<HashSet<String>> {
+    let (base_tree, head_tree) = main_and_head_trees(repo)?;
+    collect_changed_paths(repo, Some(&base_tree), Some(&head_tree))
+}
+
+pub fn recent_commits(limit: usize) -> Result<Vec<CommitInfo>> {
+    let repo = repo_from_workdir()?;
+    recent_commits_in_repo(&repo, limit)
+}
+
+pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Vec<CommitInfo>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let head_commit = match repo.head_commit() {
+        Ok(commit) => commit,
+        Err(_) => return Ok(Vec::new()),
     };
 
-    diff_trees(&repo, &base_tree, &head_tree)
+    let mut commits = Vec::new();
+    let mut current = head_commit;
+
+    loop {
+        let summary = current
+            .message()
+            .map(|message| message.summary().to_str_lossy().to_string())
+            .unwrap_or_else(|_| "(no message)".to_string());
+        commits.push(CommitInfo {
+            id: current.id().detach().to_string(),
+            summary,
+        });
+
+        if commits.len() >= limit {
+            break;
+        }
+
+        let Some(parent_id) = current.parent_ids().next() else {
+            break;
+        };
+        current = repo.find_commit(parent_id)?;
+    }
+
+    Ok(commits)
 }
 
 pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<String>> {
@@ -233,6 +276,27 @@ fn diff_trees(
     }
 
     Ok(hunks)
+}
+
+fn main_and_head_trees<'repo>(
+    repo: &'repo gix::Repository,
+) -> Result<(gix::Tree<'repo>, gix::Tree<'repo>)> {
+    let head_commit = repo.head_commit()?;
+    let head_tree = head_commit.tree()?;
+
+    let mut main_ref = repo
+        .find_reference("main")
+        .or_else(|_| repo.find_reference("master"))
+        .context("Could not find main or master branch")?;
+    let main_commit = main_ref.peel_to_commit()?;
+    let main_id = main_commit.id().detach();
+
+    let base_tree = match repo.merge_base(head_commit.id().detach(), main_id) {
+        Ok(base_id) => repo.find_commit(base_id.detach())?.tree()?,
+        Err(_) => main_commit.tree()?,
+    };
+
+    Ok((base_tree, head_tree))
 }
 
 fn collect_changed_paths(

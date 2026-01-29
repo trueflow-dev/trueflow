@@ -33,6 +33,7 @@ pub struct ReviewOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewTarget {
     DirtyWorktree,
+    MainDiff,
     All,
     File(String),
     Revision(String),
@@ -198,6 +199,9 @@ fn resolve_review_targets(options: &ReviewOptions) -> Result<Option<HashSet<Stri
                 if let Ok(dirty) = get_dirty_files() {
                     paths.extend(dirty);
                 }
+            }
+            ReviewTarget::MainDiff => {
+                paths.extend(vcs::files_changed_main_to_head()?);
             }
             ReviewTarget::File(path) => {
                 paths.insert(path);

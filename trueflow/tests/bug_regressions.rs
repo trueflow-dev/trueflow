@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
-use std::process::Command;
-use uuid::Uuid;
 
 use trueflow::block::{Block, BlockKind};
 use trueflow::hashing::hash_str;
@@ -49,21 +47,14 @@ fn test_optimizer_module_merge_preserves_content() {
 #[test]
 fn test_diff_new_content_matches_post_hunk() -> Result<()> {
     let repo = TestRepo::new("diff_new_content")?;
-    repo.write(
-        "src/main.rs",
-        "fn main() {\n    println!(\"Hello\");\n    println!(\"World\");\n}\n",
-    )?;
+    let initial = include_str!("fixtures/diff_new_content_initial.rs");
+    let updated = include_str!("fixtures/diff_new_content_updated.rs");
+    repo.write("src/main.rs", initial)?;
     repo.commit_all("Initial")?;
 
-    Command::new("git")
-        .args(["checkout", "-b", "feature/update"])
-        .current_dir(&repo.path)
-        .output()?;
+    repo.git(&["checkout", "-b", "feature/update"])?;
 
-    repo.write(
-        "src/main.rs",
-        "fn main() {\n    println!(\"Hello\");\n    println!(\"Trueflow\");\n}\n",
-    )?;
+    repo.write("src/main.rs", updated)?;
     repo.commit_all("Update message")?;
 
     let output = repo.run(&["diff", "--json"])?;
@@ -86,15 +77,15 @@ fn test_review_ignores_non_review_checks() -> Result<()> {
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
     repo.commit_all("Add lib")?;
 
+    // GIVEN: a reviewable block with no review verdicts
     let output = repo.run(&["review", "--all", "--json"])?;
-    let json: Value = serde_json::from_str(&output)?;
-    let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
-    let hash = block["hash"].as_str().context("hash")?;
+    let hash = first_block_hash(&output)?;
 
+    // WHEN: a non-review check is recorded for the block
     repo.run(&[
         "mark",
         "--fingerprint",
-        hash,
+        &hash,
         "--verdict",
         "approved",
         "--check",
@@ -102,9 +93,10 @@ fn test_review_ignores_non_review_checks() -> Result<()> {
         "--quiet",
     ])?;
 
+    // THEN: the block is still present in review output
     let output = repo.run(&["review", "--all", "--json"])?;
-    let json: Value = serde_json::from_str(&output)?;
-    assert!(!json.as_array().context("Expected array")?.is_empty());
+    let files = json_array(&output)?;
+    assert!(!files.is_empty());
     Ok(())
 }
 
@@ -115,56 +107,30 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
     repo.commit_all("Add lib")?;
 
     let output = repo.run(&["review", "--all", "--json"])?;
-    let json: Value = serde_json::from_str(&output)?;
-    let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
-    let hash = block["hash"].as_str().context("hash")?;
+    let hash = first_block_hash(&output)?;
 
     let trueflow_dir = repo.path.join(".trueflow");
-    fs::create_dir_all(&trueflow_dir)?;
-
-    let approved = serde_json::json!({
-        "id": Uuid::new_v4().to_string(),
-        "version": 1,
-        "fingerprint": hash,
-        "check": "review",
-        "verdict": "approved",
-        "identity": { "type": "email", "email": "a@example.com" },
-        "repo_ref": { "type": "vcs", "system": "git", "revision": "deadbeef" },
-        "block_state": "committed",
-        "timestamp": 2000,
-        "path_hint": null,
-        "line_hint": null,
-        "note": null,
-        "tags": null,
-        "attestations": null
-    });
-    let rejected = serde_json::json!({
-        "id": Uuid::new_v4().to_string(),
-        "version": 1,
-        "fingerprint": hash,
-        "check": "review",
-        "verdict": "rejected",
-        "identity": { "type": "email", "email": "b@example.com" },
-        "repo_ref": { "type": "vcs", "system": "git", "revision": "deadbeef" },
-        "block_state": "committed",
-        "timestamp": 1000,
-        "path_hint": null,
-        "line_hint": null,
-        "note": null,
-        "tags": null,
-        "attestations": null
-    });
-
-    let file_content = format!(
-        "{}\n{}\n",
-        serde_json::to_string(&approved)?,
-        serde_json::to_string(&rejected)?
+    let approved = review_record(
+        &hash,
+        ReviewRecordOverrides {
+            timestamp: Some(2000),
+            ..Default::default()
+        },
     );
-    fs::write(trueflow_dir.join("reviews.jsonl"), file_content)?;
+    let rejected = review_record(
+        &hash,
+        ReviewRecordOverrides {
+            verdict: Some("rejected"),
+            email: Some("b@example.com"),
+            timestamp: Some(1000),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&trueflow_dir, &[approved, rejected])?;
 
     let output = repo.run(&["review", "--all", "--json"])?;
-    let json: Value = serde_json::from_str(&output)?;
-    assert!(json.as_array().context("Expected array")?.is_empty());
+    let files = json_array(&output)?;
+    assert!(files.is_empty());
     Ok(())
 }
 
@@ -263,27 +229,19 @@ fn test_diff_uses_merge_base() -> Result<()> {
     let repo = TestRepo::new("diff_merge_base")?;
     repo.write("src/file1.rs", "fn one() {}\n")?;
     repo.commit_all("Add file1")?;
+    repo.git(&["checkout", "-B", "main"])?;
 
-    Command::new("git")
-        .args(["checkout", "-b", "feature/one"])
-        .current_dir(&repo.path)
-        .output()?;
+    repo.git(&["checkout", "-b", "feature/one"])?;
 
     repo.write("src/file1.rs", "fn one() { println!(\"feat\"); }\n")?;
     repo.commit_all("Update file1")?;
 
-    Command::new("git")
-        .args(["checkout", "main"])
-        .current_dir(&repo.path)
-        .output()?;
+    repo.git(&["checkout", "main"])?;
 
     repo.write("src/file2.rs", "fn two() {}\n")?;
     repo.commit_all("Add file2")?;
 
-    Command::new("git")
-        .args(["checkout", "feature/one"])
-        .current_dir(&repo.path)
-        .output()?;
+    repo.git(&["checkout", "feature/one"])?;
 
     let output = repo.run(&["diff", "--json"])?;
     let changes: Value = serde_json::from_str(&output)?;

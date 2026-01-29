@@ -87,7 +87,7 @@ fn load_cache(root: &Path) -> Result<Option<Vec<FileState>>> {
         return Ok(None);
     }
 
-    let root_hash = hash_str(root.to_string_lossy().as_ref());
+    let root_hash = cache_root_hash(root);
     if entry.root_hash != root_hash {
         return Ok(None);
     }
@@ -135,7 +135,7 @@ fn write_cache(root: &Path, files: &[FileState]) -> Result<()> {
     let entry = CacheEntry {
         files: cached_files,
         repo_revision: vcs::snapshot_from_workdir().repo_ref_revision,
-        root_hash: hash_str(root.to_string_lossy().as_ref()),
+        root_hash: cache_root_hash(root),
     };
 
     let contents = serde_json::to_string(&entry)?;
@@ -144,16 +144,26 @@ fn write_cache(root: &Path, files: &[FileState]) -> Result<()> {
 }
 
 fn cache_path(root: &Path) -> Result<PathBuf> {
-    let repo_name = root
+    let identity = cache_identity(root);
+    let repo_name = identity
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
     let cache_root = home_dir().unwrap_or_else(|| root.to_path_buf());
-    let root_hash = hash_str(root.to_string_lossy().as_ref());
+    let root_hash = hash_str(identity.to_string_lossy().as_ref());
     Ok(cache_root
         .join(".trueflow")
         .join("cache")
         .join(format!("scan-{}-{}.json", repo_name, root_hash)))
+}
+
+fn cache_identity(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+}
+
+fn cache_root_hash(root: &Path) -> String {
+    let identity = cache_identity(root);
+    hash_str(identity.to_string_lossy().as_ref())
 }
 
 fn system_time_to_epoch(time: SystemTime) -> u64 {

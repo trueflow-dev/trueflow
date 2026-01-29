@@ -4,7 +4,7 @@ use crate::context::TrueflowContext;
 use crate::policy::should_skip_imports_by_default;
 use crate::scanner;
 use crate::store::{
-    approved_hashes_from_verdicts, FileStore, Identity, Record, ReviewStore, Verdict,
+    FileStore, Identity, Record, ReviewStore, Verdict, approved_hashes_from_verdicts,
 };
 use crate::tree;
 use anyhow::Result;

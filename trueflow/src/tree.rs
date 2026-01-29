@@ -1,8 +1,6 @@
 use crate::analysis::Language;
 use crate::block::{Block, FileState};
 use crate::hashing::hash_str;
-use crate::sub_splitter;
-use log::warn;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -375,26 +373,7 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                     file.file_hash.clone(),
                     file.language.clone(),
                 );
-                let mut blocks: Vec<Block> = Vec::new();
-                let mut logged_fallback = false;
-                for block in &file.blocks {
-                    match sub_splitter::split(block, file.language.clone()) {
-                        Ok(sub_blocks) if !sub_blocks.is_empty() => {
-                            blocks.extend(sub_blocks);
-                        }
-                        Ok(_) => blocks.push(block.clone()),
-                        Err(err) => {
-                            if !logged_fallback {
-                                warn!(
-                                    "Subblock split failed for {}: {}, using block-level",
-                                    file.path, err
-                                );
-                                logged_fallback = true;
-                            }
-                            blocks.push(block.clone());
-                        }
-                    }
-                }
+                let mut blocks = file.blocks.clone();
                 blocks.sort_by_key(|block| (block.start_line, block.end_line));
                 for block in blocks {
                     let name = block_label(&block);
