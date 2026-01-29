@@ -1143,7 +1143,7 @@ fn count_descendant_blocks(navigator: &ReviewNavigator, id: TreeNodeId) -> usize
 
 fn render_scope_selector(frame: &mut Frame, selector: &ScopeSelector) {
     let palette = UiPalette::default();
-    let area = frame.size();
+    let area = frame.area();
 
     frame.render_widget(
         UiBlock::default().style(Style::default().bg(palette.bg)),
@@ -1199,7 +1199,7 @@ fn render_scope_selector(frame: &mut Frame, selector: &ScopeSelector) {
 
 fn ui(frame: &mut Frame, state: &mut AppState) {
     let palette = UiPalette::default();
-    let area = frame.size();
+    let area = frame.area();
 
     // 1. Background
     frame.render_widget(
