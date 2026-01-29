@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::{Block, FileState};
+use crate::block::{Block, BlockKind, FileState};
 use crate::hashing::hash_str;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -136,14 +136,15 @@ impl Tree {
         if matches!(file_node.kind, TreeNodeKind::File) && file_node.hash == hash {
             return Some(file_id);
         }
-        file_node
-            .children
-            .iter()
-            .find(|child_id| {
-                let node = self.node(**child_id);
-                matches!(node.kind, TreeNodeKind::Block) && node.hash == hash
-            })
-            .copied()
+        let mut stack = file_node.children.clone();
+        while let Some(node_id) = stack.pop() {
+            let node = self.node(node_id);
+            if matches!(node.kind, TreeNodeKind::Block) && node.hash == hash {
+                return Some(node_id);
+            }
+            stack.extend(node.children.iter().copied());
+        }
+        None
     }
 
     #[allow(dead_code)]
@@ -375,15 +376,38 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                 );
                 let mut blocks = file.blocks.clone();
                 blocks.sort_by_key(|block| (block.start_line, block.end_line));
+                let mut impl_stack: Vec<(TreeNodeId, usize, usize)> = Vec::new();
                 for block in blocks {
+                    while let Some((_, _, end_line)) = impl_stack.last()
+                        && block.start_line > *end_line
+                    {
+                        impl_stack.pop();
+                    }
+
+                    let parent = impl_stack
+                        .iter()
+                        .rev()
+                        .find(|(_, start, end)| {
+                            block.start_line >= *start && block.end_line <= *end
+                        })
+                        .map(|(id, _, _)| *id)
+                        .unwrap_or(file_id);
+
+                    let start_line = block.start_line;
+                    let end_line = block.end_line;
+                    let kind = block.kind.clone();
                     let name = block_label(&block);
-                    builder.add_block(
-                        file_id,
+                    let node_id = builder.add_block(
+                        parent,
                         name,
                         current_path.clone(),
                         block,
                         file.language.clone(),
                     );
+
+                    if kind == BlockKind::Impl {
+                        impl_stack.push((node_id, start_line, end_line));
+                    }
                 }
             } else {
                 let dir_id = directories.entry(current_path.clone()).or_insert_with(|| {

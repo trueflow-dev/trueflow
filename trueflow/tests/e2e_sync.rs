@@ -8,7 +8,7 @@ mod common;
 use common::*;
 
 fn record(id: &str, fingerprint: &str, timestamp: i64) -> Value {
-    review_record(
+    build_review_record(
         fingerprint,
         ReviewRecordOverrides {
             id: Some(id),
@@ -20,7 +20,7 @@ fn record(id: &str, fingerprint: &str, timestamp: i64) -> Value {
 }
 
 fn read_remote_reviews(remote_dir: &Path) -> Result<Vec<Value>> {
-    let stdout = git_output(remote_dir, &["show", "trueflow-db:reviews.jsonl"])?;
+    let stdout = run_git_output(remote_dir, &["show", "trueflow-db:reviews.jsonl"])?;
     let mut records = Vec::new();
     for line in stdout.lines() {
         if line.trim().is_empty() {
@@ -42,14 +42,14 @@ fn test_vet_sync() -> Result<()> {
         fs::remove_dir_all(&remote_dir)?;
     }
     fs::create_dir_all(&remote_dir)?;
-    git_in(&remote_dir, &["init", "--bare"])?;
+    run_git(&remote_dir, &["init", "--bare"])?;
 
     // 2. Create "Local" Repo
     let local = TestRepo::new("local_repo")?;
 
     // Add remote
     let remote = remote_dir.to_str().context("remote repo path")?;
-    git_in(&local.path, &["remote", "add", "origin", remote])?;
+    run_git(&local.path, &["remote", "add", "origin", remote])?;
 
     // 3. Create some vet data locally
     local.run(&[
@@ -66,18 +66,18 @@ fn test_vet_sync() -> Result<()> {
     local.run(&["sync"])?;
 
     // Verify remote has the branch
-    let stdout = git_output(&remote_dir, &["branch"])?;
+    let stdout = run_git_output(&remote_dir, &["branch"])?;
     assert!(stdout.contains("trueflow-db"));
 
     // 5. Clone another repo (simulating colleague)
     let colleague = TestRepo::new("colleague_repo")?;
-    git_in(&colleague.path, &["remote", "add", "origin", remote])?;
+    run_git(&colleague.path, &["remote", "add", "origin", remote])?;
 
     // WHEN: a colleague syncs from the same remote (fetch)
     colleague.run(&["sync"])?;
 
     // THEN: the colleague sees the review records
-    let stdout = git_output(&colleague.path, &["show", "trueflow-db:reviews.jsonl"])?;
+    let stdout = run_git_output(&colleague.path, &["show", "trueflow-db:reviews.jsonl"])?;
     assert!(stdout.contains("fp1"));
     assert!(stdout.contains("approved"));
 
@@ -94,18 +94,18 @@ fn test_sync_dedupes_and_sorts_records() -> Result<()> {
         fs::remove_dir_all(&remote_dir)?;
     }
     fs::create_dir_all(&remote_dir)?;
-    git_in(&remote_dir, &["init", "--bare"])?;
+    run_git(&remote_dir, &["init", "--bare"])?;
 
     let local = TestRepo::new("local_repo_dedup")?;
     let remote = remote_dir.to_str().context("remote repo path")?;
-    git_in(&local.path, &["remote", "add", "origin", remote])?;
+    run_git(&local.path, &["remote", "add", "origin", remote])?;
 
     let local_records = vec![record("dup", "fp-remote", 1500)];
     write_reviews_jsonl(&local.path.join(".trueflow"), &local_records)?;
     local.run(&["sync"])?;
 
     let colleague = TestRepo::new("colleague_repo_dedup")?;
-    git_in(&colleague.path, &["remote", "add", "origin", remote])?;
+    run_git(&colleague.path, &["remote", "add", "origin", remote])?;
 
     let colleague_records = vec![
         record("dup", "fp-local", 2000),

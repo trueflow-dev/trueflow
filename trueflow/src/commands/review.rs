@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::Block;
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
-use crate::policy::should_skip_imports_by_default;
+use crate::policy::{should_skip_impl_by_default, should_skip_imports_by_default};
 use crate::scanner;
 use crate::store::{
     FileStore, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
@@ -14,7 +14,6 @@ use anyhow::{Result, anyhow};
 use log::info;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 #[derive(Serialize)]
 pub struct UnreviewedFile {
@@ -58,7 +57,13 @@ pub fn collect_review_summary(
         "review collect (all={}, only={:?}, exclude={:?})",
         options.all, options.only, options.exclude
     );
-    let target_paths = resolve_review_targets(options)?;
+    let target_paths = resolve_review_targets(options)?.map(|paths| {
+        paths
+            .into_iter()
+            .map(|path| normalize_path_str(&path))
+            .collect::<HashSet<String>>()
+    });
+    let workdir_prefix = workdir_prefix_from_git_root();
 
     // 1. Load Approved Hashes
     let store = FileStore::new()?;
@@ -80,11 +85,13 @@ pub fn collect_review_summary(
 
     for file in files {
         if let Some(targets) = &target_paths {
-            let path_normalized = Path::new(&file.path)
-                .strip_prefix("./")
-                .unwrap_or(Path::new(&file.path));
-            let path_str = path_normalized.to_string_lossy();
-            if !targets.contains(path_str.as_ref()) && !targets.contains(&file.path) {
+            let file_path = normalize_path_str(&file.path);
+            let mut matches = targets.contains(&file_path);
+            if !matches && let Some(prefix) = &workdir_prefix {
+                let repo_path = format!("{prefix}/{file_path}");
+                matches = targets.contains(&repo_path);
+            }
+            if !matches {
                 continue;
             }
         }
@@ -96,6 +103,9 @@ pub fn collect_review_summary(
                 continue;
             }
             if should_skip_imports_by_default(&file.path, &block, filters) {
+                continue;
+            }
+            if should_skip_impl_by_default(&block, filters) {
                 continue;
             }
             reviewable_blocks.push(block);
@@ -231,6 +241,24 @@ fn normalize_targets(options: &ReviewOptions) -> Vec<ReviewTarget> {
         return vec![ReviewTarget::DirtyWorktree];
     }
     options.targets.clone()
+}
+
+fn workdir_prefix_from_git_root() -> Option<String> {
+    let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
+    let cwd = std::env::current_dir().ok()?;
+    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let relative = cwd.strip_prefix(&repo_root).ok()?;
+    let relative_str = normalize_path_str(relative.to_string_lossy().as_ref());
+    if relative_str.is_empty() || relative_str == "." {
+        None
+    } else {
+        Some(relative_str)
+    }
+}
+
+fn normalize_path_str(path: &str) -> String {
+    path.trim_start_matches("./").replace('\\', "/")
 }
 
 fn parse_review_targets(values: &[String]) -> Result<Vec<ReviewTarget>> {

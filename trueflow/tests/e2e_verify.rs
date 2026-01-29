@@ -6,7 +6,7 @@ use common::*;
 fn test_verify_unsigned_records() -> Result<()> {
     let repo = TestRepo::new("verify_unsigned")?;
 
-    let record = review_record(
+    let record = build_review_record(
         "deadbeef",
         ReviewRecordOverrides {
             id: Some("unsigned"),
@@ -44,7 +44,7 @@ fn test_verify_invalid_attestation() -> Result<()> {
             "public_key": "invalid"
         }
     ]);
-    let record = review_record(
+    let record = build_review_record(
         "deadbeef",
         ReviewRecordOverrides {
             id: Some("invalid"),

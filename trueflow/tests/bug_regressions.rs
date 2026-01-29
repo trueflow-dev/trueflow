@@ -46,6 +46,7 @@ fn test_optimizer_module_merge_preserves_content() {
 
 #[test]
 fn test_diff_new_content_matches_post_hunk() -> Result<()> {
+    // GIVEN: a change that replaces a line in the working tree
     let repo = TestRepo::new("diff_new_content")?;
     let initial = include_str!("fixtures/diff_new_content_initial.rs");
     let updated = include_str!("fixtures/diff_new_content_updated.rs");
@@ -57,6 +58,7 @@ fn test_diff_new_content_matches_post_hunk() -> Result<()> {
     repo.write("src/main.rs", updated)?;
     repo.commit_all("Update message")?;
 
+    // WHEN: we compute diff JSON
     let output = repo.run(&["diff", "--json"])?;
     let changes: Value = serde_json::from_str(&output)?;
     let change = changes
@@ -66,6 +68,7 @@ fn test_diff_new_content_matches_post_hunk() -> Result<()> {
         .context("Expected change")?;
     let new_content = change["new_content"].as_str().context("new_content")?;
 
+    // THEN: new_content reflects the post-hunk file content
     let file_content = fs::read_to_string(repo.path.join("src/main.rs"))?;
     assert_eq!(new_content, file_content);
     Ok(())
@@ -106,18 +109,19 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
     repo.commit_all("Add lib")?;
 
+    // GIVEN: two review records for the same block with different timestamps
     let output = repo.run(&["review", "--all", "--json"])?;
     let hash = first_block_hash(&output)?;
 
     let trueflow_dir = repo.path.join(".trueflow");
-    let approved = review_record(
+    let approved = build_review_record(
         &hash,
         ReviewRecordOverrides {
             timestamp: Some(2000),
             ..Default::default()
         },
     );
-    let rejected = review_record(
+    let rejected = build_review_record(
         &hash,
         ReviewRecordOverrides {
             verdict: Some("rejected"),
@@ -128,9 +132,40 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
     );
     write_reviews_jsonl(&trueflow_dir, &[approved, rejected])?;
 
+    // WHEN: we re-run review
     let output = repo.run(&["review", "--all", "--json"])?;
     let files = json_array(&output)?;
+
+    // THEN: the newer approval wins and nothing remains to review
     assert!(files.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_review_revision_target_from_subdir() -> Result<()> {
+    let repo = TestRepo::new("review_revision_subdir")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Initial")?;
+
+    // GIVEN: a revision that changes a file under src/
+    repo.git(&["checkout", "-b", "feature/rev"])?;
+    repo.write("src/lib.rs", "pub fn core() {}\npub fn helper() {}\n")?;
+    repo.commit_all("Add helper")?;
+
+    let head = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let revision = head.trim();
+    let subdir = repo.path.join("src");
+
+    // WHEN: we request review from a subdirectory scoped to that revision
+    let output = repo.run_in(
+        &["review", "--json", "--target", &format!("rev:{revision}")],
+        &subdir,
+    )?;
+    let files = json_array(&output)?;
+
+    // THEN: we still see reviewable output
+    assert!(!files.is_empty());
+
     Ok(())
 }
 

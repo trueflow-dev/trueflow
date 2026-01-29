@@ -23,6 +23,7 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
         Language::Rust if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_rust_function(block)?
         }
+        Language::Rust if matches!(block.kind, BlockKind::Impl) => split_rust_impl(block)?,
         Language::Python if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_python_function(block)?
         }
@@ -198,6 +199,106 @@ fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
             comment_kinds: &["line_comment", "block_comment"],
             trim_closing_brace: true,
         },
+    )
+}
+
+fn split_rust_impl(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse impl")?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "impl_item" {
+            let items = collect_rust_impl_items(block, child)?;
+            if !items.is_empty() {
+                return Ok(items);
+            }
+        }
+    }
+
+    split_code(block)
+}
+
+fn collect_rust_impl_items(parent: &Block, impl_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
+    let Some(body) = impl_node.child_by_field_name("body") else {
+        return Ok(Vec::new());
+    };
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    let mut pending_start: Option<usize> = None;
+    let mut pending_end: usize = 0;
+
+    for child in body.children(&mut cursor) {
+        let ts_kind = child.kind();
+        if matches!(ts_kind, "{" | "}") {
+            continue;
+        }
+        let start_byte = child.start_byte();
+        let end_byte = child.end_byte();
+
+        if is_rust_attribute_node(ts_kind) {
+            if pending_start.is_none() {
+                pending_start = Some(start_byte);
+            }
+            pending_end = end_byte;
+            continue;
+        }
+
+        let Some(kind) = map_rust_impl_child_kind(ts_kind) else {
+            continue;
+        };
+
+        let block_start = pending_start.unwrap_or(start_byte);
+        let chunk = &parent.content[block_start..end_byte];
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            chunk,
+            block_start,
+            end_byte,
+            kind,
+        ));
+
+        pending_start = None;
+        pending_end = 0;
+    }
+
+    if let Some(start) = pending_start {
+        let end = pending_end.max(start);
+        if end > start {
+            let chunk = &parent.content[start..end];
+            blocks.push(create_sub_block_with_kind(
+                parent,
+                chunk,
+                start,
+                end,
+                BlockKind::Code,
+            ));
+        }
+    }
+
+    Ok(blocks)
+}
+
+fn map_rust_impl_child_kind(kind: &str) -> Option<BlockKind> {
+    match kind {
+        "function_item" => Some(BlockKind::Method),
+        "function_signature_item" => Some(BlockKind::FunctionSignature),
+        "const_item" => Some(BlockKind::Const),
+        "static_item" => Some(BlockKind::Static),
+        "type_item" | "associated_type" => Some(BlockKind::Type),
+        "macro_invocation" | "macro_definition" => Some(BlockKind::Macro),
+        _ => None,
+    }
+}
+
+fn is_rust_attribute_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
     )
 }
 
@@ -636,6 +737,16 @@ mod tests {
         assert_eq!(chunks[1].kind, BlockKind::Gap);
         assert_eq!(chunks[2].kind, BlockKind::CodeParagraph);
         assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_rust_impl_into_items() {
+        let content = "impl Foo {\n    fn read_heavy(&self) {}\n    const MAX: usize = 1;\n}\n";
+        let block = make_block(content, BlockKind::Impl);
+        let chunks = split(&block, Language::Rust).unwrap();
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Const));
+        assert!(!chunks.iter().any(|b| b.kind == BlockKind::Impl));
     }
 
     #[test]

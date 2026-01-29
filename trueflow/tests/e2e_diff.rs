@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
-use std::process::Command;
 
 mod common;
 use common::*;
@@ -9,6 +8,15 @@ use common::*;
 fn get_diff_json(repo: &TestRepo) -> Result<Vec<Value>> {
     let output = repo.run(&["diff", "--json"])?;
     json_array(&output)
+}
+
+const LIB_ADD: &str = include_str!("fixtures/diff_lib_add.rs");
+const LIB_ADD_SUB: &str = include_str!("fixtures/diff_lib_add_sub.rs");
+const RENAME_NEW: &str = include_str!("fixtures/diff_rename_new.rs");
+const RENAME_OLD: &str = "pub fn alpha() {}\n";
+
+fn checkout_branch(repo: &TestRepo, branch: &str) -> Result<()> {
+    repo.git(&["checkout", "-b", branch])
 }
 
 #[test]
@@ -29,10 +37,7 @@ fn test_vet_diff_initial_state() -> Result<()> {
     // So usually we vet a feature branch.
 
     // Let's create a feature branch.
-    Command::new("git")
-        .args(["checkout", "-b", "feature/add-greeting"])
-        .current_dir(&repo.path)
-        .output()?;
+    checkout_branch(&repo, "feature/add-greeting")?;
 
     repo.write("src/main.rs", "fn main() { println!(\"Hello World\"); }")?;
     repo.commit_all("Update greeting")?;
@@ -59,18 +64,12 @@ fn test_vet_diff_initial_state() -> Result<()> {
 #[test]
 fn test_vet_mark_flow() -> Result<()> {
     let repo = TestRepo::new("mark_flow")?;
-    repo.write("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 { a + b }")?;
+    repo.write("src/lib.rs", LIB_ADD)?;
     repo.commit_all("Initial")?;
 
     // Feature
-    Command::new("git")
-        .args(["checkout", "-b", "feature/sub"])
-        .current_dir(&repo.path)
-        .output()?;
-    repo.write(
-        "src/lib.rs",
-        "pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn sub(a: i32, b: i32) -> i32 { a - b }",
-    )?;
+    checkout_branch(&repo, "feature/sub")?;
+    repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
     // 1. Get Diff
@@ -124,21 +123,12 @@ fn test_vet_mark_flow() -> Result<()> {
 #[test]
 fn test_check_command_gates_unreviewed_changes() -> Result<()> {
     let repo = TestRepo::new("check_gate")?;
-    repo.write(
-        "src/lib.rs",
-        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
-    )?;
+    repo.write("src/lib.rs", LIB_ADD)?;
     repo.commit_all("Initial")?;
 
-    Command::new("git")
-        .args(["checkout", "-b", "feature/check"])
-        .current_dir(&repo.path)
-        .output()?;
+    checkout_branch(&repo, "feature/check")?;
 
-    repo.write(
-        "src/lib.rs",
-        "pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn sub(a: i32, b: i32) -> i32 { a - b }\n",
-    )?;
+    repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
     // Expect failure
@@ -182,21 +172,12 @@ fn test_check_command_gates_unreviewed_changes() -> Result<()> {
 #[test]
 fn test_diff_ignores_non_review_checks() -> Result<()> {
     let repo = TestRepo::new("diff_non_review")?;
-    repo.write(
-        "src/lib.rs",
-        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
-    )?;
+    repo.write("src/lib.rs", LIB_ADD)?;
     repo.commit_all("Initial")?;
 
-    Command::new("git")
-        .args(["checkout", "-b", "feature/security"])
-        .current_dir(&repo.path)
-        .output()?;
+    checkout_branch(&repo, "feature/security")?;
 
-    repo.write(
-        "src/lib.rs",
-        "pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn sub(a: i32, b: i32) -> i32 { a - b }\n",
-    )?;
+    repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
     let changes = get_diff_json(&repo)?;
@@ -240,19 +221,13 @@ fn test_diff_ignores_untracked_files() -> Result<()> {
 #[test]
 fn test_diff_handles_renamed_file() -> Result<()> {
     let repo = TestRepo::new("diff_rename")?;
-    repo.write("src/old.rs", "pub fn alpha() {}\n")?;
+    repo.write("src/old.rs", RENAME_OLD)?;
     repo.commit_all("Add alpha")?;
 
-    Command::new("git")
-        .args(["checkout", "-b", "feature/rename"])
-        .current_dir(&repo.path)
-        .output()?;
+    checkout_branch(&repo, "feature/rename")?;
 
-    Command::new("git")
-        .args(["mv", "src/old.rs", "src/new.rs"])
-        .current_dir(&repo.path)
-        .output()?;
-    repo.write("src/new.rs", "pub fn alpha() {}\npub fn beta() {}\n")?;
+    repo.git(&["mv", "src/old.rs", "src/new.rs"])?;
+    repo.write("src/new.rs", RENAME_NEW)?;
     repo.commit_all("Rename and expand")?;
 
     let changes = get_diff_json(&repo)?;
@@ -274,10 +249,7 @@ fn test_diff_skips_binary_changes() -> Result<()> {
     fs::write(&binary_path, [0, 255, 0, 1])?;
     repo.commit_all("Add binary")?;
 
-    Command::new("git")
-        .args(["checkout", "-b", "feature/binary"])
-        .current_dir(&repo.path)
-        .output()?;
+    checkout_branch(&repo, "feature/binary")?;
 
     fs::write(&binary_path, [0, 255, 2, 3])?;
     repo.commit_all("Update binary")?;
@@ -294,10 +266,7 @@ fn test_diff_errors_without_main_branch() -> Result<()> {
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
     repo.commit_all("Initial")?;
 
-    Command::new("git")
-        .args(["branch", "-m", "trunk"])
-        .current_dir(&repo.path)
-        .output()?;
+    repo.git(&["branch", "-m", "trunk"])?;
 
     let output = repo.run_err(&["diff", "--json"])?;
     assert!(output.contains("main") || output.contains("master"));

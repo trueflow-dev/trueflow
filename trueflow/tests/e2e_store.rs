@@ -3,6 +3,7 @@ use std::fs;
 
 mod common;
 use common::*;
+use trueflow::store::{BlockState, RepoRef, VcsSystem};
 
 #[test]
 fn test_review_skips_invalid_db_lines() -> Result<()> {
@@ -36,11 +37,13 @@ fn test_review_skips_invalid_db_lines() -> Result<()> {
     let records = read_review_records(&db_path)?;
     assert_eq!(records.len(), 1);
     let record = &records[0];
-    assert!(record["repo_ref"].is_object());
-    assert_eq!(record["repo_ref"]["type"].as_str(), Some("vcs"));
-    assert_eq!(record["repo_ref"]["system"].as_str(), Some("git"));
-    assert!(record["repo_ref"]["revision"].is_string());
-    assert_eq!(record["block_state"].as_str(), Some("committed"));
+    match &record.repo_ref {
+        RepoRef::Vcs { system, revision } => {
+            assert_eq!(system, &VcsSystem::Git);
+            assert!(!revision.is_empty());
+        }
+    }
+    assert_eq!(record.block_state, BlockState::Committed);
 
     Ok(())
 }

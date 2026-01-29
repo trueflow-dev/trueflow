@@ -137,6 +137,10 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         }
         blocks.push(block);
 
+        if matches!(lang, Language::Rust) && ts_kind == "impl_item" {
+            blocks.extend(collect_rust_impl_items(child, content, &lang, &test_ranges));
+        }
+
         last_end_byte = end_byte;
         pending_start = None;
         pending_end = 0;
@@ -349,6 +353,85 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
         },
         _ => BlockKind::Code,
     }
+}
+
+fn map_rust_impl_child_kind(kind: &str) -> Option<BlockKind> {
+    match kind {
+        "function_item" => Some(BlockKind::Method),
+        "function_signature_item" => Some(BlockKind::FunctionSignature),
+        "const_item" => Some(BlockKind::Const),
+        "static_item" => Some(BlockKind::Static),
+        "type_item" | "associated_type" => Some(BlockKind::Type),
+        "macro_invocation" | "macro_definition" => Some(BlockKind::Macro),
+        _ => None,
+    }
+}
+
+fn is_rust_attribute_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
+    )
+}
+
+fn collect_rust_impl_items(
+    impl_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: &Language,
+    test_ranges: &[crate::block::Span],
+) -> Vec<Block> {
+    let Some(body) = impl_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    let mut pending_start: Option<usize> = None;
+    let mut pending_end: usize = 0;
+
+    for child in body.children(&mut cursor) {
+        let ts_kind = child.kind();
+        if matches!(ts_kind, "{" | "}") {
+            continue;
+        }
+        let start_byte = child.start_byte();
+        let end_byte = child.end_byte();
+
+        if is_rust_attribute_node(ts_kind) {
+            if pending_start.is_none() {
+                pending_start = Some(start_byte);
+            }
+            pending_end = end_byte;
+            continue;
+        }
+
+        let Some(kind) = map_rust_impl_child_kind(ts_kind) else {
+            continue;
+        };
+
+        let block_start = pending_start.unwrap_or(start_byte);
+        let node_content = &content[block_start..end_byte];
+        let mut block = create_block(node_content, kind, content, block_start, end_byte, lang);
+        let is_test = is_test_span(test_ranges, crate::block::Span::new(start_byte, end_byte));
+        if is_test {
+            block.tags.push("test".to_string());
+        }
+        blocks.push(block);
+
+        pending_start = None;
+        pending_end = 0;
+    }
+
+    if let Some(start) = pending_start {
+        let end = pending_end.max(start);
+        if end > start {
+            let chunk = &content[start..end];
+            let block = create_block(chunk, BlockKind::Code, content, start, end, lang);
+            blocks.push(block);
+        }
+    }
+
+    blocks
 }
 
 fn create_block(
@@ -719,6 +802,15 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_block_hashes_match(&blocks);
         assert_eq!(blocks[0].content, content);
+    }
+
+    #[test]
+    fn test_split_rust_impl_methods() {
+        let content = "struct Foo;\n\nimpl Foo {\n    fn read_heavy(&self) {}\n    const MAX: usize = 1;\n}\n";
+        let blocks = split(content, Language::Rust).unwrap();
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Impl));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
     }
 
     #[test]

@@ -1295,6 +1295,12 @@ fn build_header_lines(
 
     lines.push(format_header_row(&header_text, palette, true));
 
+    if matches!(node.kind, TreeNodeKind::Block)
+        && let Some(breadcrumb) = build_block_breadcrumb(node, state)
+    {
+        lines.push(format_header_row(&breadcrumb, palette, false));
+    }
+
     if !matches!(node.kind, TreeNodeKind::Root)
         && !node.path.is_empty()
         && !matches!(node.kind, TreeNodeKind::Block)
@@ -1315,6 +1321,70 @@ fn build_header_lines(
     }
 
     lines
+}
+
+fn build_block_breadcrumb(node: &crate::tree::TreeNode, state: &AppState) -> Option<String> {
+    if !matches!(node.kind, TreeNodeKind::Block) {
+        return None;
+    }
+
+    let tree = &state.navigator.tree;
+    let mut ancestors = tree.ancestors(node.id);
+    ancestors.reverse();
+
+    let mut parts = Vec::new();
+    let mut file_path = None;
+    let mut impl_parts = Vec::new();
+    let mut current = None;
+
+    for ancestor_id in ancestors {
+        let ancestor = tree.node(ancestor_id);
+        match ancestor.kind {
+            TreeNodeKind::File => {
+                if !ancestor.path.is_empty() {
+                    file_path = Some(ancestor.path.clone());
+                }
+            }
+            TreeNodeKind::Block => {
+                let Some(block) = ancestor.block.as_ref() else {
+                    continue;
+                };
+                let label = block_signature(block);
+                if label.is_empty() {
+                    continue;
+                }
+                if block.kind == BlockKind::Impl {
+                    impl_parts.push(label.clone());
+                }
+                if ancestor.id == node.id {
+                    current = Some(label);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(path) = file_path {
+        parts.push(format!("File ({path})"));
+    }
+    parts.extend(impl_parts);
+    if let Some(current) = current {
+        parts.push(current);
+    }
+
+    if parts.len() > 1 {
+        Some(parts.join(" -> "))
+    } else {
+        None
+    }
+}
+
+fn block_signature(block: &crate::block::Block) -> String {
+    let Some(line) = block.content.lines().find(|line| !line.trim().is_empty()) else {
+        return block.kind.as_str().to_string();
+    };
+    let trimmed = line.trim().trim_end_matches('{').trim();
+    truncate_text(trimmed, 72)
 }
 
 fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'static> {

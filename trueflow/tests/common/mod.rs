@@ -3,8 +3,10 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use trueflow::store::Record;
 use uuid::Uuid;
 
 pub struct TestRepo {
@@ -60,7 +62,7 @@ impl TestRepo {
     }
 
     pub fn git(&self, args: &[&str]) -> Result<()> {
-        git_in(&self.path, args)
+        run_git(&self.path, args)
     }
 
     pub fn add(&self, path: &str) -> Result<()> {
@@ -107,9 +109,9 @@ fn temp_dir(base: &str, name: &str) -> PathBuf {
 }
 
 fn init_git(path: &Path) -> Result<()> {
-    git_in(path, &["init", "-q"])?;
-    git_in(path, &["config", "user.email", "test@example.com"])?;
-    git_in(path, &["config", "user.name", "Test User"])?;
+    run_git(path, &["init", "-q"])?;
+    run_git(path, &["config", "user.email", "test@example.com"])?;
+    run_git(path, &["config", "user.name", "Test User"])?;
     Ok(())
 }
 
@@ -130,7 +132,7 @@ fn run_cmd(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-pub fn git_in(dir: &Path, args: &[&str]) -> Result<()> {
+pub fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git").args(args).current_dir(dir).output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -143,7 +145,7 @@ pub fn git_in(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
+pub fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git").args(args).current_dir(dir).output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -156,12 +158,12 @@ pub fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-// JSON helpers
-
+/// Parse CLI JSON output into a serde_json::Value.
 pub fn json(output: &str) -> Result<Value> {
     serde_json::from_str(output).context("Invalid JSON")
 }
 
+/// Parse CLI JSON output into a top-level array.
 pub fn json_array(output: &str) -> Result<Vec<Value>> {
     json(output)?
         .as_array()
@@ -169,6 +171,9 @@ pub fn json_array(output: &str) -> Result<Vec<Value>> {
         .context("Output should be array")
 }
 
+/// Return the first file's blocks from scan/review JSON output.
+///
+/// Input contract: JSON array with at least one file entry containing a `blocks` array.
 pub fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
@@ -178,6 +183,9 @@ pub fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
         .clone())
 }
 
+/// Return the `file_hash` from the first file entry in scan JSON output.
+///
+/// Input contract: JSON array with at least one file entry containing `file_hash`.
 pub fn first_file_hash(output: &str) -> Result<String> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
@@ -187,6 +195,9 @@ pub fn first_file_hash(output: &str) -> Result<String> {
     Ok(hash.to_string())
 }
 
+/// Return the first block hash from the first file entry in scan/review JSON output.
+///
+/// Input contract: JSON array with at least one file entry containing a non-empty `blocks` array.
 pub fn first_block_hash(output: &str) -> Result<String> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
@@ -199,6 +210,9 @@ pub fn first_block_hash(output: &str) -> Result<String> {
     Ok(hash.to_string())
 }
 
+/// Return the first block hash and its file path from scan/review JSON output.
+///
+/// Input contract: JSON array with at least one file entry containing a non-empty `blocks` array.
 pub fn first_block_info(output: &str) -> Result<(String, String)> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
@@ -212,12 +226,13 @@ pub fn first_block_info(output: &str) -> Result<(String, String)> {
     Ok((hash.to_string(), path.to_string()))
 }
 
-pub fn find_tree_hash(output: &str, path: &str) -> Result<String> {
-    let root = json(output)?;
-    find_tree_hash_inner(&root, path)
+/// Locate a tree node hash for the given path in scan --tree JSON output.
+pub fn find_tree_hash(root: &Value, path: &str) -> Result<String> {
+    find_tree_hash_inner(root, path)
         .with_context(|| format!("Tree node not found for path '{path}'"))
 }
 
+/// Depth-first search for a tree node hash by path.
 fn find_tree_hash_inner(node: &Value, path: &str) -> Option<String> {
     let node_path = node.get("path")?.as_str()?;
     if node_path == path {
@@ -236,7 +251,7 @@ fn find_tree_hash_inner(node: &Value, path: &str) -> Option<String> {
     None
 }
 
-pub fn read_review_records(path: &Path) -> Result<Vec<Value>> {
+pub fn read_review_records(path: &Path) -> Result<Vec<Record>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -244,10 +259,11 @@ pub fn read_review_records(path: &Path) -> Result<Vec<Value>> {
     Ok(content
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| serde_json::from_str::<Record>(l).ok())
         .collect())
 }
 
+/// Overrides for building test review records with stable defaults.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewRecordOverrides<'a> {
     pub id: Option<&'a str>,
@@ -260,7 +276,8 @@ pub struct ReviewRecordOverrides<'a> {
     pub attestations: Option<Value>,
 }
 
-pub fn review_record(fingerprint: &str, overrides: ReviewRecordOverrides<'_>) -> Value {
+/// Build a review record JSON value for tests.
+pub fn build_review_record(fingerprint: &str, overrides: ReviewRecordOverrides<'_>) -> Value {
     let id = overrides
         .id
         .map(str::to_string)
@@ -293,11 +310,11 @@ pub fn review_record(fingerprint: &str, overrides: ReviewRecordOverrides<'_>) ->
 
 pub fn write_reviews_jsonl(dir: &Path, records: &[Value]) -> Result<()> {
     fs::create_dir_all(dir)?;
-    let mut content = String::new();
+    let file = fs::File::create(dir.join("reviews.jsonl"))?;
+    let mut writer = BufWriter::new(file);
     for record in records {
-        content.push_str(&serde_json::to_string(record)?);
-        content.push('\n');
+        serde_json::to_writer(&mut writer, record)?;
+        writer.write_all(b"\n")?;
     }
-    fs::write(dir.join("reviews.jsonl"), content)?;
     Ok(())
 }

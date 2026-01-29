@@ -84,7 +84,7 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Review targets (file:<path>, rev:<sha>, rev:<start>..<end>)
+        /// Review targets (file:`<path>`, rev:`<sha>`, rev:`<start>..<end>`)
         #[arg(long, value_name = "TARGET")]
         target: Vec<String>,
 

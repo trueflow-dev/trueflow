@@ -307,7 +307,8 @@ fn test_directory_hash_approval_hides_blocks() -> Result<()> {
     repo.commit_all("Add libs")?;
 
     let output = repo.run(&["scan", "--tree", "--json"])?;
-    let dir_hash = find_tree_hash(&output, "src")?;
+    let tree = json(&output)?;
+    let dir_hash = find_tree_hash(&tree, "src")?;
 
     repo.run(&[
         "mark",

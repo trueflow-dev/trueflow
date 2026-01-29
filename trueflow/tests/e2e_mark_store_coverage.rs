@@ -1,9 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs;
 use std::process::Command;
 
 mod common;
 use common::*;
+use trueflow::store::BlockState;
 
 #[test]
 fn test_mark_uncommitted_state() -> Result<()> {
@@ -37,8 +38,7 @@ fn test_mark_uncommitted_state() -> Result<()> {
     let records = read_review_records(&db_path)?;
     assert_eq!(records.len(), 1);
 
-    let state = records[0]["block_state"].as_str().context("block_state")?;
-    assert_eq!(state, "uncommitted");
+    assert_eq!(records[0].block_state, BlockState::Uncommitted);
 
     Ok(())
 }
@@ -62,8 +62,7 @@ fn test_mark_unknown_state_no_path() -> Result<()> {
     let records = read_review_records(&db_path)?;
     assert_eq!(records.len(), 1);
 
-    let state = records[0]["block_state"].as_str().context("block_state")?;
-    assert_eq!(state, "unknown");
+    assert_eq!(records[0].block_state, BlockState::Unknown);
 
     Ok(())
 }
@@ -96,7 +95,7 @@ fn test_store_subdirectory_discovery() -> Result<()> {
 
     let records = read_review_records(&db_path)?;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["fingerprint"].as_str(), Some(hash));
+    assert_eq!(records[0].fingerprint, hash);
 
     Ok(())
 }
