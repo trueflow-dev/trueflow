@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block as UiBlock, Gauge, Paragraph, Wrap},
+    widgets::{Block as UiBlock, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
@@ -512,6 +512,9 @@ struct AppState {
     last_frame: std::time::Instant,
     file_cache: HashMap<PathBuf, Vec<String>>,
     root_cursor: Option<TreeNodeId>,
+    scroll_offset: u16,
+    content_height: u16,
+    viewport_height: u16,
 }
 
 pub fn run(context: &TrueflowContext) -> Result<()> {
@@ -570,6 +573,9 @@ fn build_review_state(
         last_frame: std::time::Instant::now(),
         file_cache: HashMap::new(),
         root_cursor,
+        scroll_offset: 0,
+        content_height: 0,
+        viewport_height: 0,
     })
 }
 
@@ -748,6 +754,26 @@ fn run_app(
                         handle_comment_action(&mut state)?;
                         needs_render = true;
                     }
+                    KeyCode::Char(' ') if state.navigator.current_id() != state.navigator.tree.root() => {
+                        handle_scroll_page_down(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::PageUp => {
+                        handle_scroll_page_up(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::PageDown => {
+                        handle_scroll_page_down(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Home => {
+                        state.scroll_offset = 0;
+                        needs_render = true;
+                    }
+                    KeyCode::End => {
+                        state.scroll_offset = state.content_height.saturating_sub(state.viewport_height);
+                        needs_render = true;
+                    }
                     KeyCode::Char('g') => {
                         state.navigator.jump_root();
                         needs_render = true;
@@ -804,6 +830,7 @@ fn handle_ascend(state: &mut AppState) {
         return;
     }
     state.navigator.ascend();
+    state.scroll_offset = 0;
 }
 
 fn handle_descend(state: &mut AppState) {
@@ -825,9 +852,11 @@ fn handle_descend(state: &mut AppState) {
 
         if let Some(target) = state.root_cursor {
             state.navigator.set_current(target);
+            state.scroll_offset = 0;
         }
     } else {
         state.navigator.descend();
+        state.scroll_offset = 0;
     }
 }
 
@@ -836,6 +865,7 @@ fn handle_prev(state: &mut AppState) {
         move_root_cursor(state, -1);
     } else {
         state.navigator.move_prev();
+        state.scroll_offset = 0;
     }
 }
 
@@ -844,7 +874,19 @@ fn handle_next(state: &mut AppState) {
         move_root_cursor(state, 1);
     } else {
         state.navigator.move_next();
+        state.scroll_offset = 0;
     }
+}
+
+fn handle_scroll_page_up(state: &mut AppState) {
+    let scroll_amount = state.viewport_height.saturating_sub(1);
+    state.scroll_offset = state.scroll_offset.saturating_sub(scroll_amount);
+}
+
+fn handle_scroll_page_down(state: &mut AppState) {
+    let scroll_amount = state.viewport_height.saturating_sub(1);
+    let max_scroll = state.content_height.saturating_sub(state.viewport_height);
+    state.scroll_offset = (state.scroll_offset + scroll_amount).min(max_scroll);
 }
 
 fn move_root_cursor(state: &mut AppState, offset: isize) {
@@ -1065,8 +1107,10 @@ fn apply_action_locally(
 
     if let Some(node_id) = next_id {
         state.navigator.set_current(node_id);
+        state.scroll_offset = 0;
     } else {
         state.navigator.jump_root();
+        state.scroll_offset = 0;
     }
 }
 
@@ -1269,8 +1313,14 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let focus_layout = compute_focus_layout(area, header_lines.len() as u16);
     let actions_lines = build_action_lines(focus_layout.actions.width, palette);
     let node_snapshot = node.clone();
-    let content_lines =
+    let (content_lines, total_lines) =
         build_content_lines(state, &node_snapshot, palette, focus_layout.code.height);
+
+    state.content_height = total_lines as u16;
+    state.viewport_height = focus_layout.code.height;
+    state.scroll_offset = state
+        .scroll_offset
+        .min(state.content_height.saturating_sub(state.viewport_height));
 
     let meta_block = UiBlock::default()
         .borders(ratatui::widgets::Borders::ALL)
@@ -1287,9 +1337,26 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     frame.render_widget(
         Paragraph::new(content_lines)
             .block(UiBlock::default().style(Style::default().bg(palette.code_bg)))
+            .scroll((state.scroll_offset, 0))
             .wrap(Wrap { trim: false }),
         focus_layout.code,
     );
+
+    if state.content_height > state.viewport_height {
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"));
+        let mut scrollbar_state = ScrollbarState::new(
+            state
+                .content_height
+                .saturating_sub(state.viewport_height)
+                .into(),
+        )
+        .position(state.scroll_offset.into());
+
+        frame.render_stateful_widget(scrollbar, focus_layout.code, &mut scrollbar_state);
+    }
 
     let actions_paragraph = Paragraph::new(actions_lines)
         .alignment(Alignment::Center)
@@ -1525,7 +1592,7 @@ fn build_content_lines(
     node: &crate::tree::TreeNode,
     palette: &UiPalette,
     code_height: u16,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     match node.kind {
         TreeNodeKind::Block => build_block_lines(state, node, palette, code_height),
         TreeNodeKind::File => build_file_lines(state, node, palette, code_height),
@@ -1558,36 +1625,59 @@ fn build_block_lines(
     node: &crate::tree::TreeNode,
     palette: &UiPalette,
     code_height: u16,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let Some(block) = &node.block else {
-        return vec![Line::from(Span::styled(
-            "(No content)",
-            Style::default().fg(palette.dim).bg(palette.code_bg),
-        ))];
+        return (
+            vec![Line::from(Span::styled(
+                "(No content)",
+                Style::default().fg(palette.dim).bg(palette.code_bg),
+            ))],
+            1,
+        );
     };
 
     let language = node.language.clone();
     let block_lines: Vec<String> = block.content.lines().map(|line| line.to_string()).collect();
     let extra_space = code_height.saturating_sub(block_lines.len() as u16) as isize;
 
+    // TODO: if paginating, we shouldn't truncate context based on viewport height alone.
+    // However, existing context logic tries to center the block vertically.
+    // For pagination, we probably want full context available but scrolled.
+    // For now, let's keep context logic but return full lines.
+
+    let total_context = (extra_space - 1).max(0) as usize;
+    // With scrolling, we might want more context if available, or just render everything?
+    // The current design renders a *subset* of file lines around the block.
+    // If we want to scroll *within* that subset, we return the subset.
+    // If we want to scroll the *whole file*, that's a bigger change.
+    // Let's assume we paginate the "view" constructed here.
+    // If the block is huge, 'block_lines' is huge, and 'extra_space' is negative.
+    // In that case, context is 0.
+
+    let mut top_context = total_context / 2 + (total_context % 2);
+    let mut bottom_context = total_context / 2;
+
     if extra_space < 2 {
-        return block_lines
+        // Block is large or fits perfectly. Minimal context.
+        // Actually, if block is large, extra_space < 0.
+        // We should just render the block + maybe minimal context if we want?
+        // Existing logic returns just block lines if extra_space < 2.
+        // This is fine for now; large blocks will just be the block itself.
+        let lines: Vec<Line> = block_lines
             .iter()
             .map(|line| format_code_line(line, palette, language.as_ref()))
             .collect();
+        return (lines.clone(), lines.len());
     }
-
-    let total_context = (extra_space - 1).max(0) as usize;
-    let mut top_context = total_context / 2 + (total_context % 2);
-    let mut bottom_context = total_context / 2;
 
     let file_lines = match load_file_lines(state, node) {
         Some(lines) => lines,
         None => {
-            return block_lines
+            let lines: Vec<Line> = block_lines
                 .iter()
                 .map(|line| format_code_line(line, palette, language.as_ref()))
                 .collect();
+            return (lines.clone(), lines.len());
         }
     };
 
@@ -1640,7 +1730,8 @@ fn build_block_lines(
         }
     }
 
-    lines
+    let len = lines.len();
+    (lines, len)
 }
 
 fn build_file_lines(
@@ -1648,28 +1739,33 @@ fn build_file_lines(
     node: &crate::tree::TreeNode,
     palette: &UiPalette,
     code_height: u16,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let language = node.language.clone();
     let Some(file_lines) = load_file_lines(state, node) else {
-        return vec![Line::from(Span::styled(
-            "(File missing)",
-            Style::default().fg(palette.context).bg(palette.code_bg),
-        ))];
+        return (
+            vec![Line::from(Span::styled(
+                "(File missing)",
+                Style::default().fg(palette.context).bg(palette.code_bg),
+            ))],
+            1,
+        );
     };
 
     let max_lines = code_height as usize;
+    // With scrolling, we return everything (or a large window)
+    // and let the viewport clip it.
+    // For now, let's just return all lines for file view if we want full scroll?
+    // Or keep the truncation logic but increase limit?
+    // The previous logic truncated to code_height.
+    // Let's remove the truncation for file view so we can scroll it.
+
     let mut lines = file_lines
         .iter()
-        .take(max_lines)
         .map(|line| format_code_line(line, palette, language.as_ref()))
         .collect::<Vec<_>>();
 
-    if file_lines.len() > max_lines && !lines.is_empty() {
-        let last_idx = lines.len().saturating_sub(1);
-        lines[last_idx] = format_context_line("...", palette, language.as_ref());
-    }
-
-    lines
+    let len = lines.len();
+    (lines, len)
 }
 
 fn build_directory_lines(
@@ -1677,7 +1773,7 @@ fn build_directory_lines(
     node: &crate::tree::TreeNode,
     palette: &UiPalette,
     code_height: u16,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let mut entries = Vec::new();
     for child_id in &node.children {
         if !state.navigator.visible_nodes.contains(child_id) {
@@ -1695,32 +1791,30 @@ fn build_directory_lines(
     entries.sort();
 
     if entries.is_empty() {
-        return vec![Line::from(Span::styled(
-            "(Empty)",
-            Style::default().fg(palette.context).bg(palette.code_bg),
-        ))];
+        return (
+            vec![Line::from(Span::styled(
+                "(Empty)",
+                Style::default().fg(palette.context).bg(palette.code_bg),
+            ))],
+            1,
+        );
     }
 
-    let max_lines = code_height as usize;
+    // Scrollable directory view
     let mut entries_list = entries
         .iter()
-        .take(max_lines)
         .map(|entry| format_directory_line(entry, palette))
         .collect::<Vec<_>>();
 
-    if entries.len() > max_lines && !entries_list.is_empty() {
-        let last_idx = entries_list.len().saturating_sub(1);
-        entries_list[last_idx] = format_directory_line("...", palette);
-    }
-
-    entries_list
+    let len = entries_list.len();
+    (entries_list, len)
 }
 
 fn build_root_lines(
     state: &mut AppState,
     palette: &UiPalette,
     code_height: u16,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let root = state.navigator.tree.root();
     let root_children: Vec<TreeNodeId> = state
         .navigator
@@ -1734,10 +1828,6 @@ fn build_root_lines(
 
     if state.root_cursor.is_none() {
         state.root_cursor = root_children.first().copied();
-    }
-
-    if root_children.is_empty() {
-        state.root_cursor = None;
     }
 
     let mut lines = Vec::new();
@@ -1793,14 +1883,8 @@ fn build_root_lines(
         )));
     }
 
-    let max_lines = code_height.saturating_sub(lines.len() as u16) as usize;
-    if max_lines == 0 {
-        return lines;
-    }
-
     let mut listing = root_children
         .iter()
-        .take(max_lines)
         .map(|id| {
             let child = state.navigator.tree.node(*id);
             let name = match child.kind {
@@ -1814,13 +1898,16 @@ fn build_root_lines(
         })
         .collect::<Vec<_>>();
 
-    if root_children.len() > max_lines && !listing.is_empty() {
-        let last_idx = listing.len().saturating_sub(1);
-        listing[last_idx] = format_root_entry_line("  ...", palette, false);
+    if listing.is_empty() {
+        listing.push(Line::from(Span::styled(
+            "(Empty repository)",
+            Style::default().fg(palette.context).bg(palette.code_bg),
+        )));
     }
 
     lines.append(&mut listing);
-    lines
+    let len = lines.len();
+    (lines, len)
 }
 
 fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> Line<'static> {
