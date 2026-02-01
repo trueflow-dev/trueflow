@@ -142,11 +142,81 @@ pub fn head_blocks_for_path(repo: &gix::Repository, path: &str) -> Result<Vec<Bl
     Ok(split_blocks(content, language))
 }
 
+
 pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
     let repo = repo_from_workdir()?;
     let (base_tree, head_tree) = main_and_head_trees(&repo)?;
     diff_trees(&repo, &base_tree, &head_tree)
 }
+
+pub fn diff_hunks_for_file(repo: &gix::Repository, path: &str) -> Result<Vec<DiffHunk>> {
+    let (base_tree, head_tree) = main_and_head_trees(repo)?;
+    let mut hunks = Vec::new();
+    let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
+    
+    let changes = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
+    for change in changes {
+        let change_ref = change.to_ref();
+        let location = change_ref.location();
+        if location.to_str_lossy() != path {
+            continue;
+        }
+        
+        diff_cache.set_resource_by_change(change_ref, &repo.objects)?;
+        let prep = diff_cache.prepare_diff()?;
+        if let gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } = prep.operation {
+            let input = prep.interned_input();
+            let sink = gix::diff::blob::UnifiedDiff::new(
+                &input,
+                gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(String::new(), "\n"),
+                gix::diff::blob::unified_diff::ContextSize::symmetrical(3),
+            );
+            let unified = gix::diff::blob::diff(algorithm, &input, sink)?;
+            collect_hunks(&mut hunks, path, &unified)?;
+        }
+        break; // Found our file
+    }
+    
+    Ok(hunks)
+}
+
+
+pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option<Vec<String>> {
+    let start = block.start_line as u32 + 1; // 1-based for diff
+    let end = block.end_line as u32 + 1;
+    
+    let mut relevant_lines = Vec::new();
+    let mut has_overlap = false;
+    
+    for hunk in hunks {
+        let mut current_line = hunk.new_start;
+        let mut hunk_touches_block = false;
+        
+        for line in &hunk.lines {
+            if line.starts_with('+') || line.starts_with(' ') {
+                if current_line >= start && current_line <= end {
+                    hunk_touches_block = true;
+                }
+                current_line += 1;
+            }
+            // '-' lines don't advance new file line count
+        }
+        
+        // Include the hunk if it touches the block.
+        // We might want to trim the hunk to just the block, but context is good.
+        if hunk_touches_block {
+            relevant_lines.extend(hunk.lines.clone());
+            has_overlap = true;
+        }
+    }
+    
+    if has_overlap {
+        Some(relevant_lines)
+    } else {
+        None
+    }
+}
+
 
 pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
     let repo = repo_from_workdir()?;
@@ -415,5 +485,52 @@ mod tests {
         assert_eq!(hunks[0].lines, vec!["-foo\n", "+foo\n", "+bar\n"]);
         assert_eq!(hunks[1].new_start, 6);
         assert_eq!(hunks[1].lines, vec!["-baz\n", "+qux\n"]);
+    }
+
+    #[test]
+    fn test_extract_diff_lines_overlap() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 10, // 0-based, so lines 11-20
+            end_line: 20,
+        };
+
+        let hunk_inside = DiffHunk {
+            file_path: String::new(),
+            new_start: 12, // Inside block
+            lines: vec!["+line12\n".to_string()],
+        };
+
+        let hunk_before = DiffHunk {
+            file_path: String::new(),
+            new_start: 5,
+            lines: vec!["+line5\n".to_string()],
+        };
+
+        let hunk_after = DiffHunk {
+            file_path: String::new(),
+            new_start: 25,
+            lines: vec!["+line25\n".to_string()],
+        };
+
+        // Case 1: Overlap
+        let result = extract_diff_lines_for_block(&block, &[hunk_inside.clone()]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), vec!["+line12\n"]);
+
+        // Case 2: No Overlap
+        let result = extract_diff_lines_for_block(&block, &[hunk_before.clone(), hunk_after.clone()]);
+        assert!(result.is_none());
+
+        // Case 3: Mixed
+        let result = extract_diff_lines_for_block(&block, &[hunk_before, hunk_inside, hunk_after]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), vec!["+line12\n"]);
     }
 }
