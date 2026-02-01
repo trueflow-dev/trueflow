@@ -1412,12 +1412,44 @@ fn build_block_breadcrumb(node: &crate::tree::TreeNode, state: &AppState) -> Opt
 }
 
 fn block_signature(block: &crate::block::Block) -> String {
-    let Some(line) = block.content.lines().find(|line| !line.trim().is_empty()) else {
+    let Some(line) = block
+        .content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+    else {
         return block.kind.as_str().to_string();
     };
-    let trimmed = line.trim().trim_end_matches('{').trim();
-    truncate_text(trimmed, 72)
+    let mut text = line.trim().trim_end_matches('{').trim().to_string();
+
+    if matches!(
+        block.kind,
+        BlockKind::Function | BlockKind::Method | BlockKind::FunctionSignature
+    ) {
+        if let Some(idx) = find_argument_list_start(&text) {
+            text.truncate(idx);
+        }
+    }
+
+    truncate_text(text.trim(), 72)
 }
+
+fn find_argument_list_start(text: &str) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in text.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            '(' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 
 fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'static> {
     let style = if bold {
