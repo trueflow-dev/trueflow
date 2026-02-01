@@ -9,7 +9,8 @@ pub fn should_skip_imports_by_default(path: &str, block: &Block, filters: &Block
 }
 
 pub fn should_skip_impl_by_default(block: &Block, filters: &BlockFilters) -> bool {
-    block.kind == BlockKind::Impl && !filters.only_contains(&block.kind)
+    matches!(block.kind, BlockKind::Impl | BlockKind::Interface)
+        && !filters.only_contains(&block.kind)
 }
 
 fn is_lib_rs(path: &str) -> bool {

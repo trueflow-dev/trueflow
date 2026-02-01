@@ -137,7 +137,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         }
         blocks.push(block);
 
-        if matches!(lang, Language::Rust) && ts_kind == "impl_item" {
+        if matches!(lang, Language::Rust) && matches!(ts_kind, "impl_item" | "trait_item") {
             blocks.extend(collect_rust_impl_items(child, content, &lang, &test_ranges));
         }
 
@@ -321,13 +321,16 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
     match lang {
         Language::Rust => match kind {
             "function_item" => BlockKind::Function,
-            "struct_item" => BlockKind::Struct,
+            "struct_item" | "union_item" => BlockKind::Struct,
             "enum_item" => BlockKind::Enum,
             "impl_item" => BlockKind::Impl,
-            "mod_item" => BlockKind::Module,
-            "use_declaration" => BlockKind::Import,
+            "trait_item" => BlockKind::Interface,
+            "mod_item" | "foreign_mod_item" => BlockKind::Module,
+            "use_declaration" | "extern_crate_declaration" => BlockKind::Import,
             "const_item" | "static_item" => BlockKind::Const,
-            "macro_invocation" => BlockKind::Macro,
+            "macro_invocation" | "macro_definition" => BlockKind::Macro,
+            "type_item" | "associated_type" => BlockKind::Type,
+            "function_signature_item" => BlockKind::FunctionSignature,
             _ => BlockKind::Code,
         },
         Language::Python => match kind {

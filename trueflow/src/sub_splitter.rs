@@ -23,7 +23,9 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
         Language::Rust if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_rust_function(block)?
         }
-        Language::Rust if matches!(block.kind, BlockKind::Impl) => split_rust_impl(block)?,
+        Language::Rust if matches!(block.kind, BlockKind::Impl | BlockKind::Interface) => {
+            split_rust_impl(block)?
+        }
         Language::Python if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_python_function(block)?
         }

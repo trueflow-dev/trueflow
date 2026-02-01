@@ -1077,7 +1077,7 @@ fn collect_block_ids_for_action(state: &AppState, node_id: TreeNodeId) -> Vec<Tr
             if node
                 .block
                 .as_ref()
-                .is_some_and(|block| block.kind == BlockKind::Impl)
+                .is_some_and(|block| matches!(block.kind, BlockKind::Impl | BlockKind::Interface))
             {
                 state.navigator.block_ids_in_subtree(node_id)
             } else {
@@ -1096,7 +1096,7 @@ fn compute_next_review_target(state: &AppState, node_id: TreeNodeId) -> Option<T
             if node
                 .block
                 .as_ref()
-                .is_some_and(|block| block.kind == BlockKind::Impl)
+                .is_some_and(|block| matches!(block.kind, BlockKind::Impl | BlockKind::Interface))
             {
                 let subtree_blocks: HashSet<_> = state
                     .navigator
@@ -1385,7 +1385,7 @@ fn build_block_breadcrumb(node: &crate::tree::TreeNode, state: &AppState) -> Opt
                 if label.is_empty() {
                     continue;
                 }
-                if block.kind == BlockKind::Impl {
+                if matches!(block.kind, BlockKind::Impl | BlockKind::Interface) {
                     impl_parts.push(label.clone());
                 }
                 if ancestor.id == node.id {

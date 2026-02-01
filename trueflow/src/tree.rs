@@ -405,7 +405,7 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                         file.language.clone(),
                     );
 
-                    if kind == BlockKind::Impl {
+                    if matches!(kind, BlockKind::Impl | BlockKind::Interface) {
                         impl_stack.push((node_id, start_line, end_line));
                     }
                 }
