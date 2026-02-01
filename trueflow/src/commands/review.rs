@@ -119,7 +119,7 @@ pub fn collect_review_summary(
 
         let mut unreviewed_blocks = Vec::new();
         for block in reviewable_blocks {
-            let node_id = tree.node_by_path_and_hash(&file.path, &block.hash);
+            let node_id = tree.find_block_node(&file.path, &block);
             if let Some(node_id) = node_id
                 && tree.is_node_covered(node_id, &approved_hashes)
             {

@@ -147,6 +147,24 @@ impl Tree {
         None
     }
 
+    pub fn find_block_node(&self, path: &str, block: &Block) -> Option<TreeNodeId> {
+        let file_id = self.find_by_path(path)?;
+        let file_node = self.node(file_id);
+        
+        let mut stack = file_node.children.clone();
+        while let Some(node_id) = stack.pop() {
+            let node = self.node(node_id);
+            if matches!(node.kind, TreeNodeKind::Block) 
+                && node.hash == block.hash 
+                && node.block.as_ref().is_some_and(|b| b.start_line == block.start_line)
+            {
+                return Some(node_id);
+            }
+            stack.extend(node.children.iter().copied());
+        }
+        None
+    }
+
     #[allow(dead_code)]
     pub fn file_paths(&self) -> impl Iterator<Item = &str> {
         self.file_paths.iter().map(|path| path.as_str())

@@ -165,6 +165,25 @@ fn test_review_revision_target_from_subdir() -> Result<()> {
 }
 
 #[test]
+fn test_review_progress_counts_duplicate_blocks() -> Result<()> {
+    let repo = TestRepo::new("review_duplicates")?;
+    // Two identical functions
+    let content =
+        "fn duplicate() { println!(\"hello\"); }\n\nfn duplicate() { println!(\"hello\"); }\n";
+    repo.write("src/lib.rs", content)?;
+    repo.commit_all("Add duplicates")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let files = json_array(&output)?;
+    let blocks = &files[0]["blocks"].as_array().context("blocks")?;
+
+    // Should have 2 blocks
+    assert_eq!(blocks.len(), 2);
+
+    Ok(())
+}
+
+#[test]
 fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
     let repo = TestRepo::new("exclude_gap_case")?;
     repo.write(
