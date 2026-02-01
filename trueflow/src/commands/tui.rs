@@ -515,6 +515,15 @@ struct AppState {
     scroll_offset: u16,
     content_height: u16,
     viewport_height: u16,
+    view_mode: ViewMode,
+    file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    #[default]
+    Source,
+    Diff,
 }
 
 pub fn run(context: &TrueflowContext) -> Result<()> {
@@ -576,6 +585,8 @@ fn build_review_state(
         scroll_offset: 0,
         content_height: 0,
         viewport_height: 0,
+        view_mode: ViewMode::Source,
+        file_diff_cache: HashMap::new(),
     })
 }
 
@@ -776,6 +787,15 @@ fn run_app(
                     }
                     KeyCode::Char('g') => {
                         state.navigator.jump_root();
+                        needs_render = true;
+                    }
+                    KeyCode::Char('d') => {
+                        state.view_mode = match state.view_mode {
+                            ViewMode::Source => ViewMode::Diff,
+                            ViewMode::Diff => ViewMode::Source,
+                        };
+                        // Reset scroll when switching views because content height changes
+                        state.scroll_offset = 0;
                         needs_render = true;
                     }
                     KeyCode::Enter | KeyCode::Char(' ')
@@ -1549,6 +1569,7 @@ fn build_action_lines(width: u16, palette: &UiPalette) -> Vec<Line<'static>> {
         Line::from(Span::styled("[i]ascend", pyramid_style)),
         Line::from(Span::styled("[j]prev            [l]next", pyramid_style)),
         Line::from(Span::styled("  [k]descend", pyramid_style)),
+        Line::from(Span::styled("  [d]toggle diff", pyramid_style)),
     ];
 
     let mut lines = Vec::with_capacity(1 + pyramid_lines.len());
@@ -1635,6 +1656,10 @@ fn build_block_lines(
             1,
         );
     };
+
+    if state.view_mode == ViewMode::Diff {
+        return build_block_diff_lines(state, node, block, palette);
+    }
 
     let language = node.language.clone();
     let block_lines: Vec<String> = block.content.lines().map(|line| line.to_string()).collect();
@@ -1732,6 +1757,70 @@ fn build_block_lines(
 
     let len = lines.len();
     (lines, len)
+}
+
+fn build_block_diff_lines(
+    state: &mut AppState,
+    node: &crate::tree::TreeNode,
+    block: &crate::block::Block,
+    palette: &UiPalette,
+) -> (Vec<Line<'static>>, usize) {
+    if node.path.is_empty() {
+        return (
+            vec![Line::from(Span::styled(
+                "(No path for diff)",
+                Style::default().fg(palette.dim).bg(palette.code_bg),
+            ))],
+            1,
+        );
+    }
+
+    let path = PathBuf::from(&node.path);
+    // Ensure diffs are loaded
+    if !state.file_diff_cache.contains_key(&path) {
+        if let Ok(repo) = vcs::repo_from_workdir() {
+            if let Ok(hunks) = vcs::diff_hunks_for_file(&repo, &node.path) {
+                state.file_diff_cache.insert(path.clone(), hunks);
+            } else {
+                state.file_diff_cache.insert(path.clone(), Vec::new());
+            }
+        }
+    }
+
+    let hunks = state.file_diff_cache.get(&path).unwrap();
+    let diff_lines = vcs::extract_diff_lines_for_block(block, hunks);
+
+    let Some(lines) = diff_lines else {
+        // Fallback to source view if no diff overlap found (e.g. new file not in diff, or moved code?)
+        // Or should we say "(No diff changes in this block)"?
+        // User requested diff view. If block is pure addition, maybe diff covers it?
+        // If the block is unchanged in the diff (e.g. we are reviewing it for other reasons),
+        // we should probably say so.
+        return (
+            vec![Line::from(Span::styled(
+                "(No diff changes in this block)",
+                Style::default().fg(palette.dim).bg(palette.code_bg),
+            ))],
+            1,
+        );
+    };
+
+    let formatted = lines
+        .iter()
+        .map(|line| {
+            let style = if line.starts_with('+') {
+                Style::default().fg(palette.add).bg(palette.code_bg)
+            } else if line.starts_with('-') {
+                Style::default().fg(palette.del).bg(palette.code_bg)
+            } else {
+                Style::default().fg(palette.dim).bg(palette.code_bg)
+            };
+            Line::from(Span::styled(line.trim_end().to_string(), style))
+        })
+        .collect::<Vec<_>>();
+
+    let len = formatted.len();
+    (formatted, len)
 }
 
 fn build_file_lines(
