@@ -147,12 +147,11 @@ def foo():
         except:
             pass
 ";
-        // if: +1
-        // try: +1 + 1 (nesting) = 2
-        // except: +1 + 1 (nesting) = 2? Sonar says except counts.
-        // My implementation counts try and except.
-        // Total: 5?
+        // if: +1 (nesting 0) = 1
+        // try: +1 + 1 (nesting 1, child of if) = 2
+        // except: +1 + 2 (nesting 2, child of try) = 3
+        // Total: 6
         let score = calculate(code, Language::Python);
-        assert!(score >= 3);
+        assert_eq!(score, 6);
     }
 }

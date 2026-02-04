@@ -4,15 +4,6 @@ mod common;
 use common::{TestRepo, first_file_blocks};
 
 #[test]
-fn test_tui_mode_loads_without_error() -> Result<()> {
-    // TUI is interactive, so we can't fully E2E test it easily without a pty.
-    // But we can check if it crashes on startup or basic arguments.
-    // For now, we rely on unit tests for TUI logic.
-    // This integration test just ensures wiring is present.
-    Ok(())
-}
-
-#[test]
 fn test_review_json_output_filters_marked_blocks() -> Result<()> {
     let fixture = TestRepo::fixture("empty")?;
 

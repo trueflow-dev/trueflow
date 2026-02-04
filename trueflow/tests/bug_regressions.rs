@@ -2,10 +2,6 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 
-use trueflow::block::{Block, BlockKind};
-use trueflow::hashing::hash_str;
-use trueflow::optimizer;
-
 mod common;
 use common::*;
 
@@ -202,7 +198,7 @@ fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
 
     for sub_block in &sub_blocks {
         let kind = sub_block["kind"].as_str().context("kind")?;
-        if kind.eq_ignore_ascii_case("gap") {
+        if is_gap(kind) {
             continue;
         }
         let hash = sub_block["hash"].as_str().context("hash")?;
@@ -239,6 +235,12 @@ fn test_scan_skips_unreadable_entries() -> Result<()> {
     fs::set_permissions(&secret_dir, perms)?;
 
     let output = repo.run(&["scan", "--json"])?;
+
+    // Restore permissions so cleanup can remove the directory
+    let mut perms = fs::metadata(&secret_dir)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&secret_dir, perms)?;
+
     let json: Value = serde_json::from_str(&output)?;
     let files = json.as_array().context("Expected array")?;
     assert!(files.iter().any(|entry| {

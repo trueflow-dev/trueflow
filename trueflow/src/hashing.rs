@@ -71,27 +71,21 @@ mod tests {
 
     #[test]
     fn test_stability_snapshot() {
-        // Regression test: Ensures the hashing algorithm doesn't drift
-        // NOTE: This hash WILL change with canonicalization enabled if it wasn't normalized before.
+        // Regression test: Ensures the hashing algorithm doesn't drift.
+        // If this test fails, it means fingerprints have changed and existing
+        // review records may no longer match their blocks.
         let body = "fn main() {\n    println!(\"hello\");\n}";
         let context = "use std::io;";
 
-        let _fp = compute_fingerprint(body, context);
+        let fp = compute_fingerprint(body, context);
 
-        // Previous hash: 70b4fcde92d601906732332e0908eb304aa0b7e374d03f0dab65b2311c10a75d
-        // New hash with canonicalization needs to be captured.
-        // We will update this test once we see the new value, or verify logic.
-        // Actually, let's just log it or assert assert_ne for now if we expect change?
-        // Or better, let's calculate what we expect.
-        // body is already "clean" so it should match IF hash_str didn't change behavior on clean input.
-        // But hash_str used to be raw bytes. Now it is processed bytes.
-        // Even if input == output, we allocate a new string.
-
-        // Let's comment out the exact match for a moment and verify stability properties first.
-        // assert_eq!(
-        //    fp.as_string(),
-        //    "70b4fcde92d601906732332e0908eb304aa0b7e374d03f0dab65b2311c10a75d"
-        // );
+        // This hash was computed with the current canonicalization logic.
+        // DO NOT change this value unless intentionally changing the hashing algorithm.
+        assert_eq!(
+            fp.as_string(),
+            "dc1c606ceaac3fe3f3e6c11d170d950e290cbf509cf87b905c08b0f0503178c7",
+            "Fingerprint hash changed! This will break existing review records."
+        );
     }
 
     #[test]

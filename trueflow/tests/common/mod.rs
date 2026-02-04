@@ -160,7 +160,15 @@ pub fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// Parse CLI JSON output into a serde_json::Value.
 pub fn json(output: &str) -> Result<Value> {
-    serde_json::from_str(output).context("Invalid JSON")
+    serde_json::from_str(output).with_context(|| format!("Invalid JSON: {}", truncate(output, 200)))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
 }
 
 /// Parse CLI JSON output into a top-level array.
@@ -169,6 +177,20 @@ pub fn json_array(output: &str) -> Result<Vec<Value>> {
         .as_array()
         .cloned()
         .context("Output should be array")
+}
+
+/// Check if a block kind is "gap" (case-insensitive).
+pub fn is_gap(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case("gap")
+}
+
+/// Extract block kinds from a blocks array, filtering out gaps.
+pub fn block_kinds_without_gaps(blocks: &[Value]) -> Vec<&str> {
+    blocks
+        .iter()
+        .filter_map(|block| block["kind"].as_str())
+        .filter(|kind| !is_gap(kind))
+        .collect()
 }
 
 /// Return the first file's blocks from scan/review JSON output.
@@ -256,6 +278,8 @@ pub fn read_review_records(path: &Path) -> Result<Vec<Record>> {
         return Ok(Vec::new());
     }
     let content = fs::read_to_string(path)?;
+    // Note: Skips invalid JSON lines intentionally. Some tests put
+    // corrupted data in the file to verify trueflow handles it gracefully.
     Ok(content
         .lines()
         .filter(|l| !l.trim().is_empty())

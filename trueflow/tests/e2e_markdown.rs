@@ -31,11 +31,7 @@ fn test_markdown_split_hierarchy() -> Result<()> {
 
     let output = repo.run(&["inspect", "--fingerprint", section_hash, "--split"])?;
     let subblocks = json_array(&output)?;
-    let kinds: Vec<&str> = subblocks
-        .iter()
-        .filter_map(|block| block["kind"].as_str())
-        .filter(|kind| !kind.eq_ignore_ascii_case("gap"))
-        .collect();
+    let kinds = block_kinds_without_gaps(&subblocks);
     assert_eq!(
         kinds,
         vec![
@@ -55,11 +51,7 @@ fn test_markdown_split_hierarchy() -> Result<()> {
     let paragraph_hash = paragraph["hash"].as_str().context("hash")?;
     let output = repo.run(&["inspect", "--fingerprint", paragraph_hash, "--split"])?;
     let sentence_blocks = json_array(&output)?;
-    let sentence_kinds: Vec<&str> = sentence_blocks
-        .iter()
-        .filter_map(|block| block["kind"].as_str())
-        .filter(|kind| !kind.eq_ignore_ascii_case("gap"))
-        .collect();
+    let sentence_kinds = block_kinds_without_gaps(&sentence_blocks);
     assert!(sentence_kinds.iter().all(|kind| *kind == "Sentence"));
     assert_eq!(sentence_kinds.len(), 2);
 

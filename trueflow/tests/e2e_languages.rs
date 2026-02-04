@@ -41,22 +41,25 @@ fn test_all_languages_detection() -> Result<()> {
         // Or "Text" if .org maps to Text now
     ];
 
-    for (filename, expected_lang) in expected {
-        if let Some(actual) = detected.get(filename) {
-            assert_eq!(
-                actual, expected_lang,
-                "Language mismatch for {}: expected {}, got {}",
-                filename, expected_lang, actual
-            );
-        } else {
-            // It's okay if some files are missing if the fixture isn't perfect,
-            // but we should verify the ones that exist.
-            // Let's verify at least one exists.
-        }
+    for (filename, expected_lang) in &expected {
+        let actual = detected
+            .get(*filename)
+            .with_context(|| format!("Expected file {} not found in scan output", filename))?;
+        assert_eq!(
+            actual, expected_lang,
+            "Language mismatch for {}: expected {}, got {}",
+            filename, expected_lang, actual
+        );
     }
 
-    // Ensure we found at least some of them
-    assert!(detected.len() >= 5, "Should detect at least 5 files");
+    // Verify we found all expected files
+    assert_eq!(
+        detected.len(),
+        expected.len(),
+        "Expected {} files but found {}",
+        expected.len(),
+        detected.len()
+    );
 
     Ok(())
 }

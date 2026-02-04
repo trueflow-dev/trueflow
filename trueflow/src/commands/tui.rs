@@ -1738,7 +1738,7 @@ fn build_file_lines(
     state: &mut AppState,
     node: &crate::tree::TreeNode,
     palette: &UiPalette,
-    code_height: u16,
+    _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
     let language = node.language.clone();
     let Some(file_lines) = load_file_lines(state, node) else {
@@ -1751,15 +1751,8 @@ fn build_file_lines(
         );
     };
 
-    let max_lines = code_height as usize;
-    // With scrolling, we return everything (or a large window)
-    // and let the viewport clip it.
-    // For now, let's just return all lines for file view if we want full scroll?
-    // Or keep the truncation logic but increase limit?
-    // The previous logic truncated to code_height.
-    // Let's remove the truncation for file view so we can scroll it.
-
-    let mut lines = file_lines
+    // With scrolling enabled, we return all lines and let the viewport clip them.
+    let lines = file_lines
         .iter()
         .map(|line| format_code_line(line, palette, language.as_ref()))
         .collect::<Vec<_>>();
@@ -1772,7 +1765,7 @@ fn build_directory_lines(
     state: &AppState,
     node: &crate::tree::TreeNode,
     palette: &UiPalette,
-    code_height: u16,
+    _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
     let mut entries = Vec::new();
     for child_id in &node.children {
@@ -1801,7 +1794,7 @@ fn build_directory_lines(
     }
 
     // Scrollable directory view
-    let mut entries_list = entries
+    let entries_list = entries
         .iter()
         .map(|entry| format_directory_line(entry, palette))
         .collect::<Vec<_>>();
@@ -1813,7 +1806,7 @@ fn build_directory_lines(
 fn build_root_lines(
     state: &mut AppState,
     palette: &UiPalette,
-    code_height: u16,
+    _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
     let root = state.navigator.tree.root();
     let root_children: Vec<TreeNodeId> = state
