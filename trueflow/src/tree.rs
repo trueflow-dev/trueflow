@@ -150,13 +150,16 @@ impl Tree {
     pub fn find_block_node(&self, path: &str, block: &Block) -> Option<TreeNodeId> {
         let file_id = self.find_by_path(path)?;
         let file_node = self.node(file_id);
-        
+
         let mut stack = file_node.children.clone();
         while let Some(node_id) = stack.pop() {
             let node = self.node(node_id);
-            if matches!(node.kind, TreeNodeKind::Block) 
-                && node.hash == block.hash 
-                && node.block.as_ref().is_some_and(|b| b.start_line == block.start_line)
+            if matches!(node.kind, TreeNodeKind::Block)
+                && node.hash == block.hash
+                && node
+                    .block
+                    .as_ref()
+                    .is_some_and(|b| b.start_line == block.start_line)
             {
                 return Some(node_id);
             }

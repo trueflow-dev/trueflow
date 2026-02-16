@@ -18,7 +18,9 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block as UiBlock, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{
+        Block as UiBlock, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
@@ -765,7 +767,9 @@ fn run_app(
                         handle_comment_action(&mut state)?;
                         needs_render = true;
                     }
-                    KeyCode::Char(' ') if state.navigator.current_id() != state.navigator.tree.root() => {
+                    KeyCode::Char(' ')
+                        if state.navigator.current_id() != state.navigator.tree.root() =>
+                    {
                         handle_scroll_page_down(&mut state);
                         needs_render = true;
                     }
@@ -782,7 +786,8 @@ fn run_app(
                         needs_render = true;
                     }
                     KeyCode::End => {
-                        state.scroll_offset = state.content_height.saturating_sub(state.viewport_height);
+                        state.scroll_offset =
+                            state.content_height.saturating_sub(state.viewport_height);
                         needs_render = true;
                     }
                     KeyCode::Char('g') => {
@@ -1114,10 +1119,10 @@ fn apply_action_locally(
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
         let mut removed_reviewable = 0;
         for block_id in block_ids {
-            if state.navigator.visible_nodes.remove(&block_id) {
-                if state.reviewable_nodes.remove(&block_id) {
-                    removed_reviewable += 1;
-                }
+            if state.navigator.visible_nodes.remove(&block_id)
+                && state.reviewable_nodes.remove(&block_id)
+            {
+                removed_reviewable += 1;
             }
         }
         state.remaining_blocks = state.remaining_blocks.saturating_sub(removed_reviewable);
@@ -1499,11 +1504,7 @@ fn build_block_breadcrumb(node: &crate::tree::TreeNode, state: &AppState) -> Opt
 }
 
 fn block_signature(block: &crate::block::Block) -> String {
-    let Some(line) = block
-        .content
-        .lines()
-        .find(|line| !line.trim().is_empty())
-    else {
+    let Some(line) = block.content.lines().find(|line| !line.trim().is_empty()) else {
         return block.kind.as_str().to_string();
     };
     let mut text = line.trim().trim_end_matches('{').trim().to_string();
@@ -1511,10 +1512,9 @@ fn block_signature(block: &crate::block::Block) -> String {
     if matches!(
         block.kind,
         BlockKind::Function | BlockKind::Method | BlockKind::FunctionSignature
-    ) {
-        if let Some(idx) = find_argument_list_start(&text) {
-            text.truncate(idx);
-        }
+    ) && let Some(idx) = find_argument_list_start(&text)
+    {
+        text.truncate(idx);
     }
 
     truncate_text(text.trim(), 72)
@@ -1536,7 +1536,6 @@ fn find_argument_list_start(text: &str) -> Option<usize> {
     }
     None
 }
-
 
 fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'static> {
     let style = if bold {
@@ -1777,13 +1776,13 @@ fn build_block_diff_lines(
 
     let path = PathBuf::from(&node.path);
     // Ensure diffs are loaded
-    if !state.file_diff_cache.contains_key(&path) {
-        if let Ok(repo) = vcs::repo_from_workdir() {
-            if let Ok(hunks) = vcs::diff_hunks_for_file(&repo, &node.path) {
-                state.file_diff_cache.insert(path.clone(), hunks);
-            } else {
-                state.file_diff_cache.insert(path.clone(), Vec::new());
-            }
+    if !state.file_diff_cache.contains_key(&path)
+        && let Ok(repo) = vcs::repo_from_workdir()
+    {
+        if let Ok(hunks) = vcs::diff_hunks_for_file(&repo, &node.path) {
+            state.file_diff_cache.insert(path.clone(), hunks);
+        } else {
+            state.file_diff_cache.insert(path.clone(), Vec::new());
         }
     }
 

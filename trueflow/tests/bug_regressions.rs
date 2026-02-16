@@ -28,10 +28,12 @@ fn test_optimizer_module_merge_preserves_content() -> Result<()> {
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0]["kind"], "Modules");
     assert!(blocks[0]["content"].as_str().unwrap().contains("mod a"));
-    assert!(blocks[0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("extern \"C\""));
+    assert!(
+        blocks[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("extern \"C\"")
+    );
     Ok(())
 }
 
@@ -305,13 +307,13 @@ fn test_diff_uses_merge_base() -> Result<()> {
 
     assert!(files.contains(&"src/file1.rs"));
     assert!(!files.contains(&"src/file2.rs")); // file2 is on main, not in diff base..head?
-                                               // main..head(feature) should include changes in feature not in main.
-                                               // file1 modified. file2 added on main.
-                                               // merge-base is the split point.
-                                               // Diff is base..head.
-                                               // base = split point.
-                                               // head = feature tip.
-                                               // So file2 (on main) is NOT in range. Correct.
+    // main..head(feature) should include changes in feature not in main.
+    // file1 modified. file2 added on main.
+    // merge-base is the split point.
+    // Diff is base..head.
+    // base = split point.
+    // head = feature tip.
+    // So file2 (on main) is NOT in range. Correct.
     Ok(())
 }
 

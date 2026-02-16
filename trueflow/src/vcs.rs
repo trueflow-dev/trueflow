@@ -142,7 +142,6 @@ pub fn head_blocks_for_path(repo: &gix::Repository, path: &str) -> Result<Vec<Bl
     Ok(split_blocks(content, language))
 }
 
-
 pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
     let repo = repo_from_workdir()?;
     let (base_tree, head_tree) = main_and_head_trees(&repo)?;
@@ -153,7 +152,7 @@ pub fn diff_hunks_for_file(repo: &gix::Repository, path: &str) -> Result<Vec<Dif
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
     let mut hunks = Vec::new();
     let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
-    
+
     let changes = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
     for change in changes {
         let change_ref = change.to_ref();
@@ -161,10 +160,12 @@ pub fn diff_hunks_for_file(repo: &gix::Repository, path: &str) -> Result<Vec<Dif
         if location.to_str_lossy() != path {
             continue;
         }
-        
+
         diff_cache.set_resource_by_change(change_ref, &repo.objects)?;
         let prep = diff_cache.prepare_diff()?;
-        if let gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } = prep.operation {
+        if let gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } =
+            prep.operation
+        {
             let input = prep.interned_input();
             let sink = gix::diff::blob::UnifiedDiff::new(
                 &input,
@@ -176,22 +177,21 @@ pub fn diff_hunks_for_file(repo: &gix::Repository, path: &str) -> Result<Vec<Dif
         }
         break; // Found our file
     }
-    
+
     Ok(hunks)
 }
-
 
 pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option<Vec<String>> {
     let start = block.start_line as u32 + 1; // 1-based for diff
     let end = block.end_line as u32 + 1;
-    
+
     let mut relevant_lines = Vec::new();
     let mut has_overlap = false;
-    
+
     for hunk in hunks {
         let mut current_line = hunk.new_start;
         let mut hunk_touches_block = false;
-        
+
         for line in &hunk.lines {
             if line.starts_with('+') || line.starts_with(' ') {
                 if current_line >= start && current_line <= end {
@@ -201,7 +201,7 @@ pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option
             }
             // '-' lines don't advance new file line count
         }
-        
+
         // Include the hunk if it touches the block.
         // We might want to trim the hunk to just the block, but context is good.
         if hunk_touches_block {
@@ -209,14 +209,13 @@ pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option
             has_overlap = true;
         }
     }
-    
+
     if has_overlap {
         Some(relevant_lines)
     } else {
         None
     }
 }
-
 
 pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
     let repo = repo_from_workdir()?;
@@ -520,12 +519,13 @@ mod tests {
         };
 
         // Case 1: Overlap
-        let result = extract_diff_lines_for_block(&block, &[hunk_inside.clone()]);
+        let result = extract_diff_lines_for_block(&block, std::slice::from_ref(&hunk_inside));
         assert!(result.is_some());
         assert_eq!(result.unwrap(), vec!["+line12\n"]);
 
         // Case 2: No Overlap
-        let result = extract_diff_lines_for_block(&block, &[hunk_before.clone(), hunk_after.clone()]);
+        let result =
+            extract_diff_lines_for_block(&block, &[hunk_before.clone(), hunk_after.clone()]);
         assert!(result.is_none());
 
         // Case 3: Mixed
