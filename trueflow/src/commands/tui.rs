@@ -1801,24 +1801,17 @@ fn build_block_diff_lines(
     }
 
     let path = PathBuf::from(&node.path);
-    // Ensure diffs are loaded
-    if !state.file_diff_cache.contains_key(&path)
-        && let Some(query) = diff_query_for_scope(&state.review_scope, &node.path)
-        && let Ok(repo) = vcs::repo_from_workdir()
-    {
-        let hunks_result = match query {
+    let hunks = ensure_cached_diff_hunks(&mut state.file_diff_cache, &path, || {
+        let query = diff_query_for_scope(&state.review_scope, &node.path)
+            .ok_or_else(|| anyhow::anyhow!("diff query unavailable for scope"))?;
+        let repo = vcs::repo_from_workdir()?;
+        match query {
             DiffQuery::MainDiff { path } => vcs::diff_hunks_for_file(&repo, &path),
             DiffQuery::Revision { revision, path } => {
                 vcs::diff_hunks_for_file_in_revision(&repo, &revision, &path)
             }
-        };
-        if let Ok(hunks) = hunks_result {
-            state.file_diff_cache.insert(path.clone(), hunks);
-        } else {
-            state.file_diff_cache.insert(path.clone(), Vec::new());
         }
-    }
-    let hunks = state.file_diff_cache.get(&path).unwrap();
+    });
     let diff_lines = vcs::extract_diff_lines_for_block(block, hunks);
 
     let Some(lines) = diff_lines else {
@@ -1852,6 +1845,20 @@ fn build_block_diff_lines(
 
     let len = formatted.len();
     (formatted, len)
+}
+
+fn ensure_cached_diff_hunks<'a, F>(
+    cache: &'a mut HashMap<PathBuf, Vec<vcs::DiffHunk>>,
+    path: &Path,
+    load_hunks: F,
+) -> &'a [vcs::DiffHunk]
+where
+    F: FnOnce() -> Result<Vec<vcs::DiffHunk>>,
+{
+    let entry = cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| load_hunks().unwrap_or_default());
+    entry.as_slice()
 }
 
 fn build_file_lines(
@@ -2312,6 +2319,19 @@ mod diff_scope_tests {
                 path: "src/lib.rs".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn ensure_cached_diff_hunks_inserts_empty_on_loader_error() {
+        let mut cache = HashMap::new();
+        let path = PathBuf::from("src/lib.rs");
+
+        let hunks = ensure_cached_diff_hunks(&mut cache, &path, || {
+            Err(anyhow::anyhow!("repo unavailable"))
+        });
+
+        assert!(hunks.is_empty(), "expected empty hunks on load failure");
+        assert!(cache.contains_key(&path), "failed loads should still cache empty hunks");
     }
 }
 
