@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 mod common;
-use common::TestRepo;
+use common::{TestRepo, run_git_output};
 
 #[test]
 fn test_recent_commits_in_repo_returns_head_first() -> Result<()> {
@@ -37,6 +37,44 @@ fn test_files_changed_main_to_head_in_repo() -> Result<()> {
     assert!(
         changed.contains("src/lib.rs"),
         "expected diff to include src/lib.rs"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
+    let repo = TestRepo::new("revision_diff_hunks")?;
+    repo.write("src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n")?;
+    repo.commit_all("Base")?;
+
+    repo.write("src/lib.rs", "pub fn value() -> i32 {\n    2\n}\n")?;
+    repo.commit_all("Set value to 2")?;
+    let target_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+
+    repo.write("src/lib.rs", "pub fn value() -> i32 {\n    3\n}\n")?;
+    repo.commit_all("Set value to 3")?;
+
+    let git_repo = gix::open(&repo.path)?;
+    let hunks = trueflow::vcs::diff_hunks_for_file_in_revision(
+        &git_repo,
+        target_revision.trim(),
+        "src/lib.rs",
+    )?;
+
+    assert!(!hunks.is_empty(), "expected at least one hunk");
+    let lines: Vec<&str> = hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .map(String::as_str)
+        .collect();
+    assert!(
+        lines.contains(&"+    2\n"),
+        "expected selected revision diff to include value 2"
+    );
+    assert!(
+        !lines.contains(&"+    3\n"),
+        "selected revision diff should not include later HEAD changes"
     );
 
     Ok(())

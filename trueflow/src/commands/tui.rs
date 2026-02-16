@@ -35,6 +35,24 @@ enum ReviewScope {
     Commit { id: String, summary: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffQuery {
+    MainDiff { path: String },
+    Revision { revision: String, path: String },
+}
+
+fn diff_query_for_scope(scope: &ReviewScope, path: &str) -> Option<DiffQuery> {
+    match scope {
+        ReviewScope::All | ReviewScope::MainDiff => Some(DiffQuery::MainDiff {
+            path: path.to_string(),
+        }),
+        ReviewScope::Commit { id, .. } => Some(DiffQuery::Revision {
+            revision: id.clone(),
+            path: path.to_string(),
+        }),
+    }
+}
+
 impl ReviewScope {
     fn label(&self) -> String {
         match self {
@@ -501,6 +519,7 @@ enum InputMode {
 }
 
 struct AppState {
+    review_scope: ReviewScope,
     navigator: ReviewNavigator,
     review_order: ReviewOrder,
     total_blocks: usize,
@@ -540,8 +559,13 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
             ScopeSelection::Selected(scope) => {
                 let filters = config.review.resolve_filters(&[], &[]);
                 let summary = load_review_state(context, &scope, &filters)?;
-                let state =
-                    build_review_state(context, summary, config.tui.confirm_batch, scope.label())?;
+                let state = build_review_state(
+                    context,
+                    summary,
+                    scope.clone(),
+                    config.tui.confirm_batch,
+                    scope.label(),
+                )?;
                 run_app(context, &mut terminal, state)
             }
         }
@@ -553,6 +577,7 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
 fn build_review_state(
     context: &TrueflowContext,
     summary: crate::commands::review::ReviewSummary,
+    review_scope: ReviewScope,
     confirm_batch: bool,
     scope_label: String,
 ) -> Result<AppState> {
@@ -571,6 +596,7 @@ fn build_review_state(
     let navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
 
     Ok(AppState {
+        review_scope,
         navigator,
         review_order,
         total_blocks: summary.total_blocks,
@@ -1777,15 +1803,21 @@ fn build_block_diff_lines(
     let path = PathBuf::from(&node.path);
     // Ensure diffs are loaded
     if !state.file_diff_cache.contains_key(&path)
+        && let Some(query) = diff_query_for_scope(&state.review_scope, &node.path)
         && let Ok(repo) = vcs::repo_from_workdir()
     {
-        if let Ok(hunks) = vcs::diff_hunks_for_file(&repo, &node.path) {
+        let hunks_result = match query {
+            DiffQuery::MainDiff { path } => vcs::diff_hunks_for_file(&repo, &path),
+            DiffQuery::Revision { revision, path } => {
+                vcs::diff_hunks_for_file_in_revision(&repo, &revision, &path)
+            }
+        };
+        if let Ok(hunks) = hunks_result {
             state.file_diff_cache.insert(path.clone(), hunks);
         } else {
             state.file_diff_cache.insert(path.clone(), Vec::new());
         }
     }
-
     let hunks = state.file_diff_cache.get(&path).unwrap();
     let diff_lines = vcs::extract_diff_lines_for_block(block, hunks);
 
@@ -2235,6 +2267,51 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 1);
         assert_eq!(layout.meta.height, 3);
+    }
+}
+
+#[cfg(test)]
+mod diff_scope_tests {
+    use super::*;
+
+    #[test]
+    fn diff_query_uses_main_diff_for_main_scope() {
+        let query = diff_query_for_scope(&ReviewScope::MainDiff, "src/lib.rs");
+        assert_eq!(
+            query,
+            Some(DiffQuery::MainDiff {
+                path: "src/lib.rs".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn diff_query_uses_revision_for_commit_scope() {
+        let query = diff_query_for_scope(
+            &ReviewScope::Commit {
+                id: "abc123".to_string(),
+                summary: "test".to_string(),
+            },
+            "src/lib.rs",
+        );
+        assert_eq!(
+            query,
+            Some(DiffQuery::Revision {
+                revision: "abc123".to_string(),
+                path: "src/lib.rs".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn diff_query_uses_main_diff_for_all_scope() {
+        let query = diff_query_for_scope(&ReviewScope::All, "src/lib.rs");
+        assert_eq!(
+            query,
+            Some(DiffQuery::MainDiff {
+                path: "src/lib.rs".to_string(),
+            })
+        );
     }
 }
 

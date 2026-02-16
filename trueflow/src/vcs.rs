@@ -150,10 +150,38 @@ pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
 
 pub fn diff_hunks_for_file(repo: &gix::Repository, path: &str) -> Result<Vec<DiffHunk>> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
+    diff_hunks_for_file_between_trees(repo, &base_tree, &head_tree, path)
+}
+
+pub fn diff_hunks_for_file_in_revision(
+    repo: &gix::Repository,
+    revision: &str,
+    path: &str,
+) -> Result<Vec<DiffHunk>> {
+    let object = repo.rev_parse_single(revision)?;
+    let commit = object
+        .object()?
+        .peel_to_commit()
+        .context("revision must resolve to a commit")?;
+    let head_tree = commit.tree()?;
+    let base_tree = if let Some(parent_id) = commit.parent_ids().next() {
+        repo.find_commit(parent_id)?.tree()?
+    } else {
+        repo.empty_tree()
+    };
+    diff_hunks_for_file_between_trees(repo, &base_tree, &head_tree, path)
+}
+
+fn diff_hunks_for_file_between_trees(
+    repo: &gix::Repository,
+    base_tree: &gix::Tree<'_>,
+    head_tree: &gix::Tree<'_>,
+    path: &str,
+) -> Result<Vec<DiffHunk>> {
     let mut hunks = Vec::new();
     let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
 
-    let changes = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
+    let changes = repo.diff_tree_to_tree(Some(base_tree), Some(head_tree), None)?;
     for change in changes {
         let change_ref = change.to_ref();
         let location = change_ref.location();
