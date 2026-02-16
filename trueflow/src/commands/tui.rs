@@ -2331,7 +2331,10 @@ mod diff_scope_tests {
         });
 
         assert!(hunks.is_empty(), "expected empty hunks on load failure");
-        assert!(cache.contains_key(&path), "failed loads should still cache empty hunks");
+        assert!(
+            cache.contains_key(&path),
+            "failed loads should still cache empty hunks"
+        );
     }
 }
 
