@@ -211,7 +211,7 @@ fn diff_hunks_for_file_between_trees(
 
 pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option<Vec<String>> {
     let start = block.start_line as u32 + 1; // 1-based for diff
-    let end = block.end_line as u32 + 1;
+    let end_exclusive = block.end_line as u32 + 1;
 
     let mut relevant_lines = Vec::new();
     let mut has_overlap = false;
@@ -222,7 +222,7 @@ pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option
 
         for line in &hunk.lines {
             if line.starts_with('+') || line.starts_with(' ') {
-                if current_line >= start && current_line <= end {
+                if current_line >= start && current_line < end_exclusive {
                     hunk_touches_block = true;
                 }
                 current_line += 1;
@@ -560,5 +560,29 @@ mod tests {
         let result = extract_diff_lines_for_block(&block, &[hunk_before, hunk_inside, hunk_after]);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), vec!["+line12\n"]);
+    }
+
+    #[test]
+    fn test_extract_diff_lines_respects_exclusive_end_line() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 10, // 0-based, so lines 11-20
+            end_line: 20,   // exclusive
+        };
+
+        let hunk_at_exclusive_end = DiffHunk {
+            file_path: String::new(),
+            new_start: 21, // outside the block range
+            lines: vec!["+line21\n".to_string()],
+        };
+
+        let result = extract_diff_lines_for_block(&block, &[hunk_at_exclusive_end]);
+        assert!(result.is_none(), "exclusive end_line must not overlap");
     }
 }
