@@ -530,7 +530,6 @@ struct AppState {
     input_buffer: String,
     confirm_batch: bool,
     repo_name: String,
-    last_frame: std::time::Instant,
     file_cache: HashMap<PathBuf, Vec<String>>,
     root_cursor: Option<TreeNodeId>,
     scroll_offset: u16,
@@ -610,7 +609,6 @@ fn build_review_state(
         input_buffer: String::new(),
         confirm_batch,
         repo_name: detect_repo_name(context),
-        last_frame: std::time::Instant::now(),
         file_cache: HashMap::new(),
         root_cursor,
         scroll_offset: 0,
@@ -715,36 +713,39 @@ fn run_scope_selector(
     mut selector: ScopeSelector,
 ) -> Result<ScopeSelection> {
     let mut needs_render = true;
-    let mut last_frame = std::time::Instant::now();
 
     loop {
-        if needs_render || last_frame.elapsed().as_millis() >= 250 {
+        if needs_render {
             terminal.draw(|f| render_scope_selector(f, &selector))?;
-            last_frame = std::time::Instant::now();
             needs_render = false;
         }
 
-        if event::poll(std::time::Duration::from_millis(16))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(ScopeSelection::Quit),
-                KeyCode::Char('k') | KeyCode::Up => {
-                    selector.move_prev();
-                    needs_render = true;
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    selector.move_next();
-                    needs_render = true;
-                }
-                KeyCode::Enter => {
-                    if let Some(scope) = selector.selected_scope() {
-                        return Ok(ScopeSelection::Selected(scope));
-                    }
-                }
-                _ => {}
+        let event = event::read()?;
+        if should_rerender_on_event(&event) {
+            needs_render = true;
+            continue;
+        }
+
+        let Some(key_code) = key_code_for_press_event(&event) else {
+            continue;
+        };
+
+        match key_code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(ScopeSelection::Quit),
+            KeyCode::Char('k') | KeyCode::Up => {
+                selector.move_prev();
+                needs_render = true;
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                selector.move_next();
+                needs_render = true;
+            }
+            KeyCode::Enter => {
+                if let Some(scope) = selector.selected_scope() {
+                    return Ok(ScopeSelection::Selected(scope));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -757,134 +758,149 @@ fn run_app(
     let mut needs_render = true;
 
     loop {
-        if needs_render || state.last_frame.elapsed().as_millis() >= 250 {
+        if needs_render {
             terminal.draw(|f| ui(f, &mut state))?;
-            state.last_frame = std::time::Instant::now();
             needs_render = false;
         }
 
-        if event::poll(std::time::Duration::from_millis(16))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match &state.input_mode {
-                InputMode::Normal => match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('k') | KeyCode::Down => {
-                        handle_descend(&mut state);
-                        needs_render = true;
+        let event = event::read()?;
+        if should_rerender_on_event(&event) {
+            needs_render = true;
+            continue;
+        }
+
+        let Some(key_code) = key_code_for_press_event(&event) else {
+            continue;
+        };
+
+        match &state.input_mode {
+            InputMode::Normal => match key_code {
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('k') | KeyCode::Down => {
+                    handle_descend(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Char('i') | KeyCode::Up => {
+                    handle_ascend(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    handle_next(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Char('j') | KeyCode::Left => {
+                    handle_prev(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Char('n') => {
+                    handle_next(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Char('b') => {
+                    handle_prev(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Char('a') => {
+                    handle_action(terminal, context, &mut state, Verdict::Approved)?;
+                    needs_render = true;
+                }
+                KeyCode::Char('x') => {
+                    handle_action(terminal, context, &mut state, Verdict::Rejected)?;
+                    needs_render = true;
+                }
+                KeyCode::Char('c') => {
+                    handle_comment_action(&mut state)?;
+                    needs_render = true;
+                }
+                KeyCode::Char(' ')
+                    if state.navigator.current_id() != state.navigator.tree.root() =>
+                {
+                    handle_scroll_page_down(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::PageUp => {
+                    handle_scroll_page_up(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::PageDown => {
+                    handle_scroll_page_down(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Home => {
+                    state.scroll_offset = 0;
+                    needs_render = true;
+                }
+                KeyCode::End => {
+                    state.scroll_offset =
+                        state.content_height.saturating_sub(state.viewport_height);
+                    needs_render = true;
+                }
+                KeyCode::Char('g') => {
+                    state.navigator.jump_root();
+                    needs_render = true;
+                }
+                KeyCode::Char('d') => {
+                    state.view_mode = match state.view_mode {
+                        ViewMode::Source => ViewMode::Diff,
+                        ViewMode::Diff => ViewMode::Source,
+                    };
+                    // Reset scroll when switching views because content height changes
+                    state.scroll_offset = 0;
+                    needs_render = true;
+                }
+                KeyCode::Enter | KeyCode::Char(' ')
+                    if state.navigator.current_id() == state.navigator.tree.root() =>
+                {
+                    if let Some(first) = state.review_order.first_block() {
+                        state.navigator.set_current(first);
                     }
-                    KeyCode::Char('i') | KeyCode::Up => {
-                        handle_ascend(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        handle_next(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('j') | KeyCode::Left => {
-                        handle_prev(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('n') => {
-                        handle_next(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('b') => {
-                        handle_prev(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('a') => {
-                        handle_action(terminal, context, &mut state, Verdict::Approved)?;
-                        needs_render = true;
-                    }
-                    KeyCode::Char('x') => {
-                        handle_action(terminal, context, &mut state, Verdict::Rejected)?;
-                        needs_render = true;
-                    }
-                    KeyCode::Char('c') => {
-                        handle_comment_action(&mut state)?;
-                        needs_render = true;
-                    }
-                    KeyCode::Char(' ')
-                        if state.navigator.current_id() != state.navigator.tree.root() =>
-                    {
-                        handle_scroll_page_down(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::PageUp => {
-                        handle_scroll_page_up(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::PageDown => {
-                        handle_scroll_page_down(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Home => {
-                        state.scroll_offset = 0;
-                        needs_render = true;
-                    }
-                    KeyCode::End => {
-                        state.scroll_offset =
-                            state.content_height.saturating_sub(state.viewport_height);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('g') => {
-                        state.navigator.jump_root();
-                        needs_render = true;
-                    }
-                    KeyCode::Char('d') => {
-                        state.view_mode = match state.view_mode {
-                            ViewMode::Source => ViewMode::Diff,
-                            ViewMode::Diff => ViewMode::Source,
-                        };
-                        // Reset scroll when switching views because content height changes
-                        state.scroll_offset = 0;
-                        needs_render = true;
-                    }
-                    KeyCode::Enter | KeyCode::Char(' ')
-                        if state.navigator.current_id() == state.navigator.tree.root() =>
-                    {
-                        if let Some(first) = state.review_order.first_block() {
-                            state.navigator.set_current(first);
-                        }
-                        needs_render = true;
-                    }
-                    _ => {}
-                },
-                InputMode::Editing { .. } => match key.code {
-                    KeyCode::Enter => {
-                        handle_editing_submit(terminal, context, &mut state)?;
-                        needs_render = true;
-                    }
-                    KeyCode::Esc => {
-                        handle_editing_cancel(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Backspace => {
-                        state.input_buffer.pop();
-                        needs_render = true;
-                    }
-                    KeyCode::Char(c) => {
-                        state.input_buffer.push(c);
-                        needs_render = true;
-                    }
-                    _ => {}
-                },
-                InputMode::ConfirmBatch { .. } => match key.code {
-                    KeyCode::Enter => {
-                        handle_confirm_batch(terminal, context, &mut state)?;
-                        needs_render = true;
-                    }
-                    KeyCode::Esc => {
-                        handle_confirm_cancel(&mut state);
-                        needs_render = true;
-                    }
-                    _ => {}
-                },
-            }
+                    needs_render = true;
+                }
+                _ => {}
+            },
+            InputMode::Editing { .. } => match key_code {
+                KeyCode::Enter => {
+                    handle_editing_submit(terminal, context, &mut state)?;
+                    needs_render = true;
+                }
+                KeyCode::Esc => {
+                    handle_editing_cancel(&mut state);
+                    needs_render = true;
+                }
+                KeyCode::Backspace => {
+                    state.input_buffer.pop();
+                    needs_render = true;
+                }
+                KeyCode::Char(c) => {
+                    state.input_buffer.push(c);
+                    needs_render = true;
+                }
+                _ => {}
+            },
+            InputMode::ConfirmBatch { .. } => match key_code {
+                KeyCode::Enter => {
+                    handle_confirm_batch(terminal, context, &mut state)?;
+                    needs_render = true;
+                }
+                KeyCode::Esc => {
+                    handle_confirm_cancel(&mut state);
+                    needs_render = true;
+                }
+                _ => {}
+            },
         }
     }
+}
+
+fn key_code_for_press_event(event: &Event) -> Option<KeyCode> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => Some(key.code),
+        _ => None,
+    }
+}
+
+fn should_rerender_on_event(event: &Event) -> bool {
+    matches!(event, Event::Resize(_, _))
 }
 
 // ... helper functions for actions ...
@@ -2436,6 +2452,36 @@ mod diff_scope_tests {
             format_diff_overlay_row(&line),
             "         42 + let x = 1;".to_string()
         );
+    }
+
+    #[test]
+    fn key_code_for_press_event_extracts_key_code() {
+        let event = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(key_code_for_press_event(&event), Some(KeyCode::Char('j')));
+    }
+
+    #[test]
+    fn key_code_for_press_event_ignores_non_press_keys() {
+        let event = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(key_code_for_press_event(&event), None);
+    }
+
+    #[test]
+    fn should_rerender_on_event_handles_resize_only() {
+        let resize = Event::Resize(120, 40);
+        let key = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(should_rerender_on_event(&resize));
+        assert!(!should_rerender_on_event(&key));
     }
 }
 
