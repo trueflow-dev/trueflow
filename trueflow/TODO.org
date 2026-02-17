@@ -1,74 +1,65 @@
 #+title: TODO
 
-* Roadmap to V1 Prod
-** TUI & Emacs [High]
-   - [X] **TUI: Real Review Queue**
-     - Wire `tui.rs` to use real data from `review --json`.
-     - Implement actions: `[a]pprove`, `[c]omment` (prompt), `[x]reject` calling `trueflow mark`.
-     - Implement `[s]ubdivide` to split blocks in-place and recurse.
-     - Show actual file path, block kind, and syntax-highlighted snippet.
-   - [X] **Emacs: Shippable Workflow**
-     - Core commands: `trueflow-review-list`, `trueflow-review-block`.
-     - Support sub-block splitting/review within Emacs.
-     - Integration: parse JSON output, execute `mark` commands.
-     - Polish: Modeline status (e.g., "3 unreviewed"), quick refresh.
+* Highest Leverage / Critical
+** Scanner Correctness
+   - [ ] **Integrate real `.gitignore` parsing into `scanner.rs`**
+     - Current state: scanner uses hardcoded ignore rules (`.git`, `.trueflow`, `target`, `node_modules`).
+     - Goal: honor repo `.gitignore` and nested ignore files to avoid scanning irrelevant or generated files.
 
-** Team Sync & Data [High]
-   - [X] **Git-based Sync Durability**
-     - Add conflict-safe merge strategy for `reviews.jsonl` (dedupe by `record.id`).
-     - Add file locking for `.trueflow/reviews.jsonl` to prevent concurrent write corruption.
-     - Verify signatures during sync (if present).
-     - Add `sync --dry-run` to preview operations.
-   - [X] **Schema Evolution**
-     - Add a `version` field to review records to support future migrations.
+** Config Completion
+   - [ ] **Make sync branch configurable (`storage.branch`)**
+     - Current state: sync code still hardcodes `trueflow-db` in git commands.
+     - Goal: read from config and default to `trueflow-db`.
+   - [ ] **Add `scan.ignore_globs` to `trueflow.toml`**
+     - Goal: allow user-defined ignore patterns beyond `.gitignore`.
+   - [ ] **Add `hash.normalization` configurability**
+     - Goal: expose normalization behavior as explicit config flags where it is safe to do so.
 
-** Config & Filtering [Medium]
-   - [ ] **Configuration (`trueflow.toml`)**
-     - `storage.branch`: Branch ref for sync (default: `trueflow-db`).
-     - `review.only_show`: Allowlist of block kinds (e.g., `["FunctionSignature", "Struct"]`).
-     - `review.exclude`: Block kinds to hide (e.g., `["Comment", "Gap"]`).
-     - `scan.ignore_globs`: Additional ignore patterns beyond `.gitignore`.
-     - `hash.normalization`: Toggle for whitespace/line-ending rules.
-   - [ ] **UI Filtering**
-     - Ensure filtering happens at the UI/Presentation layer (after logic/ordering) to avoid missing critical changes.
+** Test/Parsing Robustness
+   - [ ] **Refactor test detection query logic in `block_splitter.rs`**
+     - Current state: language-specific `collect_*_test_ranges` logic is repetitive.
+     - Goal: consolidate around shared `Span` overlap primitives (`src/block.rs`).
+     - Keep `tests/e2e_languages.rs` (`test_all_languages_test_blocks`) green.
 
-** Core & Hashing [High]
-   - [X] **Canonicalization Pipeline**
-     - Implement whitespace normalization (trim trailing, normalize newlines) matching README promise.
-     - Add regression tests for hash stability across formatting changes.
-   - [ ] **OS Support**
-     - Verify and fix path handling for macOS/Linux (e.g., config paths, newlines).
-   - [ ] **Git Ignore Support**
-     - Integrate `.gitignore` parsing into `scanner.rs`.
+* Medium Priority
+** Optimizer
+   - [x] **Implement optimizer pass for adjacent imports**
+   - [x] **Integrate `optimizer::optimize` into `scanner.rs` before returning `FileState`**
+   - [ ] **Evaluate/implement a "new small file -> single merged block" pass**
+     - Previous TODO said this was required (<64 lines). This remains optional and should be validated against review quality/perf tradeoffs.
 
-** Cleanup & Refactors [Medium]
-   - [X] **Rename `Signature` -> `FunctionSignature`**
-     - Rename the `BlockKind` variant `Signature` to `FunctionSignature` for clarity.
-     - Update string serialization and tests.
-   - [ ] **Refactor Test Detection Queries**
-     - Current state: `collect_test_ranges` in `block_splitter.rs` has repetitive logic per language.
-     - Goal: Use the new `Span` and overlap primitives (added in `block.rs`) consistently across all languages.
-     - Goal: Improve query robustness for Python, JS/TS, and Shell (similar to how we fixed Rust).
-     - Pointers:
-       - `src/block_splitter.rs`: `collect_test_ranges` and language-specific helpers.
-       - `src/block.rs`: `Span` struct and `overlaps` method.
-       - Tests: `tests/e2e_languages.rs` (ensure `test_all_languages_test_blocks` keeps passing).
-       - Look at `collect_rust_test_ranges` vs `collect_python_test_ranges` for consolidation opportunities.
+** Platform Verification
+   - [ ] **Run explicit macOS/Linux path/newline verification matrix**
+     - Existing path/subdir regressions are covered, but we still need a deliberate cross-platform pass.
 
-* Optimizer TODOs
-  - [ ] Implement `trueflow::optimizer::optimize` logic.
-    - [ ] Pass 1: Merge adjacent import statements (e.g. `use foo;` `use bar;` -> one block).
-    - [ ] Pass 2: Merge full-file content if file is new and small (< 64 lines).
-  - [ ] Integrate `optimizer::optimize` into `scanner.rs` before returning `FileState`.
+** Example Repo Coverage
+   - [ ] **Add smoke test for `example_repos/all_languages` review block generation**
 
-* Example repos TODOs
-  - [ ] Add smoke test for example_repos/all_languages review block generation.
+* Low Priority / Product Direction
+** Filtering Architecture Follow-up
+   - [ ] **Decide if additional presentation-layer filtering is needed**
+     - Current state: filtering occurs in review collection (core logic), not in TUI presentation.
+     - Clarify desired architecture before changing behavior.
+
+* Delivered / Done
+** TUI & Emacs
+   - [x] TUI real review queue and action wiring
+   - [x] Emacs shippable review workflow
+
+** Team Sync & Data
+   - [x] Git-based sync durability improvements (dedupe/locking/signature checks)
+   - [x] Schema evolution with `version` field
+
+** Core & Hashing
+   - [x] Canonicalization pipeline and hash stability regression tests
+
+** Cleanup
+   - [x] Rename `Signature` -> `FunctionSignature`
+
+** Config (already implemented)
+   - [x] `review.only`
+   - [x] `review.exclude`
+   - [x] TUI review settings (`confirm_batch`, diff focus mode/context)
 
 * Future Ideas
-  - Eventually, I would like to have deep semantic diffs, like "this function was
-    moved to this file". This would be a few layer above the actual set of
-    "change" objects that we have hashed and stored in trueflow. Then, if a user
-    approves one of these changes, it can approve all the underlying "changes",
-    e.g. the delete in one file and the add in the other. This can be accomplished
-    via a smart mix of LLMs and also deterministic methods like LSPs, treesitter,
-    etc.
+  - Deep semantic diffs (e.g. move detection, grouped change objects) that can map one user approval to multiple underlying deterministic change records.
