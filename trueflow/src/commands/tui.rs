@@ -244,11 +244,11 @@ impl ReviewNavigator {
             .copied()
             .filter(|child| self.visible_nodes.contains(child))
             .collect();
-        let index = siblings.iter().position(|&id| id == node_id)? as isize + offset;
-        if index < 0 {
-            return None;
-        }
-        siblings.get(index as usize).copied()
+        let index = siblings
+            .iter()
+            .position(|&id| id == node_id)?
+            .checked_add_signed(offset)?;
+        siblings.get(index).copied()
     }
 }
 
@@ -968,9 +968,13 @@ fn move_root_cursor(state: &mut AppState, offset: isize) {
     let current = state
         .root_cursor
         .and_then(|id| root_children.iter().position(|&child| child == id))
-        .unwrap_or(0) as isize;
-    let next = (current + offset).clamp(0, root_children.len() as isize - 1);
-    state.root_cursor = root_children.get(next as usize).copied();
+        .unwrap_or(0);
+    let last_index = root_children.len().saturating_sub(1);
+    let next = current
+        .checked_add_signed(offset)
+        .unwrap_or(if offset.is_negative() { 0 } else { last_index })
+        .min(last_index);
+    state.root_cursor = root_children.get(next).copied();
 }
 
 fn handle_action(
@@ -1700,14 +1704,14 @@ fn build_block_lines(
     let language = node.language.clone();
     let block_lines: Vec<String> = block.content.lines().map(|line| line.to_string()).collect();
     let extra_space =
-        code_height.saturating_sub(usize_to_u16_saturating(block_lines.len())) as isize;
+        i32::from(code_height.saturating_sub(usize_to_u16_saturating(block_lines.len())));
 
     // TODO: if paginating, we shouldn't truncate context based on viewport height alone.
     // However, existing context logic tries to center the block vertically.
     // For pagination, we probably want full context available but scrolled.
     // For now, let's keep context logic but return full lines.
 
-    let total_context = (extra_space - 1).max(0) as usize;
+    let total_context = usize::try_from((extra_space - 1).max(0)).unwrap_or(usize::MAX);
     // With scrolling, we might want more context if available, or just render everything?
     // The current design renders a *subset* of file lines around the block.
     // If we want to scroll *within* that subset, we return the subset.

@@ -86,7 +86,8 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         Err(_) => ("unknown@localhost".to_string(), None),
     };
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let now =
+        i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()).unwrap_or(i64::MAX);
 
     let identity = Identity::Email {
         email: email.clone(),
