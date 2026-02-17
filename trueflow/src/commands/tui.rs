@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{ReviewOptions, ReviewTarget, collect_review_summary};
-use crate::config::{BlockFilters, load as load_config};
+use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_config};
 use crate::context::TrueflowContext;
 use crate::store::Verdict;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
@@ -537,13 +537,14 @@ struct AppState {
     content_height: u16,
     viewport_height: u16,
     view_mode: ViewMode,
+    block_diff_focus_mode: vcs::BlockDiffFocusMode,
     file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
-    #[default]
     Source,
+    #[default]
     Diff,
 }
 
@@ -564,6 +565,7 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
                     summary,
                     scope.clone(),
                     config.tui.confirm_batch,
+                    block_diff_focus_mode_from_config(&config.tui),
                     scope.label(),
                 )?;
                 run_app(context, &mut terminal, state)
@@ -579,6 +581,7 @@ fn build_review_state(
     summary: crate::commands::review::ReviewSummary,
     review_scope: ReviewScope,
     confirm_batch: bool,
+    block_diff_focus_mode: vcs::BlockDiffFocusMode,
     scope_label: String,
 ) -> Result<AppState> {
     let reviewable_nodes: HashSet<TreeNodeId> = summary
@@ -613,9 +616,19 @@ fn build_review_state(
         scroll_offset: 0,
         content_height: 0,
         viewport_height: 0,
-        view_mode: ViewMode::Source,
+        view_mode: ViewMode::Diff,
+        block_diff_focus_mode,
         file_diff_cache: HashMap::new(),
     })
+}
+
+fn block_diff_focus_mode_from_config(config: &TuiConfig) -> vcs::BlockDiffFocusMode {
+    match config.diff_focus_mode {
+        TuiDiffFocusMode::WholeBlock => vcs::BlockDiffFocusMode::WholeBlock,
+        TuiDiffFocusMode::ChangedWithContext => vcs::BlockDiffFocusMode::ChangedWithContext {
+            context_lines: config.diff_focus_context_lines,
+        },
+    }
 }
 
 fn load_scope_options() -> Result<Vec<ScopeOption>> {
@@ -1609,7 +1622,7 @@ fn build_action_lines(width: u16, palette: &UiPalette) -> Vec<Line<'static>> {
         Line::from(Span::styled("[i]ascend", pyramid_style)),
         Line::from(Span::styled("[j]prev            [l]next", pyramid_style)),
         Line::from(Span::styled("  [k]descend", pyramid_style)),
-        Line::from(Span::styled("  [d]toggle diff", pyramid_style)),
+        Line::from(Span::styled("  [d]toggle diff/source", pyramid_style)),
     ];
 
     let mut lines = Vec::with_capacity(1 + pyramid_lines.len());
@@ -1828,9 +1841,10 @@ fn build_block_diff_lines(
             }
         }
     });
-    let diff_lines = vcs::extract_diff_lines_for_block(block, hunks);
+    let diff_view =
+        vcs::extract_block_diff_view_for_block(block, hunks, state.block_diff_focus_mode);
 
-    let Some(lines) = diff_lines else {
+    let Some(view) = diff_view else {
         // Fallback to source view if no diff overlap found (e.g. new file not in diff, or moved code?)
         // Or should we say "(No diff changes in this block)"?
         // User requested diff view. If block is pure addition, maybe diff covers it?
@@ -1845,22 +1859,57 @@ fn build_block_diff_lines(
         );
     };
 
-    let formatted = lines
+    let formatted = view
+        .lines
         .iter()
         .map(|line| {
-            let style = if line.starts_with('+') {
-                Style::default().fg(palette.add).bg(palette.code_bg)
-            } else if line.starts_with('-') {
-                Style::default().fg(palette.del).bg(palette.code_bg)
-            } else {
-                Style::default().fg(palette.dim).bg(palette.code_bg)
-            };
-            Line::from(Span::styled(line.trim_end().to_string(), style))
+            let style = style_for_diff_overlay_line(line, palette);
+            let text = format_diff_overlay_row(line);
+            Line::from(Span::styled(text, style))
         })
         .collect::<Vec<_>>();
 
     let len = formatted.len();
     (formatted, len)
+}
+
+fn style_for_diff_overlay_line(line: &vcs::DiffLine, palette: &UiPalette) -> Style {
+    match line.kind {
+        vcs::DiffLineKind::Added => Style::default()
+            .fg(palette.add)
+            .bg(palette.code_bg)
+            .add_modifier(Modifier::BOLD),
+        vcs::DiffLineKind::Removed => Style::default()
+            .fg(palette.del)
+            .bg(palette.code_bg)
+            .add_modifier(Modifier::BOLD),
+        vcs::DiffLineKind::Context => {
+            let style = Style::default().fg(palette.dim).bg(palette.code_bg);
+            if line.is_focus {
+                style
+            } else {
+                style.add_modifier(Modifier::DIM)
+            }
+        }
+    }
+}
+
+fn format_diff_overlay_row(line: &vcs::DiffLine) -> String {
+    let old_col = format_diff_line_number(line.old_line);
+    let new_col = format_diff_line_number(line.new_line);
+    let marker = match line.kind {
+        vcs::DiffLineKind::Context => ' ',
+        vcs::DiffLineKind::Added => '+',
+        vcs::DiffLineKind::Removed => '-',
+    };
+    format!("{old_col} {new_col} {marker} {}", line.text)
+}
+
+fn format_diff_line_number(line: Option<u32>) -> String {
+    match line {
+        Some(number) => format!("{number:>5}"),
+        None => "     ".to_string(),
+    }
 }
 
 fn ensure_cached_diff_hunks<'a, F>(
@@ -2350,6 +2399,42 @@ mod diff_scope_tests {
         assert!(
             cache.contains_key(&path),
             "failed loads should still cache empty hunks"
+        );
+    }
+
+    #[test]
+    fn block_diff_focus_mode_defaults_to_whole_block() {
+        let config = TuiConfig::default();
+        let mode = block_diff_focus_mode_from_config(&config);
+        assert_eq!(mode, vcs::BlockDiffFocusMode::WholeBlock);
+    }
+
+    #[test]
+    fn block_diff_focus_mode_uses_configured_context() {
+        let config = TuiConfig {
+            confirm_batch: true,
+            diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
+            diff_focus_context_lines: 7,
+        };
+        let mode = block_diff_focus_mode_from_config(&config);
+        assert_eq!(
+            mode,
+            vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 7 }
+        );
+    }
+
+    #[test]
+    fn format_diff_overlay_row_renders_old_new_gutter() {
+        let line = vcs::DiffLine {
+            kind: vcs::DiffLineKind::Added,
+            old_line: None,
+            new_line: Some(42),
+            text: "let x = 1;".to_string(),
+            is_focus: true,
+        };
+        assert_eq!(
+            format_diff_overlay_row(&line),
+            "         42 + let x = 1;".to_string()
         );
     }
 }
