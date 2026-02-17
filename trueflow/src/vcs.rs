@@ -18,8 +18,36 @@ pub struct RepoSnapshot {
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
     pub file_path: String,
+    pub old_start: u32,
     pub new_start: u32,
     pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+    pub text: String,
+    pub is_focus: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDiffFocusMode {
+    WholeBlock,
+    ChangedWithContext { context_lines: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BlockDiffView {
+    pub lines: Vec<DiffLine>,
 }
 
 pub struct GitConfig {
@@ -209,40 +237,43 @@ fn diff_hunks_for_file_between_trees(
     Ok(hunks)
 }
 
-pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option<Vec<String>> {
+pub fn extract_block_diff_view_for_block(
+    block: &Block,
+    hunks: &[DiffHunk],
+    focus_mode: BlockDiffFocusMode,
+) -> Option<BlockDiffView> {
     let start = usize_to_u32_saturating(block.start_line).saturating_add(1); // 1-based for diff
     let end_exclusive = usize_to_u32_saturating(block.end_line).saturating_add(1);
 
-    let mut relevant_lines = Vec::new();
-    let mut has_overlap = false;
-
+    let mut lines = Vec::new();
     for hunk in hunks {
-        let mut current_line = hunk.new_start;
-        let mut hunk_touches_block = false;
-
-        for line in &hunk.lines {
-            if line.starts_with('+') || line.starts_with(' ') {
-                if current_line >= start && current_line < end_exclusive {
-                    hunk_touches_block = true;
-                }
-                current_line += 1;
+        for line in positioned_hunk_lines(hunk) {
+            if line.anchor_new_line < start || line.anchor_new_line >= end_exclusive {
+                continue;
             }
-            // '-' lines don't advance new file line count
-        }
 
-        // Include the hunk if it touches the block.
-        // We might want to trim the hunk to just the block, but context is good.
-        if hunk_touches_block {
-            relevant_lines.extend(hunk.lines.clone());
-            has_overlap = true;
+            lines.push(DiffLine {
+                kind: line.kind,
+                old_line: line.old_line,
+                new_line: line.new_line,
+                text: line.text,
+                is_focus: line.kind != DiffLineKind::Context,
+            });
         }
     }
 
-    if has_overlap {
-        Some(relevant_lines)
-    } else {
-        None
+    if lines.is_empty() {
+        return None;
     }
+
+    if let BlockDiffFocusMode::ChangedWithContext { context_lines } = focus_mode {
+        lines = keep_changed_with_context(lines, context_lines);
+        if lines.is_empty() {
+            return None;
+        }
+    }
+
+    Some(BlockDiffView { lines })
 }
 
 pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
@@ -438,6 +469,7 @@ fn collect_hunks(hunks: &mut Vec<DiffHunk>, path: &str, unified: &str) -> Result
             }
             current = Some(DiffHunk {
                 file_path: path.to_string(),
+                old_start: header.before_start,
                 new_start: header.after_start,
                 lines: Vec::new(),
             });
@@ -472,9 +504,90 @@ fn parse_hunk_start(range: &str) -> Option<u32> {
 }
 
 struct HunkHeader {
-    #[allow(dead_code)]
     before_start: u32,
     after_start: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PositionedDiffLine {
+    kind: DiffLineKind,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    anchor_new_line: u32,
+    text: String,
+}
+
+fn positioned_hunk_lines(hunk: &DiffHunk) -> Vec<PositionedDiffLine> {
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
+    let mut lines = Vec::new();
+
+    for line in &hunk.lines {
+        if let Some(text) = line.strip_prefix(' ') {
+            lines.push(PositionedDiffLine {
+                kind: DiffLineKind::Context,
+                old_line: Some(old_line),
+                new_line: Some(new_line),
+                anchor_new_line: new_line,
+                text: text.trim_end_matches('\n').to_string(),
+            });
+            old_line = old_line.saturating_add(1);
+            new_line = new_line.saturating_add(1);
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix('+') {
+            lines.push(PositionedDiffLine {
+                kind: DiffLineKind::Added,
+                old_line: None,
+                new_line: Some(new_line),
+                anchor_new_line: new_line,
+                text: text.trim_end_matches('\n').to_string(),
+            });
+            new_line = new_line.saturating_add(1);
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix('-') {
+            lines.push(PositionedDiffLine {
+                kind: DiffLineKind::Removed,
+                old_line: Some(old_line),
+                new_line: None,
+                anchor_new_line: new_line,
+                text: text.trim_end_matches('\n').to_string(),
+            });
+            old_line = old_line.saturating_add(1);
+        }
+    }
+
+    lines
+}
+
+fn keep_changed_with_context(lines: Vec<DiffLine>, context_lines: usize) -> Vec<DiffLine> {
+    let changed_indices = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| (line.kind != DiffLineKind::Context).then_some(idx))
+        .collect::<Vec<_>>();
+
+    if changed_indices.is_empty() {
+        return lines;
+    }
+
+    let mut keep = vec![false; lines.len()];
+    for index in changed_indices {
+        let start = index.saturating_sub(context_lines);
+        let end = (index.saturating_add(context_lines).saturating_add(1)).min(lines.len());
+        for slot in &mut keep[start..end] {
+            *slot = true;
+        }
+    }
+
+    lines
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(line, keep)| keep.then_some(line))
+        .collect()
 }
 
 fn split_blocks(content: &str, language: Language) -> Vec<Block> {
@@ -512,14 +625,16 @@ mod tests {
 
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0].file_path, "src/main.rs");
+        assert_eq!(hunks[0].old_start, 1);
         assert_eq!(hunks[0].new_start, 1);
         assert_eq!(hunks[0].lines, vec!["-foo\n", "+foo\n", "+bar\n"]);
+        assert_eq!(hunks[1].old_start, 5);
         assert_eq!(hunks[1].new_start, 6);
         assert_eq!(hunks[1].lines, vec!["-baz\n", "+qux\n"]);
     }
 
     #[test]
-    fn test_extract_diff_lines_overlap() {
+    fn test_extract_block_diff_view_overlap() {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
@@ -534,40 +649,66 @@ mod tests {
 
         let hunk_inside = DiffHunk {
             file_path: String::new(),
+            old_start: 12,
             new_start: 12, // Inside block
             lines: vec!["+line12\n".to_string()],
         };
 
         let hunk_before = DiffHunk {
             file_path: String::new(),
+            old_start: 5,
             new_start: 5,
             lines: vec!["+line5\n".to_string()],
         };
 
         let hunk_after = DiffHunk {
             file_path: String::new(),
+            old_start: 25,
             new_start: 25,
             lines: vec!["+line25\n".to_string()],
         };
 
         // Case 1: Overlap
-        let result = extract_diff_lines_for_block(&block, std::slice::from_ref(&hunk_inside));
+        let result = extract_block_diff_view_for_block(
+            &block,
+            std::slice::from_ref(&hunk_inside),
+            BlockDiffFocusMode::WholeBlock,
+        );
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), vec!["+line12\n"]);
+        let lines = match result {
+            Some(view) => view.lines,
+            None => panic!("expected overlap"),
+        };
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].kind, DiffLineKind::Added);
+        assert_eq!(lines[0].text, "line12".to_string());
 
         // Case 2: No Overlap
-        let result =
-            extract_diff_lines_for_block(&block, &[hunk_before.clone(), hunk_after.clone()]);
+        let result = extract_block_diff_view_for_block(
+            &block,
+            &[hunk_before.clone(), hunk_after.clone()],
+            BlockDiffFocusMode::WholeBlock,
+        );
         assert!(result.is_none());
 
         // Case 3: Mixed
-        let result = extract_diff_lines_for_block(&block, &[hunk_before, hunk_inside, hunk_after]);
+        let result = extract_block_diff_view_for_block(
+            &block,
+            &[hunk_before, hunk_inside, hunk_after],
+            BlockDiffFocusMode::WholeBlock,
+        );
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), vec!["+line12\n"]);
+        let lines = match result {
+            Some(view) => view.lines,
+            None => panic!("expected overlap"),
+        };
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].kind, DiffLineKind::Added);
+        assert_eq!(lines[0].text, "line12".to_string());
     }
 
     #[test]
-    fn test_extract_diff_lines_respects_exclusive_end_line() {
+    fn test_extract_block_diff_view_respects_exclusive_end_line() {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
@@ -582,11 +723,165 @@ mod tests {
 
         let hunk_at_exclusive_end = DiffHunk {
             file_path: String::new(),
+            old_start: 21,
             new_start: 21, // outside the block range
             lines: vec!["+line21\n".to_string()],
         };
 
-        let result = extract_diff_lines_for_block(&block, &[hunk_at_exclusive_end]);
+        let result = extract_block_diff_view_for_block(
+            &block,
+            &[hunk_at_exclusive_end],
+            BlockDiffFocusMode::WholeBlock,
+        );
         assert!(result.is_none(), "exclusive end_line must not overlap");
+    }
+
+    #[test]
+    fn extract_block_diff_view_reports_kinds_focus_and_line_numbers() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 9, // 0-based, so lines 10-14
+            end_line: 14,  // exclusive
+        };
+
+        let hunk = DiffHunk {
+            file_path: String::new(),
+            old_start: 10,
+            new_start: 10,
+            lines: vec![
+                " keep_before\n".to_string(),
+                "-old_value\n".to_string(),
+                "+new_value\n".to_string(),
+                " keep_after\n".to_string(),
+            ],
+        };
+
+        let view = match extract_block_diff_view_for_block(
+            &block,
+            &[hunk],
+            BlockDiffFocusMode::WholeBlock,
+        ) {
+            Some(view) => view,
+            None => panic!("expected overlap"),
+        };
+
+        assert_eq!(view.lines.len(), 4);
+        assert_eq!(view.lines[0].kind, DiffLineKind::Context);
+        assert_eq!(view.lines[1].kind, DiffLineKind::Removed);
+        assert_eq!(view.lines[2].kind, DiffLineKind::Added);
+        assert_eq!(view.lines[3].kind, DiffLineKind::Context);
+
+        assert_eq!(view.lines[0].old_line, Some(10));
+        assert_eq!(view.lines[0].new_line, Some(10));
+        assert_eq!(view.lines[1].old_line, Some(11));
+        assert_eq!(view.lines[1].new_line, None);
+        assert_eq!(view.lines[2].old_line, None);
+        assert_eq!(view.lines[2].new_line, Some(11));
+
+        assert!(!view.lines[0].is_focus);
+        assert!(view.lines[1].is_focus);
+        assert!(view.lines[2].is_focus);
+        assert!(!view.lines[3].is_focus);
+    }
+
+    #[test]
+    fn changed_with_context_focus_mode_trims_distant_context() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 10, // 0-based, so lines 11-16
+            end_line: 16,
+        };
+
+        let hunk = DiffHunk {
+            file_path: String::new(),
+            old_start: 11,
+            new_start: 11,
+            lines: vec![
+                " ctx1\n".to_string(),
+                " ctx2\n".to_string(),
+                "-old\n".to_string(),
+                "+new\n".to_string(),
+                " ctx3\n".to_string(),
+                " ctx4\n".to_string(),
+            ],
+        };
+
+        let view = match extract_block_diff_view_for_block(
+            &block,
+            &[hunk],
+            BlockDiffFocusMode::ChangedWithContext { context_lines: 1 },
+        ) {
+            Some(view) => view,
+            None => panic!("expected overlap"),
+        };
+
+        let rendered = view
+            .lines
+            .iter()
+            .map(|line| (line.kind, line.text.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            vec![
+                (DiffLineKind::Context, "ctx2".to_string()),
+                (DiffLineKind::Removed, "old".to_string()),
+                (DiffLineKind::Added, "new".to_string()),
+                (DiffLineKind::Context, "ctx3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_hunk_keeps_removed_lines() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 10, // 0-based, so lines 11-12
+            end_line: 12,
+        };
+
+        let hunk = DiffHunk {
+            file_path: String::new(),
+            old_start: 10,
+            new_start: 10,
+            lines: vec![
+                " before\n".to_string(),
+                "-removed\n".to_string(),
+                "+added\n".to_string(),
+                " after\n".to_string(),
+            ],
+        };
+
+        let view = match extract_block_diff_view_for_block(
+            &block,
+            &[hunk],
+            BlockDiffFocusMode::WholeBlock,
+        ) {
+            Some(view) => view,
+            None => panic!("expected overlap"),
+        };
+        assert!(
+            view.lines
+                .iter()
+                .any(|line| line.kind == DiffLineKind::Removed),
+            "removed lines should be retained when an overlapping hunk is included"
+        );
     }
 }
