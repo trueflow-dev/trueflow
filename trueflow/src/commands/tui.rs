@@ -1,9 +1,9 @@
 use crate::analysis::Language;
-use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::collect_review_summary;
 use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_config};
 use crate::context::TrueflowContext;
+use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::{DiffQuery, ReviewScope, diff_query_for_scope};
@@ -1190,7 +1190,7 @@ fn build_header_lines(
     lines.push(format_header_row(&header_text, palette, true));
 
     if matches!(node.kind, TreeNodeKind::Block)
-        && let Some(breadcrumb) = build_block_breadcrumb(node, state)
+        && let Some(breadcrumb) = review_metadata::block_breadcrumb(&state.navigator.tree, node.id)
     {
         lines.push(format_header_row(&breadcrumb, palette, false));
     }
@@ -1215,96 +1215,6 @@ fn build_header_lines(
     }
 
     lines
-}
-
-fn build_block_breadcrumb(node: &crate::tree::TreeNode, state: &AppState) -> Option<String> {
-    if !matches!(node.kind, TreeNodeKind::Block) {
-        return None;
-    }
-
-    let tree = &state.navigator.tree;
-    let mut ancestors = tree.ancestors(node.id);
-    ancestors.reverse();
-
-    let mut parts = Vec::new();
-    let mut file_path = None;
-    let mut impl_parts = Vec::new();
-    let mut current = None;
-
-    for ancestor_id in ancestors {
-        let ancestor = tree.node(ancestor_id);
-        match ancestor.kind {
-            TreeNodeKind::File => {
-                if !ancestor.path.is_empty() {
-                    file_path = Some(ancestor.path.clone());
-                }
-            }
-            TreeNodeKind::Block => {
-                let Some(block) = ancestor.block.as_ref() else {
-                    continue;
-                };
-                let label = block_signature(block);
-                if label.is_empty() {
-                    continue;
-                }
-                if matches!(block.kind, BlockKind::Impl | BlockKind::Interface) {
-                    impl_parts.push(label.clone());
-                }
-                if ancestor.id == node.id {
-                    current = Some(label);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(path) = file_path {
-        parts.push(format!("File ({path})"));
-    }
-    parts.extend(impl_parts);
-    if let Some(current) = current {
-        parts.push(current);
-    }
-
-    if parts.len() > 1 {
-        Some(parts.join(" -> "))
-    } else {
-        None
-    }
-}
-
-fn block_signature(block: &crate::block::Block) -> String {
-    let Some(line) = block.content.lines().find(|line| !line.trim().is_empty()) else {
-        return block.kind.as_str().to_string();
-    };
-    let mut text = line.trim().trim_end_matches('{').trim().to_string();
-
-    if matches!(
-        block.kind,
-        BlockKind::Function | BlockKind::Method | BlockKind::FunctionSignature
-    ) && let Some(idx) = find_argument_list_start(&text)
-    {
-        text.truncate(idx);
-    }
-
-    truncate_text(text.trim(), 72)
-}
-
-fn find_argument_list_start(text: &str) -> Option<usize> {
-    let mut depth = 0;
-    for (i, c) in text.char_indices() {
-        match c {
-            '<' => depth += 1,
-            '>' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            '(' if depth == 0 => return Some(i),
-            _ => {}
-        }
-    }
-    None
 }
 
 fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'static> {
@@ -1779,20 +1689,14 @@ fn build_root_lines(
         Style::default().fg(palette.dim).bg(palette.code_bg),
     )));
 
-    let mut kind_counts = count_block_kinds(state);
-    kind_counts.sort_by(|a, b| {
-        let parent_a = parent_kind(a.0);
-        let parent_b = parent_kind(b.0);
-        if parent_a != parent_b {
-            parent_a.cmp(parent_b)
-        } else {
-            b.0.as_str().cmp(a.0.as_str())
-        }
-    });
+    let kind_counts = review_metadata::sorted_visible_block_kind_counts(
+        &state.navigator.tree,
+        &state.navigator.visible_nodes,
+    );
 
     let mut last_parent = "";
     for (kind, count) in kind_counts {
-        let parent = parent_kind(kind);
+        let parent = review_metadata::parent_kind_label(kind);
         if parent != last_parent {
             if !last_parent.is_empty() {
                 lines.push(Line::from(""));
@@ -1850,52 +1754,6 @@ fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> L
         Style::default().fg(palette.context).bg(palette.code_bg)
     };
     Line::from(Span::styled(entry.to_string(), style)).style(style)
-}
-
-fn parent_kind(kind: BlockKind) -> &'static str {
-    match kind {
-        BlockKind::Function
-        | BlockKind::Method
-        | BlockKind::FunctionSignature
-        | BlockKind::CodeParagraph => "Code Logic",
-        BlockKind::Struct
-        | BlockKind::Enum
-        | BlockKind::Class
-        | BlockKind::Impl
-        | BlockKind::Macro
-        | BlockKind::Const
-        | BlockKind::Static
-        | BlockKind::Type => "Definitions",
-        BlockKind::Module
-        | BlockKind::Modules
-        | BlockKind::Import
-        | BlockKind::Imports
-        | BlockKind::Export
-        | BlockKind::Preamble => "Module Structure",
-        BlockKind::Comment
-        | BlockKind::TextBlock
-        | BlockKind::Paragraph
-        | BlockKind::ListItem
-        | BlockKind::Header
-        | BlockKind::Quote
-        | BlockKind::Section => "Documentation",
-        _ => "Other",
-    }
-}
-
-fn count_block_kinds(state: &AppState) -> Vec<(BlockKind, usize)> {
-    let mut counts = HashMap::new();
-    for id in &state.navigator.visible_nodes {
-        let node = state.navigator.tree.node(*id);
-        if node.kind != TreeNodeKind::Block {
-            continue;
-        }
-        let Some(block) = &node.block else {
-            continue;
-        };
-        *counts.entry(block.kind).or_insert(0) += 1;
-    }
-    counts.into_iter().collect()
 }
 
 fn format_directory_line(entry: &str, palette: &UiPalette) -> Line<'static> {
