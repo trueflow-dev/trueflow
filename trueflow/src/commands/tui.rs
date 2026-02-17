@@ -1736,16 +1736,15 @@ fn format_context_line(
 }
 
 fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
-    let popup_area = centered_rect(area, 60, 20);
-    frame.render_widget(ratatui::widgets::Clear, popup_area);
-
-    let (title, hints, content) = match &state.input_mode {
+    let (overlay_kind, title, hints, content) = match &state.input_mode {
         InputMode::Editing { .. } => (
+            InputOverlayKind::Editing,
             " Comment ",
             "Enter to submit • Esc to cancel",
             state.input_buffer.clone(),
         ),
         InputMode::ConfirmBatch { count, action } => (
+            InputOverlayKind::ConfirmBatch,
             " Batch Action ",
             "Enter to confirm • Esc to cancel",
             format!(
@@ -1756,6 +1755,8 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
         ),
         InputMode::Normal => return,
     };
+    let popup_area = input_overlay_rect(area, overlay_kind);
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
 
     let block = UiBlock::default()
         .title(title)
@@ -1774,6 +1775,33 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             .wrap(Wrap { trim: false }),
         popup_area,
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOverlayKind {
+    Editing,
+    ConfirmBatch,
+}
+
+fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
+    let preferred_height = match kind {
+        InputOverlayKind::Editing => 5,
+        InputOverlayKind::ConfirmBatch => 4,
+    };
+    let height = area.height.min(preferred_height);
+    let width = if area.width >= 20 {
+        area.width.min(96)
+    } else {
+        area.width
+    };
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + area.height.saturating_sub(height);
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 fn centered_rect(r: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -2012,6 +2040,35 @@ mod diff_scope_tests {
         ));
         assert!(should_rerender_on_event(&resize));
         assert!(!should_rerender_on_event(&key));
+    }
+
+    #[test]
+    fn input_overlay_rect_anchors_to_bottom() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let rect = input_overlay_rect(area, InputOverlayKind::Editing);
+        assert_eq!(rect.width, 96);
+        assert_eq!(rect.height, 5);
+        assert_eq!(rect.y + rect.height, area.y + area.height);
+    }
+
+    #[test]
+    fn input_overlay_rect_clamps_with_small_viewport() {
+        let area = Rect {
+            x: 3,
+            y: 2,
+            width: 18,
+            height: 3,
+        };
+        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch);
+        assert_eq!(rect.width, 18);
+        assert_eq!(rect.height, 3);
+        assert_eq!(rect.x, 3);
+        assert_eq!(rect.y, 2);
     }
 
     #[test]
