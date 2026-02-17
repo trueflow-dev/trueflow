@@ -70,6 +70,7 @@
               cargo-edit
               cargo-license
               cargo-llvm-cov
+              cargo-nextest
               cargo-mutants
               cargo-pgo
               cargo-udeps

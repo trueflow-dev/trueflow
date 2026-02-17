@@ -2,15 +2,15 @@
 default:
     @just --list
 
-# Run all checks (test, lint, fmt, audit, doc)
-check: test lint fmt-check audit doc
+# Run all checks (test, lint, fmt, audit, doc, coverage)
+check: test lint fmt-check audit doc coverage-check
 
 # Fix all auto-fixable issues
 fix: fix-clippy fix-fmt fix-audit fix-cargo
 
-# Run tests
+# Run tests with nextest
 test:
-    cd trueflow && cargo test --all-features --all-targets
+    cd trueflow && cargo nextest run --all-features --all-targets
 
 
 # Run mutation tests
@@ -33,6 +33,10 @@ audit:
 # Build documentation
 doc:
     cd trueflow && cargo doc --all-features
+
+# Enforce minimum test coverage (line coverage)
+coverage-check:
+    cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
 
 # Fix clippy issues
 fix-clippy:
