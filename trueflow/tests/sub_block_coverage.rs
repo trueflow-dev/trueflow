@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 mod common;
@@ -19,8 +19,7 @@ fn mark(repo: &TestRepo, hash: &str) -> Result<()> {
 fn is_gap(sub_block: &Value) -> bool {
     sub_block["kind"]
         .as_str()
-        .unwrap()
-        .eq_ignore_ascii_case("gap")
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("gap"))
 }
 
 #[test]
@@ -39,7 +38,7 @@ fn test_implicit_approval() -> Result<()> {
     let first_hash = sub_blocks
         .first()
         .and_then(|sb| sb["hash"].as_str())
-        .unwrap();
+        .context("first sub-block is missing a hash")?;
 
     let output = repo.run(&["review", "--exclude", "Gap", "--exclude", "gap"])?;
     assert!(output.contains("[Unreviewed]"));
@@ -55,7 +54,7 @@ fn test_implicit_approval() -> Result<()> {
         if is_gap(sb) {
             continue;
         }
-        let hash = sb["hash"].as_str().unwrap();
+        let hash = sb["hash"].as_str().context("sub-block is missing a hash")?;
         mark(&repo, hash)?;
     }
 
@@ -92,7 +91,7 @@ fn test_markdown_implicit_approval() -> Result<()> {
         if is_gap(sb) {
             continue;
         }
-        let hash = sb["hash"].as_str().unwrap();
+        let hash = sb["hash"].as_str().context("sub-block is missing a hash")?;
         mark(&repo, hash)?;
     }
 

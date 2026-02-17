@@ -47,7 +47,9 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
 
     parser.set_language(&language)?;
 
-    let tree = parser.parse(content, None).unwrap();
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse source with tree-sitter")?;
     let root = tree.root_node();
     let mut blocks = Vec::new();
 

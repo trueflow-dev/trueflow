@@ -147,8 +147,12 @@ fn flush_blocks(
         return buffer;
     }
 
-    let first_idx = buffer.iter().position(|b| b.kind == target_kind).unwrap();
-    let last_idx = buffer.iter().rposition(|b| b.kind == target_kind).unwrap();
+    let Some(first_idx) = buffer.iter().position(|b| b.kind == target_kind) else {
+        return buffer;
+    };
+    let Some(last_idx) = buffer.iter().rposition(|b| b.kind == target_kind) else {
+        return buffer;
+    };
 
     let mut result = Vec::with_capacity(buffer.len() - (last_idx - first_idx));
 
@@ -157,8 +161,8 @@ fn flush_blocks(
 
     // Merge range
     let range = &buffer[first_idx..=last_idx];
-    let start_line = range[0].start_line;
-    let end_line = range.last().unwrap().end_line;
+    let start_line = buffer[first_idx].start_line;
+    let end_line = buffer[last_idx].end_line;
 
     let mut content = String::new();
     let mut prev_was_target = false;
