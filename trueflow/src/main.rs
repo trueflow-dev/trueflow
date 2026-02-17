@@ -15,6 +15,7 @@ mod hashing;
 mod logging;
 mod optimizer;
 mod policy;
+mod review_navigator;
 mod review_order;
 mod review_scope;
 mod review_session;

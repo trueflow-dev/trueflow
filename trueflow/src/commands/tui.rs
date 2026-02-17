@@ -4,6 +4,7 @@ use crate::commands::mark;
 use crate::commands::review::collect_review_summary;
 use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_config};
 use crate::context::TrueflowContext;
+use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::{DiffQuery, ReviewScope, diff_query_for_scope};
 use crate::review_session;
@@ -76,100 +77,6 @@ impl ScopeSelector {
 enum ScopeSelection {
     Quit,
     Selected(ReviewScope),
-}
-
-struct ReviewNavigator {
-    tree: Tree,
-    visible_nodes: HashSet<TreeNodeId>,
-    current: TreeNodeId,
-}
-
-impl ReviewNavigator {
-    fn new(tree: Tree, unreviewed_blocks: HashSet<TreeNodeId>) -> Result<Self> {
-        // Compute visible nodes: all unreviewed blocks + their ancestors
-        let mut visible_nodes = HashSet::new();
-        for block_id in unreviewed_blocks {
-            visible_nodes.insert(block_id);
-            for ancestor in tree.ancestors(block_id) {
-                visible_nodes.insert(ancestor);
-            }
-        }
-
-        let root = tree.root();
-        visible_nodes.insert(root);
-
-        Ok(Self {
-            tree,
-            visible_nodes,
-            current: root,
-        })
-    }
-
-    fn current_id(&self) -> TreeNodeId {
-        self.current
-    }
-
-    fn set_current(&mut self, id: TreeNodeId) {
-        if self.visible_nodes.contains(&id) {
-            self.current = id;
-        }
-    }
-
-    fn jump_root(&mut self) {
-        self.current = self.tree.root();
-    }
-
-    fn descend(&mut self) {
-        if let Some(child) = self
-            .tree
-            .node(self.current)
-            .children
-            .iter()
-            .copied()
-            .find(|child| self.visible_nodes.contains(child))
-        {
-            self.current = child;
-        }
-    }
-
-    fn ascend(&mut self) {
-        if let Some(parent) = self.tree.parent(self.current)
-            && self.visible_nodes.contains(&parent)
-        {
-            self.current = parent;
-        }
-    }
-
-    // Move to next sibling (same parent)
-    fn move_next(&mut self) {
-        if let Some(next) = self.sibling_at_offset(self.current, 1) {
-            self.current = next;
-        }
-    }
-
-    // Move to prev sibling (same parent)
-    fn move_prev(&mut self) {
-        if let Some(prev) = self.sibling_at_offset(self.current, -1) {
-            self.current = prev;
-        }
-    }
-
-    fn sibling_at_offset(&self, node_id: TreeNodeId, offset: isize) -> Option<TreeNodeId> {
-        let parent = self.tree.parent(node_id)?;
-        let siblings: Vec<TreeNodeId> = self
-            .tree
-            .node(parent)
-            .children
-            .iter()
-            .copied()
-            .filter(|child| self.visible_nodes.contains(child))
-            .collect();
-        let index = siblings
-            .iter()
-            .position(|&id| id == node_id)?
-            .checked_add_signed(offset)?;
-        siblings.get(index).copied()
-    }
 }
 
 // --- Application Logic ---
