@@ -538,6 +538,7 @@ struct AppState {
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
+    content_frame_cache: Option<ContentFrameCacheEntry>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +546,21 @@ enum ViewMode {
     Source,
     #[default]
     Diff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentFrameCacheKey {
+    node_id: TreeNodeId,
+    view_mode: ViewMode,
+    block_diff_focus_mode: vcs::BlockDiffFocusMode,
+    code_height: u16,
+}
+
+#[derive(Clone)]
+struct ContentFrameCacheEntry {
+    key: ContentFrameCacheKey,
+    lines: Vec<Line<'static>>,
+    total_lines: usize,
 }
 
 pub fn run(context: &TrueflowContext) -> Result<()> {
@@ -617,6 +633,7 @@ fn build_review_state(
         view_mode: ViewMode::Diff,
         block_diff_focus_mode,
         file_diff_cache: HashMap::new(),
+        content_frame_cache: None,
     })
 }
 
@@ -1408,8 +1425,12 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
     let actions_lines = build_action_lines(focus_layout.actions.width, palette);
     let node_snapshot = node.clone();
-    let (content_lines, total_lines) =
-        build_content_lines(state, &node_snapshot, palette, focus_layout.code.height);
+    let (content_lines, total_lines) = build_content_lines_with_frame_cache(
+        state,
+        &node_snapshot,
+        palette,
+        focus_layout.code.height,
+    );
 
     state.content_height = usize_to_u16_saturating(total_lines);
     state.viewport_height = focus_layout.code.height;
@@ -1458,6 +1479,62 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         .style(Style::default().bg(palette.bg));
 
     frame.render_widget(actions_paragraph, focus_layout.actions);
+}
+
+fn content_frame_cache_key(
+    node_id: TreeNodeId,
+    node_kind: TreeNodeKind,
+    view_mode: ViewMode,
+    block_diff_focus_mode: vcs::BlockDiffFocusMode,
+    code_height: u16,
+) -> Option<ContentFrameCacheKey> {
+    if !is_content_kind_cacheable(node_kind) {
+        return None;
+    }
+
+    Some(ContentFrameCacheKey {
+        node_id,
+        view_mode,
+        block_diff_focus_mode,
+        code_height,
+    })
+}
+
+fn is_content_kind_cacheable(kind: TreeNodeKind) -> bool {
+    matches!(kind, TreeNodeKind::Block | TreeNodeKind::File)
+}
+
+fn build_content_lines_with_frame_cache(
+    state: &mut AppState,
+    node: &crate::tree::TreeNode,
+    palette: &UiPalette,
+    code_height: u16,
+) -> (Vec<Line<'static>>, usize) {
+    let key = content_frame_cache_key(
+        node.id,
+        node.kind,
+        state.view_mode,
+        state.block_diff_focus_mode,
+        code_height,
+    );
+
+    if let Some(key) = key {
+        if let Some(cached) = &state.content_frame_cache
+            && cached.key == key
+        {
+            return (cached.lines.clone(), cached.total_lines);
+        }
+
+        let (lines, total_lines) = build_content_lines(state, node, palette, code_height);
+        state.content_frame_cache = Some(ContentFrameCacheEntry {
+            key,
+            lines: lines.clone(),
+            total_lines,
+        });
+        return (lines, total_lines);
+    }
+
+    build_content_lines(state, node, palette, code_height)
 }
 
 fn build_header_lines(
@@ -2482,6 +2559,57 @@ mod diff_scope_tests {
         ));
         assert!(should_rerender_on_event(&resize));
         assert!(!should_rerender_on_event(&key));
+    }
+
+    #[test]
+    fn content_cache_is_enabled_for_block_and_file_nodes() {
+        assert!(is_content_kind_cacheable(TreeNodeKind::Block));
+        assert!(is_content_kind_cacheable(TreeNodeKind::File));
+        assert!(!is_content_kind_cacheable(TreeNodeKind::Directory));
+        assert!(!is_content_kind_cacheable(TreeNodeKind::Root));
+    }
+
+    #[test]
+    fn content_cache_key_includes_render_dimensions_and_modes() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Block,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Block,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+        let key_c = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Block,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            25,
+        );
+
+        assert!(key_a.is_some());
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_a, key_c);
+    }
+
+    #[test]
+    fn content_cache_key_is_none_for_non_cacheable_kinds() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Directory,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            12,
+        );
+        assert!(key.is_none());
     }
 }
 
