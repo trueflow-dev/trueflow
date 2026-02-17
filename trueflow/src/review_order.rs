@@ -1,0 +1,311 @@
+use crate::tree::{Tree, TreeNode, TreeNodeId};
+use std::collections::HashSet;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewGroup {
+    Test,
+    Library,
+    Main,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewBand {
+    Data,
+    Const,
+    Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCursor {
+    pub file_path: String,
+    pub kind_rank: u8,
+    pub start_line: usize,
+    pub node_id: TreeNodeId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewOrder {
+    ordered: Vec<ReviewCursor>,
+}
+
+impl ReviewOrder {
+    pub fn from_tree(tree: &Tree, unreviewed_block_nodes: &HashSet<TreeNodeId>) -> Self {
+        let mut ordered = Vec::new();
+        let mut items: Vec<_> = unreviewed_block_nodes
+            .iter()
+            .copied()
+            .filter_map(|node_id| {
+                let node = tree.node(node_id);
+                let block = node.block.as_ref()?;
+                let file_path = if node.path.is_empty() {
+                    node.name.clone()
+                } else {
+                    node.path.clone()
+                };
+                let cursor = ReviewCursor {
+                    file_path,
+                    kind_rank: block.kind.default_review_priority(),
+                    start_line: block.start_line,
+                    node_id,
+                };
+                Some((cursor, node))
+            })
+            .collect();
+
+        items.sort_by(|(a_cursor, a_node), (b_cursor, b_node)| {
+            let a_group = review_group(&a_cursor.file_path, a_node);
+            let b_group = review_group(&b_cursor.file_path, b_node);
+            let a_band = review_band_from_kind_rank(a_cursor.kind_rank);
+            let b_band = review_band_from_kind_rank(b_cursor.kind_rank);
+            (
+                review_group_rank(a_group),
+                &a_cursor.file_path,
+                review_band_rank(a_band),
+                a_cursor.kind_rank,
+                a_cursor.start_line,
+            )
+                .cmp(&(
+                    review_group_rank(b_group),
+                    &b_cursor.file_path,
+                    review_band_rank(b_band),
+                    b_cursor.kind_rank,
+                    b_cursor.start_line,
+                ))
+        });
+
+        for (cursor, _) in items {
+            ordered.push(cursor);
+        }
+
+        Self { ordered }
+    }
+
+    pub fn first_block(&self) -> Option<TreeNodeId> {
+        self.ordered.first().map(|cursor| cursor.node_id)
+    }
+
+    pub fn next_after_blocks(
+        &self,
+        current: TreeNodeId,
+        remaining: &HashSet<TreeNodeId>,
+    ) -> Option<TreeNodeId> {
+        let index = self
+            .ordered
+            .iter()
+            .position(|cursor| cursor.node_id == current)?;
+        self.ordered
+            .iter()
+            .skip(index + 1)
+            .find(|cursor| remaining.contains(&cursor.node_id))
+            .map(|cursor| cursor.node_id)
+    }
+
+    pub fn next_after_subtree(
+        &self,
+        subtree_blocks: &HashSet<TreeNodeId>,
+        remaining: &HashSet<TreeNodeId>,
+    ) -> Option<TreeNodeId> {
+        let start_index = self
+            .ordered
+            .iter()
+            .position(|cursor| subtree_blocks.contains(&cursor.node_id))?;
+
+        self.ordered
+            .iter()
+            .skip(start_index + 1)
+            .find(|cursor| {
+                remaining.contains(&cursor.node_id) && !subtree_blocks.contains(&cursor.node_id)
+            })
+            .map(|cursor| cursor.node_id)
+    }
+
+    #[cfg(test)]
+    fn ordered_ids(&self) -> Vec<TreeNodeId> {
+        self.ordered.iter().map(|cursor| cursor.node_id).collect()
+    }
+}
+
+fn review_band_from_kind_rank(kind_rank: u8) -> ReviewBand {
+    match kind_rank {
+        0 => ReviewBand::Data,
+        20 => ReviewBand::Const,
+        _ => ReviewBand::Code,
+    }
+}
+
+fn review_band_rank(band: ReviewBand) -> u8 {
+    match band {
+        ReviewBand::Data => 0,
+        ReviewBand::Const => 1,
+        ReviewBand::Code => 2,
+    }
+}
+
+fn review_group(path: &str, node: &TreeNode) -> ReviewGroup {
+    if is_test_block(path, node) {
+        ReviewGroup::Test
+    } else if is_library_path(path) {
+        ReviewGroup::Library
+    } else {
+        ReviewGroup::Main
+    }
+}
+
+fn review_group_rank(group: ReviewGroup) -> u8 {
+    match group {
+        ReviewGroup::Test => 0,
+        ReviewGroup::Library => 1,
+        ReviewGroup::Main => 2,
+    }
+}
+
+fn is_library_path(path: &str) -> bool {
+    path == "src/lib.rs"
+        || (path.starts_with("src/")
+            && !path.starts_with("src/main.rs")
+            && !path.starts_with("src/bin/"))
+}
+
+fn is_test_block(path: &str, node: &TreeNode) -> bool {
+    if is_test_path(path) {
+        return true;
+    }
+
+    if let Some(block) = node.block.as_ref() {
+        return block.tags.iter().any(|tag| tag == "test");
+    }
+
+    false
+}
+
+fn is_test_path(path: &str) -> bool {
+    let path = Path::new(path);
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "tests")
+    {
+        return true;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    file_name.starts_with("test_")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("_test.js")
+        || file_name.ends_with("_test.ts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::Language;
+    use crate::block::{Block, BlockKind};
+    use crate::tree::TreeBuilder;
+
+    fn test_block(kind: BlockKind, start: usize, tags: &[&str]) -> Block {
+        let mut block = Block::new(format!("line {start}"), kind, start, start + 1);
+        block.tags = tags.iter().map(|tag| (*tag).to_string()).collect();
+        block
+    }
+
+    #[test]
+    fn review_order_prioritizes_test_then_library_then_main() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let tests = builder.add_dir(root, "tests".to_string(), "tests".to_string());
+
+        let test_file = builder.add_file(
+            tests,
+            "unit.rs".to_string(),
+            "tests/unit.rs".to_string(),
+            "file-test".to_string(),
+            Language::Rust,
+        );
+        let lib_file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-lib".to_string(),
+            Language::Rust,
+        );
+        let main_file = builder.add_file(
+            src,
+            "main.rs".to_string(),
+            "src/main.rs".to_string(),
+            "file-main".to_string(),
+            Language::Rust,
+        );
+
+        let test_block_id = builder.add_block(
+            test_file,
+            "test".to_string(),
+            "tests/unit.rs".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Rust,
+        );
+        let lib_block_id = builder.add_block(
+            lib_file,
+            "lib".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Rust,
+        );
+        let main_block_id = builder.add_block(
+            main_file,
+            "main".to_string(),
+            "src/main.rs".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Rust,
+        );
+
+        let tree = builder.finalize();
+        let unreviewed = HashSet::from([main_block_id, test_block_id, lib_block_id]);
+        let order = ReviewOrder::from_tree(&tree, &unreviewed);
+
+        assert_eq!(
+            order.ordered_ids(),
+            vec![test_block_id, lib_block_id, main_block_id]
+        );
+    }
+
+    #[test]
+    fn review_order_uses_kind_priority_before_line_number_within_file() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-lib".to_string(),
+            Language::Rust,
+        );
+
+        let function_id = builder.add_block(
+            file,
+            "function".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Rust,
+        );
+        let struct_id = builder.add_block(
+            file,
+            "struct".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Struct, 40, &[]),
+            Language::Rust,
+        );
+
+        let tree = builder.finalize();
+        let unreviewed = HashSet::from([function_id, struct_id]);
+        let order = ReviewOrder::from_tree(&tree, &unreviewed);
+
+        assert_eq!(order.ordered_ids(), vec![struct_id, function_id]);
+    }
+}

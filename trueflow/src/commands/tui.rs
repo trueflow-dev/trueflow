@@ -4,6 +4,7 @@ use crate::commands::mark;
 use crate::commands::review::collect_review_summary;
 use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_config};
 use crate::context::TrueflowContext;
+use crate::review_order::ReviewOrder;
 use crate::review_scope::{DiffQuery, ReviewScope, diff_query_for_scope};
 use crate::store::Verdict;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
@@ -188,171 +189,6 @@ impl ReviewNavigator {
     }
 }
 
-fn review_band(block: &crate::block::Block) -> ReviewBand {
-    match block.kind.default_review_priority() {
-        0 => ReviewBand::Data,
-        20 => ReviewBand::Const,
-        _ => ReviewBand::Code,
-    }
-}
-
-fn review_band_rank(band: ReviewBand) -> u8 {
-    match band {
-        ReviewBand::Data => 0,
-        ReviewBand::Const => 1,
-        ReviewBand::Code => 2,
-    }
-}
-
-fn review_group(path: &str, node: &crate::tree::TreeNode) -> ReviewGroup {
-    if is_test_block(path, node) {
-        ReviewGroup::Test
-    } else if is_library_path(path) {
-        ReviewGroup::Library
-    } else {
-        ReviewGroup::Main
-    }
-}
-
-fn review_group_rank(group: ReviewGroup) -> u8 {
-    match group {
-        ReviewGroup::Test => 0,
-        ReviewGroup::Library => 1,
-        ReviewGroup::Main => 2,
-    }
-}
-
-fn is_library_path(path: &str) -> bool {
-    path == "src/lib.rs"
-        || (path.starts_with("src/")
-            && !path.starts_with("src/main.rs")
-            && !path.starts_with("src/bin/"))
-}
-
-fn is_test_block(path: &str, node: &crate::tree::TreeNode) -> bool {
-    if is_test_path(path) {
-        return true;
-    }
-
-    if let Some(block) = node.block.as_ref() {
-        return block.tags.iter().any(|tag| tag == "test");
-    }
-
-    false
-}
-
-fn is_test_path(path: &str) -> bool {
-    let path = Path::new(path);
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "tests")
-    {
-        return true;
-    }
-
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    file_name.starts_with("test_")
-        || file_name.ends_with("_test.rs")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with("_test.js")
-        || file_name.ends_with("_test.ts")
-}
-
-impl ReviewOrder {
-    fn from_summary(summary: &crate::commands::review::ReviewSummary) -> Self {
-        let mut ordered = Vec::new();
-        let mut items: Vec<_> = summary
-            .unreviewed_block_nodes
-            .iter()
-            .copied()
-            .filter_map(|node_id| {
-                let node = summary.tree.node(node_id);
-                let block = node.block.as_ref()?;
-                let file_path = if node.path.is_empty() {
-                    node.name.clone()
-                } else {
-                    node.path.clone()
-                };
-                let cursor = ReviewCursor {
-                    file_path,
-                    band: review_band(block),
-                    kind_rank: block.kind.default_review_priority(),
-                    start_line: block.start_line,
-                    node_id,
-                };
-                Some((cursor, node))
-            })
-            .collect();
-
-        items.sort_by(|(a_cursor, a_node), (b_cursor, b_node)| {
-            let a_group = review_group(&a_cursor.file_path, a_node);
-            let b_group = review_group(&b_cursor.file_path, b_node);
-            (
-                review_group_rank(a_group),
-                &a_cursor.file_path,
-                review_band_rank(a_cursor.band),
-                a_cursor.kind_rank,
-                a_cursor.start_line,
-            )
-                .cmp(&(
-                    review_group_rank(b_group),
-                    &b_cursor.file_path,
-                    review_band_rank(b_cursor.band),
-                    b_cursor.kind_rank,
-                    b_cursor.start_line,
-                ))
-        });
-
-        for (cursor, _) in items {
-            ordered.push(cursor);
-        }
-
-        Self { ordered }
-    }
-
-    fn first_block(&self) -> Option<TreeNodeId> {
-        self.ordered.first().map(|cursor| cursor.node_id)
-    }
-
-    fn next_after_blocks(
-        &self,
-        current: TreeNodeId,
-        remaining: &HashSet<TreeNodeId>,
-    ) -> Option<TreeNodeId> {
-        let index = self
-            .ordered
-            .iter()
-            .position(|cursor| cursor.node_id == current)?;
-        self.ordered
-            .iter()
-            .skip(index + 1)
-            .find(|cursor| remaining.contains(&cursor.node_id))
-            .map(|cursor| cursor.node_id)
-    }
-
-    fn next_after_subtree(
-        &self,
-        subtree_blocks: &HashSet<TreeNodeId>,
-        remaining: &HashSet<TreeNodeId>,
-    ) -> Option<TreeNodeId> {
-        let start_index = self
-            .ordered
-            .iter()
-            .position(|cursor| subtree_blocks.contains(&cursor.node_id))?;
-
-        self.ordered
-            .iter()
-            .skip(start_index + 1)
-            .find(|cursor| {
-                remaining.contains(&cursor.node_id) && !subtree_blocks.contains(&cursor.node_id)
-            })
-            .map(|cursor| cursor.node_id)
-    }
-}
-
 // --- Application Logic ---
 
 #[derive(Clone, PartialEq)]
@@ -367,34 +203,6 @@ enum PendingAction {
         verdict: Verdict,
         note: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewGroup {
-    Test,
-    Library,
-    Main,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewBand {
-    Data,
-    Const,
-    Code,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReviewCursor {
-    file_path: String,
-    band: ReviewBand,
-    kind_rank: u8,
-    start_line: usize,
-    node_id: TreeNodeId,
-}
-
-#[derive(Debug, Clone)]
-struct ReviewOrder {
-    ordered: Vec<ReviewCursor>,
 }
 
 impl PendingAction {
@@ -584,7 +392,7 @@ fn build_review_state(
     let root_children = summary.tree.node(summary.tree.root()).children.clone();
     let root_cursor = root_children.first().copied();
 
-    let review_order = ReviewOrder::from_summary(&summary);
+    let review_order = ReviewOrder::from_tree(&summary.tree, &summary.unreviewed_block_nodes);
     let navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
 
     Ok(AppState {
