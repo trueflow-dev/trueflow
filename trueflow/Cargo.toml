@@ -46,3 +46,4 @@ uuid = { version = "1.19.0", features = ["v4"] }
 await_holding_lock = "warn"
 await_holding_refcell_ref = "warn"
 box_collection = "warn"
+cast_possible_truncation = "warn"

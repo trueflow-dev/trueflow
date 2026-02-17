@@ -210,8 +210,8 @@ fn diff_hunks_for_file_between_trees(
 }
 
 pub fn extract_diff_lines_for_block(block: &Block, hunks: &[DiffHunk]) -> Option<Vec<String>> {
-    let start = block.start_line as u32 + 1; // 1-based for diff
-    let end_exclusive = block.end_line as u32 + 1;
+    let start = usize_to_u32_saturating(block.start_line).saturating_add(1); // 1-based for diff
+    let end_exclusive = usize_to_u32_saturating(block.end_line).saturating_add(1);
 
     let mut relevant_lines = Vec::new();
     let mut has_overlap = false;
@@ -486,6 +486,10 @@ fn split_blocks(content: &str, language: Language) -> Vec<Block> {
     }
 
     scanner::fallback_split_blocks(content, scanner::FallbackMode::Text)
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

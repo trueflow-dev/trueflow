@@ -298,7 +298,7 @@ fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8>
             let line = content.get(start..)?.lines().next()?;
             let level = line.chars().take_while(|ch| *ch == '#').count();
             if level > 0 {
-                Some(level.min(6) as u8)
+                u8::try_from(level.min(6)).ok()
             } else {
                 None
             }

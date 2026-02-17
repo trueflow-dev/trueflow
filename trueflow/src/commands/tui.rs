@@ -876,6 +876,14 @@ fn run_app(
 
 // ... helper functions for actions ...
 
+fn usize_to_u16_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 fn handle_ascend(state: &mut AppState) {
     if state.navigator.current_id() == state.navigator.tree.root() {
         return;
@@ -1090,7 +1098,10 @@ fn execute_action(
             Some(node.path.clone())
         };
 
-        let line_hint = node.block.as_ref().map(|block| block.start_line as u32);
+        let line_hint = node
+            .block
+            .as_ref()
+            .map(|block| usize_to_u32_saturating(block.start_line));
 
         mark::run(
             context,
@@ -1361,13 +1372,13 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     let header_lines = build_header_lines(node, state, palette);
 
-    let focus_layout = compute_focus_layout(area, header_lines.len() as u16);
+    let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
     let actions_lines = build_action_lines(focus_layout.actions.width, palette);
     let node_snapshot = node.clone();
     let (content_lines, total_lines) =
         build_content_lines(state, &node_snapshot, palette, focus_layout.code.height);
 
-    state.content_height = total_lines as u16;
+    state.content_height = usize_to_u16_saturating(total_lines);
     state.viewport_height = focus_layout.code.height;
     state.scroll_offset = state
         .scroll_offset
@@ -1688,7 +1699,8 @@ fn build_block_lines(
 
     let language = node.language.clone();
     let block_lines: Vec<String> = block.content.lines().map(|line| line.to_string()).collect();
-    let extra_space = code_height.saturating_sub(block_lines.len() as u16) as isize;
+    let extra_space =
+        code_height.saturating_sub(usize_to_u16_saturating(block_lines.len())) as isize;
 
     // TODO: if paginating, we shouldn't truncate context based on viewport height alone.
     // However, existing context logic tries to center the block vertically.
@@ -2190,7 +2202,7 @@ struct FocusLayout {
 fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let code_width = area.width.min(120);
     let desired_code_height = area.height.min(32);
-    let padding = ((area.height as f32) * 0.05).round() as u16;
+    let padding = u16::try_from((u32::from(area.height) * 5 + 50) / 100).unwrap_or(u16::MAX);
 
     let available_height = area.height.saturating_sub(padding * 2).max(1);
     let min_header_height = 3.min(available_height);
