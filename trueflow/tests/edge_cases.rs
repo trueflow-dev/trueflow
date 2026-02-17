@@ -16,7 +16,7 @@ fn test_binary_file() -> Result<()> {
     // Scan
     let output = repo.run(&["scan", "--json"])?;
     let json: serde_json::Value = serde_json::from_str(&output)?;
-    let arr = json.as_array().expect("Array");
+    let arr = json.as_array().unwrap();
 
     let file_obj = arr
         .iter()
@@ -39,7 +39,7 @@ fn test_invalid_utf8() -> Result<()> {
     // Scan
     let output = repo.run(&["scan", "--json"])?;
     let json: serde_json::Value = serde_json::from_str(&output)?;
-    let arr = json.as_array().expect("Array");
+    let arr = json.as_array().unwrap();
 
     let file_obj = arr
         .iter()

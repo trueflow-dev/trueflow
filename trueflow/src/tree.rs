@@ -472,7 +472,7 @@ mod tests {
         );
 
         let tree = builder.finalize();
-        let dir_node = tree.node(tree.find_by_path("src").expect("dir"));
+        let dir_node = tree.node(tree.find_by_path("src").unwrap());
         let hash_first = dir_node.hash.clone();
 
         let mut builder_alt = TreeBuilder::new();
@@ -493,7 +493,7 @@ mod tests {
             Language::Unknown,
         );
         let tree_alt = builder_alt.finalize();
-        let dir_alt_node = tree_alt.node(tree_alt.find_by_path("src").expect("dir"));
+        let dir_alt_node = tree_alt.node(tree_alt.find_by_path("src").unwrap());
         let hash_second = dir_alt_node.hash.clone();
 
         assert_eq!(hash_first, hash_second);

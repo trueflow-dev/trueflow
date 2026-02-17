@@ -19,7 +19,7 @@ fn mark(repo: &TestRepo, hash: &str) -> Result<()> {
 fn is_gap(sub_block: &Value) -> bool {
     sub_block["kind"]
         .as_str()
-        .expect("kind")
+        .unwrap()
         .eq_ignore_ascii_case("gap")
 }
 
@@ -39,7 +39,7 @@ fn test_implicit_approval() -> Result<()> {
     let first_hash = sub_blocks
         .first()
         .and_then(|sb| sb["hash"].as_str())
-        .expect("sub-block hash");
+        .unwrap();
 
     let output = repo.run(&["review", "--exclude", "Gap", "--exclude", "gap"])?;
     assert!(output.contains("[Unreviewed]"));
@@ -55,7 +55,7 @@ fn test_implicit_approval() -> Result<()> {
         if is_gap(sb) {
             continue;
         }
-        let hash = sb["hash"].as_str().expect("hash");
+        let hash = sb["hash"].as_str().unwrap();
         mark(&repo, hash)?;
     }
 
@@ -92,7 +92,7 @@ fn test_markdown_implicit_approval() -> Result<()> {
         if is_gap(sb) {
             continue;
         }
-        let hash = sb["hash"].as_str().expect("hash");
+        let hash = sb["hash"].as_str().unwrap();
         mark(&repo, hash)?;
     }
 

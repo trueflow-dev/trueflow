@@ -95,7 +95,7 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
     let section = blocks
         .iter()
         .find(|block| block.kind == BlockKind::Section)
-        .expect("Expected markdown section block");
+        .unwrap();
 
     let sub_blocks = sub_splitter::split(section, Language::Markdown)?;
     let kinds: Vec<BlockKind> = sub_blocks
@@ -119,7 +119,7 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
     let paragraph = sub_blocks
         .iter()
         .find(|block| block.kind == BlockKind::Paragraph)
-        .expect("Expected paragraph block");
+        .unwrap();
     let sentence_blocks = sub_splitter::split(paragraph, Language::Markdown)?;
     let sentence_kinds: Vec<BlockKind> = sentence_blocks
         .iter()

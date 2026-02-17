@@ -5,7 +5,10 @@ use std::sync::OnceLock;
 static PARAGRAPH_BREAK: OnceLock<Regex> = OnceLock::new();
 
 pub fn paragraph_break_regex() -> &'static Regex {
-    PARAGRAPH_BREAK.get_or_init(|| Regex::new(r"\n\s*\n").expect("valid paragraph regex"))
+    PARAGRAPH_BREAK.get_or_init(|| match Regex::new(r"\n\s*\n") {
+        Ok(regex) => regex,
+        Err(error) => panic!("invalid paragraph regex: {error}"),
+    })
 }
 
 pub fn split_by_paragraph_breaks<F>(content: &str, mut make_block: F) -> Vec<Block>

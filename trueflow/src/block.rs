@@ -350,12 +350,12 @@ mod tests {
             assert_eq!(display_str, s, "Display impl mismatch for {:?}", kind);
 
             // 3. Test FromStr (exact match)
-            let parsed = BlockKind::from_str(s).expect("Failed to parse back from as_str()");
+            let parsed = BlockKind::from_str(s).unwrap();
             assert_eq!(parsed, kind, "FromStr roundtrip failed for {:?}", kind);
 
             // 4. Test FromStr (case insensitive normalization)
             let upper = s.to_uppercase();
-            let parsed_upper = BlockKind::from_str(&upper).expect("Failed to parse uppercase");
+            let parsed_upper = BlockKind::from_str(&upper).unwrap();
             assert_eq!(
                 parsed_upper, kind,
                 "FromStr uppercase roundtrip failed for {:?}",

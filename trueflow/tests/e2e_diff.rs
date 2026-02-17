@@ -147,7 +147,7 @@ fn test_check_command_gates_unreviewed_changes() -> Result<()> {
     );
 
     let changes = get_diff_json(&repo)?;
-    let fp = changes[0]["fingerprint"].as_str().expect("fingerprint");
+    let fp = changes[0]["fingerprint"].as_str().unwrap();
 
     // Mark approved
     repo.run(&[

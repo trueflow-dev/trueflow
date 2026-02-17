@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn parse_hunk_header_extracts_positions() {
         let header = "@@ -10,2 +12,4 @@";
-        let parsed = parse_hunk_header(header).expect("header");
+        let parsed = parse_hunk_header(header).unwrap();
         assert_eq!(parsed.before_start, 10);
         assert_eq!(parsed.after_start, 12);
     }
@@ -508,7 +508,7 @@ mod tests {
     fn collect_hunks_groups_lines_by_header() {
         let diff = "@@ -1,1 +1,2 @@\n-foo\n+foo\n+bar\n@@ -5,1 +6,1 @@\n-baz\n+qux\n";
         let mut hunks = Vec::new();
-        collect_hunks(&mut hunks, "src/main.rs", diff).expect("collect");
+        collect_hunks(&mut hunks, "src/main.rs", diff).unwrap();
 
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0].file_path, "src/main.rs");
