@@ -1,9 +1,10 @@
 use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
-use crate::commands::review::{ReviewOptions, ReviewTarget, collect_review_summary};
+use crate::commands::review::collect_review_summary;
 use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_config};
 use crate::context::TrueflowContext;
+use crate::review_scope::{DiffQuery, ReviewScope, diff_query_for_scope};
 use crate::store::Verdict;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
@@ -28,72 +29,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // --- Core Structs ---
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReviewScope {
-    All,
-    MainDiff,
-    Commit { id: String, summary: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DiffQuery {
-    MainDiff { path: String },
-    Revision { revision: String, path: String },
-}
-
-fn diff_query_for_scope(scope: &ReviewScope, path: &str) -> Option<DiffQuery> {
-    match scope {
-        ReviewScope::All | ReviewScope::MainDiff => Some(DiffQuery::MainDiff {
-            path: path.to_string(),
-        }),
-        ReviewScope::Commit { id, .. } => Some(DiffQuery::Revision {
-            revision: id.clone(),
-            path: path.to_string(),
-        }),
-    }
-}
-
-impl ReviewScope {
-    fn label(&self) -> String {
-        match self {
-            ReviewScope::All => "entire review".to_string(),
-            ReviewScope::MainDiff => "diff vs main".to_string(),
-            ReviewScope::Commit { id, summary } => {
-                let short_id = short_commit_id(id);
-                let summary = truncate_text(summary, 32);
-                if summary.is_empty() {
-                    format!("commit {short_id}")
-                } else {
-                    format!("commit {short_id} {summary}")
-                }
-            }
-        }
-    }
-
-    fn to_review_options(&self) -> ReviewOptions {
-        match self {
-            ReviewScope::All => ReviewOptions {
-                all: true,
-                targets: vec![ReviewTarget::All],
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
-            ReviewScope::MainDiff => ReviewOptions {
-                all: false,
-                targets: vec![ReviewTarget::MainDiff],
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
-            ReviewScope::Commit { id, .. } => ReviewOptions {
-                all: false,
-                targets: vec![ReviewTarget::Revision(id.clone())],
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct ScopeOption {
@@ -1998,8 +1933,7 @@ fn build_block_diff_lines(
 
     let path = PathBuf::from(&node.path);
     let hunks = ensure_cached_diff_hunks(&mut state.file_diff_cache, &path, || {
-        let query = diff_query_for_scope(&state.review_scope, &node.path)
-            .ok_or_else(|| anyhow::anyhow!("diff query unavailable for scope"))?;
+        let query = diff_query_for_scope(&state.review_scope, &node.path);
         let repo = vcs::repo_from_workdir()?;
         match query {
             DiffQuery::MainDiff { path } => vcs::diff_hunks_for_file(&repo, &path),
@@ -2524,9 +2458,9 @@ mod diff_scope_tests {
         let query = diff_query_for_scope(&ReviewScope::MainDiff, "src/lib.rs");
         assert_eq!(
             query,
-            Some(DiffQuery::MainDiff {
+            DiffQuery::MainDiff {
                 path: "src/lib.rs".to_string(),
-            })
+            }
         );
     }
 
@@ -2541,10 +2475,10 @@ mod diff_scope_tests {
         );
         assert_eq!(
             query,
-            Some(DiffQuery::Revision {
+            DiffQuery::Revision {
                 revision: "abc123".to_string(),
                 path: "src/lib.rs".to_string(),
-            })
+            }
         );
     }
 
@@ -2553,9 +2487,9 @@ mod diff_scope_tests {
         let query = diff_query_for_scope(&ReviewScope::All, "src/lib.rs");
         assert_eq!(
             query,
-            Some(DiffQuery::MainDiff {
+            DiffQuery::MainDiff {
                 path: "src/lib.rs".to_string(),
-            })
+            }
         );
     }
 

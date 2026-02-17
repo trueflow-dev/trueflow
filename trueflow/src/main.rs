@@ -15,6 +15,7 @@ mod hashing;
 mod logging;
 mod optimizer;
 mod policy;
+mod review_scope;
 mod scanner;
 mod store;
 pub mod sub_splitter;
