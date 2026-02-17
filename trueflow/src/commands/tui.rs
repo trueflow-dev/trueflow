@@ -6,7 +6,9 @@ use crate::context::TrueflowContext;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
-use crate::review_scope::{DiffQuery, ReviewScope, diff_query_for_scope};
+use crate::review_scope::{
+    DiffQuery, ReviewScope, ScopeOption, default_scope_options, diff_query_for_scope,
+};
 use crate::review_session;
 use crate::store::Verdict;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
@@ -32,12 +34,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // --- Core Structs ---
-
-#[derive(Debug, Clone)]
-struct ScopeOption {
-    label: String,
-    scope: ReviewScope,
-}
 
 #[derive(Debug, Clone)]
 struct ScopeSelector {
@@ -320,65 +316,8 @@ fn block_diff_focus_mode_from_config(config: &TuiConfig) -> vcs::BlockDiffFocusM
 }
 
 fn load_scope_options() -> Result<Vec<ScopeOption>> {
-    let mut options = vec![
-        ScopeOption {
-            label: "All files".to_string(),
-            scope: ReviewScope::All,
-        },
-        ScopeOption {
-            label: "Diff vs main".to_string(),
-            scope: ReviewScope::MainDiff,
-        },
-    ];
-
-    if let Ok(commits) = vcs::recent_commits(8) {
-        for commit in commits {
-            options.push(commit_scope_option(commit));
-        }
-    }
-
-    Ok(options)
-}
-
-fn commit_scope_option(commit: vcs::CommitInfo) -> ScopeOption {
-    let short_id = short_commit_id(&commit.id);
-    let summary = truncate_text(&commit.summary, 60);
-    let label = if summary.is_empty() {
-        format!("Commit {short_id}")
-    } else {
-        format!("Commit {short_id} {summary}")
-    };
-    ScopeOption {
-        label,
-        scope: ReviewScope::Commit {
-            id: commit.id,
-            summary: commit.summary,
-        },
-    }
-}
-
-fn short_commit_id(id: &str) -> String {
-    id.chars().take(7).collect()
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    if max_chars == 0 || trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let cutoff = max_chars.saturating_sub(3).max(1);
-    let mut out = String::new();
-    for (idx, ch) in trimmed.chars().enumerate() {
-        if idx >= cutoff {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
+    let commits = vcs::recent_commits(8).unwrap_or_default();
+    Ok(default_scope_options(&commits))
 }
 
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
