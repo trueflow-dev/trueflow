@@ -553,9 +553,14 @@ enum ViewMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ContentFrameCacheKey {
     node_id: TreeNodeId,
-    view_mode: ViewMode,
-    block_diff_focus_mode: vcs::BlockDiffFocusMode,
-    code_height: u16,
+    variant: ContentFrameCacheVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ContentFrameCacheVariant {
+    File,
+    BlockDiff { focus_mode: vcs::BlockDiffFocusMode },
+    BlockSource { code_height: u16 },
 }
 
 #[derive(Clone)]
@@ -1494,12 +1499,18 @@ fn content_frame_cache_key(
         return None;
     }
 
-    Some(ContentFrameCacheKey {
-        node_id,
-        view_mode,
-        block_diff_focus_mode,
-        code_height,
-    })
+    let variant = match node_kind {
+        TreeNodeKind::File => ContentFrameCacheVariant::File,
+        TreeNodeKind::Block => match view_mode {
+            ViewMode::Diff => ContentFrameCacheVariant::BlockDiff {
+                focus_mode: block_diff_focus_mode,
+            },
+            ViewMode::Source => ContentFrameCacheVariant::BlockSource { code_height },
+        },
+        TreeNodeKind::Directory | TreeNodeKind::Root => return None,
+    };
+
+    Some(ContentFrameCacheKey { node_id, variant })
 }
 
 fn is_content_kind_cacheable(kind: TreeNodeKind) -> bool {
@@ -2610,12 +2621,12 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn content_cache_key_includes_render_dimensions_and_modes() {
+    fn content_cache_key_tracks_block_source_height() {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
             TreeNodeKind::Block,
-            ViewMode::Diff,
+            ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
         );
@@ -2629,14 +2640,56 @@ mod diff_scope_tests {
         let key_c = content_frame_cache_key(
             node_id,
             TreeNodeKind::Block,
-            ViewMode::Diff,
+            ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             25,
         );
 
         assert!(key_a.is_some());
-        assert_ne!(key_a, key_b);
+        assert_eq!(key_a, key_b);
         assert_ne!(key_a, key_c);
+    }
+
+    #[test]
+    fn content_cache_key_ignores_height_for_block_diff() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Block,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Block,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            40,
+        );
+
+        assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn content_cache_key_ignores_mode_and_height_for_file_nodes() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::File,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::File,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 3 },
+            40,
+        );
+
+        assert_eq!(key_a, key_b);
     }
 
     #[test]
