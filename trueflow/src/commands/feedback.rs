@@ -163,7 +163,7 @@ fn print_block_xml(block: &Block, reviews: &[Record]) {
 
     println!("      <context><![CDATA[");
     let safe_content = block.content.replace("]]>", "]]]]><![CDATA[>");
-    println!("{}", safe_content);
+    println!("{safe_content}");
     println!("]]></context>");
 
     println!("      <reviews>");

@@ -159,9 +159,6 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     } else {
         ""
     };
-    info!(
-        "Recorded verdict '{}' for {} by {}{}",
-        verdict, fingerprint, email, signed_msg
-    );
+    info!("Recorded verdict '{verdict}' for {fingerprint} by {email}{signed_msg}");
     Ok(())
 }

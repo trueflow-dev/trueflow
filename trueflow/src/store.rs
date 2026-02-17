@@ -156,7 +156,7 @@ impl FromStr for Verdict {
             "rejected" => Ok(Verdict::Rejected),
             "question" => Ok(Verdict::Question),
             "comment" => Ok(Verdict::Comment),
-            _ => Err(anyhow::anyhow!("Unknown verdict: {}", value)),
+            _ => Err(anyhow::anyhow!("Unknown verdict: {value}")),
         }
     }
 }
@@ -291,7 +291,7 @@ impl ReviewStore for FileStore {
             }
             match serde_json::from_str::<Record>(&line) {
                 Ok(record) => records.push(record),
-                Err(err) => warn!("Skipping malformed record: {}", err),
+                Err(err) => warn!("Skipping malformed record: {err}"),
             }
         }
 

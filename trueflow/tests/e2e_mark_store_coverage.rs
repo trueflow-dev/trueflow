@@ -132,8 +132,7 @@ fn test_mark_signing_failure() -> Result<()> {
             || output_lower.contains("sign")
             || output_lower.contains("key")
             || output_lower.contains("spawn"),
-        "Expected signing-related error message, got: {}",
-        output
+        "Expected signing-related error message, got: {output}"
     );
 
     Ok(())

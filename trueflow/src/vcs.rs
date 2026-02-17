@@ -446,7 +446,7 @@ fn collect_hunks(hunks: &mut Vec<DiffHunk>, path: &str, unified: &str) -> Result
         if let Some(hunk) = &mut current
             && (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
         {
-            hunk.lines.push(format!("{}\n", line));
+            hunk.lines.push(format!("{line}\n"));
         }
     }
     if let Some(hunk) = current {

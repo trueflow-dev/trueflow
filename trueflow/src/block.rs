@@ -207,7 +207,7 @@ impl FromStr for BlockKind {
             "imports" => BlockKind::Imports,
             "functionsignature" | "signature" => BlockKind::FunctionSignature,
             _ => {
-                return Err(anyhow!("Unknown block kind: {}", value));
+                return Err(anyhow!("Unknown block kind: {value}"));
             }
         };
 
@@ -339,27 +339,22 @@ mod tests {
         for kind in kinds {
             // 1. Test as_str()
             let s = kind.as_str();
-            assert!(
-                !s.is_empty(),
-                "as_str() returned empty string for {:?}",
-                kind
-            );
+            assert!(!s.is_empty(), "as_str() returned empty string for {kind:?}");
 
             // 2. Test Display
-            let display_str = format!("{}", kind);
-            assert_eq!(display_str, s, "Display impl mismatch for {:?}", kind);
+            let display_str = format!("{kind}");
+            assert_eq!(display_str, s, "Display impl mismatch for {kind:?}");
 
             // 3. Test FromStr (exact match)
             let parsed = BlockKind::from_str(s).unwrap();
-            assert_eq!(parsed, kind, "FromStr roundtrip failed for {:?}", kind);
+            assert_eq!(parsed, kind, "FromStr roundtrip failed for {kind:?}");
 
             // 4. Test FromStr (case insensitive normalization)
             let upper = s.to_uppercase();
             let parsed_upper = BlockKind::from_str(&upper).unwrap();
             assert_eq!(
                 parsed_upper, kind,
-                "FromStr uppercase roundtrip failed for {:?}",
-                kind
+                "FromStr uppercase roundtrip failed for {kind:?}"
             );
         }
     }

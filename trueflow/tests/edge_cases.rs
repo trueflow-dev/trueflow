@@ -99,7 +99,7 @@ fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
         let file_state = file_states
             .iter()
             .find(|file| file.path.ends_with(name))
-            .unwrap_or_else(|| panic!("missing scan output for {}", name));
+            .unwrap_or_else(|| panic!("missing scan output for {name}"));
 
         assert!(
             !file_state.blocks.is_empty(),

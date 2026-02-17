@@ -29,7 +29,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                warn!("Skipping unreadable entry: {}", err);
+                warn!("Skipping unreadable entry: {err}");
                 continue;
             }
         };
@@ -154,7 +154,7 @@ fn cache_path(root: &Path) -> Result<PathBuf> {
     Ok(cache_root
         .join(".trueflow")
         .join("cache")
-        .join(format!("scan-{}-{}.json", repo_name, root_hash)))
+        .join(format!("scan-{repo_name}-{root_hash}.json")))
 }
 
 fn cache_identity(root: &Path) -> PathBuf {
@@ -206,10 +206,7 @@ fn process_file(path: &Path) -> Result<FileState> {
                     fallback_split_blocks(&content, FallbackMode::Code),
                 ), // Fallback if splitter returns empty (not implemented or empty file)
                 Err(e) => {
-                    warn!(
-                        "Failed to parse file {:?}: {}, falling back to paragraphs",
-                        path, e
-                    );
+                    warn!("Failed to parse file {path:?}: {e}, falling back to paragraphs");
                     (
                         language,
                         fallback_split_blocks(&content, FallbackMode::Code),

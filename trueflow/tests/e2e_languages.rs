@@ -44,11 +44,10 @@ fn test_all_languages_detection() -> Result<()> {
     for (filename, expected_lang) in &expected {
         let actual = detected
             .get(*filename)
-            .with_context(|| format!("Expected file {} not found in scan output", filename))?;
+            .with_context(|| format!("Expected file {filename} not found in scan output"))?;
         assert_eq!(
             actual, expected_lang,
-            "Language mismatch for {}: expected {}, got {}",
-            filename, expected_lang, actual
+            "Language mismatch for {filename}: expected {expected_lang}, got {actual}"
         );
     }
 
@@ -99,12 +98,10 @@ fn test_all_languages_test_blocks() -> Result<()> {
     for filename in expected {
         let tags = tags_by_path
             .get(filename)
-            .with_context(|| format!("missing scan output for {}", filename))?;
+            .with_context(|| format!("missing scan output for {filename}"))?;
         assert!(
             tags.iter().any(|tag| tag == "test"),
-            "expected at least one test tag in {} (tags={:?})",
-            filename,
-            tags
+            "expected at least one test tag in {filename} (tags={tags:?})"
         );
     }
 

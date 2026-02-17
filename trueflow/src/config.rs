@@ -133,7 +133,7 @@ fn parse_block_kinds(values: &[String]) -> HashSet<BlockKind> {
                 kinds.insert(kind);
             }
             Err(err) => {
-                warn!("Ignoring unknown block kind '{}': {}", value, err);
+                warn!("Ignoring unknown block kind '{value}': {err}");
             }
         }
     }

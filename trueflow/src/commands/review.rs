@@ -279,7 +279,7 @@ fn parse_review_targets(values: &[String]) -> Result<Vec<ReviewTarget>> {
             }
             continue;
         }
-        return Err(anyhow!("Unknown review target: {}", raw));
+        return Err(anyhow!("Unknown review target: {raw}"));
     }
     Ok(targets)
 }
@@ -293,8 +293,7 @@ pub fn run(
     exclude: &[String],
 ) -> Result<()> {
     info!(
-        "review start (json={}, all={}, target={:?}, only={:?}, exclude={:?})",
-        json, all, target, only, exclude
+        "review start (json={json}, all={all}, target={target:?}, only={only:?}, exclude={exclude:?})"
     );
     let config = load_config()?;
     let filters = config.review.resolve_filters(only, exclude);

@@ -57,7 +57,7 @@ pub fn init_logging(mode: LoggingMode, debug: bool) -> Result<()> {
 
     dispatch.apply()?;
     if let Some(err) = log_warning {
-        log::warn!("Failed to open log file: {}", err);
+        log::warn!("Failed to open log file: {err}");
     }
     Ok(())
 }
@@ -73,7 +73,7 @@ fn create_log_file() -> Result<std::fs::File> {
     fs::create_dir_all(&log_dir)?;
 
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let log_path: PathBuf = log_dir.join(format!("{}.log", date));
+    let log_path: PathBuf = log_dir.join(format!("{date}.log"));
 
     let file = OpenOptions::new()
         .create(true)

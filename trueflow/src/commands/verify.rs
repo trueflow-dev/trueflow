@@ -140,9 +140,9 @@ pub fn run(all: bool, id: Option<&str>) -> Result<()> {
         attested += 1;
     }
 
-    println!("Attested: {}", attested);
-    println!("Unattested: {}", unattested);
-    println!("Invalid: {}", invalid);
+    println!("Attested: {attested}");
+    println!("Unattested: {unattested}");
+    println!("Invalid: {invalid}");
 
     if invalid > 0 {
         anyhow::bail!("Signature verification failed");

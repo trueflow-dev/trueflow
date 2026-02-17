@@ -2001,7 +2001,7 @@ fn build_root_lines(
                 lines.push(Line::from(""));
             }
             lines.push(Line::from(Span::styled(
-                format!("{}:", parent),
+                format!("{parent}:"),
                 Style::default().fg(palette.fg).bg(palette.code_bg),
             )));
             last_parent = parent;

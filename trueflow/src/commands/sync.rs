@@ -90,7 +90,7 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
         .args([
             "push",
             "origin",
-            &format!("{}:refs/heads/trueflow-db", commit_hash),
+            &format!("{commit_hash}:refs/heads/trueflow-db"),
         ])
         .status()
         .context("Failed to execute git push")?;
@@ -143,7 +143,7 @@ fn git_hash_object(content: &str) -> Result<String> {
 }
 
 fn git_mktree(blob_hash: &str) -> Result<String> {
-    let entry = format!("100644 blob {}\treviews.jsonl", blob_hash);
+    let entry = format!("100644 blob {blob_hash}\treviews.jsonl");
     let mut child = Command::new("git")
         .arg("mktree")
         .stdin(Stdio::piped())
