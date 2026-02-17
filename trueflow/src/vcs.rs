@@ -39,7 +39,7 @@ pub struct DiffLine {
     pub is_focus: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockDiffFocusMode {
     WholeBlock,
     ChangedWithContext { context_lines: usize },

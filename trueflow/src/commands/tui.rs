@@ -538,17 +538,17 @@ struct AppState {
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
-    content_frame_cache: Option<ContentFrameCacheEntry>,
+    content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ViewMode {
     Source,
     #[default]
     Diff,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ContentFrameCacheKey {
     node_id: TreeNodeId,
     view_mode: ViewMode,
@@ -558,7 +558,6 @@ struct ContentFrameCacheKey {
 
 #[derive(Clone)]
 struct ContentFrameCacheEntry {
-    key: ContentFrameCacheKey,
     lines: Vec<Line<'static>>,
     total_lines: usize,
 }
@@ -633,7 +632,7 @@ fn build_review_state(
         view_mode: ViewMode::Diff,
         block_diff_focus_mode,
         file_diff_cache: HashMap::new(),
-        content_frame_cache: None,
+        content_frame_cache: HashMap::new(),
     })
 }
 
@@ -1519,18 +1518,18 @@ fn build_content_lines_with_frame_cache(
     );
 
     if let Some(key) = key {
-        if let Some(cached) = &state.content_frame_cache
-            && cached.key == key
-        {
+        if let Some(cached) = state.content_frame_cache.get(&key) {
             return (cached.lines.clone(), cached.total_lines);
         }
 
         let (lines, total_lines) = build_content_lines(state, node, palette, code_height);
-        state.content_frame_cache = Some(ContentFrameCacheEntry {
+        state.content_frame_cache.insert(
             key,
-            lines: lines.clone(),
-            total_lines,
-        });
+            ContentFrameCacheEntry {
+                lines: lines.clone(),
+                total_lines,
+            },
+        );
         return (lines, total_lines);
     }
 
@@ -2610,6 +2609,50 @@ mod diff_scope_tests {
             12,
         );
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn content_frame_cache_stores_multiple_keys() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Block,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::Block,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+
+        let Some(key_a) = key_a else {
+            panic!("expected cache key");
+        };
+        let Some(key_b) = key_b else {
+            panic!("expected cache key");
+        };
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            key_a,
+            ContentFrameCacheEntry {
+                lines: vec![Line::from("a")],
+                total_lines: 1,
+            },
+        );
+        cache.insert(
+            key_b,
+            ContentFrameCacheEntry {
+                lines: vec![Line::from("b")],
+                total_lines: 1,
+            },
+        );
+
+        assert_eq!(cache.len(), 2);
     }
 }
 
