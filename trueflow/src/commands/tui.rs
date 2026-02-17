@@ -25,6 +25,7 @@ use ratatui::{
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // --- Core Structs ---
 
@@ -530,7 +531,7 @@ struct AppState {
     input_buffer: String,
     confirm_batch: bool,
     repo_name: String,
-    file_cache: HashMap<PathBuf, Vec<String>>,
+    file_cache: HashMap<PathBuf, Arc<[String]>>,
     root_cursor: Option<TreeNodeId>,
     scroll_offset: u16,
     content_height: u16,
@@ -539,6 +540,7 @@ struct AppState {
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
+    highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -633,6 +635,7 @@ fn build_review_state(
         block_diff_focus_mode,
         file_diff_cache: HashMap::new(),
         content_frame_cache: HashMap::new(),
+        highlighted_line_cache: HashMap::new(),
     })
 }
 
@@ -1767,25 +1770,24 @@ fn build_content_lines(
     }
 }
 
-fn load_file_lines<'a>(
-    state: &'a mut AppState,
-    node: &crate::tree::TreeNode,
-) -> Option<&'a [String]> {
+fn load_file_lines(state: &mut AppState, node: &crate::tree::TreeNode) -> Option<Arc<[String]>> {
     if node.path.is_empty() {
         return None;
     }
 
     let path = PathBuf::from(&node.path);
-    if !state.file_cache.contains_key(&path) {
-        let contents = std::fs::read_to_string(&path).ok()?;
-        let lines = contents
-            .lines()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        state.file_cache.insert(path.clone(), lines);
+    if let Some(lines) = state.file_cache.get(&path) {
+        return Some(Arc::clone(lines));
     }
 
-    state.file_cache.get(&path).map(Vec::as_slice)
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let lines: Arc<[String]> = contents
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .into();
+    state.file_cache.insert(path, Arc::clone(&lines));
+    Some(lines)
 }
 
 fn build_block_lines(
@@ -1838,7 +1840,14 @@ fn build_block_lines(
         // This is fine for now; large blocks will just be the block itself.
         let lines: Vec<Line> = block_lines
             .iter()
-            .map(|line| format_code_line(line, palette, language.as_ref()))
+            .map(|line| {
+                format_code_line(
+                    &mut state.highlighted_line_cache,
+                    line,
+                    palette,
+                    language.as_ref(),
+                )
+            })
             .collect();
         return (lines.clone(), lines.len());
     }
@@ -1848,7 +1857,14 @@ fn build_block_lines(
         None => {
             let lines: Vec<Line> = block_lines
                 .iter()
-                .map(|line| format_code_line(line, palette, language.as_ref()))
+                .map(|line| {
+                    format_code_line(
+                        &mut state.highlighted_line_cache,
+                        line,
+                        palette,
+                        language.as_ref(),
+                    )
+                })
                 .collect();
             return (lines.clone(), lines.len());
         }
@@ -1887,19 +1903,34 @@ fn build_block_lines(
         let start = start_line.saturating_sub(top_context);
         let end = start_line;
         for line in &file_lines[start..end] {
-            lines.push(format_context_line(line, palette, language.as_ref()));
+            lines.push(format_context_line(
+                &mut state.highlighted_line_cache,
+                line,
+                palette,
+                language.as_ref(),
+            ));
         }
     }
 
     for line in &block_lines {
-        lines.push(format_code_line(line, palette, language.as_ref()));
+        lines.push(format_code_line(
+            &mut state.highlighted_line_cache,
+            line,
+            palette,
+            language.as_ref(),
+        ));
     }
 
     if bottom_context > 0 {
         let start = end_line;
         let end = (end_line + bottom_context).min(file_lines.len());
         for line in &file_lines[start..end] {
-            lines.push(format_context_line(line, palette, language.as_ref()));
+            lines.push(format_context_line(
+                &mut state.highlighted_line_cache,
+                line,
+                palette,
+                language.as_ref(),
+            ));
         }
     }
 
@@ -2038,10 +2069,15 @@ fn build_file_lines(
     };
 
     // With scrolling enabled, we return all lines and let the viewport clip them.
-    let lines = file_lines
-        .iter()
-        .map(|line| format_code_line(line, palette, language.as_ref()))
-        .collect::<Vec<_>>();
+    let mut lines = Vec::with_capacity(file_lines.len());
+    for line in file_lines.iter() {
+        lines.push(format_code_line(
+            &mut state.highlighted_line_cache,
+            line,
+            palette,
+            language.as_ref(),
+        ));
+    }
 
     let len = lines.len();
     (lines, len)
@@ -2261,6 +2297,7 @@ fn format_directory_line(entry: &str, palette: &UiPalette) -> Line<'static> {
 }
 
 fn format_context_line(
+    highlighted_line_cache: &mut HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     line: &str,
     palette: &UiPalette,
     language: Option<&Language>,
@@ -2268,7 +2305,7 @@ fn format_context_line(
     let gutter_left = 4;
     let gutter_right = 2;
     let gutter_spacing = " ".repeat(gutter_left + gutter_right + 1);
-    let tokens = highlight_line(line, language);
+    let tokens = highlighted_tokens_for_line(highlighted_line_cache, line, language);
     let mut spans = Vec::with_capacity(tokens.len() + 1);
     spans.push(Span::styled(
         gutter_spacing,
@@ -2656,6 +2693,18 @@ mod diff_scope_tests {
 
         assert_eq!(cache.len(), 2);
     }
+
+    #[test]
+    fn highlighted_tokens_for_line_reuses_cached_tokens() {
+        let mut cache = HashMap::new();
+        let first =
+            highlighted_tokens_for_line(&mut cache, "let value = 42;", Some(&Language::Rust));
+        let second =
+            highlighted_tokens_for_line(&mut cache, "let value = 42;", Some(&Language::Rust));
+
+        assert_eq!(first, second);
+        assert_eq!(cache.len(), 1);
+    }
 }
 
 struct UiPalette {
@@ -2712,6 +2761,12 @@ struct HighlightToken {
     kind: TokenKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HighlightLineCacheKey {
+    line: String,
+    language: Option<Language>,
+}
+
 fn highlight_line(line: &str, _language: Option<&Language>) -> Vec<HighlightToken> {
     // Very basic highlighting for now
     let mut tokens = Vec::new();
@@ -2764,8 +2819,13 @@ fn style_for_token(kind: TokenKind, palette: &UiPalette) -> Style {
     }
 }
 
-fn format_code_line(line: &str, palette: &UiPalette, language: Option<&Language>) -> Line<'static> {
-    let tokens = highlight_line(line, language);
+fn format_code_line(
+    highlighted_line_cache: &mut HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
+    line: &str,
+    palette: &UiPalette,
+    language: Option<&Language>,
+) -> Line<'static> {
+    let tokens = highlighted_tokens_for_line(highlighted_line_cache, line, language);
     let mut spans = Vec::with_capacity(tokens.len());
     for token in tokens {
         spans.push(Span::styled(
@@ -2774,4 +2834,22 @@ fn format_code_line(line: &str, palette: &UiPalette, language: Option<&Language>
         ));
     }
     Line::from(spans)
+}
+
+fn highlighted_tokens_for_line(
+    cache: &mut HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
+    line: &str,
+    language: Option<&Language>,
+) -> Vec<HighlightToken> {
+    let key = HighlightLineCacheKey {
+        line: line.to_string(),
+        language: language.copied(),
+    };
+    if let Some(tokens) = cache.get(&key) {
+        return tokens.clone();
+    }
+
+    let tokens = highlight_line(line, language);
+    cache.insert(key, tokens.clone());
+    tokens
 }
