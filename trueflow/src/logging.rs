@@ -36,7 +36,7 @@ pub fn init_logging(mode: LoggingMode, debug: bool) -> Result<()> {
                 module,
                 line,
                 message
-            ))
+            ));
         });
 
     let mut log_warning = None;

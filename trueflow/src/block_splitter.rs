@@ -587,7 +587,7 @@ fn collect_python_test_ranges(
                 "name" => name = Some(capture.node.utf8_text(source.as_bytes())?.to_string()),
                 "func" => func_range = Some((capture.node.start_byte(), capture.node.end_byte())),
                 "decor" => {
-                    decorator_text = Some(capture.node.utf8_text(source.as_bytes())?.to_string())
+                    decorator_text = Some(capture.node.utf8_text(source.as_bytes())?.to_string());
                 }
                 _ => {}
             }
