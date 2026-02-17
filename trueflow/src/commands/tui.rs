@@ -1849,7 +1849,8 @@ fn build_block_lines(
                 )
             })
             .collect();
-        return (lines.clone(), lines.len());
+        let len = lines.len();
+        return (lines, len);
     }
 
     let file_lines = match load_file_lines(state, node) {
@@ -1866,7 +1867,8 @@ fn build_block_lines(
                     )
                 })
                 .collect();
-            return (lines.clone(), lines.len());
+            let len = lines.len();
+            return (lines, len);
         }
     };
 
