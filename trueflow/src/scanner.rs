@@ -196,8 +196,8 @@ fn process_file(path: &Path) -> Result<FileState> {
     let (language, blocks) = match file_type {
         FileType::Code(code_file) => {
             // Check if we have a splitter for this language
-            let language = code_file.language.clone();
-            let blocks = block_splitter::split(&content, language.clone());
+            let language = code_file.language;
+            let blocks = block_splitter::split(&content, language);
 
             match blocks {
                 Ok(b) if !b.is_empty() => (language, optimizer::optimize(b)),

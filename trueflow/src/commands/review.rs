@@ -96,7 +96,7 @@ pub fn collect_review_summary(
             }
         }
 
-        let language = file.language.clone();
+        let language = file.language;
         let mut reviewable_blocks = Vec::new();
         for block in file.blocks {
             if !filters.allows_block(&block.kind) {
@@ -133,7 +133,7 @@ pub fn collect_review_summary(
 
             if !fingerprint_status.contains_key(&block.hash) {
                 // Not explicitly approved. Check implicit approval via sub-blocks.
-                if let Ok(sub_blocks) = sub_splitter::split(&block, language.clone())
+                if let Ok(sub_blocks) = sub_splitter::split(&block, language)
                     && !sub_blocks.is_empty()
                 {
                     let all_approved = sub_blocks.iter().all(|sb| {
@@ -288,21 +288,21 @@ pub fn run(
     context: &TrueflowContext,
     json: bool,
     all: bool,
-    target: Vec<String>,
-    only: Vec<String>,
-    exclude: Vec<String>,
+    target: &[String],
+    only: &[String],
+    exclude: &[String],
 ) -> Result<()> {
     info!(
         "review start (json={}, all={}, target={:?}, only={:?}, exclude={:?})",
         json, all, target, only, exclude
     );
     let config = load_config()?;
-    let filters = config.review.resolve_filters(&only, &exclude);
+    let filters = config.review.resolve_filters(only, exclude);
     let options = ReviewOptions {
         all,
-        targets: parse_review_targets(&target)?,
-        only,
-        exclude,
+        targets: parse_review_targets(target)?,
+        only: only.to_vec(),
+        exclude: exclude.to_vec(),
     };
     let unreviewed_files = collect_unreviewed(context, &options, &filters)?;
 

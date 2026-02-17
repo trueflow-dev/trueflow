@@ -1701,7 +1701,7 @@ fn build_block_lines(
         return build_block_diff_lines(state, node, block, palette);
     }
 
-    let language = node.language.clone();
+    let language = node.language;
     let block_lines: Vec<String> = block.content.lines().map(|line| line.to_string()).collect();
     let extra_space =
         i32::from(code_height.saturating_sub(usize_to_u16_saturating(block_lines.len())));
@@ -1883,7 +1883,7 @@ fn build_file_lines(
     palette: &UiPalette,
     _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
-    let language = node.language.clone();
+    let language = node.language;
     let Some(file_lines) = load_file_lines(state, node) else {
         return (
             vec![Line::from(Span::styled(
@@ -2096,7 +2096,7 @@ fn count_block_kinds(state: &AppState) -> Vec<(BlockKind, usize)> {
         let Some(block) = &node.block else {
             continue;
         };
-        *counts.entry(block.kind.clone()).or_insert(0) += 1;
+        *counts.entry(block.kind).or_insert(0) += 1;
     }
     counts.into_iter().collect()
 }

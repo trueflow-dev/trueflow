@@ -114,7 +114,7 @@ fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
                 file_state.path,
                 block.kind
             );
-            let sub_blocks = sub_splitter::split(block, file_state.language.clone())?;
+            let sub_blocks = sub_splitter::split(block, file_state.language)?;
             assert!(
                 !sub_blocks.is_empty(),
                 "expected sub-blocks for {} block {}",

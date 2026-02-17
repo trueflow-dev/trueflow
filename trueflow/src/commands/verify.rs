@@ -70,11 +70,11 @@ impl Drop for Verifier {
     }
 }
 
-pub fn run(all: bool, id: Option<String>) -> Result<()> {
+pub fn run(all: bool, id: Option<&str>) -> Result<()> {
     let store = FileStore::new()?;
     let records = store.read_history()?;
 
-    let filtered = filter_records(records, all, id.as_deref())?;
+    let filtered = filter_records(records, all, id)?;
 
     let mut attested = 0;
     let mut unattested = 0;

@@ -193,7 +193,7 @@ struct FunctionSplitConfig<'a> {
 fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
-        FunctionSplitConfig {
+        &FunctionSplitConfig {
             language: tree_sitter_rust::LANGUAGE.into(),
             function_kind: "function_item",
             body_kind: "block",
@@ -307,7 +307,7 @@ fn is_rust_attribute_node(kind: &str) -> bool {
 fn split_python_function(block: &Block) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
-        FunctionSplitConfig {
+        &FunctionSplitConfig {
             language: tree_sitter_python::LANGUAGE.into(),
             function_kind: "function_definition",
             body_kind: "block",
@@ -325,7 +325,7 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
     };
     split_function_with_parser(
         block,
-        FunctionSplitConfig {
+        &FunctionSplitConfig {
             language,
             function_kind: "function_declaration",
             body_kind: "statement_block",
@@ -338,7 +338,7 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
 
 fn split_function_with_parser(
     block: &Block,
-    config: FunctionSplitConfig<'_>,
+    config: &FunctionSplitConfig<'_>,
 ) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
     parser.set_language(&config.language)?;
@@ -704,7 +704,7 @@ mod tests {
         // Gap (\n\n)
         // Paragraph
 
-        let kinds: Vec<BlockKind> = chunks.iter().map(|b| b.kind.clone()).collect();
+        let kinds: Vec<BlockKind> = chunks.iter().map(|b| b.kind).collect();
         assert_eq!(
             kinds,
             vec![

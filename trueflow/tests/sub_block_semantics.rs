@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use trueflow::analysis::Language;
 use trueflow::block::BlockKind;
@@ -8,17 +8,17 @@ use trueflow::finder::fuzzy_find_block;
 use trueflow::sub_splitter;
 
 fn assert_subblock_kinds(
-    path: PathBuf,
+    path: &Path,
     ident: &str,
     language: Language,
     expected: &[BlockKind],
 ) -> Result<()> {
-    let block = fuzzy_find_block(&path, ident)?;
+    let block = fuzzy_find_block(path, ident)?;
     let sub_blocks = sub_splitter::split(&block, language)?;
     let kinds: Vec<BlockKind> = sub_blocks
         .iter()
         .filter(|sub| sub.kind != BlockKind::Gap)
-        .map(|sub| sub.kind.clone())
+        .map(|sub| sub.kind)
         .collect();
 
     assert_eq!(kinds, expected);
@@ -37,7 +37,7 @@ fn test_rust_function_subblock_types() -> Result<()> {
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
     ];
-    assert_subblock_kinds(file_path, "process_data", Language::Rust, &expected)
+    assert_subblock_kinds(&file_path, "process_data", Language::Rust, &expected)
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn test_python_function_subblock_types() -> Result<()> {
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
     ];
-    assert_subblock_kinds(file_path, "process_data", Language::Python, &expected)
+    assert_subblock_kinds(&file_path, "process_data", Language::Python, &expected)
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn test_js_function_subblock_types() -> Result<()> {
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
     ];
-    assert_subblock_kinds(file_path, "processData", Language::JavaScript, &expected)
+    assert_subblock_kinds(&file_path, "processData", Language::JavaScript, &expected)
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn test_ts_function_subblock_types() -> Result<()> {
         BlockKind::CodeParagraph,
         BlockKind::CodeParagraph,
     ];
-    assert_subblock_kinds(file_path, "processData", Language::TypeScript, &expected)
+    assert_subblock_kinds(&file_path, "processData", Language::TypeScript, &expected)
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
     let kinds: Vec<BlockKind> = sub_blocks
         .iter()
         .filter(|sub| sub.kind != BlockKind::Gap)
-        .map(|sub| sub.kind.clone())
+        .map(|sub| sub.kind)
         .collect();
 
     assert_eq!(
@@ -124,7 +124,7 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
     let sentence_kinds: Vec<BlockKind> = sentence_blocks
         .iter()
         .filter(|sub| sub.kind != BlockKind::Gap)
-        .map(|sub| sub.kind.clone())
+        .map(|sub| sub.kind)
         .collect();
 
     assert!(

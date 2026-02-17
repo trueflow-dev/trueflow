@@ -67,30 +67,17 @@ fn main() -> Result<()> {
             target,
             only,
             exclude,
-        } => commands::review::run(
-            &context,
-            *json,
-            *all,
-            target.clone(),
-            only.clone(),
-            exclude.clone(),
-        ),
+        } => commands::review::run(&context, *json, *all, target, only, exclude),
         Commands::Feedback {
             format,
             include_approved,
             only,
             exclude,
-        } => commands::feedback::run(
-            &context,
-            format,
-            *include_approved,
-            only.clone(),
-            exclude.clone(),
-        ),
+        } => commands::feedback::run(&context, format, *include_approved, only, exclude),
         Commands::Inspect { fingerprint, split } => {
             commands::inspect::run(&context, fingerprint, *split)
         }
-        Commands::Verify { all, id } => commands::verify::run(*all, id.clone()),
+        Commands::Verify { all, id } => commands::verify::run(*all, id.as_deref()),
         Commands::Tui => commands::tui::run(&context),
     }
 }

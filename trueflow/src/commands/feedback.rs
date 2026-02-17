@@ -14,11 +14,11 @@ pub fn run(
     _context: &TrueflowContext,
     format: &str,
     include_approved: bool,
-    only: Vec<String>,
-    exclude: Vec<String>,
+    only: &[String],
+    exclude: &[String],
 ) -> Result<()> {
     let config = load_config()?;
-    let filters = config.feedback.resolve_filters(&only, &exclude);
+    let filters = config.feedback.resolve_filters(only, exclude);
 
     // 1. Scan Directory (Current State)
     let files = scanner::scan_directory(".")?;

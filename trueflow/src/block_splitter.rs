@@ -126,7 +126,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         let node_content = &content[block_start..end_byte];
         let mut block = create_block(
             node_content,
-            map_kind(lang.clone(), ts_kind),
+            map_kind(lang, ts_kind),
             content,
             block_start,
             end_byte,
@@ -446,7 +446,7 @@ fn create_block(
     lang: &Language,
 ) -> Block {
     let hash = hash_str(text);
-    let complexity = complexity::calculate(text, lang.clone());
+    let complexity = complexity::calculate(text, *lang);
 
     // Line mapping (byte -> line index)
     // Reusing the logic from previous implementation

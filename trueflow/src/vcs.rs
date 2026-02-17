@@ -479,7 +479,7 @@ struct HunkHeader {
 
 fn split_blocks(content: &str, language: Language) -> Vec<Block> {
     if language != Language::Unknown
-        && let Ok(blocks) = block_splitter::split(content, language.clone())
+        && let Ok(blocks) = block_splitter::split(content, language)
         && !blocks.is_empty()
     {
         return crate::optimizer::optimize(blocks);

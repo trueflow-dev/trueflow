@@ -10,7 +10,7 @@ pub fn run(_context: &TrueflowContext, fingerprint: &str, split: bool) -> Result
     for file in &files {
         for block in &file.blocks {
             if block.hash.starts_with(fingerprint) {
-                matches.push((block.clone(), file.language.clone()));
+                matches.push((block.clone(), file.language));
             }
         }
     }
@@ -18,10 +18,10 @@ pub fn run(_context: &TrueflowContext, fingerprint: &str, split: bool) -> Result
     if matches.is_empty() {
         for file in &files {
             for block in &file.blocks {
-                if let Ok(sub_blocks) = sub_splitter::split(block, file.language.clone()) {
+                if let Ok(sub_blocks) = sub_splitter::split(block, file.language) {
                     for sub_block in sub_blocks {
                         if sub_block.hash.starts_with(fingerprint) {
-                            matches.push((sub_block, file.language.clone()));
+                            matches.push((sub_block, file.language));
                         }
                     }
                 }

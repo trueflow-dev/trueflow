@@ -15,7 +15,7 @@ pub fn fuzzy_find_block(path: &Path, fuzzy_ident: &str) -> Result<Block> {
         _ => Language::Unknown,
     };
 
-    let blocks = match block_splitter::split(&content, language.clone()) {
+    let blocks = match block_splitter::split(&content, language) {
         Ok(blocks) if !blocks.is_empty() => optimizer::optimize(blocks),
         Ok(_) => Vec::new(),
         Err(err) => bail!("Failed to split file {}: {}", path.display(), err),

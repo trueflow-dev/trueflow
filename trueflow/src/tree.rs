@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct TreeNodeId(usize);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum TreeNodeKind {
     Root,
     Directory,
@@ -269,23 +269,26 @@ impl TreeBuilder {
         path: String,
     ) -> TreeNodeId {
         let id = TreeNodeId(self.nodes.len());
+        let is_hash_entry = kind.is_hash_entry();
+        let is_file = matches!(kind, TreeNodeKind::File);
+        let index_path = path.clone();
         let node = TreeNode {
             id,
             parent: Some(parent),
-            kind: kind.clone(),
-            name: name.clone(),
-            path: path.clone(),
+            kind,
+            name,
+            path,
             hash: String::new(),
             children: Vec::new(),
             block: None,
             language: None,
         };
         self.nodes.push(node);
-        if matches!(kind, TreeNodeKind::Directory | TreeNodeKind::File) {
-            self.nodes_by_path.insert(path.clone(), id);
+        if is_hash_entry {
+            self.nodes_by_path.insert(index_path.clone(), id);
         }
-        if matches!(kind, TreeNodeKind::File) {
-            self.file_paths.insert(path);
+        if is_file {
+            self.file_paths.insert(index_path);
         }
         self.children_by_id.entry(parent).or_default().push(id);
         id
@@ -308,7 +311,7 @@ impl TreeBuilder {
     }
 
     fn attach_children(&mut self, id: TreeNodeId, mut children: Vec<TreeNodeId>) {
-        let kind = self.nodes[id.0].kind.clone();
+        let kind = self.nodes[id.0].kind;
         if kind.should_sort_children() {
             children.sort_by(|a, b| {
                 let a_node = &self.nodes[a.0];
@@ -334,7 +337,7 @@ impl TreeBuilder {
             self.compute_hashes(*child);
         }
 
-        let kind = self.nodes[id.0].kind.clone();
+        let kind = self.nodes[id.0].kind;
         if matches!(kind, TreeNodeKind::Block | TreeNodeKind::File) {
             return;
         }
@@ -393,7 +396,7 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                     part.to_string(),
                     current_path.clone(),
                     file.file_hash.clone(),
-                    file.language.clone(),
+                    file.language,
                 );
                 let mut blocks = file.blocks.clone();
                 blocks.sort_by_key(|block| (block.start_line, block.end_line));
@@ -416,15 +419,10 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
 
                     let start_line = block.start_line;
                     let end_line = block.end_line;
-                    let kind = block.kind.clone();
+                    let kind = block.kind;
                     let name = block_label(&block);
-                    let node_id = builder.add_block(
-                        parent,
-                        name,
-                        current_path.clone(),
-                        block,
-                        file.language.clone(),
-                    );
+                    let node_id =
+                        builder.add_block(parent, name, current_path.clone(), block, file.language);
 
                     if matches!(kind, BlockKind::Impl | BlockKind::Interface) {
                         impl_stack.push((node_id, start_line, end_line));
