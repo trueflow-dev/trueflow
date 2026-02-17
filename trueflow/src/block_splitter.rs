@@ -54,7 +54,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
     let mut cursor = root.walk();
     let mut last_end_byte = 0;
 
-    let test_ranges = collect_test_ranges(&lang, &tree, content)?;
+    let test_ranges = collect_test_ranges(lang, &tree, content)?;
 
     // State for pending attributes/comments that should be attached to the next node
     let mut pending_start: Option<usize> = None;
@@ -90,7 +90,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
                             content,
                             last_end_byte,
                             start_byte,
-                            &lang,
+                            lang,
                         ));
                     }
                 }
@@ -116,7 +116,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
                         content,
                         last_end_byte,
                         start_byte,
-                        &lang,
+                        lang,
                     ));
                 }
             }
@@ -130,7 +130,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             content,
             block_start,
             end_byte,
-            &lang,
+            lang,
         );
         if is_test {
             block.tags.push("test".to_string());
@@ -138,7 +138,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         blocks.push(block);
 
         if matches!(lang, Language::Rust) && matches!(ts_kind, "impl_item" | "trait_item") {
-            blocks.extend(collect_rust_impl_items(child, content, &lang, &test_ranges));
+            blocks.extend(collect_rust_impl_items(child, content, lang, &test_ranges));
         }
 
         last_end_byte = end_byte;
@@ -155,7 +155,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             content,
             start,
             pending_end,
-            &lang,
+            lang,
         ));
         last_end_byte = pending_end;
     }
@@ -170,7 +170,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
                 content,
                 last_end_byte,
                 content.len(),
-                &lang,
+                lang,
             ));
         }
     }
@@ -209,7 +209,7 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
                         content,
                         section_start,
                         heading.start,
-                        &Language::Markdown,
+                        Language::Markdown,
                     ));
                 }
             }
@@ -227,7 +227,7 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
                     content,
                     section_start,
                     heading.start,
-                    &Language::Markdown,
+                    Language::Markdown,
                 ));
             }
             section_start = heading.start;
@@ -248,7 +248,7 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
                 content,
                 section_start,
                 content.len(),
-                &Language::Markdown,
+                Language::Markdown,
             ));
         }
     }
@@ -263,7 +263,7 @@ fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
         } else {
             BlockKind::Paragraph
         };
-        create_block(chunk, kind, content, start, end, &lang)
+        create_block(chunk, kind, content, start, end, lang)
     })
 }
 
@@ -380,7 +380,7 @@ fn is_rust_attribute_node(kind: &str) -> bool {
 fn collect_rust_impl_items(
     impl_node: tree_sitter::Node<'_>,
     content: &str,
-    lang: &Language,
+    lang: Language,
     test_ranges: &[crate::block::Span],
 ) -> Vec<Block> {
     let Some(body) = impl_node.child_by_field_name("body") else {
@@ -443,10 +443,10 @@ fn create_block(
     full_source: &str,
     start_byte: usize,
     end_byte: usize,
-    lang: &Language,
+    lang: Language,
 ) -> Block {
     let hash = hash_str(text);
-    let complexity = complexity::calculate(text, *lang);
+    let complexity = complexity::calculate(text, lang);
 
     // Line mapping (byte -> line index)
     // Reusing the logic from previous implementation
@@ -464,7 +464,7 @@ fn create_block(
 }
 
 fn collect_test_ranges(
-    lang: &Language,
+    lang: Language,
     tree: &tree_sitter::Tree,
     source: &str,
 ) -> Result<Vec<crate::block::Span>> {

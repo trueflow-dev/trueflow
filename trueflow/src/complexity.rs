@@ -25,12 +25,12 @@ pub fn calculate(content: &str, lang: Language) -> u32 {
     }
 
     match parser.parse(content, None) {
-        Some(tree) => calculate_node(tree.root_node(), 0, &lang),
+        Some(tree) => calculate_node(tree.root_node(), 0, lang),
         None => 0,
     }
 }
 
-fn calculate_node(node: Node, nesting: u32, lang: &Language) -> u32 {
+fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
     let mut score = 0;
     let kind = node.kind();
 

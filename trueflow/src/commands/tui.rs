@@ -1984,8 +1984,8 @@ fn build_root_lines(
 
     let mut kind_counts = count_block_kinds(state);
     kind_counts.sort_by(|a, b| {
-        let parent_a = parent_kind(&a.0);
-        let parent_b = parent_kind(&b.0);
+        let parent_a = parent_kind(a.0);
+        let parent_b = parent_kind(b.0);
         if parent_a != parent_b {
             parent_a.cmp(parent_b)
         } else {
@@ -1995,7 +1995,7 @@ fn build_root_lines(
 
     let mut last_parent = "";
     for (kind, count) in kind_counts {
-        let parent = parent_kind(&kind);
+        let parent = parent_kind(kind);
         if parent != last_parent {
             if !last_parent.is_empty() {
                 lines.push(Line::from(""));
@@ -2055,7 +2055,7 @@ fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> L
     Line::from(Span::styled(entry.to_string(), style)).style(style)
 }
 
-fn parent_kind(kind: &BlockKind) -> &'static str {
+fn parent_kind(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Function
         | BlockKind::Method
@@ -2132,7 +2132,7 @@ fn format_context_line(
         Style::default().fg(palette.context).bg(palette.code_bg),
     ));
     for token in tokens {
-        let style = style_for_token(&token.kind, palette)
+        let style = style_for_token(token.kind, palette)
             .fg(palette.context)
             .bg(palette.code_bg);
         spans.push(Span::styled(token.text, style));
@@ -2448,7 +2448,7 @@ fn classify_token(word: &str) -> HighlightToken {
     }
 }
 
-fn style_for_token(kind: &TokenKind, palette: &UiPalette) -> Style {
+fn style_for_token(kind: TokenKind, palette: &UiPalette) -> Style {
     match kind {
         TokenKind::Base => Style::default().fg(palette.code_fg),
         TokenKind::Keyword => Style::default()
@@ -2466,7 +2466,7 @@ fn format_code_line(line: &str, palette: &UiPalette, language: Option<&Language>
     for token in tokens {
         spans.push(Span::styled(
             token.text,
-            style_for_token(&token.kind, palette).bg(palette.code_bg),
+            style_for_token(token.kind, palette).bg(palette.code_bg),
         ));
     }
     Line::from(spans)

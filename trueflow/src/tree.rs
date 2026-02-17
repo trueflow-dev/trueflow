@@ -17,7 +17,7 @@ pub enum TreeNodeKind {
 }
 
 impl TreeNodeKind {
-    fn label(&self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             TreeNodeKind::Root => "root",
             TreeNodeKind::Directory => "directory",
@@ -26,7 +26,7 @@ impl TreeNodeKind {
         }
     }
 
-    fn entry_prefix(&self) -> &'static str {
+    fn entry_prefix(self) -> &'static str {
         match self {
             TreeNodeKind::Root => "root",
             TreeNodeKind::Directory => "dir",
@@ -35,15 +35,15 @@ impl TreeNodeKind {
         }
     }
 
-    fn should_sort_children(&self) -> bool {
+    fn should_sort_children(self) -> bool {
         matches!(self, TreeNodeKind::Root | TreeNodeKind::Directory)
     }
 
-    fn is_hash_entry(&self) -> bool {
+    fn is_hash_entry(self) -> bool {
         matches!(self, TreeNodeKind::Directory | TreeNodeKind::File)
     }
 
-    fn sort_key(&self, name: &str) -> String {
+    fn sort_key(self, name: &str) -> String {
         format!("{}:{}", self.entry_prefix(), name)
     }
 }

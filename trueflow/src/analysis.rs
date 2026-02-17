@@ -21,7 +21,7 @@ pub enum Language {
 // TODO: add Language::Go, Language::Java, Language::Cpp once tree-sitter support is wired.
 
 impl Language {
-    pub fn uses_text_fallback(&self) -> bool {
+    pub fn uses_text_fallback(self) -> bool {
         matches!(
             self,
             Language::Text | Language::Toml | Language::Nix | Language::Just

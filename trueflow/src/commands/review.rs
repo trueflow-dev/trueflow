@@ -99,7 +99,7 @@ pub fn collect_review_summary(
         let language = file.language;
         let mut reviewable_blocks = Vec::new();
         for block in file.blocks {
-            if !filters.allows_block(&block.kind) {
+            if !filters.allows_block(block.kind) {
                 continue;
             }
             if should_skip_imports_by_default(&file.path, &block, filters) {
@@ -137,7 +137,7 @@ pub fn collect_review_summary(
                     && !sub_blocks.is_empty()
                 {
                     let all_approved = sub_blocks.iter().all(|sb| {
-                        if !filters.allows_subblock(&sb.kind) {
+                        if !filters.allows_subblock(sb.kind) {
                             return true;
                         }
                         fingerprint_status.get(&sb.hash) == Some(&Verdict::Approved)

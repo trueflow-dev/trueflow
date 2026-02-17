@@ -53,7 +53,7 @@ pub fn run(
 
         for file in files {
             for block in file.blocks {
-                if !filters.allows_block(&block.kind) {
+                if !filters.allows_block(block.kind) {
                     continue;
                 }
                 if should_skip_imports_by_default(&file.path, &block, &filters) {
@@ -108,7 +108,7 @@ pub fn run(
             let mut blocks_to_print = Vec::new();
 
             for block in file.blocks {
-                if !filters.allows_block(&block.kind) {
+                if !filters.allows_block(block.kind) {
                     continue;
                 }
                 if should_skip_imports_by_default(&file.path, &block, &filters) {

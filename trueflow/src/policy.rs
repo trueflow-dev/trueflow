@@ -2,7 +2,7 @@ use crate::block::{Block, BlockKind};
 use crate::config::BlockFilters;
 
 pub fn should_skip_imports_by_default(path: &str, block: &Block, filters: &BlockFilters) -> bool {
-    if block.kind.is_import_like() && !is_lib_rs(path) && !filters.only_contains(&block.kind) {
+    if block.kind.is_import_like() && !is_lib_rs(path) && !filters.only_contains(block.kind) {
         return true;
     }
     false
@@ -10,7 +10,7 @@ pub fn should_skip_imports_by_default(path: &str, block: &Block, filters: &Block
 
 pub fn should_skip_impl_by_default(block: &Block, filters: &BlockFilters) -> bool {
     matches!(block.kind, BlockKind::Impl | BlockKind::Interface)
-        && !filters.only_contains(&block.kind)
+        && !filters.only_contains(block.kind)
 }
 
 fn is_lib_rs(path: &str) -> bool {

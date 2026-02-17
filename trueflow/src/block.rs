@@ -82,14 +82,14 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
-    pub fn is_import_like(&self) -> bool {
+    pub fn is_import_like(self) -> bool {
         matches!(
             self,
             BlockKind::Import | BlockKind::Imports | BlockKind::Module | BlockKind::Modules
         )
     }
 
-    pub fn default_review_priority(&self) -> u8 {
+    pub fn default_review_priority(self) -> u8 {
         if self.is_import_like() {
             return 70;
         }
@@ -112,7 +112,7 @@ impl BlockKind {
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             BlockKind::TextBlock => "TextBlock",
             BlockKind::Code => "code",
