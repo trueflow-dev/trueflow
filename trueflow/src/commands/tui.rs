@@ -1822,9 +1822,9 @@ fn build_block_lines(
     }
 
     let language = node.language;
-    let block_lines: Vec<String> = block.content.lines().map(|line| line.to_string()).collect();
+    let block_line_count = block.content.lines().count();
     let extra_space =
-        i32::from(code_height.saturating_sub(usize_to_u16_saturating(block_lines.len())));
+        i32::from(code_height.saturating_sub(usize_to_u16_saturating(block_line_count)));
 
     // TODO: if paginating, we shouldn't truncate context based on viewport height alone.
     // However, existing context logic tries to center the block vertically.
@@ -1849,17 +1849,15 @@ fn build_block_lines(
         // We should just render the block + maybe minimal context if we want?
         // Existing logic returns just block lines if extra_space < 2.
         // This is fine for now; large blocks will just be the block itself.
-        let lines: Vec<Line> = block_lines
-            .iter()
-            .map(|line| {
-                format_code_line(
-                    &mut state.highlighted_line_cache,
-                    line,
-                    palette,
-                    language.as_ref(),
-                )
-            })
-            .collect();
+        let mut lines = Vec::with_capacity(block_line_count);
+        for line in block.content.lines() {
+            lines.push(format_code_line(
+                &mut state.highlighted_line_cache,
+                line,
+                palette,
+                language.as_ref(),
+            ));
+        }
         let len = lines.len();
         return (lines, len);
     }
@@ -1867,17 +1865,15 @@ fn build_block_lines(
     let file_lines = match load_file_lines(state, node) {
         Some(lines) => lines,
         None => {
-            let lines: Vec<Line> = block_lines
-                .iter()
-                .map(|line| {
-                    format_code_line(
-                        &mut state.highlighted_line_cache,
-                        line,
-                        palette,
-                        language.as_ref(),
-                    )
-                })
-                .collect();
+            let mut lines = Vec::with_capacity(block_line_count);
+            for line in block.content.lines() {
+                lines.push(format_code_line(
+                    &mut state.highlighted_line_cache,
+                    line,
+                    palette,
+                    language.as_ref(),
+                ));
+            }
             let len = lines.len();
             return (lines, len);
         }
@@ -1925,7 +1921,7 @@ fn build_block_lines(
         }
     }
 
-    for line in &block_lines {
+    for line in block.content.lines() {
         lines.push(format_code_line(
             &mut state.highlighted_line_cache,
             line,
