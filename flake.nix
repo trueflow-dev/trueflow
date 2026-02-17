@@ -54,9 +54,10 @@
           CARGO_BUILD_TARGET = "${pkgs.pkgsStatic.stdenv.hostPlatform.config}";
         };
       in {
-        packages.default = trueflow;
+        packages.default = trueflowMusl;
+        packages.native = trueflow;
         packages.musl = trueflowMusl;
-        apps.default = flake-utils.lib.mkApp { drv = trueflow; };
+        apps.default = flake-utils.lib.mkApp { drv = trueflowMusl; };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs;
