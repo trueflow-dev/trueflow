@@ -569,6 +569,39 @@ struct ContentFrameCacheEntry {
     total_lines: usize,
 }
 
+#[derive(Clone)]
+struct ContentNodeSnapshot {
+    id: TreeNodeId,
+    kind: TreeNodeKind,
+    path: String,
+    children: Vec<TreeNodeId>,
+    block: Option<crate::block::Block>,
+    language: Option<Language>,
+}
+
+impl ContentNodeSnapshot {
+    fn from_node(node: &crate::tree::TreeNode) -> Self {
+        let children = if matches!(node.kind, TreeNodeKind::Directory) {
+            node.children.clone()
+        } else {
+            Vec::new()
+        };
+        let block = if matches!(node.kind, TreeNodeKind::Block) {
+            node.block.clone()
+        } else {
+            None
+        };
+        Self {
+            id: node.id,
+            kind: node.kind,
+            path: node.path.clone(),
+            children,
+            block,
+            language: node.language,
+        }
+    }
+}
+
 pub fn run(context: &TrueflowContext) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let config = load_config()?;
@@ -1431,7 +1464,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
     let actions_lines = build_action_lines(focus_layout.actions.width, palette);
-    let node_snapshot = node.clone();
+    let node_snapshot = ContentNodeSnapshot::from_node(node);
     let (content_lines, total_lines) = build_content_lines_with_frame_cache(
         state,
         &node_snapshot,
@@ -1519,7 +1552,7 @@ fn is_content_kind_cacheable(kind: TreeNodeKind) -> bool {
 
 fn build_content_lines_with_frame_cache(
     state: &mut AppState,
-    node: &crate::tree::TreeNode,
+    node: &ContentNodeSnapshot,
     palette: &UiPalette,
     code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
@@ -1769,7 +1802,7 @@ fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPa
 
 fn build_content_lines(
     state: &mut AppState,
-    node: &crate::tree::TreeNode,
+    node: &ContentNodeSnapshot,
     palette: &UiPalette,
     code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
@@ -1781,29 +1814,29 @@ fn build_content_lines(
     }
 }
 
-fn load_file_lines(state: &mut AppState, node: &crate::tree::TreeNode) -> Option<Arc<[String]>> {
-    if node.path.is_empty() {
+fn load_file_lines(state: &mut AppState, path: &str) -> Option<Arc<[String]>> {
+    if path.is_empty() {
         return None;
     }
 
-    let path = PathBuf::from(&node.path);
-    if let Some(lines) = state.file_cache.get(&path) {
+    let path_buf = PathBuf::from(path);
+    if let Some(lines) = state.file_cache.get(&path_buf) {
         return Some(Arc::clone(lines));
     }
 
-    let contents = std::fs::read_to_string(&path).ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
     let lines: Arc<[String]> = contents
         .lines()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .into();
-    state.file_cache.insert(path, Arc::clone(&lines));
+    state.file_cache.insert(path_buf, Arc::clone(&lines));
     Some(lines)
 }
 
 fn build_block_lines(
     state: &mut AppState,
-    node: &crate::tree::TreeNode,
+    node: &ContentNodeSnapshot,
     palette: &UiPalette,
     code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
@@ -1862,7 +1895,7 @@ fn build_block_lines(
         return (lines, len);
     }
 
-    let file_lines = match load_file_lines(state, node) {
+    let file_lines = match load_file_lines(state, &node.path) {
         Some(lines) => lines,
         None => {
             let mut lines = Vec::with_capacity(block_line_count);
@@ -1949,7 +1982,7 @@ fn build_block_lines(
 
 fn build_block_diff_lines(
     state: &mut AppState,
-    node: &crate::tree::TreeNode,
+    node: &ContentNodeSnapshot,
     block: &crate::block::Block,
     palette: &UiPalette,
 ) -> (Vec<Line<'static>>, usize) {
@@ -2062,12 +2095,12 @@ where
 
 fn build_file_lines(
     state: &mut AppState,
-    node: &crate::tree::TreeNode,
+    node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
     let language = node.language;
-    let Some(file_lines) = load_file_lines(state, node) else {
+    let Some(file_lines) = load_file_lines(state, &node.path) else {
         return (
             vec![Line::from(Span::styled(
                 "(File missing)",
@@ -2094,7 +2127,7 @@ fn build_file_lines(
 
 fn build_directory_lines(
     state: &AppState,
-    node: &crate::tree::TreeNode,
+    node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
