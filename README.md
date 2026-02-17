@@ -2,6 +2,11 @@
 
 ![trueflow logo](./design/trueflow.jpg)
 
+**Warning:** This project is partially an experiment in how far one can take the
+philosophy of agent-based implementation. I heavily guide the agents and provide
+the designs and overall dev environment choices, but the code itself, primarily
+generated.
+
 ## Motivation
 
 Reviewing is becoming the bottleneck to shipping.
