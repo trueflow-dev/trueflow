@@ -14,6 +14,7 @@ pub mod optimizer;
 pub mod policy;
 pub mod review_order;
 pub mod review_scope;
+pub mod review_session;
 pub mod scanner;
 pub mod store;
 pub mod sub_splitter;

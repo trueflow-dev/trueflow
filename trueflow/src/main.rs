@@ -17,6 +17,7 @@ mod optimizer;
 mod policy;
 mod review_order;
 mod review_scope;
+mod review_session;
 mod scanner;
 mod store;
 pub mod sub_splitter;

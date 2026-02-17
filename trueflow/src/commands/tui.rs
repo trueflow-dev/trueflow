@@ -6,6 +6,7 @@ use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_conf
 use crate::context::TrueflowContext;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::{DiffQuery, ReviewScope, diff_query_for_scope};
+use crate::review_session;
 use crate::store::Verdict;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
@@ -102,24 +103,6 @@ impl ReviewNavigator {
             visible_nodes,
             current: root,
         })
-    }
-
-    fn block_ids_in_subtree(&self, root: TreeNodeId) -> Vec<TreeNodeId> {
-        let mut stack = vec![root];
-        let mut blocks = Vec::new();
-        while let Some(node_id) = stack.pop() {
-            if !self.visible_nodes.contains(&node_id) {
-                continue;
-            }
-            let node = self.tree.node(node_id);
-            if matches!(node.kind, TreeNodeKind::Block) {
-                blocks.push(node_id);
-            }
-            for child in &node.children {
-                stack.push(*child);
-            }
-        }
-        blocks
     }
 
     fn current_id(&self) -> TreeNodeId {
@@ -984,7 +967,11 @@ fn apply_action_locally(
     verdict: &Verdict,
     next_id: Option<TreeNodeId>,
 ) {
-    let block_ids = collect_block_ids_for_action(state, node_id);
+    let block_ids = review_session::action_block_ids(
+        &state.navigator.tree,
+        &state.navigator.visible_nodes,
+        node_id,
+    );
 
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
         let mut removed_reviewable = 0;
@@ -998,7 +985,8 @@ fn apply_action_locally(
         state.remaining_blocks = state.remaining_blocks.saturating_sub(removed_reviewable);
     }
 
-    prune_invisible_ancestors(state);
+    state.navigator.visible_nodes =
+        review_session::prune_visible_nodes(&state.navigator.tree, &state.navigator.visible_nodes);
 
     if let Some(node_id) = next_id {
         state.navigator.set_current(node_id);
@@ -1009,75 +997,14 @@ fn apply_action_locally(
     }
 }
 
-fn collect_block_ids_for_action(state: &AppState, node_id: TreeNodeId) -> Vec<TreeNodeId> {
-    let node = state.navigator.tree.node(node_id);
-    match node.kind {
-        TreeNodeKind::Block => {
-            if node
-                .block
-                .as_ref()
-                .is_some_and(|block| matches!(block.kind, BlockKind::Impl | BlockKind::Interface))
-            {
-                state.navigator.block_ids_in_subtree(node_id)
-            } else {
-                vec![node_id]
-            }
-        }
-        _ => state.navigator.block_ids_in_subtree(node_id),
-    }
-}
-
 fn compute_next_review_target(state: &AppState, node_id: TreeNodeId) -> Option<TreeNodeId> {
-    let node = state.navigator.tree.node(node_id);
-    let remaining = &state.reviewable_nodes;
-    match node.kind {
-        TreeNodeKind::Block => {
-            if node
-                .block
-                .as_ref()
-                .is_some_and(|block| matches!(block.kind, BlockKind::Impl | BlockKind::Interface))
-            {
-                let subtree_blocks: HashSet<_> = state
-                    .navigator
-                    .block_ids_in_subtree(node_id)
-                    .into_iter()
-                    .collect();
-                state
-                    .review_order
-                    .next_after_subtree(&subtree_blocks, remaining)
-            } else {
-                state.review_order.next_after_blocks(node_id, remaining)
-            }
-        }
-        _ => {
-            let subtree_blocks: HashSet<_> = state
-                .navigator
-                .block_ids_in_subtree(node_id)
-                .into_iter()
-                .collect();
-            state
-                .review_order
-                .next_after_subtree(&subtree_blocks, remaining)
-        }
-    }
-}
-
-fn prune_invisible_ancestors(state: &mut AppState) {
-    let mut visible_nodes = HashSet::new();
-    for node_id in state
-        .navigator
-        .visible_nodes
-        .iter()
-        .copied()
-        .filter(|id| matches!(state.navigator.tree.node(*id).kind, TreeNodeKind::Block))
-    {
-        for ancestor in state.navigator.tree.ancestors(node_id) {
-            visible_nodes.insert(ancestor);
-        }
-    }
-
-    visible_nodes.insert(state.navigator.tree.root());
-    state.navigator.visible_nodes = visible_nodes;
+    review_session::next_review_target(
+        &state.navigator.tree,
+        &state.navigator.visible_nodes,
+        &state.review_order,
+        &state.reviewable_nodes,
+        node_id,
+    )
 }
 
 fn detect_repo_name(context: &TrueflowContext) -> String {
