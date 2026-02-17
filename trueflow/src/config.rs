@@ -22,18 +22,39 @@ pub struct TrueflowConfig {
 pub struct TuiConfig {
     #[serde(default = "default_confirm_batch")]
     pub confirm_batch: bool,
+    #[serde(default = "default_tui_diff_focus_mode")]
+    pub diff_focus_mode: TuiDiffFocusMode,
+    #[serde(default = "default_diff_focus_context_lines")]
+    pub diff_focus_context_lines: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiDiffFocusMode {
+    WholeBlock,
+    ChangedWithContext,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             confirm_batch: true,
+            diff_focus_mode: default_tui_diff_focus_mode(),
+            diff_focus_context_lines: default_diff_focus_context_lines(),
         }
     }
 }
 
 fn default_confirm_batch() -> bool {
     true
+}
+
+fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {
+    TuiDiffFocusMode::WholeBlock
+}
+
+fn default_diff_focus_context_lines() -> usize {
+    3
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -138,4 +159,35 @@ fn parse_block_kinds(values: &[String]) -> HashSet<BlockKind> {
         }
     }
     kinds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_config_defaults_to_whole_block_focus() {
+        let cfg: TrueflowConfig = match toml::from_str("") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert!(cfg.tui.confirm_batch);
+        assert_eq!(cfg.tui.diff_focus_mode, TuiDiffFocusMode::WholeBlock);
+        assert_eq!(cfg.tui.diff_focus_context_lines, 3);
+    }
+
+    #[test]
+    fn tui_config_parses_changed_with_context_focus() {
+        let cfg: TrueflowConfig = match toml::from_str(
+            "[tui]\ndiff_focus_mode = \"changed_with_context\"\ndiff_focus_context_lines = 5\n",
+        ) {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert_eq!(
+            cfg.tui.diff_focus_mode,
+            TuiDiffFocusMode::ChangedWithContext
+        );
+        assert_eq!(cfg.tui.diff_focus_context_lines, 5);
+    }
 }
