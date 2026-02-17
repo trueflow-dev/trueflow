@@ -44,3 +44,4 @@ uuid = { version = "1.19.0", features = ["v4"] }
 
 [lints.clippy]
 await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
