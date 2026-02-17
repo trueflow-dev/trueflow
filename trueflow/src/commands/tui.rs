@@ -1767,23 +1767,25 @@ fn build_content_lines(
     }
 }
 
-fn load_file_lines(state: &mut AppState, node: &crate::tree::TreeNode) -> Option<Vec<String>> {
+fn load_file_lines<'a>(
+    state: &'a mut AppState,
+    node: &crate::tree::TreeNode,
+) -> Option<&'a [String]> {
     if node.path.is_empty() {
         return None;
     }
 
     let path = PathBuf::from(&node.path);
-    if let Some(lines) = state.file_cache.get(&path) {
-        return Some(lines.clone());
+    if !state.file_cache.contains_key(&path) {
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let lines = contents
+            .lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        state.file_cache.insert(path.clone(), lines);
     }
 
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let lines = contents
-        .lines()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    state.file_cache.insert(path, lines.clone());
-    Some(lines)
+    state.file_cache.get(&path).map(Vec::as_slice)
 }
 
 fn build_block_lines(
