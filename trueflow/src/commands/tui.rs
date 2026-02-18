@@ -15,7 +15,7 @@ use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -415,9 +415,10 @@ fn run_scope_selector(
             continue;
         }
 
-        let Some(key_code) = key_code_for_press_event(&event) else {
+        let Some(key_event) = key_event_for_press_event(&event) else {
             continue;
         };
+        let key_code = key_event.code;
 
         match key_code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(ScopeSelection::Quit),
@@ -458,9 +459,10 @@ fn run_app(
             continue;
         }
 
-        let Some(key_code) = key_code_for_press_event(&event) else {
+        let Some(key_event) = key_event_for_press_event(&event) else {
             continue;
         };
+        let key_code = key_event.code;
 
         match &state.input_mode {
             InputMode::Normal => match key_code {
@@ -547,24 +549,28 @@ fn run_app(
                 }
                 _ => {}
             },
-            InputMode::Editing { .. } => match key_code {
-                KeyCode::Enter => {
+            InputMode::Editing { .. } => match editing_key_action_for_event(&key_event) {
+                EditingKeyAction::Submit => {
                     handle_editing_submit(terminal, context, &mut state)?;
                     needs_render = true;
                 }
-                KeyCode::Esc => {
+                EditingKeyAction::InsertNewline => {
+                    state.input_buffer.push('\n');
+                    needs_render = true;
+                }
+                EditingKeyAction::Cancel => {
                     handle_editing_cancel(&mut state);
                     needs_render = true;
                 }
-                KeyCode::Backspace => {
+                EditingKeyAction::Backspace => {
                     state.input_buffer.pop();
                     needs_render = true;
                 }
-                KeyCode::Char(c) => {
+                EditingKeyAction::InsertChar(c) => {
                     state.input_buffer.push(c);
                     needs_render = true;
                 }
-                _ => {}
+                EditingKeyAction::Ignore => {}
             },
             InputMode::ConfirmBatch { .. } => match key_code {
                 KeyCode::Enter => {
@@ -581,11 +587,48 @@ fn run_app(
     }
 }
 
-fn key_code_for_press_event(event: &Event) -> Option<KeyCode> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditingKeyAction {
+    Submit,
+    InsertNewline,
+    Cancel,
+    Backspace,
+    InsertChar(char),
+    Ignore,
+}
+
+fn editing_key_action_for_event(key_event: &KeyEvent) -> EditingKeyAction {
+    match key_event.code {
+        KeyCode::Enter if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+            EditingKeyAction::InsertNewline
+        }
+        KeyCode::Enter => EditingKeyAction::Submit,
+        KeyCode::Esc => EditingKeyAction::Cancel,
+        KeyCode::Backspace => EditingKeyAction::Backspace,
+        KeyCode::Char(c) => {
+            if key_event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                EditingKeyAction::Ignore
+            } else {
+                EditingKeyAction::InsertChar(c)
+            }
+        }
+        _ => EditingKeyAction::Ignore,
+    }
+}
+
+fn key_event_for_press_event(event: &Event) -> Option<KeyEvent> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => Some(key.code),
+        Event::Key(key) if key.kind == KeyEventKind::Press => Some(*key),
         _ => None,
     }
+}
+
+#[cfg(test)]
+fn key_code_for_press_event(event: &Event) -> Option<KeyCode> {
+    key_event_for_press_event(event).map(|key| key.code)
 }
 
 fn should_rerender_on_event(event: &Event) -> bool {
@@ -1841,12 +1884,16 @@ fn format_context_line(
 
 fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
     let (overlay_kind, title, hints, content) = match &state.input_mode {
-        InputMode::Editing { .. } => (
-            InputOverlayKind::Editing,
-            " Comment ",
-            "Enter to submit • Esc to cancel",
-            state.input_buffer.clone(),
-        ),
+        InputMode::Editing { .. } => {
+            let content = state.input_buffer.clone();
+            let input_lines = usize_to_u16_saturating(content.split('\n').count().max(1));
+            (
+                InputOverlayKind::Editing { input_lines },
+                " Comment ",
+                "Enter to submit • Shift+Enter newline • Esc to cancel",
+                content,
+            )
+        }
         InputMode::ConfirmBatch { count, action } => (
             InputOverlayKind::ConfirmBatch,
             " Batch Action ",
@@ -1867,11 +1914,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
         .borders(ratatui::widgets::Borders::ALL)
         .style(Style::default().bg(palette.bg).fg(palette.fg));
 
-    let lines = vec![
-        Line::from(content),
-        Line::from(""),
-        Line::from(Span::styled(hints, Style::default().fg(palette.dim))),
-    ];
+    let lines = input_overlay_lines(&content, hints, palette);
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -1883,13 +1926,13 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputOverlayKind {
-    Editing,
+    Editing { input_lines: u16 },
     ConfirmBatch,
 }
 
 fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
     let preferred_height = match kind {
-        InputOverlayKind::Editing => 5,
+        InputOverlayKind::Editing { input_lines } => input_lines.saturating_add(4).clamp(5, 12),
         InputOverlayKind::ConfirmBatch => 4,
     };
     let height = area.height.min(preferred_height);
@@ -1906,6 +1949,22 @@ fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
         width,
         height,
     }
+}
+
+fn input_overlay_lines(content: &str, hints: &str, palette: &UiPalette) -> Vec<Line<'static>> {
+    let mut lines = content
+        .split('\n')
+        .map(|line| Line::from(line.to_string()))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        hints.to_string(),
+        Style::default().fg(palette.dim),
+    )));
+    lines
 }
 
 fn centered_rect(r: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -2194,10 +2253,22 @@ mod diff_scope_tests {
             width: 120,
             height: 40,
         };
-        let rect = input_overlay_rect(area, InputOverlayKind::Editing);
+        let rect = input_overlay_rect(area, InputOverlayKind::Editing { input_lines: 1 });
         assert_eq!(rect.width, 96);
         assert_eq!(rect.height, 5);
         assert_eq!(rect.y + rect.height, area.y + area.height);
+    }
+
+    #[test]
+    fn input_overlay_rect_grows_for_multiline_editing() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let rect = input_overlay_rect(area, InputOverlayKind::Editing { input_lines: 4 });
+        assert_eq!(rect.height, 8);
     }
 
     #[test]
@@ -2242,6 +2313,41 @@ mod diff_scope_tests {
         let layout = scope_selector_content_layout(inner);
         assert_eq!(layout.content.height, 0);
         assert_eq!(layout.hints, inner);
+    }
+
+    #[test]
+    fn editing_key_action_shift_enter_inserts_newline() {
+        let key =
+            crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::SHIFT);
+        assert_eq!(
+            editing_key_action_for_event(&key),
+            EditingKeyAction::InsertNewline
+        );
+    }
+
+    #[test]
+    fn editing_key_action_plain_enter_submits() {
+        let key =
+            crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        assert_eq!(editing_key_action_for_event(&key), EditingKeyAction::Submit);
+    }
+
+    #[test]
+    fn input_overlay_lines_preserve_multiline_content() {
+        let palette = UiPalette::default();
+        let lines = input_overlay_lines(
+            "first line\nsecond line",
+            "Enter to submit • Shift+Enter newline • Esc to cancel",
+            &palette,
+        );
+
+        assert_eq!(lines[0].to_string(), "first line");
+        assert_eq!(lines[1].to_string(), "second line");
+        assert_eq!(lines[2].to_string(), "");
+        assert!(
+            lines[3].to_string().contains("Shift+Enter newline"),
+            "expected multiline hint line to include Shift+Enter guidance"
+        );
     }
 
     #[test]
