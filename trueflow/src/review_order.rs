@@ -1,5 +1,5 @@
 use crate::tree::{Tree, TreeNode, TreeNodeId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,7 @@ pub struct ReviewCursor {
 #[derive(Debug, Clone)]
 pub struct ReviewOrder {
     ordered: Vec<ReviewCursor>,
+    index_by_node: HashMap<TreeNodeId, usize>,
 }
 
 impl ReviewOrder {
@@ -74,11 +75,16 @@ impl ReviewOrder {
                 ))
         });
 
-        for (cursor, _) in items {
+        let mut index_by_node = HashMap::with_capacity(items.len());
+        for (index, (cursor, _)) in items.into_iter().enumerate() {
+            index_by_node.insert(cursor.node_id, index);
             ordered.push(cursor);
         }
 
-        Self { ordered }
+        Self {
+            ordered,
+            index_by_node,
+        }
     }
 
     pub fn first_block(&self) -> Option<TreeNodeId> {
@@ -90,10 +96,7 @@ impl ReviewOrder {
         current: TreeNodeId,
         remaining: &HashSet<TreeNodeId>,
     ) -> Option<TreeNodeId> {
-        let index = self
-            .ordered
-            .iter()
-            .position(|cursor| cursor.node_id == current)?;
+        let index = *self.index_by_node.get(&current)?;
         self.ordered
             .iter()
             .skip(index + 1)
@@ -106,10 +109,10 @@ impl ReviewOrder {
         subtree_blocks: &HashSet<TreeNodeId>,
         remaining: &HashSet<TreeNodeId>,
     ) -> Option<TreeNodeId> {
-        let start_index = self
-            .ordered
+        let start_index = subtree_blocks
             .iter()
-            .position(|cursor| subtree_blocks.contains(&cursor.node_id))?;
+            .filter_map(|node_id| self.index_by_node.get(node_id).copied())
+            .min()?;
 
         self.ordered
             .iter()
@@ -123,6 +126,11 @@ impl ReviewOrder {
     #[cfg(test)]
     fn ordered_ids(&self) -> Vec<TreeNodeId> {
         self.ordered.iter().map(|cursor| cursor.node_id).collect()
+    }
+
+    #[cfg(test)]
+    fn index_for(&self, node_id: TreeNodeId) -> Option<usize> {
+        self.index_by_node.get(&node_id).copied()
     }
 }
 
@@ -307,5 +315,42 @@ mod tests {
         let order = ReviewOrder::from_tree(&tree, &unreviewed);
 
         assert_eq!(order.ordered_ids(), vec![struct_id, function_id]);
+    }
+
+    #[test]
+    fn review_order_index_matches_sorted_positions() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-lib".to_string(),
+            Language::Rust,
+        );
+
+        let first = builder.add_block(
+            file,
+            "first".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Struct, 1, &[]),
+            Language::Rust,
+        );
+        let second = builder.add_block(
+            file,
+            "second".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 10, &[]),
+            Language::Rust,
+        );
+
+        let tree = builder.finalize();
+        let unreviewed = HashSet::from([first, second]);
+        let order = ReviewOrder::from_tree(&tree, &unreviewed);
+
+        assert_eq!(order.ordered_ids(), vec![first, second]);
+        assert_eq!(order.index_for(first), Some(0));
+        assert_eq!(order.index_for(second), Some(1));
     }
 }
