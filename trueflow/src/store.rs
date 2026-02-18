@@ -207,15 +207,35 @@ pub trait ReviewStore {
 }
 
 pub fn latest_review_verdicts(records: &[Record]) -> HashMap<String, Verdict> {
-    let mut sorted = records.to_vec();
-    sorted.sort_by_key(|record| record.timestamp);
-    let mut verdicts = HashMap::new();
-    for record in sorted {
-        if record.check == "review" {
-            verdicts.insert(record.fingerprint, record.verdict);
+    let mut latest_by_fingerprint: HashMap<String, (i64, Verdict)> = HashMap::new();
+
+    for record in records {
+        if record.check != "review" {
+            continue;
+        }
+
+        match latest_by_fingerprint.get_mut(&record.fingerprint) {
+            Some((timestamp, verdict)) => {
+                // Keep semantics compatible with stable-sort behavior:
+                // for equal timestamps, later entries in input order win.
+                if record.timestamp >= *timestamp {
+                    *timestamp = record.timestamp;
+                    *verdict = record.verdict.clone();
+                }
+            }
+            None => {
+                latest_by_fingerprint.insert(
+                    record.fingerprint.clone(),
+                    (record.timestamp, record.verdict.clone()),
+                );
+            }
         }
     }
-    verdicts
+
+    latest_by_fingerprint
+        .into_iter()
+        .map(|(fingerprint, (_, verdict))| (fingerprint, verdict))
+        .collect()
 }
 
 pub fn approved_hashes_from_verdicts(verdicts: &HashMap<String, Verdict>) -> HashSet<String> {
@@ -312,5 +332,74 @@ impl ReviewStore for FileStore {
 
         // Lock releases when file is dropped
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(
+        id: &str,
+        fingerprint: &str,
+        check: &str,
+        verdict: Verdict,
+        timestamp: i64,
+    ) -> Record {
+        Record {
+            id: id.to_string(),
+            version: CURRENT_VERSION,
+            fingerprint: fingerprint.to_string(),
+            check: check.to_string(),
+            verdict,
+            identity: Identity::Email {
+                email: "dev@example.com".to_string(),
+            },
+            repo_ref: RepoRef::Vcs {
+                system: VcsSystem::Git,
+                revision: "0123456789abcdef".to_string(),
+            },
+            block_state: BlockState::Committed,
+            timestamp,
+            path_hint: Some("src/lib.rs".to_string()),
+            line_hint: Some(1),
+            note: None,
+            tags: None,
+            attestations: None,
+        }
+    }
+
+    #[test]
+    fn latest_review_verdicts_prefers_highest_timestamp() {
+        let records = vec![
+            record("1", "fp", "review", Verdict::Rejected, 1),
+            record("2", "fp", "review", Verdict::Approved, 2),
+            record("3", "fp", "review", Verdict::Question, 0),
+        ];
+
+        let latest = latest_review_verdicts(&records);
+        assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
+    }
+
+    #[test]
+    fn latest_review_verdicts_uses_last_entry_for_equal_timestamp() {
+        let records = vec![
+            record("1", "fp", "review", Verdict::Rejected, 5),
+            record("2", "fp", "review", Verdict::Approved, 5),
+        ];
+
+        let latest = latest_review_verdicts(&records);
+        assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
+    }
+
+    #[test]
+    fn latest_review_verdicts_ignores_non_review_checks() {
+        let records = vec![
+            record("1", "fp", "security", Verdict::Rejected, 10),
+            record("2", "fp", "review", Verdict::Approved, 1),
+        ];
+
+        let latest = latest_review_verdicts(&records);
+        assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
     }
 }
