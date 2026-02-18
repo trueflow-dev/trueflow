@@ -242,7 +242,10 @@ mod tests {
         let tree = builder.finalize();
 
         let breadcrumb = block_breadcrumb(&tree, impl_block);
-        assert_eq!(breadcrumb, Some("File (src/lib.rs) -> impl Foo".to_string()));
+        assert_eq!(
+            breadcrumb,
+            Some("File (src/lib.rs) -> impl Foo".to_string())
+        );
     }
 
     #[test]
