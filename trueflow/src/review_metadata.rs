@@ -47,7 +47,9 @@ pub fn block_breadcrumb(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
     }
     parts.extend(impl_parts);
     if let Some(current) = current {
-        parts.push(current);
+        if parts.last().is_none_or(|part| part != &current) {
+            parts.push(current);
+        }
     }
 
     if parts.len() > 1 {
@@ -216,6 +218,31 @@ mod tests {
             breadcrumb,
             Some("File (src/lib.rs) -> impl Foo -> fn bar".to_string())
         );
+    }
+
+    #[test]
+    fn breadcrumb_for_impl_block_does_not_duplicate_current_label() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let impl_block = builder.add_block(
+            file,
+            "impl".to_string(),
+            "src/lib.rs".to_string(),
+            block("impl Foo {", BlockKind::Impl, 1, 40),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+
+        let breadcrumb = block_breadcrumb(&tree, impl_block);
+        assert_eq!(breadcrumb, Some("File (src/lib.rs) -> impl Foo".to_string()));
     }
 
     #[test]
