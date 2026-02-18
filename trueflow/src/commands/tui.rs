@@ -317,7 +317,67 @@ fn block_diff_focus_mode_from_config(config: &TuiConfig) -> vcs::BlockDiffFocusM
 
 fn load_scope_options() -> Result<Vec<ScopeOption>> {
     let commits = vcs::recent_commits(8).unwrap_or_default();
+    let workdir_prefix = workdir_prefix_from_git_root();
+    let commits = filter_commits_for_prefix(
+        commits,
+        workdir_prefix.as_deref(),
+        vcs::files_changed_in_revision,
+    );
     Ok(default_scope_options(&commits))
+}
+
+fn filter_commits_for_prefix<F>(
+    commits: Vec<vcs::CommitInfo>,
+    workdir_prefix: Option<&str>,
+    mut changed_paths_for_revision: F,
+) -> Vec<vcs::CommitInfo>
+where
+    F: FnMut(&str) -> Result<HashSet<String>>,
+{
+    let Some(prefix) = workdir_prefix
+        .map(normalize_path_str)
+        .filter(|p| !p.is_empty())
+    else {
+        return commits;
+    };
+
+    commits
+        .into_iter()
+        .filter(|commit| {
+            match changed_paths_for_revision(&commit.id) {
+                Ok(paths) => paths
+                    .iter()
+                    .any(|path| path_matches_workdir_prefix(path, &prefix)),
+                // If we can't resolve changed paths, keep the option instead of hiding it.
+                Err(_) => true,
+            }
+        })
+        .collect()
+}
+
+fn path_matches_workdir_prefix(path: &str, prefix: &str) -> bool {
+    let normalized_path = normalize_path_str(path);
+    let normalized_prefix = normalize_path_str(prefix);
+    normalized_path == normalized_prefix
+        || normalized_path.starts_with(&format!("{normalized_prefix}/"))
+}
+
+fn workdir_prefix_from_git_root() -> Option<String> {
+    let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
+    let cwd = std::env::current_dir().ok()?;
+    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let relative = cwd.strip_prefix(&repo_root).ok()?;
+    let relative_str = normalize_path_str(relative.to_string_lossy().as_ref());
+    if relative_str.is_empty() || relative_str == "." {
+        None
+    } else {
+        Some(relative_str)
+    }
+}
+
+fn normalize_path_str(path: &str) -> String {
+    path.trim_start_matches("./").replace('\\', "/")
 }
 
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
@@ -920,25 +980,69 @@ fn render_scope_selector(frame: &mut Frame, selector: &ScopeSelector) {
         )));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[Enter] select  [j/k] move  [q] quit",
-        Style::default().fg(palette.dim).bg(palette.bg),
-    )));
-
     let block = UiBlock::default()
         .title(" Review scope ")
         .borders(ratatui::widgets::Borders::ALL)
         .style(Style::default().bg(palette.bg).fg(palette.fg));
 
     let popup_area = centered_rect(area, 70, 60);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    let layout = scope_selector_content_layout(inner_area);
+
+    if layout.content.height > 0 && layout.content.width > 0 {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Left)
+                .wrap(Wrap { trim: false }),
+            layout.content,
+        );
+    }
+
+    if layout.hints.height > 0 && layout.hints.width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[Enter] select  [j/k] move  [q] quit",
+                Style::default().fg(palette.dim).bg(palette.bg),
+            )))
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: false }),
-        popup_area,
-    );
+            layout.hints,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScopeSelectorContentLayout {
+    content: Rect,
+    hints: Rect,
+}
+
+fn scope_selector_content_layout(inner: Rect) -> ScopeSelectorContentLayout {
+    let zero = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 0,
+    };
+    if inner.height == 0 || inner.width == 0 {
+        return ScopeSelectorContentLayout {
+            content: zero,
+            hints: zero,
+        };
+    }
+    if inner.height == 1 {
+        return ScopeSelectorContentLayout {
+            content: zero,
+            hints: inner,
+        };
+    }
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    ScopeSelectorContentLayout {
+        content: chunks[0],
+        hints: chunks[1],
+    }
 }
 
 fn ui(frame: &mut Frame, state: &mut AppState) {
@@ -1961,6 +2065,46 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn path_matches_workdir_prefix_matches_exact_and_descendants() {
+        assert!(path_matches_workdir_prefix(
+            "trueflow/src/lib.rs",
+            "trueflow"
+        ));
+        assert!(path_matches_workdir_prefix("trueflow", "trueflow"));
+        assert!(!path_matches_workdir_prefix("other/src/lib.rs", "trueflow"));
+        assert!(!path_matches_workdir_prefix(
+            "trueflowish/src/lib.rs",
+            "trueflow"
+        ));
+    }
+
+    #[test]
+    fn filter_commits_for_prefix_keeps_only_commits_touching_prefix() {
+        let commits = vec![
+            vcs::CommitInfo {
+                id: "a".to_string(),
+                summary: "touches subtree".to_string(),
+            },
+            vcs::CommitInfo {
+                id: "b".to_string(),
+                summary: "outside subtree".to_string(),
+            },
+        ];
+
+        let filtered = filter_commits_for_prefix(commits, Some("trueflow"), |revision| {
+            let paths = match revision {
+                "a" => HashSet::from([String::from("trueflow/src/lib.rs")]),
+                "b" => HashSet::from([String::from("README.md")]),
+                _ => HashSet::new(),
+            };
+            Ok(paths)
+        });
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "a");
+    }
+
+    #[test]
     fn ensure_cached_diff_hunks_inserts_empty_on_loader_error() {
         let mut cache = HashMap::new();
         let path = PathBuf::from("src/lib.rs");
@@ -2069,6 +2213,35 @@ mod diff_scope_tests {
         assert_eq!(rect.height, 3);
         assert_eq!(rect.x, 3);
         assert_eq!(rect.y, 2);
+    }
+
+    #[test]
+    fn scope_selector_content_layout_anchors_hints_to_bottom() {
+        let inner = Rect {
+            x: 4,
+            y: 3,
+            width: 70,
+            height: 12,
+        };
+
+        let layout = scope_selector_content_layout(inner);
+        assert_eq!(layout.hints.height, 1);
+        assert_eq!(layout.hints.y + layout.hints.height, inner.y + inner.height);
+        assert_eq!(layout.content.y, inner.y);
+    }
+
+    #[test]
+    fn scope_selector_content_layout_handles_single_line_inner_area() {
+        let inner = Rect {
+            x: 1,
+            y: 2,
+            width: 30,
+            height: 1,
+        };
+
+        let layout = scope_selector_content_layout(inner);
+        assert_eq!(layout.content.height, 0);
+        assert_eq!(layout.hints, inner);
     }
 
     #[test]
