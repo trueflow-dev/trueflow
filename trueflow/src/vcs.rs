@@ -67,7 +67,7 @@ pub fn repo_from_workdir() -> Result<gix::Repository> {
 
 pub fn git_root_from_workdir() -> Result<Option<PathBuf>> {
     let repo = repo_from_workdir()?;
-    Ok(repo.workdir().map(|path| path.to_path_buf()))
+    Ok(repo.workdir().map(Path::to_path_buf))
 }
 
 pub fn snapshot_from_workdir() -> RepoSnapshot {
@@ -85,10 +85,10 @@ pub fn snapshot_from_workdir() -> RepoSnapshot {
 pub fn git_config_from_workdir() -> Result<GitConfig> {
     let repo = repo_from_workdir()?;
     let config = repo.config_snapshot();
-    let email = config
-        .string("user.email")
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown@localhost".to_string());
+    let email = config.string("user.email").map_or_else(
+        || "unknown@localhost".to_string(),
+        |value| value.to_string(),
+    );
     let signing_key = config
         .string("user.signingkey")
         .map(|value| value.to_string());
@@ -296,19 +296,18 @@ pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Ve
         return Ok(Vec::new());
     }
 
-    let head_commit = match repo.head_commit() {
-        Ok(commit) => commit,
-        Err(_) => return Ok(Vec::new()),
+    let Ok(head_commit) = repo.head_commit() else {
+        return Ok(Vec::new());
     };
 
     let mut commits = Vec::new();
     let mut current = head_commit;
 
     loop {
-        let summary = current
-            .message()
-            .map(|message| message.summary().to_str_lossy().to_string())
-            .unwrap_or_else(|_| "(no message)".to_string());
+        let summary = current.message().map_or_else(
+            |_| "(no message)".to_string(),
+            |message| message.summary().to_str_lossy().to_string(),
+        );
         commits.push(CommitInfo {
             id: current.id().detach().to_string(),
             summary,

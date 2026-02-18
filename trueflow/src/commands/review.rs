@@ -172,7 +172,7 @@ pub fn collect_review_summary(
 
     // 2. Sort files (Files with higher priority blocks come first)
     unreviewed_files.sort_by(|a, b| {
-        let rank_fn = |file: &UnreviewedFile| file.blocks.first().map(kind_rank).unwrap_or(100);
+        let rank_fn = |file: &UnreviewedFile| file.blocks.first().map_or(100, kind_rank);
         (rank_fn(a), &a.path).cmp(&(rank_fn(b), &b.path))
     });
 

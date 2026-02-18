@@ -62,8 +62,7 @@ pub fn run(
 
                 let verdict = latest_verdict
                     .get(&block.hash)
-                    .map(|value| value.as_str())
-                    .unwrap_or("unreviewed");
+                    .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
                     continue;
@@ -117,8 +116,7 @@ pub fn run(
 
                 let verdict = latest_verdict
                     .get(&block.hash)
-                    .map(|value| value.as_str())
-                    .unwrap_or("unreviewed");
+                    .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
                     continue;
@@ -186,9 +184,9 @@ fn print_block_xml(block: &Block, reviews: &[Record]) {
 }
 
 fn escape_xml(s: &str) -> String {
-    s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-        .replace("'", "&apos;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
