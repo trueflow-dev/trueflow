@@ -46,10 +46,10 @@ pub fn block_breadcrumb(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
         parts.push(format!("File ({path})"));
     }
     parts.extend(impl_parts);
-    if let Some(current) = current {
-        if parts.last().is_none_or(|part| part != &current) {
-            parts.push(current);
-        }
+    if let Some(current) = current
+        && parts.last().is_none_or(|part| part != &current)
+    {
+        parts.push(current);
     }
 
     if parts.len() > 1 {
