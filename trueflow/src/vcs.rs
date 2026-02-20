@@ -200,6 +200,27 @@ pub fn diff_hunks_for_file_in_revision(
     diff_hunks_for_file_between_trees(repo, &base_tree, &head_tree, path)
 }
 
+pub fn diff_hunks_for_file_in_range(
+    repo: &gix::Repository,
+    start: &str,
+    end: &str,
+    path: &str,
+) -> Result<Vec<DiffHunk>> {
+    let start_obj = repo.rev_parse_single(start)?;
+    let end_obj = repo.rev_parse_single(end)?;
+    let start_commit = start_obj
+        .object()?
+        .peel_to_commit()
+        .context("start revision must resolve to a commit")?;
+    let end_commit = end_obj
+        .object()?
+        .peel_to_commit()
+        .context("end revision must resolve to a commit")?;
+    let start_tree = start_commit.tree()?;
+    let end_tree = end_commit.tree()?;
+    diff_hunks_for_file_between_trees(repo, &start_tree, &end_tree, path)
+}
+
 fn diff_hunks_for_file_between_trees(
     repo: &gix::Repository,
     base_tree: &gix::Tree<'_>,
@@ -274,6 +295,16 @@ pub fn extract_block_diff_view_for_block(
     }
 
     Some(BlockDiffView { lines })
+}
+
+pub fn block_has_changed_lines_in_diff(block: &Block, hunks: &[DiffHunk]) -> bool {
+    extract_block_diff_view_for_block(block, hunks, BlockDiffFocusMode::WholeBlock).is_some_and(
+        |view| {
+            view.lines
+                .iter()
+                .any(|line| line.kind != DiffLineKind::Context)
+        },
+    )
 }
 
 pub fn files_changed_main_to_head() -> Result<HashSet<String>> {

@@ -57,12 +57,19 @@ pub fn collect_review_summary(
         "review collect (all={}, only={:?}, exclude={:?})",
         options.all, options.only, options.exclude
     );
-    let target_paths = resolve_review_targets(options)?.map(|paths| {
+    let normalized_targets = normalize_targets(options);
+    let target_paths = resolve_review_targets_from_targets(&normalized_targets)?.map(|paths| {
         paths
             .into_iter()
             .map(|path| normalize_path_str(&path))
             .collect::<HashSet<String>>()
     });
+    let diff_overlap_targets = diff_overlap_targets(&normalized_targets);
+    let diff_repo = if diff_overlap_targets.is_some() {
+        Some(vcs::repo_from_workdir()?)
+    } else {
+        None
+    };
     let workdir_prefix = workdir_prefix_from_git_root();
 
     // 1. Load Approved Hashes
@@ -97,6 +104,18 @@ pub fn collect_review_summary(
         }
 
         let language = file.language;
+        let file_diff_hunks = if let (Some(repo), Some(diff_targets)) =
+            (diff_repo.as_ref(), diff_overlap_targets.as_ref())
+        {
+            Some(diff_hunks_for_file_targets(
+                repo,
+                diff_targets,
+                &file.path,
+                workdir_prefix.as_deref(),
+            )?)
+        } else {
+            None
+        };
         let mut reviewable_blocks = Vec::new();
         for block in file.blocks {
             if !filters.allows_block(block.kind) {
@@ -106,6 +125,11 @@ pub fn collect_review_summary(
                 continue;
             }
             if should_skip_impl_by_default(&block, filters) {
+                continue;
+            }
+            if let Some(hunks) = file_diff_hunks.as_deref()
+                && !vcs::block_has_changed_lines_in_diff(&block, hunks)
+            {
                 continue;
             }
             reviewable_blocks.push(block);
@@ -193,8 +217,9 @@ pub fn collect_unreviewed(
     Ok(collect_review_summary(context, options, filters)?.files)
 }
 
-fn resolve_review_targets(options: &ReviewOptions) -> Result<Option<HashSet<String>>> {
-    let targets = normalize_targets(options);
+fn resolve_review_targets_from_targets(
+    targets: &[ReviewTarget],
+) -> Result<Option<HashSet<String>>> {
     if targets
         .iter()
         .any(|target| matches!(target, ReviewTarget::All))
@@ -214,13 +239,13 @@ fn resolve_review_targets(options: &ReviewOptions) -> Result<Option<HashSet<Stri
                 paths.extend(vcs::files_changed_main_to_head()?);
             }
             ReviewTarget::File(path) => {
-                paths.insert(path);
+                paths.insert(path.clone());
             }
             ReviewTarget::Revision(revision) => {
-                paths.extend(vcs::files_changed_in_revision(&revision)?);
+                paths.extend(vcs::files_changed_in_revision(revision)?);
             }
             ReviewTarget::RevisionRange { start, end } => {
-                paths.extend(vcs::files_changed_in_range(&start, &end)?);
+                paths.extend(vcs::files_changed_in_range(start, end)?);
             }
             ReviewTarget::All => {}
         }
@@ -241,6 +266,81 @@ fn normalize_targets(options: &ReviewOptions) -> Vec<ReviewTarget> {
         return vec![ReviewTarget::DirtyWorktree];
     }
     options.targets.clone()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffOverlapTarget {
+    MainDiff,
+    Revision(String),
+    RevisionRange { start: String, end: String },
+}
+
+fn diff_overlap_targets(targets: &[ReviewTarget]) -> Option<Vec<DiffOverlapTarget>> {
+    let mut diff_targets = Vec::new();
+
+    for target in targets {
+        match target {
+            ReviewTarget::MainDiff => diff_targets.push(DiffOverlapTarget::MainDiff),
+            ReviewTarget::Revision(revision) => {
+                diff_targets.push(DiffOverlapTarget::Revision(revision.clone()));
+            }
+            ReviewTarget::RevisionRange { start, end } => {
+                diff_targets.push(DiffOverlapTarget::RevisionRange {
+                    start: start.clone(),
+                    end: end.clone(),
+                });
+            }
+            ReviewTarget::DirtyWorktree | ReviewTarget::All | ReviewTarget::File(_) => {
+                return None;
+            }
+        }
+    }
+
+    if diff_targets.is_empty() {
+        None
+    } else {
+        Some(diff_targets)
+    }
+}
+
+fn diff_hunks_for_file_targets(
+    repo: &gix::Repository,
+    targets: &[DiffOverlapTarget],
+    file_path: &str,
+    workdir_prefix: Option<&str>,
+) -> Result<Vec<vcs::DiffHunk>> {
+    let repo_relative_path = repo_relative_path_for_diff(file_path, workdir_prefix);
+    let mut hunks = Vec::new();
+
+    for target in targets {
+        let target_hunks = match target {
+            DiffOverlapTarget::MainDiff => vcs::diff_hunks_for_file(repo, &repo_relative_path)?,
+            DiffOverlapTarget::Revision(revision) => {
+                vcs::diff_hunks_for_file_in_revision(repo, revision, &repo_relative_path)?
+            }
+            DiffOverlapTarget::RevisionRange { start, end } => {
+                vcs::diff_hunks_for_file_in_range(repo, start, end, &repo_relative_path)?
+            }
+        };
+        hunks.extend(target_hunks);
+    }
+
+    Ok(hunks)
+}
+
+fn repo_relative_path_for_diff(file_path: &str, workdir_prefix: Option<&str>) -> String {
+    let normalized_file_path = normalize_path_str(file_path);
+    let Some(prefix) = workdir_prefix.filter(|value| !value.is_empty()) else {
+        return normalized_file_path;
+    };
+    if normalized_file_path == prefix {
+        return normalized_file_path;
+    }
+    let prefixed_root = format!("{prefix}/");
+    if normalized_file_path.starts_with(&prefixed_root) {
+        return normalized_file_path;
+    }
+    format!("{prefix}/{normalized_file_path}")
 }
 
 fn workdir_prefix_from_git_root() -> Option<String> {

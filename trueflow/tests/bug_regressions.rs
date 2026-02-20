@@ -163,6 +163,45 @@ fn test_review_revision_target_from_subdir() -> Result<()> {
 }
 
 #[test]
+fn test_review_revision_target_includes_only_changed_blocks() -> Result<()> {
+    let repo = TestRepo::new("review_revision_changed_blocks_only")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn changed() {\n    println!(\"before\");\n}\n\npub fn untouched() {\n    println!(\"stable untouched marker\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+
+    repo.git(&["checkout", "-b", "feature/rev-filter"])?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn changed() {\n    println!(\"after\");\n}\n\npub fn untouched() {\n    println!(\"stable untouched marker\");\n}\n",
+    )?;
+    repo.commit_all("Change one block")?;
+
+    let head = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let revision = head.trim();
+    let output = repo.run(&["review", "--json", "--target", &format!("rev:{revision}")])?;
+    let files = json_array(&output)?;
+    let blocks = files.first().context("Expected file in review output")?["blocks"]
+        .as_array()
+        .context("blocks")?;
+
+    assert!(
+        !blocks.is_empty(),
+        "expected changed blocks in revision output"
+    );
+    for block in blocks {
+        let content = block["content"].as_str().context("content")?;
+        assert!(
+            !content.contains("stable untouched marker"),
+            "revision-scoped review included an unchanged block: {content}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_review_progress_counts_duplicate_blocks() -> Result<()> {
     let repo = TestRepo::new("review_duplicates")?;
     // Two identical functions
