@@ -82,6 +82,10 @@ impl TestRepo {
         run_cmd(&self.path, args)
     }
 
+    pub fn run_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+        run_cmd_with_env(&self.path, args, envs)
+    }
+
     pub fn run_in(&self, args: &[&str], dir: &Path) -> Result<String> {
         run_cmd(dir, args)
     }
@@ -123,6 +127,22 @@ fn build_cmd(dir: &Path, args: &[&str]) -> Command {
 
 fn run_cmd(dir: &Path, args: &[&str]) -> Result<String> {
     let output = build_cmd(dir, args).output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "trueflow failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn run_cmd_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = build_cmd(dir, args);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+
+    let output = cmd.output()?;
     if !output.status.success() {
         anyhow::bail!(
             "trueflow failed: {}",

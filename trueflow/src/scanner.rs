@@ -4,12 +4,12 @@ use crate::block_splitter;
 use crate::hashing::hash_str;
 use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
-use crate::vcs;
 use anyhow::Result;
 use dirs::home_dir;
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,8 +17,10 @@ use walkdir::WalkDir;
 
 pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
     let root = root.as_ref();
-    if let Some(cached) = load_cache(root)? {
-        return Ok(cached);
+    match load_cache(root) {
+        Ok(Some(cached)) => return Ok(cached),
+        Ok(None) => {}
+        Err(err) => debug!("scan cache unavailable, continuing without cache: {err}"),
     }
 
     let mut files = Vec::new();
@@ -29,19 +31,21 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                warn!("Skipping unreadable entry: {err}");
+                log_walkdir_scan_error(&err);
                 continue;
             }
         };
         if entry.file_type().is_file() {
             match process_file(entry.path()) {
                 Ok(file_state) => files.push(file_state),
-                Err(e) => warn!("Skipping file {:?}: {}", entry.path(), e),
+                Err(err) => log_process_file_error(entry.path(), &err),
             }
         }
     }
 
-    write_cache(root, &files)?;
+    if let Err(err) = write_cache(root, &files) {
+        debug!("failed to write scan cache, continuing: {err}");
+    }
     Ok(files)
 }
 
@@ -56,13 +60,13 @@ fn is_ignored(entry: &walkdir::DirEntry) -> bool {
     // Basic ignore rules
     name.starts_with('.') || // .git, .trueflow, .env
     name == "target" ||      // rust build
-    name == "node_modules" // js dependencies
+    name == "node_modules" || // js dependencies
+    name == "mutants.out" // mutation testing artifacts
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
     files: Vec<CachedFile>,
-    repo_revision: Option<String>,
     root_hash: String,
 }
 
@@ -74,37 +78,54 @@ struct CachedFile {
     file_state: FileState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified_at: u64,
+    size: u64,
+}
+
 fn load_cache(root: &Path) -> Result<Option<Vec<FileState>>> {
     let cache_path = cache_path(root)?;
     let contents = match fs::read_to_string(&cache_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            debug!("failed to read scan cache at {cache_path:?}: {err}");
+            return Ok(None);
+        }
     };
 
-    let entry: CacheEntry = serde_json::from_str(&contents)?;
-    if entry.repo_revision != vcs::snapshot_from_workdir().repo_ref_revision {
-        return Ok(None);
-    }
+    let entry: CacheEntry = match serde_json::from_str(&contents) {
+        Ok(entry) => entry,
+        Err(err) => {
+            debug!("failed to parse scan cache at {cache_path:?}: {err}");
+            return Ok(None);
+        }
+    };
 
     let root_hash = cache_root_hash(root);
     if entry.root_hash != root_hash {
         return Ok(None);
     }
 
+    let current_stamps = match collect_current_file_stamps(root) {
+        Ok(stamps) => stamps,
+        Err(err) => {
+            debug!("failed to build current file manifest for cache check: {err}");
+            return Ok(None);
+        }
+    };
+
+    if current_stamps.len() != entry.files.len() {
+        return Ok(None);
+    }
+
     let mut files = Vec::new();
     for cached in entry.files {
-        let full_path = root.join(&cached.path);
-        let metadata = match fs::metadata(&full_path) {
-            Ok(metadata) => metadata,
-            Err(_) => return Ok(None),
+        let Some(current) = current_stamps.get(&cached.path) else {
+            return Ok(None);
         };
-        let modified = match metadata.modified() {
-            Ok(time) => time,
-            Err(_) => return Ok(None),
-        };
-        let modified_at = system_time_to_epoch(modified);
-        if modified_at != cached.modified_at || metadata.len() != cached.size {
+        if current.modified_at != cached.modified_at || current.size != cached.size {
             return Ok(None);
         }
         files.push(cached.file_state);
@@ -134,7 +155,6 @@ fn write_cache(root: &Path, files: &[FileState]) -> Result<()> {
 
     let entry = CacheEntry {
         files: cached_files,
-        repo_revision: vcs::snapshot_from_workdir().repo_ref_revision,
         root_hash: cache_root_hash(root),
     };
 
@@ -166,10 +186,96 @@ fn cache_root_hash(root: &Path) -> String {
     hash_str(identity.to_string_lossy().as_ref())
 }
 
+fn collect_current_file_stamps(root: &Path) -> Result<HashMap<String, FileStamp>> {
+    let mut stamps = HashMap::new();
+    let walker = WalkDir::new(root).into_iter();
+    for entry in walker.filter_entry(|e| !is_ignored(e)) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                if is_permission_denied_walkdir(&err) {
+                    debug!("Skipping unreadable entry during cache validation: {err}");
+                    continue;
+                }
+                return Err(err.into());
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(err) if is_permission_denied_io(&err) => {
+                debug!(
+                    "Skipping unreadable file during cache validation {:?}: {}",
+                    entry.path(),
+                    err
+                );
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(err) if is_permission_denied_io(&err) => {
+                debug!(
+                    "Skipping unreadable metadata during cache validation {:?}: {}",
+                    entry.path(),
+                    err
+                );
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let path = normalize_cache_key(root, entry.path());
+        stamps.insert(
+            path,
+            FileStamp {
+                modified_at: system_time_to_epoch(modified),
+                size: metadata.len(),
+            },
+        );
+    }
+    Ok(stamps)
+}
+
+fn normalize_cache_key(_root: &Path, path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_start_matches("./")
+        .replace('\\', "/")
+}
+
 fn system_time_to_epoch(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn is_permission_denied_io(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+fn is_permission_denied_walkdir(err: &walkdir::Error) -> bool {
+    err.io_error().is_some_and(is_permission_denied_io)
+}
+
+fn log_walkdir_scan_error(err: &walkdir::Error) {
+    if is_permission_denied_walkdir(err) {
+        debug!("Skipping unreadable entry: {err}");
+    } else {
+        warn!("Skipping unreadable entry: {err}");
+    }
+}
+
+fn log_process_file_error(path: &Path, err: &anyhow::Error) {
+    if err
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(is_permission_denied_io)
+    {
+        debug!("Skipping unreadable file {path:?}: {err}");
+    } else {
+        warn!("Skipping file {path:?}: {err}");
+    }
 }
 
 // TODO: Investigate whether salsa can help incremental review caching.
