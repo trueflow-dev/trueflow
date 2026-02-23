@@ -5,7 +5,72 @@ use crate::hashing::hash_str;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::{Context, Result};
 use log::info;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use std::sync::LazyLock;
+use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor, StreamingIterator};
+
+static RUST_ATTR_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_rust::LANGUAGE.into(),
+        "(attribute_item) @attr",
+        "rust attribute query",
+    )
+});
+static PYTHON_DECORATED_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_python::LANGUAGE.into(),
+        "(decorated_definition (decorator) @decor (function_definition name: (identifier) @name) @func)",
+        "python decorated test query",
+    )
+});
+static PYTHON_FUNCTION_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_python::LANGUAGE.into(),
+        "(function_definition name: (identifier) @name) @func",
+        "python function test query",
+    )
+});
+static JAVASCRIPT_ARROW_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_javascript::LANGUAGE.into(),
+        "(call_expression function: (identifier) @name arguments: (arguments (arrow_function) @fn)) @call",
+        "javascript arrow test query",
+    )
+});
+static JAVASCRIPT_MEMBER_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_javascript::LANGUAGE.into(),
+        "(call_expression function: (member_expression object: (identifier) @name)) @call",
+        "javascript member test query",
+    )
+});
+static TYPESCRIPT_ARROW_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "(call_expression function: (identifier) @name arguments: (arguments (arrow_function) @fn)) @call",
+        "typescript arrow test query",
+    )
+});
+static TYPESCRIPT_MEMBER_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "(call_expression function: (member_expression object: (identifier) @name)) @call",
+        "typescript member test query",
+    )
+});
+static SHELL_FUNCTION_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_bash::LANGUAGE.into(),
+        "(function_definition name: (word) @name) @func",
+        "shell function test query",
+    )
+});
+
+fn compile_query(language: &TsLanguage, source: &str, name: &str) -> Query {
+    match Query::new(language, source) {
+        Ok(query) => query,
+        Err(err) => panic!("invalid {name}: {err}"),
+    }
+}
 
 pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
     info!(
@@ -329,7 +394,8 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             "trait_item" => BlockKind::Interface,
             "mod_item" | "foreign_mod_item" => BlockKind::Module,
             "use_declaration" | "extern_crate_declaration" => BlockKind::Import,
-            "const_item" | "static_item" => BlockKind::Const,
+            "const_item" => BlockKind::Const,
+            "static_item" => BlockKind::Static,
             "macro_invocation" | "macro_definition" => BlockKind::Macro,
             "type_item" | "associated_type" => BlockKind::Type,
             "function_signature_item" => BlockKind::FunctionSignature,
@@ -473,13 +539,11 @@ fn collect_test_ranges(
     let mut ranges: Vec<crate::block::Span> = Vec::new();
     match lang {
         Language::Rust => {
-            let attr_query =
-                Query::new(&tree_sitter_rust::LANGUAGE.into(), "(attribute_item) @attr")?;
             let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&attr_query, tree.root_node(), source.as_bytes());
+            let mut matches = cursor.matches(&RUST_ATTR_QUERY, tree.root_node(), source.as_bytes());
             while let Some(match_) = matches.next() {
                 for capture in match_.captures {
-                    let name = &attr_query.capture_names()[capture.index as usize];
+                    let name = &RUST_ATTR_QUERY.capture_names()[capture.index as usize];
                     if *name != "attr" {
                         continue;
                     }
@@ -506,50 +570,19 @@ fn collect_test_ranges(
             }
         }
         Language::Python => {
-            let query = Query::new(
-                &tree_sitter_python::LANGUAGE.into(),
-                "(decorated_definition (decorator) @decor (function_definition name: (identifier) @name) @func)",
-            )?;
-            collect_python_test_ranges(&query, tree, source, &mut ranges)?;
-
-            let query = Query::new(
-                &tree_sitter_python::LANGUAGE.into(),
-                "(function_definition name: (identifier) @name) @func",
-            )?;
-            collect_python_test_ranges(&query, tree, source, &mut ranges)?;
+            collect_python_test_ranges(&PYTHON_DECORATED_TEST_QUERY, tree, source, &mut ranges)?;
+            collect_python_test_ranges(&PYTHON_FUNCTION_TEST_QUERY, tree, source, &mut ranges)?;
         }
         Language::JavaScript => {
-            let query = Query::new(
-                &tree_sitter_javascript::LANGUAGE.into(),
-                "(call_expression function: (identifier) @name arguments: (arguments (arrow_function) @fn)) @call",
-            )?;
-            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
-
-            let query = Query::new(
-                &tree_sitter_javascript::LANGUAGE.into(),
-                "(call_expression function: (member_expression object: (identifier) @name)) @call",
-            )?;
-            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
+            collect_js_test_ranges(&JAVASCRIPT_ARROW_TEST_QUERY, tree, source, &mut ranges)?;
+            collect_js_test_ranges(&JAVASCRIPT_MEMBER_TEST_QUERY, tree, source, &mut ranges)?;
         }
         Language::TypeScript => {
-            let query = Query::new(
-                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                "(call_expression function: (identifier) @name arguments: (arguments (arrow_function) @fn)) @call",
-            )?;
-            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
-
-            let query = Query::new(
-                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                "(call_expression function: (member_expression object: (identifier) @name)) @call",
-            )?;
-            collect_js_test_ranges(&query, tree, source, &mut ranges)?;
+            collect_js_test_ranges(&TYPESCRIPT_ARROW_TEST_QUERY, tree, source, &mut ranges)?;
+            collect_js_test_ranges(&TYPESCRIPT_MEMBER_TEST_QUERY, tree, source, &mut ranges)?;
         }
         Language::Shell => {
-            let query = Query::new(
-                &tree_sitter_bash::LANGUAGE.into(),
-                "(function_definition name: (word) @name) @func",
-            )?;
-            collect_shell_test_ranges(&query, tree, source, &mut ranges)?;
+            collect_shell_test_ranges(&SHELL_FUNCTION_TEST_QUERY, tree, source, &mut ranges)?;
         }
         _ => {}
     }
@@ -816,6 +849,13 @@ mod tests {
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Impl));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
+    }
+
+    #[test]
+    fn test_split_rust_top_level_static_maps_to_static_kind() {
+        let content = "static MAX: usize = 1;\n";
+        let blocks = split(content, Language::Rust).unwrap();
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Static));
     }
 
     #[test]
