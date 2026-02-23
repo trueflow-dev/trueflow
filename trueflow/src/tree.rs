@@ -66,6 +66,7 @@ pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
     nodes_by_path: HashMap<String, TreeNodeId>,
+    block_nodes_by_path_hash_start: HashMap<String, HashMap<String, HashMap<usize, TreeNodeId>>>,
     #[allow(dead_code)]
     file_paths: HashSet<String>,
 }
@@ -130,42 +131,12 @@ impl Tree {
             .filter(|node| matches!(node.kind, TreeNodeKind::File))
     }
 
-    pub fn node_by_path_and_hash(&self, path: &str, hash: &str) -> Option<TreeNodeId> {
-        let file_id = self.find_by_path(path)?;
-        let file_node = self.node(file_id);
-        if matches!(file_node.kind, TreeNodeKind::File) && file_node.hash == hash {
-            return Some(file_id);
-        }
-        let mut stack = file_node.children.clone();
-        while let Some(node_id) = stack.pop() {
-            let node = self.node(node_id);
-            if matches!(node.kind, TreeNodeKind::Block) && node.hash == hash {
-                return Some(node_id);
-            }
-            stack.extend(node.children.iter().copied());
-        }
-        None
-    }
-
     pub fn find_block_node(&self, path: &str, block: &Block) -> Option<TreeNodeId> {
-        let file_id = self.find_by_path(path)?;
-        let file_node = self.node(file_id);
-
-        let mut stack = file_node.children.clone();
-        while let Some(node_id) = stack.pop() {
-            let node = self.node(node_id);
-            if matches!(node.kind, TreeNodeKind::Block)
-                && node.hash == block.hash
-                && node
-                    .block
-                    .as_ref()
-                    .is_some_and(|b| b.start_line == block.start_line)
-            {
-                return Some(node_id);
-            }
-            stack.extend(node.children.iter().copied());
-        }
-        None
+        self.block_nodes_by_path_hash_start
+            .get(path)?
+            .get(block.hash.as_str())?
+            .get(&block.start_line)
+            .copied()
     }
 
     #[allow(dead_code)]
@@ -174,9 +145,15 @@ impl Tree {
     }
 
     pub fn is_node_covered(&self, id: TreeNodeId, approved_hashes: &HashSet<String>) -> bool {
-        self.ancestors(id)
-            .iter()
-            .any(|node_id| approved_hashes.contains(&self.node(*node_id).hash))
+        let mut current = Some(id);
+        while let Some(node_id) = current {
+            let node = self.node(node_id);
+            if approved_hashes.contains(&node.hash) {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
     }
 }
 
@@ -302,10 +279,12 @@ impl TreeBuilder {
             .unwrap_or_default();
         self.attach_children(self.root, root_children);
         self.compute_hashes(self.root);
+        let block_nodes_by_path_hash_start = build_block_lookup_indexes(&self.nodes);
         Tree {
             nodes: self.nodes,
             root: self.root,
             nodes_by_path: self.nodes_by_path,
+            block_nodes_by_path_hash_start,
             file_paths: self.file_paths,
         }
     }
@@ -364,6 +343,32 @@ impl TreeBuilder {
         }
         self.nodes[id.0].hash = hash_str(&concatenated);
     }
+}
+
+fn build_block_lookup_indexes(
+    nodes: &[TreeNode],
+) -> HashMap<String, HashMap<String, HashMap<usize, TreeNodeId>>> {
+    let mut by_path_hash_start: HashMap<String, HashMap<String, HashMap<usize, TreeNodeId>>> =
+        HashMap::new();
+
+    for node in nodes {
+        if !matches!(node.kind, TreeNodeKind::Block) {
+            continue;
+        }
+
+        let Some(block) = node.block.as_ref() else {
+            continue;
+        };
+
+        by_path_hash_start
+            .entry(node.path.clone())
+            .or_default()
+            .entry(node.hash.clone())
+            .or_default()
+            .insert(block.start_line, node.id);
+    }
+
+    by_path_hash_start
 }
 
 fn block_label(block: &Block) -> String {
@@ -448,6 +453,29 @@ pub fn build_tree_from_path(root: &str) -> anyhow::Result<Tree> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_block_node_distinguishes_duplicate_hashes_by_start_line() {
+        let shared_content = "fn dup() {}".to_string();
+        let first = Block::new(shared_content.clone(), BlockKind::Function, 1, 2);
+        let second = Block::new(shared_content, BlockKind::Function, 10, 11);
+        assert_eq!(first.hash, second.hash);
+        assert_ne!(first.start_line, second.start_line);
+
+        let files = vec![FileState {
+            path: "src/lib.rs".to_string(),
+            language: Language::Rust,
+            file_hash: "file-hash".to_string(),
+            blocks: vec![first.clone(), second.clone()],
+        }];
+
+        let tree = build_tree_from_files(&files);
+        let first_id = tree.find_block_node("src/lib.rs", &first);
+        let second_id = tree.find_block_node("src/lib.rs", &second);
+        assert!(first_id.is_some());
+        assert!(second_id.is_some());
+        assert_ne!(first_id, second_id);
+    }
 
     #[test]
     fn test_directory_hash_uses_sorted_children() {

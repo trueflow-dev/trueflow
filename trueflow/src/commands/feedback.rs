@@ -5,6 +5,7 @@ use crate::policy::should_skip_imports_by_default;
 use crate::scanner;
 use crate::store::{
     FileStore, Identity, Record, ReviewStore, Verdict, approved_hashes_from_verdicts,
+    latest_verdicts,
 };
 use crate::tree;
 use anyhow::Result;
@@ -28,18 +29,14 @@ pub fn run(
     let store = FileStore::new()?;
     let history = store.read_history()?;
 
-    // 3. Group Reviews by Fingerprint
+    // 3. Group Reviews by target key
     // We want ALL reviews for a fingerprint, not just the latest.
+    let latest_verdict: HashMap<String, Verdict> = latest_verdicts(&history, None);
     let mut reviews_by_fp: HashMap<String, Vec<Record>> = HashMap::new();
-    let mut latest_verdict: HashMap<String, Verdict> = HashMap::new();
 
     for record in history {
-        // Update latest verdict (Last Write Wins)
-        latest_verdict.insert(record.fingerprint.clone(), record.verdict.clone());
-
-        // Collect history
         reviews_by_fp
-            .entry(record.fingerprint.clone())
+            .entry(record.lookup_key().to_string())
             .or_default()
             .push(record);
     }
@@ -70,7 +67,7 @@ pub fn run(
 
                 if !include_approved
                     && tree
-                        .node_by_path_and_hash(&file.path, &block.hash)
+                        .find_block_node(&file.path, &block)
                         .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
                 {
                     continue;
@@ -124,7 +121,7 @@ pub fn run(
 
                 if !include_approved
                     && tree
-                        .node_by_path_and_hash(&file.path, &block.hash)
+                        .find_block_node(&file.path, &block)
                         .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
                 {
                     continue;

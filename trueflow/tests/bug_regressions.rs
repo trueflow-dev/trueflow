@@ -135,6 +135,48 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
 }
 
 #[test]
+fn test_feedback_latest_timestamp_wins() -> Result<()> {
+    let repo = TestRepo::new("feedback_timestamp")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Add lib")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let hash = first_block_hash(&output)?;
+
+    let trueflow_dir = repo.path.join(".trueflow");
+    let newer_approved = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            check: Some("security"),
+            verdict: Some("approved"),
+            timestamp: Some(2000),
+            ..Default::default()
+        },
+    );
+    let older_rejected = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            check: Some("security"),
+            verdict: Some("rejected"),
+            timestamp: Some(1000),
+            ..Default::default()
+        },
+    );
+    // Intentionally write the older record last to verify timestamp, not file order, decides.
+    write_reviews_jsonl(&trueflow_dir, &[newer_approved, older_rejected])?;
+
+    let output = repo.run(&["feedback", "--format", "json", "--include-approved"])?;
+    let entries = json_array(&output)?;
+    let entry = entries.first().context("expected feedback entry")?;
+    assert_eq!(
+        entry["latest_verdict"].as_str().context("latest_verdict")?,
+        "approved"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_review_revision_target_from_subdir() -> Result<()> {
     let repo = TestRepo::new("review_revision_subdir")?;
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
@@ -290,6 +332,195 @@ fn test_scan_skips_unreadable_entries() -> Result<()> {
             .unwrap_or_default()
             .contains("src/main.rs")
     }));
+    Ok(())
+}
+
+#[test]
+fn test_scan_cache_write_permission_error_is_non_fatal() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("scan_cache_write_perm")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.commit_all("Add main")?;
+
+    let home = repo.path.join("readonly-home");
+    fs::create_dir_all(&home)?;
+    let mut perms = fs::metadata(&home)?.permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(&home, perms)?;
+
+    let home_value = home.to_string_lossy().to_string();
+    let run_result = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())]);
+
+    let mut reset = fs::metadata(&home)?.permissions();
+    reset.set_mode(0o755);
+    fs::set_permissions(&home, reset)?;
+
+    let output = run_result?;
+    let json: Value = serde_json::from_str(&output)?;
+    let files = json.as_array().context("Expected array")?;
+    assert!(files.iter().any(|entry| {
+        entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("src/main.rs")
+    }));
+    Ok(())
+}
+
+#[test]
+fn test_scan_cache_detects_new_untracked_files() -> Result<()> {
+    let repo = TestRepo::new("scan_cache_new_untracked")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.commit_all("Add main")?;
+
+    let home = repo.path.join("cache-home");
+    fs::create_dir_all(&home)?;
+    let home_value = home.to_string_lossy().to_string();
+
+    let initial = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
+    let initial_files = json_array(&initial)?;
+    assert!(initial_files.iter().any(|entry| {
+        entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("src/main.rs")
+    }));
+
+    repo.write("src/new_file.rs", "pub fn new_file() {}\n")?;
+
+    let rescanned = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
+    let rescanned_files = json_array(&rescanned)?;
+    assert!(rescanned_files.iter().any(|entry| {
+        entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("src/new_file.rs")
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn test_scan_ignores_mutants_out_directory() -> Result<()> {
+    let repo = TestRepo::new("scan_ignores_mutants_out")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.commit_all("Add main")?;
+
+    repo.write(
+        "mutants.out/log/baseline.log",
+        "generated logs should be ignored\n",
+    )?;
+    repo.write("mutants.out/mutants.json", "{}\n")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&output)?;
+
+    assert!(files.iter().all(|entry| {
+        !entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mutants.out/")
+    }));
+    assert!(files.iter().any(|entry| {
+        entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("src/main.rs")
+    }));
+    Ok(())
+}
+
+#[test]
+fn test_feedback_uses_precise_block_lookup_for_coverage() -> Result<()> {
+    let repo = TestRepo::new("feedback_precise_lookup")?;
+    repo.write(
+        "src/lib.rs",
+        "    fn dup() {\n        println!(\"same\");\n    }\n\nstruct Foo;\n\nimpl Foo {\n    fn dup() {\n        println!(\"same\");\n    }\n}\n",
+    )?;
+    repo.commit_all("Add duplicate hash blocks")?;
+
+    let scan_output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&scan_output)?;
+    let file = files
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some("src/lib.rs"))
+        .context("expected src/lib.rs in scan output")?;
+    let blocks = file["blocks"]
+        .as_array()
+        .context("blocks should be array")?;
+
+    let impl_hash = blocks
+        .iter()
+        .find(|block| block["kind"].as_str() == Some("impl"))
+        .and_then(|block| block["hash"].as_str())
+        .context("expected impl block hash")?
+        .to_string();
+
+    let duplicate_hash = blocks
+        .iter()
+        .find(|block| block["kind"].as_str() == Some("function"))
+        .and_then(|block| block["hash"].as_str())
+        .context("expected function block hash")?
+        .to_string();
+
+    let function_start_line = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("function")
+                && block["hash"].as_str() == Some(duplicate_hash.as_str())
+        })
+        .and_then(|block| block["start_line"].as_u64())
+        .context("expected function start line")?;
+
+    let method_start_line = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("method")
+                && block["hash"].as_str() == Some(duplicate_hash.as_str())
+        })
+        .and_then(|block| block["start_line"].as_u64())
+        .context("expected method start line")?;
+
+    assert_ne!(function_start_line, method_start_line);
+
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &impl_hash,
+        "--verdict",
+        "approved",
+        "--quiet",
+    ])?;
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &duplicate_hash,
+        "--verdict",
+        "question",
+        "--quiet",
+    ])?;
+
+    let feedback_output = repo.run(&["feedback", "--format", "json"])?;
+    let feedback = json_array(&feedback_output)?;
+    let duplicate_entries: Vec<&Value> = feedback
+        .iter()
+        .filter(|entry| {
+            entry["file"].as_str() == Some("src/lib.rs")
+                && entry["block"]["hash"].as_str() == Some(duplicate_hash.as_str())
+        })
+        .collect();
+
+    assert_eq!(
+        duplicate_entries.len(),
+        1,
+        "expected only uncovered duplicate hash block in feedback"
+    );
+    assert_eq!(
+        duplicate_entries[0]["block"]["start_line"].as_u64(),
+        Some(function_start_line)
+    );
+
     Ok(())
 }
 
