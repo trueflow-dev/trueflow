@@ -10,7 +10,7 @@ use crate::review_scope::{
     DiffQuery, ReviewScope, ScopeOption, default_scope_options, diff_query_for_scope,
 };
 use crate::review_session;
-use crate::store::Verdict;
+use crate::store::{ReviewTargetKind, Verdict};
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
 use anyhow::Result;
@@ -848,12 +848,7 @@ fn execute_action(
 
     with_terminal_suspend(terminal, || {
         let node = state.navigator.tree.node(node_id);
-        let fingerprint = match node.kind {
-            TreeNodeKind::Root => "root".to_string(), // Or repo hash?
-            TreeNodeKind::Directory => node.hash.clone(),
-            TreeNodeKind::File => node.hash.clone(),
-            TreeNodeKind::Block => node.hash.clone(),
-        };
+        let (fingerprint, target_kind) = fingerprint_and_target_kind_for_node(node);
 
         // For root/dir, path might be empty or a dir path.
         // For file/block, it's the file path.
@@ -872,6 +867,7 @@ fn execute_action(
             context,
             mark::MarkParams {
                 fingerprint,
+                target_kind: Some(target_kind),
                 verdict: verdict.clone(),
                 check: "review".to_string(),
                 note,
@@ -883,6 +879,16 @@ fn execute_action(
 
     apply_action_locally(state, node_id, &verdict, next_id);
     Ok(())
+}
+
+fn fingerprint_and_target_kind_for_node(
+    node: &crate::tree::TreeNode,
+) -> (String, ReviewTargetKind) {
+    match node.kind {
+        TreeNodeKind::Root | TreeNodeKind::Directory => (node.hash.clone(), ReviewTargetKind::Tree),
+        TreeNodeKind::File => (node.hash.clone(), ReviewTargetKind::File),
+        TreeNodeKind::Block => (node.hash.clone(), ReviewTargetKind::Block),
+    }
 }
 
 fn with_terminal_suspend<F>(
@@ -2082,6 +2088,10 @@ mod focus_layout_tests {
 #[cfg(test)]
 mod diff_scope_tests {
     use super::*;
+    use crate::analysis::Language;
+    use crate::block::{Block, BlockKind};
+    use crate::store::ReviewTargetKind;
+    use crate::tree::TreeBuilder;
 
     #[test]
     fn diff_query_uses_main_diff_for_main_scope() {
@@ -2497,6 +2507,33 @@ mod diff_scope_tests {
 
         assert_eq!(first, second);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn fingerprint_and_target_kind_for_root_uses_tree_hash() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file,
+            "function".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new("fn run() {}".to_string(), BlockKind::Function, 0, 1),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let root_node = tree.node(root);
+
+        let (fingerprint, kind) = fingerprint_and_target_kind_for_node(root_node);
+        assert_eq!(fingerprint, root_node.hash);
+        assert_eq!(kind, ReviewTargetKind::Tree);
     }
 }
 

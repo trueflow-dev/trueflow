@@ -32,7 +32,7 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
 
     for record in history {
         reviews_by_fp
-            .entry(record.fingerprint.clone())
+            .entry(record.lookup_key().to_string())
             .or_default()
             .push(record);
     }

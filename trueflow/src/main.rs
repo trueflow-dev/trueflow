@@ -56,6 +56,7 @@ fn main() -> Result<()> {
             &context,
             commands::mark::MarkParams {
                 fingerprint: fingerprint.clone(),
+                target_kind: None,
                 verdict: verdict.parse()?,
                 check: check.clone(),
                 note: note.clone(),

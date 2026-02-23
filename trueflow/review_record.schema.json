@@ -44,6 +44,12 @@
       ],
       "type": "string"
     },
+    "ContentHash": {
+      "type": "string"
+    },
+    "DiffFingerprint": {
+      "type": "string"
+    },
     "Identity": {
       "oneOf": [
         {
@@ -87,6 +93,78 @@
             "type",
             "system",
             "revision"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ReviewTargetRef": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "hash": {
+              "$ref": "#/$defs/ContentHash"
+            },
+            "kind": {
+              "const": "block",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "hash"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "hash": {
+              "$ref": "#/$defs/ContentHash"
+            },
+            "kind": {
+              "const": "file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "hash"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "hash": {
+              "$ref": "#/$defs/ContentHash"
+            },
+            "kind": {
+              "const": "tree",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "hash"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fingerprint": {
+              "$ref": "#/$defs/DiffFingerprint"
+            },
+            "kind": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "fingerprint"
           ],
           "type": "object"
         }
@@ -167,6 +245,16 @@
       "type": [
         "array",
         "null"
+      ]
+    },
+    "target": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReviewTargetRef"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "timestamp": {

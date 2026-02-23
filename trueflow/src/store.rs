@@ -70,6 +70,107 @@ pub enum BlockState {
     Unknown,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+pub struct ContentHash(String);
+
+impl ContentHash {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ContentHash {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for ContentHash {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+pub struct DiffFingerprint(String);
+
+impl DiffFingerprint {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for DiffFingerprint {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for DiffFingerprint {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(deny_unknown_fields)]
+pub enum ReviewTargetKind {
+    Block,
+    File,
+    Tree,
+    Diff,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[schemars(deny_unknown_fields)]
+pub enum ReviewTargetRef {
+    Block { hash: ContentHash },
+    File { hash: ContentHash },
+    Tree { hash: ContentHash },
+    Diff { fingerprint: DiffFingerprint },
+}
+
+impl ReviewTargetRef {
+    pub fn lookup_key(&self) -> &str {
+        match self {
+            ReviewTargetRef::Block { hash }
+            | ReviewTargetRef::File { hash }
+            | ReviewTargetRef::Tree { hash } => hash.as_str(),
+            ReviewTargetRef::Diff { fingerprint } => fingerprint.as_str(),
+        }
+    }
+}
+
+impl ReviewTargetKind {
+    pub fn into_target(self, value: impl Into<String>) -> ReviewTargetRef {
+        let value = value.into();
+        match self {
+            ReviewTargetKind::Block => ReviewTargetRef::Block {
+                hash: ContentHash::new(value),
+            },
+            ReviewTargetKind::File => ReviewTargetRef::File {
+                hash: ContentHash::new(value),
+            },
+            ReviewTargetKind::Tree => ReviewTargetRef::Tree {
+                hash: ContentHash::new(value),
+            },
+            ReviewTargetKind::Diff => ReviewTargetRef::Diff {
+                fingerprint: DiffFingerprint::new(value),
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[schemars(deny_unknown_fields)]
@@ -101,6 +202,8 @@ pub struct Record {
     #[serde(default = "default_version")]
     #[schemars(range(min = 0))]
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ReviewTargetRef>,
     pub fingerprint: String,
     #[schemars(length(min = 1))]
     pub check: String,
@@ -123,6 +226,12 @@ pub struct Record {
 }
 
 impl Record {
+    pub fn lookup_key(&self) -> &str {
+        self.target
+            .as_ref()
+            .map_or(self.fingerprint.as_str(), ReviewTargetRef::lookup_key)
+    }
+
     pub fn signing_payload(&self) -> Result<String> {
         let mut payload = self.clone();
         payload.attestations = None;
@@ -206,15 +315,16 @@ pub trait ReviewStore {
     fn append(&self, record: Record) -> Result<()>;
 }
 
-pub fn latest_review_verdicts(records: &[Record]) -> HashMap<String, Verdict> {
-    let mut latest_by_fingerprint: HashMap<String, (i64, Verdict)> = HashMap::new();
+pub fn latest_verdicts(records: &[Record], check_filter: Option<&str>) -> HashMap<String, Verdict> {
+    let mut latest_by_target_key: HashMap<String, (i64, Verdict)> = HashMap::new();
 
     for record in records {
-        if record.check != "review" {
+        if check_filter.is_some_and(|check| record.check != check) {
             continue;
         }
 
-        match latest_by_fingerprint.get_mut(&record.fingerprint) {
+        let key = record.lookup_key();
+        match latest_by_target_key.get_mut(key) {
             Some((timestamp, verdict)) => {
                 // Keep semantics compatible with stable-sort behavior:
                 // for equal timestamps, later entries in input order win.
@@ -224,18 +334,20 @@ pub fn latest_review_verdicts(records: &[Record]) -> HashMap<String, Verdict> {
                 }
             }
             None => {
-                latest_by_fingerprint.insert(
-                    record.fingerprint.clone(),
-                    (record.timestamp, record.verdict.clone()),
-                );
+                latest_by_target_key
+                    .insert(key.to_string(), (record.timestamp, record.verdict.clone()));
             }
         }
     }
 
-    latest_by_fingerprint
+    latest_by_target_key
         .into_iter()
-        .map(|(fingerprint, (_, verdict))| (fingerprint, verdict))
+        .map(|(key, (_, verdict))| (key, verdict))
         .collect()
+}
+
+pub fn latest_review_verdicts(records: &[Record]) -> HashMap<String, Verdict> {
+    latest_verdicts(records, Some("review"))
 }
 
 pub fn approved_hashes_from_verdicts(verdicts: &HashMap<String, Verdict>) -> HashSet<String> {
@@ -349,6 +461,7 @@ mod tests {
         Record {
             id: id.to_string(),
             version: CURRENT_VERSION,
+            target: None,
             fingerprint: fingerprint.to_string(),
             check: check.to_string(),
             verdict,
@@ -401,5 +514,63 @@ mod tests {
 
         let latest = latest_review_verdicts(&records);
         assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
+    }
+
+    #[test]
+    fn latest_verdicts_without_check_filter_uses_latest_timestamp() {
+        let records = vec![
+            record("1", "fp", "review", Verdict::Approved, 1),
+            record("2", "fp", "security", Verdict::Rejected, 2),
+        ];
+
+        let latest = latest_verdicts(&records, None);
+        assert_eq!(latest.get("fp"), Some(&Verdict::Rejected));
+    }
+
+    #[test]
+    fn record_lookup_key_prefers_typed_target_when_present() {
+        let record = Record {
+            id: "typed".to_string(),
+            version: CURRENT_VERSION,
+            target: Some(ReviewTargetRef::Diff {
+                fingerprint: DiffFingerprint::new("diff-fp"),
+            }),
+            fingerprint: "legacy-block-fp".to_string(),
+            check: "review".to_string(),
+            verdict: Verdict::Approved,
+            identity: Identity::Email {
+                email: "dev@example.com".to_string(),
+            },
+            repo_ref: RepoRef::Vcs {
+                system: VcsSystem::Git,
+                revision: "0123456789abcdef".to_string(),
+            },
+            block_state: BlockState::Committed,
+            timestamp: 1,
+            path_hint: Some("src/lib.rs".to_string()),
+            line_hint: Some(1),
+            note: None,
+            tags: None,
+            attestations: None,
+        };
+
+        assert_eq!(record.lookup_key(), "diff-fp");
+    }
+
+    #[test]
+    fn latest_review_verdicts_uses_typed_target_key() {
+        let mut legacy = record("1", "legacy-key", "review", Verdict::Rejected, 1);
+        legacy.target = Some(ReviewTargetRef::Block {
+            hash: ContentHash::new("typed-key"),
+        });
+
+        let mut typed_later = record("2", "legacy-key", "review", Verdict::Approved, 2);
+        typed_later.target = Some(ReviewTargetRef::Block {
+            hash: ContentHash::new("typed-key"),
+        });
+
+        let latest = latest_review_verdicts(&[legacy, typed_later]);
+        assert_eq!(latest.get("typed-key"), Some(&Verdict::Approved));
+        assert!(!latest.contains_key("legacy-key"));
     }
 }

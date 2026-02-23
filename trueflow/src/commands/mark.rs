@@ -1,7 +1,7 @@
 use crate::context::TrueflowContext;
 use crate::store::{
     Attestation, AttestationKind, BlockState, Canonicalization, FileStore, Identity, Record,
-    RepoRef, ReviewStore, VcsSystem, Verdict,
+    RepoRef, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
 };
 use crate::vcs;
 use anyhow::{Context, Result};
@@ -61,6 +61,7 @@ fn export_public_key(key_id: Option<&str>) -> Result<String> {
 #[derive(Debug, Clone)]
 pub struct MarkParams {
     pub fingerprint: String,
+    pub target_kind: Option<ReviewTargetKind>,
     pub verdict: Verdict,
     pub check: String,
     pub note: Option<String>,
@@ -110,6 +111,7 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
 
     let MarkParams {
         fingerprint,
+        target_kind,
         verdict,
         check,
         note,
@@ -117,9 +119,13 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         line,
     } = params;
 
+    let target_kind = target_kind.unwrap_or(ReviewTargetKind::Block);
+    let target = Some(target_kind.into_target(fingerprint.clone()));
+
     let mut record = Record {
         id: Uuid::new_v4().to_string(),
         version: crate::store::CURRENT_VERSION,
+        target,
         fingerprint: fingerprint.clone(),
         check: check.clone(),
         verdict: verdict.clone(),
