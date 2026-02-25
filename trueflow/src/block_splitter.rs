@@ -4,8 +4,8 @@ use crate::complexity;
 use crate::hashing::hash_str;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::{Context, Result};
-use log::info;
 use std::sync::LazyLock;
+use tracing::info;
 use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor, StreamingIterator};
 
 static RUST_ATTR_QUERY: LazyLock<Query> = LazyLock::new(|| {

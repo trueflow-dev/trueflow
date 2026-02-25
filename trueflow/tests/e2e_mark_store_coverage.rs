@@ -222,3 +222,23 @@ fn test_store_parent_discovery_no_git() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_commands_write_logs_under_trueflow_directory() -> Result<()> {
+    let repo = TestRepo::new("logs_under_trueflow")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.commit_all("Initial")?;
+
+    repo.run(&["scan", "--json"])?;
+
+    let log_dir = repo.path.join(".trueflow").join("logs");
+    assert!(log_dir.is_dir(), "expected .trueflow/logs to exist");
+
+    let has_log_file = fs::read_dir(&log_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"));
+    assert!(has_log_file, "expected at least one .log file in logs dir");
+
+    Ok(())
+}

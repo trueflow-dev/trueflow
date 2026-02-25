@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use log::info;
+use tracing::info;
 
 mod analysis;
 mod block;

@@ -6,13 +6,13 @@ use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::Result;
 use dirs::home_dir;
-use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {

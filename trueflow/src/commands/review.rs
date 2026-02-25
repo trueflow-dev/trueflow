@@ -11,9 +11,9 @@ use crate::sub_splitter;
 use crate::tree;
 use crate::vcs;
 use anyhow::{Result, anyhow};
-use log::info;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use tracing::info;
 
 #[derive(Serialize)]
 pub struct UnreviewedFile {

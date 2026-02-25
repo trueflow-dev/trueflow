@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use log::warn;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 use crate::block::BlockKind;
 

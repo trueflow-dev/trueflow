@@ -1,7 +1,7 @@
 use crate::context::TrueflowContext;
 use crate::diff_logic::get_unreviewed_changes;
 use anyhow::Result;
-use log::warn;
+use tracing::warn;
 
 pub fn run(_context: &TrueflowContext, json: bool) -> Result<()> {
     let unreviewed_changes = get_unreviewed_changes()?;

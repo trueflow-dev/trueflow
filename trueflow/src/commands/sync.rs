@@ -1,10 +1,10 @@
 use crate::context::TrueflowContext;
 use crate::store::{FileStore, Record, ReviewStore};
 use anyhow::{Context, Result};
-use log::info;
 use std::collections::HashSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use tracing::info;
 
 pub fn run(_context: &TrueflowContext) -> Result<()> {
     // 1. Fetch origin/trueflow-db to ensure we have the latest

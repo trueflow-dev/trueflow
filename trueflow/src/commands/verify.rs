@@ -1,9 +1,9 @@
 use crate::store::{AttestationKind, Canonicalization, FileStore, Record, ReviewStore};
 use anyhow::{Context, Result};
-use log::info;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use tracing::info;
 
 struct Verifier {
     temp_dir: PathBuf,

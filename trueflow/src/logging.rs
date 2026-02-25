@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::store::FileStore;
 
@@ -14,51 +18,57 @@ pub enum LoggingMode {
 
 pub fn init_logging(mode: LoggingMode, debug: bool) -> Result<()> {
     let level = if debug {
-        log::LevelFilter::Debug
+        LevelFilter::DEBUG
     } else {
-        log::LevelFilter::Warn
+        LevelFilter::WARN
     };
-    let mut dispatch = fern::Dispatch::new()
-        .level(level)
-        .format(|out, message, record| {
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            let thread_id = format!("{:?}", std::thread::current().id());
-            let module = record.module_path().unwrap_or(record.target());
-            let line = record
-                .line()
-                .map(|line| line.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            out.finish(format_args!(
-                "[{}] [{}] [{}] [{}:{}] [{}]",
-                record.level(),
-                timestamp,
-                thread_id,
-                module,
-                line,
-                message
-            ));
-        });
 
     let mut log_warning = None;
     match mode {
-        LoggingMode::Stderr => {
-            dispatch = dispatch.chain(std::io::stderr());
-        }
+        LoggingMode::Stderr => init_stderr_subscriber(level)?,
         LoggingMode::File => match create_log_file() {
-            Ok(log_file) => {
-                dispatch = dispatch.chain(log_file);
-            }
+            Ok(log_file) => init_file_subscriber(level, log_file)?,
             Err(err) => {
-                dispatch = dispatch.chain(std::io::stderr());
+                init_stderr_subscriber(level)?;
                 log_warning = Some(err);
             }
         },
     }
 
-    dispatch.apply()?;
     if let Some(err) = log_warning {
-        log::warn!("Failed to open log file: {err}");
+        tracing::warn!(error = %err, "Failed to open log file, using stderr");
     }
+    Ok(())
+}
+
+fn init_stderr_subscriber(level: LevelFilter) -> Result<()> {
+    tracing_subscriber::registry()
+        .with(level)
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .compact(),
+        )
+        .try_init()?;
+    Ok(())
+}
+
+fn init_file_subscriber(level: LevelFilter, log_file: std::fs::File) -> Result<()> {
+    tracing_subscriber::registry()
+        .with(level)
+        .with(
+            fmt::layer()
+                .with_writer(std::sync::Mutex::new(log_file))
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .compact(),
+        )
+        .try_init()?;
     Ok(())
 }
 

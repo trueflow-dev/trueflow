@@ -3,7 +3,7 @@ use crate::block::{Block, BlockKind};
 use crate::hashing::hash_str;
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
 use anyhow::{Context, Result};
-use log::info;
+use tracing::info;
 use tree_sitter::Parser;
 use tree_sitter_md;
 

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use fs2::FileExt;
-use log::warn;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;

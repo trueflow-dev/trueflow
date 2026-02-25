@@ -7,8 +7,6 @@ edition = "2024"
 anyhow = "1.0.100"
 clap = { version = "=4.4.18", features = ["derive", "env"] }
 chrono = "0.4.39"
-fern = "0.6.2"
-log = "0.4.29"
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 dirs = "6.0.0"
@@ -33,6 +31,8 @@ toml = "0.9.11"
 gix = { version = "0.78.0", default-features = false, features = ["revision", "status"] }
 schemars = { version = "1.2.0" }
 serde_jcs = "0.1.0"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
 
 # [dependencies]
 # dioxus = "0.4.3"

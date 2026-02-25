@@ -5,10 +5,10 @@ use crate::store::{
 };
 use crate::vcs;
 use anyhow::{Context, Result};
-use log::info;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::info;
 use uuid::Uuid;
 
 fn sign_data(data: &str, key_id: Option<&str>) -> Result<String> {
