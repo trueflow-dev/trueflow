@@ -154,8 +154,10 @@ struct AppState {
     navigator: ReviewNavigator,
     review_order: ReviewOrder,
     total_blocks: usize,
+    initial_remaining_blocks: usize,
     remaining_blocks: usize,
     reviewable_nodes: HashSet<TreeNodeId>,
+    session_recap: SessionRecap,
     scope_label: String,
     input_mode: InputMode,
     input_buffer: String,
@@ -172,6 +174,52 @@ struct AppState {
     file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SessionRecap {
+    approved_blocks: usize,
+    rejected_blocks: usize,
+    comments: usize,
+    questions: usize,
+    blocks_touched: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ActionImpact {
+    affected_blocks: usize,
+    removed_reviewable: usize,
+}
+
+impl SessionRecap {
+    fn has_activity(self) -> bool {
+        self.approved_blocks > 0
+            || self.rejected_blocks > 0
+            || self.comments > 0
+            || self.questions > 0
+    }
+
+    fn record_action(&mut self, verdict: &Verdict, impact: ActionImpact) {
+        self.blocks_touched = self.blocks_touched.saturating_add(impact.affected_blocks);
+        match verdict {
+            Verdict::Approved => {
+                self.approved_blocks = self
+                    .approved_blocks
+                    .saturating_add(impact.removed_reviewable);
+            }
+            Verdict::Rejected => {
+                self.rejected_blocks = self
+                    .rejected_blocks
+                    .saturating_add(impact.removed_reviewable);
+            }
+            Verdict::Comment => {
+                self.comments = self.comments.saturating_add(1);
+            }
+            Verdict::Question => {
+                self.questions = self.questions.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -290,8 +338,10 @@ fn build_review_state(
         navigator,
         review_order,
         total_blocks: summary.total_blocks,
+        initial_remaining_blocks: remaining_blocks,
         remaining_blocks,
         reviewable_nodes,
+        session_recap: SessionRecap::default(),
         scope_label,
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
@@ -462,90 +512,99 @@ fn run_app(
         let key_code = key_event.code;
 
         match &state.input_mode {
-            InputMode::Normal => match key_code {
-                KeyCode::Char('q') => return Ok(()),
-                KeyCode::Char('k') | KeyCode::Down => {
-                    handle_descend(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::Char('i') | KeyCode::Up => {
-                    handle_ascend(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::Char('l') | KeyCode::Right => {
-                    handle_next(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::Char('j') | KeyCode::Left => {
-                    handle_prev(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::Char('n') => {
-                    handle_next(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::Char('b') => {
-                    handle_prev(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::Char('a') => {
-                    handle_action(terminal, context, &mut state, Verdict::Approved)?;
-                    needs_render = true;
-                }
-                KeyCode::Char('x') => {
-                    handle_action(terminal, context, &mut state, Verdict::Rejected)?;
-                    needs_render = true;
-                }
-                KeyCode::Char('c') => {
-                    handle_comment_action(&mut state)?;
-                    needs_render = true;
-                }
-                KeyCode::Char(' ')
-                    if state.navigator.current_id() != state.navigator.tree.root() =>
-                {
-                    handle_scroll_page_down(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::PageUp => {
-                    handle_scroll_page_up(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::PageDown => {
-                    handle_scroll_page_down(&mut state);
-                    needs_render = true;
-                }
-                KeyCode::Home => {
-                    state.scroll_offset = 0;
-                    needs_render = true;
-                }
-                KeyCode::End => {
-                    state.scroll_offset =
-                        state.content_height.saturating_sub(state.viewport_height);
-                    needs_render = true;
-                }
-                KeyCode::Char('g') => {
-                    state.navigator.jump_root();
-                    needs_render = true;
-                }
-                KeyCode::Char('d') => {
-                    state.view_mode = match state.view_mode {
-                        ViewMode::Source => ViewMode::Diff,
-                        ViewMode::Diff => ViewMode::Source,
-                    };
-                    // Reset scroll when switching views because content height changes
-                    state.scroll_offset = 0;
-                    needs_render = true;
-                }
-                KeyCode::Enter | KeyCode::Char(' ')
-                    if state.navigator.current_id() == state.navigator.tree.root() =>
-                {
-                    if let Some(first) = state.review_order.first_block() {
-                        state.navigator.set_current(first);
+            InputMode::Normal => {
+                if is_recap_mode(&state) {
+                    if recap_key_should_exit(key_code) {
+                        return Ok(());
                     }
-                    needs_render = true;
+                    continue;
                 }
-                _ => {}
-            },
+
+                match key_code {
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('k') | KeyCode::Down => {
+                        handle_descend(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('i') | KeyCode::Up => {
+                        handle_ascend(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        handle_next(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('j') | KeyCode::Left => {
+                        handle_prev(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('n') => {
+                        handle_next(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('b') => {
+                        handle_prev(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('a') => {
+                        handle_action(terminal, context, &mut state, Verdict::Approved)?;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('x') => {
+                        handle_action(terminal, context, &mut state, Verdict::Rejected)?;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('c') => {
+                        handle_comment_action(&mut state)?;
+                        needs_render = true;
+                    }
+                    KeyCode::Char(' ')
+                        if state.navigator.current_id() != state.navigator.tree.root() =>
+                    {
+                        handle_scroll_page_down(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::PageUp => {
+                        handle_scroll_page_up(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::PageDown => {
+                        handle_scroll_page_down(&mut state);
+                        needs_render = true;
+                    }
+                    KeyCode::Home => {
+                        state.scroll_offset = 0;
+                        needs_render = true;
+                    }
+                    KeyCode::End => {
+                        state.scroll_offset =
+                            state.content_height.saturating_sub(state.viewport_height);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('g') => {
+                        state.navigator.jump_root();
+                        needs_render = true;
+                    }
+                    KeyCode::Char('d') => {
+                        state.view_mode = match state.view_mode {
+                            ViewMode::Source => ViewMode::Diff,
+                            ViewMode::Diff => ViewMode::Source,
+                        };
+                        // Reset scroll when switching views because content height changes
+                        state.scroll_offset = 0;
+                        needs_render = true;
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ')
+                        if state.navigator.current_id() == state.navigator.tree.root() =>
+                    {
+                        if let Some(first) = state.review_order.first_block() {
+                            state.navigator.set_current(first);
+                        }
+                        needs_render = true;
+                    }
+                    _ => {}
+                }
+            }
             InputMode::Editing { .. } => match editing_key_action_for_event(&key_event) {
                 EditingKeyAction::Submit => {
                     handle_editing_submit(terminal, context, &mut state)?;
@@ -630,6 +689,17 @@ fn key_code_for_press_event(event: &Event) -> Option<KeyCode> {
 
 fn should_rerender_on_event(event: &Event) -> bool {
     matches!(event, Event::Resize(_, _))
+}
+
+fn is_recap_mode(state: &AppState) -> bool {
+    matches!(state.input_mode, InputMode::Normal) && state.remaining_blocks == 0
+}
+
+fn recap_key_should_exit(key_code: KeyCode) -> bool {
+    matches!(
+        key_code,
+        KeyCode::Char('q') | KeyCode::Char('d') | KeyCode::Esc
+    )
 }
 
 // ... helper functions for actions ...
@@ -874,7 +944,8 @@ fn execute_action(
         )
     })?;
 
-    apply_action_locally(state, node_id, &verdict, next_id);
+    let impact = apply_action_locally(state, node_id, &verdict, next_id);
+    state.session_recap.record_action(&verdict, impact);
     Ok(())
 }
 
@@ -918,15 +989,16 @@ fn apply_action_locally(
     node_id: TreeNodeId,
     verdict: &Verdict,
     next_id: Option<TreeNodeId>,
-) {
+) -> ActionImpact {
     let block_ids = review_session::action_block_ids(
         &state.navigator.tree,
         &state.navigator.visible_nodes,
         node_id,
     );
+    let affected_blocks = block_ids.len();
 
+    let mut removed_reviewable = 0;
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
-        let mut removed_reviewable = 0;
         for block_id in block_ids {
             if state.navigator.visible_nodes.remove(&block_id)
                 && state.reviewable_nodes.remove(&block_id)
@@ -946,6 +1018,11 @@ fn apply_action_locally(
     } else {
         state.navigator.jump_root();
         state.scroll_offset = 0;
+    }
+
+    ActionImpact {
+        affected_blocks,
+        removed_reviewable,
     }
 }
 
@@ -1111,8 +1188,13 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
     let content_area = layout[0];
     let footer_area = layout[1];
 
-    render_active_node(frame, state, content_area, &palette);
-    render_footer(frame, state, footer_area, &palette);
+    if is_recap_mode(state) {
+        render_recap_view(frame, state, content_area, &palette);
+        render_recap_footer(frame, footer_area, &palette);
+    } else {
+        render_active_node(frame, state, content_area, &palette);
+        render_footer(frame, state, footer_area, &palette);
+    }
 
     // 3. Input Overlay
     if matches!(
@@ -1374,6 +1456,105 @@ fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPa
         .label(Span::styled(label, Style::default().fg(palette.fg)));
 
     frame.render_widget(gauge, area);
+}
+
+fn render_recap_view(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
+    let lines = recap_summary_lines(state)
+        .into_iter()
+        .map(|line| {
+            let style = if line == "All Done" {
+                Style::default()
+                    .fg(palette.fg)
+                    .bg(palette.meta_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.dim).bg(palette.code_bg)
+            };
+            Line::from(Span::styled(line, style))
+        })
+        .collect::<Vec<_>>();
+
+    let panel = UiBlock::default()
+        .title(" Review Recap ")
+        .borders(ratatui::widgets::Borders::ALL)
+        .style(Style::default().bg(palette.code_bg).fg(palette.fg));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_recap_footer(frame: &mut Frame, area: Rect, palette: &UiPalette) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Press [d] done or [q] quit",
+            Style::default()
+                .fg(palette.fg)
+                .bg(palette.bg)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(palette.bg)),
+        area,
+    );
+}
+
+fn recap_summary_lines(state: &AppState) -> Vec<String> {
+    let mut lines = vec![
+        "All Done".to_string(),
+        format!("Scope: {}", state.scope_label),
+        String::new(),
+    ];
+
+    let initial_reviewed = state
+        .total_blocks
+        .saturating_sub(state.initial_remaining_blocks);
+    let current_reviewed = state.total_blocks.saturating_sub(state.remaining_blocks);
+    let session_delta = current_reviewed.saturating_sub(initial_reviewed);
+    lines.push(format!(
+        "Scope progress: {current_reviewed}/{} blocks reviewed (+{session_delta} this session)",
+        state.total_blocks
+    ));
+
+    let start_coverage = coverage_percent(initial_reviewed, state.total_blocks);
+    let end_coverage = coverage_percent(current_reviewed, state.total_blocks);
+    lines.push(format!(
+        "Scope coverage: {start_coverage:.1}% -> {end_coverage:.1}% ({:+.1}%)",
+        end_coverage - start_coverage
+    ));
+    lines.push(String::new());
+
+    if !state.session_recap.has_activity() {
+        lines.push("All Done (no reviews or feedback recorded)".to_string());
+        return lines;
+    }
+
+    lines.push("Session recap:".to_string());
+    lines.push(format!(
+        "Approvals: {} blocks",
+        state.session_recap.approved_blocks
+    ));
+    lines.push(format!(
+        "Rejections: {} blocks",
+        state.session_recap.rejected_blocks
+    ));
+    lines.push(format!("Comments: {}", state.session_recap.comments));
+    lines.push(format!("Questions: {}", state.session_recap.questions));
+    lines.push(format!(
+        "Blocks touched: {}",
+        state.session_recap.blocks_touched
+    ));
+    lines
+}
+
+fn coverage_percent(reviewed: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 100.0;
+    }
+    (reviewed as f64 / total as f64) * 100.0
 }
 
 fn build_content_lines(
@@ -2155,8 +2336,10 @@ mod diff_scope_tests {
             navigator,
             review_order,
             total_blocks: 0,
+            initial_remaining_blocks: 0,
             remaining_blocks: 0,
             reviewable_nodes: HashSet::new(),
+            session_recap: SessionRecap::default(),
             scope_label: String::new(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
@@ -2715,6 +2898,58 @@ mod diff_scope_tests {
         let (fingerprint, kind) = fingerprint_and_target_kind_for_node(root_node);
         assert_eq!(fingerprint, root_node.hash);
         assert_eq!(kind, ReviewTargetKind::Tree);
+    }
+
+    #[test]
+    fn recap_summary_reports_no_activity_when_session_is_empty() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.total_blocks = 3;
+        state.initial_remaining_blocks = 0;
+        state.remaining_blocks = 0;
+
+        let lines = recap_summary_lines(&state);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("All Done (no reviews or feedback recorded)")),
+            "expected no-activity recap message, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn recap_summary_reports_scope_coverage_delta_and_rollups() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.total_blocks = 10;
+        state.initial_remaining_blocks = 4;
+        state.remaining_blocks = 0;
+        state.session_recap.approved_blocks = 4;
+        state.session_recap.comments = 2;
+
+        let lines = recap_summary_lines(&state);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Scope coverage: 60.0% -> 100.0% (+40.0%)")),
+            "expected coverage delta line, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Approvals: 4 blocks")),
+            "expected approvals rollup, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Comments: 2")),
+            "expected comments rollup, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn recap_key_handler_exits_on_q_and_d() {
+        assert!(recap_key_should_exit(KeyCode::Char('q')));
+        assert!(recap_key_should_exit(KeyCode::Char('d')));
+        assert!(recap_key_should_exit(KeyCode::Esc));
+        assert!(!recap_key_should_exit(KeyCode::Char('a')));
     }
 }
 
