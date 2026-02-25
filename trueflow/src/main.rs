@@ -14,6 +14,7 @@ mod diff_logic;
 mod hashing;
 mod logging;
 mod optimizer;
+mod path_utils;
 mod policy;
 mod review_metadata;
 mod review_navigator;

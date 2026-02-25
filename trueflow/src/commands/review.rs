@@ -2,6 +2,7 @@ use crate::analysis::Language;
 use crate::block::Block;
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
+use crate::path_utils;
 use crate::policy::{should_skip_impl_by_default, should_skip_imports_by_default};
 use crate::scanner;
 use crate::store::{
@@ -329,36 +330,16 @@ fn diff_hunks_for_file_targets(
 }
 
 fn repo_relative_path_for_diff(file_path: &str, workdir_prefix: Option<&str>) -> String {
-    let normalized_file_path = normalize_path_str(file_path);
-    let Some(prefix) = workdir_prefix.filter(|value| !value.is_empty()) else {
-        return normalized_file_path;
-    };
-    if normalized_file_path == prefix {
-        return normalized_file_path;
-    }
-    let prefixed_root = format!("{prefix}/");
-    if normalized_file_path.starts_with(&prefixed_root) {
-        return normalized_file_path;
-    }
-    format!("{prefix}/{normalized_file_path}")
+    path_utils::repo_relative_path_for_diff(file_path, workdir_prefix)
 }
 
 fn workdir_prefix_from_git_root() -> Option<String> {
     let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
-    let cwd = std::env::current_dir().ok()?;
-    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let relative = cwd.strip_prefix(&repo_root).ok()?;
-    let relative_str = normalize_path_str(relative.to_string_lossy().as_ref());
-    if relative_str.is_empty() || relative_str == "." {
-        None
-    } else {
-        Some(relative_str)
-    }
+    path_utils::current_workdir_prefix_for_repo_root(&repo_root)
 }
 
 fn normalize_path_str(path: &str) -> String {
-    path.trim_start_matches("./").replace('\\', "/")
+    path_utils::normalize_path_str(path)
 }
 
 fn parse_review_targets(values: &[String]) -> Result<Vec<ReviewTarget>> {

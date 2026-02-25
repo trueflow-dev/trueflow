@@ -1,4 +1,5 @@
 use crate::hashing::compute_fingerprint;
+use crate::path_utils;
 use crate::store::{
     FileStore, Record, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
 };
@@ -91,8 +92,8 @@ fn path_is_covered_by_approved_node(
     repo_relative_path: &str,
     workdir_prefix: Option<&str>,
 ) -> bool {
-    let normalized_path = normalize_path_str(repo_relative_path);
-    let candidates = tree_path_candidates_for_repo_path(&normalized_path, workdir_prefix);
+    let candidates =
+        path_utils::tree_path_candidates_for_repo_path(repo_relative_path, workdir_prefix);
     for candidate in candidates {
         if tree
             .find_by_path(candidate.as_str())
@@ -114,46 +115,9 @@ fn path_is_covered_by_approved_node(
     false
 }
 
-fn tree_path_candidates_for_repo_path(
-    repo_relative_path: &str,
-    workdir_prefix: Option<&str>,
-) -> Vec<String> {
-    let mut candidates = vec![repo_relative_path.to_string()];
-
-    let Some(prefix) = workdir_prefix
-        .map(normalize_path_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return candidates;
-    };
-
-    let prefixed_root = format!("{prefix}/");
-    if let Some(stripped) = repo_relative_path.strip_prefix(&prefixed_root) {
-        let stripped = normalize_path_str(stripped);
-        if !stripped.is_empty() && !candidates.contains(&stripped) {
-            candidates.push(stripped);
-        }
-    }
-
-    candidates
-}
-
 fn workdir_prefix_from_git_root() -> Option<String> {
     let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
-    let cwd = std::env::current_dir().ok()?;
-    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let relative = cwd.strip_prefix(&repo_root).ok()?;
-    let relative = normalize_path_str(relative.to_string_lossy().as_ref());
-    if relative.is_empty() || relative == "." {
-        None
-    } else {
-        Some(relative)
-    }
-}
-
-fn normalize_path_str(path: &str) -> String {
-    path.trim_start_matches("./").replace('\\', "/")
+    path_utils::current_workdir_prefix_for_repo_root(&repo_root)
 }
 
 fn parse_hunk_lines(lines: &[String]) -> (String, String, String, String) {

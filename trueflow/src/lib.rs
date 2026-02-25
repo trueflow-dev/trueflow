@@ -11,6 +11,7 @@ pub mod finder;
 pub mod hashing;
 pub mod logging;
 pub mod optimizer;
+pub mod path_utils;
 pub mod policy;
 pub mod review_metadata;
 pub mod review_navigator;

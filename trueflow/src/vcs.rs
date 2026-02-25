@@ -1,6 +1,7 @@
 use crate::analysis::Language;
 use crate::block::Block;
 use crate::block_splitter;
+use crate::path_utils;
 use crate::scanner;
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
@@ -128,7 +129,11 @@ pub fn block_state_for_path(
     let Some(path) = path_hint else {
         return BlockStateResult::Unknown;
     };
-    let candidate_paths = candidate_repo_paths_for_hint(repo, path);
+    let workdir_prefix = repo
+        .workdir()
+        .and_then(path_utils::current_workdir_prefix_for_repo_root);
+    let candidate_paths =
+        path_utils::candidate_repo_paths_for_hint(path, workdir_prefix.as_deref(), repo.workdir());
     tracing::debug!(
         path_hint = %path,
         ?candidate_paths,
@@ -167,55 +172,6 @@ pub fn block_state_for_path(
         "block state resolution fell back to unknown"
     );
     BlockStateResult::Unknown
-}
-
-fn candidate_repo_paths_for_hint(repo: &gix::Repository, path_hint: &str) -> Vec<String> {
-    let normalized = normalize_repo_path(path_hint);
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-
-    let mut candidates = vec![normalized.clone()];
-    if let Some(prefix) = workdir_prefix_for_repo(repo)
-        && normalized != prefix
-        && !normalized.starts_with(&format!("{prefix}/"))
-    {
-        candidates.push(format!("{prefix}/{normalized}"));
-    }
-
-    if let Some(workdir) = repo.workdir() {
-        let hinted_path = Path::new(path_hint);
-        if hinted_path.is_absolute()
-            && let Ok(relative) = hinted_path.strip_prefix(workdir)
-        {
-            let relative = normalize_repo_path(relative.to_string_lossy().as_ref());
-            if !relative.is_empty() && !candidates.contains(&relative) {
-                candidates.push(relative);
-            }
-        }
-    }
-
-    candidates
-}
-
-fn workdir_prefix_for_repo(repo: &gix::Repository) -> Option<String> {
-    let repo_root = repo.workdir()?;
-    let cwd = std::env::current_dir().ok()?;
-    let repo_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let relative = cwd.strip_prefix(&repo_root).ok()?;
-    let relative = normalize_repo_path(relative.to_string_lossy().as_ref());
-    if relative.is_empty() || relative == "." {
-        None
-    } else {
-        Some(relative)
-    }
-}
-
-fn normalize_repo_path(path: &str) -> String {
-    path.trim_start_matches("./").replace('\\', "/")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
