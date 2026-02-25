@@ -588,6 +588,43 @@ fn test_diff_uses_merge_base() -> Result<()> {
 }
 
 #[test]
+fn test_diff_respects_file_coverage_from_subdir() -> Result<()> {
+    let repo = TestRepo::new("diff_file_coverage_subdir")?;
+    repo.write("pkg/src/lib.rs", "pub fn value() { println!(\"one\"); }\n")?;
+    repo.commit_all("Initial")?;
+    repo.git(&["checkout", "-B", "main"])?;
+    repo.git(&["checkout", "-b", "feature/subdir"])?;
+
+    repo.write("pkg/src/lib.rs", "pub fn value() { println!(\"two\"); }\n")?;
+    repo.commit_all("Change value")?;
+
+    let scan = repo.run(&["scan", "--json"])?;
+    let files = json_array(&scan)?;
+    let file_hash = files
+        .iter()
+        .find(|file| file["path"].as_str() == Some("pkg/src/lib.rs"))
+        .and_then(|file| file["file_hash"].as_str())
+        .context("expected pkg/src/lib.rs file hash")?
+        .to_string();
+
+    let approved_file = build_review_record(&file_hash, ReviewRecordOverrides::default());
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[approved_file])?;
+
+    let root_output = repo.run(&["diff", "--json"])?;
+    let root_changes = json_array(&root_output)?;
+    assert!(root_changes.is_empty(), "expected root diff to be covered");
+
+    let pkg_output = repo.run_in(&["diff", "--json"], &repo.path.join("pkg"))?;
+    let pkg_changes = json_array(&pkg_output)?;
+    assert!(
+        pkg_changes.is_empty(),
+        "expected subdir diff to honor file coverage"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_feedback_xml_escapes_cdata_end() -> Result<()> {
     let repo = TestRepo::new("feedback_cdata")?;
     repo.write("src/lib.rs", "pub fn core() { println!(\"]]>\"); }\n")?;

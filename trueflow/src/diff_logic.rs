@@ -6,7 +6,7 @@ use crate::tree;
 use crate::vcs;
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Serialize)]
 pub struct Change {
@@ -39,6 +39,7 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
 
     let approved_hashes = approved_hashes_from_verdicts(&review_state);
     let tree = tree::build_tree_from_path(".")?;
+    let workdir_prefix = workdir_prefix_from_git_root();
 
     // 2. Compute Diff
     let diff_hunks = vcs::diff_main_to_head()?;
@@ -58,10 +59,12 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
         // Get all reviews for this hunk
         let reviews = reviews_by_fp.get(&fp_str).cloned().unwrap_or_default();
 
-        if tree
-            .find_by_path(&hunk.file_path)
-            .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
-        {
+        if path_is_covered_by_approved_node(
+            &tree,
+            &approved_hashes,
+            &hunk.file_path,
+            workdir_prefix.as_deref(),
+        ) {
             continue;
         }
 
@@ -80,6 +83,77 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
     }
 
     Ok(unreviewed_changes)
+}
+
+fn path_is_covered_by_approved_node(
+    tree: &tree::Tree,
+    approved_hashes: &HashSet<String>,
+    repo_relative_path: &str,
+    workdir_prefix: Option<&str>,
+) -> bool {
+    let normalized_path = normalize_path_str(repo_relative_path);
+    let candidates = tree_path_candidates_for_repo_path(&normalized_path, workdir_prefix);
+    for candidate in candidates {
+        if tree
+            .find_by_path(candidate.as_str())
+            .is_some_and(|node_id| tree.is_node_covered(node_id, approved_hashes))
+        {
+            tracing::debug!(
+                repo_relative_path = %repo_relative_path,
+                tree_path = %candidate,
+                "diff path coverage matched approved node"
+            );
+            return true;
+        }
+    }
+    tracing::debug!(
+        repo_relative_path = %repo_relative_path,
+        workdir_prefix = ?workdir_prefix,
+        "diff path coverage found no approved node"
+    );
+    false
+}
+
+fn tree_path_candidates_for_repo_path(
+    repo_relative_path: &str,
+    workdir_prefix: Option<&str>,
+) -> Vec<String> {
+    let mut candidates = vec![repo_relative_path.to_string()];
+
+    let Some(prefix) = workdir_prefix
+        .map(normalize_path_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return candidates;
+    };
+
+    let prefixed_root = format!("{prefix}/");
+    if let Some(stripped) = repo_relative_path.strip_prefix(&prefixed_root) {
+        let stripped = normalize_path_str(stripped);
+        if !stripped.is_empty() && !candidates.contains(&stripped) {
+            candidates.push(stripped);
+        }
+    }
+
+    candidates
+}
+
+fn workdir_prefix_from_git_root() -> Option<String> {
+    let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
+    let cwd = std::env::current_dir().ok()?;
+    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let relative = cwd.strip_prefix(&repo_root).ok()?;
+    let relative = normalize_path_str(relative.to_string_lossy().as_ref());
+    if relative.is_empty() || relative == "." {
+        None
+    } else {
+        Some(relative)
+    }
+}
+
+fn normalize_path_str(path: &str) -> String {
+    path.trim_start_matches("./").replace('\\', "/")
 }
 
 fn parse_hunk_lines(lines: &[String]) -> (String, String, String, String) {
