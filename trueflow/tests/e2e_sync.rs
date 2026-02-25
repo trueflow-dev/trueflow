@@ -173,3 +173,49 @@ fn test_sync_uses_configured_storage_branch() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_sync_fails_when_local_review_store_is_unreadable() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let remote_dir = std::env::temp_dir().join("trueflow_tests").join(format!(
+        "remote_repo_unreadable_store_{}.git",
+        Uuid::new_v4()
+    ));
+    if remote_dir.exists() {
+        fs::remove_dir_all(&remote_dir)?;
+    }
+    fs::create_dir_all(&remote_dir)?;
+    run_git(&remote_dir, &["init", "--bare"])?;
+
+    let local = TestRepo::new("local_repo_unreadable_store")?;
+    let remote = remote_dir.to_str().context("remote repo path")?;
+    run_git(&local.path, &["remote", "add", "origin", remote])?;
+
+    let local_records = vec![record("local-only", "fp-local-only", 1234)];
+    write_reviews_jsonl(&local.path.join(".trueflow"), &local_records)?;
+
+    let db_path = local.path.join(".trueflow").join("reviews.jsonl");
+    let mut perms = fs::metadata(&db_path)?.permissions();
+    perms.set_mode(0o200);
+    fs::set_permissions(&db_path, perms)?;
+
+    let output = local.run_raw(&["sync"])?;
+
+    let mut reset = fs::metadata(&db_path)?.permissions();
+    reset.set_mode(0o600);
+    fs::set_permissions(&db_path, reset)?;
+
+    assert!(
+        !output.status.success(),
+        "sync should fail when local review history cannot be read"
+    );
+
+    let db_content = fs::read_to_string(&db_path)?;
+    assert!(
+        db_content.contains("fp-local-only"),
+        "sync should not truncate unreadable local review history"
+    );
+
+    Ok(())
+}

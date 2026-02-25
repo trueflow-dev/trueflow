@@ -4,6 +4,7 @@ use crate::store::{FileStore, Record, ReviewStore};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use tracing::info;
 
@@ -25,7 +26,9 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
 
     // 3. Get Local Content
     let store = FileStore::new()?;
-    let local_records = store.read_history().unwrap_or_default();
+    let local_records = store
+        .read_history()
+        .context("Failed to read local review history")?;
 
     // 4. Merge
     let mut all_records = Vec::new();
@@ -135,11 +138,19 @@ fn get_remote_head(branch: &str) -> Option<String> {
 }
 
 fn git_hash_object(content: &str) -> Result<String> {
-    let mut child = Command::new("git")
-        .args(["hash-object", "-w", "--stdin"])
+    git_hash_object_in_dir(content, None)
+}
+
+fn git_hash_object_in_dir(content: &str, current_dir: Option<&Path>) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["hash-object", "-w", "--stdin"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
+        .stdout(Stdio::piped());
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = cmd.spawn()?;
 
     {
         let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
@@ -147,16 +158,35 @@ fn git_hash_object(content: &str) -> Result<String> {
     }
 
     let output = child.wait_with_output()?;
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    if !output.status.success() {
+        anyhow::bail!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let blob_hash = String::from_utf8(output.stdout)?.trim().to_string();
+    if blob_hash.is_empty() {
+        anyhow::bail!("git hash-object returned empty output");
+    }
+    Ok(blob_hash)
 }
 
 fn git_mktree(blob_hash: &str) -> Result<String> {
+    git_mktree_in_dir(blob_hash, None)
+}
+
+fn git_mktree_in_dir(blob_hash: &str, current_dir: Option<&Path>) -> Result<String> {
     let entry = format!("100644 blob {blob_hash}\treviews.jsonl");
-    let mut child = Command::new("git")
-        .arg("mktree")
+    let mut cmd = Command::new("git");
+    cmd.arg("mktree")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
+        .stdout(Stdio::piped());
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = cmd.spawn()?;
 
     {
         let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
@@ -164,7 +194,18 @@ fn git_mktree(blob_hash: &str) -> Result<String> {
     }
 
     let output = child.wait_with_output()?;
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    if !output.status.success() {
+        anyhow::bail!(
+            "git mktree failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let tree_hash = String::from_utf8(output.stdout)?.trim().to_string();
+    if tree_hash.is_empty() {
+        anyhow::bail!("git mktree returned empty output");
+    }
+    Ok(tree_hash)
 }
 
 fn git_commit_tree(tree_hash: &str, parent: Option<&str>, message: &str) -> Result<String> {
@@ -186,4 +227,36 @@ fn git_commit_tree(tree_hash: &str, parent: Option<&str>, message: &str) -> Resu
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_hash_object_errors_when_git_fails() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "trueflow-sync-hash-object-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let result = git_hash_object_in_dir("payload\n", Some(&temp_dir));
+
+        std::fs::remove_dir_all(&temp_dir)?;
+        assert!(
+            result.is_err(),
+            "git_hash_object should fail outside a git repository"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn git_mktree_errors_for_invalid_blob_hash() {
+        let result = git_mktree("definitely-not-a-blob-hash");
+        assert!(
+            result.is_err(),
+            "git_mktree should fail for invalid blob hash input"
+        );
+    }
 }
