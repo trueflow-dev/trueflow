@@ -327,13 +327,56 @@ pub fn extract_block_diff_view_for_block(
 }
 
 pub fn block_has_changed_lines_in_diff(block: &Block, hunks: &[DiffHunk]) -> bool {
-    extract_block_diff_view_for_block(block, hunks, BlockDiffFocusMode::WholeBlock).is_some_and(
-        |view| {
-            view.lines
-                .iter()
-                .any(|line| line.kind != DiffLineKind::Context)
-        },
-    )
+    let Some(view) =
+        extract_block_diff_view_for_block(block, hunks, BlockDiffFocusMode::WholeBlock)
+    else {
+        return false;
+    };
+
+    let changed_lines = view
+        .lines
+        .iter()
+        .filter(|line| line.kind != DiffLineKind::Context)
+        .collect::<Vec<_>>();
+    if changed_lines.is_empty() {
+        return false;
+    }
+
+    if changed_lines
+        .iter()
+        .all(|line| is_trivial_closing_brace_addition(line))
+    {
+        return false;
+    }
+
+    true
+}
+
+fn is_trivial_closing_brace_addition(line: &DiffLine) -> bool {
+    if line.kind != DiffLineKind::Added {
+        return false;
+    }
+
+    let trimmed = line.text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let mut chars = trimmed.chars().peekable();
+    let mut closing_brace_count = 0usize;
+    while matches!(chars.peek(), Some('}')) {
+        chars.next();
+        closing_brace_count += 1;
+    }
+    if closing_brace_count == 0 {
+        return false;
+    }
+
+    match chars.next() {
+        None => true,
+        Some(ch) if (ch == ';' || ch == ',') && chars.next().is_none() => true,
+        _ => false,
+    }
 }
 
 pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
@@ -941,6 +984,33 @@ mod tests {
                 .iter()
                 .any(|line| line.kind == DiffLineKind::Removed),
             "removed lines should be retained when an overlapping hunk is included"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_closing_brace_only_additions() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2, // 0-based, lines 3..=5
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec!["+}\n".to_string()],
+        };
+
+        assert!(
+            !block_has_changed_lines_in_diff(&block, &[hunk]),
+            "brace-only additions should not mark a block as changed for review"
         );
     }
 }
