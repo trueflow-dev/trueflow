@@ -3,9 +3,11 @@ use crate::block::{Block, BlockKind, FileState};
 use crate::block_splitter;
 use crate::hashing::hash_str;
 use crate::optimizer;
+use crate::path_utils;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::Result;
 use dirs::home_dir;
+use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -13,7 +15,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
-use walkdir::WalkDir;
 
 pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
     let root = root.as_ref();
@@ -25,18 +26,19 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
 
     let mut files = Vec::new();
 
-    let walker = WalkDir::new(root).into_iter();
-
-    for entry in walker.filter_entry(|e| !is_ignored(e)) {
+    for entry in build_walker(root) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                log_walkdir_scan_error(&err);
+                log_walk_scan_error(&err);
                 continue;
             }
         };
-        if entry.file_type().is_file() {
-            match process_file(entry.path()) {
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            match process_file(root, entry.path()) {
                 Ok(file_state) => files.push(file_state),
                 Err(err) => log_process_file_error(entry.path(), &err),
             }
@@ -49,19 +51,27 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
     Ok(files)
 }
 
-fn is_ignored(entry: &walkdir::DirEntry) -> bool {
-    let name = entry.file_name().to_string_lossy();
+fn build_walker(root: &Path) -> ignore::Walk {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .parents(true)
+        .require_git(false);
+    builder.filter_entry(|entry| !is_custom_ignored_entry(entry));
+    builder.build()
+}
 
-    // Don't ignore the root "."
-    if name == "." {
+fn is_custom_ignored_entry(entry: &DirEntry) -> bool {
+    let Some(name) = entry.path().file_name().and_then(|name| name.to_str()) else {
         return false;
-    }
-
-    // Basic ignore rules
-    name.starts_with('.') || // .git, .trueflow, .env
-    name == "target" ||      // rust build
-    name == "node_modules" || // js dependencies
-    name == "mutants.out" // mutation testing artifacts
+    };
+    matches!(
+        name,
+        ".git" | ".trueflow" | "target" | "node_modules" | "mutants.out"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,19 +198,21 @@ fn cache_root_hash(root: &Path) -> String {
 
 fn collect_current_file_stamps(root: &Path) -> Result<HashMap<String, FileStamp>> {
     let mut stamps = HashMap::new();
-    let walker = WalkDir::new(root).into_iter();
-    for entry in walker.filter_entry(|e| !is_ignored(e)) {
+    for entry in build_walker(root) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                if is_permission_denied_walkdir(&err) {
+                if is_permission_denied_walk_error(&err) {
                     debug!("Skipping unreadable entry during cache validation: {err}");
                     continue;
                 }
                 return Err(err.into());
             }
         };
-        if !entry.file_type().is_file() {
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
             continue;
         }
         let metadata = match fs::metadata(entry.path()) {
@@ -239,10 +251,9 @@ fn collect_current_file_stamps(root: &Path) -> Result<HashMap<String, FileStamp>
     Ok(stamps)
 }
 
-fn normalize_cache_key(_root: &Path, path: &Path) -> String {
-    path.to_string_lossy()
-        .trim_start_matches("./")
-        .replace('\\', "/")
+fn normalize_cache_key(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    path_utils::normalize_path_str(relative.to_string_lossy().as_ref())
 }
 
 fn system_time_to_epoch(time: SystemTime) -> u64 {
@@ -255,12 +266,12 @@ fn is_permission_denied_io(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied
 }
 
-fn is_permission_denied_walkdir(err: &walkdir::Error) -> bool {
+fn is_permission_denied_walk_error(err: &ignore::Error) -> bool {
     err.io_error().is_some_and(is_permission_denied_io)
 }
 
-fn log_walkdir_scan_error(err: &walkdir::Error) {
-    if is_permission_denied_walkdir(err) {
+fn log_walk_scan_error(err: &ignore::Error) {
+    if is_permission_denied_walk_error(err) {
         debug!("Skipping unreadable entry: {err}");
     } else {
         warn!("Skipping unreadable entry: {err}");
@@ -280,8 +291,10 @@ fn log_process_file_error(path: &Path, err: &anyhow::Error) {
 
 // TODO: Investigate whether salsa can help incremental review caching.
 
-fn process_file(path: &Path) -> Result<FileState> {
+fn process_file(root: &Path, path: &Path) -> Result<FileState> {
     let file_type = analysis::analyze_file(path);
+    let relative_path = path.strip_prefix(root).unwrap_or(path);
+    let normalized_path = path_utils::normalize_path_str(relative_path.to_string_lossy().as_ref());
 
     // Skip binary files
     if matches!(file_type, FileType::Binary) {
@@ -289,7 +302,7 @@ fn process_file(path: &Path) -> Result<FileState> {
         // For now, let's treat them as empty/skipped to avoid polluting output with garbage.
         // Or create a single block "Binary Content".
         return Ok(FileState {
-            path: path.to_string_lossy().to_string(),
+            path: normalized_path,
             language: Language::Unknown,
             file_hash: "binary_skipped".to_string(),
             blocks: Vec::new(),
@@ -338,7 +351,7 @@ fn process_file(path: &Path) -> Result<FileState> {
     let file_hash = format!("{:x}", hasher.finalize());
 
     Ok(FileState {
-        path: path.to_string_lossy().trim_start_matches("./").to_string(),
+        path: normalized_path,
         language,
         file_hash,
         blocks,

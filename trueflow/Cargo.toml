@@ -33,6 +33,7 @@ schemars = { version = "1.2.0" }
 serde_jcs = "0.1.0"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
+ignore = "0.4.25"
 
 # [dependencies]
 # dioxus = "0.4.3"

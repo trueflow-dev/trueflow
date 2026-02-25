@@ -432,6 +432,34 @@ fn test_scan_ignores_mutants_out_directory() -> Result<()> {
 }
 
 #[test]
+fn test_scan_honors_gitignore_and_keeps_nonignored_dotfiles() -> Result<()> {
+    let repo = TestRepo::new("scan_gitignore_and_dotfiles")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.write(".gitignore", "ignored.txt\n")?;
+    repo.write("ignored.txt", "this should be ignored by scanner\n")?;
+    repo.write(".envrc", "export DEV_MODE=1\n")?;
+    repo.commit_all("Add scan fixtures")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&output)?;
+
+    assert!(files.iter().any(|entry| {
+        entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(".envrc")
+    }));
+    assert!(files.iter().all(|entry| {
+        !entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ignored.txt")
+    }));
+
+    Ok(())
+}
+
+#[test]
 fn test_feedback_uses_precise_block_lookup_for_coverage() -> Result<()> {
     let repo = TestRepo::new("feedback_precise_lookup")?;
     repo.write(
