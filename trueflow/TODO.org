@@ -1,6 +1,29 @@
 #+title: TODO
 
 * Highest Leverage / Critical
+** Diff Relevance / Noise Filtering
+   - [ ] **Skip whitespace-only block diffs during review selection**
+     - Treat a block as unchanged if every changed line in its overlapping hunks is whitespace-only.
+     - Include both additions and removals.
+     - Add regression tests in `src/vcs.rs` for: add-only whitespace, remove-only whitespace, and mixed whitespace+real change.
+   - [ ] **Generalize trivial delimiter-only diff skipping**
+     - Current behavior only skips addition-only closing-brace lines.
+     - Decide and encode exact delimiter set (e.g. `}`, `};`, `},`) and whether removals are included.
+     - Add focused tests to avoid suppressing real logic changes.
+   - [ ] **Skip paired formatting-only line replacements**
+     - If a `-line`/`+line` pair differs only by insignificant formatting, treat it as unchanged for block selection.
+     - Start with a conservative normalization policy; make aggressive behavior opt-in.
+     - Add tests for indentation-only and trailing-whitespace-only replacements.
+   - [ ] **Handle EOF newline and line-ending-only churn as non-reviewable**
+     - Ensure CRLF/LF and missing-final-newline churn does not produce reviewable blocks by itself.
+     - Add fixture-based regression coverage for cross-platform newline behavior.
+   - [ ] **Add config knobs for diff noise filtering strictness**
+     - Introduce explicit config mode(s), e.g. `strict` vs `aggressive`, for what is suppressed.
+     - Keep default conservative and document tradeoffs.
+   - [ ] **Add E2E fixture repo for diff-noise edge cases**
+     - Build commit/revision fixtures covering whitespace-only, delimiter-only, and formatting-only changes.
+     - Verify both CLI review output and TUI diff view behavior.
+
 ** Scanner Correctness
    - [ ] **Integrate real `.gitignore` parsing into `scanner.rs`**
      - Current state: scanner uses hardcoded ignore rules (`.git`, `.trueflow`, `target`, `node_modules`).
