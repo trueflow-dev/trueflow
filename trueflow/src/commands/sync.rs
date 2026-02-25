@@ -1,3 +1,4 @@
+use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::store::{FileStore, Record, ReviewStore};
 use anyhow::{Context, Result};
@@ -7,14 +8,20 @@ use std::process::{Command, Stdio};
 use tracing::info;
 
 pub fn run(_context: &TrueflowContext) -> Result<()> {
-    // 1. Fetch origin/trueflow-db to ensure we have the latest
+    let config = load_config()?;
+    let branch = config.storage.branch.trim();
+    if branch.is_empty() {
+        anyhow::bail!("storage.branch cannot be empty");
+    }
+
+    // 1. Fetch origin storage branch to ensure we have the latest
     info!("Fetching from origin...");
     let _ = Command::new("git")
-        .args(["fetch", "origin", "trueflow-db"])
+        .args(["fetch", "origin", branch])
         .output(); // Ignore error if branch doesn't exist
 
     // 2. Get Remote Content (if any)
-    let remote_content = get_remote_content().ok();
+    let remote_content = get_remote_content(branch).ok();
 
     // 3. Get Local Content
     let store = FileStore::new()?;
@@ -73,16 +80,17 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
     let blob_hash = git_hash_object(&file_content)?;
     let tree_hash = git_mktree(&blob_hash)?;
 
-    // Parent is the current origin/trueflow-db tip if it exists
-    let parent_hash = get_remote_head();
+    // Parent is the current remote storage branch tip if it exists
+    let parent_hash = get_remote_head(branch);
 
     let commit_hash = git_commit_tree(&tree_hash, parent_hash.as_deref(), "Sync reviews")?;
 
     // 7. Update local ref (so we track what we just synced)
+    let local_ref = format!("refs/heads/{branch}");
     Command::new("git")
-        .args(["update-ref", "refs/heads/trueflow-db", &commit_hash])
+        .args(["update-ref", &local_ref, &commit_hash])
         .output()
-        .context("Failed to update local trueflow-db ref")?;
+        .with_context(|| format!("Failed to update local {branch} ref"))?;
 
     // 8. Push
     info!("Pushing to origin...");
@@ -90,22 +98,22 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
         .args([
             "push",
             "origin",
-            &format!("{commit_hash}:refs/heads/trueflow-db"),
+            &format!("{commit_hash}:refs/heads/{branch}"),
         ])
         .status()
         .context("Failed to execute git push")?;
 
     if !push_status.success() {
-        anyhow::bail!("Failed to push trueflow-db to origin (maybe conflict? try syncing again)");
+        anyhow::bail!("Failed to push {branch} to origin (maybe conflict? try syncing again)");
     }
 
     info!("Sync complete.");
     Ok(())
 }
 
-fn get_remote_content() -> Result<String> {
+fn get_remote_content(branch: &str) -> Result<String> {
     let output = Command::new("git")
-        .args(["show", "origin/trueflow-db:reviews.jsonl"])
+        .args(["show", &format!("origin/{branch}:reviews.jsonl")])
         .output()?;
     if output.status.success() {
         Ok(String::from_utf8(output.stdout)?)
@@ -114,9 +122,9 @@ fn get_remote_content() -> Result<String> {
     }
 }
 
-fn get_remote_head() -> Option<String> {
+fn get_remote_head(branch: &str) -> Option<String> {
     let output = Command::new("git")
-        .args(["rev-parse", "origin/trueflow-db"])
+        .args(["rev-parse", &format!("origin/{branch}")])
         .output()
         .ok()?;
     if output.status.success() {

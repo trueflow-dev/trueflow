@@ -19,8 +19,8 @@ fn record(id: &str, fingerprint: &str, timestamp: i64) -> Value {
     )
 }
 
-fn read_remote_reviews(remote_dir: &Path) -> Result<Vec<Value>> {
-    let stdout = run_git_output(remote_dir, &["show", "trueflow-db:reviews.jsonl"])?;
+fn read_remote_reviews(remote_dir: &Path, branch: &str) -> Result<Vec<Value>> {
+    let stdout = run_git_output(remote_dir, &["show", &format!("{branch}:reviews.jsonl")])?;
     let mut records = Vec::new();
     for line in stdout.lines() {
         if line.trim().is_empty() {
@@ -115,7 +115,7 @@ fn test_sync_dedupes_and_sorts_records() -> Result<()> {
     colleague.run(&["sync"])?;
 
     // THEN: remote records are deduped by id and sorted by timestamp
-    let records = read_remote_reviews(&remote_dir)?;
+    let records = read_remote_reviews(&remote_dir, "trueflow-db")?;
     let ids: Vec<&str> = records
         .iter()
         .filter_map(|record| record["id"].as_str())
@@ -129,6 +129,47 @@ fn test_sync_dedupes_and_sorts_records() -> Result<()> {
         .filter_map(|record| record["timestamp"].as_i64())
         .collect();
     assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+
+    Ok(())
+}
+
+#[test]
+fn test_sync_uses_configured_storage_branch() -> Result<()> {
+    let remote_dir = std::env::temp_dir()
+        .join("trueflow_tests")
+        .join(format!("remote_repo_custom_branch_{}.git", Uuid::new_v4()));
+    if remote_dir.exists() {
+        fs::remove_dir_all(&remote_dir)?;
+    }
+    fs::create_dir_all(&remote_dir)?;
+    run_git(&remote_dir, &["init", "--bare"])?;
+
+    let local = TestRepo::new("local_repo_custom_branch")?;
+    let remote = remote_dir.to_str().context("remote repo path")?;
+    run_git(&local.path, &["remote", "add", "origin", remote])?;
+    local.write("trueflow.toml", "[storage]\nbranch = \"reviews/custom\"\n")?;
+
+    local.run(&[
+        "mark",
+        "--fingerprint",
+        "fp-custom-branch",
+        "--verdict",
+        "approved",
+        "--quiet",
+    ])?;
+
+    local.run(&["sync"])?;
+
+    let stdout = run_git_output(&remote_dir, &["branch"])?;
+    assert!(stdout.contains("reviews/custom"));
+    assert!(!stdout.contains("trueflow-db"));
+
+    let custom_records = read_remote_reviews(&remote_dir, "reviews/custom")?;
+    assert!(custom_records.iter().any(|record| {
+        record["fingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint == "fp-custom-branch")
+    }));
 
     Ok(())
 }

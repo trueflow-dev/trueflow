@@ -16,6 +16,8 @@ pub struct TrueflowConfig {
     pub feedback: BlockFilterConfig,
     #[serde(default)]
     pub tui: TuiConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +28,12 @@ pub struct TuiConfig {
     pub diff_focus_mode: TuiDiffFocusMode,
     #[serde(default = "default_diff_focus_context_lines")]
     pub diff_focus_context_lines: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_storage_branch")]
+    pub branch: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -45,6 +53,14 @@ impl Default for TuiConfig {
     }
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            branch: default_storage_branch(),
+        }
+    }
+}
+
 fn default_confirm_batch() -> bool {
     true
 }
@@ -55,6 +71,10 @@ fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {
 
 fn default_diff_focus_context_lines() -> usize {
     3
+}
+
+fn default_storage_branch() -> String {
+    "trueflow-db".to_string()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -189,5 +209,23 @@ mod tests {
             TuiDiffFocusMode::ChangedWithContext
         );
         assert_eq!(cfg.tui.diff_focus_context_lines, 5);
+    }
+
+    #[test]
+    fn storage_branch_defaults_to_trueflow_db() {
+        let cfg: TrueflowConfig = match toml::from_str("") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert_eq!(cfg.storage.branch, "trueflow-db");
+    }
+
+    #[test]
+    fn storage_branch_parses_custom_value() {
+        let cfg: TrueflowConfig = match toml::from_str("[storage]\nbranch = \"reviews/custom\"\n") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert_eq!(cfg.storage.branch, "reviews/custom");
     }
 }
