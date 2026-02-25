@@ -257,9 +257,10 @@ fn normalize_cache_key(root: &Path, path: &Path) -> String {
 }
 
 fn system_time_to_epoch(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        Err(_) => 0,
+    }
 }
 
 fn is_permission_denied_io(err: &std::io::Error) -> bool {
@@ -451,6 +452,7 @@ fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn assert_merged_blocks(blocks: Vec<Block>, expected: &str) {
         let merged = blocks
@@ -480,5 +482,12 @@ mod tests {
         assert_eq!(blocks[1].kind, BlockKind::Gap);
         assert_eq!(blocks[2].kind, BlockKind::Comment);
         assert_merged_blocks(blocks, content);
+    }
+
+    #[test]
+    fn cache_timestamp_preserves_subsecond_precision() {
+        let a = UNIX_EPOCH + Duration::from_secs(123) + Duration::from_nanos(1);
+        let b = UNIX_EPOCH + Duration::from_secs(123) + Duration::from_nanos(2);
+        assert_ne!(system_time_to_epoch(a), system_time_to_epoch(b));
     }
 }
