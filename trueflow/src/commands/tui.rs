@@ -160,6 +160,7 @@ struct AppState {
     input_buffer: String,
     confirm_batch: bool,
     repo_name: String,
+    workdir_prefix: Option<String>,
     file_cache: HashMap<PathBuf, Arc<[String]>>,
     root_cursor: Option<TreeNodeId>,
     scroll_offset: u16,
@@ -250,6 +251,7 @@ pub fn run(context: &TrueflowContext) -> Result<()> {
                     config.tui.confirm_batch,
                     block_diff_focus_mode_from_config(&config.tui),
                     scope.label(),
+                    workdir_prefix_from_git_root(),
                 )?;
                 run_app(context, &mut terminal, state)
             }
@@ -266,6 +268,7 @@ fn build_review_state(
     confirm_batch: bool,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     scope_label: String,
+    workdir_prefix: Option<String>,
 ) -> Result<AppState> {
     let reviewable_nodes: HashSet<TreeNodeId> = summary
         .unreviewed_block_nodes
@@ -293,6 +296,7 @@ fn build_review_state(
         input_buffer: String::new(),
         confirm_batch,
         repo_name: detect_repo_name(context),
+        workdir_prefix,
         file_cache: HashMap::new(),
         root_cursor,
         scroll_offset: 0,
@@ -378,6 +382,25 @@ fn workdir_prefix_from_git_root() -> Option<String> {
 
 fn normalize_path_str(path: &str) -> String {
     path.trim_start_matches("./").replace('\\', "/")
+}
+
+fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> String {
+    let normalized_path = normalize_path_str(path);
+    let Some(prefix) = workdir_prefix
+        .map(normalize_path_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return normalized_path;
+    };
+
+    if normalized_path.is_empty()
+        || normalized_path == prefix
+        || normalized_path.starts_with(&format!("{prefix}/"))
+    {
+        return normalized_path;
+    }
+
+    format!("{prefix}/{normalized_path}")
 }
 
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
@@ -1575,9 +1598,10 @@ fn build_block_diff_lines(
         );
     }
 
-    let path = PathBuf::from(&node.path);
+    let diff_path = repo_relative_path_for_diff(&node.path, state.workdir_prefix.as_deref());
+    let path = PathBuf::from(&diff_path);
     let hunks = ensure_cached_diff_hunks(&mut state.file_diff_cache, &path, || {
-        let query = diff_query_for_scope(&state.review_scope, &node.path);
+        let query = diff_query_for_scope(&state.review_scope, &diff_path);
         let repo = vcs::repo_from_workdir()?;
         match query {
             DiffQuery::MainDiff { path } => vcs::diff_hunks_for_file(&repo, &path),
@@ -2092,6 +2116,77 @@ mod diff_scope_tests {
     use crate::block::{Block, BlockKind};
     use crate::store::ReviewTargetKind;
     use crate::tree::TreeBuilder;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use uuid::Uuid;
+
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to execute git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_git_stdout(path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to execute git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap_or_else(|error| panic!("invalid UTF-8 from git {args:?}: {error}"))
+    }
+
+    fn build_test_state(
+        review_scope: ReviewScope,
+        workdir_prefix: Option<String>,
+        file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
+    ) -> AppState {
+        let tree = TreeBuilder::new().finalize();
+        let review_order = ReviewOrder::from_tree(&tree, &HashSet::new());
+        let navigator = ReviewNavigator::new(tree, HashSet::new())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        AppState {
+            review_scope,
+            navigator,
+            review_order,
+            total_blocks: 0,
+            remaining_blocks: 0,
+            reviewable_nodes: HashSet::new(),
+            scope_label: String::new(),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            confirm_batch: false,
+            repo_name: "repo".to_string(),
+            workdir_prefix,
+            file_cache: HashMap::new(),
+            root_cursor: None,
+            scroll_offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            view_mode: ViewMode::Diff,
+            block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            file_diff_cache,
+            content_frame_cache: HashMap::new(),
+            highlighted_line_cache: HashMap::new(),
+        }
+    }
 
     #[test]
     fn diff_query_uses_main_diff_for_main_scope() {
@@ -2507,6 +2602,84 @@ mod diff_scope_tests {
 
         assert_eq!(first, second);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn build_block_diff_lines_uses_repo_relative_path_for_commit_scope_blocks() {
+        let repo_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_commit_scope")
+            .join(Uuid::new_v4().to_string());
+        let package_dir = repo_root.join("pkg");
+        let file_path = package_dir.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
+
+        let initial = include_str!("../../example_repos/basic_changes/src/main.rs");
+        let updated = initial.replace("Hello, world!", "Hello from commit scope");
+        fs::write(&file_path, initial)
+            .unwrap_or_else(|error| panic!("failed to write initial fixture file: {error}"));
+
+        run_git(&repo_root, &["init", "-q"]);
+        run_git(&repo_root, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_root, &["config", "user.name", "Test User"]);
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+
+        fs::write(&file_path, updated)
+            .unwrap_or_else(|error| panic!("failed to write updated fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update greeting"]);
+
+        let revision = run_git_stdout(&repo_root, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let repo = gix::open(&repo_root)
+            .unwrap_or_else(|error| panic!("failed to open git fixture repo: {error}"));
+        let hunks = vcs::diff_hunks_for_file_in_revision(&repo, &revision, "pkg/src/lib.rs")
+            .unwrap_or_else(|error| panic!("failed to compute revision diff hunks: {error}"));
+        assert!(
+            !hunks.is_empty(),
+            "expected fixture commit to produce diff hunks"
+        );
+
+        let mut state = build_test_state(
+            ReviewScope::Commit {
+                id: revision,
+                summary: "Update greeting".to_string(),
+            },
+            Some("pkg".to_string()),
+            HashMap::from([(PathBuf::from("pkg/src/lib.rs"), hunks)]),
+        );
+
+        let block = Block {
+            hash: "block".to_string(),
+            content: "fn main() {\n    println!(\"Hello from commit scope\");\n}".to_string(),
+            kind: BlockKind::Function,
+            tags: vec![],
+            complexity: 0,
+            start_line: 0,
+            end_line: 3,
+        };
+        let node = ContentNodeSnapshot {
+            id: state.navigator.tree.root(),
+            kind: TreeNodeKind::Block,
+            path: "src/lib.rs".to_string(),
+            children: Vec::new(),
+            block: Some(block.clone()),
+            language: Some(Language::Rust),
+        };
+        let palette = UiPalette::default();
+
+        let (lines, _len) = build_block_diff_lines(&mut state, &node, &block, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains("(No diff changes in this block)")),
+            "expected real diff rows for commit scope block, got: {rendered:?}"
+        );
     }
 
     #[test]
