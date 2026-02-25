@@ -44,6 +44,39 @@ fn test_mark_uncommitted_state() -> Result<()> {
 }
 
 #[test]
+fn test_mark_committed_state_with_subdir_relative_path_hint() -> Result<()> {
+    let repo = TestRepo::new("committed_state_subdir_hint")?;
+
+    repo.write("pkg/src/lib.rs", "pub fn stable() {}\n")?;
+    repo.commit_all("Initial commit")?;
+
+    let package_dir = repo.path.join("pkg");
+    let output = repo.run_in(&["review", "--all", "--json"], &package_dir)?;
+    let hash = first_block_hash(&output)?;
+
+    repo.run_in(
+        &[
+            "mark",
+            "--fingerprint",
+            &hash,
+            "--verdict",
+            "approved",
+            "--path",
+            "src/lib.rs",
+            "--quiet",
+        ],
+        &package_dir,
+    )?;
+
+    let db_path = repo.path.join(".trueflow").join("reviews.jsonl");
+    let records = read_review_records(&db_path)?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].block_state, BlockState::Committed);
+
+    Ok(())
+}
+
+#[test]
 fn test_mark_unknown_state_no_path() -> Result<()> {
     let repo = TestRepo::new("unknown_state")?;
 
