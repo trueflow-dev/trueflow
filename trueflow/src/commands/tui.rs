@@ -3,6 +3,7 @@ use crate::commands::mark;
 use crate::commands::review::collect_review_summary;
 use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_config};
 use crate::context::TrueflowContext;
+use crate::path_utils;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
@@ -360,47 +361,20 @@ where
 }
 
 fn path_matches_workdir_prefix(path: &str, prefix: &str) -> bool {
-    let normalized_path = normalize_path_str(path);
-    let normalized_prefix = normalize_path_str(prefix);
-    normalized_path == normalized_prefix
-        || normalized_path.starts_with(&format!("{normalized_prefix}/"))
+    path_utils::path_matches_workdir_prefix(path, prefix)
 }
 
 fn workdir_prefix_from_git_root() -> Option<String> {
     let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
-    let cwd = std::env::current_dir().ok()?;
-    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let relative = cwd.strip_prefix(&repo_root).ok()?;
-    let relative_str = normalize_path_str(relative.to_string_lossy().as_ref());
-    if relative_str.is_empty() || relative_str == "." {
-        None
-    } else {
-        Some(relative_str)
-    }
+    path_utils::current_workdir_prefix_for_repo_root(&repo_root)
 }
 
 fn normalize_path_str(path: &str) -> String {
-    path.trim_start_matches("./").replace('\\', "/")
+    path_utils::normalize_path_str(path)
 }
 
 fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> String {
-    let normalized_path = normalize_path_str(path);
-    let Some(prefix) = workdir_prefix
-        .map(normalize_path_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return normalized_path;
-    };
-
-    if normalized_path.is_empty()
-        || normalized_path == prefix
-        || normalized_path.starts_with(&format!("{prefix}/"))
-    {
-        return normalized_path;
-    }
-
-    format!("{prefix}/{normalized_path}")
+    path_utils::repo_relative_path_for_diff(path, workdir_prefix)
 }
 
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
@@ -1916,7 +1890,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
     let (overlay_kind, title, hints, content) = match &state.input_mode {
         InputMode::Editing { .. } => {
             let content = state.input_buffer.clone();
-            let input_lines = usize_to_u16_saturating(content.split('\n').count().max(1));
+            let input_lines = editing_input_lines(&content, input_overlay_width(area.width));
             (
                 InputOverlayKind::Editing { input_lines },
                 " Comment ",
@@ -1960,17 +1934,31 @@ enum InputOverlayKind {
     ConfirmBatch,
 }
 
+fn input_overlay_width(area_width: u16) -> u16 {
+    if area_width >= 20 {
+        area_width.min(96)
+    } else {
+        area_width
+    }
+}
+
+fn editing_input_lines(content: &str, overlay_width: u16) -> u16 {
+    let inner_width = usize::from(overlay_width.saturating_sub(2).max(1));
+    let wrapped_lines = content
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(inner_width))
+        .sum::<usize>()
+        .max(1);
+    usize_to_u16_saturating(wrapped_lines)
+}
+
 fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
     let preferred_height = match kind {
         InputOverlayKind::Editing { input_lines } => input_lines.saturating_add(4).clamp(5, 12),
         InputOverlayKind::ConfirmBatch => 4,
     };
     let height = area.height.min(preferred_height);
-    let width = if area.width >= 20 {
-        area.width.min(96)
-    } else {
-        area.width
-    };
+    let width = input_overlay_width(area.width);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + area.height.saturating_sub(height);
     Rect {
@@ -2374,6 +2362,26 @@ mod diff_scope_tests {
         };
         let rect = input_overlay_rect(area, InputOverlayKind::Editing { input_lines: 4 });
         assert_eq!(rect.height, 8);
+    }
+
+    #[test]
+    fn editing_input_lines_counts_soft_wrapped_single_line_content() {
+        let content = "x".repeat(200);
+        let wrapped = editing_input_lines(&content, 30);
+        assert!(wrapped > 1, "expected soft wrapping to increase line count");
+    }
+
+    #[test]
+    fn input_overlay_rect_grows_for_soft_wrapped_editing_content() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+        let input_lines = editing_input_lines(&"x".repeat(200), input_overlay_width(area.width));
+        let rect = input_overlay_rect(area, InputOverlayKind::Editing { input_lines });
+        assert!(rect.height > 5);
     }
 
     #[test]

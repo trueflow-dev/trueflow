@@ -120,10 +120,22 @@ pub fn parent_kind_label(kind: BlockKind) -> &'static str {
 }
 
 fn block_signature(block: &crate::block::Block) -> String {
-    let Some(line) = block.content.lines().find(|line| !line.trim().is_empty()) else {
+    let mut non_empty_lines = block
+        .content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let line = if should_skip_attribute_lines(block.kind) {
+        non_empty_lines
+            .find(|line| !line.starts_with("#["))
+            .or_else(|| non_empty_lines.next())
+    } else {
+        non_empty_lines.next()
+    };
+    let Some(line) = line else {
         return block.kind.as_str().to_string();
     };
-    let mut text = line.trim().trim_end_matches('{').trim().to_string();
+    let mut text = line.trim_end_matches('{').trim().to_string();
 
     if matches!(
         block.kind,
@@ -134,6 +146,23 @@ fn block_signature(block: &crate::block::Block) -> String {
     }
 
     truncate_text(text.trim(), 72)
+}
+
+fn should_skip_attribute_lines(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::Struct
+            | BlockKind::Enum
+            | BlockKind::Class
+            | BlockKind::Function
+            | BlockKind::Method
+            | BlockKind::FunctionSignature
+            | BlockKind::Const
+            | BlockKind::Static
+            | BlockKind::Type
+            | BlockKind::Impl
+            | BlockKind::Interface
+    )
 }
 
 fn find_argument_list_start(text: &str) -> Option<usize> {
@@ -245,6 +274,39 @@ mod tests {
         assert_eq!(
             breadcrumb,
             Some("File (src/lib.rs) -> impl Foo".to_string())
+        );
+    }
+
+    #[test]
+    fn breadcrumb_struct_prefers_type_name_over_attribute_line() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let struct_block = builder.add_block(
+            file,
+            "struct".to_string(),
+            "src/lib.rs".to_string(),
+            block(
+                "#[derive(Debug, Clone)]\nstruct Config {\n    name: String,\n}\n",
+                BlockKind::Struct,
+                1,
+                6,
+            ),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+
+        let breadcrumb = block_breadcrumb(&tree, struct_block);
+        assert_eq!(
+            breadcrumb,
+            Some("File (src/lib.rs) -> struct Config".to_string())
         );
     }
 
