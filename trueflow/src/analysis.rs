@@ -9,6 +9,7 @@ pub enum Language {
     TypeScript,
     Python,
     Go,
+    Cpp,
     Shell,
     Markdown,
     Toml,
@@ -19,7 +20,7 @@ pub enum Language {
     Unknown,
 }
 
-// TODO: add Language::Java and Language::Cpp once tree-sitter support is wired.
+// TODO: add Language::Java once tree-sitter support is wired.
 
 impl Language {
     pub fn uses_text_fallback(self) -> bool {
@@ -37,6 +38,7 @@ impl Language {
             "ts" => Some(Language::TypeScript),
             "py" => Some(Language::Python),
             "go" => Some(Language::Go),
+            "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" => Some(Language::Cpp),
             "sh" => Some(Language::Shell),
             "md" | "markdown" => Some(Language::Markdown),
             "toml" => Some(Language::Toml),
@@ -103,6 +105,13 @@ mod tests {
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
+        assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("cc"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("hpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("hh"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("hxx"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("h++"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("sh"), Some(Language::Shell));
         assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
         assert_eq!(

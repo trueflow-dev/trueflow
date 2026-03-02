@@ -30,6 +30,7 @@ fn test_all_languages_detection() -> Result<()> {
         ("main.rs", "Rust"),
         ("main.el", "Elisp"),
         ("main.go", "Go"),
+        ("main.cpp", "Cpp"),
         ("main.js", "JavaScript"),
         ("main.ts", "TypeScript"),
         ("main.py", "Python"),

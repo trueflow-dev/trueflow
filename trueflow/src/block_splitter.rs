@@ -89,6 +89,11 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             info!("block_splitter done (blocks={})", blocks.len());
             return Ok(blocks);
         }
+        Language::Cpp => {
+            let blocks = split_cpp(content);
+            info!("block_splitter done (blocks={})", blocks.len());
+            return Ok(blocks);
+        }
         _ if lang.uses_text_fallback() => {
             let blocks = split_paragraphs(content, lang);
             info!("block_splitter done (blocks={})", blocks.len());
@@ -350,6 +355,17 @@ fn split_go(content: &str) -> Vec<Block> {
     })
 }
 
+fn split_cpp(content: &str) -> Vec<Block> {
+    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+        let kind = if is_gap {
+            BlockKind::Gap
+        } else {
+            classify_cpp_chunk(chunk)
+        };
+        create_block(chunk, kind, content, start, end, Language::Cpp)
+    })
+}
+
 fn classify_go_chunk(chunk: &str) -> BlockKind {
     let mut saw_non_empty = false;
     let mut first_code_line = None;
@@ -400,6 +416,79 @@ fn classify_go_chunk(chunk: &str) -> BlockKind {
     }
 
     BlockKind::Code
+}
+
+fn classify_cpp_chunk(chunk: &str) -> BlockKind {
+    let mut saw_non_empty = false;
+    let mut first_code_line = None;
+    for line in chunk.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        saw_non_empty = true;
+        if is_comment_line(trimmed) {
+            continue;
+        }
+        first_code_line = Some(trimmed);
+        break;
+    }
+
+    if !saw_non_empty {
+        return BlockKind::Gap;
+    }
+
+    let Some(line) = first_code_line else {
+        return BlockKind::Comment;
+    };
+
+    if line.starts_with("#include ") || line.starts_with("import ") {
+        return BlockKind::Import;
+    }
+    if line.starts_with("namespace ") {
+        return BlockKind::Module;
+    }
+    if line.starts_with("class ") {
+        return BlockKind::Class;
+    }
+    if line.starts_with("struct ") {
+        return BlockKind::Struct;
+    }
+    if line.starts_with("enum ") {
+        return BlockKind::Enum;
+    }
+    if line.starts_with("constexpr ") || line.starts_with("const ") {
+        return BlockKind::Const;
+    }
+    if looks_like_cpp_function(chunk, line) {
+        return BlockKind::Function;
+    }
+
+    BlockKind::Code
+}
+
+fn looks_like_cpp_function(chunk: &str, signature_line: &str) -> bool {
+    if !signature_line.contains('(') || !signature_line.contains(')') {
+        return false;
+    }
+
+    let disallowed = [
+        "if ",
+        "for ",
+        "while ",
+        "switch ",
+        "return ",
+        "catch ",
+        "static_assert",
+    ];
+    if disallowed
+        .iter()
+        .any(|prefix| signature_line.starts_with(prefix))
+    {
+        return false;
+    }
+
+    chunk.contains('{')
 }
 
 fn is_comment_line(trimmed_line: &str) -> bool {
@@ -905,6 +994,15 @@ mod tests {
         let blocks = split(content, Language::Go).unwrap();
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Struct));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
+    }
+
+    #[test]
+    fn test_split_cpp_simple_maps_import_class_and_function() {
+        let content = "#include <vector>\n\nclass Worker {\npublic:\n    int value = 1;\n};\n\nint run() {\n    return 1;\n}\n";
+        let blocks = split(content, Language::Cpp).unwrap();
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
     }
 
