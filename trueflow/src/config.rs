@@ -1,7 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table, value};
 use tracing::warn;
 
 use crate::block::BlockKind;
@@ -20,7 +21,7 @@ pub struct TrueflowConfig {
     pub storage: StorageConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TuiConfig {
     #[serde(default = "default_confirm_batch")]
     pub confirm_batch: bool,
@@ -28,6 +29,8 @@ pub struct TuiConfig {
     pub diff_focus_mode: TuiDiffFocusMode,
     #[serde(default = "default_diff_focus_context_lines")]
     pub diff_focus_context_lines: usize,
+    #[serde(default)]
+    pub speed_read: TuiSpeedReadConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,12 +46,67 @@ pub enum TuiDiffFocusMode {
     ChangedWithContext,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiSpeedReadPunctuationDwell {
+    Off,
+    Light,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TuiSpeedReadConfig {
+    #[serde(default = "default_tui_speed_read_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_speed_read_wpm")]
+    pub default_wpm: u16,
+    #[serde(default = "default_speed_read_min_wpm")]
+    pub min_wpm: u16,
+    #[serde(default = "default_speed_read_max_wpm")]
+    pub max_wpm: u16,
+    #[serde(default = "default_speed_read_chunk_words")]
+    pub default_chunk_words: u8,
+    #[serde(default = "default_speed_read_min_chunk_words")]
+    pub min_chunk_words: u8,
+    #[serde(default = "default_speed_read_max_chunk_words")]
+    pub max_chunk_words: u8,
+    #[serde(default = "default_speed_read_loop_playback")]
+    pub loop_playback: bool,
+    #[serde(default = "default_speed_read_show_orp_highlight")]
+    pub show_orp_highlight: bool,
+    #[serde(default = "default_speed_read_show_prose_hint")]
+    pub show_prose_optimization_hint: bool,
+    #[serde(default = "default_speed_read_punctuation_dwell")]
+    pub punctuation_dwell: TuiSpeedReadPunctuationDwell,
+    #[serde(default = "default_speed_read_punctuation_dwell_multiplier")]
+    pub punctuation_dwell_multiplier: f64,
+}
+
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             confirm_batch: true,
             diff_focus_mode: default_tui_diff_focus_mode(),
             diff_focus_context_lines: default_diff_focus_context_lines(),
+            speed_read: TuiSpeedReadConfig::default(),
+        }
+    }
+}
+
+impl Default for TuiSpeedReadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_tui_speed_read_enabled(),
+            default_wpm: default_speed_read_wpm(),
+            min_wpm: default_speed_read_min_wpm(),
+            max_wpm: default_speed_read_max_wpm(),
+            default_chunk_words: default_speed_read_chunk_words(),
+            min_chunk_words: default_speed_read_min_chunk_words(),
+            max_chunk_words: default_speed_read_max_chunk_words(),
+            loop_playback: default_speed_read_loop_playback(),
+            show_orp_highlight: default_speed_read_show_orp_highlight(),
+            show_prose_optimization_hint: default_speed_read_show_prose_hint(),
+            punctuation_dwell: default_speed_read_punctuation_dwell(),
+            punctuation_dwell_multiplier: default_speed_read_punctuation_dwell_multiplier(),
         }
     }
 }
@@ -71,6 +129,54 @@ fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {
 
 fn default_diff_focus_context_lines() -> usize {
     3
+}
+
+fn default_tui_speed_read_enabled() -> bool {
+    true
+}
+
+fn default_speed_read_wpm() -> u16 {
+    320
+}
+
+fn default_speed_read_min_wpm() -> u16 {
+    120
+}
+
+fn default_speed_read_max_wpm() -> u16 {
+    900
+}
+
+fn default_speed_read_chunk_words() -> u8 {
+    2
+}
+
+fn default_speed_read_min_chunk_words() -> u8 {
+    1
+}
+
+fn default_speed_read_max_chunk_words() -> u8 {
+    5
+}
+
+fn default_speed_read_loop_playback() -> bool {
+    false
+}
+
+fn default_speed_read_show_orp_highlight() -> bool {
+    false
+}
+
+fn default_speed_read_show_prose_hint() -> bool {
+    true
+}
+
+fn default_speed_read_punctuation_dwell() -> TuiSpeedReadPunctuationDwell {
+    TuiSpeedReadPunctuationDwell::Light
+}
+
+fn default_speed_read_punctuation_dwell_multiplier() -> f64 {
+    1.15
 }
 
 fn default_storage_branch() -> String {
@@ -181,6 +287,58 @@ fn parse_block_kinds(values: &[String]) -> HashSet<BlockKind> {
     kinds
 }
 
+pub fn update_speed_read_defaults_in_file(
+    path: &Path,
+    default_wpm: u16,
+    default_chunk_words: u8,
+) -> Result<()> {
+    let mut document = if path.is_file() {
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config for update: {}", path.display()))?;
+        source
+            .parse::<DocumentMut>()
+            .with_context(|| format!("Failed to parse config for update: {}", path.display()))?
+    } else {
+        DocumentMut::new()
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create config parent directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let root = document.as_table_mut();
+    let tui_item = root.entry("tui").or_insert(Item::Table(Table::new()));
+    if !tui_item.is_table() {
+        *tui_item = Item::Table(Table::new());
+    }
+    let Some(tui_table) = tui_item.as_table_mut() else {
+        return Err(anyhow!("Expected [tui] to be a table"));
+    };
+
+    let speed_read_item = tui_table
+        .entry("speed_read")
+        .or_insert(Item::Table(Table::new()));
+    if !speed_read_item.is_table() {
+        *speed_read_item = Item::Table(Table::new());
+    }
+    let Some(speed_read_table) = speed_read_item.as_table_mut() else {
+        return Err(anyhow!("Expected [tui.speed_read] to be a table"));
+    };
+
+    speed_read_table["default_wpm"] = value(i64::from(default_wpm));
+    speed_read_table["default_chunk_words"] = value(i64::from(default_chunk_words));
+
+    std::fs::write(path, document.to_string())
+        .with_context(|| format!("Failed to write config update: {}", path.display()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +385,119 @@ mod tests {
             Err(err) => panic!("parse config: {err}"),
         };
         assert_eq!(cfg.storage.branch, "reviews/custom");
+    }
+
+    #[test]
+    fn speed_read_config_defaults_are_populated() {
+        let cfg: TrueflowConfig = match toml::from_str("") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert!(cfg.tui.speed_read.enabled);
+        assert_eq!(cfg.tui.speed_read.default_wpm, 320);
+        assert_eq!(cfg.tui.speed_read.min_wpm, 120);
+        assert_eq!(cfg.tui.speed_read.max_wpm, 900);
+        assert_eq!(cfg.tui.speed_read.default_chunk_words, 2);
+        assert_eq!(cfg.tui.speed_read.min_chunk_words, 1);
+        assert_eq!(cfg.tui.speed_read.max_chunk_words, 5);
+        assert_eq!(
+            cfg.tui.speed_read.punctuation_dwell,
+            TuiSpeedReadPunctuationDwell::Light
+        );
+        assert!((cfg.tui.speed_read.punctuation_dwell_multiplier - 1.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn speed_read_config_parses_override_values() {
+        let cfg: TrueflowConfig = match toml::from_str(
+            r#"
+[tui.speed_read]
+enabled = false
+default_wpm = 400
+min_wpm = 100
+max_wpm = 1000
+default_chunk_words = 3
+min_chunk_words = 1
+max_chunk_words = 6
+loop_playback = true
+show_orp_highlight = true
+show_prose_optimization_hint = false
+punctuation_dwell = "off"
+punctuation_dwell_multiplier = 1.2
+"#,
+        ) {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert!(!cfg.tui.speed_read.enabled);
+        assert_eq!(cfg.tui.speed_read.default_wpm, 400);
+        assert_eq!(cfg.tui.speed_read.min_wpm, 100);
+        assert_eq!(cfg.tui.speed_read.max_wpm, 1000);
+        assert_eq!(cfg.tui.speed_read.default_chunk_words, 3);
+        assert_eq!(cfg.tui.speed_read.min_chunk_words, 1);
+        assert_eq!(cfg.tui.speed_read.max_chunk_words, 6);
+        assert!(cfg.tui.speed_read.loop_playback);
+        assert!(cfg.tui.speed_read.show_orp_highlight);
+        assert!(!cfg.tui.speed_read.show_prose_optimization_hint);
+        assert_eq!(
+            cfg.tui.speed_read.punctuation_dwell,
+            TuiSpeedReadPunctuationDwell::Off
+        );
+        assert!((cfg.tui.speed_read.punctuation_dwell_multiplier - 1.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn update_speed_read_defaults_creates_and_writes_config() {
+        let path = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join(format!("speed_read_cfg_{}.toml", uuid::Uuid::new_v4()));
+
+        update_speed_read_defaults_in_file(&path, 360, 3)
+            .unwrap_or_else(|err| panic!("update config: {err}"));
+
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read config: {err}"));
+        let parsed: TrueflowConfig =
+            toml::from_str(&content).unwrap_or_else(|err| panic!("parse config: {err}"));
+        assert_eq!(parsed.tui.speed_read.default_wpm, 360);
+        assert_eq!(parsed.tui.speed_read.default_chunk_words, 3);
+    }
+
+    #[test]
+    fn update_speed_read_defaults_preserves_existing_comments_and_keys() {
+        let path = std::env::temp_dir().join("trueflow_tests").join(format!(
+            "speed_read_cfg_preserve_{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let initial = r#"# user comment
+[review]
+exclude = ["gap"]
+
+[tui]
+# important note
+confirm_batch = true
+"#;
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
+            .unwrap_or_else(|err| panic!("create temp dir: {err}"));
+        std::fs::write(&path, initial).unwrap_or_else(|err| panic!("write initial: {err}"));
+
+        update_speed_read_defaults_in_file(&path, 420, 4)
+            .unwrap_or_else(|err| panic!("update config: {err}"));
+
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read config: {err}"));
+        assert!(
+            content.contains("# user comment"),
+            "expected comment to survive edit: {content}"
+        );
+        assert!(
+            content.contains("confirm_batch"),
+            "expected existing key to survive edit: {content}"
+        );
+
+        let parsed: TrueflowConfig =
+            toml::from_str(&content).unwrap_or_else(|err| panic!("parse config: {err}"));
+        assert_eq!(parsed.tui.speed_read.default_wpm, 420);
+        assert_eq!(parsed.tui.speed_read.default_chunk_words, 4);
     }
 }

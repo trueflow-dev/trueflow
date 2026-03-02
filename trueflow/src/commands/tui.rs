@@ -1,7 +1,12 @@
 use crate::analysis::Language;
 use crate::commands::mark;
-use crate::commands::review::collect_review_summary;
-use crate::config::{BlockFilters, TuiConfig, TuiDiffFocusMode, load as load_config};
+use crate::commands::review::{
+    ReviewOptions, ReviewTarget, collect_review_summary, parse_review_targets,
+};
+use crate::config::{
+    BlockFilters, TuiConfig, TuiDiffFocusMode, TuiSpeedReadConfig, TuiSpeedReadPunctuationDwell,
+    load as load_config, update_speed_read_defaults_in_file,
+};
 use crate::context::TrueflowContext;
 use crate::path_utils;
 use crate::review_metadata;
@@ -11,6 +16,11 @@ use crate::review_scope::{
     DiffQuery, ReviewScope, ScopeOption, default_scope_options, diff_query_for_scope,
 };
 use crate::review_session;
+use crate::review_speedread::{
+    PlaybackState, PunctuationDwellMode, SpeedReadModel, new_model as build_speed_read_model,
+    next_wpm_step_down, next_wpm_step_up, rechunk_preserving_progress, set_wpm, step_next,
+    step_prev, tick_interval_with_punctuation_ms,
+};
 use crate::store::{ReviewTargetKind, Verdict};
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
@@ -33,6 +43,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // --- Core Structs ---
 
@@ -74,6 +85,19 @@ impl ScopeSelector {
 enum ScopeSelection {
     Quit,
     Selected(ReviewScope),
+}
+
+struct LaunchSelection {
+    scope: ReviewScope,
+    summary: crate::commands::review::ReviewSummary,
+    scope_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct CliReviewRequest {
+    review_scope: ReviewScope,
+    review_options: ReviewOptions,
+    scope_label: String,
 }
 
 // --- Application Logic ---
@@ -174,6 +198,20 @@ struct AppState {
     file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
+    speed_read_config: TuiSpeedReadConfig,
+    speed_read: Option<SpeedReadUiState>,
+    speed_read_persisted_defaults: PersistedSpeedReadDefaults,
+    speed_read_pending_persist: Option<PendingSpeedReadPersist>,
+    speed_read_config_path: PathBuf,
+}
+
+struct ReviewStateBuildOptions {
+    confirm_batch: bool,
+    block_diff_focus_mode: vcs::BlockDiffFocusMode,
+    scope_label: String,
+    workdir_prefix: Option<String>,
+    speed_read_config: TuiSpeedReadConfig,
+    speed_read_config_path: PathBuf,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +227,26 @@ struct SessionRecap {
 struct ActionImpact {
     affected_blocks: usize,
     removed_reviewable: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedSpeedReadDefaults {
+    default_wpm: u16,
+    default_chunk_words: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSpeedReadPersist {
+    defaults: PersistedSpeedReadDefaults,
+    flush_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpeedReadUiState {
+    node_id: TreeNodeId,
+    model: SpeedReadModel,
+    next_tick_at: Option<Instant>,
+    show_prose_optimization_hint: bool,
 }
 
 impl SessionRecap {
@@ -281,43 +339,122 @@ impl ContentNodeSnapshot {
     }
 }
 
-pub fn run(context: &TrueflowContext) -> Result<()> {
+pub fn run(
+    context: &TrueflowContext,
+    all: bool,
+    target: &[String],
+    only: &[String],
+    exclude: &[String],
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let config = load_config()?;
     let run_result = (|| {
-        let scope_options = load_scope_options()?;
-        let selection = run_scope_selector(&mut terminal, ScopeSelector::new(scope_options))?;
-
-        match selection {
-            ScopeSelection::Quit => Ok(()),
-            ScopeSelection::Selected(scope) => {
-                let filters = config.review.resolve_filters(&[], &[]);
-                let summary = load_review_state(context, &scope, &filters)?;
-                let state = build_review_state(
-                    context,
-                    summary,
-                    scope.clone(),
-                    config.tui.confirm_batch,
-                    block_diff_focus_mode_from_config(&config.tui),
-                    scope.label(),
-                    workdir_prefix_from_git_root(),
-                )?;
-                run_app(context, &mut terminal, state)
+        let launch = if let Some(request) = cli_review_request(all, target, only, exclude)? {
+            let filters = config.review.resolve_filters(only, exclude);
+            let summary = collect_review_summary(context, &request.review_options, &filters)?;
+            LaunchSelection {
+                scope: request.review_scope,
+                summary,
+                scope_label: request.scope_label,
             }
-        }
+        } else {
+            let scope_options = load_scope_options()?;
+            let selection = run_scope_selector(&mut terminal, ScopeSelector::new(scope_options))?;
+            match selection {
+                ScopeSelection::Quit => return Ok(()),
+                ScopeSelection::Selected(scope) => {
+                    let filters = config.review.resolve_filters(&[], &[]);
+                    let summary = load_review_state(context, &scope, &filters)?;
+                    LaunchSelection {
+                        scope_label: scope.label(),
+                        scope,
+                        summary,
+                    }
+                }
+            }
+        };
+
+        let state = build_review_state(
+            context,
+            launch.summary,
+            launch.scope,
+            ReviewStateBuildOptions {
+                confirm_batch: config.tui.confirm_batch,
+                block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
+                scope_label: launch.scope_label,
+                workdir_prefix: workdir_prefix_from_git_root(),
+                speed_read_config: config.tui.speed_read.clone(),
+                speed_read_config_path: speed_read_config_path_for_repo_root(),
+            },
+        )?;
+        run_app(context, &mut terminal, state)
     })();
     restore_terminal(&mut terminal)?;
     run_result
+}
+
+fn cli_review_request(
+    all: bool,
+    target: &[String],
+    only: &[String],
+    exclude: &[String],
+) -> Result<Option<CliReviewRequest>> {
+    let has_cli_overrides = all || !target.is_empty() || !only.is_empty() || !exclude.is_empty();
+    if !has_cli_overrides {
+        return Ok(None);
+    }
+
+    let targets = parse_review_targets(target)?;
+    let review_scope = review_scope_for_cli_request(all, &targets);
+    let scope_label = cli_scope_label(all, &targets);
+    Ok(Some(CliReviewRequest {
+        review_scope,
+        review_options: ReviewOptions {
+            all,
+            targets,
+            only: only.to_vec(),
+            exclude: exclude.to_vec(),
+        },
+        scope_label,
+    }))
+}
+
+fn review_scope_for_cli_request(all: bool, targets: &[ReviewTarget]) -> ReviewScope {
+    if all {
+        return ReviewScope::All;
+    }
+
+    match targets {
+        [ReviewTarget::Revision(id)] => ReviewScope::Commit {
+            id: id.clone(),
+            summary: String::new(),
+        },
+        _ => ReviewScope::MainDiff,
+    }
+}
+
+fn cli_scope_label(all: bool, targets: &[ReviewTarget]) -> String {
+    if all {
+        return "all files (CLI)".to_string();
+    }
+
+    match targets {
+        [] => "custom scope (CLI)".to_string(),
+        [ReviewTarget::File(path)] => format!("file {path}"),
+        [ReviewTarget::Revision(revision)] => format!("revision {revision}"),
+        [ReviewTarget::RevisionRange { start, end }] => format!("revisions {start}..{end}"),
+        [ReviewTarget::MainDiff] => "diff vs main".to_string(),
+        [ReviewTarget::DirtyWorktree] => "dirty worktree".to_string(),
+        [ReviewTarget::All] => "all files".to_string(),
+        multiple => format!("{} targets", multiple.len()),
+    }
 }
 
 fn build_review_state(
     context: &TrueflowContext,
     summary: crate::commands::review::ReviewSummary,
     review_scope: ReviewScope,
-    confirm_batch: bool,
-    block_diff_focus_mode: vcs::BlockDiffFocusMode,
-    scope_label: String,
-    workdir_prefix: Option<String>,
+    options: ReviewStateBuildOptions,
 ) -> Result<AppState> {
     let reviewable_nodes: HashSet<TreeNodeId> = summary
         .unreviewed_block_nodes
@@ -332,6 +469,14 @@ fn build_review_state(
 
     let review_order = ReviewOrder::from_tree(&summary.tree, &summary.unreviewed_block_nodes);
     let navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
+    let default_wpm = options.speed_read_config.default_wpm.clamp(
+        options.speed_read_config.min_wpm,
+        options.speed_read_config.max_wpm,
+    );
+    let default_chunk_words = options.speed_read_config.default_chunk_words.clamp(
+        options.speed_read_config.min_chunk_words,
+        options.speed_read_config.max_chunk_words,
+    );
 
     Ok(AppState {
         review_scope,
@@ -342,22 +487,30 @@ fn build_review_state(
         remaining_blocks,
         reviewable_nodes,
         session_recap: SessionRecap::default(),
-        scope_label,
+        scope_label: options.scope_label,
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
-        confirm_batch,
+        confirm_batch: options.confirm_batch,
         repo_name: detect_repo_name(context),
-        workdir_prefix,
+        workdir_prefix: options.workdir_prefix,
         file_cache: HashMap::new(),
         root_cursor,
         scroll_offset: 0,
         content_height: 0,
         viewport_height: 0,
         view_mode: ViewMode::Diff,
-        block_diff_focus_mode,
+        block_diff_focus_mode: options.block_diff_focus_mode,
         file_diff_cache: HashMap::new(),
         content_frame_cache: HashMap::new(),
         highlighted_line_cache: HashMap::new(),
+        speed_read_config: options.speed_read_config,
+        speed_read: None,
+        speed_read_persisted_defaults: PersistedSpeedReadDefaults {
+            default_wpm,
+            default_chunk_words,
+        },
+        speed_read_pending_persist: None,
+        speed_read_config_path: options.speed_read_config_path,
     })
 }
 
@@ -417,6 +570,13 @@ fn path_matches_workdir_prefix(path: &str, prefix: &str) -> bool {
 fn workdir_prefix_from_git_root() -> Option<String> {
     let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
     path_utils::current_workdir_prefix_for_repo_root(&repo_root)
+}
+
+fn speed_read_config_path_for_repo_root() -> PathBuf {
+    match vcs::git_root_from_workdir() {
+        Ok(Some(root)) => root.join("trueflow.toml"),
+        Ok(None) | Err(_) => PathBuf::from("trueflow.toml"),
+    }
 }
 
 fn normalize_path_str(path: &str) -> String {
@@ -500,7 +660,25 @@ fn run_app(
             needs_render = false;
         }
 
-        let event = event::read()?;
+        let event = read_next_app_event(&state)?;
+        if event.is_none() {
+            let now = Instant::now();
+            let mut rerender = false;
+            if handle_speed_read_autoplay_timeout(&mut state, now) {
+                rerender = true;
+            }
+            if flush_due_speed_read_defaults(&mut state, now)? {
+                rerender = true;
+            }
+            if rerender {
+                needs_render = true;
+            }
+            continue;
+        }
+
+        let Some(event) = event else {
+            continue;
+        };
         if should_rerender_on_event(&event) {
             needs_render = true;
             continue;
@@ -515,13 +693,22 @@ fn run_app(
             InputMode::Normal => {
                 if is_recap_mode(&state) {
                     if recap_key_should_exit(key_code) {
+                        flush_pending_speed_read_defaults(&mut state)?;
                         return Ok(());
                     }
                     continue;
                 }
 
+                if handle_speed_read_key_binding(&mut state, key_code) {
+                    needs_render = true;
+                    continue;
+                }
+
                 match key_code {
-                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('q') => {
+                        flush_pending_speed_read_defaults(&mut state)?;
+                        return Ok(());
+                    }
                     KeyCode::Char('k') | KeyCode::Down => {
                         handle_descend(&mut state);
                         needs_render = true;
@@ -583,6 +770,7 @@ fn run_app(
                     }
                     KeyCode::Char('g') => {
                         state.navigator.jump_root();
+                        clear_speed_read_if_not_on_current_node(&mut state);
                         needs_render = true;
                     }
                     KeyCode::Char('d') => {
@@ -599,7 +787,12 @@ fn run_app(
                     {
                         if let Some(first) = state.review_order.first_block() {
                             state.navigator.set_current(first);
+                            clear_speed_read_if_not_on_current_node(&mut state);
                         }
+                        needs_render = true;
+                    }
+                    KeyCode::Char('r') => {
+                        toggle_speed_read_mode(&mut state);
                         needs_render = true;
                     }
                     _ => {}
@@ -641,6 +834,406 @@ fn run_app(
             },
         }
     }
+}
+
+fn read_next_app_event(state: &AppState) -> Result<Option<Event>> {
+    let Some(deadline) = next_app_deadline(state) else {
+        return Ok(Some(event::read()?));
+    };
+
+    let now = Instant::now();
+    if deadline <= now {
+        return Ok(None);
+    }
+
+    let timeout = deadline.saturating_duration_since(now);
+    if event::poll(timeout)? {
+        Ok(Some(event::read()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn next_app_deadline(state: &AppState) -> Option<Instant> {
+    let speed_read_deadline = state
+        .speed_read
+        .as_ref()
+        .and_then(|mode| mode.next_tick_at)
+        .filter(|_| speed_read_is_active_for_current_node(state));
+    let persist_deadline = state
+        .speed_read_pending_persist
+        .map(|pending| pending.flush_at);
+
+    match (speed_read_deadline, persist_deadline) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+const SPEED_READ_PERSIST_DEBOUNCE: Duration = Duration::from_millis(512);
+
+fn speed_read_is_active_for_current_node(state: &AppState) -> bool {
+    state
+        .speed_read
+        .as_ref()
+        .is_some_and(|mode| mode.node_id == state.navigator.current_id())
+}
+
+fn clear_speed_read_if_not_on_current_node(state: &mut AppState) {
+    if state
+        .speed_read
+        .as_ref()
+        .is_some_and(|mode| mode.node_id != state.navigator.current_id())
+    {
+        state.speed_read = None;
+    }
+}
+
+fn toggle_speed_read_mode(state: &mut AppState) {
+    if !state.speed_read_config.enabled {
+        state.speed_read = None;
+        return;
+    }
+
+    let current_id = state.navigator.current_id();
+    if state
+        .speed_read
+        .as_ref()
+        .is_some_and(|mode| mode.node_id == current_id)
+    {
+        state.speed_read = None;
+        return;
+    }
+
+    let node = state.navigator.tree.node(current_id);
+    if !matches!(node.kind, TreeNodeKind::Block) {
+        state.speed_read = None;
+        return;
+    }
+
+    let Some(block) = node.block.as_ref() else {
+        state.speed_read = None;
+        return;
+    };
+
+    let default_wpm = state.speed_read_persisted_defaults.default_wpm.clamp(
+        state.speed_read_config.min_wpm,
+        state.speed_read_config.max_wpm,
+    );
+    let default_chunk_words = state
+        .speed_read_persisted_defaults
+        .default_chunk_words
+        .clamp(
+            state.speed_read_config.min_chunk_words,
+            state.speed_read_config.max_chunk_words,
+        );
+    let model = build_speed_read_model(&block.content, default_wpm, default_chunk_words);
+    let show_prose_optimization_hint =
+        state.speed_read_config.show_prose_optimization_hint && is_code_heavy_text(&block.content);
+
+    state.speed_read = Some(SpeedReadUiState {
+        node_id: current_id,
+        model,
+        next_tick_at: None,
+        show_prose_optimization_hint,
+    });
+    state.scroll_offset = 0;
+}
+
+fn is_code_heavy_text(text: &str) -> bool {
+    let total = text.chars().filter(|ch| !ch.is_whitespace()).count();
+    if total == 0 {
+        return false;
+    }
+
+    let code_like = text
+        .chars()
+        .filter(|ch| {
+            matches!(
+                ch,
+                '{' | '}' | '(' | ')' | ';' | ':' | '=' | '<' | '>' | '[' | ']'
+            )
+        })
+        .count();
+
+    (code_like as f64 / total as f64) > 0.12
+}
+
+fn handle_speed_read_key_binding(state: &mut AppState, key_code: KeyCode) -> bool {
+    if !speed_read_is_active_for_current_node(state) {
+        return false;
+    }
+
+    match key_code {
+        KeyCode::Esc => {
+            state.speed_read = None;
+            true
+        }
+        KeyCode::Char(' ') => {
+            toggle_speed_read_playback(state);
+            true
+        }
+        KeyCode::Char('j') => {
+            speed_read_step_prev(state);
+            true
+        }
+        KeyCode::Char('l') => {
+            speed_read_step_next_or_exit(state);
+            true
+        }
+        KeyCode::Char('-') => {
+            speed_read_adjust_wpm_down(state);
+            true
+        }
+        KeyCode::Char('=') => {
+            speed_read_adjust_wpm_up(state);
+            true
+        }
+        KeyCode::Char('[') => {
+            speed_read_adjust_chunk_down(state);
+            true
+        }
+        KeyCode::Char(']') => {
+            speed_read_adjust_chunk_up(state);
+            true
+        }
+        KeyCode::Char('0') => {
+            speed_read_reset_to_persisted_defaults(state);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn speed_read_step_prev(state: &mut AppState) {
+    if let Some(mode) = state.speed_read.as_mut() {
+        step_prev(&mut mode.model);
+        update_speed_read_next_tick(mode, &state.speed_read_config);
+    }
+}
+
+fn speed_read_step_next_or_exit(state: &mut AppState) {
+    let mut should_exit = false;
+    if let Some(mode) = state.speed_read.as_mut() {
+        let loop_playback = state.speed_read_config.loop_playback;
+        if mode.model.phrases.is_empty()
+            || (mode.model.cursor + 1 >= mode.model.phrases.len() && !loop_playback)
+        {
+            mode.model.playback = PlaybackState::Paused;
+            should_exit = true;
+        } else {
+            step_next(&mut mode.model, loop_playback);
+            update_speed_read_next_tick(mode, &state.speed_read_config);
+        }
+    }
+    if should_exit {
+        state.speed_read = None;
+    }
+}
+
+fn toggle_speed_read_playback(state: &mut AppState) {
+    if let Some(mode) = state.speed_read.as_mut() {
+        mode.model.playback = match mode.model.playback {
+            PlaybackState::Paused => PlaybackState::Playing,
+            PlaybackState::Playing => PlaybackState::Paused,
+        };
+        update_speed_read_next_tick(mode, &state.speed_read_config);
+    }
+}
+
+fn speed_read_adjust_wpm_up(state: &mut AppState) {
+    if let Some(mode) = state.speed_read.as_mut() {
+        let updated = next_wpm_step_up(mode.model.settings.wpm, state.speed_read_config.max_wpm);
+        set_wpm(
+            &mut mode.model,
+            updated,
+            state.speed_read_config.min_wpm,
+            state.speed_read_config.max_wpm,
+        );
+        update_speed_read_next_tick(mode, &state.speed_read_config);
+        schedule_speed_read_defaults_persist(state);
+    }
+}
+
+fn speed_read_adjust_wpm_down(state: &mut AppState) {
+    if let Some(mode) = state.speed_read.as_mut() {
+        let updated = next_wpm_step_down(mode.model.settings.wpm, state.speed_read_config.min_wpm);
+        set_wpm(
+            &mut mode.model,
+            updated,
+            state.speed_read_config.min_wpm,
+            state.speed_read_config.max_wpm,
+        );
+        update_speed_read_next_tick(mode, &state.speed_read_config);
+        schedule_speed_read_defaults_persist(state);
+    }
+}
+
+fn speed_read_adjust_chunk_up(state: &mut AppState) {
+    if let Some(mode) = state.speed_read.as_mut() {
+        let updated = mode
+            .model
+            .settings
+            .chunk_words
+            .saturating_add(1)
+            .min(state.speed_read_config.max_chunk_words);
+        rechunk_preserving_progress(&mut mode.model, updated);
+        update_speed_read_next_tick(mode, &state.speed_read_config);
+        schedule_speed_read_defaults_persist(state);
+    }
+}
+
+fn speed_read_adjust_chunk_down(state: &mut AppState) {
+    if let Some(mode) = state.speed_read.as_mut() {
+        let updated = mode
+            .model
+            .settings
+            .chunk_words
+            .saturating_sub(1)
+            .max(state.speed_read_config.min_chunk_words);
+        rechunk_preserving_progress(&mut mode.model, updated);
+        update_speed_read_next_tick(mode, &state.speed_read_config);
+        schedule_speed_read_defaults_persist(state);
+    }
+}
+
+fn speed_read_reset_to_persisted_defaults(state: &mut AppState) {
+    if let Some(mode) = state.speed_read.as_mut() {
+        let default_wpm = state.speed_read_persisted_defaults.default_wpm.clamp(
+            state.speed_read_config.min_wpm,
+            state.speed_read_config.max_wpm,
+        );
+        let default_chunk_words = state
+            .speed_read_persisted_defaults
+            .default_chunk_words
+            .clamp(
+                state.speed_read_config.min_chunk_words,
+                state.speed_read_config.max_chunk_words,
+            );
+        set_wpm(
+            &mut mode.model,
+            default_wpm,
+            state.speed_read_config.min_wpm,
+            state.speed_read_config.max_wpm,
+        );
+        rechunk_preserving_progress(&mut mode.model, default_chunk_words);
+        update_speed_read_next_tick(mode, &state.speed_read_config);
+        state.speed_read_pending_persist = None;
+    }
+}
+
+fn schedule_speed_read_defaults_persist(state: &mut AppState) {
+    let Some(mode) = state.speed_read.as_ref() else {
+        return;
+    };
+
+    state.speed_read_pending_persist = Some(PendingSpeedReadPersist {
+        defaults: PersistedSpeedReadDefaults {
+            default_wpm: mode.model.settings.wpm,
+            default_chunk_words: mode.model.settings.chunk_words,
+        },
+        flush_at: Instant::now() + SPEED_READ_PERSIST_DEBOUNCE,
+    });
+}
+
+fn update_speed_read_next_tick(mode: &mut SpeedReadUiState, config: &TuiSpeedReadConfig) {
+    if mode.model.playback == PlaybackState::Playing {
+        mode.next_tick_at = Some(Instant::now() + speed_read_tick_interval(mode, config));
+    } else {
+        mode.next_tick_at = None;
+    }
+}
+
+fn speed_read_tick_interval(mode: &SpeedReadUiState, config: &TuiSpeedReadConfig) -> Duration {
+    let phrase = mode
+        .model
+        .phrases
+        .get(mode.model.cursor)
+        .map(|phrase| phrase.text.as_str())
+        .unwrap_or("");
+
+    let dwell_mode = match config.punctuation_dwell {
+        TuiSpeedReadPunctuationDwell::Off => PunctuationDwellMode::Off,
+        TuiSpeedReadPunctuationDwell::Light => PunctuationDwellMode::Light,
+    };
+    let interval_ms = tick_interval_with_punctuation_ms(
+        mode.model.settings.wpm,
+        mode.model.settings.chunk_words,
+        phrase,
+        dwell_mode,
+        config.punctuation_dwell_multiplier,
+    );
+    Duration::from_millis(interval_ms)
+}
+
+fn handle_speed_read_autoplay_timeout(state: &mut AppState, now: Instant) -> bool {
+    if !speed_read_is_active_for_current_node(state) {
+        clear_speed_read_if_not_on_current_node(state);
+        return false;
+    }
+
+    let mut should_exit = false;
+    let mut did_update = false;
+    if let Some(mode) = state.speed_read.as_mut() {
+        let loop_playback = state.speed_read_config.loop_playback;
+        if mode.model.playback != PlaybackState::Playing {
+            return false;
+        }
+        if mode.model.phrases.is_empty() {
+            should_exit = true;
+        } else if let Some(next_tick_at) = mode.next_tick_at {
+            if now >= next_tick_at {
+                if mode.model.cursor + 1 >= mode.model.phrases.len() && !loop_playback {
+                    mode.model.playback = PlaybackState::Paused;
+                    should_exit = true;
+                } else {
+                    step_next(&mut mode.model, loop_playback);
+                    mode.next_tick_at =
+                        Some(now + speed_read_tick_interval(mode, &state.speed_read_config));
+                    did_update = true;
+                }
+            }
+        } else {
+            mode.next_tick_at =
+                Some(now + speed_read_tick_interval(mode, &state.speed_read_config));
+            did_update = true;
+        }
+    }
+
+    if should_exit {
+        state.speed_read = None;
+        return true;
+    }
+
+    did_update
+}
+
+fn flush_due_speed_read_defaults(state: &mut AppState, now: Instant) -> Result<bool> {
+    let Some(pending) = state.speed_read_pending_persist else {
+        return Ok(false);
+    };
+    if now < pending.flush_at {
+        return Ok(false);
+    }
+
+    flush_pending_speed_read_defaults(state)?;
+    Ok(true)
+}
+
+fn flush_pending_speed_read_defaults(state: &mut AppState) -> Result<()> {
+    let Some(pending) = state.speed_read_pending_persist else {
+        return Ok(());
+    };
+
+    update_speed_read_defaults_in_file(
+        &state.speed_read_config_path,
+        pending.defaults.default_wpm,
+        pending.defaults.default_chunk_words,
+    )?;
+    state.speed_read_persisted_defaults = pending.defaults;
+    state.speed_read_pending_persist = None;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,6 +1311,7 @@ fn handle_ascend(state: &mut AppState) {
     }
     state.navigator.ascend();
     state.scroll_offset = 0;
+    clear_speed_read_if_not_on_current_node(state);
 }
 
 fn handle_descend(state: &mut AppState) {
@@ -740,10 +1334,12 @@ fn handle_descend(state: &mut AppState) {
         if let Some(target) = state.root_cursor {
             state.navigator.set_current(target);
             state.scroll_offset = 0;
+            clear_speed_read_if_not_on_current_node(state);
         }
     } else {
         state.navigator.descend();
         state.scroll_offset = 0;
+        clear_speed_read_if_not_on_current_node(state);
     }
 }
 
@@ -753,6 +1349,7 @@ fn handle_prev(state: &mut AppState) {
     } else {
         state.navigator.move_prev();
         state.scroll_offset = 0;
+        clear_speed_read_if_not_on_current_node(state);
     }
 }
 
@@ -762,6 +1359,7 @@ fn handle_next(state: &mut AppState) {
     } else {
         state.navigator.move_next();
         state.scroll_offset = 0;
+        clear_speed_read_if_not_on_current_node(state);
     }
 }
 
@@ -1019,6 +1617,7 @@ fn apply_action_locally(
         state.navigator.jump_root();
         state.scroll_offset = 0;
     }
+    clear_speed_read_if_not_on_current_node(state);
 
     ActionImpact {
         affected_blocks,
@@ -1213,12 +1812,18 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
     let actions_lines = build_action_lines(focus_layout.actions.width, palette);
     let node_snapshot = ContentNodeSnapshot::from_node(node);
-    let (content_lines, total_lines) = build_content_lines_with_frame_cache(
-        state,
-        &node_snapshot,
-        palette,
-        focus_layout.code.height,
-    );
+    let (content_lines, total_lines) = if let Some(speed_lines) =
+        build_speed_read_lines(state, node_snapshot.id, palette, focus_layout.code.width)
+    {
+        speed_lines
+    } else {
+        build_content_lines_with_frame_cache(
+            state,
+            &node_snapshot,
+            palette,
+            focus_layout.code.height,
+        )
+    };
 
     state.content_height = usize_to_u16_saturating(total_lines);
     state.viewport_height = focus_layout.code.height;
@@ -1267,6 +1872,106 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         .style(Style::default().bg(palette.bg));
 
     frame.render_widget(actions_paragraph, focus_layout.actions);
+}
+
+fn build_speed_read_lines(
+    state: &AppState,
+    node_id: TreeNodeId,
+    palette: &UiPalette,
+    width: u16,
+) -> Option<(Vec<Line<'static>>, usize)> {
+    let mode = state.speed_read.as_ref()?;
+    if mode.node_id != node_id {
+        return None;
+    }
+
+    let width = usize::from(width.max(1));
+    let current_phrase = mode
+        .model
+        .phrases
+        .get(mode.model.cursor)
+        .map(|phrase| phrase.text.as_str())
+        .unwrap_or("(No words)");
+    let previous_phrase = mode
+        .model
+        .cursor
+        .checked_sub(1)
+        .and_then(|index| mode.model.phrases.get(index))
+        .map(|phrase| phrase.text.as_str())
+        .unwrap_or("");
+    let next_phrase = mode
+        .model
+        .phrases
+        .get(mode.model.cursor.saturating_add(1))
+        .map(|phrase| phrase.text.as_str())
+        .unwrap_or("");
+
+    let status = format!(
+        "Speed {}  WPM:{}  Chunk:{}  {}/{}",
+        match mode.model.playback {
+            PlaybackState::Paused => "paused",
+            PlaybackState::Playing => "playing",
+        },
+        mode.model.settings.wpm,
+        mode.model.settings.chunk_words,
+        mode.model.cursor.saturating_add(1),
+        mode.model.phrases.len(),
+    );
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            center_text(previous_phrase, width),
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            center_text(current_phrase, width),
+            if state.speed_read_config.show_orp_highlight {
+                Style::default()
+                    .fg(palette.fg)
+                    .bg(palette.code_bg)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+                    .fg(palette.fg)
+                    .bg(palette.code_bg)
+                    .add_modifier(Modifier::BOLD)
+            },
+        )),
+        Line::from(Span::styled(
+            center_text("^", width),
+            Style::default().fg(palette.add).bg(palette.code_bg),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            center_text(next_phrase, width),
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            status,
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        )),
+    ];
+
+    if mode.show_prose_optimization_hint {
+        lines.push(Line::from(Span::styled(
+            "Speed mode is prose-optimized; code accuracy may be better in source/diff mode.",
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        )));
+    }
+
+    let line_count = lines.len();
+    Some((lines, line_count))
+}
+
+fn center_text(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        return text.to_string();
+    }
+    let padding = (width - len) / 2;
+    format!("{}{}", " ".repeat(padding), text)
 }
 
 fn content_frame_cache_key(
@@ -2356,7 +3061,79 @@ mod diff_scope_tests {
             file_diff_cache,
             content_frame_cache: HashMap::new(),
             highlighted_line_cache: HashMap::new(),
+            speed_read_config: TuiSpeedReadConfig::default(),
+            speed_read: None,
+            speed_read_persisted_defaults: PersistedSpeedReadDefaults {
+                default_wpm: 320,
+                default_chunk_words: 2,
+            },
+            speed_read_pending_persist: None,
+            speed_read_config_path: PathBuf::from("trueflow.toml"),
         }
+    }
+
+    fn build_state_with_single_block(content: &str) -> (AppState, TreeNodeId) {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let block = Block::new(content.to_string(), BlockKind::Paragraph, 0, 1);
+        let block_id = builder.add_block(
+            file,
+            "paragraph".to_string(),
+            "src/lib.rs".to_string(),
+            block,
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let visible = HashSet::from([block_id]);
+        let review_order = ReviewOrder::from_tree(&tree, &visible);
+        let mut navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        navigator.set_current(block_id);
+
+        let state = AppState {
+            review_scope: ReviewScope::All,
+            navigator,
+            review_order,
+            total_blocks: 1,
+            initial_remaining_blocks: 1,
+            remaining_blocks: 1,
+            reviewable_nodes: visible,
+            session_recap: SessionRecap::default(),
+            scope_label: "All".to_string(),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            confirm_batch: false,
+            repo_name: "repo".to_string(),
+            workdir_prefix: None,
+            file_cache: HashMap::new(),
+            root_cursor: None,
+            scroll_offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            view_mode: ViewMode::Diff,
+            block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            file_diff_cache: HashMap::new(),
+            content_frame_cache: HashMap::new(),
+            highlighted_line_cache: HashMap::new(),
+            speed_read_config: TuiSpeedReadConfig::default(),
+            speed_read: None,
+            speed_read_persisted_defaults: PersistedSpeedReadDefaults {
+                default_wpm: 320,
+                default_chunk_words: 2,
+            },
+            speed_read_pending_persist: None,
+            speed_read_config_path: PathBuf::from("trueflow.toml"),
+        };
+
+        (state, block_id)
     }
 
     #[test]
@@ -2468,12 +3245,61 @@ mod diff_scope_tests {
             confirm_batch: true,
             diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
             diff_focus_context_lines: 7,
+            speed_read: crate::config::TuiSpeedReadConfig::default(),
         };
         let mode = block_diff_focus_mode_from_config(&config);
         assert_eq!(
             mode,
             vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 7 }
         );
+    }
+
+    #[test]
+    fn cli_review_request_returns_none_without_cli_overrides() {
+        let request = cli_review_request(false, &[], &[], &[])
+            .unwrap_or_else(|error| panic!("expected no parse error: {error}"));
+        assert!(request.is_none());
+    }
+
+    #[test]
+    fn cli_review_request_file_target_uses_main_diff_scope() {
+        let targets = vec!["file:src/lib.rs".to_string()];
+        let request = cli_review_request(false, &targets, &[], &[])
+            .unwrap_or_else(|error| panic!("expected file target request: {error}"));
+        let Some(request) = request else {
+            panic!("expected cli request");
+        };
+
+        assert_eq!(request.review_scope, ReviewScope::MainDiff);
+        assert_eq!(request.scope_label, "file src/lib.rs");
+        assert_eq!(
+            request.review_options.targets,
+            vec![ReviewTarget::File("src/lib.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn cli_review_request_only_exclude_without_targets_is_supported() {
+        let only = vec!["function".to_string()];
+        let exclude = vec!["comment".to_string()];
+        let request = cli_review_request(false, &[], &only, &exclude)
+            .unwrap_or_else(|error| panic!("expected filter-only request: {error}"));
+        let Some(request) = request else {
+            panic!("expected cli request");
+        };
+
+        assert_eq!(request.review_scope, ReviewScope::MainDiff);
+        assert_eq!(request.scope_label, "custom scope (CLI)");
+        assert_eq!(request.review_options.only, only);
+        assert_eq!(request.review_options.exclude, exclude);
+        assert!(request.review_options.targets.is_empty());
+    }
+
+    #[test]
+    fn cli_review_request_errors_for_unknown_target_format() {
+        let targets = vec!["src/lib.rs".to_string()];
+        let request = cli_review_request(false, &targets, &[], &[]);
+        assert!(request.is_err());
     }
 
     #[test]
@@ -2950,6 +3776,68 @@ mod diff_scope_tests {
         assert!(recap_key_should_exit(KeyCode::Char('d')));
         assert!(recap_key_should_exit(KeyCode::Esc));
         assert!(!recap_key_should_exit(KeyCode::Char('a')));
+    }
+
+    #[test]
+    fn toggle_speed_read_mode_activates_on_block_node() {
+        let (mut state, block_id) = build_state_with_single_block("alpha beta gamma");
+        assert!(state.speed_read.is_none());
+
+        toggle_speed_read_mode(&mut state);
+
+        let Some(mode) = state.speed_read.as_ref() else {
+            panic!("expected speed read mode to activate");
+        };
+        assert_eq!(mode.node_id, block_id);
+        assert_eq!(mode.model.playback, PlaybackState::Paused);
+    }
+
+    #[test]
+    fn toggle_speed_read_mode_ignores_non_block_nodes() {
+        let mut state = build_test_state(ReviewScope::All, None, HashMap::new());
+        state.navigator.jump_root();
+
+        toggle_speed_read_mode(&mut state);
+
+        assert!(state.speed_read.is_none());
+    }
+
+    #[test]
+    fn speed_read_space_toggles_playback_and_sets_next_tick() {
+        let (mut state, _) = build_state_with_single_block("alpha beta gamma delta");
+        toggle_speed_read_mode(&mut state);
+
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char(' ')
+        ));
+
+        let Some(mode) = state.speed_read.as_ref() else {
+            panic!("expected speed read mode to remain active");
+        };
+        assert_eq!(mode.model.playback, PlaybackState::Playing);
+        assert!(mode.next_tick_at.is_some());
+    }
+
+    #[test]
+    fn speed_read_autoplay_timeout_exits_to_normal_view_at_end() {
+        let (mut state, _) = build_state_with_single_block("alpha beta");
+        toggle_speed_read_mode(&mut state);
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char(' ')
+        ));
+
+        if let Some(mode) = state.speed_read.as_mut() {
+            mode.next_tick_at = Some(Instant::now());
+        }
+
+        let updated = handle_speed_read_autoplay_timeout(
+            &mut state,
+            Instant::now() + Duration::from_millis(5),
+        );
+        assert!(updated);
+        assert!(state.speed_read.is_none());
     }
 }
 

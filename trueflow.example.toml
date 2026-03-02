@@ -15,3 +15,18 @@ exclude = []
 [tui]
 # Require confirmation modal before batch actions.
 confirm_batch = true
+
+[tui.speed_read]
+# Enable speed-reading mode in the TUI (`r` to toggle on block nodes).
+enabled = true
+default_wpm = 320
+min_wpm = 120
+max_wpm = 900
+default_chunk_words = 2
+min_chunk_words = 1
+max_chunk_words = 5
+loop_playback = false
+show_orp_highlight = false
+show_prose_optimization_hint = true
+punctuation_dwell = "light" # off|light
+punctuation_dwell_multiplier = 1.15

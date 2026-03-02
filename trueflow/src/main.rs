@@ -21,6 +21,7 @@ mod review_navigator;
 mod review_order;
 mod review_scope;
 mod review_session;
+mod review_speedread;
 mod scanner;
 mod store;
 pub mod sub_splitter;
@@ -85,6 +86,11 @@ fn main() -> Result<()> {
             commands::inspect::run(&context, fingerprint, *split)
         }
         Commands::Verify { all, id } => commands::verify::run(*all, id.as_deref()),
-        Commands::Tui => commands::tui::run(&context),
+        Commands::Tui {
+            all,
+            target,
+            only,
+            exclude,
+        } => commands::tui::run(&context, *all, target, only, exclude),
     }
 }

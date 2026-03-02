@@ -23,6 +23,7 @@ pub struct UnreviewedFile {
     pub blocks: Vec<Block>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewOptions {
     pub all: bool,
     pub targets: Vec<ReviewTarget>,
@@ -342,7 +343,7 @@ fn normalize_path_str(path: &str) -> String {
     path_utils::normalize_path_str(path)
 }
 
-fn parse_review_targets(values: &[String]) -> Result<Vec<ReviewTarget>> {
+pub(crate) fn parse_review_targets(values: &[String]) -> Result<Vec<ReviewTarget>> {
     let mut targets = Vec::new();
     for raw in values {
         if let Some(rest) = raw.strip_prefix("file:") {

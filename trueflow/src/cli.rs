@@ -135,5 +135,21 @@ pub enum Commands {
         id: Option<String>,
     },
     /// Launch the TUI
-    Tui,
+    Tui {
+        /// Review everything (Audit mode), ignoring git status
+        #[arg(long)]
+        all: bool,
+
+        /// Review targets (file:`<path>`, rev:`<sha>`, rev:`<start>..<end>`)
+        #[arg(long, value_name = "TARGET")]
+        target: Vec<String>,
+
+        /// Only include block types (e.g. "function", "struct")
+        #[arg(long)]
+        only: Vec<String>,
+
+        /// Exclude block types (e.g. "gap", "comment", "whitespace")
+        #[arg(long)]
+        exclude: Vec<String>,
+    },
 }
