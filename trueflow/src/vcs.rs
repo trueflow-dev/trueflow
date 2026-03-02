@@ -342,10 +342,9 @@ pub fn block_has_changed_lines_in_diff(block: &Block, hunks: &[DiffHunk]) -> boo
         return false;
     }
 
-    if changed_lines
-        .iter()
-        .all(|line| is_trivial_closing_brace_addition(line))
-    {
+    if changed_lines.iter().all(|line| {
+        is_trivial_closing_brace_addition(line) || is_trivial_whitespace_only_change(line)
+    }) {
         return false;
     }
 
@@ -377,6 +376,10 @@ fn is_trivial_closing_brace_addition(line: &DiffLine) -> bool {
         Some(ch) if (ch == ';' || ch == ',') && chars.next().is_none() => true,
         _ => false,
     }
+}
+
+fn is_trivial_whitespace_only_change(line: &DiffLine) -> bool {
+    matches!(line.kind, DiffLineKind::Added | DiffLineKind::Removed) && line.text.trim().is_empty()
 }
 
 pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
@@ -1011,6 +1014,87 @@ mod tests {
         assert!(
             !block_has_changed_lines_in_diff(&block, &[hunk]),
             "brace-only additions should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_whitespace_only_additions() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec!["+    \n".to_string(), "+\t\n".to_string()],
+        };
+
+        assert!(
+            !block_has_changed_lines_in_diff(&block, &[hunk]),
+            "whitespace-only additions should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_whitespace_only_removals() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec!["-    \n".to_string(), "-\t\n".to_string()],
+        };
+
+        assert!(
+            !block_has_changed_lines_in_diff(&block, &[hunk]),
+            "whitespace-only removals should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_keeps_mixed_whitespace_and_real_changes() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec!["+    \n".to_string(), "+let value = 42;\n".to_string()],
+        };
+
+        assert!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            "mixed whitespace and non-whitespace changes must remain reviewable"
         );
     }
 }
