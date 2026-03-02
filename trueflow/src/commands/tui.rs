@@ -2300,7 +2300,7 @@ fn build_block_lines(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
-    code_height: u16,
+    _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
     let Some(block) = &node.block else {
         return (
@@ -2317,49 +2317,10 @@ fn build_block_lines(
     }
 
     let language = node.language;
-    let block_line_count = block.content.lines().count();
-    let extra_space =
-        i32::from(code_height.saturating_sub(usize_to_u16_saturating(block_line_count)));
-
-    // TODO: if paginating, we shouldn't truncate context based on viewport height alone.
-    // However, existing context logic tries to center the block vertically.
-    // For pagination, we probably want full context available but scrolled.
-    // For now, let's keep context logic but return full lines.
-
-    let total_context = usize::try_from((extra_space - 1).max(0)).unwrap_or(usize::MAX);
-    // With scrolling, we might want more context if available, or just render everything?
-    // The current design renders a *subset* of file lines around the block.
-    // If we want to scroll *within* that subset, we return the subset.
-    // If we want to scroll the *whole file*, that's a bigger change.
-    // Let's assume we paginate the "view" constructed here.
-    // If the block is huge, 'block_lines' is huge, and 'extra_space' is negative.
-    // In that case, context is 0.
-
-    let mut top_context = total_context / 2 + (total_context % 2);
-    let mut bottom_context = total_context / 2;
-
-    if extra_space < 2 {
-        // Block is large or fits perfectly. Minimal context.
-        // Actually, if block is large, extra_space < 0.
-        // We should just render the block + maybe minimal context if we want?
-        // Existing logic returns just block lines if extra_space < 2.
-        // This is fine for now; large blocks will just be the block itself.
-        let mut lines = Vec::with_capacity(block_line_count);
-        for line in block.content.lines() {
-            lines.push(format_code_line(
-                &mut state.highlighted_line_cache,
-                line,
-                palette,
-                language.as_ref(),
-            ));
-        }
-        let len = lines.len();
-        return (lines, len);
-    }
-
     let file_lines = match load_file_lines(state, &node.path) {
         Some(lines) => lines,
         None => {
+            let block_line_count = block.content.lines().count();
             let mut lines = Vec::with_capacity(block_line_count);
             for line in block.content.lines() {
                 lines.push(format_code_line(
@@ -2376,59 +2337,32 @@ fn build_block_lines(
 
     let start_line = block.start_line.min(file_lines.len());
     let end_line = block.end_line.min(file_lines.len());
-
-    let available_top = start_line;
-    let available_bottom = file_lines.len().saturating_sub(end_line);
-
-    if top_context > available_top {
-        let overflow = top_context - available_top;
-        top_context = available_top;
-        bottom_context = (bottom_context + overflow).min(available_bottom);
-    }
-
-    if bottom_context > available_bottom {
-        let overflow = bottom_context - available_bottom;
-        bottom_context = available_bottom;
-        top_context = (top_context + overflow).min(available_top);
-    }
-
-    if top_context + bottom_context < total_context {
-        let missing = total_context - (top_context + bottom_context);
-        let add_top = missing.min(available_top.saturating_sub(top_context));
-        top_context += add_top;
-        let add_bottom = missing
-            .saturating_sub(add_top)
-            .min(available_bottom.saturating_sub(bottom_context));
-        bottom_context += add_bottom;
-    }
-
-    let mut lines = Vec::new();
-    if top_context > 0 {
-        let start = start_line.saturating_sub(top_context);
-        let end = start_line;
-        for line in &file_lines[start..end] {
-            lines.push(format_context_line(
+    if start_line >= end_line {
+        let block_line_count = block.content.lines().count();
+        let mut lines = Vec::with_capacity(block_line_count);
+        for line in block.content.lines() {
+            lines.push(format_code_line(
                 &mut state.highlighted_line_cache,
                 line,
                 palette,
                 language.as_ref(),
             ));
         }
+        let len = lines.len();
+        return (lines, len);
     }
 
-    for line in block.content.lines() {
-        lines.push(format_code_line(
-            &mut state.highlighted_line_cache,
-            line,
-            palette,
-            language.as_ref(),
-        ));
-    }
-
-    if bottom_context > 0 {
-        let start = end_line;
-        let end = (end_line + bottom_context).min(file_lines.len());
-        for line in &file_lines[start..end] {
+    // With scrolling, keep the full file context and let the viewport clip.
+    let mut lines = Vec::with_capacity(file_lines.len());
+    for (index, line) in file_lines.iter().enumerate() {
+        if (start_line..end_line).contains(&index) {
+            lines.push(format_code_line(
+                &mut state.highlighted_line_cache,
+                line,
+                palette,
+                language.as_ref(),
+            ));
+        } else {
             lines.push(format_context_line(
                 &mut state.highlighted_line_cache,
                 line,
@@ -3136,6 +3070,92 @@ mod diff_scope_tests {
         (state, block_id)
     }
 
+    fn build_state_with_block_file(
+        file_path: &Path,
+        file_content: &str,
+        block_content: &str,
+        block_start_line: usize,
+        block_end_line: usize,
+    ) -> (AppState, TreeNodeId) {
+        fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
+        fs::write(file_path, file_content)
+            .unwrap_or_else(|error| panic!("failed to write fixture file: {error}"));
+
+        let file_name = file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fixture.rs")
+            .to_string();
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            file_name,
+            file_path_str.clone(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let block = Block::new(
+            block_content.to_string(),
+            BlockKind::Function,
+            block_start_line,
+            block_end_line,
+        );
+        let block_id = builder.add_block(
+            file,
+            "function".to_string(),
+            file_path_str,
+            block,
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let visible = HashSet::from([block_id]);
+        let review_order = ReviewOrder::from_tree(&tree, &visible);
+        let mut navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        navigator.set_current(block_id);
+
+        let state = AppState {
+            review_scope: ReviewScope::All,
+            navigator,
+            review_order,
+            total_blocks: 1,
+            initial_remaining_blocks: 1,
+            remaining_blocks: 1,
+            reviewable_nodes: visible,
+            session_recap: SessionRecap::default(),
+            scope_label: "All".to_string(),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            confirm_batch: false,
+            repo_name: "repo".to_string(),
+            workdir_prefix: None,
+            file_cache: HashMap::new(),
+            root_cursor: None,
+            scroll_offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            view_mode: ViewMode::Source,
+            block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            file_diff_cache: HashMap::new(),
+            content_frame_cache: HashMap::new(),
+            highlighted_line_cache: HashMap::new(),
+            speed_read_config: TuiSpeedReadConfig::default(),
+            speed_read: None,
+            speed_read_persisted_defaults: PersistedSpeedReadDefaults {
+                default_wpm: 320,
+                default_chunk_words: 2,
+            },
+            speed_read_pending_persist: None,
+            speed_read_config_path: PathBuf::from("trueflow.toml"),
+        };
+
+        (state, block_id)
+    }
+
     #[test]
     fn diff_query_uses_main_diff_for_main_scope() {
         let query = diff_query_for_scope(&ReviewScope::MainDiff, "src/lib.rs");
@@ -3508,6 +3528,33 @@ mod diff_scope_tests {
         assert!(key_a.is_some());
         assert_eq!(key_a, key_b);
         assert_ne!(key_a, key_c);
+    }
+
+    #[test]
+    fn build_block_lines_source_mode_includes_full_file_context_for_scroll() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_source_scroll_context")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\nline2\nline3\nline4\nline5\nline6\n";
+        let block_content = "line3\nline4\n";
+        let (mut state, block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 2, 4);
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let (lines, total_lines) = build_block_lines(&mut state, &snapshot, &palette, 2);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        assert_eq!(total_lines, 6);
+        assert_eq!(rendered.len(), 6);
+        assert!(rendered[0].contains("line1"));
+        assert!(rendered[1].contains("line2"));
+        assert!(rendered[2].contains("line3"));
+        assert!(rendered[3].contains("line4"));
+        assert!(rendered[5].contains("line6"));
     }
 
     #[test]
