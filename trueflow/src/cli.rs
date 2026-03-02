@@ -60,7 +60,7 @@ pub enum Commands {
         #[arg(long)]
         quiet: bool,
     },
-    /// Sync reviews with remote (fetch & push trueflow-db branch)
+    /// Sync reviews with remote (fetch & push configured storage branch)
     Sync,
     /// CI gate check
     Check,
@@ -152,4 +152,23 @@ pub enum Commands {
         #[arg(long)]
         exclude: Vec<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn sync_help_mentions_configured_storage_branch() {
+        let mut command = Cli::command();
+        let mut help = Vec::new();
+        command
+            .write_long_help(&mut help)
+            .unwrap_or_else(|error| panic!("failed to render help output: {error}"));
+        let help =
+            String::from_utf8(help).unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
+        assert!(help.contains("configured storage branch"));
+        assert!(!help.contains("trueflow-db branch"));
+    }
 }
