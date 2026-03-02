@@ -8,6 +8,7 @@ pub enum Language {
     JavaScript,
     TypeScript,
     Python,
+    Go,
     Shell,
     Markdown,
     Toml,
@@ -18,7 +19,7 @@ pub enum Language {
     Unknown,
 }
 
-// TODO: add Language::Go, Language::Java, Language::Cpp once tree-sitter support is wired.
+// TODO: add Language::Java and Language::Cpp once tree-sitter support is wired.
 
 impl Language {
     pub fn uses_text_fallback(self) -> bool {
@@ -35,6 +36,7 @@ impl Language {
             "js" => Some(Language::JavaScript),
             "ts" => Some(Language::TypeScript),
             "py" => Some(Language::Python),
+            "go" => Some(Language::Go),
             "sh" => Some(Language::Shell),
             "md" | "markdown" => Some(Language::Markdown),
             "toml" => Some(Language::Toml),
@@ -100,6 +102,7 @@ mod tests {
         assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("sh"), Some(Language::Shell));
         assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
         assert_eq!(

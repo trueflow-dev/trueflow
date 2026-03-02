@@ -84,6 +84,11 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             info!("block_splitter done (blocks={})", blocks.len());
             return Ok(blocks);
         }
+        Language::Go => {
+            let blocks = split_go(content);
+            info!("block_splitter done (blocks={})", blocks.len());
+            return Ok(blocks);
+        }
         _ if lang.uses_text_fallback() => {
             let blocks = split_paragraphs(content, lang);
             info!("block_splitter done (blocks={})", blocks.len());
@@ -332,6 +337,76 @@ fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
         };
         create_block(chunk, kind, content, start, end, lang)
     })
+}
+
+fn split_go(content: &str) -> Vec<Block> {
+    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+        let kind = if is_gap {
+            BlockKind::Gap
+        } else {
+            classify_go_chunk(chunk)
+        };
+        create_block(chunk, kind, content, start, end, Language::Go)
+    })
+}
+
+fn classify_go_chunk(chunk: &str) -> BlockKind {
+    let mut saw_non_empty = false;
+    let mut first_code_line = None;
+    for line in chunk.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        saw_non_empty = true;
+        if is_comment_line(trimmed) {
+            continue;
+        }
+        first_code_line = Some(trimmed);
+        break;
+    }
+
+    if !saw_non_empty {
+        return BlockKind::Gap;
+    }
+
+    let Some(line) = first_code_line else {
+        return BlockKind::Comment;
+    };
+
+    if line.starts_with("package ") {
+        return BlockKind::Module;
+    }
+    if line.starts_with("import ") {
+        return BlockKind::Import;
+    }
+    if line.starts_with("type ") {
+        if line.contains("interface") {
+            return BlockKind::Interface;
+        }
+        return BlockKind::Struct;
+    }
+    if let Some(rest) = line.strip_prefix("func ") {
+        if rest.trim_start().starts_with('(') {
+            return BlockKind::Method;
+        }
+        return BlockKind::Function;
+    }
+    if line.starts_with("const ") {
+        return BlockKind::Const;
+    }
+    if line.starts_with("var ") {
+        return BlockKind::Variable;
+    }
+
+    BlockKind::Code
+}
+
+fn is_comment_line(trimmed_line: &str) -> bool {
+    trimmed_line.starts_with("//")
+        || trimmed_line.starts_with("/*")
+        || trimmed_line.starts_with('*')
+        || trimmed_line.starts_with("*/")
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +897,15 @@ mod tests {
         let blocks = split(content, Language::Rust).unwrap();
         // Tree-sitter splitting is complex but should return items
         assert!(!blocks.is_empty());
+    }
+
+    #[test]
+    fn test_split_go_simple_maps_import_struct_and_function() {
+        let content = "package main\n\nimport \"fmt\"\n\ntype Worker struct{}\n\nfunc run() {\n    fmt.Println(\"ok\")\n}\n";
+        let blocks = split(content, Language::Go).unwrap();
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Struct));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
     }
 
     #[test]
