@@ -178,13 +178,32 @@ fn flush_blocks(
         prev_was_target = block.kind == target_kind;
     }
 
-    let merged_block = Block::new(content, merged_kind, start_line, end_line);
+    let mut merged_block = Block::new(content, merged_kind, start_line, end_line);
+    let (merged_tags, merged_complexity) = merged_metadata(range);
+    merged_block.tags = merged_tags;
+    merged_block.complexity = merged_complexity;
     result.push(merged_block);
 
     // Emit trailing gaps
     result.extend(buffer.iter().skip(last_idx + 1).cloned());
 
     result
+}
+
+fn merged_metadata(blocks: &[Block]) -> (Vec<String>, u32) {
+    let mut tags = Vec::new();
+    let mut complexity = 0_u32;
+
+    for block in blocks {
+        for tag in &block.tags {
+            if !tags.iter().any(|existing| existing == tag) {
+                tags.push(tag.clone());
+            }
+        }
+        complexity = complexity.saturating_add(block.complexity);
+    }
+
+    (tags, complexity)
 }
 
 #[cfg(test)]
@@ -251,5 +270,27 @@ mod tests {
         assert_eq!(optimized[1].kind, BlockKind::Gap);
         assert_eq!(optimized[2].kind, BlockKind::CodeParagraph);
         assert_eq!(optimized[2].content, "P3\n");
+    }
+
+    #[test]
+    fn test_merge_preserves_union_tags_and_complexity() {
+        let mut module_a = make_block(BlockKind::Module, "mod tests {\n}\n", 0, 2);
+        module_a.tags = vec!["test".to_string()];
+        module_a.complexity = 2;
+
+        let mut module_b = make_block(BlockKind::Module, "mod helper {\n}\n", 3, 5);
+        module_b.tags = vec!["test".to_string(), "integration".to_string()];
+        module_b.complexity = 3;
+
+        let blocks = vec![module_a, make_block(BlockKind::Gap, "\n", 2, 3), module_b];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].kind, BlockKind::Modules);
+        assert_eq!(
+            optimized[0].tags,
+            vec!["test".to_string(), "integration".to_string()]
+        );
+        assert_eq!(optimized[0].complexity, 5);
     }
 }
