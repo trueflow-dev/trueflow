@@ -48,8 +48,8 @@
 ** Optimizer
    - [x] **Implement optimizer pass for adjacent imports**
    - [x] **Integrate `optimizer::optimize` into `scanner.rs` before returning `FileState`**
-   - [ ] **Evaluate/implement a "new small file -> single merged block" pass**
-     - Previous TODO said this was required (<64 lines). This remains optional and should be validated against review quality/perf tradeoffs.
+   - [x] **Evaluate/implement a "new small file -> single merged block" pass**
+     - Implemented conservatively: only for small semantic files, preserving merge metadata and avoiding multi-logic-block collapse.
 
 ** Platform Verification
    - [ ] **Run explicit macOS/Linux path/newline verification matrix**
