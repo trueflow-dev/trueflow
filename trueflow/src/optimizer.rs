@@ -3,11 +3,14 @@ use std::mem;
 
 const MAX_IMPORT_SPAN_LINES: usize = 24;
 const MAX_IMPORT_GAP_LINES: usize = 3;
+const SMALL_FILE_MAX_SPAN_LINES: usize = 64;
+const SMALL_FILE_MAX_NON_TRIVIAL_BLOCKS: usize = 12;
 
 pub fn optimize(blocks: Vec<Block>) -> Vec<Block> {
     let blocks = optimize_imports(blocks);
     let blocks = optimize_modules(blocks);
-    optimize_code_paragraphs(blocks)
+    let blocks = optimize_code_paragraphs(blocks);
+    optimize_small_files(blocks)
 }
 
 fn optimize_imports(blocks: Vec<Block>) -> Vec<Block> {
@@ -116,6 +119,26 @@ fn optimize_modules(blocks: Vec<Block>) -> Vec<Block> {
         },
         |buffer| flush_blocks(buffer, BlockKind::Module, BlockKind::Modules, None),
     )
+}
+
+fn optimize_small_files(blocks: Vec<Block>) -> Vec<Block> {
+    if !should_merge_small_file(&blocks) {
+        return blocks;
+    }
+
+    let mut content = String::new();
+    for block in &blocks {
+        content.push_str(&block.content);
+    }
+
+    let start_line = blocks.first().map_or(0, |block| block.start_line);
+    let end_line = blocks.last().map_or(start_line, |block| block.end_line);
+    let merged_kind = merged_small_file_kind(&blocks);
+    let mut merged = Block::new(content, merged_kind, start_line, end_line);
+    let (tags, complexity) = merged_metadata(&blocks);
+    merged.tags = tags;
+    merged.complexity = complexity;
+    vec![merged]
 }
 
 enum Decision {
@@ -232,6 +255,87 @@ fn merged_metadata(blocks: &[Block]) -> (Vec<String>, u32) {
 
 fn line_span(block: &Block) -> usize {
     block.end_line.saturating_sub(block.start_line)
+}
+
+fn should_merge_small_file(blocks: &[Block]) -> bool {
+    if blocks.len() < 2 {
+        return false;
+    }
+
+    let non_trivial_blocks: Vec<&Block> = blocks
+        .iter()
+        .filter(|block| !matches!(block.kind, BlockKind::Gap | BlockKind::Comment))
+        .collect();
+
+    if non_trivial_blocks.len() < 2 || non_trivial_blocks.len() > SMALL_FILE_MAX_NON_TRIVIAL_BLOCKS
+    {
+        return false;
+    }
+
+    if non_trivial_blocks
+        .iter()
+        .any(|block| is_non_collapsible_small_file_kind(block.kind))
+    {
+        return false;
+    }
+
+    if non_trivial_blocks.iter().all(|block| {
+        matches!(
+            block.kind,
+            BlockKind::Import | BlockKind::Imports | BlockKind::Module | BlockKind::Modules
+        )
+    }) {
+        return false;
+    }
+
+    let start_line = non_trivial_blocks.first().map_or(0, |block| block.start_line);
+    let end_line = non_trivial_blocks
+        .last()
+        .map_or(start_line, |block| block.end_line);
+    let span = end_line.saturating_sub(start_line);
+    span <= SMALL_FILE_MAX_SPAN_LINES
+}
+
+fn is_non_collapsible_small_file_kind(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::TextBlock
+            | BlockKind::CodeParagraph
+            | BlockKind::Header
+            | BlockKind::Paragraph
+            | BlockKind::CodeBlock
+            | BlockKind::List
+            | BlockKind::ListItem
+            | BlockKind::Quote
+            | BlockKind::Element
+            | BlockKind::Content
+            | BlockKind::Sentence
+            | BlockKind::Section
+            | BlockKind::Preamble
+    )
+}
+
+fn merged_small_file_kind(blocks: &[Block]) -> BlockKind {
+    let non_trivial: Vec<BlockKind> = blocks
+        .iter()
+        .filter_map(|block| {
+            if matches!(block.kind, BlockKind::Gap | BlockKind::Comment) {
+                None
+            } else {
+                Some(block.kind)
+            }
+        })
+        .collect();
+
+    let Some(first_kind) = non_trivial.first().copied() else {
+        return BlockKind::Code;
+    };
+
+    if non_trivial.iter().all(|kind| *kind == first_kind) {
+        first_kind
+    } else {
+        BlockKind::Code
+    }
 }
 
 #[cfg(test)]
@@ -353,5 +457,56 @@ mod tests {
         assert_eq!(optimized[1].kind, BlockKind::Gap);
         assert_eq!(optimized[2].kind, BlockKind::Import);
         assert_eq!(optimized[2].content, "use c;");
+    }
+
+    #[test]
+    fn test_small_file_collapses_mixed_semantic_blocks() {
+        let blocks = vec![
+            make_block(BlockKind::Import, "use std::fmt;\n", 0, 1),
+            make_block(BlockKind::Gap, "\n", 1, 2),
+            make_block(BlockKind::Function, "fn run() {}\n", 2, 3),
+            make_block(BlockKind::Gap, "\n", 3, 4),
+            make_block(BlockKind::Const, "const LIMIT: usize = 3;\n", 4, 5),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].kind, BlockKind::Code);
+        assert_eq!(
+            optimized[0].content,
+            "use std::fmt;\n\nfn run() {}\n\nconst LIMIT: usize = 3;\n"
+        );
+    }
+
+    #[test]
+    fn test_small_file_pass_does_not_collapse_large_span() {
+        let blocks = vec![
+            make_block(BlockKind::Function, "fn a() {}\n", 0, 1),
+            make_block(BlockKind::Gap, "\n", 1, 2),
+            make_block(BlockKind::Function, "fn b() {}\n", 70, 71),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 3);
+        assert_eq!(optimized[0].kind, BlockKind::Function);
+        assert_eq!(optimized[1].kind, BlockKind::Gap);
+        assert_eq!(optimized[2].kind, BlockKind::Function);
+    }
+
+    #[test]
+    fn test_small_file_pass_does_not_override_code_paragraph_strategy() {
+        let blocks = vec![
+            make_block(BlockKind::CodeParagraph, "P1\n", 0, 1),
+            make_block(BlockKind::Gap, "\n", 1, 2),
+            make_block(BlockKind::CodeParagraph, "P2\n", 2, 3),
+            make_block(BlockKind::Gap, "\n\n\n\n\n\n", 3, 9),
+            make_block(BlockKind::CodeParagraph, "P3\n", 9, 10),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 3);
+        assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(optimized[1].kind, BlockKind::Gap);
+        assert_eq!(optimized[2].kind, BlockKind::CodeParagraph);
     }
 }
