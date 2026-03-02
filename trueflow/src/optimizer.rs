@@ -1,6 +1,9 @@
 use crate::block::{Block, BlockKind};
 use std::mem;
 
+const MAX_IMPORT_SPAN_LINES: usize = 24;
+const MAX_IMPORT_GAP_LINES: usize = 3;
+
 pub fn optimize(blocks: Vec<Block>) -> Vec<Block> {
     let blocks = optimize_imports(blocks);
     let blocks = optimize_modules(blocks);
@@ -11,13 +14,34 @@ fn optimize_imports(blocks: Vec<Block>) -> Vec<Block> {
     optimize_sequence(
         blocks,
         |block, buffer| {
-            if block.kind == BlockKind::Import
-                || (block.kind == BlockKind::Gap && !buffer.is_empty())
-            {
-                Decision::Buffer
-            } else {
-                Decision::FlushAndEmit
+            if block.kind == BlockKind::Import {
+                let start_line = buffer
+                    .iter()
+                    .find(|candidate| candidate.kind == BlockKind::Import)
+                    .map(|candidate| candidate.start_line)
+                    .unwrap_or(block.start_line);
+                let span = block.end_line.saturating_sub(start_line);
+                if span > MAX_IMPORT_SPAN_LINES {
+                    return Decision::FlushAndBuffer;
+                }
+                return Decision::Buffer;
             }
+
+            if block.kind == BlockKind::Gap {
+                if buffer.is_empty() {
+                    return Decision::FlushAndEmit;
+                }
+                if line_span(block) > MAX_IMPORT_GAP_LINES {
+                    return Decision::FlushAndEmit;
+                }
+                return Decision::Buffer;
+            }
+
+            if block.kind == BlockKind::Comment && !buffer.is_empty() {
+                return Decision::Buffer;
+            }
+
+            Decision::FlushAndEmit
         },
         |buffer| flush_blocks(buffer, BlockKind::Import, BlockKind::Imports, Some("\n")),
     )
@@ -206,6 +230,10 @@ fn merged_metadata(blocks: &[Block]) -> (Vec<String>, u32) {
     (tags, complexity)
 }
 
+fn line_span(block: &Block) -> usize {
+    block.end_line.saturating_sub(block.start_line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +320,38 @@ mod tests {
             vec!["test".to_string(), "integration".to_string()]
         );
         assert_eq!(optimized[0].complexity, 5);
+    }
+
+    #[test]
+    fn test_merge_imports_with_inline_comment() {
+        let blocks = vec![
+            make_block(BlockKind::Import, "use a;", 0, 1),
+            make_block(BlockKind::Comment, "\n// grouped import note\n", 1, 3),
+            make_block(BlockKind::Import, "use b;", 3, 4),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].kind, BlockKind::Imports);
+        assert_eq!(optimized[0].content, "use a;\n// grouped import note\nuse b;");
+    }
+
+    #[test]
+    fn test_import_merge_respects_large_gap_boundary() {
+        let blocks = vec![
+            make_block(BlockKind::Import, "use a;", 0, 1),
+            make_block(BlockKind::Gap, "\n", 1, 2),
+            make_block(BlockKind::Import, "use b;", 2, 3),
+            make_block(BlockKind::Gap, "\n\n\n\n\n", 3, 8),
+            make_block(BlockKind::Import, "use c;", 8, 9),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 3);
+        assert_eq!(optimized[0].kind, BlockKind::Imports);
+        assert_eq!(optimized[0].content, "use a;\nuse b;");
+        assert_eq!(optimized[1].kind, BlockKind::Gap);
+        assert_eq!(optimized[2].kind, BlockKind::Import);
+        assert_eq!(optimized[2].content, "use c;");
     }
 }
