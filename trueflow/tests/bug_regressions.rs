@@ -242,6 +242,92 @@ fn test_feedback_latest_timestamp_wins() -> Result<()> {
 }
 
 #[test]
+fn test_feedback_since_unix_timestamp_filters_history() -> Result<()> {
+    let repo = TestRepo::new("feedback_since_timestamp")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Add lib")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let hash = first_block_hash(&output)?;
+
+    let trueflow_dir = repo.path.join(".trueflow");
+    let old_review = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            verdict: Some("rejected"),
+            timestamp: Some(1000),
+            ..Default::default()
+        },
+    );
+    let new_review = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            verdict: Some("comment"),
+            timestamp: Some(2000),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&trueflow_dir, &[old_review, new_review])?;
+
+    let output = repo.run(&["feedback", "--format", "json", "--since", "1500"])?;
+    let entries = json_array(&output)?;
+    let entry = entries.first().context("expected feedback entry")?;
+    let reviews = entry["reviews"]
+        .as_array()
+        .context("reviews should be array")?;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["timestamp"].as_i64(), Some(2000));
+
+    Ok(())
+}
+
+#[test]
+fn test_feedback_since_last_uses_cursor_file() -> Result<()> {
+    let repo = TestRepo::new("feedback_since_last_cursor")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Add lib")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let hash = first_block_hash(&output)?;
+
+    let trueflow_dir = repo.path.join(".trueflow");
+    let first_review = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            verdict: Some("rejected"),
+            timestamp: Some(1000),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&trueflow_dir, &[first_review.clone()])?;
+
+    let first_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    let first_entries = json_array(&first_output)?;
+    assert_eq!(first_entries.len(), 1);
+
+    let second_review = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            verdict: Some("comment"),
+            timestamp: Some(2000),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&trueflow_dir, &[first_review, second_review])?;
+
+    let second_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    let second_entries = json_array(&second_output)?;
+    let second_entry = second_entries.first().context("expected second feedback entry")?;
+    let second_reviews = second_entry["reviews"]
+        .as_array()
+        .context("reviews should be array")?;
+    assert_eq!(second_reviews.len(), 1);
+    assert_eq!(second_reviews[0]["timestamp"].as_i64(), Some(2000));
+
+    Ok(())
+}
+
+#[test]
 fn test_review_revision_target_from_subdir() -> Result<()> {
     let repo = TestRepo::new("review_revision_subdir")?;
     repo.write("src/lib.rs", "pub fn core() {}\n")?;

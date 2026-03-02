@@ -399,6 +399,10 @@ impl FileStore {
     pub fn db_path(&self) -> PathBuf {
         self.root_path.join(TRUEFLOW_DIR).join(DB_FILE)
     }
+
+    pub fn trueflow_dir(&self) -> PathBuf {
+        self.root_path.join(TRUEFLOW_DIR)
+    }
 }
 
 impl ReviewStore for FileStore {

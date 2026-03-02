@@ -78,10 +78,18 @@ fn main() -> Result<()> {
         } => commands::review::run(&context, *json, *all, target, only, exclude),
         Commands::Feedback {
             format,
+            since,
             include_approved,
             only,
             exclude,
-        } => commands::feedback::run(&context, format, *include_approved, only, exclude),
+        } => commands::feedback::run(
+            &context,
+            format,
+            since.as_deref(),
+            *include_approved,
+            only,
+            exclude,
+        ),
         Commands::Inspect { fingerprint, split } => {
             commands::inspect::run(&context, fingerprint, *split)
         }

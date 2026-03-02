@@ -9,11 +9,24 @@ use crate::store::{
 };
 use crate::tree;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+const FEEDBACK_CURSOR_FILE: &str = "feedback.cursor";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedbackSince {
+    All,
+    Timestamp(i64),
+    Last,
+}
 
 pub fn run(
     _context: &TrueflowContext,
     format: &str,
+    since: Option<&str>,
     include_approved: bool,
     only: &[String],
     exclude: &[String],
@@ -28,6 +41,9 @@ pub fn run(
     // 2. Load DB
     let store = FileStore::new()?;
     let history = store.read_history()?;
+    let max_history_timestamp = history.iter().map(|record| record.timestamp).max();
+    let since_mode = parse_feedback_since(since)?;
+    let since_threshold = resolve_since_threshold(&store, since_mode)?;
 
     // 3. Group Reviews by target key
     // We want ALL reviews for a fingerprint, not just the latest.
@@ -35,6 +51,9 @@ pub fn run(
     let mut reviews_by_fp: HashMap<String, Vec<Record>> = HashMap::new();
 
     for record in history {
+        if !matches_since(record.timestamp, since_threshold) {
+            continue;
+        }
         reviews_by_fp
             .entry(record.lookup_key().to_string())
             .or_default()
@@ -144,6 +163,12 @@ pub fn run(
         println!("</trueflow_feedback>");
     }
 
+    if matches!(since_mode, FeedbackSince::Last)
+        && let Some(timestamp) = max_history_timestamp
+    {
+        write_feedback_cursor(feedback_cursor_path(&store).as_path(), timestamp)?;
+    }
+
     Ok(())
 }
 
@@ -186,4 +211,75 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn parse_feedback_since(raw: Option<&str>) -> Result<FeedbackSince> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(FeedbackSince::All);
+    };
+
+    if raw.eq_ignore_ascii_case("all") {
+        return Ok(FeedbackSince::All);
+    }
+    if raw.eq_ignore_ascii_case("last") {
+        return Ok(FeedbackSince::Last);
+    }
+    if let Ok(timestamp) = raw.parse::<i64>() {
+        return Ok(FeedbackSince::Timestamp(timestamp));
+    }
+
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc).timestamp())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid --since value '{raw}'. Use 'all', 'last', unix timestamp, or RFC3339 ({error})"
+            )
+        })?;
+    Ok(FeedbackSince::Timestamp(parsed))
+}
+
+fn resolve_since_threshold(store: &FileStore, since: FeedbackSince) -> Result<Option<i64>> {
+    let threshold = match since {
+        FeedbackSince::All => None,
+        FeedbackSince::Timestamp(timestamp) => Some(timestamp),
+        FeedbackSince::Last => read_feedback_cursor(feedback_cursor_path(store).as_path())?,
+    };
+    Ok(threshold)
+}
+
+fn matches_since(timestamp: i64, threshold: Option<i64>) -> bool {
+    threshold.is_none_or(|threshold| timestamp > threshold)
+}
+
+fn feedback_cursor_path(store: &FileStore) -> std::path::PathBuf {
+    store.trueflow_dir().join(FEEDBACK_CURSOR_FILE)
+}
+
+fn read_feedback_cursor(path: &Path) -> Result<Option<i64>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let value = trimmed.parse::<i64>().map_err(|error| {
+        anyhow::anyhow!(
+            "Invalid feedback cursor at {}: expected unix timestamp ({error})",
+            path.display()
+        )
+    })?;
+    Ok(Some(value))
+}
+
+fn write_feedback_cursor(path: &Path, timestamp: i64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{timestamp}\n"))?;
+    Ok(())
 }

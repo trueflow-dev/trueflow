@@ -102,6 +102,10 @@ pub enum Commands {
         #[arg(long, default_value = "xml")]
         format: String,
 
+        /// Only include records since this point ("all", "last", unix ts, or RFC3339)
+        #[arg(long)]
+        since: Option<String>,
+
         /// Include approved blocks (for few-shot examples)
         #[arg(long)]
         include_approved: bool,
@@ -223,6 +227,35 @@ mod tests {
                 assert!(exclude.is_empty());
             }
             _ => panic!("expected tui command"),
+        }
+    }
+
+    #[test]
+    fn feedback_command_parses_since_override() {
+        let cli = Cli::parse_from([
+            "trueflow",
+            "feedback",
+            "--format",
+            "json",
+            "--since",
+            "last",
+        ]);
+
+        match cli.command {
+            Commands::Feedback {
+                format,
+                since,
+                include_approved,
+                only,
+                exclude,
+            } => {
+                assert_eq!(format, "json");
+                assert_eq!(since.as_deref(), Some("last"));
+                assert!(!include_approved);
+                assert!(only.is_empty());
+                assert!(exclude.is_empty());
+            }
+            _ => panic!("expected feedback command"),
         }
     }
 }
