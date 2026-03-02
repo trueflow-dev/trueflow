@@ -33,6 +33,7 @@ pub fn run(
 ) -> Result<()> {
     let config = load_config()?;
     let filters = config.feedback.resolve_filters(only, exclude);
+    let effective_since = since.or(Some(config.feedback.default_since.as_str()));
 
     // 1. Scan Directory (Current State)
     let files = scanner::scan_directory(".")?;
@@ -42,7 +43,7 @@ pub fn run(
     let store = FileStore::new()?;
     let history = store.read_history()?;
     let max_history_timestamp = history.iter().map(|record| record.timestamp).max();
-    let since_mode = parse_feedback_since(since)?;
+    let since_mode = parse_feedback_since(effective_since)?;
     let since_threshold = resolve_since_threshold(&store, since_mode)?;
 
     // 3. Group Reviews by target key

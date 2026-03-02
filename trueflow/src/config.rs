@@ -14,7 +14,7 @@ pub struct TrueflowConfig {
     #[serde(default)]
     pub review: BlockFilterConfig,
     #[serde(default)]
-    pub feedback: BlockFilterConfig,
+    pub feedback: FeedbackConfig,
     #[serde(default)]
     pub tui: TuiConfig,
     #[serde(default)]
@@ -37,6 +37,16 @@ pub struct TuiConfig {
 pub struct StorageConfig {
     #[serde(default = "default_storage_branch")]
     pub branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedbackConfig {
+    #[serde(default)]
+    pub only: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default = "default_feedback_since")]
+    pub default_since: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -119,6 +129,16 @@ impl Default for StorageConfig {
     }
 }
 
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            only: Vec::new(),
+            exclude: Vec::new(),
+            default_since: default_feedback_since(),
+        }
+    }
+}
+
 fn default_confirm_batch() -> bool {
     true
 }
@@ -183,6 +203,10 @@ fn default_storage_branch() -> String {
     "trueflow-db".to_string()
 }
 
+fn default_feedback_since() -> String {
+    "all".to_string()
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct BlockFilterConfig {
     #[serde(default)]
@@ -192,6 +216,22 @@ pub struct BlockFilterConfig {
 }
 
 impl BlockFilterConfig {
+    pub fn resolve_filters(&self, cli_only: &[String], cli_exclude: &[String]) -> BlockFilters {
+        let only_values = if cli_only.is_empty() {
+            &self.only
+        } else {
+            cli_only
+        };
+        let exclude_values = if cli_exclude.is_empty() {
+            &self.exclude
+        } else {
+            cli_exclude
+        };
+        BlockFilters::from_lists(only_values, exclude_values)
+    }
+}
+
+impl FeedbackConfig {
     pub fn resolve_filters(&self, cli_only: &[String], cli_exclude: &[String]) -> BlockFilters {
         let only_values = if cli_only.is_empty() {
             &self.only
@@ -444,6 +484,24 @@ punctuation_dwell_multiplier = 1.2
             TuiSpeedReadPunctuationDwell::Off
         );
         assert!((cfg.tui.speed_read.punctuation_dwell_multiplier - 1.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn feedback_default_since_defaults_to_all() {
+        let cfg: TrueflowConfig = match toml::from_str("") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert_eq!(cfg.feedback.default_since, "all");
+    }
+
+    #[test]
+    fn feedback_default_since_parses_override() {
+        let cfg: TrueflowConfig = match toml::from_str("[feedback]\ndefault_since = \"last\"\n") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert_eq!(cfg.feedback.default_since, "last");
     }
 
     #[test]
