@@ -25,9 +25,9 @@
      - Verify both CLI review output and TUI diff view behavior.
 
 ** Scanner Correctness
-   - [ ] **Integrate real `.gitignore` parsing into `scanner.rs`**
-     - Current state: scanner uses hardcoded ignore rules (`.git`, `.trueflow`, `target`, `node_modules`).
-     - Goal: honor repo `.gitignore` and nested ignore files to avoid scanning irrelevant or generated files.
+   - [x] **Integrate real `.gitignore` parsing into `scanner.rs`**
+     - Implemented with `ignore::WalkBuilder` gitignore support (`git_ignore`, `git_exclude`, `git_global`, `parents`).
+     - Covered by regression test: `test_scan_honors_gitignore_and_keeps_nonignored_dotfiles`.
 
 ** Config Completion
    - [ ] **Make sync branch configurable (`storage.branch`)**
