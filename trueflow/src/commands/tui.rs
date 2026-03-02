@@ -219,7 +219,6 @@ struct SessionRecap {
     approved_blocks: usize,
     rejected_blocks: usize,
     comments: usize,
-    questions: usize,
     blocks_touched: usize,
 }
 
@@ -254,7 +253,6 @@ impl SessionRecap {
         self.approved_blocks > 0
             || self.rejected_blocks > 0
             || self.comments > 0
-            || self.questions > 0
     }
 
     fn record_action(&mut self, verdict: &Verdict, impact: ActionImpact) {
@@ -272,9 +270,6 @@ impl SessionRecap {
             }
             Verdict::Comment => {
                 self.comments = self.comments.saturating_add(1);
-            }
-            Verdict::Question => {
-                self.questions = self.questions.saturating_add(1);
             }
         }
     }
@@ -2247,7 +2242,6 @@ fn recap_summary_lines(state: &AppState) -> Vec<String> {
         state.session_recap.rejected_blocks
     ));
     lines.push(format!("Comments: {}", state.session_recap.comments));
-    lines.push(format!("Questions: {}", state.session_recap.questions));
     lines.push(format!(
         "Blocks touched: {}",
         state.session_recap.blocks_touched
@@ -3814,6 +3808,10 @@ mod diff_scope_tests {
         assert!(
             lines.iter().any(|line| line.contains("Comments: 2")),
             "expected comments rollup, got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("Questions:")),
+            "did not expect separate questions rollup, got: {lines:?}"
         );
     }
 

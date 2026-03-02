@@ -36,7 +36,7 @@ pub enum Commands {
         #[arg(long)]
         fingerprint: String,
 
-        /// Verdict: approved, rejected, question, comment
+        /// Verdict: approved, rejected, comment
         #[arg(long, default_value = "approved")]
         verdict: String,
 

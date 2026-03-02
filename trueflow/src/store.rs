@@ -39,7 +39,7 @@ pub enum Identity {
 pub enum Verdict {
     Approved,
     Rejected,
-    Question,
+    #[serde(alias = "question")]
     Comment,
 }
 
@@ -244,7 +244,6 @@ impl Verdict {
         match self {
             Verdict::Approved => "approved",
             Verdict::Rejected => "rejected",
-            Verdict::Question => "question",
             Verdict::Comment => "comment",
         }
     }
@@ -263,7 +262,7 @@ impl FromStr for Verdict {
         match value.trim().to_ascii_lowercase().as_str() {
             "approved" => Ok(Verdict::Approved),
             "rejected" => Ok(Verdict::Rejected),
-            "question" => Ok(Verdict::Question),
+            "question" => Ok(Verdict::Comment),
             "comment" => Ok(Verdict::Comment),
             _ => Err(anyhow::anyhow!("Unknown verdict: {value}")),
         }
@@ -487,11 +486,24 @@ mod tests {
         let records = vec![
             record("1", "fp", "review", Verdict::Rejected, 1),
             record("2", "fp", "review", Verdict::Approved, 2),
-            record("3", "fp", "review", Verdict::Question, 0),
+            record("3", "fp", "review", Verdict::Comment, 0),
         ];
 
         let latest = latest_review_verdicts(&records);
         assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
+    }
+
+    #[test]
+    fn verdict_from_str_maps_question_to_comment() {
+        let parsed = "question".parse::<Verdict>().expect("question should parse");
+        assert_eq!(parsed, Verdict::Comment);
+    }
+
+    #[test]
+    fn verdict_deserialize_accepts_question_alias_as_comment() {
+        let parsed: Verdict =
+            serde_json::from_str("\"question\"").expect("question alias should deserialize");
+        assert_eq!(parsed, Verdict::Comment);
     }
 
     #[test]
