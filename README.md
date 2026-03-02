@@ -110,7 +110,20 @@ key to perform a review action on the block.
  'a' => approve the block
  'c' => comment on the block (feeds back into the agent)
  's' => split the block into sub-blocks, and recurse into them
+ 'r' => toggle speed-reading mode for the current block
  'q' => quit the review session (all progress is saved)
+```
+
+When speed-reading mode is active:
+
+```
+ 'Space' => play/pause autoplay
+ 'j' => previous phrase
+ 'l' => next phrase
+ '-' / '=' => decrease/increase WPM
+ '[' / ']' => decrease/increase chunk size (words per phrase)
+ '0' => reset WPM/chunk to persisted defaults
+ 'Esc' => exit speed-reading mode
 ```
 
 ### Emacs package (magit-like)
@@ -139,6 +152,21 @@ trueflow review --all --only function --json
 trueflow feedback --exclude gap --exclude comment
 ```
 
+### Scope TUI review targets
+
+`trueflow tui` supports the same targeting/filtering surface as `review`.
+
+```shell
+# Launch TUI directly scoped to one file
+trueflow tui --target file:src/lib.rs
+
+# Scope by revision
+trueflow tui --target rev:abc1234
+
+# Scope by revision range with additional block filtering
+trueflow tui --target rev:abc1234..def5678 --only function --exclude comment
+```
+
 ### Configure defaults with trueflow.toml
 
 Trueflow looks for a `trueflow.toml` file in the current directory or any parent
@@ -152,6 +180,11 @@ exclude = ["gap", "comment"]
 
 [feedback]
 exclude = ["gap"]
+
+[tui.speed_read]
+enabled = true
+default_wpm = 320
+default_chunk_words = 2
 ```
 
 See `trueflow.example.toml` for the default settings.
