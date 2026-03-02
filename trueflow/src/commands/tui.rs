@@ -102,7 +102,7 @@ struct CliReviewRequest {
 
 // --- Application Logic ---
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAction {
     Single {
         node_id: TreeNodeId,
@@ -1432,20 +1432,17 @@ fn handle_editing_submit(
     context: &TrueflowContext,
     state: &mut AppState,
 ) -> Result<()> {
-    let note = state.input_buffer.trim().to_string();
-    if note.is_empty() {
-        state.input_mode = InputMode::Normal;
-        state.input_buffer.clear();
+    let Some(submit) = editing_submit_decision(&state.input_mode, &state.input_buffer) else {
         return Ok(());
-    }
-
-    let action = match &state.input_mode {
-        InputMode::Editing { action } => action.with_note(note),
-        _ => return Ok(()),
     };
 
-    state.input_mode = InputMode::Normal;
-    state.input_buffer.clear();
+    let action = match submit {
+        EditingSubmitDecision::Empty => {
+            state.input_buffer.clear();
+            return Ok(());
+        }
+        EditingSubmitDecision::Ready(action) => action,
+    };
 
     if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
         let count = count_descendant_blocks(
@@ -1456,16 +1453,22 @@ fn handle_editing_submit(
                 }
             },
         );
+        state.input_buffer.clear();
         state.input_mode = InputMode::ConfirmBatch { action, count };
     } else {
+        state.input_mode = InputMode::Normal;
+        state.input_buffer.clear();
         execute_action(terminal, context, state, action)?;
     }
     Ok(())
 }
 
 fn handle_editing_cancel(state: &mut AppState) {
-    state.input_mode = InputMode::Normal;
-    state.input_buffer.clear();
+    if state.input_buffer.is_empty() {
+        state.input_mode = InputMode::Normal;
+    } else {
+        state.input_buffer.clear();
+    }
 }
 
 fn handle_confirm_batch(
@@ -2708,7 +2711,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             (
                 InputOverlayKind::Editing { input_lines },
                 " Comment ",
-                "Enter to submit • Shift+Enter newline • Esc to cancel",
+                editing_overlay_hint(&content),
                 content,
             )
         }
@@ -2797,6 +2800,31 @@ fn input_overlay_lines(content: &str, hints: &str, palette: &UiPalette) -> Vec<L
         Style::default().fg(palette.dim),
     )));
     lines
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditingSubmitDecision {
+    Empty,
+    Ready(PendingAction),
+}
+
+fn editing_submit_decision(input_mode: &InputMode, input_buffer: &str) -> Option<EditingSubmitDecision> {
+    let InputMode::Editing { action } = input_mode else {
+        return None;
+    };
+    let note = input_buffer.trim().to_string();
+    if note.is_empty() {
+        return Some(EditingSubmitDecision::Empty);
+    }
+    Some(EditingSubmitDecision::Ready(action.with_note(note)))
+}
+
+fn editing_overlay_hint(content: &str) -> &'static str {
+    if content.trim().is_empty() {
+        "Comment required • Enter keeps editor open • Esc to cancel"
+    } else {
+        "Enter to submit • Shift+Enter newline • Esc to cancel"
+    }
 }
 
 fn centered_rect(r: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -3484,6 +3512,65 @@ mod diff_scope_tests {
             lines[3].to_string().contains("Shift+Enter newline"),
             "expected multiline hint line to include Shift+Enter guidance"
         );
+    }
+
+    #[test]
+    fn editing_submit_decision_returns_empty_for_blank_input() {
+        let action = PendingAction::Single {
+            node_id: TreeBuilder::new().root(),
+            verdict: Verdict::Comment,
+            note: None,
+        };
+        let input_mode = InputMode::Editing { action };
+        let decision = editing_submit_decision(&input_mode, "   \n\t");
+        assert_eq!(decision, Some(EditingSubmitDecision::Empty));
+    }
+
+    #[test]
+    fn editing_submit_decision_returns_ready_with_trimmed_note() {
+        let action = PendingAction::Single {
+            node_id: TreeBuilder::new().root(),
+            verdict: Verdict::Comment,
+            note: None,
+        };
+        let input_mode = InputMode::Editing { action };
+        let decision = editing_submit_decision(&input_mode, "  keep this note  ");
+        let Some(EditingSubmitDecision::Ready(PendingAction::Single { note, .. })) = decision else {
+            panic!("expected ready single action");
+        };
+        assert_eq!(note.as_deref(), Some("keep this note"));
+    }
+
+    #[test]
+    fn editing_overlay_hint_requires_comment_for_empty_input() {
+        assert_eq!(
+            editing_overlay_hint(""),
+            "Comment required • Enter keeps editor open • Esc to cancel"
+        );
+        assert_eq!(
+            editing_overlay_hint("note"),
+            "Enter to submit • Shift+Enter newline • Esc to cancel"
+        );
+    }
+
+    #[test]
+    fn editing_cancel_clears_non_empty_buffer_before_exit() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = "note".to_string();
+
+        handle_editing_cancel(&mut state);
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert!(state.input_buffer.is_empty());
+
+        handle_editing_cancel(&mut state);
+        assert!(matches!(state.input_mode, InputMode::Normal));
     }
 
     #[test]
