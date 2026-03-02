@@ -156,8 +156,8 @@ pub enum Commands {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
-    use clap::CommandFactory;
+    use super::{Cli, Commands};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn sync_help_mentions_configured_storage_branch() {
@@ -170,5 +170,59 @@ mod tests {
             String::from_utf8(help).unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
         assert!(help.contains("configured storage branch"));
         assert!(!help.contains("trueflow-db branch"));
+    }
+
+    #[test]
+    fn tui_command_parses_targets_and_filters() {
+        let cli = Cli::parse_from([
+            "trueflow",
+            "tui",
+            "--target",
+            "file:src/lib.rs",
+            "--target",
+            "rev:abc1234",
+            "--only",
+            "function",
+            "--exclude",
+            "comment",
+        ]);
+
+        match cli.command {
+            Commands::Tui {
+                all,
+                target,
+                only,
+                exclude,
+            } => {
+                assert!(!all);
+                assert_eq!(
+                    target,
+                    vec!["file:src/lib.rs".to_string(), "rev:abc1234".to_string()]
+                );
+                assert_eq!(only, vec!["function".to_string()]);
+                assert_eq!(exclude, vec!["comment".to_string()]);
+            }
+            _ => panic!("expected tui command"),
+        }
+    }
+
+    #[test]
+    fn tui_command_defaults_to_empty_overrides() {
+        let cli = Cli::parse_from(["trueflow", "tui"]);
+
+        match cli.command {
+            Commands::Tui {
+                all,
+                target,
+                only,
+                exclude,
+            } => {
+                assert!(!all);
+                assert!(target.is_empty());
+                assert!(only.is_empty());
+                assert!(exclude.is_empty());
+            }
+            _ => panic!("expected tui command"),
+        }
     }
 }
