@@ -18,6 +18,17 @@ fn optimize_imports(blocks: Vec<Block>) -> Vec<Block> {
         blocks,
         |block, buffer| {
             if block.kind == BlockKind::Import {
+                let previous_import_end = buffer
+                    .iter()
+                    .rev()
+                    .find(|candidate| candidate.kind == BlockKind::Import)
+                    .map(|candidate| candidate.end_line)
+                    .unwrap_or(block.start_line);
+                let line_gap = block.start_line.saturating_sub(previous_import_end);
+                if line_gap > MAX_IMPORT_GAP_LINES {
+                    return Decision::FlushAndBuffer;
+                }
+
                 let start_line = buffer
                     .iter()
                     .find(|candidate| candidate.kind == BlockKind::Import)
@@ -288,6 +299,14 @@ fn should_merge_small_file(blocks: &[Block]) -> bool {
         return false;
     }
 
+    let logic_block_count = non_trivial_blocks
+        .iter()
+        .filter(|block| is_small_file_logic_kind(block.kind))
+        .count();
+    if logic_block_count > 1 {
+        return false;
+    }
+
     let start_line = non_trivial_blocks.first().map_or(0, |block| block.start_line);
     let end_line = non_trivial_blocks
         .last()
@@ -336,6 +355,18 @@ fn merged_small_file_kind(blocks: &[Block]) -> BlockKind {
     } else {
         BlockKind::Code
     }
+}
+
+fn is_small_file_logic_kind(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::Function
+            | BlockKind::Method
+            | BlockKind::Impl
+            | BlockKind::Macro
+            | BlockKind::Command
+            | BlockKind::Code
+    )
 }
 
 #[cfg(test)]
@@ -508,5 +539,22 @@ mod tests {
         assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
         assert_eq!(optimized[1].kind, BlockKind::Gap);
         assert_eq!(optimized[2].kind, BlockKind::CodeParagraph);
+    }
+
+    #[test]
+    fn test_small_file_pass_does_not_merge_multiple_logic_blocks() {
+        let blocks = vec![
+            make_block(BlockKind::Import, "use std::fmt;\n", 0, 1),
+            make_block(BlockKind::Gap, "\n", 1, 2),
+            make_block(BlockKind::Function, "fn a() {}\n", 2, 3),
+            make_block(BlockKind::Gap, "\n", 3, 4),
+            make_block(BlockKind::Function, "fn b() {}\n", 4, 5),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 5);
+        assert_eq!(optimized[0].kind, BlockKind::Import);
+        assert_eq!(optimized[2].kind, BlockKind::Function);
+        assert_eq!(optimized[4].kind, BlockKind::Function);
     }
 }

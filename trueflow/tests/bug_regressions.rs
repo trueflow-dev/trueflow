@@ -38,6 +38,71 @@ fn test_optimizer_module_merge_preserves_content() -> Result<()> {
 }
 
 #[test]
+fn test_optimizer_module_merge_preserves_test_tags() -> Result<()> {
+    let repo = TestRepo::new("optimizer_module_tags")?;
+    repo.write(
+        "src/lib.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {}\n}\n\nmod helper {\n    pub fn noop() {}\n}\n",
+    )?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let blocks = first_file_blocks(&output)?;
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["kind"], "Modules");
+
+    let tags = blocks[0]["tags"]
+        .as_array()
+        .context("tags should be array")?;
+    assert!(
+        tags.iter().any(|tag| tag.as_str() == Some("test")),
+        "expected merged module block to retain test tag, got {tags:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_optimizer_import_merge_respects_large_gap_boundary_e2e() -> Result<()> {
+    let repo = TestRepo::new("optimizer_import_gap_boundary")?;
+    repo.write(
+        "src/lib.rs",
+        "use std::fmt;\n\nuse std::io;\n\n\n\n\nuse std::fs;\n",
+    )?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let blocks = first_file_blocks(&output)?;
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0]["kind"], "Imports");
+    assert_eq!(blocks[1]["kind"], "import");
+
+    Ok(())
+}
+
+#[test]
+fn test_optimizer_small_file_collapses_mixed_semantic_blocks_e2e() -> Result<()> {
+    let repo = TestRepo::new("optimizer_small_file_collapse")?;
+    repo.write(
+        "src/lib.rs",
+        "use std::fmt;\n\nfn run() {\n    if true {}\n}\n\nconst LIMIT: usize = 3;\n",
+    )?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let blocks = first_file_blocks(&output)?;
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["kind"], "code");
+
+    let complexity = blocks[0]["complexity"]
+        .as_u64()
+        .context("complexity should be u64")?;
+    assert!(
+        complexity >= 1,
+        "expected collapsed block complexity to include function complexity, got {complexity}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_diff_new_content_matches_post_hunk() -> Result<()> {
     // GIVEN: a change that replaces a line in the working tree
     let repo = TestRepo::new("diff_new_content")?;
