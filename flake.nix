@@ -40,6 +40,7 @@
           cargoLock = { lockFile = ./trueflow/Cargo.lock; };
 
           nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeCheckInputs = [ pkgs.gitMinimal ];
           buildInputs = commonBuildInputs;
         };
 
@@ -50,6 +51,7 @@
           cargoLock = { lockFile = ./trueflow/Cargo.lock; };
 
           nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeCheckInputs = [ pkgs.gitMinimal ];
           buildInputs = commonBuildInputs;
           CARGO_BUILD_TARGET = "${pkgs.pkgsStatic.stdenv.hostPlatform.config}";
         };

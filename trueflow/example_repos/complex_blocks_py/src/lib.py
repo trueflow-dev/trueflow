@@ -24,3 +24,10 @@ def process_data(ctx, data):
     transformed = world.transform(output)
 
     return transformed
+
+
+def summarize_output(values):
+    if not values:
+        return 0
+
+    return len(values)

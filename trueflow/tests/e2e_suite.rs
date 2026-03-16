@@ -329,7 +329,10 @@ fn test_directory_hash_approval_hides_blocks() -> Result<()> {
 #[test]
 fn test_review_only_filters_block_kinds() -> Result<()> {
     let repo = TestRepo::fixture("only_filter")?;
-    repo.write("src/lib.rs", "struct Alpha;\n\nfn beta() {}\n")?;
+    repo.write(
+        "src/lib.rs",
+        "struct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
+    )?;
 
     let output = repo.run(&["review", "--all", "--only", "function", "--json"])?;
     let blocks = first_file_blocks(&output)?;
@@ -351,7 +354,10 @@ fn test_review_only_filters_block_kinds() -> Result<()> {
 fn test_review_config_only_filters_block_kinds() -> Result<()> {
     let repo = TestRepo::fixture("only_config")?;
     repo.write("trueflow.toml", "[review]\nonly = [\"struct\"]\n")?;
-    repo.write("src/lib.rs", "struct Alpha;\n\nfn beta() {}\n")?;
+    repo.write(
+        "src/lib.rs",
+        "struct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
+    )?;
 
     let output = repo.run(&["review", "--all", "--json"])?;
     let blocks = first_file_blocks(&output)?;
@@ -394,7 +400,7 @@ fn test_review_keeps_imports_in_lib_rs() -> Result<()> {
     let repo = TestRepo::fixture("imports_in_lib")?;
     repo.write(
         "src/lib.rs",
-        "use std::fmt;\n\nmod helpers;\n\nstruct Alpha;\n\nfn beta() {}\n",
+        "use std::fmt;\n\nmod helpers;\n\nstruct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
     )?;
 
     let output = repo.run(&["review", "--all", "--json"])?;
@@ -416,7 +422,10 @@ fn test_review_keeps_imports_in_lib_rs() -> Result<()> {
 #[test]
 fn test_review_only_includes_imports_when_filtered() -> Result<()> {
     let repo = TestRepo::fixture("imports_only_filter")?;
-    repo.write("src/main.rs", "use std::fmt;\n\nfn main() {}\n")?;
+    repo.write(
+        "src/main.rs",
+        "use std::fmt;\n\nfn main() {}\n\nfn render() {\n    main();\n}\n",
+    )?;
 
     let output = repo.run(&["review", "--all", "--only", "import", "--json"])?;
     let blocks = first_file_blocks(&output)?;
@@ -435,7 +444,7 @@ fn test_review_orders_imports_after_functions_in_lib() -> Result<()> {
     let repo = TestRepo::fixture("imports_order")?;
     repo.write(
         "src/lib.rs",
-        "use std::fmt;\n\nstruct Alpha;\n\nfn beta() {}\n",
+        "use std::fmt;\n\nstruct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
     )?;
 
     let output = repo.run(&["review", "--all", "--json"])?;

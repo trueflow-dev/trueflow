@@ -180,7 +180,6 @@
       "enum": [
         "approved",
         "rejected",
-        "question",
         "comment"
       ],
       "type": "string"
