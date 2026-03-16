@@ -250,9 +250,7 @@ struct SpeedReadUiState {
 
 impl SessionRecap {
     fn has_activity(self) -> bool {
-        self.approved_blocks > 0
-            || self.rejected_blocks > 0
-            || self.comments > 0
+        self.approved_blocks > 0 || self.rejected_blocks > 0 || self.comments > 0
     }
 
     fn record_action(&mut self, verdict: &Verdict, impact: ActionImpact) {
@@ -2808,7 +2806,10 @@ enum EditingSubmitDecision {
     Ready(PendingAction),
 }
 
-fn editing_submit_decision(input_mode: &InputMode, input_buffer: &str) -> Option<EditingSubmitDecision> {
+fn editing_submit_decision(
+    input_mode: &InputMode,
+    input_buffer: &str,
+) -> Option<EditingSubmitDecision> {
     let InputMode::Editing { action } = input_mode else {
         return None;
     };
@@ -3535,7 +3536,8 @@ mod diff_scope_tests {
         };
         let input_mode = InputMode::Editing { action };
         let decision = editing_submit_decision(&input_mode, "  keep this note  ");
-        let Some(EditingSubmitDecision::Ready(PendingAction::Single { note, .. })) = decision else {
+        let Some(EditingSubmitDecision::Ready(PendingAction::Single { note, .. })) = decision
+        else {
             panic!("expected ready single action");
         };
         assert_eq!(note.as_deref(), Some("keep this note"));

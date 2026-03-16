@@ -170,8 +170,8 @@ mod tests {
         command
             .write_long_help(&mut help)
             .unwrap_or_else(|error| panic!("failed to render help output: {error}"));
-        let help =
-            String::from_utf8(help).unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
+        let help = String::from_utf8(help)
+            .unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
         assert!(help.contains("configured storage branch"));
         assert!(!help.contains("trueflow-db branch"));
     }
@@ -233,12 +233,7 @@ mod tests {
     #[test]
     fn feedback_command_parses_since_override() {
         let cli = Cli::parse_from([
-            "trueflow",
-            "feedback",
-            "--format",
-            "json",
-            "--since",
-            "last",
+            "trueflow", "feedback", "--format", "json", "--since", "last",
         ]);
 
         match cli.command {

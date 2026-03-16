@@ -307,7 +307,9 @@ fn should_merge_small_file(blocks: &[Block]) -> bool {
         return false;
     }
 
-    let start_line = non_trivial_blocks.first().map_or(0, |block| block.start_line);
+    let start_line = non_trivial_blocks
+        .first()
+        .map_or(0, |block| block.start_line);
     let end_line = non_trivial_blocks
         .last()
         .map_or(start_line, |block| block.end_line);
@@ -468,7 +470,10 @@ mod tests {
         let optimized = optimize(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].kind, BlockKind::Imports);
-        assert_eq!(optimized[0].content, "use a;\n// grouped import note\nuse b;");
+        assert_eq!(
+            optimized[0].content,
+            "use a;\n// grouped import note\nuse b;"
+        );
     }
 
     #[test]
