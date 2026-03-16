@@ -3,6 +3,11 @@ use anyhow::{Context, Result};
 mod common;
 use common::*;
 
+fn non_collapsible_rust_file(base: &str, helper_name: &str, call_target: &str) -> String {
+    // Keep semantic blocks visible for kind-based review assertions.
+    format!("{base}\nfn {helper_name}() {{\n    {call_target}();\n}}\n")
+}
+
 #[test]
 fn test_empty_repo() -> Result<()> {
     let repo = TestRepo::fixture("empty")?;
@@ -331,7 +336,7 @@ fn test_review_only_filters_block_kinds() -> Result<()> {
     let repo = TestRepo::fixture("only_filter")?;
     repo.write(
         "src/lib.rs",
-        "struct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
+        &non_collapsible_rust_file("struct Alpha;\n\nfn beta() {}\n", "gamma", "beta"),
     )?;
 
     let output = repo.run(&["review", "--all", "--only", "function", "--json"])?;
@@ -356,7 +361,7 @@ fn test_review_config_only_filters_block_kinds() -> Result<()> {
     repo.write("trueflow.toml", "[review]\nonly = [\"struct\"]\n")?;
     repo.write(
         "src/lib.rs",
-        "struct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
+        &non_collapsible_rust_file("struct Alpha;\n\nfn beta() {}\n", "gamma", "beta"),
     )?;
 
     let output = repo.run(&["review", "--all", "--json"])?;
@@ -400,7 +405,11 @@ fn test_review_keeps_imports_in_lib_rs() -> Result<()> {
     let repo = TestRepo::fixture("imports_in_lib")?;
     repo.write(
         "src/lib.rs",
-        "use std::fmt;\n\nmod helpers;\n\nstruct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
+        &non_collapsible_rust_file(
+            "use std::fmt;\n\nmod helpers;\n\nstruct Alpha;\n\nfn beta() {}\n",
+            "gamma",
+            "beta",
+        ),
     )?;
 
     let output = repo.run(&["review", "--all", "--json"])?;
@@ -424,7 +433,7 @@ fn test_review_only_includes_imports_when_filtered() -> Result<()> {
     let repo = TestRepo::fixture("imports_only_filter")?;
     repo.write(
         "src/main.rs",
-        "use std::fmt;\n\nfn main() {}\n\nfn render() {\n    main();\n}\n",
+        &non_collapsible_rust_file("use std::fmt;\n\nfn main() {}\n", "render", "main"),
     )?;
 
     let output = repo.run(&["review", "--all", "--only", "import", "--json"])?;
@@ -444,7 +453,11 @@ fn test_review_orders_imports_after_functions_in_lib() -> Result<()> {
     let repo = TestRepo::fixture("imports_order")?;
     repo.write(
         "src/lib.rs",
-        "use std::fmt;\n\nstruct Alpha;\n\nfn beta() {}\n\nfn gamma() {\n    beta();\n}\n",
+        &non_collapsible_rust_file(
+            "use std::fmt;\n\nstruct Alpha;\n\nfn beta() {}\n",
+            "gamma",
+            "beta",
+        ),
     )?;
 
     let output = repo.run(&["review", "--all", "--json"])?;
