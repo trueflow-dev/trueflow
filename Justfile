@@ -2,8 +2,8 @@
 default:
     @just --list
 
-# Run all checks (test, lint, fmt, audit, doc, coverage)
-check: test lint fmt-check audit doc coverage-check
+# Run all checks (test, lint, fmt, audit, doc, coverage, flake builds)
+check: test lint fmt-check audit doc coverage-check nix-check
 
 # Fix all auto-fixable issues
 fix: fix-clippy fix-fmt fix-audit fix-cargo
@@ -37,6 +37,11 @@ doc:
 # Enforce minimum test coverage (line coverage)
 coverage-check:
     cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
+
+# Verify flake packages build
+nix-check:
+    nix build .#native
+    nix build .#default
 
 # Fix clippy issues
 fix-clippy:

@@ -8,3 +8,4 @@ target/
 .beads/
 trueflow/mutants.out/
 trueflow/mutants.out.old/
+result
