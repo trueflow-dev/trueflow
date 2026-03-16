@@ -499,15 +499,20 @@ mod tests {
 
     #[test]
     fn verdict_from_str_maps_question_to_comment() {
-        let parsed = "question".parse::<Verdict>().expect("question should parse");
-        assert_eq!(parsed, Verdict::Comment);
+        let parsed = "question".parse::<Verdict>();
+        assert!(
+            matches!(parsed, Ok(Verdict::Comment)),
+            "question should parse as comment, got {parsed:?}"
+        );
     }
 
     #[test]
     fn verdict_deserialize_accepts_question_alias_as_comment() {
-        let parsed: Verdict =
-            serde_json::from_str("\"question\"").expect("question alias should deserialize");
-        assert_eq!(parsed, Verdict::Comment);
+        let parsed = serde_json::from_str::<Verdict>("\"question\"");
+        assert!(
+            matches!(parsed, Ok(Verdict::Comment)),
+            "question alias should deserialize as comment, got {parsed:?}"
+        );
     }
 
     #[test]

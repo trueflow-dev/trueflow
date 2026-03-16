@@ -299,7 +299,7 @@ fn test_feedback_since_last_uses_cursor_file() -> Result<()> {
             ..Default::default()
         },
     );
-    write_reviews_jsonl(&trueflow_dir, &[first_review.clone()])?;
+    write_reviews_jsonl(&trueflow_dir, std::slice::from_ref(&first_review))?;
 
     let first_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
     let first_entries = json_array(&first_output)?;
@@ -317,7 +317,9 @@ fn test_feedback_since_last_uses_cursor_file() -> Result<()> {
 
     let second_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
     let second_entries = json_array(&second_output)?;
-    let second_entry = second_entries.first().context("expected second feedback entry")?;
+    let second_entry = second_entries
+        .first()
+        .context("expected second feedback entry")?;
     let second_reviews = second_entry["reviews"]
         .as_array()
         .context("reviews should be array")?;
@@ -346,7 +348,7 @@ fn test_feedback_uses_config_default_since_when_omitted() -> Result<()> {
             ..Default::default()
         },
     );
-    write_reviews_jsonl(&trueflow_dir, &[first_review.clone()])?;
+    write_reviews_jsonl(&trueflow_dir, std::slice::from_ref(&first_review))?;
 
     let first_output = repo.run(&["feedback", "--format", "json"])?;
     let first_entries = json_array(&first_output)?;
@@ -364,7 +366,9 @@ fn test_feedback_uses_config_default_since_when_omitted() -> Result<()> {
 
     let second_output = repo.run(&["feedback", "--format", "json"])?;
     let second_entries = json_array(&second_output)?;
-    let second_entry = second_entries.first().context("expected second feedback entry")?;
+    let second_entry = second_entries
+        .first()
+        .context("expected second feedback entry")?;
     let second_reviews = second_entry["reviews"]
         .as_array()
         .context("reviews should be array")?;
