@@ -422,6 +422,10 @@ fn review_scope_for_cli_request(all: bool, targets: &[ReviewTarget]) -> ReviewSc
             id: id.clone(),
             summary: String::new(),
         },
+        [ReviewTarget::RevisionRange { start, end }] => ReviewScope::RevisionRange {
+            start: start.clone(),
+            end: end.clone(),
+        },
         _ => ReviewScope::MainDiff,
     }
 }
@@ -2397,6 +2401,9 @@ fn build_block_diff_lines(
             DiffQuery::Revision { revision, path } => {
                 vcs::diff_hunks_for_file_in_revision(&repo, &revision, &path)
             }
+            DiffQuery::RevisionRange { start, end, path } => {
+                vcs::diff_hunks_for_file_in_range(&repo, &start, &end, &path)
+            }
         }
     });
     let diff_view =
@@ -3189,7 +3196,6 @@ mod diff_scope_tests {
             }
         );
     }
-
     #[test]
     fn diff_query_uses_revision_for_commit_scope() {
         let query = diff_query_for_scope(
@@ -3209,6 +3215,25 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn diff_query_uses_revision_range_for_range_scope() {
+        let query = diff_query_for_scope(
+            &ReviewScope::RevisionRange {
+                start: "abc123".to_string(),
+                end: "def456".to_string(),
+            },
+            "src/lib.rs",
+        );
+        assert_eq!(
+            query,
+            DiffQuery::RevisionRange {
+                start: "abc123".to_string(),
+                end: "def456".to_string(),
+                path: "src/lib.rs".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn diff_query_uses_main_diff_for_all_scope() {
         let query = diff_query_for_scope(&ReviewScope::All, "src/lib.rs");
         assert_eq!(
@@ -3218,7 +3243,6 @@ mod diff_scope_tests {
             }
         );
     }
-
     #[test]
     fn path_matches_workdir_prefix_matches_exact_and_descendants() {
         assert!(path_matches_workdir_prefix(
@@ -3303,7 +3327,6 @@ mod diff_scope_tests {
             .unwrap_or_else(|error| panic!("expected no parse error: {error}"));
         assert!(request.is_none());
     }
-
     #[test]
     fn cli_review_request_file_target_uses_main_diff_scope() {
         let targets = vec!["file:src/lib.rs".to_string()];
@@ -3318,6 +3341,32 @@ mod diff_scope_tests {
         assert_eq!(
             request.review_options.targets,
             vec![ReviewTarget::File("src/lib.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn cli_review_request_revision_range_target_uses_revision_range_scope() {
+        let targets = vec!["rev:abc1234..def5678".to_string()];
+        let request = cli_review_request(false, &targets, &[], &[])
+            .unwrap_or_else(|error| panic!("expected revision range request: {error}"));
+        let Some(request) = request else {
+            panic!("expected cli request");
+        };
+
+        assert_eq!(
+            request.review_scope,
+            ReviewScope::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+            }
+        );
+        assert_eq!(request.scope_label, "revisions abc1234..def5678");
+        assert_eq!(
+            request.review_options.targets,
+            vec![ReviewTarget::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+            }]
         );
     }
 
@@ -3337,7 +3386,6 @@ mod diff_scope_tests {
         assert_eq!(request.review_options.exclude, exclude);
         assert!(request.review_options.targets.is_empty());
     }
-
     #[test]
     fn cli_review_request_errors_for_unknown_target_format() {
         let targets = vec!["src/lib.rs".to_string()];

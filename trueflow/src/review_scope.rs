@@ -12,12 +12,23 @@ pub enum ReviewScope {
     All,
     MainDiff,
     Commit { id: String, summary: String },
+    RevisionRange { start: String, end: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffQuery {
-    MainDiff { path: String },
-    Revision { revision: String, path: String },
+    MainDiff {
+        path: String,
+    },
+    Revision {
+        revision: String,
+        path: String,
+    },
+    RevisionRange {
+        start: String,
+        end: String,
+        path: String,
+    },
 }
 
 pub fn diff_query_for_scope(scope: &ReviewScope, path: &str) -> DiffQuery {
@@ -27,6 +38,11 @@ pub fn diff_query_for_scope(scope: &ReviewScope, path: &str) -> DiffQuery {
         },
         ReviewScope::Commit { id, .. } => DiffQuery::Revision {
             revision: id.clone(),
+            path: path.to_string(),
+        },
+        ReviewScope::RevisionRange { start, end } => DiffQuery::RevisionRange {
+            start: start.clone(),
+            end: end.clone(),
             path: path.to_string(),
         },
     }
@@ -45,6 +61,13 @@ impl ReviewScope {
                 } else {
                     format!("commit {short_id} {summary}")
                 }
+            }
+            ReviewScope::RevisionRange { start, end } => {
+                format!(
+                    "revisions {}..{}",
+                    short_commit_id(start),
+                    short_commit_id(end)
+                )
             }
         }
     }
@@ -66,6 +89,15 @@ impl ReviewScope {
             ReviewScope::Commit { id, .. } => ReviewOptions {
                 all: false,
                 targets: vec![ReviewTarget::Revision(id.clone())],
+                only: Vec::new(),
+                exclude: Vec::new(),
+            },
+            ReviewScope::RevisionRange { start, end } => ReviewOptions {
+                all: false,
+                targets: vec![ReviewTarget::RevisionRange {
+                    start: start.clone(),
+                    end: end.clone(),
+                }],
                 only: Vec::new(),
                 exclude: Vec::new(),
             },
@@ -168,6 +200,25 @@ mod tests {
     }
 
     #[test]
+    fn diff_query_for_revision_range_scope_uses_revision_range() {
+        let query = diff_query_for_scope(
+            &ReviewScope::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+            },
+            "src/lib.rs",
+        );
+        assert_eq!(
+            query,
+            DiffQuery::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+                path: "src/lib.rs".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn commit_scope_label_uses_short_id_and_truncated_summary() {
         let scope = ReviewScope::Commit {
             id: "1234567890abcdef".to_string(),
@@ -178,10 +229,38 @@ mod tests {
     }
 
     #[test]
+    fn revision_range_scope_label_uses_short_ids() {
+        let scope = ReviewScope::RevisionRange {
+            start: "1234567890abcdef".to_string(),
+            end: "abcdef1234567890".to_string(),
+        };
+        assert_eq!(scope.label(), "revisions 1234567..abcdef1");
+    }
+
+    #[test]
     fn main_diff_scope_maps_to_expected_review_options() {
         let options = ReviewScope::MainDiff.to_review_options();
         assert!(!options.all);
         assert_eq!(options.targets, vec![ReviewTarget::MainDiff]);
+        assert!(options.only.is_empty());
+        assert!(options.exclude.is_empty());
+    }
+
+    #[test]
+    fn revision_range_scope_maps_to_expected_review_options() {
+        let options = ReviewScope::RevisionRange {
+            start: "abc1234".to_string(),
+            end: "def5678".to_string(),
+        }
+        .to_review_options();
+        assert!(!options.all);
+        assert_eq!(
+            options.targets,
+            vec![ReviewTarget::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+            }]
+        );
         assert!(options.only.is_empty());
         assert!(options.exclude.is_empty());
     }
