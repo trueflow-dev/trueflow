@@ -446,6 +446,356 @@ fn test_review_revision_target_includes_only_changed_blocks() -> Result<()> {
 }
 
 #[test]
+fn test_review_historical_revision_target_uses_target_revision_content() -> Result<()> {
+    let repo = TestRepo::new("review_historical_revision")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"before\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+
+    repo.git(&["checkout", "-b", "feature/history-rev"])?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"middle target marker\");\n}\n",
+    )?;
+    repo.commit_all("Target revision")?;
+
+    let target_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let target_revision = target_revision.trim().to_string();
+
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"current head marker\");\n}\n",
+    )?;
+    repo.commit_all("Later revision")?;
+
+    let output = repo.run(&[
+        "review",
+        "--json",
+        "--target",
+        &format!("rev:{target_revision}"),
+    ])?;
+    let files = json_array(&output)?;
+    let blocks = files.first().context("Expected file in review output")?["blocks"]
+        .as_array()
+        .context("blocks")?;
+
+    assert!(
+        !blocks.is_empty(),
+        "expected changed blocks for historical revision target"
+    );
+
+    let contents = blocks
+        .iter()
+        .filter_map(|block| block["content"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("middle target marker")),
+        "historical revision review did not use target commit content: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("current head marker")),
+        "historical revision review leaked current checkout content: {contents:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_review_historical_revision_range_uses_end_revision_content() -> Result<()> {
+    let repo = TestRepo::new("review_historical_revision_range")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"before\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+
+    let start_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let start_revision = start_revision.trim().to_string();
+
+    repo.git(&["checkout", "-b", "feature/history-range"])?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"range end marker\");\n}\n",
+    )?;
+    repo.commit_all("Range end")?;
+
+    let end_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let end_revision = end_revision.trim().to_string();
+
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"later head marker\");\n}\n",
+    )?;
+    repo.commit_all("Later revision")?;
+
+    let output = repo.run(&[
+        "review",
+        "--json",
+        "--target",
+        &format!("rev:{start_revision}..{end_revision}"),
+    ])?;
+    let files = json_array(&output)?;
+    let blocks = files.first().context("Expected file in review output")?["blocks"]
+        .as_array()
+        .context("blocks")?;
+
+    assert!(
+        !blocks.is_empty(),
+        "expected changed blocks for historical revision range"
+    );
+
+    let contents = blocks
+        .iter()
+        .filter_map(|block| block["content"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("range end marker")),
+        "historical revision range review did not use end revision content: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("later head marker")),
+        "historical revision range review leaked current checkout content: {contents:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_review_historical_revision_target_from_subdir_uses_target_content() -> Result<()> {
+    let repo = TestRepo::new("review_historical_revision_subdir")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"before\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+
+    repo.git(&["checkout", "-b", "feature/history-subdir"])?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"subdir target marker\");\n}\n",
+    )?;
+    repo.commit_all("Target revision")?;
+
+    let target_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let target_revision = target_revision.trim().to_string();
+    let subdir = repo.path.join("src");
+
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"later subdir marker\");\n}\n",
+    )?;
+    repo.commit_all("Later revision")?;
+
+    let output = repo.run_in(
+        &[
+            "review",
+            "--json",
+            "--target",
+            &format!("rev:{target_revision}"),
+        ],
+        &subdir,
+    )?;
+    let files = json_array(&output)?;
+    let blocks = files.first().context("Expected file in review output")?["blocks"]
+        .as_array()
+        .context("blocks")?;
+
+    assert!(
+        !blocks.is_empty(),
+        "expected changed blocks for historical revision from subdir"
+    );
+
+    let contents = blocks
+        .iter()
+        .filter_map(|block| block["content"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("subdir target marker")),
+        "historical revision review from subdir did not use target content: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("later subdir marker")),
+        "historical revision review from subdir leaked current checkout content: {contents:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_review_historical_revision_range_from_subdir_uses_end_revision_content() -> Result<()> {
+    let repo = TestRepo::new("review_historical_revision_range_subdir")?;
+    repo.write(
+        "src/lib.rs",
+        r#"pub fn tracked() {
+    println!("before");
+}
+"#,
+    )?;
+    repo.commit_all("Initial")?;
+
+    let start_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let start_revision = start_revision.trim().to_string();
+
+    repo.git(&["checkout", "-b", "feature/history-range-subdir"])?;
+    repo.write(
+        "src/lib.rs",
+        r#"pub fn tracked() {
+    println!("range subdir marker");
+}
+"#,
+    )?;
+    repo.commit_all("Range end")?;
+
+    let end_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let end_revision = end_revision.trim().to_string();
+    let subdir = repo.path.join("src");
+
+    repo.write(
+        "src/lib.rs",
+        r#"pub fn tracked() {
+    println!("later subdir head marker");
+}
+"#,
+    )?;
+    repo.commit_all("Later revision")?;
+
+    let output = repo.run_in(
+        &[
+            "review",
+            "--json",
+            "--target",
+            &format!("rev:{start_revision}..{end_revision}"),
+        ],
+        &subdir,
+    )?;
+    let files = json_array(&output)?;
+    let blocks = files.first().context("Expected file in review output")?["blocks"]
+        .as_array()
+        .context("blocks")?;
+
+    assert!(
+        !blocks.is_empty(),
+        "expected changed blocks for historical revision range from subdir"
+    );
+
+    let contents = blocks
+        .iter()
+        .filter_map(|block| block["content"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("range subdir marker")),
+        "historical revision range review from subdir did not use end revision content: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("later subdir head marker")),
+        "historical revision range review from subdir leaked current checkout content: {contents:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_review_rejects_mixed_historical_targets_with_different_content_revisions() -> Result<()> {
+    let repo = TestRepo::new("review_mixed_historical_targets")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"before\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+
+    repo.git(&["checkout", "-b", "feature/mixed-history"])?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"target one\");\n}\n",
+    )?;
+    repo.commit_all("Target one")?;
+    let revision_one = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let revision_one = revision_one.trim().to_string();
+
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"target two\");\n}\n",
+    )?;
+    repo.commit_all("Target two")?;
+    let revision_two = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let revision_two = revision_two.trim().to_string();
+
+    let err = repo.run_err(&[
+        "review",
+        "--json",
+        "--target",
+        &format!("rev:{revision_one}"),
+        "--target",
+        &format!("rev:{revision_two}"),
+    ])?;
+
+    assert!(
+        err.contains(
+            "Multiple historical targets with different content revisions are not supported"
+        ),
+        "expected mixed historical target error, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_review_rejects_all_with_explicit_targets() -> Result<()> {
+    let repo = TestRepo::new("review_mixed_historical_and_worktree_targets")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"before\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+
+    repo.git(&["checkout", "-b", "feature/mixed-history-worktree"])?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn tracked() {\n    println!(\"target revision\");\n}\n",
+    )?;
+    repo.commit_all("Target revision")?;
+    let target_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let target_revision = target_revision.trim().to_string();
+
+    let err = repo.run_err(&[
+        "review",
+        "--json",
+        "--all",
+        "--target",
+        &format!("rev:{target_revision}"),
+    ])?;
+
+    assert!(
+        err.contains("Explicit review targets cannot be combined with --all"),
+        "expected all-plus-target error, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_review_progress_counts_duplicate_blocks() -> Result<()> {
     let repo = TestRepo::new("review_duplicates")?;
     // Two identical functions

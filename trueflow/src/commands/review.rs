@@ -50,6 +50,16 @@ pub struct ReviewSummary {
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
 }
 
+enum ReviewContentSource {
+    Workdir,
+    Revision(String),
+}
+
+enum ResolvedTargetPaths {
+    All,
+    Specific(HashSet<String>),
+}
+
 pub fn collect_review_summary(
     _context: &TrueflowContext,
     options: &ReviewOptions,
@@ -59,15 +69,22 @@ pub fn collect_review_summary(
         "review collect (all={}, only={:?}, exclude={:?})",
         options.all, options.only, options.exclude
     );
+    validate_review_options(options)?;
     let normalized_targets = normalize_targets(options);
-    let target_paths = resolve_review_targets_from_targets(&normalized_targets)?.map(|paths| {
-        paths
-            .into_iter()
-            .map(|path| normalize_path_str(&path))
-            .collect::<HashSet<String>>()
-    });
+    let content_source = review_content_source(&normalized_targets)?;
+    let target_paths = match resolve_review_targets_from_targets(&normalized_targets)? {
+        ResolvedTargetPaths::All => ResolvedTargetPaths::All,
+        ResolvedTargetPaths::Specific(paths) => ResolvedTargetPaths::Specific(
+            paths
+                .into_iter()
+                .map(|path| normalize_path_str(&path))
+                .collect::<HashSet<String>>(),
+        ),
+    };
     let diff_overlap_targets = diff_overlap_targets(&normalized_targets);
-    let diff_repo = if diff_overlap_targets.is_some() {
+    let review_repo = if diff_overlap_targets.is_some()
+        || matches!(content_source, ReviewContentSource::Revision(_))
+    {
         Some(vcs::repo_from_workdir()?)
     } else {
         None
@@ -82,8 +99,29 @@ pub fn collect_review_summary(
     let fingerprint_status = latest_review_verdicts(&history);
     let approved_hashes = approved_hashes_from_verdicts(&fingerprint_status);
 
-    // 2. Scan Directory (Merkle Tree)
-    let files = scanner::scan_directory(".")?;
+    // 2. Load review content
+    let files = match &content_source {
+        ReviewContentSource::Workdir => scanner::scan_directory(".")?,
+        ReviewContentSource::Revision(revision) => {
+            let Some(repo) = review_repo.as_ref() else {
+                return Err(anyhow!("review repo unavailable for revision target"));
+            };
+            let paths = match &target_paths {
+                ResolvedTargetPaths::Specific(paths) => paths,
+                ResolvedTargetPaths::All => {
+                    return Err(anyhow!(
+                        "historical review targets must resolve to explicit paths"
+                    ));
+                }
+            };
+            vcs::file_states_for_paths_in_revision(
+                repo,
+                revision,
+                paths,
+                workdir_prefix.as_deref(),
+            )?
+        }
+    };
     info!("scanned {} files", files.len());
     let tree = tree::build_tree_from_files(&files);
 
@@ -93,7 +131,7 @@ pub fn collect_review_summary(
     let mut unreviewed_block_nodes = HashSet::new();
 
     for file in files {
-        if let Some(targets) = &target_paths {
+        if let ResolvedTargetPaths::Specific(targets) = &target_paths {
             let file_path = normalize_path_str(&file.path);
             let mut matches = targets.contains(&file_path);
             if !matches && let Some(prefix) = &workdir_prefix {
@@ -107,7 +145,7 @@ pub fn collect_review_summary(
 
         let language = file.language;
         let file_diff_hunks = if let (Some(repo), Some(diff_targets)) =
-            (diff_repo.as_ref(), diff_overlap_targets.as_ref())
+            (review_repo.as_ref(), diff_overlap_targets.as_ref())
         {
             Some(diff_hunks_for_file_targets(
                 repo,
@@ -219,14 +257,79 @@ pub fn collect_unreviewed(
     Ok(collect_review_summary(context, options, filters)?.files)
 }
 
-fn resolve_review_targets_from_targets(
-    targets: &[ReviewTarget],
-) -> Result<Option<HashSet<String>>> {
+fn review_content_source(targets: &[ReviewTarget]) -> Result<ReviewContentSource> {
+    let mut revision = None;
+    let mut saw_workdir_target = false;
+
+    for target in targets {
+        match target {
+            ReviewTarget::Revision(candidate) => {
+                if saw_workdir_target {
+                    return Err(anyhow!(
+                        "Historical targets cannot be mixed with worktree-based targets"
+                    ));
+                }
+
+                match &revision {
+                    Some(existing) if existing != candidate => {
+                        return Err(anyhow!(
+                            "Multiple historical targets with different content revisions are not supported"
+                        ));
+                    }
+                    Some(_) => {}
+                    None => revision = Some(candidate.to_string()),
+                }
+            }
+            ReviewTarget::RevisionRange { end, .. } => {
+                if saw_workdir_target {
+                    return Err(anyhow!(
+                        "Historical targets cannot be mixed with worktree-based targets"
+                    ));
+                }
+
+                match &revision {
+                    Some(existing) if existing != end => {
+                        return Err(anyhow!(
+                            "Multiple historical targets with different content revisions are not supported"
+                        ));
+                    }
+                    Some(_) => {}
+                    None => revision = Some(end.to_string()),
+                }
+            }
+            ReviewTarget::File(_) => {}
+            ReviewTarget::DirtyWorktree | ReviewTarget::MainDiff | ReviewTarget::All => {
+                if revision.is_some() {
+                    return Err(anyhow!(
+                        "Historical targets cannot be mixed with worktree-based targets"
+                    ));
+                }
+                saw_workdir_target = true;
+            }
+        }
+    }
+
+    Ok(revision
+        .map(ReviewContentSource::Revision)
+        .unwrap_or(ReviewContentSource::Workdir))
+}
+
+fn validate_review_options(options: &ReviewOptions) -> Result<()> {
+    if options.all && !options.targets.is_empty() {
+        return Err(anyhow!(
+            "Explicit review targets cannot be combined with --all"
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_review_targets_from_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargetPaths> {
     if targets
         .iter()
         .any(|target| matches!(target, ReviewTarget::All))
     {
-        return Ok(None);
+        return Ok(ResolvedTargetPaths::All);
     }
 
     let mut paths = HashSet::new();
@@ -253,11 +356,7 @@ fn resolve_review_targets_from_targets(
         }
     }
 
-    if paths.is_empty() {
-        Ok(Some(HashSet::new()))
-    } else {
-        Ok(Some(paths))
-    }
+    Ok(ResolvedTargetPaths::Specific(paths))
 }
 
 fn normalize_targets(options: &ReviewOptions) -> Vec<ReviewTarget> {

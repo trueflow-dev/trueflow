@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::Block;
+use crate::block::{Block, FileState};
 use crate::block_splitter;
 use crate::path_utils;
 use crate::scanner;
@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
 use gix::status::UntrackedFiles;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -197,6 +198,94 @@ pub fn head_blocks_for_path(repo: &gix::Repository, path: &str) -> Result<Vec<Bl
         .and_then(Language::from_extension)
         .unwrap_or(Language::Unknown);
     Ok(split_blocks(content, language))
+}
+
+pub fn file_states_for_paths_in_revision(
+    repo: &gix::Repository,
+    revision: &str,
+    paths: &HashSet<String>,
+    workdir_prefix: Option<&str>,
+) -> Result<Vec<FileState>> {
+    let object = repo.rev_parse_single(revision)?;
+    let commit = object
+        .object()?
+        .peel_to_commit()
+        .context("revision must resolve to a commit")?;
+    let tree = commit.tree()?;
+
+    file_states_for_paths_in_tree(&tree, paths, workdir_prefix)
+}
+
+fn file_states_for_paths_in_tree(
+    tree: &gix::Tree<'_>,
+    paths: &HashSet<String>,
+    workdir_prefix: Option<&str>,
+) -> Result<Vec<FileState>> {
+    let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
+    ordered_paths.sort();
+
+    let mut files = Vec::new();
+    for requested_path in ordered_paths {
+        let candidates =
+            path_utils::tree_path_candidates_for_repo_path(&requested_path, workdir_prefix);
+        for candidate in candidates {
+            if let Some(file_state) =
+                file_state_for_path_in_tree(tree, &candidate, &requested_path)?
+            {
+                files.push(file_state);
+                break;
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+fn file_state_for_path_in_tree(
+    tree: &gix::Tree<'_>,
+    tree_path_str: &str,
+    output_path: &str,
+) -> Result<Option<FileState>> {
+    let tree_path = Path::new(tree_path_str);
+    let Some(entry) = tree.lookup_entry_by_path(tree_path)? else {
+        return Ok(None);
+    };
+    if entry.mode().kind() == EntryKind::Tree {
+        return Ok(None);
+    }
+
+    let blob = entry.object()?.try_into_blob()?;
+    let content = match std::str::from_utf8(&blob.data) {
+        Ok(content) => content,
+        Err(_) => {
+            return Ok(Some(FileState {
+                path: path_utils::normalize_path_str(output_path),
+                language: Language::Unknown,
+                file_hash: "binary_skipped".to_string(),
+                blocks: Vec::new(),
+            }));
+        }
+    };
+
+    let language = tree_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(Language::from_extension)
+        .unwrap_or(Language::Unknown);
+    let blocks = split_blocks(content, language);
+
+    let mut hasher = Sha256::new();
+    for block in &blocks {
+        hasher.update(&block.hash);
+    }
+    let file_hash = format!("{:x}", hasher.finalize());
+
+    Ok(Some(FileState {
+        path: path_utils::normalize_path_str(output_path),
+        language,
+        file_hash,
+        blocks,
+    }))
 }
 
 pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
