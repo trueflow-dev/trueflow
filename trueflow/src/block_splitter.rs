@@ -94,6 +94,11 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             info!("block_splitter done (blocks={})", blocks.len());
             return Ok(blocks);
         }
+        Language::Nix => {
+            let blocks = split_nix(content)?;
+            info!("block_splitter done (blocks={})", blocks.len());
+            return Ok(blocks);
+        }
         _ if lang.uses_text_fallback() => {
             let blocks = split_paragraphs(content, lang);
             info!("block_splitter done (blocks={})", blocks.len());
@@ -364,6 +369,241 @@ fn split_cpp(content: &str) -> Vec<Block> {
         };
         create_block(chunk, kind, content, start, end, Language::Cpp)
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NixBoundary {
+    end: usize,
+    kind: BlockKind,
+}
+
+fn split_nix(content: &str) -> Result<Vec<Block>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_nix::LANGUAGE.into())
+        .context("Failed to load nix grammar")?;
+
+    let tree = parser.parse(content, None).context("Failed to parse nix")?;
+    let root = tree.root_node();
+
+    let Some(expression) = root.child_by_field_name("expression") else {
+        return Ok(split_by_paragraph_breaks(
+            content,
+            |chunk, start, end, is_gap| {
+                let kind = if is_gap {
+                    BlockKind::Gap
+                } else if is_nix_comment_chunk(chunk) {
+                    BlockKind::Comment
+                } else {
+                    BlockKind::Code
+                };
+                create_block(chunk, kind, content, start, end, Language::Nix)
+            },
+        ));
+    };
+
+    let mut boundaries = collect_nix_boundaries(expression);
+    if let Some(last_boundary) = boundaries.last_mut()
+        && content[last_boundary.end..].trim().is_empty()
+    {
+        last_boundary.end = content.len();
+    }
+
+    if boundaries.is_empty() {
+        return Ok(vec![create_block(
+            content,
+            classify_nix_node_kind(expression.kind()),
+            content,
+            0,
+            content.len(),
+            Language::Nix,
+        )]);
+    }
+
+    let mut blocks = Vec::new();
+    let mut last_end = 0;
+    for boundary in boundaries {
+        if boundary.end <= last_end {
+            continue;
+        }
+
+        let chunk = &content[last_end..boundary.end];
+        let kind = if chunk.trim().is_empty() {
+            BlockKind::Gap
+        } else {
+            boundary.kind
+        };
+        blocks.push(create_block(
+            chunk,
+            kind,
+            content,
+            last_end,
+            boundary.end,
+            Language::Nix,
+        ));
+        last_end = boundary.end;
+    }
+
+    if last_end < content.len() {
+        let chunk = &content[last_end..];
+        let kind = if chunk.trim().is_empty() {
+            BlockKind::Gap
+        } else if is_nix_comment_chunk(chunk) {
+            BlockKind::Comment
+        } else {
+            BlockKind::Code
+        };
+        blocks.push(create_block(
+            chunk,
+            kind,
+            content,
+            last_end,
+            content.len(),
+            Language::Nix,
+        ));
+    }
+
+    Ok(blocks)
+}
+
+fn collect_nix_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
+    match node.kind() {
+        "function_expression" => collect_nix_function_boundaries(node),
+        "let_expression" => collect_nix_let_boundaries(node),
+        "with_expression" | "assert_expression" => collect_nix_prefix_and_body_boundaries(node),
+        "attrset_expression" | "let_attrset_expression" | "rec_attrset_expression" => {
+            collect_nix_attrset_boundaries(node)
+        }
+        _ => vec![NixBoundary {
+            end: node.end_byte(),
+            kind: classify_nix_node_kind(node.kind()),
+        }],
+    }
+}
+
+fn collect_nix_function_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
+    let Some(body) = node.child_by_field_name("body") else {
+        return vec![NixBoundary {
+            end: node.end_byte(),
+            kind: BlockKind::Function,
+        }];
+    };
+
+    let mut boundaries = Vec::with_capacity(2);
+    if body.start_byte() > node.start_byte() {
+        boundaries.push(NixBoundary {
+            end: body.start_byte(),
+            kind: BlockKind::FunctionSignature,
+        });
+    }
+    boundaries.extend(collect_nix_boundaries(body));
+    boundaries
+}
+
+fn collect_nix_let_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
+    let mut boundaries = Vec::new();
+
+    if let Some(binding_set) = first_child_of_kind(node, "binding_set") {
+        boundaries.extend(collect_nix_binding_boundaries(
+            binding_set,
+            binding_set.end_byte(),
+        ));
+    }
+
+    if let Some(body) = node.child_by_field_name("body") {
+        boundaries.extend(collect_nix_boundaries(body));
+    }
+
+    if boundaries.is_empty() {
+        boundaries.push(NixBoundary {
+            end: node.end_byte(),
+            kind: BlockKind::Code,
+        });
+    }
+
+    boundaries
+}
+
+fn collect_nix_prefix_and_body_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
+    let Some(body) = node.child_by_field_name("body") else {
+        return vec![NixBoundary {
+            end: node.end_byte(),
+            kind: BlockKind::Code,
+        }];
+    };
+
+    let mut boundaries = Vec::with_capacity(2);
+    if body.start_byte() > node.start_byte() {
+        boundaries.push(NixBoundary {
+            end: body.start_byte(),
+            kind: BlockKind::Code,
+        });
+    }
+    boundaries.extend(collect_nix_boundaries(body));
+    boundaries
+}
+
+fn collect_nix_attrset_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
+    let Some(binding_set) = first_child_of_kind(node, "binding_set") else {
+        return vec![NixBoundary {
+            end: node.end_byte(),
+            kind: BlockKind::Code,
+        }];
+    };
+
+    collect_nix_binding_boundaries(binding_set, node.end_byte())
+}
+
+fn collect_nix_binding_boundaries(
+    binding_set: tree_sitter::Node<'_>,
+    terminal_end: usize,
+) -> Vec<NixBoundary> {
+    let mut cursor = binding_set.walk();
+    let items: Vec<_> = binding_set
+        .children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "binding" | "inherit" | "inherit_from"))
+        .collect();
+
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| NixBoundary {
+            end: if index + 1 == items.len() {
+                terminal_end
+            } else {
+                item.end_byte()
+            },
+            kind: classify_nix_node_kind(item.kind()),
+        })
+        .collect()
+}
+
+fn first_child_of_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn classify_nix_node_kind(kind: &str) -> BlockKind {
+    match kind {
+        "binding" | "variable_expression" => BlockKind::Variable,
+        "inherit" | "inherit_from" => BlockKind::Import,
+        "function_expression" => BlockKind::Function,
+        "comment" => BlockKind::Comment,
+        _ => BlockKind::Code,
+    }
+}
+
+fn is_nix_comment_chunk(chunk: &str) -> bool {
+    let trimmed = chunk.trim_start();
+    trimmed.starts_with('#') || trimmed.starts_with("/*")
 }
 
 fn classify_go_chunk(chunk: &str) -> BlockKind {
@@ -971,8 +1211,67 @@ mod tests {
     }
 
     #[test]
-    fn test_split_nix_paragraphs() {
-        assert_paragraph_split(Language::Nix);
+    fn test_split_nix_attrset_bindings() {
+        let content = "{\n  foo = \"bar\";\n  inherit pkgs;\n}\n";
+        let blocks = split(content, Language::Nix).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, BlockKind::Variable);
+        assert!(blocks[0].content.contains("foo = \"bar\";"));
+        assert_eq!(blocks[1].kind, BlockKind::Import);
+        assert!(blocks[1].content.contains("inherit pkgs;"));
+        assert_eq!(
+            blocks
+                .into_iter()
+                .map(|block| block.content)
+                .collect::<String>(),
+            content
+        );
+    }
+
+    #[test]
+    fn test_split_nix_function_let_and_body_attrset() {
+        let content =
+            "{ pkgs }:\nlet\n  foo = \"bar\";\n  inherit pkgs;\nin {\n  inherit foo;\n}\n";
+        let blocks = split(content, Language::Nix).unwrap();
+        let kinds: Vec<_> = blocks.iter().map(|block| block.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::FunctionSignature,
+                BlockKind::Variable,
+                BlockKind::Import,
+                BlockKind::Import,
+            ]
+        );
+        assert!(blocks[0].content.contains("{ pkgs }:"));
+        assert!(blocks[1].content.contains("foo = \"bar\";"));
+        assert!(blocks[2].content.contains("inherit pkgs;"));
+        assert!(blocks[3].content.contains("inherit foo;"));
+        assert_eq!(
+            blocks
+                .into_iter()
+                .map(|block| block.content)
+                .collect::<String>(),
+            content
+        );
+    }
+
+    #[test]
+    fn test_split_nix_falls_back_to_single_code_block_for_simple_if_expression() {
+        let content = "if enabled then package else fallback\n";
+        let blocks = split(content, Language::Nix).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Code);
+        assert_eq!(blocks[0].content, content);
+    }
+
+    #[test]
+    fn test_split_nix_comment_only_file_is_comment_block() {
+        let content = "# comment only\n# still comment\n";
+        let blocks = split(content, Language::Nix).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Comment);
+        assert_eq!(blocks[0].content, content);
     }
 
     #[test]

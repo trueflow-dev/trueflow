@@ -66,6 +66,43 @@ fn test_all_languages_detection() -> Result<()> {
 }
 
 #[test]
+fn test_all_languages_nix_blocks_are_structural() -> Result<()> {
+    let repo = TestRepo::fixture("all_languages")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&output)?;
+
+    let nix_file = files
+        .iter()
+        .find(|file| {
+            file["path"].as_str().map(|path| path.replace("./", "")) == Some("main.nix".to_string())
+        })
+        .context("missing scan output for main.nix")?;
+    let blocks = nix_file["blocks"]
+        .as_array()
+        .context("blocks should be array")?;
+    let kinds = blocks
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+
+    assert!(
+        kinds.iter().any(|kind| *kind == "FunctionSignature"),
+        "expected a function signature block in main.nix (kinds={kinds:?})"
+    );
+    assert!(
+        kinds.iter().any(|kind| *kind == "variable"),
+        "expected a variable block in main.nix (kinds={kinds:?})"
+    );
+    assert!(
+        !kinds.iter().any(|kind| *kind == "Paragraph"),
+        "did not expect paragraph fallback blocks in main.nix (kinds={kinds:?})"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_all_languages_test_blocks() -> Result<()> {
     let repo = TestRepo::fixture("all_languages")?;
 

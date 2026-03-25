@@ -24,10 +24,7 @@ pub enum Language {
 
 impl Language {
     pub fn uses_text_fallback(self) -> bool {
-        matches!(
-            self,
-            Language::Text | Language::Toml | Language::Nix | Language::Just
-        )
+        matches!(self, Language::Text | Language::Toml | Language::Just)
     }
 
     pub fn from_extension(ext: &str) -> Option<Self> {

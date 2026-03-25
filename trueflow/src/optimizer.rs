@@ -299,6 +299,14 @@ fn should_merge_small_file(blocks: &[Block]) -> bool {
         return false;
     }
 
+    if non_trivial_blocks.len() >= 3
+        && non_trivial_blocks
+            .iter()
+            .all(|block| is_small_file_declarative_kind(block.kind))
+    {
+        return false;
+    }
+
     let logic_block_count = non_trivial_blocks
         .iter()
         .filter(|block| is_small_file_logic_kind(block.kind))
@@ -333,6 +341,18 @@ fn is_non_collapsible_small_file_kind(kind: BlockKind) -> bool {
             | BlockKind::Sentence
             | BlockKind::Section
             | BlockKind::Preamble
+    )
+}
+
+fn is_small_file_declarative_kind(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::Import
+            | BlockKind::Imports
+            | BlockKind::Variable
+            | BlockKind::Const
+            | BlockKind::Static
+            | BlockKind::FunctionSignature
     )
 }
 
@@ -561,5 +581,22 @@ mod tests {
         assert_eq!(optimized[0].kind, BlockKind::Import);
         assert_eq!(optimized[2].kind, BlockKind::Function);
         assert_eq!(optimized[4].kind, BlockKind::Function);
+    }
+    #[test]
+    fn test_small_file_pass_does_not_merge_declarative_block_sets() {
+        let blocks = vec![
+            make_block(BlockKind::FunctionSignature, "{ pkgs }:\n", 0, 1),
+            make_block(BlockKind::Variable, "let\n  foo = 1;\n", 1, 3),
+            make_block(BlockKind::Gap, "\n", 3, 4),
+            make_block(BlockKind::Variable, "  bar = 2;\n", 4, 5),
+            make_block(BlockKind::Import, "in { inherit foo bar; }\n", 5, 6),
+        ];
+
+        let optimized = optimize(blocks.clone());
+        assert_eq!(optimized.len(), blocks.len());
+        assert_eq!(optimized[0].kind, BlockKind::FunctionSignature);
+        assert_eq!(optimized[1].kind, BlockKind::Variable);
+        assert_eq!(optimized[3].kind, BlockKind::Variable);
+        assert_eq!(optimized[4].kind, BlockKind::Import);
     }
 }
