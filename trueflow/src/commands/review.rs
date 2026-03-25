@@ -574,4 +574,32 @@ mod tests {
         assert_eq!(data_rank, kind_rank(&make_block(BlockKind::Interface, &[])));
         assert_eq!(data_rank, kind_rank(&make_block(BlockKind::Class, &[])));
     }
+
+    #[test]
+    fn validate_review_options_allows_all_without_explicit_targets() {
+        let options = ReviewOptions {
+            all: true,
+            targets: Vec::new(),
+            only: Vec::new(),
+            exclude: Vec::new(),
+        };
+
+        assert!(validate_review_options(&options).is_ok());
+    }
+
+    #[test]
+    fn validate_review_options_rejects_all_with_explicit_targets() {
+        let options = ReviewOptions {
+            all: true,
+            targets: vec![ReviewTarget::All],
+            only: Vec::new(),
+            exclude: Vec::new(),
+        };
+
+        let err = validate_review_options(&options).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Explicit review targets cannot be combined with --all")
+        );
+    }
 }

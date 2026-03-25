@@ -76,7 +76,7 @@ impl ReviewScope {
         match self {
             ReviewScope::All => ReviewOptions {
                 all: true,
-                targets: vec![ReviewTarget::All],
+                targets: Vec::new(),
                 only: Vec::new(),
                 exclude: Vec::new(),
             },
@@ -235,6 +235,15 @@ mod tests {
             end: "abcdef1234567890".to_string(),
         };
         assert_eq!(scope.label(), "revisions 1234567..abcdef1");
+    }
+
+    #[test]
+    fn all_scope_maps_to_all_flag_without_explicit_targets() {
+        let options = ReviewScope::All.to_review_options();
+        assert!(options.all);
+        assert!(options.targets.is_empty());
+        assert!(options.only.is_empty());
+        assert!(options.exclude.is_empty());
     }
 
     #[test]
