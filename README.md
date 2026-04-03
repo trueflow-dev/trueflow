@@ -19,9 +19,12 @@ history.
 
 ## Current model
 
+
 - The canonical review unit is a **block**, not a textual diff hunk.
 - Runtime config lives in `trueflow.toml`.
-- In this repo, `trueflow.metadata.toml` is brand/site metadata, not runtime config.
+
+Still some rough edges.
+
 - The current public CLI field name is still `fingerprint`.
 - Diff fingerprints and content-addressed block identities both exist today and
   are not fully unified yet.
