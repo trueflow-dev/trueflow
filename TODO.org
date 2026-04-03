@@ -43,6 +43,10 @@
 ** TODO [High] Language coverage sweep
    - [ ] Add top 16 languages/markdown variants.
    - [ ] Add an `all_langs` repo fixture and E2E smoke tests per language.
+** TODO [High] Swift review support
+   - [ ] Add Swift language support for common review units: imports, structs/classes/enums, protocols, extensions, methods, and tests.
+   - [ ] Add Swift fixtures and E2E review-generation tests covering realistic review cases.
+   - [ ] Verify review UX for Swift-specific patterns like protocol conformance changes, extension-heavy files, and SwiftUI view bodies.
 ** TODO [High] Review types/modes
    - [ ] Support review types (security, dependencies, performance, readability, data structures, business logic).
    - [ ] Tag reviews with a type and make modes affect block ordering and filters (e.g., data structures shows structs).
