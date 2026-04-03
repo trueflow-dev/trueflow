@@ -1,5 +1,6 @@
 use crate::analysis::Language;
-use crate::hashing::ContentHash;
+use crate::hashing::{BytesHash, TreeHash};
+use crate::repo_path::RepoPath;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -219,7 +220,7 @@ impl FromStr for BlockKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     /// The content-addressable identity of this block
-    pub hash: ContentHash,
+    pub hash: TreeHash,
 
     /// The actual text content
     pub content: String,
@@ -246,7 +247,7 @@ pub struct Block {
 impl Block {
     pub fn new(content: String, kind: BlockKind, start_line: usize, end_line: usize) -> Self {
         Self {
-            hash: ContentHash::from_content(&content),
+            hash: TreeHash::from_content(&content),
             content,
             kind,
             tags: Vec::new(),
@@ -318,12 +319,54 @@ impl ByteSpan {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileState {
-    pub path: String,
+    pub path: RepoPath,
     #[serde(default)]
     pub language: Language,
-    /// The hash of the entire file (e.g. Merkle root of blocks)
-    pub file_hash: ContentHash,
+    /// Exact hash of the raw file bytes.
+    pub bytes_hash: BytesHash,
+    /// Review-tree hash for this file. For files with blocks, this is the ordered
+    /// hash of child block hashes. For leaf-like files with no blocks, this reuses
+    /// the bytes hash.
+    pub tree_hash: TreeHash,
     pub blocks: Vec<Block>,
+}
+
+impl FileState {
+    pub fn new(
+        path: RepoPath,
+        language: Language,
+        bytes_hash: BytesHash,
+        mut blocks: Vec<Block>,
+    ) -> Self {
+        assert!(!path.is_root(), "FileState path must not be root");
+        blocks.sort_by_key(|block| (block.start_line, block.end_line));
+        let tree_hash = if blocks.is_empty() {
+            TreeHash::from_bytes_hash(&bytes_hash)
+        } else {
+            TreeHash::from_child_hashes(blocks.iter().map(|block| &block.hash))
+        };
+
+        Self {
+            path,
+            language,
+            bytes_hash,
+            tree_hash,
+            blocks,
+        }
+    }
+
+    pub fn from_text(path: RepoPath, language: Language, bytes: &[u8], blocks: Vec<Block>) -> Self {
+        Self::new(path, language, BytesHash::from_bytes(bytes), blocks)
+    }
+
+    pub fn from_binary(path: RepoPath, bytes: &[u8]) -> Self {
+        Self::new(
+            path,
+            Language::Unknown,
+            BytesHash::from_bytes(bytes),
+            Vec::new(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +496,26 @@ mod tests {
         assert!(base.contains(&ByteSpan::new(0, 10)));
         assert!(base.contains(&ByteSpan::new(2, 5)));
         assert!(!base.contains(&overlap));
+    }
+
+    #[test]
+    fn test_file_state_tracks_bytes_hash_and_tree_hash() {
+        let path = crate::repo_path::RepoPath::new("src/lib.rs").unwrap();
+        let blocks = vec![
+            Block::new("fn b() {}\n".to_string(), BlockKind::Function, 10, 11),
+            Block::new("fn a() {}\n".to_string(), BlockKind::Function, 1, 2),
+        ];
+        let file = FileState::from_text(path, Language::Rust, b"fn a() {}\nfn b() {}\n", blocks);
+
+        assert_eq!(file.path.as_str(), "src/lib.rs");
+        assert_eq!(file.blocks[0].start_line, 1);
+        assert_eq!(file.blocks[1].start_line, 10);
+        assert_eq!(
+            file.tree_hash,
+            crate::hashing::TreeHash::from_child_hashes(
+                file.blocks.iter().map(|block| &block.hash)
+            )
+        );
+        assert_ne!(file.bytes_hash.as_str(), file.tree_hash.as_str());
     }
 }

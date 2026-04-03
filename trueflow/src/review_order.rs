@@ -1,3 +1,4 @@
+use crate::repo_path::RepoPath;
 use crate::tree::{Tree, TreeNode, TreeNodeId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -18,7 +19,7 @@ enum ReviewBand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewCursor {
-    pub file_path: String,
+    pub file_path: RepoPath,
     pub kind_rank: u8,
     pub start_line: usize,
     pub node_id: TreeNodeId,
@@ -39,8 +40,13 @@ impl ReviewOrder {
             .filter_map(|node_id| {
                 let node = tree.node(node_id);
                 let block = node.block.as_ref()?;
-                let file_path = if node.path.is_empty() {
-                    node.name.clone()
+                let file_path = if node.path.is_root() {
+                    match RepoPath::new(&node.name) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            panic!("tree node name should form a valid repo path: {error}")
+                        }
+                    }
                 } else {
                     node.path.clone()
                 };
@@ -150,7 +156,7 @@ fn review_band_rank(band: ReviewBand) -> u8 {
     }
 }
 
-fn review_group(path: &str, node: &TreeNode) -> ReviewGroup {
+fn review_group(path: &RepoPath, node: &TreeNode) -> ReviewGroup {
     if is_test_block(path, node) {
         ReviewGroup::Test
     } else if is_library_path(path) {
@@ -168,14 +174,14 @@ fn review_group_rank(group: ReviewGroup) -> u8 {
     }
 }
 
-fn is_library_path(path: &str) -> bool {
-    path == "src/lib.rs"
-        || (path.starts_with("src/")
-            && !path.starts_with("src/main.rs")
-            && !path.starts_with("src/bin/"))
+fn is_library_path(path: &RepoPath) -> bool {
+    path.as_str() == "src/lib.rs"
+        || (path.as_str().starts_with("src/")
+            && !path.as_str().starts_with("src/main.rs")
+            && !path.as_str().starts_with("src/bin/"))
 }
 
-fn is_test_block(path: &str, node: &TreeNode) -> bool {
+fn is_test_block(path: &RepoPath, node: &TreeNode) -> bool {
     if is_test_path(path) {
         return true;
     }
@@ -187,8 +193,8 @@ fn is_test_block(path: &str, node: &TreeNode) -> bool {
     false
 }
 
-fn is_test_path(path: &str) -> bool {
-    let path = Path::new(path);
+fn is_test_path(path: &RepoPath) -> bool {
+    let path = Path::new(path.as_str());
     if path
         .components()
         .any(|component| component.as_os_str() == "tests")

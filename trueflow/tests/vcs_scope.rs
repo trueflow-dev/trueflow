@@ -59,7 +59,7 @@ fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
     let hunks = trueflow::vcs::diff_hunks_for_file_in_revision(
         &git_repo,
         target_revision.trim(),
-        "src/lib.rs",
+        &trueflow::repo_path::RepoPath::new("src/lib.rs")?,
     )?;
 
     assert!(!hunks.is_empty(), "expected at least one hunk");

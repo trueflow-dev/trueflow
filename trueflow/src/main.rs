@@ -16,6 +16,7 @@ mod logging;
 mod optimizer;
 mod path_utils;
 mod policy;
+mod repo_path;
 mod review_metadata;
 mod review_navigator;
 mod review_order;

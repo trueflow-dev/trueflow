@@ -19,7 +19,7 @@ pub fn block_breadcrumb(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
         let ancestor = tree.node(ancestor_id);
         match ancestor.kind {
             TreeNodeKind::File => {
-                if !ancestor.path.is_empty() {
+                if !ancestor.path.is_root() {
                     file_path = Some(ancestor.path.clone());
                 }
             }

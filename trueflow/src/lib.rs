@@ -13,6 +13,7 @@ pub mod logging;
 pub mod optimizer;
 pub mod path_utils;
 pub mod policy;
+pub mod repo_path;
 pub mod review_metadata;
 pub mod review_navigator;
 pub mod review_order;

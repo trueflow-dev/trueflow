@@ -4,6 +4,7 @@ use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::path_utils;
 use crate::policy::{should_skip_impl_by_default, should_skip_imports_by_default};
+use crate::repo_path::RepoPath;
 use crate::scanner;
 use crate::store::{
     FileStore, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
@@ -18,7 +19,7 @@ use tracing::info;
 
 #[derive(Serialize)]
 pub struct UnreviewedFile {
-    pub path: String,
+    pub path: RepoPath,
     pub language: Language,
     pub blocks: Vec<Block>,
 }
@@ -57,7 +58,7 @@ enum ReviewContentSource {
 
 enum ResolvedTargetPaths {
     All,
-    Specific(HashSet<String>),
+    Specific(HashSet<RepoPath>),
 }
 
 pub fn collect_review_summary(
@@ -72,15 +73,7 @@ pub fn collect_review_summary(
     validate_review_options(options)?;
     let normalized_targets = normalize_targets(options);
     let content_source = review_content_source(&normalized_targets)?;
-    let target_paths = match resolve_review_targets_from_targets(&normalized_targets)? {
-        ResolvedTargetPaths::All => ResolvedTargetPaths::All,
-        ResolvedTargetPaths::Specific(paths) => ResolvedTargetPaths::Specific(
-            paths
-                .into_iter()
-                .map(|path| normalize_path_str(&path))
-                .collect::<HashSet<String>>(),
-        ),
-    };
+    let target_paths = resolve_review_targets_from_targets(&normalized_targets)?;
     let diff_overlap_targets = diff_overlap_targets(&normalized_targets);
     let review_repo = if diff_overlap_targets.is_some()
         || matches!(content_source, ReviewContentSource::Revision(_))
@@ -132,10 +125,10 @@ pub fn collect_review_summary(
 
     for file in files {
         if let ResolvedTargetPaths::Specific(targets) = &target_paths {
-            let file_path = normalize_path_str(&file.path);
+            let file_path = file.path.clone();
             let mut matches = targets.contains(&file_path);
             if !matches && let Some(prefix) = &workdir_prefix {
-                let repo_path = format!("{prefix}/{file_path}");
+                let repo_path = RepoPath::new(format!("{prefix}/{file_path}"))?;
                 matches = targets.contains(&repo_path);
             }
             if !matches {
@@ -161,7 +154,7 @@ pub fn collect_review_summary(
             if !filters.allows_block(block.kind) {
                 continue;
             }
-            if should_skip_imports_by_default(&file.path, &block, filters) {
+            if should_skip_imports_by_default(file.path.as_str(), &block, filters) {
                 continue;
             }
             if should_skip_impl_by_default(&block, filters) {
@@ -177,7 +170,7 @@ pub fn collect_review_summary(
         total_blocks += reviewable_blocks.len();
 
         // Optimization: If the FILE hash is approved, everything inside is approved.
-        if fingerprint_status.get(file.file_hash.as_str()) == Some(&Verdict::Approved) {
+        if fingerprint_status.get(file.tree_hash.as_str()) == Some(&Verdict::Approved) {
             continue;
         }
 
@@ -344,7 +337,7 @@ fn resolve_review_targets_from_targets(targets: &[ReviewTarget]) -> Result<Resol
                 paths.extend(vcs::files_changed_main_to_head()?);
             }
             ReviewTarget::File(path) => {
-                paths.insert(path.clone());
+                paths.insert(RepoPath::new(path)?);
             }
             ReviewTarget::Revision(revision) => {
                 paths.extend(vcs::files_changed_in_revision(revision)?);
@@ -407,10 +400,10 @@ fn diff_overlap_targets(targets: &[ReviewTarget]) -> Option<Vec<DiffOverlapTarge
 fn diff_hunks_for_file_targets(
     repo: &gix::Repository,
     targets: &[DiffOverlapTarget],
-    file_path: &str,
+    file_path: &RepoPath,
     workdir_prefix: Option<&str>,
 ) -> Result<Vec<vcs::DiffHunk>> {
-    let repo_relative_path = repo_relative_path_for_diff(file_path, workdir_prefix);
+    let repo_relative_path = repo_relative_path_for_diff(file_path, workdir_prefix)?;
     let mut hunks = Vec::new();
 
     for target in targets {
@@ -429,17 +422,19 @@ fn diff_hunks_for_file_targets(
     Ok(hunks)
 }
 
-fn repo_relative_path_for_diff(file_path: &str, workdir_prefix: Option<&str>) -> String {
-    path_utils::repo_relative_path_for_diff(file_path, workdir_prefix)
+fn repo_relative_path_for_diff(
+    file_path: &RepoPath,
+    workdir_prefix: Option<&str>,
+) -> Result<RepoPath> {
+    RepoPath::new(path_utils::repo_relative_path_for_diff(
+        file_path.as_str(),
+        workdir_prefix,
+    ))
 }
 
 fn workdir_prefix_from_git_root() -> Option<String> {
     let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
     path_utils::current_workdir_prefix_for_repo_root(&repo_root)
-}
-
-fn normalize_path_str(path: &str) -> String {
-    path_utils::normalize_path_str(path)
 }
 
 pub(crate) fn parse_review_targets(values: &[String]) -> Result<Vec<ReviewTarget>> {
@@ -514,7 +509,7 @@ pub fn run(
     Ok(())
 }
 
-fn get_dirty_files() -> Result<HashSet<String>> {
+fn get_dirty_files() -> Result<HashSet<RepoPath>> {
     vcs::dirty_files_from_workdir()
 }
 
@@ -529,11 +524,11 @@ fn kind_rank(block: &Block) -> u8 {
 mod tests {
     use super::*;
     use crate::block::BlockKind;
-    use crate::hashing::ContentHash;
+    use crate::hashing::TreeHash;
 
     fn make_block(kind: BlockKind, tags: &[&str]) -> Block {
         Block {
-            hash: ContentHash::new("hash"),
+            hash: TreeHash::new("hash"),
             content: "content".to_string(),
             kind,
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),

@@ -1,5 +1,6 @@
 use crate::hashing::compute_fingerprint;
 use crate::path_utils;
+use crate::repo_path::RepoPath;
 use crate::store::{
     FileStore, Record, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
 };
@@ -12,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Serialize)]
 pub struct Change {
     pub fingerprint: String,
-    pub file: String,
+    pub file: RepoPath,
     pub line: u32,
     pub diff_content: String, // The +/- diff
     pub new_content: String,  // The clean new content (for editing/preview)
@@ -89,11 +90,11 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
 fn path_is_covered_by_approved_node(
     tree: &tree::Tree,
     approved_hashes: &HashSet<String>,
-    repo_relative_path: &str,
+    repo_relative_path: &RepoPath,
     workdir_prefix: Option<&str>,
 ) -> bool {
     let candidates =
-        path_utils::tree_path_candidates_for_repo_path(repo_relative_path, workdir_prefix);
+        path_utils::tree_path_candidates_for_repo_path(repo_relative_path.as_str(), workdir_prefix);
     for candidate in candidates {
         if tree
             .find_by_path(candidate.as_str())

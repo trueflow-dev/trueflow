@@ -225,15 +225,15 @@ pub fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
         .clone())
 }
 
-/// Return the `file_hash` from the first file entry in scan JSON output.
+/// Return the `tree_hash` from the first file entry in scan JSON output.
 ///
-/// Input contract: JSON array with at least one file entry containing `file_hash`.
-pub fn first_file_hash(output: &str) -> Result<String> {
+/// Input contract: JSON array with at least one file entry containing `tree_hash`.
+pub fn first_file_tree_hash(output: &str) -> Result<String> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
-    let hash = file["file_hash"]
+    let hash = file["tree_hash"]
         .as_str()
-        .context("file_hash should be string")?;
+        .context("tree_hash should be string")?;
     Ok(hash.to_string())
 }
 

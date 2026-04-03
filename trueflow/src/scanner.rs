@@ -1,15 +1,14 @@
 use crate::analysis::{self, FileType, Language};
 use crate::block::{Block, BlockKind, FileState};
 use crate::block_splitter;
-use crate::hashing::{ContentHash, hash_str};
+use crate::hashing::{TreeHash, hash_str};
 use crate::optimizer;
-use crate::path_utils;
+use crate::repo_path::RepoPath;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::Result;
 use dirs::home_dir;
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,7 +81,7 @@ struct CacheEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedFile {
-    path: String,
+    path: RepoPath,
     modified_at: u64,
     size: u64,
     file_state: FileState,
@@ -152,7 +151,7 @@ fn write_cache(root: &Path, files: &[FileState]) -> Result<()> {
 
     let mut cached_files = Vec::new();
     for file in files {
-        let full_path = root.join(&file.path);
+        let full_path = root.join(file.path.as_str());
         let metadata = fs::metadata(&full_path)?;
         let modified = metadata.modified()?;
         cached_files.push(CachedFile {
@@ -196,7 +195,7 @@ fn cache_root_hash(root: &Path) -> String {
     hash_str(identity.to_string_lossy().as_ref())
 }
 
-fn collect_current_file_stamps(root: &Path) -> Result<HashMap<String, FileStamp>> {
+fn collect_current_file_stamps(root: &Path) -> Result<HashMap<RepoPath, FileStamp>> {
     let mut stamps = HashMap::new();
     for entry in build_walker(root) {
         let entry = match entry {
@@ -239,7 +238,7 @@ fn collect_current_file_stamps(root: &Path) -> Result<HashMap<String, FileStamp>
             }
             Err(err) => return Err(err.into()),
         };
-        let path = normalize_cache_key(root, entry.path());
+        let path = normalize_cache_key(root, entry.path())?;
         stamps.insert(
             path,
             FileStamp {
@@ -251,9 +250,9 @@ fn collect_current_file_stamps(root: &Path) -> Result<HashMap<String, FileStamp>
     Ok(stamps)
 }
 
-fn normalize_cache_key(root: &Path, path: &Path) -> String {
+fn normalize_cache_key(root: &Path, path: &Path) -> Result<RepoPath> {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    path_utils::normalize_path_str(relative.to_string_lossy().as_ref())
+    RepoPath::from_relative_path(relative)
 }
 
 fn system_time_to_epoch(time: SystemTime) -> u64 {
@@ -295,68 +294,48 @@ fn log_process_file_error(path: &Path, err: &anyhow::Error) {
 fn process_file(root: &Path, path: &Path) -> Result<FileState> {
     let file_type = analysis::analyze_file(path);
     let relative_path = path.strip_prefix(root).unwrap_or(path);
-    let normalized_path = path_utils::normalize_path_str(relative_path.to_string_lossy().as_ref());
+    let normalized_path = RepoPath::from_relative_path(relative_path)?;
 
     // Skip binary files
     if matches!(file_type, FileType::Binary) {
-        // Return empty block list or handle specifically?
-        // For now, let's treat them as empty/skipped to avoid polluting output with garbage.
-        // Or create a single block "Binary Content".
-        return Ok(FileState {
-            path: normalized_path,
-            language: Language::Unknown,
-            file_hash: ContentHash::new("binary_skipped"),
-            blocks: Vec::new(),
-        });
+        return Ok(FileState::from_binary(normalized_path, &fs::read(path)?));
     }
 
-    let content = fs::read_to_string(path)?;
+    let bytes = fs::read(path)?;
+    let content = std::str::from_utf8(&bytes)?;
 
     // Choose chunker based on analysis
     let (language, blocks) = match file_type {
         FileType::Code(code_file) => {
             // Check if we have a splitter for this language
             let language = code_file.language;
-            let blocks = block_splitter::split(&content, language);
+            let blocks = block_splitter::split(content, language);
 
             match blocks {
                 Ok(b) if !b.is_empty() => (language, optimizer::optimize(b)),
-                Ok(_) => (
-                    language,
-                    fallback_split_blocks(&content, FallbackMode::Code),
-                ), // Fallback if splitter returns empty (not implemented or empty file)
+                Ok(_) => (language, fallback_split_blocks(content, FallbackMode::Code)), // Fallback if splitter returns empty (not implemented or empty file)
                 Err(e) => {
                     warn!("Failed to parse file {path:?}: {e}, falling back to paragraphs");
-                    (
-                        language,
-                        fallback_split_blocks(&content, FallbackMode::Code),
-                    )
+                    (language, fallback_split_blocks(content, FallbackMode::Code))
                 }
             }
         }
         FileType::Text => (
             Language::Text,
-            fallback_split_blocks(&content, FallbackMode::Text),
+            fallback_split_blocks(content, FallbackMode::Text),
         ),
         _ => (
             Language::Unknown,
-            fallback_split_blocks(&content, FallbackMode::Text),
+            fallback_split_blocks(content, FallbackMode::Text),
         ), // Fallback for non-code files
     };
 
-    // Compute file hash (Merkle root of block hashes)
-    let mut hasher = Sha256::new();
-    for block in &blocks {
-        hasher.update(block.hash.as_str());
-    }
-    let file_hash = ContentHash::new(format!("{:x}", hasher.finalize()));
-
-    Ok(FileState {
-        path: normalized_path,
+    Ok(FileState::from_text(
+        normalized_path,
         language,
-        file_hash,
+        &bytes,
         blocks,
-    })
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,7 +402,7 @@ fn create_fallback_block(
 ) -> Block {
     let (start_line, end_line) = byte_range_to_lines(full_source, start, end);
     Block {
-        hash: ContentHash::from_content(chunk),
+        hash: TreeHash::from_content(chunk),
         content: chunk.to_string(),
         kind,
         tags: Vec::new(),

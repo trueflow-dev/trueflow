@@ -1,16 +1,18 @@
 use crate::analysis::Language;
 use crate::block::{Block, FileState};
 use crate::block_splitter;
-use crate::hashing::ContentHash;
 use crate::path_utils;
+use crate::repo_path::RepoPath;
 use crate::scanner;
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
 use gix::status::UntrackedFiles;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use crate::hashing::TreeHash;
 
 #[derive(Clone)]
 pub struct RepoSnapshot {
@@ -20,7 +22,7 @@ pub struct RepoSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
-    pub file_path: String,
+    pub file_path: RepoPath,
     pub old_start: u32,
     pub new_start: u32,
     pub lines: Vec<String>,
@@ -98,12 +100,12 @@ pub fn git_config_from_workdir() -> Result<GitConfig> {
     Ok(GitConfig { email, signing_key })
 }
 
-pub fn dirty_files_from_workdir() -> Result<HashSet<String>> {
+pub fn dirty_files_from_workdir() -> Result<HashSet<RepoPath>> {
     let repo = repo_from_workdir()?;
     dirty_files(&repo)
 }
 
-pub fn dirty_files(repo: &gix::Repository) -> Result<HashSet<String>> {
+pub fn dirty_files(repo: &gix::Repository) -> Result<HashSet<RepoPath>> {
     let mut dirty = HashSet::new();
     let iter = repo
         .status(gix::progress::Discard)?
@@ -115,7 +117,7 @@ pub fn dirty_files(repo: &gix::Repository) -> Result<HashSet<String>> {
         if summary.is_none() {
             continue;
         }
-        dirty.insert(item.rela_path().to_str_lossy().to_string());
+        dirty.insert(RepoPath::new(item.rela_path().to_str_lossy().as_ref())?);
     }
     Ok(dirty)
 }
@@ -143,7 +145,10 @@ pub fn block_state_for_path(
     );
 
     for candidate in &candidate_paths {
-        if let Ok(blocks) = head_blocks_for_path(repo, candidate)
+        let Ok(candidate_path) = RepoPath::new(candidate) else {
+            continue;
+        };
+        if let Ok(blocks) = head_blocks_for_path(repo, &candidate_path)
             && blocks
                 .iter()
                 .any(|block| block.hash.as_str() == fingerprint)
@@ -160,7 +165,8 @@ pub fn block_state_for_path(
     if let Ok(dirty) = dirty_files(repo)
         && candidate_paths
             .iter()
-            .any(|candidate| dirty.contains(candidate.as_str()))
+            .filter_map(|candidate| RepoPath::new(candidate).ok())
+            .any(|candidate| dirty.contains(&candidate))
     {
         tracing::debug!(
             path_hint = %path,
@@ -185,9 +191,9 @@ pub enum BlockStateResult {
     Unknown,
 }
 
-pub fn head_blocks_for_path(repo: &gix::Repository, path: &str) -> Result<Vec<Block>> {
+pub fn head_blocks_for_path(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<Block>> {
     let head_tree = repo.head_tree()?;
-    let tree_path = Path::new(path);
+    let tree_path = Path::new(path.as_str());
     let entry = head_tree
         .lookup_entry_by_path(tree_path)?
         .context("path not found in head tree")?;
@@ -206,7 +212,7 @@ pub fn head_blocks_for_path(repo: &gix::Repository, path: &str) -> Result<Vec<Bl
 pub fn file_states_for_paths_in_revision(
     repo: &gix::Repository,
     revision: &str,
-    paths: &HashSet<String>,
+    paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
 ) -> Result<Vec<FileState>> {
     let object = repo.rev_parse_single(revision)?;
@@ -221,7 +227,7 @@ pub fn file_states_for_paths_in_revision(
 
 fn file_states_for_paths_in_tree(
     tree: &gix::Tree<'_>,
-    paths: &HashSet<String>,
+    paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
 ) -> Result<Vec<FileState>> {
     let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
@@ -230,7 +236,7 @@ fn file_states_for_paths_in_tree(
     let mut files = Vec::new();
     for requested_path in ordered_paths {
         let candidates =
-            path_utils::tree_path_candidates_for_repo_path(&requested_path, workdir_prefix);
+            path_utils::tree_path_candidates_for_repo_path(requested_path.as_str(), workdir_prefix);
         for candidate in candidates {
             if let Some(file_state) =
                 file_state_for_path_in_tree(tree, &candidate, &requested_path)?
@@ -247,7 +253,7 @@ fn file_states_for_paths_in_tree(
 fn file_state_for_path_in_tree(
     tree: &gix::Tree<'_>,
     tree_path_str: &str,
-    output_path: &str,
+    output_path: &RepoPath,
 ) -> Result<Option<FileState>> {
     let tree_path = Path::new(tree_path_str);
     let Some(entry) = tree.lookup_entry_by_path(tree_path)? else {
@@ -261,12 +267,10 @@ fn file_state_for_path_in_tree(
     let content = match std::str::from_utf8(&blob.data) {
         Ok(content) => content,
         Err(_) => {
-            return Ok(Some(FileState {
-                path: path_utils::normalize_path_str(output_path),
-                language: Language::Unknown,
-                file_hash: ContentHash::new("binary_skipped"),
-                blocks: Vec::new(),
-            }));
+            return Ok(Some(FileState::from_binary(
+                output_path.clone(),
+                &blob.data,
+            )));
         }
     };
 
@@ -277,18 +281,12 @@ fn file_state_for_path_in_tree(
         .unwrap_or(Language::Unknown);
     let blocks = split_blocks(content, language);
 
-    let mut hasher = Sha256::new();
-    for block in &blocks {
-        hasher.update(block.hash.as_str());
-    }
-    let file_hash = ContentHash::new(format!("{:x}", hasher.finalize()));
-
-    Ok(Some(FileState {
-        path: path_utils::normalize_path_str(output_path),
+    Ok(Some(FileState::from_text(
+        output_path.clone(),
         language,
-        file_hash,
+        &blob.data,
         blocks,
-    }))
+    )))
 }
 
 pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
@@ -297,7 +295,7 @@ pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
     diff_trees(&repo, &base_tree, &head_tree)
 }
 
-pub fn diff_hunks_for_file(repo: &gix::Repository, path: &str) -> Result<Vec<DiffHunk>> {
+pub fn diff_hunks_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<DiffHunk>> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
     diff_hunks_for_file_between_trees(repo, &base_tree, &head_tree, path)
 }
@@ -305,7 +303,7 @@ pub fn diff_hunks_for_file(repo: &gix::Repository, path: &str) -> Result<Vec<Dif
 pub fn diff_hunks_for_file_in_revision(
     repo: &gix::Repository,
     revision: &str,
-    path: &str,
+    path: &RepoPath,
 ) -> Result<Vec<DiffHunk>> {
     let object = repo.rev_parse_single(revision)?;
     let commit = object
@@ -325,7 +323,7 @@ pub fn diff_hunks_for_file_in_range(
     repo: &gix::Repository,
     start: &str,
     end: &str,
-    path: &str,
+    path: &RepoPath,
 ) -> Result<Vec<DiffHunk>> {
     let start_obj = repo.rev_parse_single(start)?;
     let end_obj = repo.rev_parse_single(end)?;
@@ -346,7 +344,7 @@ fn diff_hunks_for_file_between_trees(
     repo: &gix::Repository,
     base_tree: &gix::Tree<'_>,
     head_tree: &gix::Tree<'_>,
-    path: &str,
+    path: &RepoPath,
 ) -> Result<Vec<DiffHunk>> {
     let mut hunks = Vec::new();
     let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
@@ -355,7 +353,7 @@ fn diff_hunks_for_file_between_trees(
     for change in changes {
         let change_ref = change.to_ref();
         let location = change_ref.location();
-        if location.to_str_lossy() != path {
+        if location.to_str_lossy() != path.as_str() {
             continue;
         }
 
@@ -502,12 +500,12 @@ fn is_trivial_formatting_only_replacement(first: &DiffLine, second: &DiffLine) -
         && first.text.trim() == second.text.trim()
 }
 
-pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
+pub fn files_changed_main_to_head() -> Result<HashSet<RepoPath>> {
     let repo = repo_from_workdir()?;
     files_changed_main_to_head_in_repo(&repo)
 }
 
-pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<HashSet<String>> {
+pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<HashSet<RepoPath>> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
     collect_changed_paths(repo, Some(&base_tree), Some(&head_tree))
 }
@@ -552,7 +550,7 @@ pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Ve
     Ok(commits)
 }
 
-pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<String>> {
+pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<RepoPath>> {
     let repo = repo_from_workdir()?;
     let object = repo.rev_parse_single(revision)?;
     let commit = object
@@ -568,7 +566,7 @@ pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<String>> {
     collect_changed_paths(&repo, Some(&parent_tree), Some(&commit_tree))
 }
 
-pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<String>> {
+pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<RepoPath>> {
     let repo = repo_from_workdir()?;
     let start_obj = repo.rev_parse_single(start)?;
     let end_obj = repo.rev_parse_single(end)?;
@@ -620,8 +618,8 @@ fn diff_trees(
                     gix::diff::blob::unified_diff::ContextSize::symmetrical(3),
                 );
                 let unified = gix::diff::blob::diff(algorithm, &input, sink)?;
-                let path = location.to_str_lossy();
-                collect_hunks(&mut hunks, path.as_ref(), &unified)?;
+                let path = RepoPath::new(location.to_str_lossy().as_ref())?;
+                collect_hunks(&mut hunks, &path, &unified)?;
             }
         }
 
@@ -656,7 +654,7 @@ fn collect_changed_paths(
     repo: &gix::Repository,
     base_tree: Option<&gix::Tree<'_>>,
     head_tree: Option<&gix::Tree<'_>>,
-) -> Result<HashSet<String>> {
+) -> Result<HashSet<RepoPath>> {
     let changes = repo.diff_tree_to_tree(base_tree, head_tree, None)?;
     let mut paths = HashSet::new();
     for change in changes {
@@ -668,7 +666,7 @@ fn collect_changed_paths(
         if !is_blob_change(&change_ref) {
             continue;
         }
-        paths.insert(location.to_str_lossy().to_string());
+        paths.insert(RepoPath::new(location.to_str_lossy().as_ref())?);
     }
     Ok(paths)
 }
@@ -685,7 +683,7 @@ fn is_blob_change(change: &gix::diff::tree_with_rewrites::ChangeRef<'_>) -> bool
     is_blob(mode) || is_blob(source_mode)
 }
 
-fn collect_hunks(hunks: &mut Vec<DiffHunk>, path: &str, unified: &str) -> Result<()> {
+fn collect_hunks(hunks: &mut Vec<DiffHunk>, path: &RepoPath, unified: &str) -> Result<()> {
     let mut current: Option<DiffHunk> = None;
     for line in unified.lines() {
         if let Some(header) = parse_hunk_header(line) {
@@ -693,7 +691,7 @@ fn collect_hunks(hunks: &mut Vec<DiffHunk>, path: &str, unified: &str) -> Result
                 hunks.push(hunk);
             }
             current = Some(DiffHunk {
-                file_path: path.to_string(),
+                file_path: path.clone(),
                 old_start: header.before_start,
                 new_start: header.after_start,
                 lines: Vec::new(),
@@ -846,10 +844,10 @@ mod tests {
     fn collect_hunks_groups_lines_by_header() {
         let diff = "@@ -1,1 +1,2 @@\n-foo\n+foo\n+bar\n@@ -5,1 +6,1 @@\n-baz\n+qux\n";
         let mut hunks = Vec::new();
-        collect_hunks(&mut hunks, "src/main.rs", diff).unwrap();
+        collect_hunks(&mut hunks, &RepoPath::new("src/main.rs").unwrap(), diff).unwrap();
 
         assert_eq!(hunks.len(), 2);
-        assert_eq!(hunks[0].file_path, "src/main.rs");
+        assert_eq!(hunks[0].file_path, RepoPath::new("src/main.rs").unwrap());
         assert_eq!(hunks[0].old_start, 1);
         assert_eq!(hunks[0].new_start, 1);
         assert_eq!(hunks[0].lines, vec!["-foo\n", "+foo\n", "+bar\n"]);
@@ -863,7 +861,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -873,21 +871,21 @@ mod tests {
         };
 
         let hunk_inside = DiffHunk {
-            file_path: String::new(),
+            file_path: RepoPath::root(),
             old_start: 12,
             new_start: 12, // Inside block
             lines: vec!["+line12\n".to_string()],
         };
 
         let hunk_before = DiffHunk {
-            file_path: String::new(),
+            file_path: RepoPath::root(),
             old_start: 5,
             new_start: 5,
             lines: vec!["+line5\n".to_string()],
         };
 
         let hunk_after = DiffHunk {
-            file_path: String::new(),
+            file_path: RepoPath::root(),
             old_start: 25,
             new_start: 25,
             lines: vec!["+line25\n".to_string()],
@@ -937,7 +935,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -947,7 +945,7 @@ mod tests {
         };
 
         let hunk_at_exclusive_end = DiffHunk {
-            file_path: String::new(),
+            file_path: RepoPath::root(),
             old_start: 21,
             new_start: 21, // outside the block range
             lines: vec!["+line21\n".to_string()],
@@ -966,7 +964,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -976,7 +974,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: String::new(),
+            file_path: RepoPath::root(),
             old_start: 10,
             new_start: 10,
             lines: vec![
@@ -1020,7 +1018,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1030,7 +1028,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: String::new(),
+            file_path: RepoPath::root(),
             old_start: 11,
             new_start: 11,
             lines: vec![
@@ -1073,7 +1071,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1083,7 +1081,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: String::new(),
+            file_path: RepoPath::root(),
             old_start: 10,
             new_start: 10,
             lines: vec![
@@ -1116,7 +1114,7 @@ mod tests {
             "@@ -1 +1 @@\n-let value = 42;\n\\ No newline at end of file\n+let value = 42;\n";
         let mut hunks = Vec::new();
 
-        collect_hunks(&mut hunks, "src/lib.rs", unified)
+        collect_hunks(&mut hunks, &RepoPath::new("src/lib.rs").unwrap(), unified)
             .unwrap_or_else(|error| panic!("collect hunks should succeed: {error}"));
 
         assert_eq!(hunks.len(), 1);
@@ -1134,7 +1132,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1144,7 +1142,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec!["+}\n".to_string()],
@@ -1161,7 +1159,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1171,7 +1169,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec!["+    \n".to_string(), "+\t\n".to_string()],
@@ -1188,7 +1186,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1198,7 +1196,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec!["-    \n".to_string(), "-\t\n".to_string()],
@@ -1215,7 +1213,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1225,7 +1223,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec!["+    \n".to_string(), "+let value = 42;\n".to_string()],
@@ -1242,7 +1240,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1252,7 +1250,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec![
@@ -1272,7 +1270,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1282,7 +1280,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec![
@@ -1302,7 +1300,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1312,7 +1310,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec![
@@ -1332,7 +1330,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1342,7 +1340,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec![
@@ -1362,7 +1360,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1372,7 +1370,7 @@ mod tests {
         };
 
         let hunk = DiffHunk {
-            file_path: "src/lib.rs".to_string(),
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
             lines: vec![

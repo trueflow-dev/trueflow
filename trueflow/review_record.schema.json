@@ -44,9 +44,6 @@
       ],
       "type": "string"
     },
-    "ContentHash": {
-      "type": "string"
-    },
     "DiffFingerprint": {
       "type": "string"
     },
@@ -104,7 +101,7 @@
           "additionalProperties": false,
           "properties": {
             "hash": {
-              "$ref": "#/$defs/ContentHash"
+              "type": "string"
             },
             "kind": {
               "const": "block",
@@ -121,7 +118,7 @@
           "additionalProperties": false,
           "properties": {
             "hash": {
-              "$ref": "#/$defs/ContentHash"
+              "type": "string"
             },
             "kind": {
               "const": "file",
@@ -138,7 +135,7 @@
           "additionalProperties": false,
           "properties": {
             "hash": {
-              "$ref": "#/$defs/ContentHash"
+              "type": "string"
             },
             "kind": {
               "const": "tree",

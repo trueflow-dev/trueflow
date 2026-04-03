@@ -23,7 +23,8 @@ fn test_binary_file() -> Result<()> {
         .find(|obj| obj["path"].as_str().unwrap().contains("binary.bin"));
     assert!(file_obj.is_some(), "Binary file should be in output");
     let file_obj = file_obj.unwrap();
-    assert_eq!(file_obj["file_hash"], "binary_skipped");
+    assert_eq!(file_obj["bytes_hash"], file_obj["tree_hash"]);
+    assert!(file_obj["bytes_hash"].as_str().is_some());
     assert!(file_obj["blocks"].as_array().unwrap().is_empty());
 
     Ok(())
@@ -98,7 +99,7 @@ fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
     for &(name, _) in &test_cases {
         let file_state = file_states
             .iter()
-            .find(|file| file.path.ends_with(name))
+            .find(|file| file.path.as_str().ends_with(name))
             .unwrap_or_else(|| panic!("missing scan output for {name}"));
 
         assert!(

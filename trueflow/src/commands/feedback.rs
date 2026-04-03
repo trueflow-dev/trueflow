@@ -73,7 +73,7 @@ pub fn run(
                 if !filters.allows_block(block.kind) {
                     continue;
                 }
-                if should_skip_imports_by_default(&file.path, &block, &filters) {
+                if should_skip_imports_by_default(file.path.as_str(), &block, &filters) {
                     continue;
                 }
 
@@ -127,7 +127,7 @@ pub fn run(
                 if !filters.allows_block(block.kind) {
                     continue;
                 }
-                if should_skip_imports_by_default(&file.path, &block, &filters) {
+                if should_skip_imports_by_default(file.path.as_str(), &block, &filters) {
                     continue;
                 }
 
@@ -153,7 +153,7 @@ pub fn run(
             }
 
             if !blocks_to_print.is_empty() {
-                println!("  <file path=\"{}\">", escape_xml(&file.path));
+                println!("  <file path=\"{}\">", escape_xml(file.path.as_str()));
                 for (block, reviews) in blocks_to_print {
                     print_block_xml(&block, reviews);
                 }

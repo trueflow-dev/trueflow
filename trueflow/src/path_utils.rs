@@ -1,7 +1,8 @@
+use crate::repo_path::normalize_repo_path_string;
 use std::path::{Path, PathBuf};
 
 pub fn normalize_path_str(path: &str) -> String {
-    path.trim_start_matches("./").replace('\\', "/")
+    normalize_repo_path_string(path)
 }
 
 pub fn workdir_prefix_for_repo_root(repo_root: &Path, cwd: &Path) -> Option<String> {

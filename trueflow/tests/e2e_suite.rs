@@ -285,7 +285,7 @@ fn test_file_hash_approval_hides_blocks() -> Result<()> {
     repo.commit("Add lib")?;
 
     let output = repo.run(&["scan", "--json"])?;
-    let file_hash = first_file_hash(&output)?;
+    let file_hash = first_file_tree_hash(&output)?;
 
     repo.run(&[
         "mark",

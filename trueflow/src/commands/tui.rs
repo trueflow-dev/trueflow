@@ -9,6 +9,7 @@ use crate::config::{
 };
 use crate::context::TrueflowContext;
 use crate::path_utils;
+use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
@@ -303,7 +304,7 @@ struct ContentFrameCacheEntry {
 struct ContentNodeSnapshot {
     id: TreeNodeId,
     kind: TreeNodeKind,
-    path: String,
+    path: RepoPath,
     children: Vec<TreeNodeId>,
     block: Option<crate::block::Block>,
     language: Option<Language>,
@@ -537,7 +538,7 @@ fn filter_commits_for_prefix<F>(
     mut changed_paths_for_revision: F,
 ) -> Vec<vcs::CommitInfo>
 where
-    F: FnMut(&str) -> Result<HashSet<String>>,
+    F: FnMut(&str) -> Result<HashSet<RepoPath>>,
 {
     let Some(prefix) = workdir_prefix
         .map(normalize_path_str)
@@ -552,7 +553,7 @@ where
             match changed_paths_for_revision(&commit.id) {
                 Ok(paths) => paths
                     .iter()
-                    .any(|path| path_matches_workdir_prefix(path, &prefix)),
+                    .any(|path| path_matches_workdir_prefix(path.as_str(), &prefix)),
                 // If we can't resolve changed paths, keep the option instead of hiding it.
                 Err(_) => true,
             }
@@ -1517,10 +1518,10 @@ fn execute_action(
 
         // For root/dir, path might be empty or a dir path.
         // For file/block, it's the file path.
-        let path_hint = if node.path.is_empty() {
+        let path_hint = if node.path.is_root() {
             None
         } else {
-            Some(node.path.clone())
+            Some(node.path.to_string())
         };
 
         let line_hint = node
@@ -2053,10 +2054,10 @@ fn build_header_lines(
             if let Some(block) = &node.block {
                 let start = block.start_line + 1;
                 let end = block.end_line.max(start);
-                let path = if node.path.is_empty() {
+                let path = if node.path.is_root() {
                     "unknown"
                 } else {
-                    &node.path
+                    node.path.as_str()
                 };
                 format!("{} @ {}:{}-{}", block.kind.as_str(), path, start, end)
             } else {
@@ -2074,10 +2075,10 @@ fn build_header_lines(
     }
 
     if !matches!(node.kind, TreeNodeKind::Root)
-        && !node.path.is_empty()
+        && !node.path.is_root()
         && !matches!(node.kind, TreeNodeKind::Block)
     {
-        lines.push(format_header_row(&node.path, palette, false));
+        lines.push(format_header_row(node.path.as_str(), palette, false));
     }
 
     let node_hash = node.hash.as_str();
@@ -2278,17 +2279,17 @@ fn build_content_lines(
     }
 }
 
-fn load_file_lines(state: &mut AppState, path: &str) -> Option<Arc<[String]>> {
-    if path.is_empty() {
+fn load_file_lines(state: &mut AppState, path: &RepoPath) -> Option<Arc<[String]>> {
+    if path.is_root() {
         return None;
     }
 
-    let path_buf = PathBuf::from(path);
+    let path_buf = PathBuf::from(path.as_str());
     if let Some(lines) = state.file_cache.get(&path_buf) {
         return Some(Arc::clone(lines));
     }
 
-    let contents = std::fs::read_to_string(path).ok()?;
+    let contents = std::fs::read_to_string(path.as_str()).ok()?;
     let lines: Arc<[String]> = contents
         .lines()
         .map(|line| line.to_string())
@@ -2384,7 +2385,7 @@ fn build_block_diff_lines(
     block: &crate::block::Block,
     palette: &UiPalette,
 ) -> (Vec<Line<'static>>, usize) {
-    if node.path.is_empty() {
+    if node.path.is_root() {
         return (
             vec![Line::from(Span::styled(
                 "(No path for diff)",
@@ -2394,18 +2395,19 @@ fn build_block_diff_lines(
         );
     }
 
-    let diff_path = repo_relative_path_for_diff(&node.path, state.workdir_prefix.as_deref());
+    let diff_path =
+        repo_relative_path_for_diff(node.path.as_str(), state.workdir_prefix.as_deref());
     let path = PathBuf::from(&diff_path);
     let hunks = ensure_cached_diff_hunks(&mut state.file_diff_cache, &path, || {
         let query = diff_query_for_scope(&state.review_scope, &diff_path);
         let repo = vcs::repo_from_workdir()?;
         match query {
-            DiffQuery::MainDiff { path } => vcs::diff_hunks_for_file(&repo, &path),
+            DiffQuery::MainDiff { path } => vcs::diff_hunks_for_file(&repo, &RepoPath::new(path)?),
             DiffQuery::Revision { revision, path } => {
-                vcs::diff_hunks_for_file_in_revision(&repo, &revision, &path)
+                vcs::diff_hunks_for_file_in_revision(&repo, &revision, &RepoPath::new(path)?)
             }
             DiffQuery::RevisionRange { start, end, path } => {
-                vcs::diff_hunks_for_file_in_range(&repo, &start, &end, &path)
+                vcs::diff_hunks_for_file_in_range(&repo, &start, &end, &RepoPath::new(path)?)
             }
         }
     });
@@ -3120,14 +3122,14 @@ mod diff_scope_tests {
             .and_then(|name| name.to_str())
             .unwrap_or("fixture.rs")
             .to_string();
-        let file_path_str = file_path.to_string_lossy().to_string();
+        let repo_path = format!("src/{file_name}");
 
         let mut builder = TreeBuilder::new();
         let root = builder.root();
         let file = builder.add_file(
             root,
             file_name,
-            file_path_str.clone(),
+            repo_path.clone(),
             "file-hash".to_string(),
             Language::Rust,
         );
@@ -3140,7 +3142,7 @@ mod diff_scope_tests {
         let block_id = builder.add_block(
             file,
             "function".to_string(),
-            file_path_str,
+            repo_path.clone(),
             block,
             Language::Rust,
         );
@@ -3166,7 +3168,16 @@ mod diff_scope_tests {
             confirm_batch: false,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
-            file_cache: HashMap::new(),
+            file_cache: HashMap::from([(
+                PathBuf::from(&repo_path),
+                Arc::from(
+                    file_content
+                        .lines()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+            )]),
             root_cursor: None,
             scroll_offset: 0,
             content_height: 0,
@@ -3275,8 +3286,8 @@ mod diff_scope_tests {
 
         let filtered = filter_commits_for_prefix(commits, Some("trueflow"), |revision| {
             let paths = match revision {
-                "a" => HashSet::from([String::from("trueflow/src/lib.rs")]),
-                "b" => HashSet::from([String::from("README.md")]),
+                "a" => HashSet::from([RepoPath::new("trueflow/src/lib.rs").unwrap()]),
+                "b" => HashSet::from([RepoPath::new("README.md").unwrap()]),
                 _ => HashSet::new(),
             };
             Ok(paths)
@@ -3834,8 +3845,12 @@ mod diff_scope_tests {
             .to_string();
         let repo = gix::open(&repo_root)
             .unwrap_or_else(|error| panic!("failed to open git fixture repo: {error}"));
-        let hunks = vcs::diff_hunks_for_file_in_revision(&repo, &revision, "pkg/src/lib.rs")
-            .unwrap_or_else(|error| panic!("failed to compute revision diff hunks: {error}"));
+        let hunks = vcs::diff_hunks_for_file_in_revision(
+            &repo,
+            &revision,
+            &RepoPath::new("pkg/src/lib.rs").unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("failed to compute revision diff hunks: {error}"));
         assert!(
             !hunks.is_empty(),
             "expected fixture commit to produce diff hunks"
@@ -3851,7 +3866,7 @@ mod diff_scope_tests {
         );
 
         let block = Block {
-            hash: crate::hashing::ContentHash::new("block"),
+            hash: crate::hashing::TreeHash::new("block"),
             content: "fn main() {\n    println!(\"Hello from commit scope\");\n}".to_string(),
             kind: BlockKind::Function,
             tags: vec![],
@@ -3862,7 +3877,7 @@ mod diff_scope_tests {
         let node = ContentNodeSnapshot {
             id: state.navigator.tree.root(),
             kind: TreeNodeKind::Block,
-            path: "src/lib.rs".to_string(),
+            path: RepoPath::new("src/lib.rs").unwrap(),
             children: Vec::new(),
             block: Some(block.clone()),
             language: Some(Language::Rust),

@@ -1,6 +1,6 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
-use crate::hashing::ContentHash;
+use crate::hashing::TreeHash;
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
 use anyhow::{Context, Result};
 use tracing::info;
@@ -623,7 +623,7 @@ fn create_sub_block_with_kind(
     let end_line = start_line + chunk_newlines + if content.ends_with('\n') { 0 } else { 1 };
 
     Block {
-        hash: ContentHash::from_content(content),
+        hash: TreeHash::from_content(content),
         content: content.to_string(),
         kind,
         tags: parent.tags.clone(),
@@ -651,7 +651,7 @@ mod tests {
 
     fn make_block(content: &str, kind: BlockKind) -> Block {
         Block {
-            hash: ContentHash::new("test"),
+            hash: TreeHash::new("test"),
             content: content.to_string(),
             kind,
             tags: Vec::new(),

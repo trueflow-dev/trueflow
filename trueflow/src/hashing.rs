@@ -3,44 +3,95 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
-pub struct ContentHash(String);
+macro_rules! define_hash_type {
+    ($name:ident) => {
+        #[derive(
+            Serialize,
+            Deserialize,
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            Hash,
+            Default,
+            PartialOrd,
+            Ord,
+            JsonSchema,
+        )]
+        #[serde(transparent)]
+        #[schemars(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self::new(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self::new(value)
+            }
+        }
+    };
+}
+
+define_hash_type!(ContentHash);
+define_hash_type!(BytesHash);
+define_hash_type!(TreeHash);
 
 impl ContentHash {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn from_content(input: &str) -> Self {
+        Self::new(hash_str(input))
     }
+}
 
+impl BytesHash {
+    pub fn from_bytes(input: &[u8]) -> Self {
+        Self::new(hash_bytes(input))
+    }
+}
+
+impl TreeHash {
     pub fn from_content(input: &str) -> Self {
         Self::new(hash_str(input))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn from_bytes_hash(bytes_hash: &BytesHash) -> Self {
+        Self::new(bytes_hash.as_str())
     }
-}
 
-impl fmt::Display for ContentHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl AsRef<str> for ContentHash {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl From<String> for ContentHash {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<&str> for ContentHash {
-    fn from(value: &str) -> Self {
-        Self::new(value)
+    pub fn from_child_hashes<'a, I>(hashes: I) -> Self
+    where
+        I: IntoIterator<Item = &'a TreeHash>,
+    {
+        let mut hasher = Sha256::new();
+        for hash in hashes {
+            hasher.update(hash.as_str());
+        }
+        Self::new(format!("{:x}", hasher.finalize()))
     }
 }
 
@@ -72,6 +123,12 @@ pub fn hash_str(input: &str) -> String {
     let mut hasher = Sha256::new();
     let normalized = canonicalize(input);
     hasher.update(normalized);
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn hash_bytes(input: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
     format!("{:x}", hasher.finalize())
 }
 
@@ -173,5 +230,25 @@ mod tests {
         assert_eq!(round_trip, hash);
         assert_eq!(round_trip.as_str(), "abc123");
         Ok(())
+    }
+
+    #[test]
+    fn test_bytes_hash_is_exact_over_raw_bytes() {
+        assert_ne!(
+            BytesHash::from_bytes(b"line\n"),
+            BytesHash::from_bytes(b"line\r\n")
+        );
+        assert_ne!(
+            BytesHash::from_bytes(b"line"),
+            BytesHash::from_bytes(b"line\n")
+        );
+    }
+
+    #[test]
+    fn test_tree_hash_can_reuse_bytes_hash_for_leaf_files() {
+        let bytes_hash = BytesHash::from_bytes(b"raw-bytes");
+        let tree_hash = TreeHash::from_bytes_hash(&bytes_hash);
+
+        assert_eq!(tree_hash.as_str(), bytes_hash.as_str());
     }
 }

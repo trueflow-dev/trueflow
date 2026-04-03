@@ -1,7 +1,7 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
 use crate::complexity;
-use crate::hashing::ContentHash;
+use crate::hashing::TreeHash;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::{Context, Result};
 use std::sync::LazyLock;
@@ -917,7 +917,7 @@ fn create_block(
     end_byte: usize,
     lang: Language,
 ) -> Block {
-    let hash = ContentHash::from_content(text);
+    let hash = TreeHash::from_content(text);
     let complexity = complexity::calculate(text, lang);
 
     // Line mapping (byte -> line index)
@@ -1166,7 +1166,7 @@ mod tests {
 
     fn assert_block_hashes_match(blocks: &[Block]) {
         for block in blocks {
-            let expected_hash = crate::hashing::ContentHash::from_content(&block.content);
+            let expected_hash = crate::hashing::TreeHash::from_content(&block.content);
             assert_eq!(
                 block.hash, expected_hash,
                 "Hash mismatch for block kind {:?}:\nContent:\n{:?}",

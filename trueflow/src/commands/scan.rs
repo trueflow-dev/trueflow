@@ -18,7 +18,10 @@ pub fn run(_context: &TrueflowContext, json: bool, tree_output: bool) -> Result<
         println!("{}", serde_json::to_string_pretty(&files)?);
     } else {
         for file in files {
-            println!("File: {} (Hash: {})", file.path, file.file_hash);
+            println!(
+                "File: {} (Tree Hash: {}, Bytes Hash: {})",
+                file.path, file.tree_hash, file.bytes_hash
+            );
             for block in file.blocks {
                 println!(
                     "  Block [L{}-L{}]: {}",

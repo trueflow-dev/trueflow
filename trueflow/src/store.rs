@@ -70,7 +70,8 @@ pub enum BlockState {
     Unknown,
 }
 
-pub use crate::hashing::ContentHash;
+#[allow(unused_imports)]
+pub use crate::hashing::{ContentHash, TreeHash};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
 pub struct DiffFingerprint(String);
@@ -111,9 +112,9 @@ pub enum ReviewTargetKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[schemars(deny_unknown_fields)]
 pub enum ReviewTargetRef {
-    Block { hash: ContentHash },
-    File { hash: ContentHash },
-    Tree { hash: ContentHash },
+    Block { hash: TreeHash },
+    File { hash: TreeHash },
+    Tree { hash: TreeHash },
     Diff { fingerprint: DiffFingerprint },
 }
 
@@ -133,13 +134,13 @@ impl ReviewTargetKind {
         let value = value.into();
         match self {
             ReviewTargetKind::Block => ReviewTargetRef::Block {
-                hash: ContentHash::new(value),
+                hash: TreeHash::new(value),
             },
             ReviewTargetKind::File => ReviewTargetRef::File {
-                hash: ContentHash::new(value),
+                hash: TreeHash::new(value),
             },
             ReviewTargetKind::Tree => ReviewTargetRef::Tree {
-                hash: ContentHash::new(value),
+                hash: TreeHash::new(value),
             },
             ReviewTargetKind::Diff => ReviewTargetRef::Diff {
                 fingerprint: DiffFingerprint::new(value),
@@ -559,12 +560,12 @@ mod tests {
     fn latest_review_verdicts_uses_typed_target_key() {
         let mut legacy = record("1", "legacy-key", "review", Verdict::Rejected, 1);
         legacy.target = Some(ReviewTargetRef::Block {
-            hash: ContentHash::new("typed-key"),
+            hash: TreeHash::new("typed-key"),
         });
 
         let mut typed_later = record("2", "legacy-key", "review", Verdict::Approved, 2);
         typed_later.target = Some(ReviewTargetRef::Block {
-            hash: ContentHash::new("typed-key"),
+            hash: TreeHash::new("typed-key"),
         });
 
         let latest = latest_review_verdicts(&[legacy, typed_later]);

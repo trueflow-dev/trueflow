@@ -1,6 +1,7 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, FileState};
-use crate::hashing::{ContentHash, hash_str};
+use crate::hashing::{TreeHash, hash_str};
+use crate::repo_path::RepoPath;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -55,8 +56,8 @@ pub struct TreeNode {
     pub parent: Option<TreeNodeId>,
     pub kind: TreeNodeKind,
     pub name: String,
-    pub path: String,
-    pub hash: ContentHash,
+    pub path: RepoPath,
+    pub hash: TreeHash,
     pub children: Vec<TreeNodeId>,
     pub block: Option<Block>,
     pub language: Option<Language>,
@@ -65,11 +66,11 @@ pub struct TreeNode {
 pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
-    nodes_by_path: HashMap<String, TreeNodeId>,
+    nodes_by_path: HashMap<RepoPath, TreeNodeId>,
     block_nodes_by_path_hash_start:
-        HashMap<String, HashMap<ContentHash, HashMap<usize, TreeNodeId>>>,
+        HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>>,
     #[allow(dead_code)]
-    file_paths: HashSet<String>,
+    file_paths: HashSet<RepoPath>,
 }
 
 impl Tree {
@@ -108,7 +109,8 @@ impl Tree {
     }
 
     pub fn find_by_path(&self, path: &str) -> Option<TreeNodeId> {
-        self.nodes_by_path.get(path).copied()
+        let path = RepoPath::new(path).ok()?;
+        self.nodes_by_path.get(&path).copied()
     }
 
     pub fn parent(&self, id: TreeNodeId) -> Option<TreeNodeId> {
@@ -132,17 +134,18 @@ impl Tree {
             .filter(|node| matches!(node.kind, TreeNodeKind::File))
     }
 
-    pub fn find_block_node(&self, path: &str, block: &Block) -> Option<TreeNodeId> {
+    pub fn find_block_node(&self, path: impl AsRef<str>, block: &Block) -> Option<TreeNodeId> {
+        let path = RepoPath::new(path.as_ref()).ok()?;
         self.block_nodes_by_path_hash_start
-            .get(path)?
+            .get(&path)?
             .get(&block.hash)?
             .get(&block.start_line)
             .copied()
     }
 
     #[allow(dead_code)]
-    pub fn file_paths(&self) -> impl Iterator<Item = &str> {
-        self.file_paths.iter().map(|path| path.as_str())
+    pub fn file_paths(&self) -> impl Iterator<Item = &RepoPath> {
+        self.file_paths.iter()
     }
 
     pub fn is_node_covered(&self, id: TreeNodeId, approved_hashes: &HashSet<String>) -> bool {
@@ -162,8 +165,8 @@ pub struct TreeBuilder {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
     children_by_id: HashMap<TreeNodeId, Vec<TreeNodeId>>,
-    nodes_by_path: HashMap<String, TreeNodeId>,
-    file_paths: HashSet<String>,
+    nodes_by_path: HashMap<RepoPath, TreeNodeId>,
+    file_paths: HashSet<RepoPath>,
 }
 
 impl Default for TreeBuilder {
@@ -180,14 +183,14 @@ impl TreeBuilder {
             parent: None,
             kind: TreeNodeKind::Root,
             name: "Root".to_string(),
-            path: String::new(),
-            hash: ContentHash::default(),
+            path: RepoPath::root(),
+            hash: TreeHash::default(),
             children: Vec::new(),
             block: None,
             language: None,
         };
         let mut nodes_by_path = HashMap::new();
-        nodes_by_path.insert(String::new(), root);
+        nodes_by_path.insert(RepoPath::root(), root);
         Self {
             nodes: vec![root_node],
             root,
@@ -201,18 +204,26 @@ impl TreeBuilder {
         self.root
     }
 
-    pub fn add_dir(&mut self, parent: TreeNodeId, name: String, path: String) -> TreeNodeId {
+    pub fn add_dir<P>(&mut self, parent: TreeNodeId, name: String, path: P) -> TreeNodeId
+    where
+        P: TryInto<RepoPath>,
+        P::Error: std::fmt::Debug,
+    {
         self.add_node(parent, TreeNodeKind::Directory, name, path)
     }
 
-    pub fn add_file(
+    pub fn add_file<P>(
         &mut self,
         parent: TreeNodeId,
         name: String,
-        path: String,
-        hash: impl Into<ContentHash>,
+        path: P,
+        hash: impl Into<TreeHash>,
         language: Language,
-    ) -> TreeNodeId {
+    ) -> TreeNodeId
+    where
+        P: TryInto<RepoPath>,
+        P::Error: std::fmt::Debug,
+    {
         let id = self.add_node(parent, TreeNodeKind::File, name, path);
         if let Some(node) = self.nodes.get_mut(id.0) {
             node.hash = hash.into();
@@ -221,14 +232,18 @@ impl TreeBuilder {
         id
     }
 
-    pub fn add_block(
+    pub fn add_block<P>(
         &mut self,
         parent: TreeNodeId,
         name: String,
-        path: String,
+        path: P,
         block: Block,
         language: Language,
-    ) -> TreeNodeId {
+    ) -> TreeNodeId
+    where
+        P: TryInto<RepoPath>,
+        P::Error: std::fmt::Debug,
+    {
         let hash = block.hash.clone();
         let id = self.add_node(parent, TreeNodeKind::Block, name, path);
         if let Some(node) = self.nodes.get_mut(id.0) {
@@ -239,13 +254,21 @@ impl TreeBuilder {
         id
     }
 
-    fn add_node(
+    fn add_node<P>(
         &mut self,
         parent: TreeNodeId,
         kind: TreeNodeKind,
         name: String,
-        path: String,
-    ) -> TreeNodeId {
+        path: P,
+    ) -> TreeNodeId
+    where
+        P: TryInto<RepoPath>,
+        P::Error: std::fmt::Debug,
+    {
+        let path = match path.try_into() {
+            Ok(path) => path,
+            Err(error) => panic!("tree node path should be valid repo path: {error:?}"),
+        };
         let id = TreeNodeId(self.nodes.len());
         let is_hash_entry = kind.is_hash_entry();
         let is_file = matches!(kind, TreeNodeKind::File);
@@ -256,7 +279,7 @@ impl TreeBuilder {
             kind,
             name,
             path,
-            hash: ContentHash::default(),
+            hash: TreeHash::default(),
             children: Vec::new(),
             block: None,
             language: None,
@@ -322,7 +345,7 @@ impl TreeBuilder {
             return;
         }
 
-        let mut entries: Vec<(String, ContentHash)> = children
+        let mut entries: Vec<(String, TreeHash)> = children
             .iter()
             .filter_map(|child| {
                 let node = &self.nodes[child.0];
@@ -342,14 +365,14 @@ impl TreeBuilder {
             concatenated.push_str(hash.as_str());
             concatenated.push('|');
         }
-        self.nodes[id.0].hash = ContentHash::new(hash_str(&concatenated));
+        self.nodes[id.0].hash = TreeHash::new(hash_str(&concatenated));
     }
 }
 
 fn build_block_lookup_indexes(
     nodes: &[TreeNode],
-) -> HashMap<String, HashMap<ContentHash, HashMap<usize, TreeNodeId>>> {
-    let mut by_path_hash_start: HashMap<String, HashMap<ContentHash, HashMap<usize, TreeNodeId>>> =
+) -> HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>> {
+    let mut by_path_hash_start: HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>> =
         HashMap::new();
 
     for node in nodes {
@@ -381,33 +404,31 @@ fn block_label(block: &Block) -> String {
 pub fn build_tree_from_files(files: &[FileState]) -> Tree {
     let mut builder = TreeBuilder::new();
     let root = builder.root();
-    let mut directories: BTreeMap<String, TreeNodeId> = BTreeMap::new();
-    directories.insert(String::new(), root);
+    let mut directories: BTreeMap<RepoPath, TreeNodeId> = BTreeMap::new();
+    directories.insert(RepoPath::root(), root);
 
     for file in files {
-        let parts: Vec<&str> = file.path.split('/').collect();
-        let mut current_path = String::new();
+        let parts: Vec<&str> = file.path.as_str().split('/').collect();
+        let mut current_path = RepoPath::root();
         let mut parent = root;
 
         for (index, part) in parts.iter().enumerate() {
             let is_file = index == parts.len().saturating_sub(1);
-            if !current_path.is_empty() {
-                current_path.push('/');
-            }
-            current_path.push_str(part);
+            let next_path = match current_path.join(part) {
+                Ok(path) => path,
+                Err(error) => panic!("valid tree path segment expected: {error}"),
+            };
 
             if is_file {
                 let file_id = builder.add_file(
                     parent,
                     part.to_string(),
-                    current_path.clone(),
-                    file.file_hash.clone(),
+                    next_path.clone(),
+                    file.tree_hash.clone(),
                     file.language,
                 );
-                let mut blocks = file.blocks.clone();
-                blocks.sort_by_key(|block| (block.start_line, block.end_line));
                 let mut impl_stack: Vec<(TreeNodeId, usize, usize)> = Vec::new();
-                for block in blocks {
+                for block in file.blocks.clone() {
                     while let Some((_, _, end_line)) = impl_stack.last()
                         && block.start_line > *end_line
                     {
@@ -428,17 +449,18 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                     let kind = block.kind;
                     let name = block_label(&block);
                     let node_id =
-                        builder.add_block(parent, name, current_path.clone(), block, file.language);
+                        builder.add_block(parent, name, next_path.clone(), block, file.language);
 
                     if matches!(kind, BlockKind::Impl | BlockKind::Interface) {
                         impl_stack.push((node_id, start_line, end_line));
                     }
                 }
             } else {
-                let dir_id = directories.entry(current_path.clone()).or_insert_with(|| {
-                    builder.add_dir(parent, part.to_string(), current_path.clone())
+                let dir_id = directories.entry(next_path.clone()).or_insert_with(|| {
+                    builder.add_dir(parent, part.to_string(), next_path.clone())
                 });
                 parent = *dir_id;
+                current_path = next_path;
             }
         }
     }
@@ -454,6 +476,7 @@ pub fn build_tree_from_path(root: &str) -> anyhow::Result<Tree> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hashing::BytesHash;
 
     #[test]
     fn find_block_node_distinguishes_duplicate_hashes_by_start_line() {
@@ -463,16 +486,16 @@ mod tests {
         assert_eq!(first.hash, second.hash);
         assert_ne!(first.start_line, second.start_line);
 
-        let files = vec![FileState {
-            path: "src/lib.rs".to_string(),
-            language: Language::Rust,
-            file_hash: ContentHash::new("file-hash"),
-            blocks: vec![first.clone(), second.clone()],
-        }];
+        let files = vec![FileState::new(
+            RepoPath::new("src/lib.rs").unwrap(),
+            Language::Rust,
+            BytesHash::new("bytes-hash"),
+            vec![first.clone(), second.clone()],
+        )];
 
         let tree = build_tree_from_files(&files);
-        let first_id = tree.find_block_node("src/lib.rs", &first);
-        let second_id = tree.find_block_node("src/lib.rs", &second);
+        let first_id = tree.find_block_node(RepoPath::new("src/lib.rs").unwrap(), &first);
+        let second_id = tree.find_block_node(RepoPath::new("src/lib.rs").unwrap(), &second);
         assert!(first_id.is_some());
         assert!(second_id.is_some());
         assert_ne!(first_id, second_id);
@@ -482,19 +505,19 @@ mod tests {
     fn test_directory_hash_uses_sorted_children() {
         let mut builder = TreeBuilder::new();
         let root = builder.root();
-        let dir = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let dir = builder.add_dir(root, "src".to_string(), RepoPath::new("src").unwrap());
         builder.add_file(
             dir,
             "b.rs".to_string(),
-            "src/b.rs".to_string(),
-            "hash-b".to_string(),
+            RepoPath::new("src/b.rs").unwrap(),
+            "hash-b",
             Language::Unknown,
         );
         builder.add_file(
             dir,
             "a.rs".to_string(),
-            "src/a.rs".to_string(),
-            "hash-a".to_string(),
+            RepoPath::new("src/a.rs").unwrap(),
+            "hash-a",
             Language::Unknown,
         );
 
@@ -504,19 +527,20 @@ mod tests {
 
         let mut builder_alt = TreeBuilder::new();
         let root_alt = builder_alt.root();
-        let dir_alt = builder_alt.add_dir(root_alt, "src".to_string(), "src".to_string());
+        let dir_alt =
+            builder_alt.add_dir(root_alt, "src".to_string(), RepoPath::new("src").unwrap());
         builder_alt.add_file(
             dir_alt,
             "a.rs".to_string(),
-            "src/a.rs".to_string(),
-            "hash-a".to_string(),
+            RepoPath::new("src/a.rs").unwrap(),
+            "hash-a",
             Language::Unknown,
         );
         builder_alt.add_file(
             dir_alt,
             "b.rs".to_string(),
-            "src/b.rs".to_string(),
-            "hash-b".to_string(),
+            RepoPath::new("src/b.rs").unwrap(),
+            "hash-b",
             Language::Unknown,
         );
         let tree_alt = builder_alt.finalize();

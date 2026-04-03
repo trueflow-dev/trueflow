@@ -1183,8 +1183,8 @@ fn test_diff_respects_file_coverage_from_subdir() -> Result<()> {
     let file_hash = files
         .iter()
         .find(|file| file["path"].as_str() == Some("pkg/src/lib.rs"))
-        .and_then(|file| file["file_hash"].as_str())
-        .context("expected pkg/src/lib.rs file hash")?
+        .and_then(|file| file["tree_hash"].as_str())
+        .context("expected pkg/src/lib.rs tree hash")?
         .to_string();
 
     let approved_file = build_review_record(&file_hash, ReviewRecordOverrides::default());
