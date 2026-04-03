@@ -1,0 +1,18 @@
+[package]
+name = "review-bench-workspace"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+insta = "1"
+
+[[bin]]
+name = "review-bench"
+path = "src/main.rs"

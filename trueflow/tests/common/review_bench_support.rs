@@ -1,0 +1,145 @@
+use anyhow::{Context, Result, anyhow};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{LazyLock, Mutex};
+use uuid::Uuid;
+
+use trueflow::cli::{Cli, Commands};
+use trueflow::commands::review::{ReviewOptions, ReviewSummary, collect_review_summary};
+use trueflow::config::BlockFilters;
+use trueflow::context::TrueflowContext;
+use trueflow::logging::LoggingMode;
+
+static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+pub struct ReviewBenchRepo {
+    pub path: PathBuf,
+}
+
+impl ReviewBenchRepo {
+    pub fn fixture(name: &str) -> Result<Self> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("example_repos")
+            .join(name);
+        if !src.is_dir() {
+            return Err(anyhow!("benchmark fixture not found: {}", src.display()));
+        }
+
+        let path = temp_dir("trueflow_review_bench", name);
+        copy_dir_all(&src, &path)?;
+        init_git(&path)?;
+
+        Ok(Self { path })
+    }
+
+    pub fn full_review_summary(&self) -> Result<ReviewSummary> {
+        run_full_review(&self.path)
+    }
+}
+
+impl Drop for ReviewBenchRepo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+pub fn run_full_review(path: &Path) -> Result<ReviewSummary> {
+    with_current_dir(path, || {
+        let context = TrueflowContext::new(Cli {
+            command: Commands::Review {
+                json: false,
+                all: true,
+                target: Vec::new(),
+                only: Vec::new(),
+                exclude: Vec::new(),
+            },
+            debug: false,
+            logging_mode: LoggingMode::Stderr,
+        });
+
+        let options = ReviewOptions {
+            all: true,
+            targets: Vec::new(),
+            only: Vec::new(),
+            exclude: Vec::new(),
+        };
+
+        collect_review_summary(&context, &options, &BlockFilters::default())
+    })
+}
+
+fn with_current_dir<T>(path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = CWD_LOCK
+        .lock()
+        .map_err(|error| anyhow!("current-directory lock poisoned: {error}"))?;
+    let original = std::env::current_dir().context("failed to capture original cwd")?;
+    std::env::set_current_dir(path)
+        .with_context(|| format!("failed to switch cwd to {}", path.display()))?;
+
+    let result = action();
+    let restore_result = std::env::set_current_dir(&original)
+        .with_context(|| format!("failed to restore cwd to {}", original.display()));
+
+    match (result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(error), Err(restore_error)) => {
+            Err(error.context(format!("also failed to restore cwd: {restore_error}")))
+        }
+    }
+}
+
+fn temp_dir(base: &str, name: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join(base)
+        .join(name)
+        .join(Uuid::new_v4().to_string())
+}
+
+fn init_git(path: &Path) -> Result<()> {
+    run_git(path, &["init", "-q"])?;
+    run_git(path, &["config", "user.email", "bench@example.com"])?;
+    run_git(path, &["config", "user.name", "Bench User"])?;
+    Ok(())
+}
+
+fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git").args(args).current_dir(dir).output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create fixture dir {}", dst.display()))?;
+
+    for entry in fs::read_dir(src)
+        .with_context(|| format!("failed to read fixture dir {}", src.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target).with_context(|| {
+                format!(
+                    "failed to copy fixture file {} -> {}",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}

@@ -1,0 +1,19 @@
+[review]
+only = ["function", "struct", "enum", "impl", "method"]
+exclude = ["gap"]
+
+[feedback]
+exclude = ["gap", "comment"]
+default_since = "all"
+
+[tui]
+confirm_batch = true
+diff_focus_mode = "changed_with_context"
+diff_focus_context_lines = 4
+
+[tui.speed_read]
+enabled = true
+default_wpm = 320
+default_chunk_words = 2
+loop_playback = false
+show_prose_optimization_hint = true

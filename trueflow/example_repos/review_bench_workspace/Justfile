@@ -1,0 +1,18 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+default:
+    @just --list
+
+check:
+    cargo fmt --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test
+
+review:
+    cargo run -- review --all --json
+
+smoke:
+    cargo run -- scan --json > /tmp/review-bench-scan.json
+
+benchmark:
+    hyperfine --warmup 1 'cargo run -- review --all --json >/dev/null'
