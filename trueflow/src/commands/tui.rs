@@ -344,9 +344,11 @@ pub fn run(
     let mut terminal = setup_terminal()?;
     let config = load_config()?;
     let run_result = (|| {
+        let scan_options = config.scan.resolve_options()?;
         let launch = if let Some(request) = cli_review_request(all, target, only, exclude)? {
             let filters = config.review.resolve_filters(only, exclude);
-            let summary = collect_review_summary(context, &request.review_options, &filters)?;
+            let summary =
+                collect_review_summary(context, &request.review_options, &filters, &scan_options)?;
             LaunchSelection {
                 scope: request.review_scope,
                 summary,
@@ -359,7 +361,7 @@ pub fn run(
                 ScopeSelection::Quit => return Ok(()),
                 ScopeSelection::Selected(scope) => {
                     let filters = config.review.resolve_filters(&[], &[]);
-                    let summary = load_review_state(context, &scope, &filters)?;
+                    let summary = load_review_state(context, &scope, &filters, &scan_options)?;
                     LaunchSelection {
                         scope_label: scope.label(),
                         scope,
@@ -1581,9 +1583,10 @@ fn load_review_state(
     context: &TrueflowContext,
     scope: &ReviewScope,
     filters: &BlockFilters,
+    scan_options: &crate::scanner::ScanOptions,
 ) -> Result<crate::commands::review::ReviewSummary> {
     let options = scope.to_review_options();
-    collect_review_summary(context, &options, filters)
+    collect_review_summary(context, &options, filters, scan_options)
 }
 
 fn apply_action_locally(

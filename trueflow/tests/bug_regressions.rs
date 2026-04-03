@@ -876,8 +876,7 @@ fn test_scan_skips_unreadable_entries() -> Result<()> {
     perms.set_mode(0o755);
     fs::set_permissions(&secret_dir, perms)?;
 
-    let json: Value = serde_json::from_str(&output)?;
-    let files = json.as_array().context("Expected array")?;
+    let files = json_array(&output)?;
     assert!(files.iter().any(|entry| {
         entry["path"]
             .as_str()
@@ -909,8 +908,7 @@ fn test_scan_cache_write_permission_error_is_non_fatal() -> Result<()> {
     fs::set_permissions(&home, reset)?;
 
     let output = run_result?;
-    let json: Value = serde_json::from_str(&output)?;
-    let files = json.as_array().context("Expected array")?;
+    let files = json_array(&output)?;
     assert!(files.iter().any(|entry| {
         entry["path"]
             .as_str()
@@ -1006,6 +1004,51 @@ fn test_scan_honors_gitignore_and_keeps_nonignored_dotfiles() -> Result<()> {
             .as_str()
             .unwrap_or_default()
             .contains("ignored.txt")
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn test_scan_sorts_files_by_repo_path() -> Result<()> {
+    let repo = TestRepo::new("scan_sorted_paths")?;
+    repo.write("src/z.rs", "fn z() {}\n")?;
+    repo.write("src/a.rs", "fn a() {}\n")?;
+    repo.write("src/m.rs", "fn m() {}\n")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&output)?;
+    let paths: Vec<&str> = files
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+
+    Ok(())
+}
+
+#[test]
+fn test_scan_config_ignores_path_prefixes() -> Result<()> {
+    let repo = TestRepo::new("scan_config_ignore_prefix")?;
+    repo.write(
+        "trueflow.toml",
+        "[scan]\nignore_path_prefixes = [\"vendor\"]\n",
+    )?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.write("vendor/lib.rs", "pub fn vendored() {}\n")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&output)?;
+
+    assert!(
+        files
+            .iter()
+            .any(|entry| entry["path"].as_str() == Some("src/main.rs"))
+    );
+    assert!(files.iter().all(|entry| {
+        entry["path"].as_str().unwrap_or_default().split('/').next() != Some("vendor")
     }));
 
     Ok(())

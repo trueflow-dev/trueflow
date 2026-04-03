@@ -191,12 +191,19 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Parse CLI JSON output into a top-level array.
+/// Parse CLI JSON output into a file array.
+///
+/// Supports both legacy top-level arrays and scan-result objects with a
+/// top-level `files` array.
 pub fn json_array(output: &str) -> Result<Vec<Value>> {
-    json(output)?
+    let json = json(output)?;
+    if let Some(array) = json.as_array() {
+        return Ok(array.clone());
+    }
+    json["files"]
         .as_array()
         .cloned()
-        .context("Output should be array")
+        .context("Output should be array or object with files array")
 }
 
 /// Check if a block kind is "gap" (case-insensitive).
@@ -215,7 +222,8 @@ pub fn block_kinds_without_gaps(blocks: &[Value]) -> Vec<&str> {
 
 /// Return the first file's blocks from scan/review JSON output.
 ///
-/// Input contract: JSON array with at least one file entry containing a `blocks` array.
+/// Input contract: JSON array or scan-result object with at least one file entry
+/// containing a `blocks` array.
 pub fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
@@ -227,7 +235,8 @@ pub fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
 
 /// Return the `tree_hash` from the first file entry in scan JSON output.
 ///
-/// Input contract: JSON array with at least one file entry containing `tree_hash`.
+/// Input contract: JSON array or scan-result object with at least one file entry
+/// containing `tree_hash`.
 pub fn first_file_tree_hash(output: &str) -> Result<String> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
@@ -239,7 +248,8 @@ pub fn first_file_tree_hash(output: &str) -> Result<String> {
 
 /// Return the first block hash from the first file entry in scan/review JSON output.
 ///
-/// Input contract: JSON array with at least one file entry containing a non-empty `blocks` array.
+/// Input contract: JSON array or scan-result object with at least one file entry
+/// containing a non-empty `blocks` array.
 pub fn first_block_hash(output: &str) -> Result<String> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
@@ -254,7 +264,8 @@ pub fn first_block_hash(output: &str) -> Result<String> {
 
 /// Return the first block hash and its file path from scan/review JSON output.
 ///
-/// Input contract: JSON array with at least one file entry containing a non-empty `blocks` array.
+/// Input contract: JSON array or scan-result object with at least one file entry
+/// containing a non-empty `blocks` array.
 pub fn first_block_info(output: &str) -> Result<(String, String)> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;

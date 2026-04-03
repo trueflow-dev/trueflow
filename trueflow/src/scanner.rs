@@ -7,29 +7,140 @@ use crate::repo_path::RepoPath;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::Result;
 use dirs::home_dir;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
-pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
+const DEFAULT_IGNORE_NAMES: &[&str] =
+    &[".git", ".trueflow", "target", "node_modules", "mutants.out"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanOptions {
+    pub use_cache: bool,
+    pub write_cache: bool,
+    pub cache_dir: Option<PathBuf>,
+    pub ignore_names: Vec<String>,
+    pub ignore_globs: Vec<String>,
+    pub ignore_path_prefixes: Vec<RepoPath>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            use_cache: true,
+            write_cache: true,
+            cache_dir: None,
+            ignore_names: DEFAULT_IGNORE_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            ignore_globs: Vec::new(),
+            ignore_path_prefixes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanDiagnostic {
+    pub path: Option<RepoPath>,
+    pub reason: String,
+}
+
+impl ScanDiagnostic {
+    pub fn new(path: Option<RepoPath>, reason: impl Into<String>) -> Self {
+        Self {
+            path,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn display_message(&self) -> String {
+        match &self.path {
+            Some(path) => format!("{path}: {}", self.reason),
+            None => self.reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanCacheReadStatus {
+    Disabled,
+    Hit,
+    Miss,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanCacheWriteStatus {
+    Disabled,
+    Wrote,
+    Skipped,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanCacheReport {
+    pub read: ScanCacheReadStatus,
+    pub write: ScanCacheWriteStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanResult {
+    pub files: Vec<FileState>,
+    pub diagnostics: Vec<ScanDiagnostic>,
+    pub cache: ScanCacheReport,
+}
+
+pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<ScanResult> {
     let root = root.as_ref();
-    match load_cache(root) {
-        Ok(Some(cached)) => return Ok(cached),
-        Ok(None) => {}
-        Err(err) => debug!("scan cache unavailable, continuing without cache: {err}"),
+    let mut diagnostics = Vec::new();
+    let mut cache = ScanCacheReport {
+        read: ScanCacheReadStatus::Disabled,
+        write: ScanCacheWriteStatus::Disabled,
+    };
+
+    if options.use_cache {
+        match load_cache(root, options) {
+            Ok(Some(mut cached)) => {
+                cached.sort_by(|a, b| a.path.cmp(&b.path));
+                cache.read = ScanCacheReadStatus::Hit;
+                cache.write = ScanCacheWriteStatus::Skipped;
+                return Ok(ScanResult {
+                    files: cached,
+                    diagnostics,
+                    cache,
+                });
+            }
+            Ok(None) => {
+                cache.read = ScanCacheReadStatus::Miss;
+            }
+            Err(err) => {
+                cache.read = ScanCacheReadStatus::Error;
+                diagnostics.push(ScanDiagnostic::new(
+                    None,
+                    format!("failed to load scan cache: {err}"),
+                ));
+                debug!("scan cache unavailable, continuing without cache: {err}");
+            }
+        }
     }
 
     let mut files = Vec::new();
 
-    for entry in build_walker(root) {
+    for entry in build_walker(root, options)? {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                log_walk_scan_error(&err);
+                let diagnostic = diagnostic_for_walk_error(root, &err);
+                log_walk_scan_error(&diagnostic, &err);
+                diagnostics.push(diagnostic);
                 continue;
             }
         };
@@ -37,21 +148,44 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> Result<Vec<FileState>> {
             .file_type()
             .is_some_and(|file_type| file_type.is_file())
         {
-            match process_file(root, entry.path()) {
+            match process_file(root, entry.path(), &mut diagnostics) {
                 Ok(file_state) => files.push(file_state),
-                Err(err) => log_process_file_error(entry.path(), &err),
+                Err(err) => {
+                    let diagnostic = diagnostic_for_process_file_error(root, entry.path(), &err);
+                    log_process_file_error(&diagnostic, &err);
+                    diagnostics.push(diagnostic);
+                }
             }
         }
     }
 
-    if let Err(err) = write_cache(root, &files) {
-        debug!("failed to write scan cache, continuing: {err}");
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    if options.write_cache {
+        match write_cache(root, options, &files) {
+            Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
+            Err(err) => {
+                cache.write = ScanCacheWriteStatus::Error;
+                diagnostics.push(ScanDiagnostic::new(
+                    None,
+                    format!("failed to write scan cache: {err}"),
+                ));
+                debug!("failed to write scan cache, continuing: {err}");
+            }
+        }
     }
-    Ok(files)
+
+    Ok(ScanResult {
+        files,
+        diagnostics,
+        cache,
+    })
 }
 
-fn build_walker(root: &Path) -> ignore::Walk {
-    let mut builder = WalkBuilder::new(root);
+fn build_walker(root: &Path, options: &ScanOptions) -> Result<ignore::Walk> {
+    let matcher = IgnoreMatcher::new(root, options)?;
+    let root = root.to_path_buf();
+    let mut builder = WalkBuilder::new(&root);
     builder
         .hidden(false)
         .git_ignore(true)
@@ -59,18 +193,73 @@ fn build_walker(root: &Path) -> ignore::Walk {
         .git_global(true)
         .parents(true)
         .require_git(false);
-    builder.filter_entry(|entry| !is_custom_ignored_entry(entry));
-    builder.build()
+    builder.filter_entry(move |entry| !matcher.matches(&root, entry));
+    Ok(builder.build())
 }
 
-fn is_custom_ignored_entry(entry: &DirEntry) -> bool {
-    let Some(name) = entry.path().file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    matches!(
-        name,
-        ".git" | ".trueflow" | "target" | "node_modules" | "mutants.out"
-    )
+struct IgnoreMatcher {
+    names: HashSet<String>,
+    path_prefixes: Vec<RepoPath>,
+    glob_matcher: Gitignore,
+}
+
+impl IgnoreMatcher {
+    fn new(root: &Path, options: &ScanOptions) -> Result<Self> {
+        let mut builder = GitignoreBuilder::new(root);
+        builder.allow_unclosed_class(false);
+        for pattern in &options.ignore_globs {
+            builder.add_line(None, pattern)?;
+        }
+
+        Ok(Self {
+            names: options.ignore_names.iter().cloned().collect(),
+            path_prefixes: options.ignore_path_prefixes.clone(),
+            glob_matcher: if options.ignore_globs.is_empty() {
+                Gitignore::empty()
+            } else {
+                builder.build()?
+            },
+        })
+    }
+
+    fn matches(&self, root: &Path, entry: &DirEntry) -> bool {
+        let Some(name) = entry.path().file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if self.names.contains(name) {
+            return true;
+        }
+
+        let is_dir = entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir());
+        let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+
+        if !self.path_prefixes.is_empty()
+            && let Ok(repo_path) = RepoPath::from_relative_path(relative)
+            && self
+                .path_prefixes
+                .iter()
+                .any(|prefix| repo_path_matches_prefix(&repo_path, prefix))
+        {
+            return true;
+        }
+
+        self.glob_matcher
+            .matched_path_or_any_parents(relative, is_dir)
+            .is_ignore()
+    }
+}
+
+fn repo_path_matches_prefix(path: &RepoPath, prefix: &RepoPath) -> bool {
+    if prefix.is_root() {
+        return true;
+    }
+    path == prefix
+        || path
+            .as_str()
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,38 +282,22 @@ struct FileStamp {
     size: u64,
 }
 
-fn load_cache(root: &Path) -> Result<Option<Vec<FileState>>> {
-    let cache_path = cache_path(root)?;
+fn load_cache(root: &Path, options: &ScanOptions) -> Result<Option<Vec<FileState>>> {
+    let cache_path = cache_path(root, options)?;
     let contents = match fs::read_to_string(&cache_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            debug!("failed to read scan cache at {cache_path:?}: {err}");
-            return Ok(None);
-        }
+        Err(err) => return Err(err.into()),
     };
 
-    let entry: CacheEntry = match serde_json::from_str(&contents) {
-        Ok(entry) => entry,
-        Err(err) => {
-            debug!("failed to parse scan cache at {cache_path:?}: {err}");
-            return Ok(None);
-        }
-    };
+    let entry: CacheEntry = serde_json::from_str(&contents)?;
 
     let root_hash = cache_root_hash(root);
     if entry.root_hash != root_hash {
         return Ok(None);
     }
 
-    let current_stamps = match collect_current_file_stamps(root) {
-        Ok(stamps) => stamps,
-        Err(err) => {
-            debug!("failed to build current file manifest for cache check: {err}");
-            return Ok(None);
-        }
-    };
-
+    let current_stamps = collect_current_file_stamps(root, options)?;
     if current_stamps.len() != entry.files.len() {
         return Ok(None);
     }
@@ -143,8 +316,8 @@ fn load_cache(root: &Path) -> Result<Option<Vec<FileState>>> {
     Ok(Some(files))
 }
 
-fn write_cache(root: &Path, files: &[FileState]) -> Result<()> {
-    let cache_path = cache_path(root)?;
+fn write_cache(root: &Path, options: &ScanOptions, files: &[FileState]) -> Result<()> {
+    let cache_path = cache_path(root, options)?;
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -172,18 +345,20 @@ fn write_cache(root: &Path, files: &[FileState]) -> Result<()> {
     Ok(())
 }
 
-fn cache_path(root: &Path) -> Result<PathBuf> {
+fn cache_path(root: &Path, options: &ScanOptions) -> Result<PathBuf> {
     let identity = cache_identity(root);
     let repo_name = identity
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
-    let cache_root = home_dir().unwrap_or_else(|| root.to_path_buf());
+    let cache_root = options.cache_dir.clone().unwrap_or_else(|| {
+        home_dir()
+            .unwrap_or_else(|| root.to_path_buf())
+            .join(".trueflow")
+            .join("cache")
+    });
     let root_hash = hash_str(identity.to_string_lossy().as_ref());
-    Ok(cache_root
-        .join(".trueflow")
-        .join("cache")
-        .join(format!("scan-{repo_name}-{root_hash}.json")))
+    Ok(cache_root.join(format!("scan-{repo_name}-{root_hash}.json")))
 }
 
 fn cache_identity(root: &Path) -> PathBuf {
@@ -195,9 +370,12 @@ fn cache_root_hash(root: &Path) -> String {
     hash_str(identity.to_string_lossy().as_ref())
 }
 
-fn collect_current_file_stamps(root: &Path) -> Result<HashMap<RepoPath, FileStamp>> {
+fn collect_current_file_stamps(
+    root: &Path,
+    options: &ScanOptions,
+) -> Result<HashMap<RepoPath, FileStamp>> {
     let mut stamps = HashMap::new();
-    for entry in build_walker(root) {
+    for entry in build_walker(root, options)? {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -270,33 +448,64 @@ fn is_permission_denied_walk_error(err: &ignore::Error) -> bool {
     err.io_error().is_some_and(is_permission_denied_io)
 }
 
-fn log_walk_scan_error(err: &ignore::Error) {
+fn log_walk_scan_error(diagnostic: &ScanDiagnostic, err: &ignore::Error) {
     if is_permission_denied_walk_error(err) {
-        debug!("Skipping unreadable entry: {err}");
+        debug!("{}", diagnostic.display_message());
     } else {
-        warn!("Skipping unreadable entry: {err}");
+        warn!("{}", diagnostic.display_message());
     }
 }
 
-fn log_process_file_error(path: &Path, err: &anyhow::Error) {
+fn log_process_file_error(diagnostic: &ScanDiagnostic, err: &anyhow::Error) {
     if err
         .downcast_ref::<std::io::Error>()
         .is_some_and(is_permission_denied_io)
     {
-        debug!("Skipping unreadable file {path:?}: {err}");
+        debug!("{}", diagnostic.display_message());
     } else {
-        warn!("Skipping file {path:?}: {err}");
+        warn!("{}", diagnostic.display_message());
     }
+}
+
+fn diagnostic_for_walk_error(_root: &Path, err: &ignore::Error) -> ScanDiagnostic {
+    let reason = if is_permission_denied_walk_error(err) {
+        format!("skipped unreadable entry: {err}")
+    } else {
+        format!("skipped entry: {err}")
+    };
+    ScanDiagnostic::new(None, reason)
+}
+
+fn diagnostic_for_process_file_error(
+    root: &Path,
+    path: &Path,
+    err: &anyhow::Error,
+) -> ScanDiagnostic {
+    let path = normalize_cache_key(root, path).ok();
+    let reason = if err.downcast_ref::<std::str::Utf8Error>().is_some() {
+        "skipped invalid UTF-8 file".to_string()
+    } else if err
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(is_permission_denied_io)
+    {
+        format!("skipped unreadable file: {err}")
+    } else {
+        format!("skipped file: {err}")
+    };
+    ScanDiagnostic::new(path, reason)
 }
 
 // TODO: Investigate whether salsa can help incremental review caching.
 
-fn process_file(root: &Path, path: &Path) -> Result<FileState> {
+fn process_file(
+    root: &Path,
+    path: &Path,
+    diagnostics: &mut Vec<ScanDiagnostic>,
+) -> Result<FileState> {
     let file_type = analysis::analyze_file(path);
     let relative_path = path.strip_prefix(root).unwrap_or(path);
     let normalized_path = RepoPath::from_relative_path(relative_path)?;
 
-    // Skip binary files
     if matches!(file_type, FileType::Binary) {
         return Ok(FileState::from_binary(normalized_path, &fs::read(path)?));
     }
@@ -304,17 +513,25 @@ fn process_file(root: &Path, path: &Path) -> Result<FileState> {
     let bytes = fs::read(path)?;
     let content = std::str::from_utf8(&bytes)?;
 
-    // Choose chunker based on analysis
     let (language, blocks) = match file_type {
         FileType::Code(code_file) => {
-            // Check if we have a splitter for this language
             let language = code_file.language;
             let blocks = block_splitter::split(content, language);
 
             match blocks {
                 Ok(b) if !b.is_empty() => (language, optimizer::optimize(b)),
-                Ok(_) => (language, fallback_split_blocks(content, FallbackMode::Code)), // Fallback if splitter returns empty (not implemented or empty file)
+                Ok(_) => {
+                    diagnostics.push(ScanDiagnostic::new(
+                        Some(normalized_path.clone()),
+                        "block splitter returned no blocks; used fallback splitter",
+                    ));
+                    (language, fallback_split_blocks(content, FallbackMode::Code))
+                }
                 Err(e) => {
+                    diagnostics.push(ScanDiagnostic::new(
+                        Some(normalized_path.clone()),
+                        format!("block splitter failed; used fallback splitter: {e}"),
+                    ));
                     warn!("Failed to parse file {path:?}: {e}, falling back to paragraphs");
                     (language, fallback_split_blocks(content, FallbackMode::Code))
                 }
@@ -327,7 +544,7 @@ fn process_file(root: &Path, path: &Path) -> Result<FileState> {
         _ => (
             Language::Unknown,
             fallback_split_blocks(content, FallbackMode::Text),
-        ), // Fallback for non-code files
+        ),
     };
 
     Ok(FileState::from_text(
@@ -468,5 +685,22 @@ mod tests {
         let a = UNIX_EPOCH + Duration::from_secs(123) + Duration::from_nanos(1);
         let b = UNIX_EPOCH + Duration::from_secs(123) + Duration::from_nanos(2);
         assert_ne!(system_time_to_epoch(a), system_time_to_epoch(b));
+    }
+
+    #[test]
+    fn repo_path_matches_prefix_checks_exact_or_descendant() {
+        let prefix = RepoPath::new("src/generated").unwrap();
+        assert!(repo_path_matches_prefix(
+            &RepoPath::new("src/generated").unwrap(),
+            &prefix,
+        ));
+        assert!(repo_path_matches_prefix(
+            &RepoPath::new("src/generated/out.rs").unwrap(),
+            &prefix,
+        ));
+        assert!(!repo_path_matches_prefix(
+            &RepoPath::new("src/generate.rs").unwrap(),
+            &prefix,
+        ));
     }
 }

@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
-use trueflow::block::FileState;
+use trueflow::scanner::ScanResult;
 use trueflow::sub_splitter;
 
 mod common;
-use common::TestRepo;
+use common::*;
 
 #[test]
 fn test_binary_file() -> Result<()> {
@@ -15,8 +15,7 @@ fn test_binary_file() -> Result<()> {
 
     // Scan
     let output = repo.run(&["scan", "--json"])?;
-    let json: serde_json::Value = serde_json::from_str(&output)?;
-    let arr = json.as_array().unwrap();
+    let arr = json_array(&output)?;
 
     let file_obj = arr
         .iter()
@@ -39,13 +38,50 @@ fn test_invalid_utf8() -> Result<()> {
 
     // Scan
     let output = repo.run(&["scan", "--json"])?;
-    let json: serde_json::Value = serde_json::from_str(&output)?;
-    let arr = json.as_array().unwrap();
+    let arr = json_array(&output)?;
+    let scan = json(&output)?;
 
     let file_obj = arr
         .iter()
         .find(|obj| obj["path"].as_str().unwrap().contains("bad.txt"));
     assert!(file_obj.is_none(), "Invalid UTF-8 file should be skipped");
+    let diagnostics = scan["diagnostics"]
+        .as_array()
+        .context("diagnostics should be array")?;
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["path"].as_str() == Some("bad.txt")
+            && diagnostic["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid UTF-8")
+    }));
+    assert!(scan["cache"]["read"].is_string());
+    assert!(scan["cache"]["write"].is_string());
+
+    Ok(())
+}
+
+#[test]
+fn test_review_warns_on_skipped_invalid_utf8() -> Result<()> {
+    let repo = TestRepo::new("review_warns_invalid_utf8")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    fs::write(repo.path.join("bad.txt"), [0xFF, 0xFE, 0xFD])?;
+
+    let output = repo.run_raw(&["review", "--all", "--json"])?;
+    assert!(output.status.success(), "review failed unexpectedly");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("warning:"),
+        "expected warning in stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("bad.txt"),
+        "expected bad file path in stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("invalid UTF-8"),
+        "expected invalid UTF-8 reason in stderr: {stderr}"
+    );
 
     Ok(())
 }
@@ -57,8 +93,7 @@ fn test_empty_file() -> Result<()> {
     fs::write(&file_path, "")?;
 
     let output = repo.run(&["scan", "--json"])?;
-    let json: serde_json::Value = serde_json::from_str(&output)?;
-    let arr = json.as_array().unwrap();
+    let arr = json_array(&output)?;
 
     let file_obj = arr
         .iter()
@@ -94,7 +129,8 @@ fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
     }
 
     let output = repo.run(&["scan", "--json"])?;
-    let file_states: Vec<FileState> = serde_json::from_str(&output)?;
+    let scan_result: ScanResult = serde_json::from_str(&output)?;
+    let file_states = scan_result.files;
 
     for &(name, _) in &test_cases {
         let file_state = file_states

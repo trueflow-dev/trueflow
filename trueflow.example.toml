@@ -13,6 +13,18 @@ only = []
 # Exclude block kinds from feedback output.
 exclude = []
 
+[scan]
+# Read/write the scan cache under ~/.trueflow/cache by default.
+use_cache = true
+write_cache = true
+# cache_dir = ".trueflow/cache"
+# Additional exact-name ignores, applied anywhere in the tree.
+ignore_names = []
+# Additional repo-relative path-prefix ignores.
+ignore_path_prefixes = []
+# Additional gitignore-style glob ignores.
+ignore_globs = []
+
 [tui]
 # Require confirmation modal before batch actions.
 confirm_batch = true

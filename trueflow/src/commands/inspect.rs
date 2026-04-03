@@ -1,10 +1,14 @@
+use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::scanner;
 use crate::sub_splitter;
 use anyhow::{Context, Result, bail};
 
 pub fn run(_context: &TrueflowContext, fingerprint: &str, split: bool) -> Result<()> {
-    let files = scanner::scan_directory(".")?;
+    let config = load_config()?;
+    let scan_options = config.scan.resolve_options()?;
+    let scan_result = scanner::scan_directory(".", &scan_options)?;
+    let files = scan_result.files;
     let mut matches = Vec::new();
 
     for file in &files {

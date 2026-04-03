@@ -469,8 +469,9 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
 }
 
 pub fn build_tree_from_path(root: &str) -> anyhow::Result<Tree> {
-    let files = crate::scanner::scan_directory(root)?;
-    Ok(build_tree_from_files(&files))
+    let scan_result =
+        crate::scanner::scan_directory(root, &crate::scanner::ScanOptions::default())?;
+    Ok(build_tree_from_files(&scan_result.files))
 }
 
 #[cfg(test)]

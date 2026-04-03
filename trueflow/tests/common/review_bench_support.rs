@@ -10,6 +10,7 @@ use trueflow::commands::review::{ReviewOptions, ReviewSummary, collect_review_su
 use trueflow::config::BlockFilters;
 use trueflow::context::TrueflowContext;
 use trueflow::logging::LoggingMode;
+use trueflow::scanner::ScanOptions;
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -65,7 +66,12 @@ pub fn run_full_review(path: &Path) -> Result<ReviewSummary> {
             exclude: Vec::new(),
         };
 
-        collect_review_summary(&context, &options, &BlockFilters::default())
+        collect_review_summary(
+            &context,
+            &options,
+            &BlockFilters::default(),
+            &ScanOptions::default(),
+        )
     })
 }
 

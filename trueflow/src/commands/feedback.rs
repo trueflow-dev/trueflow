@@ -33,10 +33,12 @@ pub fn run(
 ) -> Result<()> {
     let config = load_config()?;
     let filters = config.feedback.resolve_filters(only, exclude);
+    let scan_options = config.scan.resolve_options()?;
     let effective_since = since.or(Some(config.feedback.default_since.as_str()));
 
     // 1. Scan Directory (Current State)
-    let files = scanner::scan_directory(".")?;
+    let scan_result = scanner::scan_directory(".", &scan_options)?;
+    let files = scan_result.files;
     let tree = tree::build_tree_from_files(&files);
 
     // 2. Load DB

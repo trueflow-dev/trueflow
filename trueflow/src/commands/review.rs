@@ -5,7 +5,7 @@ use crate::context::TrueflowContext;
 use crate::path_utils;
 use crate::policy::{should_skip_impl_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
-use crate::scanner;
+use crate::scanner::{self, ScanDiagnostic, ScanOptions};
 use crate::store::{
     FileStore, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
 };
@@ -49,6 +49,7 @@ pub struct ReviewSummary {
     pub review_state: HashMap<String, Verdict>,
     pub tree: tree::Tree,
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
+    pub scan_diagnostics: Vec<ScanDiagnostic>,
 }
 
 enum ReviewContentSource {
@@ -65,6 +66,7 @@ pub fn collect_review_summary(
     _context: &TrueflowContext,
     options: &ReviewOptions,
     filters: &BlockFilters,
+    scan_options: &ScanOptions,
 ) -> Result<ReviewSummary> {
     info!(
         "review collect (all={}, only={:?}, exclude={:?})",
@@ -93,8 +95,11 @@ pub fn collect_review_summary(
     let approved_hashes = approved_hashes_from_verdicts(&fingerprint_status);
 
     // 2. Load review content
-    let files = match &content_source {
-        ReviewContentSource::Workdir => scanner::scan_directory(".")?,
+    let (files, scan_diagnostics) = match &content_source {
+        ReviewContentSource::Workdir => {
+            let scan_result = scanner::scan_directory(".", scan_options)?;
+            (scan_result.files, scan_result.diagnostics)
+        }
         ReviewContentSource::Revision(revision) => {
             let Some(repo) = review_repo.as_ref() else {
                 return Err(anyhow!("review repo unavailable for revision target"));
@@ -107,12 +112,15 @@ pub fn collect_review_summary(
                     ));
                 }
             };
-            vcs::file_states_for_paths_in_revision(
-                repo,
-                revision,
-                paths,
-                workdir_prefix.as_deref(),
-            )?
+            (
+                vcs::file_states_for_paths_in_revision(
+                    repo,
+                    revision,
+                    paths,
+                    workdir_prefix.as_deref(),
+                )?,
+                Vec::new(),
+            )
         }
     };
     info!("scanned {} files", files.len());
@@ -239,15 +247,8 @@ pub fn collect_review_summary(
         review_state: fingerprint_status,
         tree,
         unreviewed_block_nodes,
+        scan_diagnostics,
     })
-}
-
-pub fn collect_unreviewed(
-    context: &TrueflowContext,
-    options: &ReviewOptions,
-    filters: &BlockFilters,
-) -> Result<Vec<UnreviewedFile>> {
-    Ok(collect_review_summary(context, options, filters)?.files)
 }
 
 fn review_content_source(targets: &[ReviewTarget]) -> Result<ReviewContentSource> {
@@ -473,13 +474,18 @@ pub fn run(
     );
     let config = load_config()?;
     let filters = config.review.resolve_filters(only, exclude);
+    let scan_options = config.scan.resolve_options()?;
     let options = ReviewOptions {
         all,
         targets: parse_review_targets(target)?,
         only: only.to_vec(),
         exclude: exclude.to_vec(),
     };
-    let unreviewed_files = collect_unreviewed(context, &options, &filters)?;
+    let summary = collect_review_summary(context, &options, &filters, &scan_options)?;
+    for diagnostic in &summary.scan_diagnostics {
+        eprintln!("warning: {}", diagnostic.display_message());
+    }
+    let unreviewed_files = summary.files;
 
     let total_blocks: usize = unreviewed_files.iter().map(|file| file.blocks.len()).sum();
     info!(

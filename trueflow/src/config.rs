@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, anyhow};
+use ignore::gitignore::GitignoreBuilder;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::block::BlockKind;
+use crate::repo_path::RepoPath;
+use crate::scanner::ScanOptions;
 
 const CONFIG_FILE_NAME: &str = "trueflow.toml";
 
@@ -18,6 +21,8 @@ pub struct TrueflowConfig {
     pub tui: TuiConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub scan: ScanConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +41,22 @@ pub struct TuiConfig {
 pub struct StorageConfig {
     #[serde(default = "default_storage_branch")]
     pub branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanConfig {
+    #[serde(default = "default_scan_use_cache")]
+    pub use_cache: bool,
+    #[serde(default = "default_scan_write_cache")]
+    pub write_cache: bool,
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub ignore_names: Vec<String>,
+    #[serde(default)]
+    pub ignore_globs: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_repo_paths")]
+    pub ignore_path_prefixes: Vec<RepoPath>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +149,19 @@ impl Default for StorageConfig {
     }
 }
 
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            use_cache: default_scan_use_cache(),
+            write_cache: default_scan_write_cache(),
+            cache_dir: None,
+            ignore_names: Vec::new(),
+            ignore_globs: Vec::new(),
+            ignore_path_prefixes: Vec::new(),
+        }
+    }
+}
+
 impl Default for FeedbackConfig {
     fn default() -> Self {
         Self {
@@ -202,6 +236,14 @@ fn default_storage_branch() -> String {
     "trueflow-db".to_string()
 }
 
+fn default_scan_use_cache() -> bool {
+    true
+}
+
+fn default_scan_write_cache() -> bool {
+    true
+}
+
 fn default_feedback_since() -> String {
     "all".to_string()
 }
@@ -251,6 +293,35 @@ impl FeedbackConfig {
             cli_exclude
         };
         BlockFilters::from_lists(only_values, exclude_values)
+    }
+}
+
+impl ScanConfig {
+    pub fn resolve_options(&self) -> Result<ScanOptions> {
+        validate_ignore_globs(&self.ignore_globs)?;
+
+        let mut options = ScanOptions {
+            use_cache: self.use_cache,
+            write_cache: self.write_cache,
+            cache_dir: self.cache_dir.clone(),
+            ..ScanOptions::default()
+        };
+        options
+            .ignore_names
+            .extend(self.ignore_names.iter().cloned());
+        options.ignore_names.sort();
+        options.ignore_names.dedup();
+        options
+            .ignore_globs
+            .extend(self.ignore_globs.iter().cloned());
+        options.ignore_globs.sort();
+        options.ignore_globs.dedup();
+        options
+            .ignore_path_prefixes
+            .extend(self.ignore_path_prefixes.iter().cloned());
+        options.ignore_path_prefixes.sort();
+        options.ignore_path_prefixes.dedup();
+        Ok(options)
     }
 }
 
@@ -328,6 +399,28 @@ where
         .into_iter()
         .map(|value| value.parse().map_err(serde::de::Error::custom))
         .collect()
+}
+
+fn deserialize_repo_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<RepoPath>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| RepoPath::new(value).map_err(serde::de::Error::custom))
+        .collect()
+}
+
+fn validate_ignore_globs(patterns: &[String]) -> Result<()> {
+    let mut builder = GitignoreBuilder::new(".");
+    builder.allow_unclosed_class(false);
+    for pattern in patterns {
+        builder
+            .add_line(None, pattern)
+            .map_err(|err| anyhow!("invalid scan ignore glob {pattern:?}: {err}"))?;
+    }
+    Ok(())
 }
 
 pub fn update_speed_read_defaults_in_file(
@@ -538,6 +631,51 @@ exclude = ["comment"]
             err.to_string()
                 .contains("Unknown block kind: not-a-real-kind"),
             "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn scan_config_resolves_defaults_and_overrides() {
+        let cfg: TrueflowConfig = toml::from_str(
+            r#"
+[scan]
+use_cache = false
+write_cache = true
+cache_dir = "custom-cache"
+ignore_names = ["dist"]
+ignore_globs = ["*.snap"]
+ignore_path_prefixes = ["vendor", "generated"]
+"#,
+        )
+        .unwrap_or_else(|err| panic!("parse config: {err}"));
+
+        let options = cfg
+            .scan
+            .resolve_options()
+            .unwrap_or_else(|err| panic!("resolve scan options: {err}"));
+        assert!(!options.use_cache);
+        assert!(options.write_cache);
+        assert_eq!(options.cache_dir, Some(PathBuf::from("custom-cache")));
+        assert!(options.ignore_names.iter().any(|name| name == ".git"));
+        assert!(options.ignore_names.iter().any(|name| name == "dist"));
+        assert_eq!(options.ignore_globs, vec!["*.snap".to_string()]);
+        assert_eq!(
+            options.ignore_path_prefixes,
+            vec![
+                RepoPath::new("generated").unwrap(),
+                RepoPath::new("vendor").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_config_rejects_invalid_ignore_globs() {
+        let cfg: TrueflowConfig = toml::from_str("[scan]\nignore_globs = [\"[\"]\n")
+            .unwrap_or_else(|err| panic!("parse config: {err}"));
+        let err = cfg.scan.resolve_options().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid scan ignore glob"),
+            "unexpected scan config error: {err}"
         );
     }
 
