@@ -106,6 +106,37 @@ fn test_empty_file() -> Result<()> {
 }
 
 #[test]
+fn test_scan_surfaces_unsupported_code_fallback_diagnostic() -> Result<()> {
+    let repo = TestRepo::new("unsupported_code_fallback")?;
+    repo.write(
+        "main.el",
+        "(message \"hello\")\n\n(defun greet ()\n  (message \"hi\"))\n",
+    )?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let scan_result: ScanResult = serde_json::from_str(&output)?;
+    let file_state = scan_result
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "main.el")
+        .context("missing scan output for main.el")?;
+
+    assert!(!file_state.blocks.is_empty());
+    assert!(
+        file_state
+            .blocks
+            .iter()
+            .any(|block| block.kind == trueflow::block::BlockKind::CodeParagraph)
+    );
+    assert!(scan_result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.path.as_ref().map(|path| path.as_str()) == Some("main.el")
+            && diagnostic.reason.contains("unsupported language")
+    }));
+
+    Ok(())
+}
+
+#[test]
 fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
     let repo = TestRepo::new("sub_splitter_empty")?;
     let test_cases = [

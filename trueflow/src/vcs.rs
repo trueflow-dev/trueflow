@@ -3,7 +3,6 @@ use crate::block::{Block, FileState};
 use crate::block_splitter;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
-use crate::scanner;
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
@@ -814,14 +813,7 @@ fn keep_changed_with_context(lines: Vec<DiffLine>, context_lines: usize) -> Vec<
 }
 
 fn split_blocks(content: &str, language: Language) -> Vec<Block> {
-    if language != Language::Unknown
-        && let Ok(blocks) = block_splitter::split(content, language)
-        && !blocks.is_empty()
-    {
-        return crate::optimizer::optimize(blocks);
-    }
-
-    scanner::fallback_split_blocks(content, scanner::FallbackMode::Text)
+    block_splitter::split(content, language).into_review_blocks()
 }
 
 fn usize_to_u32_saturating(value: usize) -> u32 {

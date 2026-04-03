@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
-use crate::{block_splitter, optimizer};
+use crate::block_splitter;
 
 pub fn fuzzy_find_block(path: &Path, fuzzy_ident: &str) -> Result<Block> {
     let content = std::fs::read_to_string(path)
@@ -15,11 +15,7 @@ pub fn fuzzy_find_block(path: &Path, fuzzy_ident: &str) -> Result<Block> {
         _ => Language::Unknown,
     };
 
-    let blocks = match block_splitter::split(&content, language) {
-        Ok(blocks) if !blocks.is_empty() => optimizer::optimize(blocks),
-        Ok(_) => Vec::new(),
-        Err(err) => bail!("Failed to split file {}: {}", path.display(), err),
-    };
+    let blocks = block_splitter::split(&content, language).into_review_blocks();
 
     let mut matches = blocks
         .iter()

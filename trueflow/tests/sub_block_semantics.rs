@@ -91,7 +91,7 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
     let file_path = repo_root.join("example_repos/complex_blocks_md/README.md");
     let content = std::fs::read_to_string(&file_path)?;
 
-    let blocks = block_splitter::split(&content, Language::Markdown)?;
+    let blocks = block_splitter::split(&content, Language::Markdown).blocks;
     let section = blocks
         .iter()
         .find(|block| block.kind == BlockKind::Section)

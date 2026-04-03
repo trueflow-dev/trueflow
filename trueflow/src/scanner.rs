@@ -1,10 +1,8 @@
 use crate::analysis::{self, FileType, Language};
-use crate::block::{Block, BlockKind, FileState};
+use crate::block::FileState;
 use crate::block_splitter;
-use crate::hashing::{TreeHash, hash_str};
-use crate::optimizer;
+use crate::hashing::hash_str;
 use crate::repo_path::RepoPath;
-use crate::text_split::split_by_paragraph_breaks;
 use anyhow::Result;
 use dirs::home_dir;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -513,172 +511,31 @@ fn process_file(
     let bytes = fs::read(path)?;
     let content = std::str::from_utf8(&bytes)?;
 
-    let (language, blocks) = match file_type {
-        FileType::Code(code_file) => {
-            let language = code_file.language;
-            let blocks = block_splitter::split(content, language);
-
-            match blocks {
-                Ok(b) if !b.is_empty() => (language, optimizer::optimize(b)),
-                Ok(_) => {
-                    diagnostics.push(ScanDiagnostic::new(
-                        Some(normalized_path.clone()),
-                        "block splitter returned no blocks; used fallback splitter",
-                    ));
-                    (language, fallback_split_blocks(content, FallbackMode::Code))
-                }
-                Err(e) => {
-                    diagnostics.push(ScanDiagnostic::new(
-                        Some(normalized_path.clone()),
-                        format!("block splitter failed; used fallback splitter: {e}"),
-                    ));
-                    warn!("Failed to parse file {path:?}: {e}, falling back to paragraphs");
-                    (language, fallback_split_blocks(content, FallbackMode::Code))
-                }
-            }
-        }
-        FileType::Text => (
-            Language::Text,
-            fallback_split_blocks(content, FallbackMode::Text),
-        ),
-        _ => (
-            Language::Unknown,
-            fallback_split_blocks(content, FallbackMode::Text),
-        ),
+    let language = match file_type {
+        FileType::Code(code_file) => code_file.language,
+        FileType::Text => Language::Text,
+        _ => Language::Unknown,
     };
+    let split_result = block_splitter::split(content, language);
+    for diagnostic in &split_result.diagnostics {
+        diagnostics.push(ScanDiagnostic::new(
+            Some(normalized_path.clone()),
+            diagnostic.reason.clone(),
+        ));
+    }
 
     Ok(FileState::from_text(
         normalized_path,
         language,
         &bytes,
-        blocks,
+        split_result.into_review_blocks(),
     ))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FallbackMode {
-    Code,
-    Text,
-}
-
-pub(crate) fn fallback_split_blocks(content: &str, mode: FallbackMode) -> Vec<Block> {
-    let fallback = split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
-        let kind = classify_fallback_chunk(chunk, mode, is_gap);
-        create_fallback_block(content, chunk, kind, start, end)
-    });
-
-    if fallback.is_empty() {
-        return Vec::new();
-    }
-
-    fallback
-}
-
-fn classify_fallback_chunk(chunk: &str, mode: FallbackMode, is_gap: bool) -> BlockKind {
-    if is_gap {
-        return BlockKind::Gap;
-    }
-
-    if chunk.trim().is_empty() {
-        return BlockKind::Gap;
-    }
-
-    match mode {
-        FallbackMode::Code => classify_code_paragraph(chunk),
-        FallbackMode::Text => BlockKind::Paragraph,
-    }
-}
-
-fn classify_code_paragraph(chunk: &str) -> BlockKind {
-    let trimmed = chunk.trim();
-    if trimmed.is_empty() {
-        return BlockKind::Gap;
-    }
-
-    let is_comment = trimmed.lines().all(|line| {
-        let line = line.trim_start();
-        line.starts_with("//")
-            || line.starts_with('#')
-            || line.starts_with("/*")
-            || line.starts_with('*')
-    });
-
-    if is_comment {
-        BlockKind::Comment
-    } else {
-        BlockKind::CodeParagraph
-    }
-}
-
-fn create_fallback_block(
-    full_source: &str,
-    chunk: &str,
-    kind: BlockKind,
-    start: usize,
-    end: usize,
-) -> Block {
-    let (start_line, end_line) = byte_range_to_lines(full_source, start, end);
-    Block {
-        hash: TreeHash::from_content(chunk),
-        content: chunk.to_string(),
-        kind,
-        tags: Vec::new(),
-        complexity: 0,
-        start_line,
-        end_line,
-    }
-}
-
-fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let pre = &source[..start];
-    let start_line = pre.lines().count();
-    let start_line = if start > 0 && pre.ends_with('\n') {
-        start_line
-    } else {
-        start_line.saturating_sub(1)
-    };
-
-    let mid = &source[start..end];
-    let new_lines = mid.chars().filter(|&c| c == '\n').count();
-    let end_line = start_line + new_lines + if mid.ends_with('\n') { 0 } else { 1 };
-
-    (start_line, end_line)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    fn assert_merged_blocks(blocks: Vec<Block>, expected: &str) {
-        let merged = blocks
-            .into_iter()
-            .map(|block| block.content)
-            .collect::<String>();
-        assert_eq!(merged, expected);
-    }
-
-    #[test]
-    fn fallback_split_text_paragraphs() {
-        let content = "Para 1.\n\nPara 2.";
-        let blocks = fallback_split_blocks(content, FallbackMode::Text);
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
-        assert_eq!(blocks[1].kind, BlockKind::Gap);
-        assert_eq!(blocks[2].kind, BlockKind::Paragraph);
-        assert_merged_blocks(blocks, content);
-    }
-
-    #[test]
-    fn fallback_split_code_paragraphs() {
-        let content = "fn main() {}\n\n// comment";
-        let blocks = fallback_split_blocks(content, FallbackMode::Code);
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].kind, BlockKind::CodeParagraph);
-        assert_eq!(blocks[1].kind, BlockKind::Gap);
-        assert_eq!(blocks[2].kind, BlockKind::Comment);
-        assert_merged_blocks(blocks, content);
-    }
 
     #[test]
     fn cache_timestamp_preserves_subsecond_precision() {

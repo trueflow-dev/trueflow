@@ -1,7 +1,8 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
 use crate::complexity;
 use crate::hashing::TreeHash;
+use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::{Context, Result};
 use std::sync::LazyLock;
@@ -72,59 +73,207 @@ fn compile_query(language: &TsLanguage, source: &str, name: &str) -> Query {
     }
 }
 
-pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockSplitStrategy {
+    /// The input was empty, so there are no top-level blocks.
+    EmptyInput,
+    Structured,
+    /// Language-specific heuristics were used instead of a parser-backed structure walk.
+    Heuristic,
+    /// Plain textual paragraph splitting was used intentionally.
+    Textual,
+    /// A code-oriented fallback splitter was used after a structured attempt degraded.
+    FallbackCode,
+    /// A text-oriented fallback splitter was used after a structured attempt degraded.
+    FallbackText,
+    /// The language is recognized as code but has no dedicated structured splitter yet.
+    UnsupportedCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSplitDiagnostic {
+    pub reason: String,
+}
+
+impl BlockSplitDiagnostic {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockSplitResult {
+    /// Raw top-level blocks produced by the splitter before review-time optimization.
+    pub blocks: Vec<Block>,
+    pub strategy: BlockSplitStrategy,
+    pub diagnostics: Vec<BlockSplitDiagnostic>,
+}
+
+impl BlockSplitResult {
+    fn new(
+        blocks: Vec<Block>,
+        strategy: BlockSplitStrategy,
+        diagnostics: Vec<BlockSplitDiagnostic>,
+    ) -> Self {
+        Self {
+            blocks,
+            strategy,
+            diagnostics,
+        }
+    }
+
+    /// Convert raw split blocks into the optimized review-time block set.
+    pub fn into_review_blocks(self) -> Vec<Block> {
+        if self.blocks.is_empty() {
+            Vec::new()
+        } else {
+            optimizer::optimize(self.blocks)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackMode {
+    Code,
+    Text,
+}
+
+impl FallbackMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Text => "text",
+        }
+    }
+
+    fn strategy(self) -> BlockSplitStrategy {
+        match self {
+            Self::Code => BlockSplitStrategy::FallbackCode,
+            Self::Text => BlockSplitStrategy::FallbackText,
+        }
+    }
+}
+
+/// Split a text file into raw top-level review blocks.
+pub fn split(content: &str, lang: Language) -> BlockSplitResult {
     info!(
         "block_splitter start (lang={:?}, bytes={})",
         lang,
         content.len()
     );
-    match lang {
-        Language::Markdown => {
-            let blocks = split_markdown(content)?;
-            info!("block_splitter done (blocks={})", blocks.len());
-            return Ok(blocks);
-        }
-        Language::Go => {
-            let blocks = split_go(content);
-            info!("block_splitter done (blocks={})", blocks.len());
-            return Ok(blocks);
-        }
-        Language::Cpp => {
-            let blocks = split_cpp(content);
-            info!("block_splitter done (blocks={})", blocks.len());
-            return Ok(blocks);
-        }
-        Language::Nix => {
-            let blocks = split_nix(content)?;
-            info!("block_splitter done (blocks={})", blocks.len());
-            return Ok(blocks);
-        }
-        _ if lang.uses_text_fallback() => {
-            let blocks = split_paragraphs(content, lang);
-            info!("block_splitter done (blocks={})", blocks.len());
-            return Ok(blocks);
-        }
-        _ => {}
+
+    let result = split_non_empty(content, lang);
+
+    info!(
+        "block_splitter done (strategy={:?}, blocks={}, diagnostics={})",
+        result.strategy,
+        result.blocks.len(),
+        result.diagnostics.len()
+    );
+    result
+}
+
+fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
+    if content.is_empty() {
+        return BlockSplitResult::new(Vec::new(), BlockSplitStrategy::EmptyInput, Vec::new());
     }
 
+    match lang {
+        Language::Markdown => {
+            attempt_split(content, lang, split_markdown(content), FallbackMode::Text)
+        }
+        Language::Go => {
+            complete_split(split_go(content), BlockSplitStrategy::Heuristic, Vec::new())
+        }
+        Language::Cpp => complete_split(
+            split_cpp(content),
+            BlockSplitStrategy::Heuristic,
+            Vec::new(),
+        ),
+        Language::Nix => attempt_split(content, lang, split_nix(content), FallbackMode::Code),
+        _ if lang.uses_text_fallback() || matches!(lang, Language::Unknown) => complete_split(
+            split_paragraphs(content, lang),
+            BlockSplitStrategy::Textual,
+            Vec::new(),
+        ),
+        Language::Rust
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Python
+        | Language::Shell => attempt_split(
+            content,
+            lang,
+            split_tree_sitter(content, lang),
+            FallbackMode::Code,
+        ),
+        _ => fallback_result(
+            content,
+            lang,
+            FallbackMode::Code,
+            BlockSplitStrategy::UnsupportedCode,
+            format!("unsupported language {lang:?}; used code fallback"),
+        ),
+    }
+}
+
+fn attempt_split(
+    content: &str,
+    lang: Language,
+    attempt: Result<Vec<Block>>,
+    fallback_mode: FallbackMode,
+) -> BlockSplitResult {
+    match attempt {
+        Ok(blocks) if !blocks.is_empty() => {
+            complete_split(blocks, BlockSplitStrategy::Structured, Vec::new())
+        }
+        Ok(_) => fallback_result(
+            content,
+            lang,
+            fallback_mode,
+            fallback_mode.strategy(),
+            format!(
+                "{lang:?} splitter returned no blocks; used {} fallback",
+                fallback_mode.as_str()
+            ),
+        ),
+        Err(err) => fallback_result(
+            content,
+            lang,
+            fallback_mode,
+            fallback_mode.strategy(),
+            format!(
+                "{lang:?} splitter failed; used {} fallback: {err}",
+                fallback_mode.as_str()
+            ),
+        ),
+    }
+}
+
+fn fallback_result(
+    content: &str,
+    lang: Language,
+    fallback_mode: FallbackMode,
+    strategy: BlockSplitStrategy,
+    reason: String,
+) -> BlockSplitResult {
+    let blocks = fallback_split_blocks(content, fallback_mode, lang);
+    complete_split(blocks, strategy, vec![BlockSplitDiagnostic::new(reason)])
+}
+
+fn complete_split(
+    blocks: Vec<Block>,
+    strategy: BlockSplitStrategy,
+    diagnostics: Vec<BlockSplitDiagnostic>,
+) -> BlockSplitResult {
+    BlockSplitResult::new(blocks, strategy, diagnostics)
+}
+
+fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
-
-    // Select grammar based on language
-    let language = match lang {
-        Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
-        Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
-        Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
-        Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
-        _ => None,
-    };
-
-    let Some(language) = language else {
-        info!("block_splitter unsupported language, returning empty blocks");
-        info!("block_splitter done (blocks=0)");
-        return Ok(Vec::new());
-    };
-
+    let language = tree_sitter_language_for(lang)
+        .ok_or_else(|| anyhow::anyhow!("No tree-sitter grammar configured for {lang:?}"))?;
     parser.set_language(&language)?;
 
     let tree = parser
@@ -136,20 +285,16 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
     let mut cursor = root.walk();
     let mut last_end_byte = 0;
 
-    let test_ranges = collect_test_ranges(lang, &tree, content)?;
+    let test_spans = collect_test_line_spans(lang, &tree, content)?;
 
-    // State for pending attributes/comments that should be attached to the next node
     let mut pending_start: Option<usize> = None;
     let mut pending_end: usize = 0;
 
-    // Iterate over children of root
     for child in root.children(&mut cursor) {
         let start_byte = child.start_byte();
         let end_byte = child.end_byte();
         let ts_kind = child.kind();
-        let is_test = is_test_span(&test_ranges, ByteSpan::new(start_byte, end_byte));
 
-        // Check if this node is an attribute or comment that should be grouped
         let is_attribute = match lang {
             Language::Rust => {
                 ts_kind == "attribute_item"
@@ -162,7 +307,6 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
 
         if is_attribute {
             if pending_start.is_none() {
-                // First attribute in a potential group. Handle gap prior to it.
                 if start_byte > last_end_byte {
                     let gap = &content[last_end_byte..start_byte];
                     if !gap.trim().is_empty() {
@@ -182,13 +326,9 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
             continue;
         }
 
-        // It is a "real" item
-
-        // Determine the actual start byte for this block (including pending attributes)
         let block_start = if let Some(ps) = pending_start {
             ps
         } else {
-            // No pending attributes, handle gap now
             if start_byte > last_end_byte {
                 let gap = &content[last_end_byte..start_byte];
                 if !gap.trim().is_empty() {
@@ -206,21 +346,17 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         };
 
         let node_content = &content[block_start..end_byte];
-        let mut block = create_block(
+        blocks.push(create_block(
             node_content,
             map_kind(lang, ts_kind),
             content,
             block_start,
             end_byte,
             lang,
-        );
-        if is_test {
-            block.tags.push("test".to_string());
-        }
-        blocks.push(block);
+        ));
 
         if matches!(lang, Language::Rust) && matches!(ts_kind, "impl_item" | "trait_item") {
-            blocks.extend(collect_rust_impl_items(child, content, lang, &test_ranges));
+            blocks.extend(collect_rust_impl_items(child, content, lang));
         }
 
         last_end_byte = end_byte;
@@ -228,7 +364,6 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         pending_end = 0;
     }
 
-    // If we have pending attributes left at the end (e.g. trailing comments or attribute at EOF)
     if let Some(start) = pending_start {
         let node_content = &content[start..pending_end];
         blocks.push(create_block(
@@ -242,7 +377,6 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         last_end_byte = pending_end;
     }
 
-    // Trailing gap
     if last_end_byte < content.len() {
         let gap = &content[last_end_byte..];
         if !gap.trim().is_empty() {
@@ -257,8 +391,20 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         }
     }
 
-    info!("block_splitter done (blocks={})", blocks.len());
+    apply_test_tags(&mut blocks, &test_spans);
+
     Ok(blocks)
+}
+
+fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
+    match lang {
+        Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+        Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+        Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
+        Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
+        _ => None,
+    }
 }
 
 fn split_markdown(content: &str) -> Result<Vec<Block>> {
@@ -336,6 +482,69 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
     }
 
     Ok(blocks)
+}
+
+pub(crate) fn fallback_split_blocks(
+    content: &str,
+    mode: FallbackMode,
+    lang: Language,
+) -> Vec<Block> {
+    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+        let kind = classify_fallback_chunk(chunk, mode, is_gap);
+        create_fallback_block(content, chunk, kind, start, end, lang)
+    })
+}
+
+fn classify_fallback_chunk(chunk: &str, mode: FallbackMode, is_gap: bool) -> BlockKind {
+    if is_gap || chunk.trim().is_empty() {
+        return BlockKind::Gap;
+    }
+
+    match mode {
+        FallbackMode::Code => classify_code_paragraph(chunk),
+        FallbackMode::Text => BlockKind::Paragraph,
+    }
+}
+
+fn classify_code_paragraph(chunk: &str) -> BlockKind {
+    let trimmed = chunk.trim();
+    if trimmed.is_empty() {
+        return BlockKind::Gap;
+    }
+
+    let is_comment = trimmed.lines().all(|line| {
+        let line = line.trim_start();
+        line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+            || line.starts_with('*')
+    });
+
+    if is_comment {
+        BlockKind::Comment
+    } else {
+        BlockKind::CodeParagraph
+    }
+}
+
+fn create_fallback_block(
+    full_source: &str,
+    chunk: &str,
+    kind: BlockKind,
+    start: usize,
+    end: usize,
+    lang: Language,
+) -> Block {
+    let (start_line, end_line) = byte_range_to_lines(full_source, start, end);
+    Block {
+        hash: TreeHash::from_content(chunk),
+        content: chunk.to_string(),
+        kind,
+        tags: Vec::new(),
+        complexity: complexity::calculate(chunk, lang),
+        start_line,
+        end_line,
+    }
 }
 
 fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
@@ -853,7 +1062,6 @@ fn collect_rust_impl_items(
     impl_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-    test_ranges: &[ByteSpan],
 ) -> Vec<Block> {
     let Some(body) = impl_node.child_by_field_name("body") else {
         return Vec::new();
@@ -886,12 +1094,14 @@ fn collect_rust_impl_items(
 
         let block_start = pending_start.unwrap_or(start_byte);
         let node_content = &content[block_start..end_byte];
-        let mut block = create_block(node_content, kind, content, block_start, end_byte, lang);
-        let is_test = is_test_span(test_ranges, ByteSpan::new(start_byte, end_byte));
-        if is_test {
-            block.tags.push("test".to_string());
-        }
-        blocks.push(block);
+        blocks.push(create_block(
+            node_content,
+            kind,
+            content,
+            block_start,
+            end_byte,
+            lang,
+        ));
 
         pending_start = None;
         pending_end = 0;
@@ -989,6 +1199,35 @@ fn collect_test_ranges(
     }
 
     Ok(ranges)
+}
+
+fn collect_test_line_spans(
+    lang: Language,
+    tree: &tree_sitter::Tree,
+    source: &str,
+) -> Result<Vec<LineSpan>> {
+    collect_test_ranges(lang, tree, source).map(|ranges| {
+        ranges
+            .into_iter()
+            .map(|range| {
+                let (start_line, end_line) =
+                    byte_range_to_lines(source, range.start_byte, range.end_byte);
+                LineSpan::new(start_line, end_line)
+            })
+            .collect()
+    })
+}
+
+fn apply_test_tags(blocks: &mut [Block], test_spans: &[LineSpan]) {
+    for block in blocks {
+        if test_spans
+            .iter()
+            .any(|test_span| block.line_span().overlaps(test_span))
+            && !block.has_tag("test")
+        {
+            block.tags.push("test".to_string());
+        }
+    }
 }
 
 fn next_named_sibling_of_kind<'a>(
@@ -1099,10 +1338,6 @@ fn collect_shell_test_ranges(
     Ok(())
 }
 
-fn is_test_span(ranges: &[ByteSpan], block_span: ByteSpan) -> bool {
-    ranges.iter().any(|range| range.overlaps(&block_span))
-}
-
 fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
     let pre = &source[..start];
     let start_line = pre.lines().count();
@@ -1123,14 +1358,26 @@ fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize)
 mod tests {
     use super::*;
 
+    fn split_result(content: &str, language: Language) -> BlockSplitResult {
+        split(content, language)
+    }
+
+    fn split_blocks(content: &str, language: Language) -> Vec<Block> {
+        split_result(content, language).blocks
+    }
+
     #[test]
     fn test_rust_test_detection() {
         let content = "#[test]
 fn test_foo() {}
 ";
-        let blocks = split(content, Language::Rust).unwrap();
-        assert!(!blocks.is_empty());
-        let test_block = blocks.iter().find(|b| b.content.contains("fn test_foo"));
+        let result = split_result(content, Language::Rust);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        assert!(!result.blocks.is_empty());
+        let test_block = result
+            .blocks
+            .iter()
+            .find(|b| b.content.contains("fn test_foo"));
         assert!(test_block.is_some());
         assert!(test_block.unwrap().tags.contains(&"test".to_string()));
     }
@@ -1143,16 +1390,22 @@ mod tests {
     fn test_inner() {}
 }
 ";
-        let blocks = split(content, Language::Rust).unwrap();
-        assert!(!blocks.is_empty());
-        let module_block = blocks.iter().find(|b| b.content.contains("mod tests"));
+        let result = split_result(content, Language::Rust);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        assert!(!result.blocks.is_empty());
+        let module_block = result
+            .blocks
+            .iter()
+            .find(|b| b.content.contains("mod tests"));
         assert!(module_block.is_some());
         assert!(module_block.unwrap().tags.contains(&"test".to_string()));
     }
 
     fn assert_paragraph_split(language: Language) {
         let content = "Para 1.\n\nPara 2.";
-        let blocks = split(content, language).unwrap();
+        let result = split_result(content, language);
+        assert_eq!(result.strategy, BlockSplitStrategy::Textual);
+        let blocks = result.blocks;
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].kind, BlockKind::Paragraph);
         assert_eq!(blocks[1].kind, BlockKind::Gap);
@@ -1177,8 +1430,12 @@ mod tests {
 
     #[test]
     fn test_split_markdown_headers() {
-        let content = "# Section 1\nText.\n# Section 2\nMore text.";
-        let blocks = split(content, Language::Markdown).unwrap();
+        let result = split_result(
+            "# Section 1\nText.\n# Section 2\nMore text.",
+            Language::Markdown,
+        );
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].kind, BlockKind::Section);
         assert_eq!(blocks[0].content, "# Section 1\nText.\n");
@@ -1188,12 +1445,9 @@ mod tests {
 
     #[test]
     fn test_split_markdown_hierarchy() {
-        let content = "# Root\n## Sub\n### SubSub\n# Root 2";
-        let blocks = split(content, Language::Markdown).unwrap();
+        let blocks = split_blocks("# Root\n## Sub\n### SubSub\n# Root 2", Language::Markdown);
         assert_eq!(blocks.len(), 2);
-        // First block contains Root, Sub, SubSub
         assert_eq!(blocks[0].content, "# Root\n## Sub\n### SubSub\n");
-        // Second block contains Root 2
         assert_eq!(blocks[1].content, "# Root 2");
     }
 
@@ -1210,7 +1464,9 @@ mod tests {
     #[test]
     fn test_split_nix_attrset_bindings() {
         let content = "{\n  foo = \"bar\";\n  inherit pkgs;\n}\n";
-        let blocks = split(content, Language::Nix).unwrap();
+        let result = split_result(content, Language::Nix);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].kind, BlockKind::Variable);
         assert!(blocks[0].content.contains("foo = \"bar\";"));
@@ -1229,7 +1485,9 @@ mod tests {
     fn test_split_nix_function_let_and_body_attrset() {
         let content =
             "{ pkgs }:\nlet\n  foo = \"bar\";\n  inherit pkgs;\nin {\n  inherit foo;\n}\n";
-        let blocks = split(content, Language::Nix).unwrap();
+        let result = split_result(content, Language::Nix);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
         let kinds: Vec<_> = blocks.iter().map(|block| block.kind).collect();
         assert_eq!(
             kinds,
@@ -1256,7 +1514,9 @@ mod tests {
     #[test]
     fn test_split_nix_falls_back_to_single_code_block_for_simple_if_expression() {
         let content = "if enabled then package else fallback\n";
-        let blocks = split(content, Language::Nix).unwrap();
+        let result = split_result(content, Language::Nix);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Code);
         assert_eq!(blocks[0].content, content);
@@ -1265,7 +1525,7 @@ mod tests {
     #[test]
     fn test_split_nix_comment_only_file_is_comment_block() {
         let content = "# comment only\n# still comment\n";
-        let blocks = split(content, Language::Nix).unwrap();
+        let blocks = split_blocks(content, Language::Nix);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Comment);
         assert_eq!(blocks[0].content, content);
@@ -1278,16 +1538,18 @@ mod tests {
 
     #[test]
     fn test_split_rust_simple() {
-        let content = "fn foo() {}\n\nstruct Bar;";
-        let blocks = split(content, Language::Rust).unwrap();
-        // Tree-sitter splitting is complex but should return items
+        let blocks = split_blocks("fn foo() {}\n\nstruct Bar;", Language::Rust);
         assert!(!blocks.is_empty());
     }
 
     #[test]
     fn test_split_go_simple_maps_import_struct_and_function() {
-        let content = "package main\n\nimport \"fmt\"\n\ntype Worker struct{}\n\nfunc run() {\n    fmt.Println(\"ok\")\n}\n";
-        let blocks = split(content, Language::Go).unwrap();
+        let result = split_result(
+            "package main\n\nimport \"fmt\"\n\ntype Worker struct{}\n\nfunc run() {\n    fmt.Println(\"ok\")\n}\n",
+            Language::Go,
+        );
+        assert_eq!(result.strategy, BlockSplitStrategy::Heuristic);
+        let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Struct));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
@@ -1295,8 +1557,12 @@ mod tests {
 
     #[test]
     fn test_split_cpp_simple_maps_import_class_and_function() {
-        let content = "#include <vector>\n\nclass Worker {\npublic:\n    int value = 1;\n};\n\nint run() {\n    return 1;\n}\n";
-        let blocks = split(content, Language::Cpp).unwrap();
+        let result = split_result(
+            "#include <vector>\n\nclass Worker {\npublic:\n    int value = 1;\n};\n\nint run() {\n    return 1;\n}\n",
+            Language::Cpp,
+        );
+        assert_eq!(result.strategy, BlockSplitStrategy::Heuristic);
+        let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
@@ -1304,8 +1570,7 @@ mod tests {
 
     #[test]
     fn test_block_hashes_match_content_rust() {
-        let content = "use std::fmt;\n\nfn foo() {}\n";
-        let blocks = split(content, Language::Rust).unwrap();
+        let blocks = split_blocks("use std::fmt;\n\nfn foo() {}\n", Language::Rust);
         assert!(!blocks.is_empty());
         assert_block_hashes_match(&blocks);
         assert!(!blocks.iter().any(|block| block.kind == BlockKind::Gap));
@@ -1314,7 +1579,7 @@ mod tests {
     #[test]
     fn test_block_hashes_match_content_markdown() {
         let content = "# Title\nParagraph text.\n";
-        let blocks = split(content, Language::Markdown).unwrap();
+        let blocks = split_blocks(content, Language::Markdown);
         assert_eq!(blocks.len(), 1);
         assert_block_hashes_match(&blocks);
         assert_eq!(blocks[0].content, content);
@@ -1322,8 +1587,10 @@ mod tests {
 
     #[test]
     fn test_split_rust_impl_methods() {
-        let content = "struct Foo;\n\nimpl Foo {\n    fn read_heavy(&self) {}\n    const MAX: usize = 1;\n}\n";
-        let blocks = split(content, Language::Rust).unwrap();
+        let blocks = split_blocks(
+            "struct Foo;\n\nimpl Foo {\n    fn read_heavy(&self) {}\n    const MAX: usize = 1;\n}\n",
+            Language::Rust,
+        );
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Impl));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
@@ -1331,16 +1598,61 @@ mod tests {
 
     #[test]
     fn test_split_rust_top_level_static_maps_to_static_kind() {
-        let content = "static MAX: usize = 1;\n";
-        let blocks = split(content, Language::Rust).unwrap();
+        let blocks = split_blocks("static MAX: usize = 1;\n", Language::Rust);
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Static));
     }
 
     #[test]
     fn test_markdown_discards_whitespace_only_preamble() {
-        let content = "\n\n# Title\nBody";
-        let blocks = split(content, Language::Markdown).unwrap();
+        let blocks = split_blocks("\n\n# Title\nBody", Language::Markdown);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].content, "# Title\nBody");
+    }
+
+    #[test]
+    fn test_split_unsupported_code_language_falls_back_to_code_blocks() {
+        let content = "(message \"hello\")\n\n(defun greet ()\n  (message \"hi\"))\n";
+        let result = split_result(content, Language::Elisp);
+        assert_eq!(result.strategy, BlockSplitStrategy::UnsupportedCode);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.reason.contains("unsupported language"))
+        );
+        let blocks = result.blocks;
+        assert!(!blocks.is_empty());
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::CodeParagraph)
+        );
+    }
+
+    #[test]
+    fn test_split_whitespace_only_code_returns_gap_block() {
+        let content = "\n\n    \n";
+        let result = split_result(content, Language::Rust);
+        assert_eq!(result.strategy, BlockSplitStrategy::FallbackCode);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.reason.contains("returned no blocks"))
+        );
+        let blocks = result.blocks;
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Gap);
+        assert_eq!(blocks[0].content, content);
+    }
+
+    #[test]
+    fn test_split_includes_optimization_pipeline() {
+        let result = split_result("use std::fmt;\n\nuse std::io;\n", Language::Rust);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.into_review_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Imports);
+        assert_eq!(blocks[0].content, "use std::fmt;\nuse std::io;");
     }
 }

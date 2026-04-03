@@ -307,6 +307,7 @@ impl ByteSpan {
         }
     }
 
+    #[allow(dead_code)]
     pub fn overlaps(&self, other: &ByteSpan) -> bool {
         self.start_byte < other.end_byte && self.end_byte > other.start_byte
     }
