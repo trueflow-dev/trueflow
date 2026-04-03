@@ -82,4 +82,4 @@
 ## Project Management
 - Status: planning complete, awaiting implementation.
 - Completed: initial design brief, layout and palette guidance, repo layout decision.
-- Next: add `trueflow.toml` website data, scaffold Axum crate, implement SSR templates + CSS.
+- Next: add `trueflow.metadata.toml` website data, scaffold Axum crate, implement SSR templates + CSS.

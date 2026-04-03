@@ -277,7 +277,7 @@ fn review_content_source(targets: &[ReviewTarget]) -> Result<ReviewContentSource
                         ));
                     }
                     Some(_) => {}
-                    None => revision = Some(candidate.to_string()),
+                    None => revision = Some(candidate.clone()),
                 }
             }
             ReviewTarget::RevisionRange { end, .. } => {
@@ -294,7 +294,7 @@ fn review_content_source(targets: &[ReviewTarget]) -> Result<ReviewContentSource
                         ));
                     }
                     Some(_) => {}
-                    None => revision = Some(end.to_string()),
+                    None => revision = Some(end.clone()),
                 }
             }
             ReviewTarget::File(_) => {}

@@ -2,172 +2,64 @@
 
 ![trueflow logo](./design/trueflow.jpg)
 
-**Warning:** This project is partially an experiment in how far one can take the
-philosophy of agent-based implementation. I heavily guide the agents and provide
-the designs and overall dev environment choices, but the code itself, primarily
-generated.
+Trueflow is an experimental semantic code review tool.
 
-## Motivation
+It turns files or diffs into reviewable **blocks**, lets you review those blocks
+in a CLI/TUI/Emacs workflow, and stores review state separately from commit
+history.
 
-Reviewing is becoming the bottleneck to shipping.
+## What it does
 
-Things that are now truer than ever:
+- scans a working tree or revision range into semantic review blocks
+- lets you approve, reject, comment on, and split blocks
+- stores review records in `.trueflow/reviews.jsonl`
+- exports review feedback for an agent or other automation
 
-- We cannot review all code.
-- Existing code review tools are insufficient.
-- Some code is more important to be reviewed than other code.
-- We need tools to understand what has and has not been reviewed.
+## Current model
 
-Some folks say that we won't need any code review, that agents will review
-everything. I think it's true that agents will do a lot of the reviewing, maybe
-even most of it, but I don't think we can eschew human review entirely, ever.
-If we accept that bet as true, then it becomes imperative that we have the right
-tools to review the right code, and to understand what has and hasn't been
-reviewed.
+- The canonical review unit is a **block**, not a textual diff hunk.
+- Runtime config lives in `trueflow.toml`.
+- In this repo, `trueflow.metadata.toml` is brand/site metadata, not runtime config.
+- The current public CLI field name is still `fingerprint`.
+- Diff fingerprints and content-addressed block identities both exist today and
+  are not fully unified yet.
 
-## Design
+## Quick start
 
-Trueflow is a CLI-driven engine/tool for a highly efficient code review workflow.
+```sh
+# Review current changes as JSON
+trueflow review --json
 
-It wants to be responsible for the following things:
+# Launch the TUI
+trueflow tui
 
-- Presenting code in a highly reviewable format, optimized for efficiency.
-- Ordering the review items in a optimal way.
-- Keeping track of what was reviewed, by whom, and what lens it was reviewed from.
+# Inspect and split a block
+trueflow inspect --fingerprint <fp> --split
 
-### Semantic code review
-
-If you're familiar with git terminology, git has hunks. Hunks are like sections
-of a file that have changed. In `trueflow`, we have `blocks`. `Blocks` are
-semantic -- they aren't just text, but they have a `BlockType`. For example, in
-a markdown document, we might show you `Paragraphs` as a primitive for review.
-Similarly, for code, we might show you a changed or added `Function` or `Struct`
-as a `Block` of review.
-
-### Internal data structure: Merkle tree of blocks
-
-A file creates the root of a merkle sub-tree of `blocks`. Each `Block` is a
-[content-addressed](https://en.wikipedia.org/wiki/Content-addressable_storage)
-hash of its canonicalized content. If you review a block, and then it gets
-formatted, it's still marked as reviewed. Exceptional engineers ignore
-whitespace changes in review diffs anyway; why not just canonicalize them out of
-the review?
-
-### Blocks are splittable into subblocks
-
-If you're reviewing a `Block`, and it's too long to review,  you can `split` the
-block (UX: press 's'). Then, we split the block into its constituent subblocks.
-
-You can imagine that there's always a recursive relationship of `Blocks` to
-sub-blocks.
-
-For example, an example hierarchy of block types:
-
-```
-File
-  ↘ 
-   ImportBlock
-  ↘ 
-   Constant
-   Constant
-  ↘ 
-   Function
-    ↘ 
-     FunctionSignature
-     CodeParagraph
-     CodeParagraph
-     Comment
-     CodeParagraph
-     CodeParagraph
+# Export review feedback
+trueflow feedback --format xml
 ```
 
-Imagine for example, the function in the above file is presented to you for
-review, and it's just too long to digest at once. You can press 's' and
-`trueflow` splits it into sub-blocks, and then you start reviewing one item at a
-time. We show you the sub-blocks in order. Trueflow keeps track of what you've
-reviewed, and you can comment independently on any block.
+## Filter and scope review
 
-## Development
-
-### Test Coverage
-
-To generate a test coverage report (requires `cargo-llvm-cov`):
-
-```shell
-just coverage
-```
-
-The report will be available at `trueflow/target/llvm-cov/html/index.html`.
-
-## UX
-
-### TUI
-
-We expose a TUI. It feeds you a stream of unreviewed blocks. You press a single
-key to perform a review action on the block.
-
-``` 
- 'a' => approve the block
- 'c' => comment on the block (feeds back into the agent)
- 's' => split the block into sub-blocks, and recurse into them
- 'r' => toggle speed-reading mode for the current block
- 'q' => quit the review session (all progress is saved)
-```
-
-When speed-reading mode is active:
-
-```
- 'Space' => play/pause autoplay
- 'j' => previous phrase
- 'l' => next phrase
- '-' / '=' => decrease/increase WPM
- '[' / ']' => decrease/increase chunk size (words per phrase)
- '0' => reset WPM/chunk to persisted defaults
- 'Esc' => exit speed-reading mode
-```
-
-### Emacs package (magit-like)
-
-``` 
- 'a' => approve the block
- 'c' => comment on the block (feeds back into the agent)
- 's' => split the block into sub-blocks, and recurse into them
- 'q' => quit the review session (all progress is saved)
-```
-
-## Usage
-
-### Filter block types
-
-You can limit which block kinds appear in `review` and `feedback` by using the
-`--only` or `--exclude` flags. Block kinds are case-insensitive and match the
-semantic kinds shown in JSON output (e.g. `function`, `struct`, `gap`,
-`comment`, `paragraph`).
-
-```shell
+```sh
 # Review only functions
 trueflow review --all --only function --json
 
 # Exclude gaps and comments from feedback output
 trueflow feedback --exclude gap --exclude comment
-```
 
-### Scope TUI review targets
-
-`trueflow tui` supports the same targeting/filtering surface as `review`.
-
-```shell
-# Launch TUI directly scoped to one file
+# Launch the TUI scoped to one file
 trueflow tui --target file:src/lib.rs
 
-# Scope by revision
-trueflow tui --target rev:abc1234
-
-# Scope by revision range with additional block filtering
+# Scope the TUI to a revision range with additional filtering
 trueflow tui --target rev:abc1234..def5678 --only function --exclude comment
 ```
 
-### Configure defaults with trueflow.toml
+Block kinds are case-insensitive and match the semantic kinds shown in JSON
+output.
+
+## Runtime config
 
 Trueflow looks for a `trueflow.toml` file in the current directory or any parent
 folder. It applies defaults for `review` and `feedback` unless overridden by CLI
@@ -189,34 +81,40 @@ default_chunk_words = 2
 
 See `trueflow.example.toml` for the default settings.
 
-## Feedback
+## Interfaces
 
-After performing a review, all progress is saved to a database in a local file.
-This file is an append-only database of `review` objects that point to the
-block's sha256 w/ other metadata.
+### TUI
 
-``` shell
-trueflow feedback
+Main review actions:
+
+- `a` approve
+- `x` reject
+- `c` comment
+- `s` split
+- `r` toggle speed-reading
+- `q` quit
+
+### Emacs
+
+The Emacs frontend provides a Magit-like status view and focused review flow.
+Key actions include approve/reject/comment/split/refresh/review-start.
+
+## Feedback and metadata
+
+`trueflow feedback` exports review history for reuse by an agent or another
+consumer.
+
+At the public CLI/API boundary, the review-target identifier is still named
+`fingerprint`. That currently coexists with separate diff fingerprints.
+
+Review records can also carry metadata such as reviewer identity and review
+labels.
+
+## Development
+
+```sh
+nix develop -c just check
+nix develop -c just coverage
 ```
 
-Generates an Agent-optimized prompt output to feedback into the agent, to close
-the loop from review back into executing on the requested changes (or questions,
-etc.)
-
-Naturally, we have plans to also enable modal `feedback`, e.g. `feedback
---github` to post as comments on a PR or something, should the need arise.
-
-
-## Metadata
-
-The append-only database of reviews includes metadata.
-
-- Reviewer `identity` (e.g. email, pgp key, signature)
-- Review `label`. (e.g. `security`, `general`, `legal`)
-
-The idea behind labels:
-
-We can have agent reviewers use this system, e.g. `code-simplifier` could be an
-agent label. 2. We can have specialized human reviews, e.g. `security`, `legal`,
-`code`, `general`, `product`. Then you can understand the review posture of your
-code interdisciplinarily.
+The coverage report is written to `trueflow/target/llvm-cov/html/index.html`.

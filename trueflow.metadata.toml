@@ -1,4 +1,5 @@
-# TRUEFLOW BRAND CONFIGURATION
+# TRUEFLOW BRAND / WEBSITE METADATA
+# This file is not runtime CLI config; `trueflow.toml` remains the runtime config name.
 # Metaphor: Laminar Flow (Review without resistance)
 
 [meta]

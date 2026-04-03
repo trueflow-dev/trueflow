@@ -87,15 +87,15 @@ fn test_all_languages_nix_blocks_are_structural() -> Result<()> {
         .collect::<Vec<_>>();
 
     assert!(
-        kinds.iter().any(|kind| *kind == "FunctionSignature"),
+        kinds.contains(&"FunctionSignature"),
         "expected a function signature block in main.nix (kinds={kinds:?})"
     );
     assert!(
-        kinds.iter().any(|kind| *kind == "variable"),
+        kinds.contains(&"variable"),
         "expected a variable block in main.nix (kinds={kinds:?})"
     );
     assert!(
-        !kinds.iter().any(|kind| *kind == "Paragraph"),
+        !kinds.contains(&"Paragraph"),
         "did not expect paragraph fallback blocks in main.nix (kinds={kinds:?})"
     );
 

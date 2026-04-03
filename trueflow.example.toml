@@ -1,4 +1,5 @@
-# trueflow configuration (defaults)
+# trueflow runtime configuration (defaults)
+# Project brand/site metadata lives separately in `trueflow.metadata.toml`.
 
 [review]
 # Only include specific block kinds (case-insensitive). Empty means all.

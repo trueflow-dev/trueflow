@@ -7,15 +7,15 @@
   reviews from many individuals (across companies), and we can cryptographically
   verify who reviewed what.
 
-* Emacs Package (vet.el)
+* Emacs Package (trueflow.el)
 ** TODO [High] Basic Infrastructure
-   - [ ] Define `vet-mode` and basic buffer setup.
-   - [ ] Implement `vet-core.el` wrapper for CLI calls (`trueflow diff`, `trueflow mark`, `trueflow sync`).
+   - [ ] Define `trueflow-mode` and basic buffer setup.
+   - [ ] Implement `trueflow.el` wrapper for CLI calls (`trueflow diff`, `trueflow mark`, `trueflow sync`).
    - [ ] Define customization groups (executable path, faces).
 
-** TODO [High] Status View (`vet-status`)
-   - [ ] Render "Unreviewed Hunks" section.
-   - [ ] Implement `vet-refresh` to parse JSON from CLI.
+** TODO [High] Status View (`trueflow-status`)
+   - [ ] Render "Unreviewed Blocks" section.
+   - [ ] Implement `trueflow-refresh` to parse JSON from CLI.
    - [ ] Bind `g` to refresh, `q` to quit window.
 
 ** TODO [High] Review Actions
@@ -27,8 +27,8 @@
    - [ ] Show reviewed vs remaining counts in bottom-right (e.g., 5 / 15), with green reviewed and yellow remaining.
 
 ** TODO [Medium] Iterative Review Mode
-   - [ ] Command `vet-review-start` (bound to `r`).
-   - [ ] Walk through hunks one by one.
+   - [ ] Command `trueflow-review-start` (bound to `r`).
+   - [ ] Walk through blocks one by one.
    - [ ] Implement side-by-side view (Diff vs New Content).
 
 ** TODO [High] Inline Editing
@@ -37,9 +37,9 @@
      - *Draft Plan:* Use `ediff` or a custom overlay that writes back to file on `C-c C-c`.
      - *Alternative:* Use `recursive-edit` in the file buffer.
 
-* CLI Improvements (vet-cli)
+* CLI Improvements (trueflow CLI)
 ** TODO [Medium] `trueflow check`
-   - [ ] Implement CI gate logic (exit 1 if unreviewed hunks exist).
+   - [ ] Implement CI gate logic (exit 1 if unreviewed blocks exist).
 
 * Attestation & Verification
 ** TODO [Medium] Add Record::new constructor in store.rs
@@ -116,7 +116,7 @@ Two things:
    reverse-chronological order, like a trueflow log command, defaults to say the
    most recent 16 or something.
 ** TODO [Medium] Diff vs new-content investigation
-   - [ ] Define and verify how we present hunks versus reconstructed new content.
+   - [ ] Define and verify how we present textual diff chunks versus reconstructed new content.
 ** TODO [Medium] jj integration
    - [ ] Explore how Jujutsu can improve diffing, review, and syncing flows.
 ** TODO [Medium] Website + docs

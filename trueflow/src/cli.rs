@@ -24,15 +24,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Show unreviewed hunks (semantic diff)
+    /// Show unreviewed blocks (semantic diff view)
     Diff {
         /// Output format (default is text, use --json for machine parsing)
         #[arg(long)]
         json: bool,
     },
-    /// Mark a hunk with a verdict
+    /// Mark a review target with a verdict
     Mark {
-        /// Content-based fingerprint of the hunk
+        /// Current CLI field name for the review-target identifier
+        /// (content-addressed block hash; distinct from diff fingerprints)
         #[arg(long)]
         fingerprint: String,
 
@@ -118,9 +119,10 @@ pub enum Commands {
         #[arg(long)]
         exclude: Vec<String>,
     },
-    /// Inspect a block (and optionally split it)
+    /// Inspect a block review target (and optionally split it)
     Inspect {
-        /// Block fingerprint (hash)
+        /// Current CLI field name for the block identifier
+        /// (content-addressed block hash)
         #[arg(long)]
         fingerprint: String,
 

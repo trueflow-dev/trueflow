@@ -6,7 +6,7 @@
 #+STARTUP: content hidestars
 
 * 1. Overview
-  **Anchor** (formerly Vibecheck) is a semantic code review system. It decouples review status
+  **Trueflow** (historically called Anchor / Vibecheck) is a semantic code review system. It decouples review status
   from git history, relying instead on **Content-Addressed Identity**.
 
   *Core Philosophy:*
@@ -14,7 +14,7 @@
   2.  **Git-Independent:** The system works on any directory of files. Git is just a transport layer.
   3.  **Merkle-Based:** Files are trees of "Blocks". Reviews can attach to any node in the tree (Line, Block, File).
 
-* 2. Architecture: The Anchor Model
+* 2. Architecture: The Trueflow Model
   
 ** 2.1 The Hierarchy
    The system sees a repository as a forest of Merkle Trees.
@@ -56,7 +56,7 @@
 * 3. Workflows
 
 ** 3.1 "Cold Start" (Audit Mode)
-   - User runs `anchor scan`.
+   - User runs `trueflow scan`.
    - System computes Merkle Trees for all files in the directory.
    - System queries DB: "Which nodes in this tree are NOT in the Approved Set?"
    - Result: A list of unreviewed Blocks (e.g., "Function X is unreviewed").
@@ -64,7 +64,7 @@
    - *Stats:* "Coverage = 85% of tree nodes approved."
 
 ** 3.2 "Diff Mode" (Incremental)
-   - User runs `anchor diff`.
+   - User runs `trueflow diff`.
    - System calculates `Merkle(Disk)` vs `Merkle(HEAD)`.
    - Identification of changed Blocks.
    - Filters out Blocks that are already approved (even if they moved).
@@ -91,11 +91,12 @@
 
 * 6. FAQ / Design Questions
 
-** How do we handle identical hunks (boilerplate)?
-   - *Issue:* Identical code blocks appearing in multiple files produce the same fingerprint.
+** How do we handle identical blocks (boilerplate)?
+   - *Issue:* Identical code blocks appearing in multiple files produce the same content-addressed review target.
+   - *Current CLI/API note:* The public field name for this review-target identifier is still ~fingerprint~, even when it refers to a block/content hash.
    - *Decision:* By default, they share the same review status (approving one approves all).
    - *Override:* If they require separate context, the ~path_hint~ metadata helps the reviewer
-     identify the location. Future iterations could add a ~unique_salt~ to the fingerprint
+     identify the location. Future iterations could add a ~unique_salt~ to the review-target identifier
      if strictly separate reviews are required for identical content.
 
 ** What counts as "whitespace normalization"?
@@ -105,7 +106,7 @@
    - *Goal:* `int x = 1;` and `int x=1;` should NOT match, but indentation changes should match.
 
 ** Conflict Resolution
-   - *Scenario:* Two users push to ~vet-db~ simultaneously.
+   - *Scenario:* Two users push to the configured storage branch simultaneously.
    - *Strategy:* Git handles the text merge of JSONL (union).
    - *Logical Conflict:* User A approves, User B rejects.
    - *Resolution:* Both records exist. The UI aggregates them.
@@ -118,6 +119,6 @@
 
 ** CI Integration
    - *MVP:* ~trueflow check~ binary runs in CI.
-   - *Logic:* Fetches ~vet-db~, computes local hashes of ~src/~.
-   - *Fail:* If any hunk in the PR (base..HEAD) is not "approved" in the DB.
+   - *Logic:* Fetches the configured storage branch, computes local hashes of ~src/~.
+   - *Fail:* If any block in the PR (base..HEAD) is not "approved" in the DB.
    - *Trusted:* Start informational. Later, enforce GPG signatures on review records.
