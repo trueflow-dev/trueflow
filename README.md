@@ -106,8 +106,9 @@ Key actions include approve/reject/comment/split/refresh/review-start.
 `trueflow feedback` exports review history for reuse by an agent or another
 consumer.
 
-At the public CLI/API boundary, the review-target identifier is still named
-`fingerprint`. That currently coexists with separate diff fingerprints.
+The current public CLI/API field name for a review target is still
+`fingerprint`. That currently coexists with separate diff fingerprints, so the
+identity surface is not fully unified yet.
 
 Review records can also carry metadata such as reviewer identity and review
 labels.
