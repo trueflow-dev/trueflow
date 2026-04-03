@@ -70,30 +70,7 @@ pub enum BlockState {
     Unknown,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
-pub struct ContentHash(String);
-
-impl ContentHash {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for ContentHash {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<&str> for ContentHash {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
+pub use crate::hashing::ContentHash;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
 pub struct DiffFingerprint(String);

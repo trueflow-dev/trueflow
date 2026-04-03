@@ -1,7 +1,7 @@
 use crate::analysis::{self, FileType, Language};
 use crate::block::{Block, BlockKind, FileState};
 use crate::block_splitter;
-use crate::hashing::hash_str;
+use crate::hashing::{ContentHash, hash_str};
 use crate::optimizer;
 use crate::path_utils;
 use crate::text_split::split_by_paragraph_breaks;
@@ -305,7 +305,7 @@ fn process_file(root: &Path, path: &Path) -> Result<FileState> {
         return Ok(FileState {
             path: normalized_path,
             language: Language::Unknown,
-            file_hash: "binary_skipped".to_string(),
+            file_hash: ContentHash::new("binary_skipped"),
             blocks: Vec::new(),
         });
     }
@@ -347,9 +347,9 @@ fn process_file(root: &Path, path: &Path) -> Result<FileState> {
     // Compute file hash (Merkle root of block hashes)
     let mut hasher = Sha256::new();
     for block in &blocks {
-        hasher.update(&block.hash);
+        hasher.update(block.hash.as_str());
     }
-    let file_hash = format!("{:x}", hasher.finalize());
+    let file_hash = ContentHash::new(format!("{:x}", hasher.finalize()));
 
     Ok(FileState {
         path: normalized_path,
@@ -423,7 +423,7 @@ fn create_fallback_block(
 ) -> Block {
     let (start_line, end_line) = byte_range_to_lines(full_source, start, end);
     Block {
-        hash: hash_str(chunk),
+        hash: ContentHash::from_content(chunk),
         content: chunk.to_string(),
         kind,
         tags: Vec::new(),

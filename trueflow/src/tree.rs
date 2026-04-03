@@ -1,6 +1,6 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, FileState};
-use crate::hashing::hash_str;
+use crate::hashing::{ContentHash, hash_str};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -56,7 +56,7 @@ pub struct TreeNode {
     pub kind: TreeNodeKind,
     pub name: String,
     pub path: String,
-    pub hash: String,
+    pub hash: ContentHash,
     pub children: Vec<TreeNodeId>,
     pub block: Option<Block>,
     pub language: Option<Language>,
@@ -66,7 +66,8 @@ pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
     nodes_by_path: HashMap<String, TreeNodeId>,
-    block_nodes_by_path_hash_start: HashMap<String, HashMap<String, HashMap<usize, TreeNodeId>>>,
+    block_nodes_by_path_hash_start:
+        HashMap<String, HashMap<ContentHash, HashMap<usize, TreeNodeId>>>,
     #[allow(dead_code)]
     file_paths: HashSet<String>,
 }
@@ -134,7 +135,7 @@ impl Tree {
     pub fn find_block_node(&self, path: &str, block: &Block) -> Option<TreeNodeId> {
         self.block_nodes_by_path_hash_start
             .get(path)?
-            .get(block.hash.as_str())?
+            .get(&block.hash)?
             .get(&block.start_line)
             .copied()
     }
@@ -148,7 +149,7 @@ impl Tree {
         let mut current = Some(id);
         while let Some(node_id) = current {
             let node = self.node(node_id);
-            if approved_hashes.contains(&node.hash) {
+            if approved_hashes.contains(node.hash.as_str()) {
                 return true;
             }
             current = node.parent;
@@ -180,7 +181,7 @@ impl TreeBuilder {
             kind: TreeNodeKind::Root,
             name: "Root".to_string(),
             path: String::new(),
-            hash: String::new(),
+            hash: ContentHash::default(),
             children: Vec::new(),
             block: None,
             language: None,
@@ -209,12 +210,12 @@ impl TreeBuilder {
         parent: TreeNodeId,
         name: String,
         path: String,
-        hash: String,
+        hash: impl Into<ContentHash>,
         language: Language,
     ) -> TreeNodeId {
         let id = self.add_node(parent, TreeNodeKind::File, name, path);
         if let Some(node) = self.nodes.get_mut(id.0) {
-            node.hash = hash;
+            node.hash = hash.into();
             node.language = Some(language);
         }
         id
@@ -255,7 +256,7 @@ impl TreeBuilder {
             kind,
             name,
             path,
-            hash: String::new(),
+            hash: ContentHash::default(),
             children: Vec::new(),
             block: None,
             language: None,
@@ -321,7 +322,7 @@ impl TreeBuilder {
             return;
         }
 
-        let mut entries: Vec<(String, String)> = children
+        let mut entries: Vec<(String, ContentHash)> = children
             .iter()
             .filter_map(|child| {
                 let node = &self.nodes[child.0];
@@ -338,17 +339,17 @@ impl TreeBuilder {
         for (name, hash) in entries {
             concatenated.push_str(&name);
             concatenated.push(':');
-            concatenated.push_str(&hash);
+            concatenated.push_str(hash.as_str());
             concatenated.push('|');
         }
-        self.nodes[id.0].hash = hash_str(&concatenated);
+        self.nodes[id.0].hash = ContentHash::new(hash_str(&concatenated));
     }
 }
 
 fn build_block_lookup_indexes(
     nodes: &[TreeNode],
-) -> HashMap<String, HashMap<String, HashMap<usize, TreeNodeId>>> {
-    let mut by_path_hash_start: HashMap<String, HashMap<String, HashMap<usize, TreeNodeId>>> =
+) -> HashMap<String, HashMap<ContentHash, HashMap<usize, TreeNodeId>>> {
+    let mut by_path_hash_start: HashMap<String, HashMap<ContentHash, HashMap<usize, TreeNodeId>>> =
         HashMap::new();
 
     for node in nodes {
@@ -465,7 +466,7 @@ mod tests {
         let files = vec![FileState {
             path: "src/lib.rs".to_string(),
             language: Language::Rust,
-            file_hash: "file-hash".to_string(),
+            file_hash: ContentHash::new("file-hash"),
             blocks: vec![first.clone(), second.clone()],
         }];
 

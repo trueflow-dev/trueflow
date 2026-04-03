@@ -1,6 +1,7 @@
 use crate::analysis::Language;
 use crate::block::{Block, FileState};
 use crate::block_splitter;
+use crate::hashing::ContentHash;
 use crate::path_utils;
 use crate::scanner;
 use anyhow::{Context, Result};
@@ -143,7 +144,9 @@ pub fn block_state_for_path(
 
     for candidate in &candidate_paths {
         if let Ok(blocks) = head_blocks_for_path(repo, candidate)
-            && blocks.iter().any(|block| block.hash == fingerprint)
+            && blocks
+                .iter()
+                .any(|block| block.hash.as_str() == fingerprint)
         {
             tracing::debug!(
                 path_hint = %path,
@@ -261,7 +264,7 @@ fn file_state_for_path_in_tree(
             return Ok(Some(FileState {
                 path: path_utils::normalize_path_str(output_path),
                 language: Language::Unknown,
-                file_hash: "binary_skipped".to_string(),
+                file_hash: ContentHash::new("binary_skipped"),
                 blocks: Vec::new(),
             }));
         }
@@ -276,9 +279,9 @@ fn file_state_for_path_in_tree(
 
     let mut hasher = Sha256::new();
     for block in &blocks {
-        hasher.update(&block.hash);
+        hasher.update(block.hash.as_str());
     }
-    let file_hash = format!("{:x}", hasher.finalize());
+    let file_hash = ContentHash::new(format!("{:x}", hasher.finalize()));
 
     Ok(Some(FileState {
         path: path_utils::normalize_path_str(output_path),
@@ -860,7 +863,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -934,7 +937,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -963,7 +966,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1017,7 +1020,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1070,7 +1073,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1131,7 +1134,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1158,7 +1161,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1185,7 +1188,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1212,7 +1215,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1239,7 +1242,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1269,7 +1272,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1299,7 +1302,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1329,7 +1332,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
@@ -1359,7 +1362,7 @@ mod tests {
         use crate::block::{Block, BlockKind};
 
         let block = Block {
-            hash: String::new(),
+            hash: ContentHash::default(),
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],

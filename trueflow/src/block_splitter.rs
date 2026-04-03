@@ -1,7 +1,7 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::complexity;
-use crate::hashing::hash_str;
+use crate::hashing::ContentHash;
 use crate::text_split::split_by_paragraph_breaks;
 use anyhow::{Context, Result};
 use std::sync::LazyLock;
@@ -147,7 +147,7 @@ pub fn split(content: &str, lang: Language) -> Result<Vec<Block>> {
         let start_byte = child.start_byte();
         let end_byte = child.end_byte();
         let ts_kind = child.kind();
-        let is_test = is_test_span(&test_ranges, crate::block::Span::new(start_byte, end_byte));
+        let is_test = is_test_span(&test_ranges, ByteSpan::new(start_byte, end_byte));
 
         // Check if this node is an attribute or comment that should be grouped
         let is_attribute = match lang {
@@ -853,7 +853,7 @@ fn collect_rust_impl_items(
     impl_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-    test_ranges: &[crate::block::Span],
+    test_ranges: &[ByteSpan],
 ) -> Vec<Block> {
     let Some(body) = impl_node.child_by_field_name("body") else {
         return Vec::new();
@@ -887,7 +887,7 @@ fn collect_rust_impl_items(
         let block_start = pending_start.unwrap_or(start_byte);
         let node_content = &content[block_start..end_byte];
         let mut block = create_block(node_content, kind, content, block_start, end_byte, lang);
-        let is_test = is_test_span(test_ranges, crate::block::Span::new(start_byte, end_byte));
+        let is_test = is_test_span(test_ranges, ByteSpan::new(start_byte, end_byte));
         if is_test {
             block.tags.push("test".to_string());
         }
@@ -917,7 +917,7 @@ fn create_block(
     end_byte: usize,
     lang: Language,
 ) -> Block {
-    let hash = hash_str(text);
+    let hash = ContentHash::from_content(text);
     let complexity = complexity::calculate(text, lang);
 
     // Line mapping (byte -> line index)
@@ -939,8 +939,8 @@ fn collect_test_ranges(
     lang: Language,
     tree: &tree_sitter::Tree,
     source: &str,
-) -> Result<Vec<crate::block::Span>> {
-    let mut ranges: Vec<crate::block::Span> = Vec::new();
+) -> Result<Vec<ByteSpan>> {
+    let mut ranges: Vec<ByteSpan> = Vec::new();
     match lang {
         Language::Rust => {
             let mut cursor = QueryCursor::new();
@@ -956,7 +956,7 @@ fn collect_test_ranges(
                         && let Some(function_item) =
                             next_named_sibling_of_kind(capture.node, "function_item")
                     {
-                        ranges.push(crate::block::Span::new(
+                        ranges.push(ByteSpan::new(
                             function_item.start_byte(),
                             function_item.end_byte(),
                         ));
@@ -965,10 +965,7 @@ fn collect_test_ranges(
                         && attr_text.contains("test")
                         && let Some(mod_item) = next_named_sibling_of_kind(capture.node, "mod_item")
                     {
-                        ranges.push(crate::block::Span::new(
-                            mod_item.start_byte(),
-                            mod_item.end_byte(),
-                        ));
+                        ranges.push(ByteSpan::new(mod_item.start_byte(), mod_item.end_byte()));
                     }
                 }
             }
@@ -1012,7 +1009,7 @@ fn collect_python_test_ranges(
     query: &Query,
     tree: &tree_sitter::Tree,
     source: &str,
-    ranges: &mut Vec<crate::block::Span>,
+    ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
@@ -1034,13 +1031,13 @@ fn collect_python_test_ranges(
         if let (Some(name), Some(range)) = (name, func_range)
             && name.starts_with("test_")
         {
-            ranges.push(crate::block::Span::new(range.0, range.1));
+            ranges.push(ByteSpan::new(range.0, range.1));
             continue;
         }
         if let (Some(decor_text), Some(range)) = (decorator_text, func_range)
             && decor_text.contains("test_")
         {
-            ranges.push(crate::block::Span::new(range.0, range.1));
+            ranges.push(ByteSpan::new(range.0, range.1));
         }
     }
     Ok(())
@@ -1050,7 +1047,7 @@ fn collect_js_test_ranges(
     query: &Query,
     tree: &tree_sitter::Tree,
     source: &str,
-    ranges: &mut Vec<crate::block::Span>,
+    ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
@@ -1068,7 +1065,7 @@ fn collect_js_test_ranges(
         if let (Some(name), Some(range)) = (name, call_range)
             && matches!(name.as_str(), "describe" | "it" | "test")
         {
-            ranges.push(crate::block::Span::new(range.0, range.1));
+            ranges.push(ByteSpan::new(range.0, range.1));
         }
     }
     Ok(())
@@ -1078,7 +1075,7 @@ fn collect_shell_test_ranges(
     query: &Query,
     tree: &tree_sitter::Tree,
     source: &str,
-    ranges: &mut Vec<crate::block::Span>,
+    ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
@@ -1096,13 +1093,13 @@ fn collect_shell_test_ranges(
         if let (Some(name), Some(range)) = (name, func_range)
             && name.starts_with("test_")
         {
-            ranges.push(crate::block::Span::new(range.0, range.1));
+            ranges.push(ByteSpan::new(range.0, range.1));
         }
     }
     Ok(())
 }
 
-fn is_test_span(ranges: &[crate::block::Span], block_span: crate::block::Span) -> bool {
+fn is_test_span(ranges: &[ByteSpan], block_span: ByteSpan) -> bool {
     ranges.iter().any(|range| range.overlaps(&block_span))
 }
 
@@ -1169,7 +1166,7 @@ mod tests {
 
     fn assert_block_hashes_match(blocks: &[Block]) {
         for block in blocks {
-            let expected_hash = crate::hashing::hash_str(&block.content);
+            let expected_hash = crate::hashing::ContentHash::from_content(&block.content);
             assert_eq!(
                 block.hash, expected_hash,
                 "Hash mismatch for block kind {:?}:\nContent:\n{:?}",

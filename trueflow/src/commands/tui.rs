@@ -1551,9 +1551,11 @@ fn fingerprint_and_target_kind_for_node(
     node: &crate::tree::TreeNode,
 ) -> (String, ReviewTargetKind) {
     match node.kind {
-        TreeNodeKind::Root | TreeNodeKind::Directory => (node.hash.clone(), ReviewTargetKind::Tree),
-        TreeNodeKind::File => (node.hash.clone(), ReviewTargetKind::File),
-        TreeNodeKind::Block => (node.hash.clone(), ReviewTargetKind::Block),
+        TreeNodeKind::Root | TreeNodeKind::Directory => {
+            (node.hash.to_string(), ReviewTargetKind::Tree)
+        }
+        TreeNodeKind::File => (node.hash.to_string(), ReviewTargetKind::File),
+        TreeNodeKind::Block => (node.hash.to_string(), ReviewTargetKind::Block),
     }
 }
 
@@ -2078,9 +2080,10 @@ fn build_header_lines(
         lines.push(format_header_row(&node.path, palette, false));
     }
 
-    if !matches!(node.kind, TreeNodeKind::Root) && !node.hash.is_empty() {
+    let node_hash = node.hash.as_str();
+    if !matches!(node.kind, TreeNodeKind::Root) && !node_hash.is_empty() {
         lines.push(format_header_row(
-            &format!("Hash: {}", &node.hash[..node.hash.len().min(12)]),
+            &format!("Hash: {}", &node_hash[..node_hash.len().min(12)]),
             palette,
             false,
         ));
@@ -3848,7 +3851,7 @@ mod diff_scope_tests {
         );
 
         let block = Block {
-            hash: "block".to_string(),
+            hash: crate::hashing::ContentHash::new("block"),
             content: "fn main() {\n    println!(\"Hello from commit scope\");\n}".to_string(),
             kind: BlockKind::Function,
             tags: vec![],
@@ -3900,7 +3903,7 @@ mod diff_scope_tests {
         let root_node = tree.node(root);
 
         let (fingerprint, kind) = fingerprint_and_target_kind_for_node(root_node);
-        assert_eq!(fingerprint, root_node.hash);
+        assert_eq!(fingerprint, root_node.hash.to_string());
         assert_eq!(kind, ReviewTargetKind::Tree);
     }
 

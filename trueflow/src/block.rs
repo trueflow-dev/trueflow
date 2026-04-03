@@ -1,4 +1,5 @@
 use crate::analysis::Language;
+use crate::hashing::ContentHash;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -218,7 +219,7 @@ impl FromStr for BlockKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     /// The content-addressable identity of this block
-    pub hash: String,
+    pub hash: ContentHash,
 
     /// The actual text content
     pub content: String,
@@ -245,7 +246,7 @@ pub struct Block {
 impl Block {
     pub fn new(content: String, kind: BlockKind, start_line: usize, end_line: usize) -> Self {
         Self {
-            hash: crate::hashing::hash_str(&content),
+            hash: ContentHash::from_content(&content),
             content,
             kind,
             tags: Vec::new(),
@@ -255,28 +256,63 @@ impl Block {
         }
     }
 
-    pub fn span(&self) -> Span {
-        Span::new(self.start_line, self.end_line)
+    pub fn line_span(&self) -> LineSpan {
+        LineSpan::new(self.start_line, self.end_line)
+    }
+
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|candidate| candidate == tag)
+    }
+
+    pub fn is_test(&self) -> bool {
+        self.has_tag("test")
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
+pub struct LineSpan {
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
-impl Span {
-    pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+impl LineSpan {
+    pub fn new(start_line: usize, end_line: usize) -> Self {
+        Self {
+            start_line,
+            end_line,
+        }
     }
 
-    pub fn overlaps(&self, other: &Span) -> bool {
-        self.start < other.end && self.end > other.start
+    pub fn overlaps(&self, other: &LineSpan) -> bool {
+        self.start_line < other.end_line && self.end_line > other.start_line
     }
 
-    pub fn contains(&self, other: &Span) -> bool {
-        self.start <= other.start && self.end >= other.end
+    pub fn contains(&self, other: &LineSpan) -> bool {
+        self.start_line <= other.start_line && self.end_line >= other.end_line
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+impl ByteSpan {
+    pub fn new(start_byte: usize, end_byte: usize) -> Self {
+        Self {
+            start_byte,
+            end_byte,
+        }
+    }
+
+    pub fn overlaps(&self, other: &ByteSpan) -> bool {
+        self.start_byte < other.end_byte && self.end_byte > other.start_byte
+    }
+
+    #[allow(dead_code)]
+    pub fn contains(&self, other: &ByteSpan) -> bool {
+        self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
     }
 }
 
@@ -286,7 +322,7 @@ pub struct FileState {
     #[serde(default)]
     pub language: Language,
     /// The hash of the entire file (e.g. Merkle root of blocks)
-    pub file_hash: String,
+    pub file_hash: ContentHash,
     pub blocks: Vec<Block>,
 }
 
@@ -377,17 +413,45 @@ mod tests {
     }
 
     #[test]
-    fn test_span_overlap_logic() {
-        let base = Span::new(0, 10);
-        let overlap = Span::new(5, 12);
-        let touch = Span::new(10, 12);
-        let disjoint = Span::new(12, 15);
+    fn test_block_helpers_report_line_span_and_test_tag() {
+        let mut block = Block::new("fn test_thing() {}".to_string(), BlockKind::Function, 3, 7);
+        block.tags.push("test".to_string());
+        block.tags.push("integration".to_string());
+
+        assert_eq!(block.line_span(), LineSpan::new(3, 7));
+        assert!(block.has_tag("test"));
+        assert!(block.has_tag("integration"));
+        assert!(block.is_test());
+        assert!(!block.has_tag("unit"));
+    }
+
+    #[test]
+    fn test_line_span_overlap_logic() {
+        let base = LineSpan::new(0, 10);
+        let overlap = LineSpan::new(5, 12);
+        let touch = LineSpan::new(10, 12);
+        let disjoint = LineSpan::new(12, 15);
 
         assert!(base.overlaps(&overlap));
         assert!(!base.overlaps(&touch));
         assert!(!base.overlaps(&disjoint));
-        assert!(base.contains(&Span::new(0, 10)));
-        assert!(base.contains(&Span::new(2, 5)));
+        assert!(base.contains(&LineSpan::new(0, 10)));
+        assert!(base.contains(&LineSpan::new(2, 5)));
+        assert!(!base.contains(&overlap));
+    }
+
+    #[test]
+    fn test_byte_span_overlap_logic() {
+        let base = ByteSpan::new(0, 10);
+        let overlap = ByteSpan::new(5, 12);
+        let touch = ByteSpan::new(10, 12);
+        let disjoint = ByteSpan::new(12, 15);
+
+        assert!(base.overlaps(&overlap));
+        assert!(!base.overlaps(&touch));
+        assert!(!base.overlaps(&disjoint));
+        assert!(base.contains(&ByteSpan::new(0, 10)));
+        assert!(base.contains(&ByteSpan::new(2, 5)));
         assert!(!base.contains(&overlap));
     }
 }

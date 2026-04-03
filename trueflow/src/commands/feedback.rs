@@ -78,7 +78,7 @@ pub fn run(
                 }
 
                 let verdict = latest_verdict
-                    .get(&block.hash)
+                    .get(block.hash.as_str())
                     .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
@@ -99,7 +99,7 @@ pub fn run(
                 // So we only export things THAT HAVE REVIEWS.
                 // If verdict is "unreviewed", skip.
 
-                if let Some(reviews) = reviews_by_fp.get(&block.hash) {
+                if let Some(reviews) = reviews_by_fp.get(block.hash.as_str()) {
                     export_list.push(serde_json::json!({
                         "file": file.path,
                         "block": block,
@@ -132,7 +132,7 @@ pub fn run(
                 }
 
                 let verdict = latest_verdict
-                    .get(&block.hash)
+                    .get(block.hash.as_str())
                     .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
@@ -147,7 +147,7 @@ pub fn run(
                     continue;
                 }
 
-                if let Some(reviews) = reviews_by_fp.get(&block.hash) {
+                if let Some(reviews) = reviews_by_fp.get(block.hash.as_str()) {
                     blocks_to_print.push((block, reviews));
                 }
             }

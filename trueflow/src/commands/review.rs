@@ -177,7 +177,7 @@ pub fn collect_review_summary(
         total_blocks += reviewable_blocks.len();
 
         // Optimization: If the FILE hash is approved, everything inside is approved.
-        if fingerprint_status.get(&file.file_hash) == Some(&Verdict::Approved) {
+        if fingerprint_status.get(file.file_hash.as_str()) == Some(&Verdict::Approved) {
             continue;
         }
 
@@ -191,11 +191,11 @@ pub fn collect_review_summary(
             }
 
             // Check status
-            if fingerprint_status.get(&block.hash) == Some(&Verdict::Approved) {
+            if fingerprint_status.get(block.hash.as_str()) == Some(&Verdict::Approved) {
                 continue;
             }
 
-            if !fingerprint_status.contains_key(&block.hash) {
+            if !fingerprint_status.contains_key(block.hash.as_str()) {
                 // Not explicitly approved. Check implicit approval via sub-blocks.
                 if let Ok(sub_blocks) = sub_splitter::split(&block, language)
                     && !sub_blocks.is_empty()
@@ -204,7 +204,7 @@ pub fn collect_review_summary(
                         if !filters.allows_subblock(sb.kind) {
                             return true;
                         }
-                        fingerprint_status.get(&sb.hash) == Some(&Verdict::Approved)
+                        fingerprint_status.get(sb.hash.as_str()) == Some(&Verdict::Approved)
                     });
 
                     if all_approved {
@@ -529,10 +529,11 @@ fn kind_rank(block: &Block) -> u8 {
 mod tests {
     use super::*;
     use crate::block::BlockKind;
+    use crate::hashing::ContentHash;
 
     fn make_block(kind: BlockKind, tags: &[&str]) -> Block {
         Block {
-            hash: "hash".to_string(),
+            hash: ContentHash::new("hash"),
             content: "content".to_string(),
             kind,
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
