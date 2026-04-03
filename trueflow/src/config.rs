@@ -1,9 +1,8 @@
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, value};
-use tracing::warn;
 
 use crate::block::BlockKind;
 
@@ -41,10 +40,10 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeedbackConfig {
-    #[serde(default)]
-    pub only: Vec<String>,
-    #[serde(default)]
-    pub exclude: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_block_kinds")]
+    pub only: Vec<BlockKind>,
+    #[serde(default, deserialize_with = "deserialize_block_kinds")]
+    pub exclude: Vec<BlockKind>,
     #[serde(default = "default_feedback_since")]
     pub default_since: String,
 }
@@ -209,14 +208,18 @@ fn default_feedback_since() -> String {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct BlockFilterConfig {
-    #[serde(default)]
-    pub only: Vec<String>,
-    #[serde(default)]
-    pub exclude: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_block_kinds")]
+    pub only: Vec<BlockKind>,
+    #[serde(default, deserialize_with = "deserialize_block_kinds")]
+    pub exclude: Vec<BlockKind>,
 }
 
 impl BlockFilterConfig {
-    pub fn resolve_filters(&self, cli_only: &[String], cli_exclude: &[String]) -> BlockFilters {
+    pub fn resolve_filters(
+        &self,
+        cli_only: &[BlockKind],
+        cli_exclude: &[BlockKind],
+    ) -> BlockFilters {
         let only_values = if cli_only.is_empty() {
             &self.only
         } else {
@@ -232,7 +235,11 @@ impl BlockFilterConfig {
 }
 
 impl FeedbackConfig {
-    pub fn resolve_filters(&self, cli_only: &[String], cli_exclude: &[String]) -> BlockFilters {
+    pub fn resolve_filters(
+        &self,
+        cli_only: &[BlockKind],
+        cli_exclude: &[BlockKind],
+    ) -> BlockFilters {
         let only_values = if cli_only.is_empty() {
             &self.only
         } else {
@@ -254,9 +261,9 @@ pub struct BlockFilters {
 }
 
 impl BlockFilters {
-    pub fn from_lists(only: &[String], exclude: &[String]) -> Self {
-        let only_set = parse_block_kinds(only);
-        let exclude_set = parse_block_kinds(exclude);
+    pub fn from_lists(only: &[BlockKind], exclude: &[BlockKind]) -> Self {
+        let only_set: HashSet<_> = only.iter().copied().collect();
+        let exclude_set: HashSet<_> = exclude.iter().copied().collect();
         let only = if only_set.is_empty() {
             None
         } else {
@@ -312,19 +319,15 @@ fn find_config_path(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn parse_block_kinds(values: &[String]) -> HashSet<BlockKind> {
-    let mut kinds = HashSet::new();
-    for value in values {
-        match value.parse::<BlockKind>() {
-            Ok(kind) => {
-                kinds.insert(kind);
-            }
-            Err(err) => {
-                warn!("Ignoring unknown block kind '{value}': {err}");
-            }
-        }
-    }
-    kinds
+fn deserialize_block_kinds<'de, D>(deserializer: D) -> std::result::Result<Vec<BlockKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| value.parse().map_err(serde::de::Error::custom))
+        .collect()
 }
 
 pub fn update_speed_read_defaults_in_file(
@@ -502,6 +505,40 @@ punctuation_dwell_multiplier = 1.2
             Err(err) => panic!("parse config: {err}"),
         };
         assert_eq!(cfg.feedback.default_since, "last");
+    }
+
+    #[test]
+    fn block_filter_config_parses_directly_to_block_kinds() {
+        let cfg: TrueflowConfig = match toml::from_str(
+            r#"
+[review]
+only = ["Function-Signature"]
+exclude = ["gap"]
+
+[feedback]
+only = ["Struct"]
+exclude = ["comment"]
+"#,
+        ) {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+
+        assert_eq!(cfg.review.only, vec![BlockKind::FunctionSignature]);
+        assert_eq!(cfg.review.exclude, vec![BlockKind::Gap]);
+        assert_eq!(cfg.feedback.only, vec![BlockKind::Struct]);
+        assert_eq!(cfg.feedback.exclude, vec![BlockKind::Comment]);
+    }
+
+    #[test]
+    fn block_filter_config_rejects_unknown_block_kinds() {
+        let err = toml::from_str::<TrueflowConfig>("[review]\nonly = [\"not-a-real-kind\"]\n")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unknown block kind: not-a-real-kind"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]

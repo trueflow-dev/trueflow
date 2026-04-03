@@ -377,6 +377,20 @@ fn test_review_config_only_filters_block_kinds() -> Result<()> {
 }
 
 #[test]
+fn test_review_config_rejects_unknown_block_kinds() -> Result<()> {
+    let repo = TestRepo::fixture("invalid_config_kind")?;
+    repo.write("trueflow.toml", "[review]\nonly = [\"not-a-real-kind\"]\n")?;
+
+    let err = repo.run_err(&["review", "--all", "--json"])?;
+    assert!(
+        err.contains("Unknown block kind: not-a-real-kind"),
+        "unexpected stderr: {err}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_review_hides_imports_outside_lib_by_default() -> Result<()> {
     let repo = TestRepo::fixture("hide_imports_default")?;
     repo.write(

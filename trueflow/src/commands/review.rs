@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::Block;
+use crate::block::{Block, BlockKind};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::path_utils;
@@ -28,8 +28,8 @@ pub struct UnreviewedFile {
 pub struct ReviewOptions {
     pub all: bool,
     pub targets: Vec<ReviewTarget>,
-    pub only: Vec<String>,
-    pub exclude: Vec<String>,
+    pub only: Vec<BlockKind>,
+    pub exclude: Vec<BlockKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,8 +465,8 @@ pub fn run(
     json: bool,
     all: bool,
     target: &[String],
-    only: &[String],
-    exclude: &[String],
+    only: &[BlockKind],
+    exclude: &[BlockKind],
 ) -> Result<()> {
     info!(
         "review start (json={json}, all={all}, target={target:?}, only={only:?}, exclude={exclude:?})"
@@ -523,7 +523,6 @@ fn kind_rank(block: &Block) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::BlockKind;
     use crate::hashing::TreeHash;
 
     fn make_block(kind: BlockKind, tags: &[&str]) -> Block {

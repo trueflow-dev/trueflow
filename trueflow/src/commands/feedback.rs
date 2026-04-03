@@ -1,4 +1,4 @@
-use crate::block::Block;
+use crate::block::{Block, BlockKind};
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::policy::should_skip_imports_by_default;
@@ -28,8 +28,8 @@ pub fn run(
     format: &str,
     since: Option<&str>,
     include_approved: bool,
-    only: &[String],
-    exclude: &[String],
+    only: &[BlockKind],
+    exclude: &[BlockKind],
 ) -> Result<()> {
     let config = load_config()?;
     let filters = config.feedback.resolve_filters(only, exclude);

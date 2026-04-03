@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+use crate::block::BlockKind;
 use crate::logging::LoggingMode;
 
 #[derive(Parser)]
@@ -91,11 +92,11 @@ pub enum Commands {
 
         /// Only include block types (e.g. "function", "struct")
         #[arg(long)]
-        only: Vec<String>,
+        only: Vec<BlockKind>,
 
         /// Exclude block types (e.g. "gap", "comment", "whitespace")
         #[arg(long)]
-        exclude: Vec<String>,
+        exclude: Vec<BlockKind>,
     },
     /// Export feedback for LLM/Agent consumption
     Feedback {
@@ -113,11 +114,11 @@ pub enum Commands {
 
         /// Only include block types
         #[arg(long)]
-        only: Vec<String>,
+        only: Vec<BlockKind>,
 
         /// Exclude block types
         #[arg(long)]
-        exclude: Vec<String>,
+        exclude: Vec<BlockKind>,
     },
     /// Inspect a block review target (and optionally split it)
     Inspect {
@@ -152,17 +153,18 @@ pub enum Commands {
 
         /// Only include block types (e.g. "function", "struct")
         #[arg(long)]
-        only: Vec<String>,
+        only: Vec<BlockKind>,
 
         /// Exclude block types (e.g. "gap", "comment", "whitespace")
         #[arg(long)]
-        exclude: Vec<String>,
+        exclude: Vec<BlockKind>,
     },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands};
+    use crate::block::BlockKind;
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -205,8 +207,8 @@ mod tests {
                     target,
                     vec!["file:src/lib.rs".to_string(), "rev:abc1234".to_string()]
                 );
-                assert_eq!(only, vec!["function".to_string()]);
-                assert_eq!(exclude, vec!["comment".to_string()]);
+                assert_eq!(only, vec![BlockKind::Function]);
+                assert_eq!(exclude, vec![BlockKind::Comment]);
             }
             _ => panic!("expected tui command"),
         }
@@ -254,5 +256,18 @@ mod tests {
             }
             _ => panic!("expected feedback command"),
         }
+    }
+
+    #[test]
+    fn review_command_rejects_unknown_block_kind() {
+        let err = match Cli::try_parse_from(["trueflow", "review", "--only", "not-a-kind"]) {
+            Ok(_) => panic!("expected clap to reject unknown block kind"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("Unknown block kind: not-a-kind"),
+            "unexpected clap error: {rendered}"
+        );
     }
 }

@@ -1,4 +1,5 @@
 use crate::analysis::Language;
+use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
     ReviewOptions, ReviewTarget, collect_review_summary, parse_review_targets,
@@ -337,8 +338,8 @@ pub fn run(
     context: &TrueflowContext,
     all: bool,
     target: &[String],
-    only: &[String],
-    exclude: &[String],
+    only: &[BlockKind],
+    exclude: &[BlockKind],
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let config = load_config()?;
@@ -390,8 +391,8 @@ pub fn run(
 fn cli_review_request(
     all: bool,
     target: &[String],
-    only: &[String],
-    exclude: &[String],
+    only: &[BlockKind],
+    exclude: &[BlockKind],
 ) -> Result<Option<CliReviewRequest>> {
     let has_cli_overrides = all || !target.is_empty() || !only.is_empty() || !exclude.is_empty();
     if !has_cli_overrides {
@@ -3386,8 +3387,8 @@ mod diff_scope_tests {
 
     #[test]
     fn cli_review_request_only_exclude_without_targets_is_supported() {
-        let only = vec!["function".to_string()];
-        let exclude = vec!["comment".to_string()];
+        let only = vec![BlockKind::Function];
+        let exclude = vec![BlockKind::Comment];
         let request = cli_review_request(false, &[], &only, &exclude)
             .unwrap_or_else(|error| panic!("expected filter-only request: {error}"));
         let Some(request) = request else {
