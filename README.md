@@ -2,6 +2,8 @@
 
 ![trueflow logo](./design/trueflow.jpg)
 
+![trueflow TUI screenshot](./tui.png)
+
 Trueflow is an experimental semantic code review tool.
 
 It turns files or diffs into reviewable **blocks**, lets you review those blocks
