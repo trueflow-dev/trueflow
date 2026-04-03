@@ -488,6 +488,10 @@ fn is_trivial_whitespace_only_change(line: &DiffLine) -> bool {
 }
 
 fn is_trivial_formatting_only_replacement(first: &DiffLine, second: &DiffLine) -> bool {
+    // This conservative comparison intentionally treats leading/trailing trivia as
+    // non-reviewable churn for replacement pairs. That includes indentation-only,
+    // trailing-whitespace-only, CRLF/LF-only, and missing-final-newline-only diffs,
+    // while still keeping internal spacing changes reviewable.
     matches!(
         (first.kind, second.kind),
         (DiffLineKind::Removed, DiffLineKind::Added) | (DiffLineKind::Added, DiffLineKind::Removed)
@@ -1104,6 +1108,25 @@ mod tests {
     }
 
     #[test]
+    fn collect_hunks_ignores_no_newline_metadata_lines() {
+        let unified =
+            "@@ -1 +1 @@\n-let value = 42;\n\\ No newline at end of file\n+let value = 42;\n";
+        let mut hunks = Vec::new();
+
+        collect_hunks(&mut hunks, "src/lib.rs", unified)
+            .unwrap_or_else(|error| panic!("collect hunks should succeed: {error}"));
+
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                "-let value = 42;\n".to_string(),
+                "+let value = 42;\n".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn block_has_changed_lines_ignores_closing_brace_only_additions() {
         use crate::block::{Block, BlockKind};
 
@@ -1298,6 +1321,66 @@ mod tests {
         assert!(
             block_has_changed_lines_in_diff(&block, &[hunk]),
             "internal spacing replacements should remain reviewable under conservative filtering"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_crlf_to_lf_only_replacements() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec![
+                "-let value = 42;\r\n".to_string(),
+                "+let value = 42;\n".to_string(),
+            ],
+        };
+
+        assert!(
+            !block_has_changed_lines_in_diff(&block, &[hunk]),
+            "CRLF/LF-only replacements should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_missing_final_newline_only_replacements() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec![
+                "-let value = 42;\n".to_string(),
+                "+let value = 42;\n".to_string(),
+            ],
+        };
+
+        assert!(
+            !block_has_changed_lines_in_diff(&block, &[hunk]),
+            "missing-final-newline-only replacements should not mark a block as changed for review"
         );
     }
 }
