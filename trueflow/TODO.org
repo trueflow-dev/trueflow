@@ -2,10 +2,6 @@
 
 * Highest Leverage / Critical
 ** Diff Relevance / Noise Filtering
-   - [ ] **Skip whitespace-only block diffs during review selection**
-     - Treat a block as unchanged if every changed line in its overlapping hunks is whitespace-only.
-     - Include both additions and removals.
-     - Add regression tests in `src/vcs.rs` for: add-only whitespace, remove-only whitespace, and mixed whitespace+real change.
    - [ ] **Generalize trivial delimiter-only diff skipping**
      - Current behavior only skips addition-only closing-brace lines.
      - Decide and encode exact delimiter set (e.g. `}`, `};`, `},`) and whether removals are included.
@@ -24,15 +20,7 @@
      - Build commit/revision fixtures covering whitespace-only, delimiter-only, and formatting-only changes.
      - Verify both CLI review output and TUI diff view behavior.
 
-** Scanner Correctness
-   - [x] **Integrate real `.gitignore` parsing into `scanner.rs`**
-     - Implemented with `ignore::WalkBuilder` gitignore support (`git_ignore`, `git_exclude`, `git_global`, `parents`).
-     - Covered by regression test: `test_scan_honors_gitignore_and_keeps_nonignored_dotfiles`.
-
 ** Config Completion
-   - [ ] **Make sync branch configurable (`storage.branch`)**
-     - Current state: sync code still hardcodes `trueflow-db` in git commands.
-     - Goal: read from config and default to `trueflow-db`.
    - [ ] **Add `scan.ignore_globs` to `trueflow.toml`**
      - Goal: allow user-defined ignore patterns beyond `.gitignore`.
    - [ ] **Add `hash.normalization` configurability**
@@ -45,12 +33,6 @@
      - Keep `tests/e2e_languages.rs` (`test_all_languages_test_blocks`) green.
 
 * Medium Priority
-** Optimizer
-   - [x] **Implement optimizer pass for adjacent imports**
-   - [x] **Integrate `optimizer::optimize` into `scanner.rs` before returning `FileState`**
-   - [x] **Evaluate/implement a "new small file -> single merged block" pass**
-     - Implemented conservatively: only for small semantic files, preserving merge metadata and avoiding multi-logic-block collapse.
-
 ** Platform Verification
    - [ ] **Run explicit macOS/Linux path/newline verification matrix**
      - Existing path/subdir regressions are covered, but we still need a deliberate cross-platform pass.
@@ -63,26 +45,6 @@
    - [ ] **Decide if additional presentation-layer filtering is needed**
      - Current state: filtering occurs in review collection (core logic), not in TUI presentation.
      - Clarify desired architecture before changing behavior.
-
-* Delivered / Done
-** TUI & Emacs
-   - [x] TUI real review queue and action wiring
-   - [x] Emacs shippable review workflow
-
-** Team Sync & Data
-   - [x] Git-based sync durability improvements (dedupe/locking/signature checks)
-   - [x] Schema evolution with `version` field
-
-** Core & Hashing
-   - [x] Canonicalization pipeline and hash stability regression tests
-
-** Cleanup
-   - [x] Rename `Signature` -> `FunctionSignature`
-
-** Config (already implemented)
-   - [x] `review.only`
-   - [x] `review.exclude`
-   - [x] TUI review settings (`confirm_batch`, diff focus mode/context)
 
 * Future Ideas
   - Deep semantic diffs (e.g. move detection, grouped change objects) that can map one user approval to multiple underlying deterministic change records.

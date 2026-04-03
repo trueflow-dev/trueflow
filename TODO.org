@@ -8,38 +8,17 @@
   verify who reviewed what.
 
 * Emacs Package (trueflow.el)
-** TODO [High] Basic Infrastructure
-   - [ ] Define `trueflow-mode` and basic buffer setup.
-   - [ ] Implement `trueflow.el` wrapper for CLI calls (`trueflow diff`, `trueflow mark`, `trueflow sync`).
-   - [ ] Define customization groups (executable path, faces).
-
-** TODO [High] Status View (`trueflow-status`)
-   - [ ] Render "Unreviewed Blocks" section.
-   - [ ] Implement `trueflow-refresh` to parse JSON from CLI.
-   - [ ] Bind `g` to refresh, `q` to quit window.
-
 ** TODO [High] Review Actions
-   - [ ] Implement `a` (Approve) command.
-   - [ ] Implement `c` (Comment) command with minibuffer prompt.
-   - [ ] Implement `x` (Reject) command.
-   - [ ] Wiring: Execute `trueflow mark`, then refresh UI.
    - [ ] Add a small "reviewed!" animation in review mode when approving/commenting.
    - [ ] Show reviewed vs remaining counts in bottom-right (e.g., 5 / 15), with green reviewed and yellow remaining.
 
 ** TODO [Medium] Iterative Review Mode
-   - [ ] Command `trueflow-review-start` (bound to `r`).
-   - [ ] Walk through blocks one by one.
    - [ ] Implement side-by-side view (Diff vs New Content).
 
 ** TODO [High] Inline Editing
-   - [ ] Bind `e` to jump to file location.
    - [ ] **Complex:** Implement true inline editing where changes in the review buffer apply to the file.
      - *Draft Plan:* Use `ediff` or a custom overlay that writes back to file on `C-c C-c`.
      - *Alternative:* Use `recursive-edit` in the file buffer.
-
-* CLI Improvements (trueflow CLI)
-** TODO [Medium] `trueflow check`
-   - [ ] Implement CI gate logic (exit 1 if unreviewed blocks exist).
 
 * Attestation & Verification
 ** TODO [Medium] Add Record::new constructor in store.rs
@@ -50,8 +29,6 @@
    - [ ] Extract `GpgClient` to handle temp dir lifecycle and provide high-level `sign` and `verify` methods.
 
 * Product & Platform Roadmap
-** TODO [High] Review ordering prioritizes tests
-   - [ ] Sort blocks so test code is reviewed first (need reliable test detection).
 ** TODO [High] Coverage mode + heatmap
    - [ ] Add `trueflow coverage` command that shells out to `cargo llvm-cov` or `just coverage`.
    - [ ] Add coverage mode to show least-reviewed files.
@@ -101,14 +78,7 @@ Two things:
        -> struct Config (hash=a85ccbc9)
          {directly embed the subblock tree here}
 
-** TODO [READY] TUI UX: no need for Trueflow TUI text/title at the top of the TUI.
 ** TODO [READY] TUI UX: need a command to like batch approve a whole file (or module or dir, etc.)
-** TODO [READY] TUI UX: the modal when entering a comment shouldn't obscure the
-   content beneath it, but be side-by-side or below, so all of the content is
-   visible.
-** TODO [READY] WHen the comment modal comes up, it should give command hints on how to submit the comment.
-** TODO When you write a lot into a comment modal in the TUI, it doesn't wrap
-   the text in the box. It just goes invisible off-frame. This is a bug.
 ** TODO [READY] There should be a trueflow command to reset the review state for the
    current user for the current REV. i.e. delete all review records that point
    to the current rev. (without removing historical reviews, etc.)

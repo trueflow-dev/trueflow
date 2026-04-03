@@ -431,9 +431,25 @@ pub fn block_has_changed_lines_in_diff(block: &Block, hunks: &[DiffHunk]) -> boo
         return false;
     }
 
-    if changed_lines.iter().all(|line| {
-        is_trivial_closing_brace_addition(line) || is_trivial_whitespace_only_change(line)
-    }) {
+    !all_changed_lines_are_nonreviewable(&changed_lines)
+}
+
+fn all_changed_lines_are_nonreviewable(changed_lines: &[&DiffLine]) -> bool {
+    let mut index = 0;
+    while index < changed_lines.len() {
+        let line = changed_lines[index];
+        if is_trivial_closing_brace_addition(line) || is_trivial_whitespace_only_change(line) {
+            index += 1;
+            continue;
+        }
+
+        if let Some(next) = changed_lines.get(index + 1)
+            && is_trivial_formatting_only_replacement(line, next)
+        {
+            index += 2;
+            continue;
+        }
+
         return false;
     }
 
@@ -469,6 +485,14 @@ fn is_trivial_closing_brace_addition(line: &DiffLine) -> bool {
 
 fn is_trivial_whitespace_only_change(line: &DiffLine) -> bool {
     matches!(line.kind, DiffLineKind::Added | DiffLineKind::Removed) && line.text.trim().is_empty()
+}
+
+fn is_trivial_formatting_only_replacement(first: &DiffLine, second: &DiffLine) -> bool {
+    matches!(
+        (first.kind, second.kind),
+        (DiffLineKind::Removed, DiffLineKind::Added) | (DiffLineKind::Added, DiffLineKind::Removed)
+    ) && !first.text.trim().is_empty()
+        && first.text.trim() == second.text.trim()
 }
 
 pub fn files_changed_main_to_head() -> Result<HashSet<String>> {
@@ -1184,6 +1208,96 @@ mod tests {
         assert!(
             block_has_changed_lines_in_diff(&block, &[hunk]),
             "mixed whitespace and non-whitespace changes must remain reviewable"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_indentation_only_replacements() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec![
+                "-let value = 42;\n".to_string(),
+                "+    let value = 42;\n".to_string(),
+            ],
+        };
+
+        assert!(
+            !block_has_changed_lines_in_diff(&block, &[hunk]),
+            "indentation-only replacements should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_trailing_whitespace_only_replacements() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec![
+                "-let value = 42;\n".to_string(),
+                "+let value = 42;   \n".to_string(),
+            ],
+        };
+
+        assert!(
+            !block_has_changed_lines_in_diff(&block, &[hunk]),
+            "trailing-whitespace-only replacements should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_keeps_internal_spacing_replacements_reviewable() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: String::new(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 5,
+        };
+
+        let hunk = DiffHunk {
+            file_path: "src/lib.rs".to_string(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec![
+                "-let value = compute(a, b);\n".to_string(),
+                "+let value = compute(a,  b);\n".to_string(),
+            ],
+        };
+
+        assert!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            "internal spacing replacements should remain reviewable under conservative filtering"
         );
     }
 }
