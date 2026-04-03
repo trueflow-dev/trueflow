@@ -36,6 +36,14 @@
   :type 'string
   :group 'trueflow)
 
+(defcustom trueflow-allow-repo-local-executable nil
+  "When non-nil, allow falling back to a repo-local trueflow build output.
+
+This only affects the default `trueflow' executable name fallback. It does not
+change how explicit absolute or relative path values are resolved."
+  :type 'boolean
+  :group 'trueflow)
+
 (defface trueflow-action-face
   '((t :inherit shadow :weight bold))
   "Face for action hints in Trueflow buffers."
@@ -134,27 +142,57 @@
 ;;; Core Helpers
 
 (defun trueflow-root (&optional dir)
-  "Return the root directory of the current repository."
+  "Return the project root for DIR.
+
+If no VCS root exists, fall back to DIR itself so Trueflow can operate on any
+plain directory of files."
   (let* ((dir (file-name-as-directory (expand-file-name (or dir default-directory))))
          (root (or (let ((default-directory dir))
                      (vc-root-dir))
                    (and (fboundp 'magit-toplevel)
                         (ignore-errors (magit-toplevel dir)))
                    (locate-dominating-file dir ".git"))))
-    (if root
-        (file-name-as-directory (expand-file-name root))
-      (error "Not inside a VCS repository"))))
+    (file-name-as-directory (expand-file-name (or root dir)))))
+
+(defun trueflow--executable-file-p (path)
+  "Return non-nil when PATH names an executable file."
+  (and path
+       (file-exists-p path)
+       (not (file-directory-p path))
+       (file-executable-p path)))
+
+(defun trueflow--path-like-executable-p (value)
+  "Return non-nil when VALUE should be treated as a path.
+
+Absolute paths are treated as paths. Relative values are treated as paths only
+when they contain a path separator. Bare command names are resolved via
+`executable-find'."
+  (and value
+       (or (file-name-absolute-p value)
+           (string-match-p (rx (or "/" "\\")) value))))
 
 (defun trueflow--resolve-executable ()
   "Return an absolute path to the trueflow executable."
-  (let* ((user-val (and trueflow-executable (expand-file-name trueflow-executable)))
+  (let* ((user-val (and (stringp trueflow-executable)
+                        (not (string-empty-p trueflow-executable))
+                        trueflow-executable))
          (root (condition-case nil (trueflow-root) (error nil)))
          (repo-binary (and root (expand-file-name "trueflow/target/debug/trueflow" root))))
-    
     (cond
-     ((and user-val (file-exists-p user-val) (not (file-directory-p user-val)) (file-executable-p user-val)) 
-      user-val)
-     ((and repo-binary (file-exists-p repo-binary) (not (file-directory-p repo-binary)) (file-executable-p repo-binary)) 
+     ((trueflow--path-like-executable-p user-val)
+      (let ((path (expand-file-name user-val)))
+        (if (trueflow--executable-file-p path)
+            path
+          (error "Configured trueflow executable path is not executable: %s" user-val))))
+     (user-val
+      (or (executable-find user-val)
+          (and trueflow-allow-repo-local-executable
+               (equal user-val "trueflow")
+               (trueflow--executable-file-p repo-binary)
+               repo-binary)
+          (error "Could not find trueflow executable '%s'" user-val)))
+     ((and trueflow-allow-repo-local-executable
+           (trueflow--executable-file-p repo-binary))
       repo-binary)
      ((executable-find "trueflow"))
      (t (error "Could not find 'trueflow' binary.")))))
@@ -517,25 +555,55 @@
 (defvar-local trueflow-last-scan-data nil
   "The last data retrieved from trueflow CLI.")
 
+(defun trueflow--review-items-from-scan-data (scan-data)
+  "Flatten SCAN-DATA into review items annotated with their file paths."
+  (seq-mapcat
+   (lambda (file)
+     (let ((path (alist-get 'path file)))
+       (mapcar
+        (lambda (block)
+          (let ((annotated (copy-alist block)))
+            (setf (alist-get 'file annotated) path)
+            annotated))
+        (trueflow--ensure-list (alist-get 'blocks file)))))
+   scan-data))
+
+(defun trueflow--refresh-review-state (&optional current-hash)
+  "Rebuild review state from `trueflow-last-scan-data'.
+
+When CURRENT-HASH is provided, prefer keeping the index aligned with that item
+if it still exists after refresh. Otherwise, keep the same numeric index so the
+next refreshed item is shown instead of skipping ahead."
+  (let ((old-index trueflow-review-index))
+    (setq trueflow-review-items
+          (trueflow--review-items-from-scan-data trueflow-last-scan-data))
+    (cond
+     ((null trueflow-review-items)
+      (setq trueflow-review-index 0))
+     (current-hash
+      (let ((current-position
+             (cl-position-if
+              (lambda (block)
+                (equal (alist-get 'hash block) current-hash))
+              trueflow-review-items)))
+        (setq trueflow-review-index
+              (if current-position
+                  current-position
+                (min old-index (1- (length trueflow-review-items)))))))
+     (t
+      (setq trueflow-review-index
+            (min old-index (1- (length trueflow-review-items))))))))
+
 (defun trueflow-review-start ()
   "Start a review session from the status buffer."
   (interactive)
   (unless (eq major-mode 'trueflow-mode)
     (user-error "Not in trueflow-status buffer"))
-  
+
   (setq trueflow-review-items
-        (seq-mapcat
-         (lambda (file)
-           (let ((path (alist-get 'path file)))
-             (mapcar
-              (lambda (block)
-                (let ((annotated (copy-alist block)))
-                  (setf (alist-get 'file annotated) path)
-                  annotated))
-              (trueflow--ensure-list (alist-get 'blocks file)))))
-         trueflow-last-scan-data))
+        (trueflow--review-items-from-scan-data trueflow-last-scan-data))
   (setq trueflow-review-index 0)
-  
+
   (if trueflow-review-items
       (trueflow-focus-update)
     (message "No blocks to review.")))
@@ -613,14 +681,21 @@
          "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit")
         (goto-char (point-min))))))
 
+(defun trueflow--refresh-focus-session (status-buf current-hash)
+  "Refresh STATUS-BUF after acting on CURRENT-HASH and reopen focus view."
+  (if (and status-buf (buffer-live-p status-buf))
+      (with-current-buffer status-buf
+        (trueflow-refresh)
+        (trueflow--refresh-review-state current-hash)
+        (trueflow-focus-update))
+    (message "Status buffer lost.")))
+
 (defun trueflow-focus-action (verdict &optional note)
-  "Apply VERDICT to current focused block and move to next."
+  "Apply VERDICT to current focused block and move to the next refreshed item."
   (when trueflow-focus-current-block
     (let ((hash (alist-get 'hash trueflow-focus-current-block)))
       (trueflow--run-mark hash verdict note)
-      (with-current-buffer trueflow-focus-status-buffer
-        (trueflow-refresh)
-        (trueflow-focus-next)))))
+      (trueflow--refresh-focus-session trueflow-focus-status-buffer hash))))
 
 (defun trueflow-focus-approve ()
   (interactive)
@@ -648,11 +723,9 @@
       (erase-buffer)
       (setq-local trueflow-comment-target-hash hash)
       (setq-local trueflow-comment-status-buffer status-buf)
-      (setq-local trueflow-comment-after-commit-function 
+      (setq-local trueflow-comment-after-commit-function
                   (lambda ()
-                    (with-current-buffer status-buf
-                      (trueflow-refresh)
-                      (trueflow-focus-next))))
+                    (trueflow--refresh-focus-session status-buf hash)))
       (insert "# Write your comment below. Press C-c C-c to finish, C-c C-k to cancel.\n\n"))))
 
 (defun trueflow-focus-skip ()
