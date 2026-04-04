@@ -30,14 +30,13 @@ impl TestRepo {
         let src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("example_repos")
             .join(name);
+        if !src.is_dir() {
+            anyhow::bail!("test fixture not found: {}", src.display());
+        }
 
         let path = temp_dir("trueflow_e2e", name);
         if path.exists() {
             fs::remove_dir_all(&path)?;
-        }
-
-        if !src.exists() {
-            fs::create_dir_all(&src)?;
         }
 
         copy_dir_all(&src, &path)?;

@@ -154,7 +154,8 @@ fn test_check_ignores_legacy_diff_like_fingerprint_marks() -> Result<()> {
     let output = repo.run_raw(&["check"])?;
     assert!(!output.status.success(), "Expected check to fail");
 
-    let fake_diff_like_fingerprint = "5555555555555555555555555555555555555555555555555555555555555555";
+    let fake_diff_like_fingerprint =
+        "5555555555555555555555555555555555555555555555555555555555555555";
     repo.run(&[
         "mark",
         "--fingerprint",

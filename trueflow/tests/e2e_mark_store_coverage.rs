@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs;
 use std::process::Command;
 
@@ -101,22 +101,18 @@ fn test_mark_unknown_state_no_path() -> Result<()> {
 }
 
 #[test]
-fn test_mark_diff_fingerprint_records_block_target() -> Result<()> {
-    let repo = TestRepo::new("mark_diff_fingerprint_block_target")?;
+fn test_mark_diff_block_hash_records_block_target() -> Result<()> {
+    let repo = TestRepo::new("mark_diff_block_hash_block_target")?;
     repo.write("src/lib.rs", "pub fn value() -> i32 { 1 }\n")?;
     repo.commit_all("Initial")?;
     repo.git(&["checkout", "-B", "main"])?;
-    repo.git(&["checkout", "-b", "feature/diff-fingerprint"])?;
+    repo.git(&["checkout", "-b", "feature/diff-block-hash"])?;
 
     repo.write("src/lib.rs", "pub fn value() -> i32 { 2 }\n")?;
     repo.commit_all("Change value")?;
 
     let diff_output = repo.run(&["diff", "--json"])?;
-    let changes = json_array(&diff_output)?;
-    let fingerprint = changes[0]["fingerprint"]
-        .as_str()
-        .context("diff fingerprint")?
-        .to_string();
+    let fingerprint = first_block_hash(&diff_output)?;
 
     repo.run(&[
         "mark",
@@ -136,8 +132,7 @@ fn test_mark_diff_fingerprint_records_block_target() -> Result<()> {
     }
 
     let changes_after = json_array(&repo.run(&["diff", "--json"])?)?;
-    assert_eq!(changes_after.len(), 1);
-    assert_eq!(changes_after[0]["status"].as_str(), Some("unreviewed"));
+    assert!(changes_after.is_empty());
 
     Ok(())
 }
