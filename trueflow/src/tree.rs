@@ -48,6 +48,15 @@ impl TreeNodeKind {
     fn sort_key(self, name: &str) -> String {
         format!("{}:{}", self.entry_prefix(), name)
     }
+
+    fn can_contain(self, child: TreeNodeKind) -> bool {
+        match self {
+            TreeNodeKind::Root | TreeNodeKind::Directory => {
+                matches!(child, TreeNodeKind::Directory | TreeNodeKind::File)
+            }
+            TreeNodeKind::File | TreeNodeKind::Block => matches!(child, TreeNodeKind::Block),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +324,16 @@ impl TreeBuilder {
             Ok(path) => path,
             Err(error) => panic!("tree node path should be valid repo path: {error:?}"),
         };
+        let parent_kind = self
+            .nodes
+            .get(parent.0)
+            .unwrap_or_else(|| panic!("tree parent id {parent:?} must exist"))
+            .kind;
+        assert!(
+            parent_kind.can_contain(kind),
+            "tree node kind {kind:?} cannot be added under {parent_kind:?}"
+        );
+
         let id = TreeNodeId(self.nodes.len());
         let is_hash_entry = kind.is_hash_entry();
         let is_file = matches!(kind, TreeNodeKind::File);
@@ -332,10 +351,15 @@ impl TreeBuilder {
         };
         self.nodes.push(node);
         if is_hash_entry {
-            self.nodes_by_path.insert(index_path.clone(), id);
+            let previous = self.nodes_by_path.insert(index_path.clone(), id);
+            assert!(
+                previous.is_none(),
+                "tree node path must be unique: {index_path}"
+            );
         }
         if is_file {
-            self.file_paths.insert(index_path);
+            let inserted = self.file_paths.insert(index_path);
+            assert!(inserted, "file path must be unique");
         }
         self.children_by_id.entry(parent).or_default().push(id);
         id
@@ -430,12 +454,19 @@ fn build_block_lookup_indexes(
             continue;
         };
 
-        by_path_hash_start
+        let previous = by_path_hash_start
             .entry(node.path.clone())
             .or_default()
             .entry(node.hash.clone())
             .or_default()
             .insert(block.start_line, node.id);
+        assert!(
+            previous.is_none(),
+            "duplicate block lookup key: path={}, hash={}, start_line={}",
+            node.path,
+            node.hash,
+            block.start_line
+        );
     }
 
     by_path_hash_start
@@ -633,5 +664,56 @@ mod tests {
         let hash_second = dir_alt_node.hash.clone();
 
         assert_eq!(hash_first, hash_second);
+    }
+
+    #[test]
+    #[should_panic(expected = "tree node path must be unique")]
+    fn builder_rejects_duplicate_indexed_paths() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let dir = builder.add_dir(root, "src".to_string(), RepoPath::new("src").unwrap());
+        builder.add_file(
+            dir,
+            "lib.rs".to_string(),
+            RepoPath::new("src/lib.rs").unwrap(),
+            "hash-a",
+            Language::Rust,
+        );
+        builder.add_file(
+            dir,
+            "lib.rs".to_string(),
+            RepoPath::new("src/lib.rs").unwrap(),
+            "hash-b",
+            Language::Rust,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tree node kind Block cannot be added under Directory")]
+    fn builder_rejects_invalid_parent_child_relationships() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let dir = builder.add_dir(root, "src".to_string(), RepoPath::new("src").unwrap());
+        builder.add_block(
+            dir,
+            "function:L1-L2".to_string(),
+            RepoPath::new("src/lib.rs").unwrap(),
+            Block::new("fn f() {}".to_string(), BlockKind::Function, 0, 1),
+            Language::Rust,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate block lookup key")]
+    fn build_tree_rejects_duplicate_block_lookup_keys() {
+        let block = Block::new("fn dup() {}".to_string(), BlockKind::Function, 1, 2);
+        let files = vec![FileState::new(
+            RepoPath::new("src/lib.rs").unwrap(),
+            Language::Rust,
+            BytesHash::new("bytes-hash"),
+            vec![block.clone(), block],
+        )];
+
+        let _tree = build_tree_from_files(&files);
     }
 }
