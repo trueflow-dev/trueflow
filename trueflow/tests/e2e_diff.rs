@@ -98,7 +98,7 @@ fn test_diff_and_mark_flow_uses_block_reviews() -> Result<()> {
 }
 
 #[test]
-fn test_check_command_gates_unreviewed_changes() -> Result<()> {
+fn test_check_command_gates_semantic_main_diff_blocks() -> Result<()> {
     let repo = TestRepo::new("check_gate")?;
     repo.write("src/lib.rs", LIB_ADD)?;
     repo.commit_all("Initial")?;
@@ -108,7 +108,6 @@ fn test_check_command_gates_unreviewed_changes() -> Result<()> {
     repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
-    // Expect failure
     let output = repo.run_raw(&["check"])?;
     assert!(!output.status.success(), "Expected check to fail");
     let stdout = String::from_utf8(output.stdout)?;
@@ -121,8 +120,6 @@ fn test_check_command_gates_unreviewed_changes() -> Result<()> {
     assert!(diff_output.contains("File: src/lib.rs"));
 
     let fp = first_diff_block_hash(&repo)?;
-
-    // Mark approved
     repo.run(&[
         "mark",
         "--fingerprint",
@@ -132,10 +129,43 @@ fn test_check_command_gates_unreviewed_changes() -> Result<()> {
         "--quiet",
     ])?;
 
-    // Check pass
     let output = repo.run(&["check"])?;
     assert!(
         output.trim().is_empty(),
+        "Expected check to be silent on stdout"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_check_ignores_legacy_diff_like_fingerprint_marks() -> Result<()> {
+    let repo = TestRepo::new("check_diff_like_fingerprint_ignored")?;
+    repo.write("src/lib.rs", LIB_ADD)?;
+    repo.commit_all("Initial")?;
+
+    checkout_branch(&repo, "feature/check-diff-like")?;
+    repo.write("src/lib.rs", LIB_ADD_SUB)?;
+    repo.commit_all("Add sub")?;
+
+    let output = repo.run_raw(&["check"])?;
+    assert!(!output.status.success(), "Expected check to fail");
+
+    let fake_diff_like_fingerprint = "5555555555555555555555555555555555555555555555555555555555555555";
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        fake_diff_like_fingerprint,
+        "--verdict",
+        "approved",
+        "--quiet",
+    ])?;
+
+    let output = repo.run_raw(&["check"])?;
+    assert!(!output.status.success(), "Expected check to keep failing");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.trim().is_empty(),
         "Expected check to be silent on stdout"
     );
 
