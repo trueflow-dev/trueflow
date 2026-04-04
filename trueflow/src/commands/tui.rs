@@ -2,7 +2,8 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    ReviewOptions, ReviewTarget, collect_review_summary, parse_review_targets,
+    CollectedReview, ReviewRequest, ReviewTarget, collect_review, parse_review_request,
+    resolve_review_request,
 };
 use crate::config::{
     BlockFilters, TuiConfig, TuiDiffFocusMode, TuiSpeedReadConfig, TuiSpeedReadPunctuationDwell,
@@ -91,14 +92,14 @@ enum ScopeSelection {
 
 struct LaunchSelection {
     scope: ReviewScope,
-    summary: crate::commands::review::ReviewSummary,
+    review: CollectedReview,
     scope_label: String,
 }
 
 #[derive(Debug, Clone)]
 struct CliReviewRequest {
     review_scope: ReviewScope,
-    review_options: ReviewOptions,
+    review_request: ReviewRequest,
     scope_label: String,
 }
 
@@ -347,11 +348,13 @@ pub fn run(
         let scan_options = config.scan.resolve_options()?;
         let launch = if let Some(request) = cli_review_request(all, target, only, exclude)? {
             let filters = config.review.resolve_filters(only, exclude);
-            let summary =
-                collect_review_summary(context, &request.review_options, &filters, &scan_options)?;
+            let review = {
+                let query = resolve_review_request(request.review_request, filters, scan_options)?;
+                collect_review(&query)?
+            };
             LaunchSelection {
                 scope: request.review_scope,
-                summary,
+                review,
                 scope_label: request.scope_label,
             }
         } else {
@@ -361,11 +364,11 @@ pub fn run(
                 ScopeSelection::Quit => return Ok(()),
                 ScopeSelection::Selected(scope) => {
                     let filters = config.review.resolve_filters(&[], &[]);
-                    let summary = load_review_state(context, &scope, &filters, &scan_options)?;
+                    let review = load_review_state(&scope, &filters, &scan_options)?;
                     LaunchSelection {
                         scope_label: scope.label(),
                         scope,
-                        summary,
+                        review,
                     }
                 }
             }
@@ -373,7 +376,7 @@ pub fn run(
 
         let state = build_review_state(
             context,
-            launch.summary,
+            launch.review,
             launch.scope,
             ReviewStateBuildOptions {
                 confirm_batch: config.tui.confirm_batch,
@@ -401,75 +404,68 @@ fn cli_review_request(
         return Ok(None);
     }
 
-    let targets = parse_review_targets(target)?;
-    let review_scope = review_scope_for_cli_request(all, &targets);
-    let scope_label = cli_scope_label(all, &targets);
+    let review_request = parse_review_request(all, target)?;
+    let review_scope = review_scope_for_cli_request(&review_request);
+    let scope_label = cli_scope_label(&review_request);
     Ok(Some(CliReviewRequest {
         review_scope,
-        review_options: ReviewOptions {
-            all,
-            targets,
-            only: only.to_vec(),
-            exclude: exclude.to_vec(),
-        },
+        review_request,
         scope_label,
     }))
 }
 
-fn review_scope_for_cli_request(all: bool, targets: &[ReviewTarget]) -> ReviewScope {
-    if all {
-        return ReviewScope::All;
-    }
-
-    match targets {
-        [ReviewTarget::Revision(id)] => ReviewScope::Commit {
-            id: id.clone(),
-            summary: String::new(),
+fn review_scope_for_cli_request(request: &ReviewRequest) -> ReviewScope {
+    match request {
+        ReviewRequest::AllFiles => ReviewScope::All,
+        ReviewRequest::Targets(targets) => match targets.as_slice() {
+            [ReviewTarget::Revision(id)] => ReviewScope::Commit {
+                id: id.as_str().to_string(),
+                summary: String::new(),
+            },
+            [ReviewTarget::RevisionRange(range)] => ReviewScope::RevisionRange {
+                start: range.start.as_str().to_string(),
+                end: range.end.as_str().to_string(),
+            },
+            _ => ReviewScope::MainDiff,
         },
-        [ReviewTarget::RevisionRange { start, end }] => ReviewScope::RevisionRange {
-            start: start.clone(),
-            end: end.clone(),
-        },
-        _ => ReviewScope::MainDiff,
     }
 }
 
-fn cli_scope_label(all: bool, targets: &[ReviewTarget]) -> String {
-    if all {
-        return "all files (CLI)".to_string();
-    }
-
-    match targets {
-        [] => "custom scope (CLI)".to_string(),
-        [ReviewTarget::File(path)] => format!("file {path}"),
-        [ReviewTarget::Revision(revision)] => format!("revision {revision}"),
-        [ReviewTarget::RevisionRange { start, end }] => format!("revisions {start}..{end}"),
-        [ReviewTarget::MainDiff] => "diff vs main".to_string(),
-        [ReviewTarget::DirtyWorktree] => "dirty worktree".to_string(),
-        [ReviewTarget::All] => "all files".to_string(),
-        multiple => format!("{} targets", multiple.len()),
+fn cli_scope_label(request: &ReviewRequest) -> String {
+    match request {
+        ReviewRequest::AllFiles => "all files (CLI)".to_string(),
+        ReviewRequest::Targets(targets) => match targets.as_slice() {
+            [ReviewTarget::File(path)] => format!("file {path}"),
+            [ReviewTarget::Revision(revision)] => format!("revision {revision}"),
+            [ReviewTarget::RevisionRange(range)] => {
+                format!("revisions {}..{}", range.start, range.end)
+            }
+            [ReviewTarget::MainDiff] => "diff vs main".to_string(),
+            [ReviewTarget::DirtyWorktree] => "dirty worktree".to_string(),
+            multiple => format!("{} targets", multiple.len()),
+        },
     }
 }
 
 fn build_review_state(
     context: &TrueflowContext,
-    summary: crate::commands::review::ReviewSummary,
+    review: CollectedReview,
     review_scope: ReviewScope,
     options: ReviewStateBuildOptions,
 ) -> Result<AppState> {
-    let reviewable_nodes: HashSet<TreeNodeId> = summary
+    let reviewable_nodes: HashSet<TreeNodeId> = review
         .unreviewed_block_nodes
         .iter()
         .copied()
-        .filter(|&id| matches!(summary.tree.node(id).kind, TreeNodeKind::Block))
+        .filter(|&id| matches!(review.tree.node(id).kind, TreeNodeKind::Block))
         .collect();
     let remaining_blocks = reviewable_nodes.len();
 
-    let root_children = summary.tree.node(summary.tree.root()).children.clone();
+    let root_children = review.tree.node(review.tree.root()).children.clone();
     let root_cursor = root_children.first().copied();
 
-    let review_order = ReviewOrder::from_tree(&summary.tree, &summary.unreviewed_block_nodes);
-    let navigator = ReviewNavigator::new(summary.tree, summary.unreviewed_block_nodes)?;
+    let review_order = ReviewOrder::from_tree(&review.tree, &review.unreviewed_block_nodes);
+    let navigator = ReviewNavigator::new(review.tree, review.unreviewed_block_nodes)?;
     let default_wpm = options.speed_read_config.default_wpm.clamp(
         options.speed_read_config.min_wpm,
         options.speed_read_config.max_wpm,
@@ -483,7 +479,7 @@ fn build_review_state(
         review_scope,
         navigator,
         review_order,
-        total_blocks: summary.total_blocks,
+        total_blocks: review.summary.total_blocks,
         initial_remaining_blocks: remaining_blocks,
         remaining_blocks,
         reviewable_nodes,
@@ -1580,13 +1576,13 @@ where
 }
 
 fn load_review_state(
-    context: &TrueflowContext,
     scope: &ReviewScope,
     filters: &BlockFilters,
     scan_options: &crate::scanner::ScanOptions,
-) -> Result<crate::commands::review::ReviewSummary> {
-    let options = scope.to_review_options();
-    collect_review_summary(context, &options, filters, scan_options)
+) -> Result<CollectedReview> {
+    let request = scope.to_review_request()?;
+    let query = resolve_review_request(request, filters.clone(), scan_options.clone())?;
+    collect_review(&query)
 }
 
 fn apply_action_locally(
@@ -3357,8 +3353,10 @@ mod diff_scope_tests {
         assert_eq!(request.review_scope, ReviewScope::MainDiff);
         assert_eq!(request.scope_label, "file src/lib.rs");
         assert_eq!(
-            request.review_options.targets,
-            vec![ReviewTarget::File("src/lib.rs".to_string())]
+            request.review_request,
+            ReviewRequest::Targets(vec![ReviewTarget::File(
+                RepoPath::new("src/lib.rs").unwrap()
+            )])
         );
     }
 
@@ -3380,11 +3378,10 @@ mod diff_scope_tests {
         );
         assert_eq!(request.scope_label, "revisions abc1234..def5678");
         assert_eq!(
-            request.review_options.targets,
-            vec![ReviewTarget::RevisionRange {
-                start: "abc1234".to_string(),
-                end: "def5678".to_string(),
-            }]
+            request.review_request,
+            ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
+                crate::commands::review::RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+            )])
         );
     }
 
@@ -3399,10 +3396,11 @@ mod diff_scope_tests {
         };
 
         assert_eq!(request.review_scope, ReviewScope::MainDiff);
-        assert_eq!(request.scope_label, "custom scope (CLI)");
-        assert_eq!(request.review_options.only, only);
-        assert_eq!(request.review_options.exclude, exclude);
-        assert!(request.review_options.targets.is_empty());
+        assert_eq!(request.scope_label, "dirty worktree");
+        assert_eq!(
+            request.review_request,
+            ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree])
+        );
     }
     #[test]
     fn cli_review_request_errors_for_unknown_target_format() {

@@ -5,11 +5,10 @@ use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use uuid::Uuid;
 
-use trueflow::cli::{Cli, Commands};
-use trueflow::commands::review::{ReviewOptions, ReviewSummary, collect_review_summary};
+use trueflow::commands::review::{
+    ReviewRequest, ReviewSummary, collect_review_summary, resolve_review_request,
+};
 use trueflow::config::BlockFilters;
-use trueflow::context::TrueflowContext;
-use trueflow::logging::LoggingMode;
 use trueflow::scanner::ScanOptions;
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -47,31 +46,13 @@ impl Drop for ReviewBenchRepo {
 
 pub fn run_full_review(path: &Path) -> Result<ReviewSummary> {
     with_current_dir(path, || {
-        let context = TrueflowContext::new(Cli {
-            command: Commands::Review {
-                json: false,
-                all: true,
-                target: Vec::new(),
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
-            debug: false,
-            logging_mode: LoggingMode::Stderr,
-        });
+        let query = resolve_review_request(
+            ReviewRequest::AllFiles,
+            BlockFilters::default(),
+            ScanOptions::default(),
+        )?;
 
-        let options = ReviewOptions {
-            all: true,
-            targets: Vec::new(),
-            only: Vec::new(),
-            exclude: Vec::new(),
-        };
-
-        collect_review_summary(
-            &context,
-            &options,
-            &BlockFilters::default(),
-            &ScanOptions::default(),
-        )
+        collect_review_summary(&query)
     })
 }
 

@@ -1,5 +1,6 @@
-use crate::commands::review::{ReviewOptions, ReviewTarget};
+use crate::commands::review::{ReviewRequest, ReviewTarget, RevisionRangeSpec, RevisionSpec};
 use crate::vcs::CommitInfo;
+use anyhow::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeOption {
@@ -72,35 +73,20 @@ impl ReviewScope {
         }
     }
 
-    pub fn to_review_options(&self) -> ReviewOptions {
+    pub fn to_review_request(&self) -> Result<ReviewRequest> {
         match self {
-            ReviewScope::All => ReviewOptions {
-                all: true,
-                targets: Vec::new(),
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
-            ReviewScope::MainDiff => ReviewOptions {
-                all: false,
-                targets: vec![ReviewTarget::MainDiff],
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
-            ReviewScope::Commit { id, .. } => ReviewOptions {
-                all: false,
-                targets: vec![ReviewTarget::Revision(id.clone())],
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
-            ReviewScope::RevisionRange { start, end } => ReviewOptions {
-                all: false,
-                targets: vec![ReviewTarget::RevisionRange {
-                    start: start.clone(),
-                    end: end.clone(),
-                }],
-                only: Vec::new(),
-                exclude: Vec::new(),
-            },
+            ReviewScope::All => Ok(ReviewRequest::AllFiles),
+            ReviewScope::MainDiff => Ok(ReviewRequest::Targets(vec![ReviewTarget::MainDiff])),
+            ReviewScope::Commit { id, .. } => {
+                Ok(ReviewRequest::Targets(vec![ReviewTarget::Revision(
+                    RevisionSpec::new(id.clone())?,
+                )]))
+            }
+            ReviewScope::RevisionRange { start, end } => {
+                Ok(ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
+                    RevisionRangeSpec::new(start.clone(), end.clone())?,
+                )]))
+            }
         }
     }
 }
@@ -238,40 +224,38 @@ mod tests {
     }
 
     #[test]
-    fn all_scope_maps_to_all_flag_without_explicit_targets() {
-        let options = ReviewScope::All.to_review_options();
-        assert!(options.all);
-        assert!(options.targets.is_empty());
-        assert!(options.only.is_empty());
-        assert!(options.exclude.is_empty());
+    fn all_scope_maps_to_all_review_request() {
+        let request = ReviewScope::All
+            .to_review_request()
+            .unwrap_or_else(|error| panic!("expected all review request: {error}"));
+        assert_eq!(request, ReviewRequest::AllFiles);
     }
 
     #[test]
-    fn main_diff_scope_maps_to_expected_review_options() {
-        let options = ReviewScope::MainDiff.to_review_options();
-        assert!(!options.all);
-        assert_eq!(options.targets, vec![ReviewTarget::MainDiff]);
-        assert!(options.only.is_empty());
-        assert!(options.exclude.is_empty());
+    fn main_diff_scope_maps_to_expected_review_request() {
+        let request = ReviewScope::MainDiff
+            .to_review_request()
+            .unwrap_or_else(|error| panic!("expected main diff review request: {error}"));
+        assert_eq!(
+            request,
+            ReviewRequest::Targets(vec![ReviewTarget::MainDiff])
+        );
     }
 
     #[test]
-    fn revision_range_scope_maps_to_expected_review_options() {
-        let options = ReviewScope::RevisionRange {
+    fn revision_range_scope_maps_to_expected_review_request() {
+        let request = ReviewScope::RevisionRange {
             start: "abc1234".to_string(),
             end: "def5678".to_string(),
         }
-        .to_review_options();
-        assert!(!options.all);
+        .to_review_request()
+        .unwrap_or_else(|error| panic!("expected revision range review request: {error}"));
         assert_eq!(
-            options.targets,
-            vec![ReviewTarget::RevisionRange {
-                start: "abc1234".to_string(),
-                end: "def5678".to_string(),
-            }]
+            request,
+            ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
+                RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+            )])
         );
-        assert!(options.only.is_empty());
-        assert!(options.exclude.is_empty());
     }
 
     #[test]
