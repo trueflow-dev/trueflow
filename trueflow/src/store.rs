@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::vcs;
 
@@ -361,6 +362,8 @@ impl fmt::Display for BlockState {
 #[derive(Debug, Clone, Default)]
 pub struct ApprovedTargets {
     block_hashes: HashSet<TreeHash>,
+    path_scoped_block_targets: HashSet<PathScopedBlockTarget>,
+    exact_block_targets: HashSet<ExactBlockTarget>,
     file_hashes: HashSet<TreeHash>,
     tree_hashes: HashSet<TreeHash>,
     diff_fingerprints: HashSet<DiffFingerprint>,
@@ -375,16 +378,58 @@ impl ApprovedTargets {
             ReviewTargetRef::Diff { fingerprint } => self.diff_fingerprints.contains(fingerprint),
         }
     }
+
+    pub fn contains_block(
+        &self,
+        hash: &TreeHash,
+        path: &RepoPath,
+        start_line: usize,
+        workdir_prefix: Option<&str>,
+    ) -> bool {
+        let candidates = block_path_candidates(path, workdir_prefix);
+        if let Ok(start_line) = u32::try_from(start_line) {
+            for candidate in &candidates {
+                if self.exact_block_targets.contains(&ExactBlockTarget {
+                    hash: hash.clone(),
+                    path: candidate.clone(),
+                    start_line,
+                }) {
+                    return true;
+                }
+            }
+        }
+
+        for candidate in &candidates {
+            if self
+                .path_scoped_block_targets
+                .contains(&PathScopedBlockTarget {
+                    hash: hash.clone(),
+                    path: candidate.clone(),
+                })
+            {
+                return true;
+            }
+        }
+
+        self.block_hashes.contains(hash)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewIndex {
     latest_verdicts: HashMap<ReviewTargetRef, Verdict>,
+    block_hash_verdicts: HashMap<TreeHash, Verdict>,
+    path_scoped_block_verdicts: HashMap<PathScopedBlockTarget, Verdict>,
+    exact_block_verdicts: HashMap<ExactBlockTarget, Verdict>,
 }
 
 impl ReviewIndex {
     pub fn from_records(records: &[Record], check_filter: Option<&ReviewCheck>) -> Self {
         let mut latest_by_target: HashMap<ReviewTargetRef, (i64, Verdict)> = HashMap::new();
+        let mut block_hash_verdicts: HashMap<TreeHash, (i64, Verdict)> = HashMap::new();
+        let mut path_scoped_block_verdicts: HashMap<PathScopedBlockTarget, (i64, Verdict)> =
+            HashMap::new();
+        let mut exact_block_verdicts: HashMap<ExactBlockTarget, (i64, Verdict)> = HashMap::new();
 
         for record in records {
             if check_filter.is_some_and(|check| &record.check != check) {
@@ -405,12 +450,54 @@ impl ReviewIndex {
                     );
                 }
             }
+
+            if let ReviewTargetRef::Block { hash } = &record.target {
+                match (&record.path_hint, record.line_hint) {
+                    (Some(path), Some(start_line)) => update_latest_verdict(
+                        &mut exact_block_verdicts,
+                        ExactBlockTarget {
+                            hash: hash.clone(),
+                            path: path.clone(),
+                            start_line,
+                        },
+                        record.timestamp,
+                        record.verdict.clone(),
+                    ),
+                    (Some(path), None) => update_latest_verdict(
+                        &mut path_scoped_block_verdicts,
+                        PathScopedBlockTarget {
+                            hash: hash.clone(),
+                            path: path.clone(),
+                        },
+                        record.timestamp,
+                        record.verdict.clone(),
+                    ),
+                    (None, _) => update_latest_verdict(
+                        &mut block_hash_verdicts,
+                        hash.clone(),
+                        record.timestamp,
+                        record.verdict.clone(),
+                    ),
+                }
+            }
         }
 
         Self {
             latest_verdicts: latest_by_target
                 .into_iter()
                 .map(|(target, (_, verdict))| (target, verdict))
+                .collect(),
+            block_hash_verdicts: block_hash_verdicts
+                .into_iter()
+                .map(|(key, (_, verdict))| (key, verdict))
+                .collect(),
+            path_scoped_block_verdicts: path_scoped_block_verdicts
+                .into_iter()
+                .map(|(key, (_, verdict))| (key, verdict))
+                .collect(),
+            exact_block_verdicts: exact_block_verdicts
+                .into_iter()
+                .map(|(key, (_, verdict))| (key, verdict))
                 .collect(),
         }
     }
@@ -423,6 +510,48 @@ impl ReviewIndex {
         self.verdict_for(target) == Some(&Verdict::Approved)
     }
 
+    pub fn block_verdict_for(
+        &self,
+        hash: &TreeHash,
+        path: &RepoPath,
+        start_line: usize,
+        workdir_prefix: Option<&str>,
+    ) -> Option<&Verdict> {
+        let candidates = block_path_candidates(path, workdir_prefix);
+        if let Ok(start_line) = u32::try_from(start_line) {
+            for candidate in &candidates {
+                if let Some(verdict) = self.exact_block_verdicts.get(&ExactBlockTarget {
+                    hash: hash.clone(),
+                    path: candidate.clone(),
+                    start_line,
+                }) {
+                    return Some(verdict);
+                }
+            }
+        }
+
+        for candidate in &candidates {
+            if let Some(verdict) = self.path_scoped_block_verdicts.get(&PathScopedBlockTarget {
+                hash: hash.clone(),
+                path: candidate.clone(),
+            }) {
+                return Some(verdict);
+            }
+        }
+
+        self.block_hash_verdicts.get(hash)
+    }
+
+    pub fn is_block_approved(
+        &self,
+        hash: &TreeHash,
+        path: &RepoPath,
+        start_line: usize,
+        workdir_prefix: Option<&str>,
+    ) -> bool {
+        self.block_verdict_for(hash, path, start_line, workdir_prefix) == Some(&Verdict::Approved)
+    }
+
     pub fn approved_targets(&self) -> ApprovedTargets {
         let mut approved = ApprovedTargets::default();
         for (target, verdict) in &self.latest_verdicts {
@@ -430,9 +559,7 @@ impl ReviewIndex {
                 continue;
             }
             match target {
-                ReviewTargetRef::Block { hash } => {
-                    approved.block_hashes.insert(hash.clone());
-                }
+                ReviewTargetRef::Block { .. } => {}
                 ReviewTargetRef::File { hash } => {
                     approved.file_hashes.insert(hash.clone());
                 }
@@ -444,8 +571,71 @@ impl ReviewIndex {
                 }
             }
         }
+
+        for (hash, verdict) in &self.block_hash_verdicts {
+            if verdict == &Verdict::Approved {
+                approved.block_hashes.insert(hash.clone());
+            }
+        }
+        for (target, verdict) in &self.path_scoped_block_verdicts {
+            if verdict == &Verdict::Approved {
+                approved.path_scoped_block_targets.insert(target.clone());
+            }
+        }
+        for (target, verdict) in &self.exact_block_verdicts {
+            if verdict == &Verdict::Approved {
+                approved.exact_block_targets.insert(target.clone());
+            }
+        }
+
         approved
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PathScopedBlockTarget {
+    hash: TreeHash,
+    path: RepoPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExactBlockTarget {
+    hash: TreeHash,
+    path: RepoPath,
+    start_line: u32,
+}
+
+fn update_latest_verdict<K: Eq + std::hash::Hash>(
+    entries: &mut HashMap<K, (i64, Verdict)>,
+    key: K,
+    timestamp: i64,
+    verdict: Verdict,
+) {
+    match entries.get_mut(&key) {
+        Some((existing_timestamp, existing_verdict)) => {
+            if timestamp >= *existing_timestamp {
+                *existing_timestamp = timestamp;
+                *existing_verdict = verdict;
+            }
+        }
+        None => {
+            entries.insert(key, (timestamp, verdict));
+        }
+    }
+}
+
+fn block_path_candidates(path: &RepoPath, workdir_prefix: Option<&str>) -> Vec<RepoPath> {
+    let mut candidates = Vec::new();
+    for candidate in path_utils::candidate_repo_paths_for_hint(path.as_str(), workdir_prefix, None)
+    {
+        let Ok(candidate) = RepoPath::new(candidate) else {
+            continue;
+        };
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 #[derive(Debug, Clone, Default)]
@@ -781,6 +971,30 @@ mod tests {
         let any_index = ReviewIndex::from_records(&records, None);
         assert_eq!(review_index.verdict_for(&target), Some(&Verdict::Approved));
         assert_eq!(any_index.verdict_for(&target), Some(&Verdict::Rejected));
+    }
+
+    #[test]
+    fn review_index_uses_exact_block_location_before_hash_fallback() {
+        let hash = TreeHash::new("typed-key");
+        let target = ReviewTargetRef::Block { hash: hash.clone() };
+        let mut precise = record("1", target.clone(), "review", Verdict::Approved, 2);
+        precise.path_hint = Some(RepoPath::new("src/lib.rs").unwrap());
+        precise.line_hint = Some(10);
+
+        let mut coarse = record("2", target, "review", Verdict::Rejected, 1);
+        coarse.path_hint = None;
+        coarse.line_hint = None;
+
+        let index = ReviewIndex::from_records(&[precise, coarse], Some(&ReviewCheck::review()));
+
+        assert_eq!(
+            index.block_verdict_for(&hash, &RepoPath::new("src/lib.rs").unwrap(), 10, None),
+            Some(&Verdict::Approved)
+        );
+        assert_eq!(
+            index.block_verdict_for(&hash, &RepoPath::new("src/lib.rs").unwrap(), 11, None),
+            Some(&Verdict::Rejected)
+        );
     }
 
     #[test]

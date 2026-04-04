@@ -1,10 +1,13 @@
 use crate::block::{Block, BlockKind};
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
+use crate::path_utils;
 use crate::policy::should_skip_imports_by_default;
+use crate::repo_path::RepoPath;
 use crate::scanner;
 use crate::store::{FileStore, Identity, Record, ReviewStore, ReviewTargetRef};
 use crate::tree;
+use crate::vcs;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::fs;
@@ -47,6 +50,7 @@ pub fn run(
     let latest_verdict = database.latest_index(None);
     let reviews_by_target = database.records_by_target_since(since_threshold);
     let approved_targets = latest_verdict.approved_targets();
+    let workdir_prefix = workdir_prefix_from_git_root();
 
     if format == "json" {
         // Output JSON
@@ -66,7 +70,12 @@ pub fn run(
                     hash: block.hash.clone(),
                 };
                 let verdict = latest_verdict
-                    .verdict_for(&block_target)
+                    .block_verdict_for(
+                        &block.hash,
+                        &file.path,
+                        block.start_line,
+                        workdir_prefix.as_deref(),
+                    )
                     .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
@@ -76,12 +85,28 @@ pub fn run(
                 if !include_approved
                     && tree
                         .find_block_node(&file.path, &block)
-                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_targets))
+                        .is_some_and(|node_id| {
+                            tree.is_node_covered(
+                                node_id,
+                                &approved_targets,
+                                workdir_prefix.as_deref(),
+                            )
+                        })
                 {
                     continue;
                 }
 
                 if let Some(reviews) = reviews_by_target.get(&block_target) {
+                    let reviews = matching_reviews_for_block(
+                        reviews,
+                        &block.hash,
+                        &file.path,
+                        block.start_line,
+                        workdir_prefix.as_deref(),
+                    );
+                    if reviews.is_empty() {
+                        continue;
+                    }
                     export_list.push(serde_json::json!({
                         "file": file.path,
                         "block": block,
@@ -117,7 +142,12 @@ pub fn run(
                     hash: block.hash.clone(),
                 };
                 let verdict = latest_verdict
-                    .verdict_for(&block_target)
+                    .block_verdict_for(
+                        &block.hash,
+                        &file.path,
+                        block.start_line,
+                        workdir_prefix.as_deref(),
+                    )
                     .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
@@ -127,12 +157,28 @@ pub fn run(
                 if !include_approved
                     && tree
                         .find_block_node(&file.path, &block)
-                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_targets))
+                        .is_some_and(|node_id| {
+                            tree.is_node_covered(
+                                node_id,
+                                &approved_targets,
+                                workdir_prefix.as_deref(),
+                            )
+                        })
                 {
                     continue;
                 }
 
                 if let Some(reviews) = reviews_by_target.get(&block_target) {
+                    let reviews = matching_reviews_for_block(
+                        reviews,
+                        &block.hash,
+                        &file.path,
+                        block.start_line,
+                        workdir_prefix.as_deref(),
+                    );
+                    if reviews.is_empty() {
+                        continue;
+                    }
                     blocks_to_print.push((block, reviews));
                 }
             }
@@ -140,7 +186,7 @@ pub fn run(
             if !blocks_to_print.is_empty() {
                 println!("  <file path=\"{}\">", escape_xml(file.path.as_str()));
                 for (block, reviews) in blocks_to_print {
-                    print_block_xml(&block, reviews);
+                    print_block_xml(&block, &reviews);
                 }
                 println!("  </file>");
             }
@@ -197,6 +243,52 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn matching_reviews_for_block(
+    reviews: &[Record],
+    hash: &crate::store::TreeHash,
+    path: &RepoPath,
+    start_line: usize,
+    workdir_prefix: Option<&str>,
+) -> Vec<Record> {
+    let candidates = path_utils::candidate_repo_paths_for_hint(path.as_str(), workdir_prefix, None);
+    let Ok(start_line) = u32::try_from(start_line) else {
+        return Vec::new();
+    };
+
+    reviews
+        .iter()
+        .filter(|record| record_matches_block(record, hash, start_line, &candidates))
+        .cloned()
+        .collect()
+}
+
+fn record_matches_block(
+    record: &Record,
+    hash: &crate::store::TreeHash,
+    start_line: u32,
+    candidate_paths: &[String],
+) -> bool {
+    let ReviewTargetRef::Block { hash: record_hash } = &record.target else {
+        return false;
+    };
+    if record_hash != hash {
+        return false;
+    }
+
+    match (&record.path_hint, record.line_hint) {
+        (Some(path_hint), Some(line_hint)) => {
+            line_hint == start_line
+                && candidate_paths
+                    .iter()
+                    .any(|candidate| candidate == path_hint.as_str())
+        }
+        (Some(path_hint), None) => candidate_paths
+            .iter()
+            .any(|candidate| candidate == path_hint.as_str()),
+        (None, _) => true,
+    }
 }
 
 fn parse_feedback_since(raw: Option<&str>) -> Result<FeedbackSince> {
@@ -264,4 +356,9 @@ fn write_feedback_cursor(path: &Path, timestamp: i64) -> Result<()> {
     }
     fs::write(path, format!("{timestamp}\n"))?;
     Ok(())
+}
+
+fn workdir_prefix_from_git_root() -> Option<String> {
+    let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
+    path_utils::current_workdir_prefix_for_repo_root(&repo_root)
 }

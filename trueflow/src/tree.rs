@@ -149,25 +149,46 @@ impl Tree {
         self.file_paths.iter()
     }
 
-    pub fn is_node_covered(&self, id: TreeNodeId, approved_targets: &ApprovedTargets) -> bool {
+    pub fn is_node_covered(
+        &self,
+        id: TreeNodeId,
+        approved_targets: &ApprovedTargets,
+        workdir_prefix: Option<&str>,
+    ) -> bool {
         let mut current = Some(id);
         while let Some(node_id) = current {
             let node = self.node(node_id);
-            let target = match node.kind {
+            match node.kind {
                 TreeNodeKind::Root | TreeNodeKind::Directory => {
-                    crate::store::ReviewTargetRef::Tree {
+                    let target = crate::store::ReviewTargetRef::Tree {
                         hash: node.hash.clone(),
+                    };
+                    if approved_targets.contains_target(&target) {
+                        return true;
                     }
                 }
-                TreeNodeKind::File => crate::store::ReviewTargetRef::File {
-                    hash: node.hash.clone(),
-                },
-                TreeNodeKind::Block => crate::store::ReviewTargetRef::Block {
-                    hash: node.hash.clone(),
-                },
-            };
-            if approved_targets.contains_target(&target) {
-                return true;
+                TreeNodeKind::File => {
+                    let target = crate::store::ReviewTargetRef::File {
+                        hash: node.hash.clone(),
+                    };
+                    if approved_targets.contains_target(&target) {
+                        return true;
+                    }
+                }
+                TreeNodeKind::Block => {
+                    let Some(block) = node.block.as_ref() else {
+                        current = node.parent;
+                        continue;
+                    };
+                    if approved_targets.contains_block(
+                        &node.hash,
+                        &node.path,
+                        block.start_line,
+                        workdir_prefix,
+                    ) {
+                        return true;
+                    }
+                }
             }
             current = node.parent;
         }

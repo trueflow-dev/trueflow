@@ -815,6 +815,60 @@ fn test_review_progress_counts_duplicate_blocks() -> Result<()> {
 }
 
 #[test]
+fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> {
+    let repo = TestRepo::new("review_duplicate_precise_approval")?;
+    repo.write(
+        "src/lib.rs",
+        "fn duplicate() { println!(\"hello\"); }\n\nfn duplicate() { println!(\"hello\"); }\n",
+    )?;
+    repo.commit_all("Add duplicates")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let files = json_array(&output)?;
+    let blocks = files[0]["blocks"].as_array().context("blocks")?;
+    assert_eq!(blocks.len(), 2, "expected duplicate blocks before approval");
+
+    let duplicate_hash = blocks[0]["hash"].as_str().context("duplicate hash")?;
+    let first_start_line = blocks[0]["start_line"]
+        .as_u64()
+        .context("first start line")?;
+    let second_start_line = blocks[1]["start_line"]
+        .as_u64()
+        .context("second start line")?;
+    assert_eq!(blocks[1]["hash"].as_str(), Some(duplicate_hash));
+    assert_ne!(first_start_line, second_start_line);
+
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        duplicate_hash,
+        "--verdict",
+        "approved",
+        "--path",
+        "src/lib.rs",
+        "--line",
+        &first_start_line.to_string(),
+        "--quiet",
+    ])?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let files = json_array(&output)?;
+    let remaining_blocks = files[0]["blocks"].as_array().context("remaining blocks")?;
+
+    assert_eq!(
+        remaining_blocks.len(),
+        1,
+        "expected one duplicate block to remain after exact approval"
+    );
+    assert_eq!(
+        remaining_blocks[0]["start_line"].as_u64(),
+        Some(second_start_line)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
     let repo = TestRepo::new("exclude_gap_case")?;
     repo.write(

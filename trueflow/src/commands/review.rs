@@ -364,7 +364,8 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                 continue;
             }
             if let Some(hunks) = file_diff_hunks.as_deref()
-                && !vcs::block_has_changed_lines_in_diff(&block, hunks)
+                && vcs::block_has_changed_lines_in_diff(&block, hunks)
+                    != vcs::BlockDiffChangeKind::ReviewableChanges
             {
                 continue;
             }
@@ -381,20 +382,29 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         let mut unreviewed_blocks = Vec::new();
         for block in reviewable_blocks {
             let node_id = tree.find_block_node(&file.path, &block);
-            let block_target = ReviewTargetRef::Block {
-                hash: block.hash.clone(),
-            };
             if let Some(node_id) = node_id
-                && tree.is_node_covered(node_id, &approved_targets)
+                && tree.is_node_covered(node_id, &approved_targets, workdir_prefix.as_deref())
             {
                 continue;
             }
 
-            if review_index.is_approved(&block_target) {
+            if review_index.is_block_approved(
+                &block.hash,
+                &file.path,
+                block.start_line,
+                workdir_prefix.as_deref(),
+            ) {
                 continue;
             }
 
-            if review_index.verdict_for(&block_target).is_none()
+            if review_index
+                .block_verdict_for(
+                    &block.hash,
+                    &file.path,
+                    block.start_line,
+                    workdir_prefix.as_deref(),
+                )
+                .is_none()
                 && let Ok(sub_blocks) = sub_splitter::split(&block, language)
                 && !sub_blocks.is_empty()
             {
@@ -402,9 +412,12 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                     if !query.filters.allows_subblock(sb.kind) {
                         return true;
                     }
-                    review_index.is_approved(&ReviewTargetRef::Block {
-                        hash: sb.hash.clone(),
-                    })
+                    review_index.is_block_approved(
+                        &sb.hash,
+                        &file.path,
+                        sb.start_line,
+                        workdir_prefix.as_deref(),
+                    )
                 });
 
                 if all_approved {
