@@ -26,6 +26,21 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
         Language::Rust if matches!(block.kind, BlockKind::Impl | BlockKind::Interface) => {
             split_rust_impl(block)?
         }
+        Language::Swift if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
+            split_swift_function(block)?
+        }
+        Language::Swift
+            if matches!(
+                block.kind,
+                BlockKind::Impl
+                    | BlockKind::Interface
+                    | BlockKind::Class
+                    | BlockKind::Struct
+                    | BlockKind::Enum
+            ) =>
+        {
+            split_swift_type(block)?
+        }
         Language::Python if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
             split_python_function(block)?
         }
@@ -185,6 +200,7 @@ struct FunctionSplitConfig<'a> {
     language: tree_sitter::Language,
     function_kind: &'a str,
     body_kind: &'a str,
+    body_statement_kind: Option<&'a str>,
     signature_end: fn(&str, usize) -> usize,
     comment_kinds: &'a [&'a str],
     trim_closing_brace: bool,
@@ -197,6 +213,7 @@ fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
             language: tree_sitter_rust::LANGUAGE.into(),
             function_kind: "function_item",
             body_kind: "block",
+            body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["line_comment", "block_comment"],
             trim_closing_brace: true,
@@ -311,6 +328,7 @@ fn split_python_function(block: &Block) -> Result<Vec<Block>> {
             language: tree_sitter_python::LANGUAGE.into(),
             function_kind: "function_definition",
             body_kind: "block",
+            body_statement_kind: None,
             signature_end: signature_end_before_body,
             comment_kinds: &["comment", "line_comment", "block_comment"],
             trim_closing_brace: false,
@@ -329,11 +347,55 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
             language,
             function_kind: "function_declaration",
             body_kind: "statement_block",
+            body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["comment", "line_comment", "block_comment"],
             trim_closing_brace: true,
         },
     )
+}
+
+fn split_swift_function(block: &Block) -> Result<Vec<Block>> {
+    split_function_with_parser(
+        block,
+        &FunctionSplitConfig {
+            language: tree_sitter_swift::LANGUAGE.into(),
+            function_kind: "function_declaration",
+            body_kind: "function_body",
+            body_statement_kind: Some("statements"),
+            signature_end: signature_end_offset,
+            comment_kinds: &["comment", "multiline_comment"],
+            trim_closing_brace: true,
+        },
+    )
+}
+
+fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_swift::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse swift type")?;
+    let root = tree.root_node();
+    let type_node = find_named_descendant(root, "class_declaration")
+        .or_else(|| find_named_descendant(root, "protocol_declaration"));
+    let Some(type_node) = type_node else {
+        return split_code(block);
+    };
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return split_code(block);
+    };
+    if !swift_body_is_non_trivial(body, content) {
+        return split_code(block);
+    }
+
+    let items = collect_swift_type_items(block, body, content);
+    if items.is_empty() {
+        split_code(block)
+    } else {
+        Ok(items)
+    }
 }
 
 fn split_function_with_parser(
@@ -353,6 +415,10 @@ fn split_function_with_parser(
     let Some(body_node) = find_named_descendant(function_node, config.body_kind) else {
         return split_code(block);
     };
+    let split_node = config
+        .body_statement_kind
+        .and_then(|kind| find_named_descendant(body_node, kind))
+        .unwrap_or(body_node);
 
     let mut blocks = Vec::new();
     let content = block.content.as_str();
@@ -367,7 +433,7 @@ fn split_function_with_parser(
         ));
     }
 
-    let nodes = collect_body_nodes(body_node, config.comment_kinds);
+    let nodes = collect_body_nodes(split_node, config.comment_kinds);
     if nodes.is_empty() {
         return split_code(block);
     }
@@ -576,6 +642,142 @@ fn collect_body_nodes<'a>(
     nodes
 }
 
+fn swift_body_is_non_trivial(body: tree_sitter::Node<'_>, content: &str) -> bool {
+    let mut cursor = body.walk();
+    let member_count = body
+        .children(&mut cursor)
+        .filter(|child| map_swift_member_kind(*child, content).is_some())
+        .count();
+    if member_count >= 2 {
+        return true;
+    }
+
+    let body_content = &content[body.start_byte()..body.end_byte()];
+    body_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        >= 10
+}
+
+fn collect_swift_type_items(
+    parent: &Block,
+    body: tree_sitter::Node<'_>,
+    content: &str,
+) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    let mut pending_start: Option<usize> = None;
+    let mut pending_end: usize = 0;
+
+    for child in body.children(&mut cursor) {
+        let ts_kind = child.kind();
+        if matches!(ts_kind, "{" | "}") {
+            continue;
+        }
+
+        let start_byte = child.start_byte();
+        let end_byte = child.end_byte();
+        if is_swift_attribute_node(ts_kind) {
+            if pending_start.is_none() {
+                pending_start = Some(start_byte);
+            }
+            pending_end = end_byte;
+            continue;
+        }
+
+        let Some(kind) = map_swift_member_kind(child, content) else {
+            continue;
+        };
+
+        let block_start = pending_start.unwrap_or(start_byte);
+        let chunk = &parent.content[block_start..end_byte];
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            chunk,
+            block_start,
+            end_byte,
+            kind,
+        ));
+
+        pending_start = None;
+        pending_end = 0;
+    }
+
+    if let Some(start) = pending_start {
+        let end = pending_end.max(start);
+        if end > start {
+            let chunk = &parent.content[start..end];
+            blocks.push(create_sub_block_with_kind(
+                parent,
+                chunk,
+                start,
+                end,
+                BlockKind::Code,
+            ));
+        }
+    }
+
+    blocks
+}
+
+fn map_swift_member_kind(node: tree_sitter::Node<'_>, content: &str) -> Option<BlockKind> {
+    match node.kind() {
+        "attribute" | "comment" | "multiline_comment" => None,
+        "class_declaration" => Some(match swift_declaration_keyword(node) {
+            Some("struct") => BlockKind::Struct,
+            Some("enum") => BlockKind::Enum,
+            Some("extension") => BlockKind::Impl,
+            Some("actor" | "class") => BlockKind::Class,
+            _ => BlockKind::Code,
+        }),
+        "protocol_declaration" => Some(BlockKind::Interface),
+        "function_declaration"
+        | "init_declaration"
+        | "deinit_declaration"
+        | "subscript_declaration" => Some(BlockKind::Method),
+        "protocol_function_declaration" => Some(BlockKind::FunctionSignature),
+        "typealias_declaration" | "associatedtype_declaration" => Some(BlockKind::Type),
+        "property_declaration" | "protocol_property_declaration" => {
+            Some(map_swift_property_kind(node, content))
+        }
+        "import_declaration" => Some(BlockKind::Import),
+        _ => None,
+    }
+}
+
+fn swift_declaration_keyword(node: tree_sitter::Node<'_>) -> Option<&str> {
+    node.child_by_field_name("declaration_kind")
+        .map(|child| child.kind())
+}
+
+fn map_swift_property_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "value_binding_pattern" {
+            continue;
+        }
+        if let Some(mutability) = child.child_by_field_name("mutability") {
+            return if mutability.kind() == "let" {
+                BlockKind::Const
+            } else {
+                BlockKind::Variable
+            };
+        }
+    }
+
+    let node_content = &content[node.start_byte()..node.end_byte()];
+    if node_content.contains("let ") {
+        BlockKind::Const
+    } else {
+        BlockKind::Variable
+    }
+}
+
+fn is_swift_attribute_node(kind: &str) -> bool {
+    matches!(kind, "attribute" | "comment" | "multiline_comment")
+}
+
 fn gap_prefix_length(gap: &str) -> usize {
     if gap.is_empty() {
         return 0;
@@ -748,6 +950,15 @@ mod tests {
         let chunks = split(&block, Language::Rust).unwrap();
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Const));
+        assert!(!chunks.iter().any(|b| b.kind == BlockKind::Impl));
+    }
+
+    #[test]
+    fn test_split_swift_extension_into_members_when_non_trivial() {
+        let content = "extension Context {\n    func fetchWorld() -> World {\n        world\n    }\n\n    func reset() async -> [UInt8] {\n        await world.transform([])\n    }\n}\n";
+        let block = make_block(content, BlockKind::Impl);
+        let chunks = split(&block, Language::Swift).unwrap();
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Impl));
     }
 

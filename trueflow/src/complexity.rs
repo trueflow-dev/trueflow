@@ -9,6 +9,7 @@ pub fn calculate(content: &str, lang: Language) -> u32 {
     let mut parser = Parser::new();
     let language = match lang {
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+        Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
@@ -43,6 +44,17 @@ fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
                 | "loop_expression"
                 | "match_expression"
         ),
+        Language::Swift => matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "repeat_while_statement"
+                | "guard_statement"
+                | "switch_statement"
+                | "do_statement"
+                | "ternary_expression"
+        ),
         Language::JavaScript | Language::TypeScript => matches!(
             kind,
             "if_statement"
@@ -70,6 +82,12 @@ fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
 
     let is_logical_op = match lang {
         Language::Rust => matches!(kind, "&&" | "||"),
+        Language::Swift => {
+            matches!(
+                kind,
+                "conjunction_expression" | "disjunction_expression" | "nil_coalescing_expression"
+            )
+        }
         Language::JavaScript | Language::TypeScript => matches!(kind, "&&" | "||" | "??"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
@@ -153,5 +171,21 @@ def foo():
         // Total: 6
         let score = calculate(code, Language::Python);
         assert_eq!(score, 6);
+    }
+
+    #[test]
+    fn test_calculate_complexity_swift() {
+        let code = "
+func run(_ values: [Int]) -> Int {
+    var result = 0
+    for value in values {
+        if value > 0 {
+            result += value
+        }
+    }
+    return result
+}";
+        let score = calculate(code, Language::Swift);
+        assert_eq!(score, 3);
     }
 }

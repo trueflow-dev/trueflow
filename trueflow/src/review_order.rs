@@ -179,6 +179,7 @@ fn is_library_path(path: &RepoPath) -> bool {
         || (path.as_str().starts_with("src/")
             && !path.as_str().starts_with("src/main.rs")
             && !path.as_str().starts_with("src/bin/"))
+        || path.as_str().starts_with("Sources/")
 }
 
 fn is_test_block(path: &RepoPath, node: &TreeNode) -> bool {
@@ -211,6 +212,9 @@ fn is_test_path(path: &RepoPath) -> bool {
         || file_name.ends_with("_test.py")
         || file_name.ends_with("_test.js")
         || file_name.ends_with("_test.ts")
+        || file_name.ends_with("_test.swift")
+        || file_name.ends_with("Tests.swift")
+        || file_name.ends_with("Test.swift")
 }
 
 #[cfg(test)]
@@ -321,6 +325,71 @@ mod tests {
         let order = ReviewOrder::from_tree(&tree, &unreviewed);
 
         assert_eq!(order.ordered_ids(), vec![struct_id, function_id]);
+    }
+
+    #[test]
+    fn review_order_prioritizes_swiftpm_tests_then_sources_then_manifest() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+
+        let sources = builder.add_dir(root, "Sources".to_string(), "Sources".to_string());
+        let app = builder.add_dir(sources, "App".to_string(), "Sources/App".to_string());
+        let tests = builder.add_dir(root, "Tests".to_string(), "Tests".to_string());
+        let app_tests =
+            builder.add_dir(tests, "AppTests".to_string(), "Tests/AppTests".to_string());
+
+        let source_file = builder.add_file(
+            app,
+            "Core.swift".to_string(),
+            "Sources/App/Core.swift".to_string(),
+            "file-source".to_string(),
+            Language::Swift,
+        );
+        let test_file = builder.add_file(
+            app_tests,
+            "CoreTests.swift".to_string(),
+            "Tests/AppTests/CoreTests.swift".to_string(),
+            "file-test".to_string(),
+            Language::Swift,
+        );
+        let manifest_file = builder.add_file(
+            root,
+            "Package.swift".to_string(),
+            "Package.swift".to_string(),
+            "file-package".to_string(),
+            Language::Swift,
+        );
+
+        let source_block_id = builder.add_block(
+            source_file,
+            "source".to_string(),
+            "Sources/App/Core.swift".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Swift,
+        );
+        let test_block_id = builder.add_block(
+            test_file,
+            "test".to_string(),
+            "Tests/AppTests/CoreTests.swift".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Swift,
+        );
+        let manifest_block_id = builder.add_block(
+            manifest_file,
+            "manifest".to_string(),
+            "Package.swift".to_string(),
+            test_block(BlockKind::Const, 1, &[]),
+            Language::Swift,
+        );
+
+        let tree = builder.finalize();
+        let unreviewed = HashSet::from([manifest_block_id, source_block_id, test_block_id]);
+        let order = ReviewOrder::from_tree(&tree, &unreviewed);
+
+        assert_eq!(
+            order.ordered_ids(),
+            vec![test_block_id, source_block_id, manifest_block_id]
+        );
     }
 
     #[test]

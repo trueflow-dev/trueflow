@@ -86,6 +86,21 @@ fn test_ts_function_subblock_types() -> Result<()> {
 }
 
 #[test]
+fn test_swift_function_subblock_types() -> Result<()> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let file_path = repo_root.join("example_repos/complex_blocks_swift/Sources/App/Core.swift");
+    let expected = vec![
+        BlockKind::FunctionSignature,
+        BlockKind::CodeParagraph,
+        BlockKind::CodeParagraph,
+        BlockKind::Comment,
+        BlockKind::CodeParagraph,
+        BlockKind::CodeParagraph,
+    ];
+    assert_subblock_kinds(&file_path, "processData", Language::Swift, &expected)
+}
+
+#[test]
 fn test_markdown_subblocks_and_sentences() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks_md/README.md");

@@ -28,6 +28,7 @@ fn test_all_languages_detection() -> Result<()> {
     // Assertions
     let expected = vec![
         ("main.rs", "Rust"),
+        ("main.swift", "Swift"),
         ("main.el", "Elisp"),
         ("main.go", "Go"),
         ("main.cpp", "Cpp"),
@@ -132,7 +133,7 @@ fn test_all_languages_test_blocks() -> Result<()> {
         tags_by_path.insert(path, tags);
     }
 
-    let expected = ["main.py", "main.js", "main.ts", "main.sh"];
+    let expected = ["main.py", "main.js", "main.ts", "main.sh", "main.swift"];
 
     for filename in expected {
         let tags = tags_by_path

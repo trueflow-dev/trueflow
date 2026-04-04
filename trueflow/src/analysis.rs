@@ -4,6 +4,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
+    Swift,
     Elisp,
     JavaScript,
     TypeScript,
@@ -30,6 +31,7 @@ impl Language {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "rs" => Some(Language::Rust),
+            "swift" => Some(Language::Swift),
             "el" => Some(Language::Elisp),
             "js" => Some(Language::JavaScript),
             "ts" => Some(Language::TypeScript),
@@ -97,6 +99,7 @@ mod tests {
     fn test_language_from_extension() {
         // Covers all match arms to ensure no dead code mutants
         assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
+        assert_eq!(Language::from_extension("swift"), Some(Language::Swift));
         assert_eq!(Language::from_extension("el"), Some(Language::Elisp));
         assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));

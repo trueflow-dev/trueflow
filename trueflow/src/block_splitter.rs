@@ -16,6 +16,13 @@ static RUST_ATTR_QUERY: LazyLock<Query> = LazyLock::new(|| {
         "rust attribute query",
     )
 });
+static SWIFT_ATTR_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_swift::LANGUAGE.into(),
+        "(attribute) @attr",
+        "swift attribute query",
+    )
+});
 static PYTHON_DECORATED_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
     compile_query(
         &tree_sitter_python::LANGUAGE.into(),
@@ -199,6 +206,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
             Vec::new(),
         ),
         Language::Rust
+        | Language::Swift
         | Language::JavaScript
         | Language::TypeScript
         | Language::Python
@@ -302,6 +310,9 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                     || ts_kind == "block_comment"
             }
             Language::Python => ts_kind == "decorator",
+            Language::Swift => {
+                matches!(ts_kind, "attribute" | "comment" | "multiline_comment")
+            }
             _ => false,
         };
 
@@ -348,7 +359,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         let node_content = &content[block_start..end_byte];
         blocks.push(create_block(
             node_content,
-            map_kind(lang, ts_kind),
+            map_kind_for_node(lang, child, content),
             content,
             block_start,
             end_byte,
@@ -357,6 +368,11 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
 
         if matches!(lang, Language::Rust) && matches!(ts_kind, "impl_item" | "trait_item") {
             blocks.extend(collect_rust_impl_items(child, content, lang));
+        }
+        if matches!(lang, Language::Swift)
+            && matches!(ts_kind, "class_declaration" | "protocol_declaration")
+        {
+            blocks.extend(collect_swift_type_items(child, content, lang));
         }
 
         last_end_byte = end_byte;
@@ -399,6 +415,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
 fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
     match lang {
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+        Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
@@ -997,6 +1014,13 @@ fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8>
     }
 }
 
+fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match lang {
+        Language::Swift => map_swift_kind(node, content),
+        _ => map_kind(lang, node.kind()),
+    }
+}
+
 fn map_kind(lang: Language, kind: &str) -> BlockKind {
     match lang {
         Language::Rust => match kind {
@@ -1037,6 +1061,167 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
         },
         _ => BlockKind::Code,
     }
+}
+
+fn map_swift_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match node.kind() {
+        "import_declaration" => BlockKind::Import,
+        "function_declaration" => BlockKind::Function,
+        "class_declaration" => match swift_declaration_keyword(node) {
+            Some("struct") => BlockKind::Struct,
+            Some("enum") => BlockKind::Enum,
+            Some("extension") => BlockKind::Impl,
+            Some("actor" | "class") => BlockKind::Class,
+            _ => BlockKind::Code,
+        },
+        "protocol_declaration" => BlockKind::Interface,
+        "typealias_declaration" | "associatedtype_declaration" => BlockKind::Type,
+        "property_declaration" | "protocol_property_declaration" => {
+            map_swift_property_kind(node, content)
+        }
+        "init_declaration" | "deinit_declaration" | "subscript_declaration" => BlockKind::Method,
+        "protocol_function_declaration" => BlockKind::FunctionSignature,
+        _ => BlockKind::Code,
+    }
+}
+
+fn swift_declaration_keyword(node: tree_sitter::Node<'_>) -> Option<&str> {
+    node.child_by_field_name("declaration_kind")
+        .map(|child| child.kind())
+}
+
+fn map_swift_property_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "value_binding_pattern" {
+            continue;
+        }
+        if let Some(mutability) = child.child_by_field_name("mutability") {
+            return if mutability.kind() == "let" {
+                BlockKind::Const
+            } else {
+                BlockKind::Variable
+            };
+        }
+    }
+
+    let node_content = &content[node.start_byte()..node.end_byte()];
+    if node_content.contains("let ") {
+        BlockKind::Const
+    } else {
+        BlockKind::Variable
+    }
+}
+
+fn map_swift_member_kind(node: tree_sitter::Node<'_>, content: &str) -> Option<BlockKind> {
+    match node.kind() {
+        "attribute" | "comment" | "multiline_comment" => None,
+        "class_declaration"
+        | "protocol_declaration"
+        | "function_declaration"
+        | "property_declaration"
+        | "protocol_property_declaration"
+        | "init_declaration"
+        | "deinit_declaration"
+        | "subscript_declaration"
+        | "protocol_function_declaration"
+        | "typealias_declaration"
+        | "associatedtype_declaration"
+        | "import_declaration" => Some(map_swift_kind(node, content)),
+        _ => None,
+    }
+}
+
+fn is_swift_attribute_node(kind: &str) -> bool {
+    matches!(kind, "attribute" | "comment" | "multiline_comment")
+}
+
+fn swift_body_is_non_trivial(body: tree_sitter::Node<'_>, content: &str) -> bool {
+    let mut cursor = body.walk();
+    let member_count = body
+        .children(&mut cursor)
+        .filter(|child| map_swift_member_kind(*child, content).is_some())
+        .count();
+    if member_count >= 2 {
+        return true;
+    }
+
+    let body_content = &content[body.start_byte()..body.end_byte()];
+    body_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        >= 10
+}
+
+fn collect_swift_type_items(
+    type_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    if !swift_body_is_non_trivial(body, content) {
+        return Vec::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    let mut pending_start: Option<usize> = None;
+    let mut pending_end: usize = 0;
+
+    for child in body.children(&mut cursor) {
+        let ts_kind = child.kind();
+        if matches!(ts_kind, "{" | "}") {
+            continue;
+        }
+
+        let start_byte = child.start_byte();
+        let end_byte = child.end_byte();
+        if is_swift_attribute_node(ts_kind) {
+            if pending_start.is_none() {
+                pending_start = Some(start_byte);
+            }
+            pending_end = end_byte;
+            continue;
+        }
+
+        let Some(kind) = map_swift_member_kind(child, content) else {
+            continue;
+        };
+
+        let block_start = pending_start.unwrap_or(start_byte);
+        let node_content = &content[block_start..end_byte];
+        blocks.push(create_block(
+            node_content,
+            kind,
+            content,
+            block_start,
+            end_byte,
+            lang,
+        ));
+
+        pending_start = None;
+        pending_end = 0;
+    }
+
+    if let Some(start) = pending_start {
+        let end = pending_end.max(start);
+        if end > start {
+            let chunk = &content[start..end];
+            blocks.push(create_block(
+                chunk,
+                BlockKind::Code,
+                content,
+                start,
+                end,
+                lang,
+            ));
+        }
+    }
+
+    blocks
 }
 
 fn map_rust_impl_child_kind(kind: &str) -> Option<BlockKind> {
@@ -1180,6 +1365,43 @@ fn collect_test_ranges(
                 }
             }
         }
+        Language::Swift => {
+            let mut cursor = QueryCursor::new();
+            let mut matches =
+                cursor.matches(&SWIFT_ATTR_QUERY, tree.root_node(), source.as_bytes());
+            while let Some(match_) = matches.next() {
+                for capture in match_.captures {
+                    let name = &SWIFT_ATTR_QUERY.capture_names()[capture.index as usize];
+                    if *name != "attr" {
+                        continue;
+                    }
+                    let attr_text = capture.node.utf8_text(source.as_bytes())?;
+                    if (attr_text.contains("Test") || attr_text.contains("Suite"))
+                        && let Some(target) = ancestor_or_self_of_kinds(
+                            capture.node,
+                            &[
+                                "function_declaration",
+                                "class_declaration",
+                                "protocol_declaration",
+                            ],
+                        )
+                        .or_else(|| {
+                            next_named_sibling_of_kinds(
+                                capture.node,
+                                &[
+                                    "function_declaration",
+                                    "class_declaration",
+                                    "protocol_declaration",
+                                ],
+                            )
+                        })
+                    {
+                        ranges.push(ByteSpan::new(target.start_byte(), target.end_byte()));
+                    }
+                }
+            }
+            collect_swift_xctest_ranges(tree.root_node(), source, &mut ranges)?;
+        }
         Language::Python => {
             collect_python_test_ranges(&PYTHON_DECORATED_TEST_QUERY, tree, source, &mut ranges)?;
             collect_python_test_ranges(&PYTHON_FUNCTION_TEST_QUERY, tree, source, &mut ranges)?;
@@ -1242,6 +1464,57 @@ fn next_named_sibling_of_kind<'a>(
         current = next;
     }
     None
+}
+
+fn next_named_sibling_of_kinds<'a>(
+    node: tree_sitter::Node<'a>,
+    kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    let mut current = node;
+    while let Some(next) = current.next_named_sibling() {
+        if kinds.iter().any(|kind| *kind == next.kind()) {
+            return Some(next);
+        }
+        current = next;
+    }
+    None
+}
+
+fn ancestor_or_self_of_kinds<'a>(
+    node: tree_sitter::Node<'a>,
+    kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if kinds.iter().any(|kind| *kind == candidate.kind()) {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn collect_swift_xctest_ranges(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    ranges: &mut Vec<ByteSpan>,
+) -> Result<()> {
+    if node.kind() == "class_declaration" {
+        let header_end = node
+            .child_by_field_name("body")
+            .map_or(node.end_byte(), |body| body.start_byte());
+        let header = &source[node.start_byte()..header_end];
+        if header.contains("XCTestCase") {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_swift_xctest_ranges(child, source, ranges)?;
+    }
+
+    Ok(())
 }
 
 fn collect_python_test_ranges(
@@ -1399,6 +1672,46 @@ mod tests {
             .find(|b| b.content.contains("mod tests"));
         assert!(module_block.is_some());
         assert!(module_block.unwrap().tags.contains(&"test".to_string()));
+    }
+
+    #[test]
+    fn test_swift_structural_blocks_and_test_detection() {
+        let content = "import Foundation\nimport Testing\n\n\
+typealias Payload = [UInt8]\n\n\
+actor Worker {\n    func run() {}\n}\n\n\
+extension Worker {\n    func stop() {}\n    var body: some View { Text(\"hi\") }\n}\n\n\
+@Test\nfunc test_worker() async throws {}\n\n\
+final class LegacyWorkerTests: XCTestCase {\n    func testLegacyPath() {}\n}\n";
+        let result = split_result(content, Language::Swift);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Type));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Impl));
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| block.tags.iter().any(|tag| tag == "test"))
+                .count()
+                >= 2
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Paragraph))
+        );
+    }
+
+    #[test]
+    fn test_swift_package_manifest_is_structural() {
+        let content = "import PackageDescription\n\n\
+let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(name: \"Demo\", targets: [\"Demo\"]),\n    ],\n    targets: [\n        .target(name: \"Demo\"),\n        .testTarget(name: \"DemoTests\", dependencies: [\"Demo\"]),\n    ]\n)\n";
+        let result = split_result(content, Language::Swift);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let kinds: Vec<_> = result.blocks.iter().map(|block| block.kind).collect();
+        assert!(kinds.contains(&BlockKind::Import));
+        assert!(kinds.contains(&BlockKind::Const) || kinds.contains(&BlockKind::Variable));
     }
 
     fn assert_paragraph_split(language: Language) {
