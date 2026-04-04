@@ -1,11 +1,15 @@
 use anyhow::{Result, anyhow};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fmt;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
+#[schemars(transparent)]
 pub struct RepoPath(String);
 
 impl RepoPath {

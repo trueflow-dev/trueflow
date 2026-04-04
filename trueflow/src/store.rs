@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -8,18 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 
+use crate::repo_path::RepoPath;
 use crate::vcs;
 
 const TRUEFLOW_DIR: &str = ".trueflow";
 const DB_FILE: &str = "reviews.jsonl";
-pub const CURRENT_VERSION: u32 = 1;
-
-fn default_version() -> u32 {
-    0 // Legacy records
-}
+pub const CURRENT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(tag = "type")]
@@ -30,7 +27,6 @@ pub enum Identity {
         #[schemars(email)]
         email: String,
     },
-    // Future: OIDC, DID, etc.
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -50,15 +46,42 @@ pub enum VcsSystem {
     Git,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct RepoRevision(String);
+
+impl RepoRevision {
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        let value = value.as_ref().trim();
+        if !(7..=40).contains(&value.len()) || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "repo revision must be a 7-40 character hex string: {value}"
+            ));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RepoRevision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 #[schemars(deny_unknown_fields)]
 pub enum RepoRef {
     Vcs {
         system: VcsSystem,
-        #[schemars(regex(pattern = "^[0-9a-f]{7,40}$"))]
-        revision: String,
+        revision: RepoRevision,
     },
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -70,14 +93,25 @@ pub enum BlockState {
     Unknown,
 }
 
-#[allow(unused_imports)]
-pub use crate::hashing::{ContentHash, TreeHash};
+pub use crate::hashing::TreeHash;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
 pub struct DiffFingerprint(String);
 
 impl DiffFingerprint {
-    pub fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        let value = value.as_ref().trim();
+        if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "diff fingerprint must be a 64-character hex string: {value}"
+            ));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    pub fn from_computed(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
@@ -86,15 +120,38 @@ impl DiffFingerprint {
     }
 }
 
-impl From<String> for DiffFingerprint {
-    fn from(value: String) -> Self {
-        Self::new(value)
+impl fmt::Display for DiffFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
-impl From<&str> for DiffFingerprint {
-    fn from(value: &str) -> Self {
-        Self::new(value)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReviewCheck(String);
+
+impl ReviewCheck {
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        let value = value.as_ref().trim();
+        if value.is_empty() {
+            return Err(anyhow!("review check cannot be empty"));
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn review() -> Self {
+        Self("review".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ReviewCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -130,21 +187,20 @@ impl ReviewTargetRef {
 }
 
 impl ReviewTargetKind {
-    pub fn into_target(self, value: impl Into<String>) -> ReviewTargetRef {
-        let value = value.into();
+    pub fn parse_target(self, raw: &str) -> Result<ReviewTargetRef> {
         match self {
-            ReviewTargetKind::Block => ReviewTargetRef::Block {
-                hash: TreeHash::new(value),
-            },
-            ReviewTargetKind::File => ReviewTargetRef::File {
-                hash: TreeHash::new(value),
-            },
-            ReviewTargetKind::Tree => ReviewTargetRef::Tree {
-                hash: TreeHash::new(value),
-            },
-            ReviewTargetKind::Diff => ReviewTargetRef::Diff {
-                fingerprint: DiffFingerprint::new(value),
-            },
+            ReviewTargetKind::Block => Ok(ReviewTargetRef::Block {
+                hash: TreeHash::parse(raw)?,
+            }),
+            ReviewTargetKind::File => Ok(ReviewTargetRef::File {
+                hash: TreeHash::parse(raw)?,
+            }),
+            ReviewTargetKind::Tree => Ok(ReviewTargetRef::Tree {
+                hash: TreeHash::parse(raw)?,
+            }),
+            ReviewTargetKind::Diff => Ok(ReviewTargetRef::Diff {
+                fingerprint: DiffFingerprint::new(raw)?,
+            }),
         }
     }
 }
@@ -176,25 +232,17 @@ pub struct Attestation {
 #[schemars(deny_unknown_fields)]
 pub struct Record {
     pub id: String,
-    // Schema version
-    #[serde(default = "default_version")]
     #[schemars(range(min = 0))]
     pub version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<ReviewTargetRef>,
-    pub fingerprint: String,
-    #[schemars(length(min = 1))]
-    pub check: String,
+    pub target: ReviewTargetRef,
+    pub check: ReviewCheck,
     pub verdict: Verdict,
-
     pub identity: Identity,
-
     pub repo_ref: RepoRef,
     pub block_state: BlockState,
-
     #[schemars(range(min = 0))]
     pub timestamp: i64,
-    pub path_hint: Option<String>,
+    pub path_hint: Option<RepoPath>,
     pub line_hint: Option<u32>,
     pub note: Option<String>,
     #[schemars(inner(length(min = 1)))]
@@ -203,17 +251,40 @@ pub struct Record {
     pub attestations: Option<Vec<Attestation>>,
 }
 
-impl Record {
-    pub fn lookup_key(&self) -> &str {
-        self.target
-            .as_ref()
-            .map_or(self.fingerprint.as_str(), ReviewTargetRef::lookup_key)
-    }
+#[derive(Serialize)]
+struct SignableRecord<'a> {
+    id: &'a str,
+    version: u32,
+    target: &'a ReviewTargetRef,
+    check: &'a ReviewCheck,
+    verdict: &'a Verdict,
+    identity: &'a Identity,
+    repo_ref: &'a RepoRef,
+    block_state: &'a BlockState,
+    timestamp: i64,
+    path_hint: &'a Option<RepoPath>,
+    line_hint: &'a Option<u32>,
+    note: &'a Option<String>,
+    tags: &'a Option<Vec<String>>,
+}
 
+impl Record {
     pub fn signing_payload(&self) -> Result<String> {
-        let mut payload = self.clone();
-        payload.attestations = None;
-        Ok(serde_jcs::to_string(&payload)?)
+        Ok(serde_jcs::to_string(&SignableRecord {
+            id: &self.id,
+            version: self.version,
+            target: &self.target,
+            check: &self.check,
+            verdict: &self.verdict,
+            identity: &self.identity,
+            repo_ref: &self.repo_ref,
+            block_state: &self.block_state,
+            timestamp: self.timestamp,
+            path_hint: &self.path_hint,
+            line_hint: &self.line_hint,
+            note: &self.note,
+            tags: &self.tags,
+        })?)
     }
 }
 
@@ -242,7 +313,7 @@ impl FromStr for Verdict {
             "rejected" => Ok(Verdict::Rejected),
             "question" => Ok(Verdict::Comment),
             "comment" => Ok(Verdict::Comment),
-            _ => Err(anyhow::anyhow!("Unknown verdict: {value}")),
+            _ => Err(anyhow!("Unknown verdict: {value}")),
         }
     }
 }
@@ -287,76 +358,203 @@ impl fmt::Display for BlockState {
     }
 }
 
-pub trait ReviewStore {
-    fn read_history(&self) -> Result<Vec<Record>>;
-    fn append(&self, record: Record) -> Result<()>;
+#[derive(Debug, Clone, Default)]
+pub struct ApprovedTargets {
+    block_hashes: HashSet<TreeHash>,
+    file_hashes: HashSet<TreeHash>,
+    tree_hashes: HashSet<TreeHash>,
+    diff_fingerprints: HashSet<DiffFingerprint>,
 }
 
-pub fn latest_verdicts(records: &[Record], check_filter: Option<&str>) -> HashMap<String, Verdict> {
-    let mut latest_by_target_key: HashMap<String, (i64, Verdict)> = HashMap::new();
-
-    for record in records {
-        if check_filter.is_some_and(|check| record.check != check) {
-            continue;
+impl ApprovedTargets {
+    pub fn contains_target(&self, target: &ReviewTargetRef) -> bool {
+        match target {
+            ReviewTargetRef::Block { hash } => self.block_hashes.contains(hash),
+            ReviewTargetRef::File { hash } => self.file_hashes.contains(hash),
+            ReviewTargetRef::Tree { hash } => self.tree_hashes.contains(hash),
+            ReviewTargetRef::Diff { fingerprint } => self.diff_fingerprints.contains(fingerprint),
         }
+    }
+}
 
-        let key = record.lookup_key();
-        match latest_by_target_key.get_mut(key) {
-            Some((timestamp, verdict)) => {
-                // Keep semantics compatible with stable-sort behavior:
-                // for equal timestamps, later entries in input order win.
-                if record.timestamp >= *timestamp {
-                    *timestamp = record.timestamp;
-                    *verdict = record.verdict.clone();
+#[derive(Debug, Clone, Default)]
+pub struct ReviewIndex {
+    latest_verdicts: HashMap<ReviewTargetRef, Verdict>,
+}
+
+impl ReviewIndex {
+    pub fn from_records(records: &[Record], check_filter: Option<&ReviewCheck>) -> Self {
+        let mut latest_by_target: HashMap<ReviewTargetRef, (i64, Verdict)> = HashMap::new();
+
+        for record in records {
+            if check_filter.is_some_and(|check| &record.check != check) {
+                continue;
+            }
+
+            match latest_by_target.get_mut(&record.target) {
+                Some((timestamp, verdict)) => {
+                    if record.timestamp >= *timestamp {
+                        *timestamp = record.timestamp;
+                        *verdict = record.verdict.clone();
+                    }
+                }
+                None => {
+                    latest_by_target.insert(
+                        record.target.clone(),
+                        (record.timestamp, record.verdict.clone()),
+                    );
                 }
             }
-            None => {
-                latest_by_target_key
-                    .insert(key.to_string(), (record.timestamp, record.verdict.clone()));
-            }
+        }
+
+        Self {
+            latest_verdicts: latest_by_target
+                .into_iter()
+                .map(|(target, (_, verdict))| (target, verdict))
+                .collect(),
         }
     }
 
-    latest_by_target_key
-        .into_iter()
-        .map(|(key, (_, verdict))| (key, verdict))
-        .collect()
+    pub fn verdict_for(&self, target: &ReviewTargetRef) -> Option<&Verdict> {
+        self.latest_verdicts.get(target)
+    }
+
+    pub fn is_approved(&self, target: &ReviewTargetRef) -> bool {
+        self.verdict_for(target) == Some(&Verdict::Approved)
+    }
+
+    pub fn approved_targets(&self) -> ApprovedTargets {
+        let mut approved = ApprovedTargets::default();
+        for (target, verdict) in &self.latest_verdicts {
+            if verdict != &Verdict::Approved {
+                continue;
+            }
+            match target {
+                ReviewTargetRef::Block { hash } => {
+                    approved.block_hashes.insert(hash.clone());
+                }
+                ReviewTargetRef::File { hash } => {
+                    approved.file_hashes.insert(hash.clone());
+                }
+                ReviewTargetRef::Tree { hash } => {
+                    approved.tree_hashes.insert(hash.clone());
+                }
+                ReviewTargetRef::Diff { fingerprint } => {
+                    approved.diff_fingerprints.insert(fingerprint.clone());
+                }
+            }
+        }
+        approved
+    }
 }
 
-pub fn latest_review_verdicts(records: &[Record]) -> HashMap<String, Verdict> {
-    latest_verdicts(records, Some("review"))
+#[derive(Debug, Clone, Default)]
+pub struct ReviewDatabase {
+    records: Vec<Record>,
 }
 
-pub fn approved_hashes_from_verdicts(verdicts: &HashMap<String, Verdict>) -> HashSet<String> {
-    verdicts
-        .iter()
-        .filter_map(|(hash, verdict)| {
-            if verdict == &Verdict::Approved {
-                Some(hash.clone())
-            } else {
+impl ReviewDatabase {
+    pub fn load(store: &impl ReviewStore) -> Result<Self> {
+        Ok(Self {
+            records: store.read_history()?,
+        })
+    }
+
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
+
+    pub fn max_timestamp(&self) -> Option<i64> {
+        self.records.iter().map(|record| record.timestamp).max()
+    }
+
+    pub fn latest_index(&self, check_filter: Option<&ReviewCheck>) -> ReviewIndex {
+        ReviewIndex::from_records(&self.records, check_filter)
+    }
+
+    pub fn records_by_target_since(
+        &self,
+        threshold: Option<i64>,
+    ) -> HashMap<ReviewTargetRef, Vec<Record>> {
+        let mut grouped = HashMap::new();
+        for record in &self.records {
+            if threshold.is_some_and(|threshold| record.timestamp <= threshold) {
+                continue;
+            }
+            grouped
+                .entry(record.target.clone())
+                .or_insert_with(Vec::new)
+                .push(record.clone());
+        }
+        grouped
+    }
+}
+
+pub fn merge_record_histories<I, J>(left: I, right: J) -> Vec<Record>
+where
+    I: IntoIterator<Item = Record>,
+    J: IntoIterator<Item = Record>,
+{
+    let mut all_records = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for record in left.into_iter().chain(right) {
+        if seen_ids.insert(record.id.clone()) {
+            all_records.push(record);
+        }
+    }
+
+    all_records.sort_by_key(|record| record.timestamp);
+    all_records
+}
+
+pub fn serialize_records_jsonl(records: &[Record]) -> Result<String> {
+    let mut content = String::new();
+    for record in records {
+        content.push_str(&serde_json::to_string(record)?);
+        content.push('\n');
+    }
+    Ok(content)
+}
+
+pub fn parse_records_jsonl(content: &str) -> Vec<Record> {
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json::from_str::<Record>(line) {
+            Ok(record) => Some(record),
+            Err(err) => {
+                warn!("Skipping malformed record: {err}");
                 None
             }
         })
         .collect()
 }
 
-pub struct FileStore {
+pub trait ReviewStore {
+    fn read_history(&self) -> Result<Vec<Record>>;
+    fn append(&self, record: &Record) -> Result<()>;
+    fn replace_all(&self, records: &[Record]) -> Result<()>;
+
+    fn load_database(&self) -> Result<ReviewDatabase>
+    where
+        Self: Sized,
+    {
+        ReviewDatabase::load(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreLocation {
     root_path: PathBuf,
 }
 
-fn ensure_trueflow_dir(root: &Path) -> Result<()> {
-    let trueflow_dir = root.join(TRUEFLOW_DIR);
-    if !trueflow_dir.exists() {
-        fs::create_dir(&trueflow_dir)?;
-    }
-    Ok(())
-}
-
-impl FileStore {
-    pub fn new() -> Result<Self> {
+impl StoreLocation {
+    pub fn discover() -> Result<Self> {
         if let Ok(Some(root)) = vcs::git_root_from_workdir() {
-            ensure_trueflow_dir(&root)?;
-            return Ok(Self { root_path: root });
+            let location = Self { root_path: root };
+            location.ensure_trueflow_dir()?;
+            return Ok(location);
         }
 
         let start_dir = std::env::current_dir()?;
@@ -368,35 +566,50 @@ impl FileStore {
             }
         }
 
-        ensure_trueflow_dir(&start_dir)?;
-        Ok(Self {
+        let location = Self {
             root_path: start_dir,
-        })
+        };
+        location.ensure_trueflow_dir()?;
+        Ok(location)
     }
 
     pub fn db_path(&self) -> PathBuf {
-        self.root_path.join(TRUEFLOW_DIR).join(DB_FILE)
+        self.trueflow_dir().join(DB_FILE)
     }
 
     pub fn trueflow_dir(&self) -> PathBuf {
         self.root_path.join(TRUEFLOW_DIR)
     }
+
+    fn ensure_trueflow_dir(&self) -> Result<()> {
+        let trueflow_dir = self.trueflow_dir();
+        if !trueflow_dir.exists() {
+            fs::create_dir(&trueflow_dir)?;
+        }
+        Ok(())
+    }
 }
 
-impl ReviewStore for FileStore {
-    fn read_history(&self) -> Result<Vec<Record>> {
-        let db_path = self.db_path();
+#[derive(Debug, Clone)]
+struct JsonlStoreBackend {
+    db_path: PathBuf,
+}
 
-        if !db_path.exists() {
+impl JsonlStoreBackend {
+    fn new(db_path: PathBuf) -> Self {
+        Self { db_path }
+    }
+
+    fn read_history(&self) -> Result<Vec<Record>> {
+        if !self.db_path.exists() {
             return Ok(Vec::new());
         }
 
-        let file = fs::File::open(db_path)?;
-        file.lock_shared()?; // Shared lock for reading
+        let file = fs::File::open(&self.db_path)?;
+        file.lock_shared()?;
 
         let reader = BufReader::new(file);
         let mut records = Vec::new();
-
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -407,24 +620,67 @@ impl ReviewStore for FileStore {
                 Err(err) => warn!("Skipping malformed record: {err}"),
             }
         }
-
-        // Lock releases when file is dropped
         Ok(records)
     }
 
-    fn append(&self, record: Record) -> Result<()> {
-        let db_path = self.db_path();
+    fn append(&self, record: &Record) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.db_path)?;
+        file.lock_exclusive()?;
 
-        let mut file = OpenOptions::new().create(true).append(true).open(db_path)?;
-        file.lock_exclusive()?; // Exclusive lock for appending
-
-        let mut line = serde_json::to_string(&record)?;
+        let mut line = serde_json::to_string(record)?;
         line.push('\n');
-
         file.write_all(line.as_bytes())?;
-
-        // Lock releases when file is dropped
         Ok(())
+    }
+
+    fn replace_all(&self, records: &[Record]) -> Result<()> {
+        let content = serialize_records_jsonl(records)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.db_path)?;
+        file.lock_exclusive()?;
+        file.write_all(content.as_bytes())?;
+        Ok(())
+    }
+}
+
+pub struct FileStore {
+    location: StoreLocation,
+    backend: JsonlStoreBackend,
+}
+
+impl FileStore {
+    pub fn new() -> Result<Self> {
+        let location = StoreLocation::discover()?;
+        let backend = JsonlStoreBackend::new(location.db_path());
+        Ok(Self { location, backend })
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.location.db_path()
+    }
+
+    pub fn trueflow_dir(&self) -> PathBuf {
+        self.location.trueflow_dir()
+    }
+}
+
+impl ReviewStore for FileStore {
+    fn read_history(&self) -> Result<Vec<Record>> {
+        self.backend.read_history()
+    }
+
+    fn append(&self, record: &Record) -> Result<()> {
+        self.backend.append(record)
+    }
+
+    fn replace_all(&self, records: &[Record]) -> Result<()> {
+        self.backend.replace_all(records)
     }
 }
 
@@ -434,7 +690,7 @@ mod tests {
 
     fn record(
         id: &str,
-        fingerprint: &str,
+        target: ReviewTargetRef,
         check: &str,
         verdict: Verdict,
         timestamp: i64,
@@ -442,20 +698,19 @@ mod tests {
         Record {
             id: id.to_string(),
             version: CURRENT_VERSION,
-            target: None,
-            fingerprint: fingerprint.to_string(),
-            check: check.to_string(),
+            target,
+            check: ReviewCheck::new(check).unwrap(),
             verdict,
             identity: Identity::Email {
                 email: "dev@example.com".to_string(),
             },
             repo_ref: RepoRef::Vcs {
                 system: VcsSystem::Git,
-                revision: "0123456789abcdef".to_string(),
+                revision: RepoRevision::new("0123456789abcdef").unwrap(),
             },
             block_state: BlockState::Committed,
             timestamp,
-            path_hint: Some("src/lib.rs".to_string()),
+            path_hint: Some(RepoPath::new("src/lib.rs").unwrap()),
             line_hint: Some(1),
             note: None,
             tags: None,
@@ -464,112 +719,137 @@ mod tests {
     }
 
     #[test]
-    fn latest_review_verdicts_prefers_highest_timestamp() {
-        let records = vec![
-            record("1", "fp", "review", Verdict::Rejected, 1),
-            record("2", "fp", "review", Verdict::Approved, 2),
-            record("3", "fp", "review", Verdict::Comment, 0),
-        ];
+    fn review_target_kind_parses_typed_hash_and_diff_targets() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let block = ReviewTargetKind::Block.parse_target(hash).unwrap();
+        let diff = ReviewTargetKind::Diff.parse_target(hash).unwrap();
 
-        let latest = latest_review_verdicts(&records);
-        assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
-    }
-
-    #[test]
-    fn verdict_from_str_maps_question_to_comment() {
-        let parsed = "question".parse::<Verdict>();
-        assert!(
-            matches!(parsed, Ok(Verdict::Comment)),
-            "question should parse as comment, got {parsed:?}"
+        assert_eq!(
+            block,
+            ReviewTargetRef::Block {
+                hash: TreeHash::parse(hash).unwrap()
+            }
+        );
+        assert_eq!(
+            diff,
+            ReviewTargetRef::Diff {
+                fingerprint: DiffFingerprint::new(hash).unwrap(),
+            }
         );
     }
 
     #[test]
-    fn verdict_deserialize_accepts_question_alias_as_comment() {
-        let parsed = serde_json::from_str::<Verdict>("\"question\"");
-        assert!(
-            matches!(parsed, Ok(Verdict::Comment)),
-            "question alias should deserialize as comment, got {parsed:?}"
-        );
-    }
-
-    #[test]
-    fn latest_review_verdicts_uses_last_entry_for_equal_timestamp() {
-        let records = vec![
-            record("1", "fp", "review", Verdict::Rejected, 5),
-            record("2", "fp", "review", Verdict::Approved, 5),
-        ];
-
-        let latest = latest_review_verdicts(&records);
-        assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
-    }
-
-    #[test]
-    fn latest_review_verdicts_ignores_non_review_checks() {
-        let records = vec![
-            record("1", "fp", "security", Verdict::Rejected, 10),
-            record("2", "fp", "review", Verdict::Approved, 1),
-        ];
-
-        let latest = latest_review_verdicts(&records);
-        assert_eq!(latest.get("fp"), Some(&Verdict::Approved));
-    }
-
-    #[test]
-    fn latest_verdicts_without_check_filter_uses_latest_timestamp() {
-        let records = vec![
-            record("1", "fp", "review", Verdict::Approved, 1),
-            record("2", "fp", "security", Verdict::Rejected, 2),
-        ];
-
-        let latest = latest_verdicts(&records, None);
-        assert_eq!(latest.get("fp"), Some(&Verdict::Rejected));
-    }
-
-    #[test]
-    fn record_lookup_key_prefers_typed_target_when_present() {
-        let record = Record {
-            id: "typed".to_string(),
-            version: CURRENT_VERSION,
-            target: Some(ReviewTargetRef::Diff {
-                fingerprint: DiffFingerprint::new("diff-fp"),
-            }),
-            fingerprint: "legacy-block-fp".to_string(),
-            check: "review".to_string(),
-            verdict: Verdict::Approved,
-            identity: Identity::Email {
-                email: "dev@example.com".to_string(),
-            },
-            repo_ref: RepoRef::Vcs {
-                system: VcsSystem::Git,
-                revision: "0123456789abcdef".to_string(),
-            },
-            block_state: BlockState::Committed,
-            timestamp: 1,
-            path_hint: Some("src/lib.rs".to_string()),
-            line_hint: Some(1),
-            note: None,
-            tags: None,
-            attestations: None,
+    fn review_index_prefers_highest_timestamp_for_typed_target() {
+        let target = ReviewTargetRef::Block {
+            hash: TreeHash::new("typed-key"),
         };
+        let records = vec![
+            record("1", target.clone(), "review", Verdict::Rejected, 1),
+            record("2", target.clone(), "review", Verdict::Approved, 2),
+            record("3", target.clone(), "review", Verdict::Comment, 0),
+        ];
 
-        assert_eq!(record.lookup_key(), "diff-fp");
+        let index = ReviewIndex::from_records(&records, Some(&ReviewCheck::review()));
+        assert_eq!(index.verdict_for(&target), Some(&Verdict::Approved));
     }
 
     #[test]
-    fn latest_review_verdicts_uses_typed_target_key() {
-        let mut legacy = record("1", "legacy-key", "review", Verdict::Rejected, 1);
-        legacy.target = Some(ReviewTargetRef::Block {
+    fn review_index_uses_last_entry_for_equal_timestamp() {
+        let target = ReviewTargetRef::Block {
             hash: TreeHash::new("typed-key"),
-        });
+        };
+        let records = vec![
+            record("1", target.clone(), "review", Verdict::Rejected, 5),
+            record("2", target.clone(), "review", Verdict::Approved, 5),
+        ];
 
-        let mut typed_later = record("2", "legacy-key", "review", Verdict::Approved, 2);
-        typed_later.target = Some(ReviewTargetRef::Block {
+        let index = ReviewIndex::from_records(&records, Some(&ReviewCheck::review()));
+        assert_eq!(index.verdict_for(&target), Some(&Verdict::Approved));
+    }
+
+    #[test]
+    fn review_index_ignores_non_matching_checks() {
+        let target = ReviewTargetRef::Block {
             hash: TreeHash::new("typed-key"),
-        });
+        };
+        let records = vec![
+            record("1", target.clone(), "security", Verdict::Rejected, 10),
+            record("2", target.clone(), "review", Verdict::Approved, 1),
+        ];
 
-        let latest = latest_review_verdicts(&[legacy, typed_later]);
-        assert_eq!(latest.get("typed-key"), Some(&Verdict::Approved));
-        assert!(!latest.contains_key("legacy-key"));
+        let review_index = ReviewIndex::from_records(&records, Some(&ReviewCheck::review()));
+        let any_index = ReviewIndex::from_records(&records, None);
+        assert_eq!(review_index.verdict_for(&target), Some(&Verdict::Approved));
+        assert_eq!(any_index.verdict_for(&target), Some(&Verdict::Rejected));
+    }
+
+    #[test]
+    fn approved_targets_track_typed_target_kinds_separately() {
+        let approved = vec![
+            record(
+                "1",
+                ReviewTargetRef::Block {
+                    hash: TreeHash::new("block-hash"),
+                },
+                "review",
+                Verdict::Approved,
+                1,
+            ),
+            record(
+                "2",
+                ReviewTargetRef::File {
+                    hash: TreeHash::new("file-hash"),
+                },
+                "review",
+                Verdict::Approved,
+                2,
+            ),
+            record(
+                "3",
+                ReviewTargetRef::Tree {
+                    hash: TreeHash::new("tree-hash"),
+                },
+                "review",
+                Verdict::Approved,
+                3,
+            ),
+        ];
+
+        let index = ReviewIndex::from_records(&approved, Some(&ReviewCheck::review()));
+        let approved_targets = index.approved_targets();
+
+        assert!(approved_targets.contains_target(&ReviewTargetRef::Block {
+            hash: TreeHash::new("block-hash")
+        }));
+        assert!(approved_targets.contains_target(&ReviewTargetRef::File {
+            hash: TreeHash::new("file-hash")
+        }));
+        assert!(approved_targets.contains_target(&ReviewTargetRef::Tree {
+            hash: TreeHash::new("tree-hash")
+        }));
+    }
+
+    #[test]
+    fn merge_record_histories_dedupes_by_id_and_sorts_by_timestamp() {
+        let target = ReviewTargetRef::Block {
+            hash: TreeHash::new("typed-key"),
+        };
+        let merged = merge_record_histories(
+            vec![record(
+                "dup",
+                target.clone(),
+                "review",
+                Verdict::Approved,
+                2,
+            )],
+            vec![
+                record("dup", target.clone(), "review", Verdict::Rejected, 1),
+                record("unique", target, "review", Verdict::Comment, 0),
+            ],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "unique");
+        assert_eq!(merged[1].id, "dup");
     }
 }

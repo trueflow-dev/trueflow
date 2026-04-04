@@ -1157,7 +1157,7 @@ fn test_filestore_uses_repo_root_from_subdir() -> Result<()> {
         &[
             "mark",
             "--fingerprint",
-            "deadbeef",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             "--verdict",
             "approved",
             "--quiet",
@@ -1230,7 +1230,13 @@ fn test_diff_respects_file_coverage_from_subdir() -> Result<()> {
         .context("expected pkg/src/lib.rs tree hash")?
         .to_string();
 
-    let approved_file = build_review_record(&file_hash, ReviewRecordOverrides::default());
+    let approved_file = build_review_record(
+        &file_hash,
+        ReviewRecordOverrides {
+            target_kind: Some("file"),
+            ..Default::default()
+        },
+    );
     write_reviews_jsonl(&repo.path.join(".trueflow"), &[approved_file])?;
 
     let root_output = repo.run(&["diff", "--json"])?;

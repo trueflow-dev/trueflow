@@ -81,7 +81,7 @@ fn test_mark_unknown_state_no_path() -> Result<()> {
     let repo = TestRepo::new("unknown_state")?;
 
     // Just mark arbitrary hash without path
-    let hash = "abc1234567890abcdef1234567890abcdef12";
+    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     repo.run(&[
         "mark",
         "--fingerprint",
@@ -107,7 +107,7 @@ fn test_store_subdirectory_discovery() -> Result<()> {
     let subdir = repo.path.join("subdir");
     fs::create_dir(&subdir)?;
 
-    let hash = "def1234567890abcdef1234567890abcdef12";
+    let hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     // Run mark from subdir
     repo.run_in(
@@ -128,7 +128,7 @@ fn test_store_subdirectory_discovery() -> Result<()> {
 
     let records = read_review_records(&db_path)?;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].fingerprint, hash);
+    assert_eq!(record_target_key(&records[0]), hash);
 
     Ok(())
 }
@@ -143,7 +143,7 @@ fn test_mark_signing_failure() -> Result<()> {
         .current_dir(&repo.path)
         .output()?;
 
-    let hash = "bad1234567890abcdef1234567890abcdef12";
+    let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     // Attempt mark, expect failure
     let output = repo.run_err(&[
@@ -189,7 +189,7 @@ fn test_store_parent_discovery_no_git() -> Result<()> {
     fs::create_dir(&subdir)?;
 
     let bin = env!("CARGO_BIN_EXE_trueflow");
-    let hash = "1234567890abcdef1234567890abcdef12";
+    let hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
     let output = Command::new(bin)
         .args([

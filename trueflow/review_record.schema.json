@@ -44,9 +44,6 @@
       ],
       "type": "string"
     },
-    "DiffFingerprint": {
-      "type": "string"
-    },
     "Identity": {
       "oneOf": [
         {
@@ -75,7 +72,6 @@
           "additionalProperties": false,
           "properties": {
             "revision": {
-              "pattern": "^[0-9a-f]{7,40}$",
               "type": "string"
             },
             "system": {
@@ -90,6 +86,19 @@
             "type",
             "system",
             "revision"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
           ],
           "type": "object"
         }
@@ -152,7 +161,7 @@
           "additionalProperties": false,
           "properties": {
             "fingerprint": {
-              "$ref": "#/$defs/DiffFingerprint"
+              "type": "string"
             },
             "kind": {
               "const": "diff",
@@ -198,10 +207,6 @@
       "$ref": "#/$defs/BlockState"
     },
     "check": {
-      "minLength": 1,
-      "type": "string"
-    },
-    "fingerprint": {
       "type": "string"
     },
     "id": {
@@ -244,14 +249,7 @@
       ]
     },
     "target": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ReviewTargetRef"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/ReviewTargetRef"
     },
     "timestamp": {
       "format": "int64",
@@ -262,7 +260,6 @@
       "$ref": "#/$defs/Verdict"
     },
     "version": {
-      "default": 0,
       "format": "uint32",
       "minimum": 0,
       "type": "integer"
@@ -271,7 +268,7 @@
   "required": [
     "id",
     "version",
-    "fingerprint",
+    "target",
     "check",
     "verdict",
     "identity",

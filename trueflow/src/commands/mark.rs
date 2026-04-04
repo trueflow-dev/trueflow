@@ -1,8 +1,12 @@
 use crate::context::TrueflowContext;
+use crate::hashing::compute_fingerprint;
+use crate::repo_path::RepoPath;
+use crate::scanner::ScanOptions;
 use crate::store::{
     Attestation, AttestationKind, BlockState, Canonicalization, FileStore, Identity, Record,
-    RepoRef, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
+    RepoRef, RepoRevision, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
 };
+use crate::tree::{self, TreeNodeKind};
 use crate::vcs;
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -100,14 +104,13 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    let repo_ref = RepoRef::Vcs {
-        system: VcsSystem::Git,
-        revision,
+    let repo_ref = match RepoRevision::new(&revision) {
+        Ok(revision) => RepoRef::Vcs {
+            system: VcsSystem::Git,
+            revision,
+        },
+        Err(_) => RepoRef::Unknown,
     };
-
-    let block_state: BlockState =
-        vcs::block_state_for_path(&repo_snapshot, params.path.as_deref(), &params.fingerprint)
-            .into();
 
     let MarkParams {
         fingerprint,
@@ -119,21 +122,28 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         line,
     } = params;
 
-    let target_kind = target_kind.unwrap_or(ReviewTargetKind::Block);
-    let target = Some(target_kind.into_target(fingerprint.clone()));
+    let target_kind = infer_target_kind(target_kind, &fingerprint)?;
+    let target = target_kind.parse_target(&fingerprint)?;
+    let check = ReviewCheck::new(check)?;
+    let path_hint = path.map(RepoPath::new).transpose()?;
+    let block_state: BlockState = vcs::block_state_for_path(
+        &repo_snapshot,
+        path_hint.as_ref().map(RepoPath::as_str),
+        target.lookup_key(),
+    )
+    .into();
 
     let mut record = Record {
         id: Uuid::new_v4().to_string(),
         version: crate::store::CURRENT_VERSION,
         target,
-        fingerprint: fingerprint.clone(),
         check: check.clone(),
         verdict: verdict.clone(),
         identity,
         repo_ref,
         block_state,
         timestamp: now,
-        path_hint: path,
+        path_hint,
         line_hint: line,
         note,
         tags: None,
@@ -152,11 +162,11 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         }]);
     }
 
-    store.append(record)?;
+    store.append(&record)?;
     info!(
         "mark recorded (fingerprint={}, check={}, verdict={})",
         fingerprint,
-        check,
+        check.as_str(),
         verdict.as_str()
     );
 
@@ -167,4 +177,79 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     };
     info!("Recorded verdict '{verdict}' for {fingerprint} by {email}{signed_msg}");
     Ok(())
+}
+
+fn infer_target_kind(
+    explicit: Option<ReviewTargetKind>,
+    fingerprint: &str,
+) -> Result<ReviewTargetKind> {
+    if let Some(kind) = explicit {
+        return Ok(kind);
+    }
+
+    if looks_like_current_diff_fingerprint(fingerprint)? {
+        return Ok(ReviewTargetKind::Diff);
+    }
+
+    if let Some(kind) = infer_target_kind_from_current_tree(fingerprint)? {
+        return Ok(kind);
+    }
+
+    Ok(ReviewTargetKind::Block)
+}
+
+fn infer_target_kind_from_current_tree(fingerprint: &str) -> Result<Option<ReviewTargetKind>> {
+    let scan_result = match crate::scanner::scan_directory(".", &ScanOptions::default()) {
+        Ok(scan_result) => scan_result,
+        Err(_) => return Ok(None),
+    };
+    let tree = tree::build_tree_from_files(&scan_result.files);
+
+    for node in tree.nodes() {
+        if node.hash.as_str() != fingerprint {
+            continue;
+        }
+        let kind = match node.kind {
+            TreeNodeKind::Root | TreeNodeKind::Directory => ReviewTargetKind::Tree,
+            TreeNodeKind::File => ReviewTargetKind::File,
+            TreeNodeKind::Block => ReviewTargetKind::Block,
+        };
+        return Ok(Some(kind));
+    }
+
+    Ok(None)
+}
+
+fn looks_like_current_diff_fingerprint(fingerprint: &str) -> Result<bool> {
+    let diff_hunks = match vcs::diff_main_to_head() {
+        Ok(hunks) => hunks,
+        Err(_) => return Ok(false),
+    };
+
+    for hunk in diff_hunks {
+        let (_, context, hash_body) = parse_diff_fingerprint_inputs(&hunk.lines);
+        let computed = compute_fingerprint(&hash_body, &context).as_string();
+        if computed == fingerprint {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn parse_diff_fingerprint_inputs(lines: &[String]) -> (String, String, String) {
+    let mut diff_content = String::new();
+    let mut context = String::new();
+    let mut hash_body = String::new();
+
+    for line in lines {
+        if line.starts_with(' ') {
+            context.push_str(line);
+        } else if line.starts_with('+') || line.starts_with('-') {
+            diff_content.push_str(line);
+            hash_body.push_str(line);
+        }
+    }
+
+    (diff_content, context, hash_body)
 }

@@ -2,13 +2,12 @@ use crate::hashing::compute_fingerprint;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::{
-    FileStore, Record, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
+    DiffFingerprint, FileStore, Record, ReviewCheck, ReviewStore, ReviewTargetRef, Verdict,
 };
 use crate::tree;
 use crate::vcs;
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
 
 #[derive(Serialize)]
 pub struct Change {
@@ -25,21 +24,10 @@ pub struct Change {
 pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
     // 1. Load DB
     let store = FileStore::new()?;
-    let history = store.read_history()?;
-
-    // Build lookup map: (fingerprint, check) -> verdict
-    // We also store the full history for the fingerprint to enable queries
-    let review_state = latest_review_verdicts(&history);
-    let mut reviews_by_fp: HashMap<String, Vec<Record>> = HashMap::new();
-
-    for record in history {
-        reviews_by_fp
-            .entry(record.lookup_key().to_string())
-            .or_default()
-            .push(record);
-    }
-
-    let approved_hashes = approved_hashes_from_verdicts(&review_state);
+    let database = store.load_database()?;
+    let review_index = database.latest_index(Some(&ReviewCheck::review()));
+    let reviews_by_target = database.records_by_target_since(None);
+    let approved_targets = review_index.approved_targets();
     let tree = tree::build_tree_from_path(".")?;
     let workdir_prefix = workdir_prefix_from_git_root();
 
@@ -51,19 +39,24 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
     for hunk in diff_hunks {
         let (diff_content, new_content, context, hash_body) = parse_hunk_lines(&hunk.lines);
 
-        let fp = compute_fingerprint(&hash_body, &context);
-        let fp_str = fp.as_string();
+        let fp =
+            DiffFingerprint::from_computed(compute_fingerprint(&hash_body, &context).as_string());
+        let fp_str = fp.as_str().to_string();
+        let diff_target = ReviewTargetRef::Diff {
+            fingerprint: fp.clone(),
+        };
 
-        // Check status
-        let verdict = review_state.get(&fp_str);
+        let verdict = review_index.verdict_for(&diff_target);
         let status = verdict.map(|v| v.as_str()).unwrap_or("unreviewed");
 
-        // Get all reviews for this hunk
-        let reviews = reviews_by_fp.get(&fp_str).cloned().unwrap_or_default();
+        let reviews = reviews_by_target
+            .get(&diff_target)
+            .cloned()
+            .unwrap_or_default();
 
         if path_is_covered_by_approved_node(
             &tree,
-            &approved_hashes,
+            &approved_targets,
             &hunk.file_path,
             workdir_prefix.as_deref(),
         ) {
@@ -89,7 +82,7 @@ pub fn get_unreviewed_changes() -> Result<Vec<Change>> {
 
 fn path_is_covered_by_approved_node(
     tree: &tree::Tree,
-    approved_hashes: &HashSet<String>,
+    approved_targets: &crate::store::ApprovedTargets,
     repo_relative_path: &RepoPath,
     workdir_prefix: Option<&str>,
 ) -> bool {
@@ -98,7 +91,7 @@ fn path_is_covered_by_approved_node(
     for candidate in candidates {
         if tree
             .find_by_path(candidate.as_str())
-            .is_some_and(|node_id| tree.is_node_covered(node_id, approved_hashes))
+            .is_some_and(|node_id| tree.is_node_covered(node_id, approved_targets))
         {
             tracing::debug!(
                 repo_relative_path = %repo_relative_path,

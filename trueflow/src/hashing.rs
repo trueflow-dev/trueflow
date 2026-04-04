@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +26,18 @@ macro_rules! define_hash_type {
         impl $name {
             pub fn new(value: impl Into<String>) -> Self {
                 Self(value.into())
+            }
+
+            #[allow(dead_code)]
+            pub fn parse(value: impl AsRef<str>) -> Result<Self> {
+                let value = value.as_ref().trim();
+                if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    return Err(anyhow!(
+                        "{} must be a 64-character hex string: {value}",
+                        stringify!($name)
+                    ));
+                }
+                Ok(Self(value.to_ascii_lowercase()))
             }
 
             pub fn as_str(&self) -> &str {

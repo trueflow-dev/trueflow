@@ -40,8 +40,9 @@ fn test_review_skips_invalid_db_lines() -> Result<()> {
     match &record.repo_ref {
         RepoRef::Vcs { system, revision } => {
             assert_eq!(system, &VcsSystem::Git);
-            assert!(!revision.is_empty());
+            assert!(!revision.as_str().is_empty());
         }
+        RepoRef::Unknown => panic!("expected vcs repo ref"),
     }
     assert_eq!(record.block_state, BlockState::Committed);
 

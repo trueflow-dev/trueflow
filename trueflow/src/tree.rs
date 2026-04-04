@@ -2,6 +2,7 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind, FileState};
 use crate::hashing::{TreeHash, hash_str};
 use crate::repo_path::RepoPath;
+use crate::store::ApprovedTargets;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -148,11 +149,24 @@ impl Tree {
         self.file_paths.iter()
     }
 
-    pub fn is_node_covered(&self, id: TreeNodeId, approved_hashes: &HashSet<String>) -> bool {
+    pub fn is_node_covered(&self, id: TreeNodeId, approved_targets: &ApprovedTargets) -> bool {
         let mut current = Some(id);
         while let Some(node_id) = current {
             let node = self.node(node_id);
-            if approved_hashes.contains(node.hash.as_str()) {
+            let target = match node.kind {
+                TreeNodeKind::Root | TreeNodeKind::Directory => {
+                    crate::store::ReviewTargetRef::Tree {
+                        hash: node.hash.clone(),
+                    }
+                }
+                TreeNodeKind::File => crate::store::ReviewTargetRef::File {
+                    hash: node.hash.clone(),
+                },
+                TreeNodeKind::Block => crate::store::ReviewTargetRef::Block {
+                    hash: node.hash.clone(),
+                },
+            };
+            if approved_targets.contains_target(&target) {
                 return true;
             }
             current = node.parent;

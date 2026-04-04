@@ -3,14 +3,10 @@ use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::policy::should_skip_imports_by_default;
 use crate::scanner;
-use crate::store::{
-    FileStore, Identity, Record, ReviewStore, Verdict, approved_hashes_from_verdicts,
-    latest_verdicts,
-};
+use crate::store::{FileStore, Identity, Record, ReviewStore, ReviewTargetRef};
 use crate::tree;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -43,27 +39,14 @@ pub fn run(
 
     // 2. Load DB
     let store = FileStore::new()?;
-    let history = store.read_history()?;
-    let max_history_timestamp = history.iter().map(|record| record.timestamp).max();
+    let database = store.load_database()?;
+    let max_history_timestamp = database.max_timestamp();
     let since_mode = parse_feedback_since(effective_since)?;
     let since_threshold = resolve_since_threshold(&store, since_mode)?;
 
-    // 3. Group Reviews by target key
-    // We want ALL reviews for a fingerprint, not just the latest.
-    let latest_verdict: HashMap<String, Verdict> = latest_verdicts(&history, None);
-    let mut reviews_by_fp: HashMap<String, Vec<Record>> = HashMap::new();
-
-    for record in history {
-        if !matches_since(record.timestamp, since_threshold) {
-            continue;
-        }
-        reviews_by_fp
-            .entry(record.lookup_key().to_string())
-            .or_default()
-            .push(record);
-    }
-
-    let approved_hashes = approved_hashes_from_verdicts(&latest_verdict);
+    let latest_verdict = database.latest_index(None);
+    let reviews_by_target = database.records_by_target_since(since_threshold);
+    let approved_targets = latest_verdict.approved_targets();
 
     if format == "json" {
         // Output JSON
@@ -79,8 +62,11 @@ pub fn run(
                     continue;
                 }
 
+                let block_target = ReviewTargetRef::Block {
+                    hash: block.hash.clone(),
+                };
                 let verdict = latest_verdict
-                    .get(block.hash.as_str())
+                    .verdict_for(&block_target)
                     .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
@@ -90,18 +76,12 @@ pub fn run(
                 if !include_approved
                     && tree
                         .find_block_node(&file.path, &block)
-                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
+                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_targets))
                 {
                     continue;
                 }
 
-                // Only include if there is actual history (or if it's unreviewed? No, "feedback" usually means critiques)
-                // If it's unreviewed, the agent might not care unless we want to ask for review?
-                // The prompt was "review content that we just did".
-                // So we only export things THAT HAVE REVIEWS.
-                // If verdict is "unreviewed", skip.
-
-                if let Some(reviews) = reviews_by_fp.get(block.hash.as_str()) {
+                if let Some(reviews) = reviews_by_target.get(&block_target) {
                     export_list.push(serde_json::json!({
                         "file": file.path,
                         "block": block,
@@ -133,8 +113,11 @@ pub fn run(
                     continue;
                 }
 
+                let block_target = ReviewTargetRef::Block {
+                    hash: block.hash.clone(),
+                };
                 let verdict = latest_verdict
-                    .get(block.hash.as_str())
+                    .verdict_for(&block_target)
                     .map_or("unreviewed", crate::store::Verdict::as_str);
 
                 if !include_approved && verdict == "approved" {
@@ -144,12 +127,12 @@ pub fn run(
                 if !include_approved
                     && tree
                         .find_block_node(&file.path, &block)
-                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_hashes))
+                        .is_some_and(|node_id| tree.is_node_covered(node_id, &approved_targets))
                 {
                     continue;
                 }
 
-                if let Some(reviews) = reviews_by_fp.get(block.hash.as_str()) {
+                if let Some(reviews) = reviews_by_target.get(&block_target) {
                     blocks_to_print.push((block, reviews));
                 }
             }
@@ -248,10 +231,6 @@ fn resolve_since_threshold(store: &FileStore, since: FeedbackSince) -> Result<Op
         FeedbackSince::Last => read_feedback_cursor(feedback_cursor_path(store).as_path())?,
     };
     Ok(threshold)
-}
-
-fn matches_since(timestamp: i64, threshold: Option<i64>) -> bool {
-    threshold.is_none_or(|threshold| timestamp > threshold)
 }
 
 fn feedback_cursor_path(store: &FileStore) -> std::path::PathBuf {

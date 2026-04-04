@@ -6,9 +6,7 @@ use crate::path_utils;
 use crate::policy::{should_skip_impl_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
-use crate::store::{
-    FileStore, ReviewStore, Verdict, approved_hashes_from_verdicts, latest_review_verdicts,
-};
+use crate::store::{FileStore, ReviewCheck, ReviewStore, ReviewTargetRef};
 use crate::sub_splitter;
 use crate::tree;
 use crate::vcs;
@@ -284,11 +282,12 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     let workdir_prefix = workdir_prefix_from_git_root();
 
     let store = FileStore::new()?;
-    let history = store.read_history()?;
-    info!("loaded {} review records", history.len());
+    let database = store.load_database()?;
+    info!("loaded {} review records", database.records().len());
 
-    let fingerprint_status = latest_review_verdicts(&history);
-    let approved_hashes = approved_hashes_from_verdicts(&fingerprint_status);
+    let review_check = ReviewCheck::review();
+    let review_index = database.latest_index(Some(&review_check));
+    let approved_targets = review_index.approved_targets();
 
     let (files, diagnostics) = match &query.content_source {
         ReviewContentSource::Workdir => {
@@ -373,24 +372,29 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
         total_blocks += reviewable_blocks.len();
 
-        if fingerprint_status.get(file.tree_hash.as_str()) == Some(&Verdict::Approved) {
+        if review_index.is_approved(&ReviewTargetRef::File {
+            hash: file.tree_hash.clone(),
+        }) {
             continue;
         }
 
         let mut unreviewed_blocks = Vec::new();
         for block in reviewable_blocks {
             let node_id = tree.find_block_node(&file.path, &block);
+            let block_target = ReviewTargetRef::Block {
+                hash: block.hash.clone(),
+            };
             if let Some(node_id) = node_id
-                && tree.is_node_covered(node_id, &approved_hashes)
+                && tree.is_node_covered(node_id, &approved_targets)
             {
                 continue;
             }
 
-            if fingerprint_status.get(block.hash.as_str()) == Some(&Verdict::Approved) {
+            if review_index.is_approved(&block_target) {
                 continue;
             }
 
-            if !fingerprint_status.contains_key(block.hash.as_str())
+            if review_index.verdict_for(&block_target).is_none()
                 && let Ok(sub_blocks) = sub_splitter::split(&block, language)
                 && !sub_blocks.is_empty()
             {
@@ -398,7 +402,9 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                     if !query.filters.allows_subblock(sb.kind) {
                         return true;
                     }
-                    fingerprint_status.get(sb.hash.as_str()) == Some(&Verdict::Approved)
+                    review_index.is_approved(&ReviewTargetRef::Block {
+                        hash: sb.hash.clone(),
+                    })
                 });
 
                 if all_approved {

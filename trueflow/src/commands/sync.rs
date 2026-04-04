@@ -1,8 +1,9 @@
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
-use crate::store::{FileStore, Record, ReviewStore};
+use crate::store::{
+    FileStore, ReviewStore, merge_record_histories, parse_records_jsonl, serialize_records_jsonl,
+};
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -31,52 +32,15 @@ pub fn run(_context: &TrueflowContext) -> Result<()> {
         .context("Failed to read local review history")?;
 
     // 4. Merge
-    let mut all_records = Vec::new();
-    let mut seen_ids = HashSet::new();
-
-    // Add remote records first (historical base)
-    if let Some(content) = &remote_content {
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(record) = serde_json::from_str::<Record>(line)
-                && seen_ids.insert(record.id.clone())
-            {
-                all_records.push(record);
-            }
-        }
-    }
-
-    // Add local records (new additions)
-    for record in local_records {
-        if seen_ids.insert(record.id.clone()) {
-            all_records.push(record);
-        }
-    }
-
-    // Sort by timestamp to ensure deterministic ordering (roughly)
-    all_records.sort_by_key(|r| r.timestamp);
+    let remote_records = remote_content
+        .as_deref()
+        .map(parse_records_jsonl)
+        .unwrap_or_default();
+    let all_records = merge_record_histories(remote_records, local_records);
 
     // 5. Write back to local file
-    let mut file_content = String::new();
-    for record in &all_records {
-        file_content.push_str(&serde_json::to_string(record)?);
-        file_content.push('\n');
-    }
-
-    // Write content with exclusive lock
-    use fs2::FileExt;
-    let db_path = store.db_path();
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&db_path)?;
-
-    file.lock_exclusive()?;
-    file.write_all(file_content.as_bytes())?;
-    // Lock releases on drop
+    store.replace_all(&all_records)?;
+    let file_content = serialize_records_jsonl(&all_records)?;
 
     // 6. Commit to Orphan Branch (Plumbing)
     info!("Preparing commit...");

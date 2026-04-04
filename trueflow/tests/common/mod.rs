@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trueflow::store::Record;
+use trueflow::store::{Record, ReviewTargetRef};
 use uuid::Uuid;
 
 pub struct TestRepo {
@@ -328,11 +328,21 @@ pub struct ReviewRecordOverrides<'a> {
     pub timestamp: Option<i64>,
     pub repo_revision: Option<&'a str>,
     pub block_state: Option<&'a str>,
+    pub target_kind: Option<&'a str>,
     pub attestations: Option<Value>,
 }
 
+pub fn record_target_key(record: &Record) -> &str {
+    match &record.target {
+        ReviewTargetRef::Block { hash }
+        | ReviewTargetRef::File { hash }
+        | ReviewTargetRef::Tree { hash } => hash.as_str(),
+        ReviewTargetRef::Diff { fingerprint } => fingerprint.as_str(),
+    }
+}
+
 /// Build a review record JSON value for tests.
-pub fn build_review_record(fingerprint: &str, overrides: ReviewRecordOverrides<'_>) -> Value {
+pub fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_>) -> Value {
     let id = overrides
         .id
         .map(str::to_string)
@@ -342,13 +352,14 @@ pub fn build_review_record(fingerprint: &str, overrides: ReviewRecordOverrides<'
     let email = overrides.email.unwrap_or("a@example.com");
     let repo_revision = overrides.repo_revision.unwrap_or("deadbeef");
     let block_state = overrides.block_state.unwrap_or("committed");
+    let target_kind = overrides.target_kind.unwrap_or("block");
     let timestamp = overrides.timestamp.unwrap_or(0);
     let attestations = overrides.attestations.unwrap_or(Value::Null);
 
     serde_json::json!({
         "id": id,
-        "version": 1,
-        "fingerprint": fingerprint,
+        "version": 2,
+        "target": { "kind": target_kind, "hash": target_key },
         "check": check,
         "verdict": verdict,
         "identity": { "type": "email", "email": email },

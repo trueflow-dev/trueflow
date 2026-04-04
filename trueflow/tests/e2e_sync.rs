@@ -55,7 +55,7 @@ fn test_vet_sync() -> Result<()> {
     local.run(&[
         "mark",
         "--fingerprint",
-        "fp1",
+        "1111111111111111111111111111111111111111111111111111111111111111",
         "--verdict",
         "approved",
         "--quiet",
@@ -78,7 +78,7 @@ fn test_vet_sync() -> Result<()> {
 
     // THEN: the colleague sees the review records
     let stdout = run_git_output(&colleague.path, &["show", "trueflow-db:reviews.jsonl"])?;
-    assert!(stdout.contains("fp1"));
+    assert!(stdout.contains("1111111111111111111111111111111111111111111111111111111111111111"));
     assert!(stdout.contains("approved"));
 
     Ok(())
@@ -100,7 +100,11 @@ fn test_sync_dedupes_and_sorts_records() -> Result<()> {
     let remote = remote_dir.to_str().context("remote repo path")?;
     run_git(&local.path, &["remote", "add", "origin", remote])?;
 
-    let local_records = vec![record("dup", "fp-remote", 1500)];
+    let local_records = vec![record(
+        "dup",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        1500,
+    )];
     write_reviews_jsonl(&local.path.join(".trueflow"), &local_records)?;
     local.run(&["sync"])?;
 
@@ -108,8 +112,16 @@ fn test_sync_dedupes_and_sorts_records() -> Result<()> {
     run_git(&colleague.path, &["remote", "add", "origin", remote])?;
 
     let colleague_records = vec![
-        record("dup", "fp-local", 2000),
-        record("unique", "fp-unique", 1000),
+        record(
+            "dup",
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            2000,
+        ),
+        record(
+            "unique",
+            "4444444444444444444444444444444444444444444444444444444444444444",
+            1000,
+        ),
     ];
     write_reviews_jsonl(&colleague.path.join(".trueflow"), &colleague_records)?;
     colleague.run(&["sync"])?;
@@ -152,7 +164,7 @@ fn test_sync_uses_configured_storage_branch() -> Result<()> {
     local.run(&[
         "mark",
         "--fingerprint",
-        "fp-custom-branch",
+        "5555555555555555555555555555555555555555555555555555555555555555",
         "--verdict",
         "approved",
         "--quiet",
@@ -166,9 +178,11 @@ fn test_sync_uses_configured_storage_branch() -> Result<()> {
 
     let custom_records = read_remote_reviews(&remote_dir, "reviews/custom")?;
     assert!(custom_records.iter().any(|record| {
-        record["fingerprint"]
+        record["target"]["hash"]
             .as_str()
-            .is_some_and(|fingerprint| fingerprint == "fp-custom-branch")
+            .is_some_and(|fingerprint| {
+                fingerprint == "5555555555555555555555555555555555555555555555555555555555555555"
+            })
     }));
 
     Ok(())
@@ -192,7 +206,11 @@ fn test_sync_fails_when_local_review_store_is_unreadable() -> Result<()> {
     let remote = remote_dir.to_str().context("remote repo path")?;
     run_git(&local.path, &["remote", "add", "origin", remote])?;
 
-    let local_records = vec![record("local-only", "fp-local-only", 1234)];
+    let local_records = vec![record(
+        "local-only",
+        "6666666666666666666666666666666666666666666666666666666666666666",
+        1234,
+    )];
     write_reviews_jsonl(&local.path.join(".trueflow"), &local_records)?;
 
     let db_path = local.path.join(".trueflow").join("reviews.jsonl");
@@ -213,7 +231,7 @@ fn test_sync_fails_when_local_review_store_is_unreadable() -> Result<()> {
 
     let db_content = fs::read_to_string(&db_path)?;
     assert!(
-        db_content.contains("fp-local-only"),
+        db_content.contains("6666666666666666666666666666666666666666666666666666666666666666"),
         "sync should not truncate unreadable local review history"
     );
 
