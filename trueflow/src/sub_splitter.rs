@@ -1,8 +1,8 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::hashing::TreeHash;
-use crate::swift;
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
+use crate::{rust, swift};
 use anyhow::{Context, Result};
 use tracing::info;
 use tree_sitter::Parser;
@@ -331,82 +331,18 @@ fn split_rust_impl(block: &Block) -> Result<Vec<Block>> {
 }
 
 fn collect_rust_impl_items(parent: &Block, impl_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
-    let Some(body) = impl_node.child_by_field_name("body") else {
-        return Ok(Vec::new());
-    };
-    let mut blocks = Vec::new();
-    let mut cursor = body.walk();
-    let mut pending_start: Option<usize> = None;
-    let mut pending_end: usize = 0;
-
-    for child in body.children(&mut cursor) {
-        let ts_kind = child.kind();
-        if matches!(ts_kind, "{" | "}") {
-            continue;
-        }
-        let start_byte = child.start_byte();
-        let end_byte = child.end_byte();
-
-        if is_rust_attribute_node(ts_kind) {
-            if pending_start.is_none() {
-                pending_start = Some(start_byte);
-            }
-            pending_end = end_byte;
-            continue;
-        }
-
-        let Some(kind) = map_rust_impl_child_kind(ts_kind) else {
-            continue;
-        };
-
-        let block_start = pending_start.unwrap_or(start_byte);
-        let chunk = &parent.content[block_start..end_byte];
-        blocks.push(create_sub_block_with_kind(
-            parent,
-            chunk,
-            block_start,
-            end_byte,
-            kind,
-        ));
-
-        pending_start = None;
-        pending_end = 0;
-    }
-
-    if let Some(start) = pending_start {
-        let end = pending_end.max(start);
-        if end > start {
-            let chunk = &parent.content[start..end];
-            blocks.push(create_sub_block_with_kind(
+    Ok(rust::collect_impl_member_spans(impl_node)
+        .into_iter()
+        .map(|member| {
+            create_sub_block_with_kind(
                 parent,
-                chunk,
-                start,
-                end,
-                BlockKind::Code,
-            ));
-        }
-    }
-
-    Ok(blocks)
-}
-
-fn map_rust_impl_child_kind(kind: &str) -> Option<BlockKind> {
-    match kind {
-        "function_item" => Some(BlockKind::Method),
-        "function_signature_item" => Some(BlockKind::FunctionSignature),
-        "const_item" => Some(BlockKind::Const),
-        "static_item" => Some(BlockKind::Static),
-        "type_item" | "associated_type" => Some(BlockKind::Type),
-        "macro_invocation" | "macro_definition" => Some(BlockKind::Macro),
-        _ => None,
-    }
-}
-
-fn is_rust_attribute_node(kind: &str) -> bool {
-    matches!(
-        kind,
-        "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
-    )
+                &parent.content[member.start_byte..member.end_byte],
+                member.start_byte,
+                member.end_byte,
+                member.kind,
+            )
+        })
+        .collect())
 }
 
 fn split_python_function(block: &Block) -> Result<Vec<Block>> {

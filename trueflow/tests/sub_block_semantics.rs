@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use trueflow::analysis::Language;
@@ -116,6 +116,47 @@ fn test_function_subblocks_are_review_units() -> Result<()> {
             .any(|block| block.kind == BlockKind::FunctionSignature)
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_rust_impl_subblocks_match_top_level_impl_members() -> Result<()> {
+    let content = "struct Foo;\n\nimpl Foo {\n    #[cfg(test)]\n    fn read_heavy(&self) {}\n\n    // limit\n    const MAX: usize = 1;\n}\n";
+    let blocks = block_splitter::split(content, Language::Rust).blocks;
+    let impl_block = blocks
+        .iter()
+        .find(|block| block.kind == BlockKind::Impl)
+        .context("expected impl block")?;
+
+    let top_level_members: Vec<_> = blocks
+        .iter()
+        .filter(|block| matches!(block.kind, BlockKind::Method | BlockKind::Const))
+        .map(|block| {
+            (
+                block.kind,
+                block.hash.clone(),
+                block.content.clone(),
+                block.start_line,
+                block.end_line,
+            )
+        })
+        .collect();
+
+    let sub_members: Vec<_> = sub_splitter::split(impl_block, Language::Rust)?
+        .into_iter()
+        .filter(|block| matches!(block.kind, BlockKind::Method | BlockKind::Const))
+        .map(|block| {
+            (
+                block.kind,
+                block.hash,
+                block.content,
+                block.start_line,
+                block.end_line,
+            )
+        })
+        .collect();
+
+    assert_eq!(sub_members, top_level_members);
     Ok(())
 }
 
