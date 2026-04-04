@@ -32,24 +32,44 @@ pub enum DiffQuery {
     },
 }
 
-pub fn diff_query_for_scope(scope: &ReviewScope, path: &str) -> DiffQuery {
-    match scope {
-        ReviewScope::All | ReviewScope::MainDiff => DiffQuery::MainDiff {
-            path: path.to_string(),
-        },
-        ReviewScope::Commit { id, .. } => DiffQuery::Revision {
-            revision: id.clone(),
-            path: path.to_string(),
-        },
-        ReviewScope::RevisionRange { start, end } => DiffQuery::RevisionRange {
-            start: start.clone(),
-            end: end.clone(),
-            path: path.to_string(),
-        },
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewDiffSelection {
+    MainDiff,
+    Revision { revision: String },
+    RevisionRange { start: String, end: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewContentSelection {
+    EntireReview,
+    DiffOnly(ReviewDiffSelection),
 }
 
 impl ReviewScope {
+    pub fn diff_selection(&self) -> ReviewDiffSelection {
+        match self {
+            ReviewScope::All | ReviewScope::MainDiff => ReviewDiffSelection::MainDiff,
+            ReviewScope::Commit { id, .. } => ReviewDiffSelection::Revision {
+                revision: id.clone(),
+            },
+            ReviewScope::RevisionRange { start, end } => ReviewDiffSelection::RevisionRange {
+                start: start.clone(),
+                end: end.clone(),
+            },
+        }
+    }
+
+    pub fn content_selection(&self) -> ReviewContentSelection {
+        match self {
+            ReviewScope::All => ReviewContentSelection::EntireReview,
+            ReviewScope::MainDiff
+            | ReviewScope::Commit { .. }
+            | ReviewScope::RevisionRange { .. } => {
+                ReviewContentSelection::DiffOnly(self.diff_selection())
+            }
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             ReviewScope::All => "entire review".to_string(),
@@ -74,19 +94,50 @@ impl ReviewScope {
     }
 
     pub fn to_review_request(&self) -> Result<ReviewRequest> {
+        self.content_selection().to_review_request()
+    }
+}
+
+impl ReviewDiffSelection {
+    pub fn query_for_path(&self, path: &str) -> DiffQuery {
         match self {
-            ReviewScope::All => Ok(ReviewRequest::AllFiles),
-            ReviewScope::MainDiff => Ok(ReviewRequest::Targets(vec![ReviewTarget::MainDiff])),
-            ReviewScope::Commit { id, .. } => {
-                Ok(ReviewRequest::Targets(vec![ReviewTarget::Revision(
-                    RevisionSpec::new(id.clone())?,
-                )]))
+            ReviewDiffSelection::MainDiff => DiffQuery::MainDiff {
+                path: path.to_string(),
+            },
+            ReviewDiffSelection::Revision { revision } => DiffQuery::Revision {
+                revision: revision.clone(),
+                path: path.to_string(),
+            },
+            ReviewDiffSelection::RevisionRange { start, end } => DiffQuery::RevisionRange {
+                start: start.clone(),
+                end: end.clone(),
+                path: path.to_string(),
+            },
+        }
+    }
+}
+
+impl ReviewContentSelection {
+    pub fn to_review_request(&self) -> Result<ReviewRequest> {
+        match self {
+            ReviewContentSelection::EntireReview => Ok(ReviewRequest::AllFiles),
+            ReviewContentSelection::DiffOnly(diff_selection) => Ok(ReviewRequest::Targets(vec![
+                diff_selection.to_review_target()?,
+            ])),
+        }
+    }
+}
+
+impl ReviewDiffSelection {
+    fn to_review_target(&self) -> Result<ReviewTarget> {
+        match self {
+            ReviewDiffSelection::MainDiff => Ok(ReviewTarget::MainDiff),
+            ReviewDiffSelection::Revision { revision } => {
+                Ok(ReviewTarget::Revision(RevisionSpec::new(revision.clone())?))
             }
-            ReviewScope::RevisionRange { start, end } => {
-                Ok(ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
-                    RevisionRangeSpec::new(start.clone(), end.clone())?,
-                )]))
-            }
+            ReviewDiffSelection::RevisionRange { start, end } => Ok(ReviewTarget::RevisionRange(
+                RevisionRangeSpec::new(start.clone(), end.clone())?,
+            )),
         }
     }
 }
@@ -157,8 +208,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn all_scope_uses_entire_review_content_and_main_diff_selection() {
+        let scope = ReviewScope::All;
+        assert_eq!(
+            scope.content_selection(),
+            ReviewContentSelection::EntireReview
+        );
+        assert_eq!(scope.diff_selection(), ReviewDiffSelection::MainDiff);
+    }
+
+    #[test]
+    fn main_diff_scope_uses_diff_only_content_and_main_diff_selection() {
+        let scope = ReviewScope::MainDiff;
+        assert_eq!(
+            scope.content_selection(),
+            ReviewContentSelection::DiffOnly(ReviewDiffSelection::MainDiff)
+        );
+        assert_eq!(scope.diff_selection(), ReviewDiffSelection::MainDiff);
+    }
+
+    #[test]
     fn diff_query_for_main_scope_uses_main_diff() {
-        let query = diff_query_for_scope(&ReviewScope::MainDiff, "src/lib.rs");
+        let query = ReviewScope::MainDiff
+            .diff_selection()
+            .query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::MainDiff {
@@ -168,14 +241,33 @@ mod tests {
     }
 
     #[test]
-    fn diff_query_for_commit_scope_uses_revision() {
-        let query = diff_query_for_scope(
-            &ReviewScope::Commit {
-                id: "abc1234".to_string(),
-                summary: "message".to_string(),
-            },
-            "src/lib.rs",
+    fn commit_scope_uses_diff_only_content_and_revision_selection() {
+        let scope = ReviewScope::Commit {
+            id: "abc1234".to_string(),
+            summary: "message".to_string(),
+        };
+        assert_eq!(
+            scope.content_selection(),
+            ReviewContentSelection::DiffOnly(ReviewDiffSelection::Revision {
+                revision: "abc1234".to_string(),
+            })
         );
+        assert_eq!(
+            scope.diff_selection(),
+            ReviewDiffSelection::Revision {
+                revision: "abc1234".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn diff_query_for_commit_scope_uses_revision() {
+        let query = ReviewScope::Commit {
+            id: "abc1234".to_string(),
+            summary: "message".to_string(),
+        }
+        .diff_selection()
+        .query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::Revision {
@@ -186,14 +278,35 @@ mod tests {
     }
 
     #[test]
-    fn diff_query_for_revision_range_scope_uses_revision_range() {
-        let query = diff_query_for_scope(
-            &ReviewScope::RevisionRange {
+    fn revision_range_scope_uses_diff_only_content_and_revision_range_selection() {
+        let scope = ReviewScope::RevisionRange {
+            start: "abc1234".to_string(),
+            end: "def5678".to_string(),
+        };
+        assert_eq!(
+            scope.content_selection(),
+            ReviewContentSelection::DiffOnly(ReviewDiffSelection::RevisionRange {
                 start: "abc1234".to_string(),
                 end: "def5678".to_string(),
-            },
-            "src/lib.rs",
+            })
         );
+        assert_eq!(
+            scope.diff_selection(),
+            ReviewDiffSelection::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn diff_query_for_revision_range_scope_uses_revision_range() {
+        let query = ReviewScope::RevisionRange {
+            start: "abc1234".to_string(),
+            end: "def5678".to_string(),
+        }
+        .diff_selection()
+        .query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::RevisionRange {

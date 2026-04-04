@@ -15,9 +15,7 @@ use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
-use crate::review_scope::{
-    DiffQuery, ReviewScope, ScopeOption, default_scope_options, diff_query_for_scope,
-};
+use crate::review_scope::{DiffQuery, ReviewScope, ScopeOption, default_scope_options};
 use crate::review_session;
 use crate::review_speedread::{
     PlaybackState, PunctuationDwellMode, SpeedReadModel, new_model as build_speed_read_model,
@@ -2399,7 +2397,10 @@ fn build_block_diff_lines(
         repo_relative_path_for_diff(node.path.as_str(), state.workdir_prefix.as_deref());
     let path = PathBuf::from(&diff_path);
     let file_diff = ensure_cached_file_diff(&mut state.file_diff_cache, &path, || {
-        let query = diff_query_for_scope(&state.review_scope, &diff_path);
+        let query = state
+            .review_scope
+            .diff_selection()
+            .query_for_path(&diff_path);
         let repo = vcs::repo_from_workdir()?;
         match query {
             DiffQuery::MainDiff { path } => vcs::diff_for_file(&repo, &RepoPath::new(path)?),
@@ -3214,7 +3215,9 @@ mod diff_scope_tests {
 
     #[test]
     fn diff_query_uses_main_diff_for_main_scope() {
-        let query = diff_query_for_scope(&ReviewScope::MainDiff, "src/lib.rs");
+        let query = ReviewScope::MainDiff
+            .diff_selection()
+            .query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::MainDiff {
@@ -3224,13 +3227,12 @@ mod diff_scope_tests {
     }
     #[test]
     fn diff_query_uses_revision_for_commit_scope() {
-        let query = diff_query_for_scope(
-            &ReviewScope::Commit {
-                id: "abc123".to_string(),
-                summary: "test".to_string(),
-            },
-            "src/lib.rs",
-        );
+        let query = ReviewScope::Commit {
+            id: "abc123".to_string(),
+            summary: "test".to_string(),
+        }
+        .diff_selection()
+        .query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::Revision {
@@ -3242,13 +3244,12 @@ mod diff_scope_tests {
 
     #[test]
     fn diff_query_uses_revision_range_for_range_scope() {
-        let query = diff_query_for_scope(
-            &ReviewScope::RevisionRange {
-                start: "abc123".to_string(),
-                end: "def456".to_string(),
-            },
-            "src/lib.rs",
-        );
+        let query = ReviewScope::RevisionRange {
+            start: "abc123".to_string(),
+            end: "def456".to_string(),
+        }
+        .diff_selection()
+        .query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::RevisionRange {
@@ -3261,7 +3262,9 @@ mod diff_scope_tests {
 
     #[test]
     fn diff_query_uses_main_diff_for_all_scope() {
-        let query = diff_query_for_scope(&ReviewScope::All, "src/lib.rs");
+        let query = ReviewScope::All
+            .diff_selection()
+            .query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::MainDiff {
