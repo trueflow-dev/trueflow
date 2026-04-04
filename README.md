@@ -7,18 +7,20 @@
 Trueflow is an experimental semantic code review tool.
 
 It turns files or diffs into reviewable **blocks**, lets you review those blocks
-in a CLI/TUI/Emacs workflow, and stores review state separately from commit
-history.
+in a CLI/TUI/Emacs workflow, and stores review state in an append-only flat file
+database, e.g. `.trueflow/reviews.jsonl`.
 
 ## What it does
 
-- scans a working tree or revision range into semantic review blocks
-- lets you approve, reject, comment on, and split blocks
+- scans a working tree or revision range into semantic review `blocks` (a
+  `block` is some semantic unit of content, e.g. `Method`, `Struct`,
+  `CodeParagraph`)
+- lets you approve, reject, or comment on `blocks`
 - stores review records in `.trueflow/reviews.jsonl`
 - exports review feedback for an agent or other automation
+- TODO: auto-integration with agents as you review
 
 ## Current model
-
 
 - The canonical review unit is a **block**, not a textual diff hunk.
 - Runtime config lives in `trueflow.toml`.
@@ -32,11 +34,12 @@ Still some rough edges.
 ## Quick start
 
 ```sh
-# Review current changes as JSON
+# Launch the TUI. The main way to use trueflow.
+trueflow tui
+
+# Review current changes as JSON. Machine-readable, suitable for integrations.
 trueflow review --json
 
-# Launch the TUI
-trueflow tui
 
 # Inspect and split a block
 trueflow inspect --fingerprint <fp> --split
@@ -123,4 +126,4 @@ nix develop -c just check
 nix develop -c just coverage
 ```
 
-The coverage report is written to `trueflow/target/llvm-cov/html/index.html`.
+    The coverage report is written to `trueflow/target/llvm-cov/html/index.html`.
