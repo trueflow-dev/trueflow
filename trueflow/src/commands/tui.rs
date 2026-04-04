@@ -780,7 +780,7 @@ fn run_app(
                     KeyCode::Enter | KeyCode::Char(' ')
                         if state.navigator.current_id() == state.navigator.tree.root() =>
                     {
-                        if let Some(first) = state.review_order.first_block() {
+                        if let Some(first) = state.review_order.first_reviewable_block() {
                             state.navigator.set_current(first);
                             clear_speed_read_if_not_on_current_node(&mut state);
                         }
@@ -1314,17 +1314,8 @@ fn handle_descend(state: &mut AppState) {
         let root = state.navigator.tree.root();
         state.root_cursor = state
             .root_cursor
-            .filter(|id| state.navigator.visible_nodes.contains(id))
-            .or_else(|| {
-                state
-                    .navigator
-                    .tree
-                    .node(root)
-                    .children
-                    .iter()
-                    .copied()
-                    .find(|child| state.navigator.visible_nodes.contains(child))
-            });
+            .filter(|id| state.navigator.is_visible(*id))
+            .or_else(|| state.navigator.first_visible_child(root));
 
         if let Some(target) = state.root_cursor {
             state.navigator.set_current(target);
@@ -1378,7 +1369,7 @@ fn move_root_cursor(state: &mut AppState, offset: isize) {
         .children
         .iter()
         .copied()
-        .filter(|child| state.navigator.visible_nodes.contains(child))
+        .filter(|child| state.navigator.is_visible(*child))
         .collect();
 
     if root_children.is_empty() {
@@ -1408,7 +1399,9 @@ fn handle_action(
         PendingAction::from_node(&state.navigator.tree, state.navigator.current_id(), verdict);
 
     if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
-        let count = count_descendant_blocks(&state.navigator, state.navigator.current_id());
+        let count = state
+            .navigator
+            .count_visible_descendant_blocks(state.navigator.current_id());
         state.input_mode = InputMode::ConfirmBatch { action, count };
     } else {
         execute_action(terminal, context, state, action)?;
@@ -1445,14 +1438,13 @@ fn handle_editing_submit(
     };
 
     if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
-        let count = count_descendant_blocks(
-            &state.navigator,
-            match &action {
+        let count = state
+            .navigator
+            .count_visible_descendant_blocks(match &action {
                 PendingAction::Single { node_id, .. } | PendingAction::Batch { node_id, .. } => {
                     *node_id
                 }
-            },
-        );
+            });
         state.input_buffer.clear();
         state.input_mode = InputMode::ConfirmBatch { action, count };
     } else {
@@ -1589,18 +1581,13 @@ fn apply_action_locally(
     verdict: &Verdict,
     next_id: Option<TreeNodeId>,
 ) -> ActionImpact {
-    let block_ids = review_session::action_block_ids(
-        &state.navigator.tree,
-        &state.navigator.visible_nodes,
-        node_id,
-    );
+    let block_ids = review_session::action_block_ids(&state.navigator, node_id);
     let affected_blocks = block_ids.len();
 
     let mut removed_reviewable = 0;
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
         for block_id in block_ids {
-            if state.navigator.visible_nodes.remove(&block_id)
-                && state.reviewable_nodes.remove(&block_id)
+            if state.navigator.remove_visible(block_id) && state.reviewable_nodes.remove(&block_id)
             {
                 removed_reviewable += 1;
             }
@@ -1608,8 +1595,7 @@ fn apply_action_locally(
         state.remaining_blocks = state.remaining_blocks.saturating_sub(removed_reviewable);
     }
 
-    state.navigator.visible_nodes =
-        review_session::prune_visible_nodes(&state.navigator.tree, &state.navigator.visible_nodes);
+    state.navigator.prune_visible_to_block_ancestors();
 
     if let Some(node_id) = next_id {
         state.navigator.set_current(node_id);
@@ -1628,8 +1614,7 @@ fn apply_action_locally(
 
 fn compute_next_review_target(state: &AppState, node_id: TreeNodeId) -> Option<TreeNodeId> {
     review_session::next_review_target(
-        &state.navigator.tree,
-        &state.navigator.visible_nodes,
+        &state.navigator,
         &state.review_order,
         &state.reviewable_nodes,
         node_id,
@@ -1647,23 +1632,6 @@ fn detect_repo_name(context: &TrueflowContext) -> String {
         }
     }
     "repo".to_string()
-}
-
-fn count_descendant_blocks(navigator: &ReviewNavigator, id: TreeNodeId) -> usize {
-    let mut count = 0;
-    let mut stack = vec![id];
-    while let Some(curr) = stack.pop() {
-        let node = navigator.tree.node(curr);
-        if matches!(node.kind, TreeNodeKind::Block) && navigator.visible_nodes.contains(&curr) {
-            count += 1;
-        }
-        for child in &node.children {
-            if navigator.visible_nodes.contains(child) {
-                stack.push(*child);
-            }
-        }
-    }
-    count
 }
 
 // --- UI Rendering ---
@@ -2549,7 +2517,7 @@ fn build_directory_lines(
 ) -> (Vec<Line<'static>>, usize) {
     let mut entries = Vec::new();
     for child_id in &node.children {
-        if !state.navigator.visible_nodes.contains(child_id) {
+        if !state.navigator.is_visible(*child_id) {
             continue;
         }
         let child = state.navigator.tree.node(*child_id);
@@ -2596,7 +2564,7 @@ fn build_root_lines(
         .children
         .iter()
         .copied()
-        .filter(|child| state.navigator.visible_nodes.contains(child))
+        .filter(|child| state.navigator.is_visible(*child))
         .collect();
 
     if state.root_cursor.is_none() {
@@ -2621,7 +2589,7 @@ fn build_root_lines(
 
     let kind_counts = review_metadata::sorted_visible_block_kind_counts(
         &state.navigator.tree,
-        &state.navigator.visible_nodes,
+        state.navigator.visible_nodes(),
     );
 
     let mut last_parent = "";

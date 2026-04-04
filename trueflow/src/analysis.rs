@@ -136,7 +136,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use uuid::Uuid;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempPath {
         path: PathBuf,
@@ -169,9 +170,17 @@ mod tests {
     }
 
     fn write_temp_file(name: &str, contents: &[u8]) -> TempPath {
-        let dir = std::env::temp_dir()
-            .join("trueflow-analysis-tests")
-            .join(Uuid::new_v4().to_string());
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let unique_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "trueflow-analysis-tests-{}-{timestamp}-{unique_id}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("create temp directory: {error}"));
         let path = dir.join(name);
         fs::write(&path, contents).unwrap_or_else(|error| panic!("write temp file: {error}"));

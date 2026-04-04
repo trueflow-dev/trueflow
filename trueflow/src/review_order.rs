@@ -25,6 +25,12 @@ pub struct ReviewCursor {
     pub node_id: TreeNodeId,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ReviewAnchor<'a> {
+    Block(TreeNodeId),
+    Subtree(&'a HashSet<TreeNodeId>),
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewOrder {
     ordered: Vec<ReviewCursor>,
@@ -93,40 +99,40 @@ impl ReviewOrder {
         }
     }
 
-    pub fn first_block(&self) -> Option<TreeNodeId> {
+    pub fn first_reviewable_block(&self) -> Option<TreeNodeId> {
         self.ordered.first().map(|cursor| cursor.node_id)
     }
 
-    pub fn next_after_blocks(
+    pub fn next_remaining_after(
         &self,
-        current: TreeNodeId,
+        anchor: ReviewAnchor<'_>,
         remaining: &HashSet<TreeNodeId>,
     ) -> Option<TreeNodeId> {
-        let index = *self.index_by_node.get(&current)?;
-        self.ordered
-            .iter()
-            .skip(index + 1)
-            .find(|cursor| remaining.contains(&cursor.node_id))
-            .map(|cursor| cursor.node_id)
-    }
+        match anchor {
+            ReviewAnchor::Block(current) => {
+                let index = *self.index_by_node.get(&current)?;
+                self.ordered
+                    .iter()
+                    .skip(index + 1)
+                    .find(|cursor| remaining.contains(&cursor.node_id))
+                    .map(|cursor| cursor.node_id)
+            }
+            ReviewAnchor::Subtree(subtree_blocks) => {
+                let start_index = subtree_blocks
+                    .iter()
+                    .filter_map(|node_id| self.index_by_node.get(node_id).copied())
+                    .min()?;
 
-    pub fn next_after_subtree(
-        &self,
-        subtree_blocks: &HashSet<TreeNodeId>,
-        remaining: &HashSet<TreeNodeId>,
-    ) -> Option<TreeNodeId> {
-        let start_index = subtree_blocks
-            .iter()
-            .filter_map(|node_id| self.index_by_node.get(node_id).copied())
-            .min()?;
-
-        self.ordered
-            .iter()
-            .skip(start_index + 1)
-            .find(|cursor| {
-                remaining.contains(&cursor.node_id) && !subtree_blocks.contains(&cursor.node_id)
-            })
-            .map(|cursor| cursor.node_id)
+                self.ordered
+                    .iter()
+                    .skip(start_index + 1)
+                    .find(|cursor| {
+                        remaining.contains(&cursor.node_id)
+                            && !subtree_blocks.contains(&cursor.node_id)
+                    })
+                    .map(|cursor| cursor.node_id)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -476,5 +482,55 @@ mod tests {
         assert_eq!(order.ordered_ids(), vec![first, second]);
         assert_eq!(order.index_for(first), Some(0));
         assert_eq!(order.index_for(second), Some(1));
+    }
+
+    #[test]
+    fn next_remaining_after_uses_typed_anchor_for_block_and_subtree() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-lib".to_string(),
+            Language::Rust,
+        );
+
+        let impl_block = builder.add_block(
+            file,
+            "impl".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Impl, 1, &[]),
+            Language::Rust,
+        );
+        let method = builder.add_block(
+            impl_block,
+            "method".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Method, 3, &[]),
+            Language::Rust,
+        );
+        let tail = builder.add_block(
+            file,
+            "tail".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 20, &[]),
+            Language::Rust,
+        );
+
+        let tree = builder.finalize();
+        let remaining = HashSet::from([impl_block, method, tail]);
+        let order = ReviewOrder::from_tree(&tree, &remaining);
+        let subtree = HashSet::from([impl_block, method]);
+
+        assert_eq!(
+            order.next_remaining_after(ReviewAnchor::Block(impl_block), &remaining),
+            Some(method)
+        );
+        assert_eq!(
+            order.next_remaining_after(ReviewAnchor::Subtree(&subtree), &remaining),
+            Some(tail)
+        );
     }
 }

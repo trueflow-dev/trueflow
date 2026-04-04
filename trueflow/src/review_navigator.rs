@@ -1,29 +1,19 @@
-use crate::tree::{Tree, TreeNodeId};
+use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use anyhow::Result;
 use std::collections::HashSet;
 
 pub struct ReviewNavigator {
     pub tree: Tree,
-    pub visible_nodes: HashSet<TreeNodeId>,
+    visible_nodes: HashSet<TreeNodeId>,
     current: TreeNodeId,
 }
 
 impl ReviewNavigator {
     pub fn new(tree: Tree, unreviewed_blocks: HashSet<TreeNodeId>) -> Result<Self> {
-        let mut visible_nodes = HashSet::new();
-        for block_id in unreviewed_blocks {
-            visible_nodes.insert(block_id);
-            for ancestor in tree.ancestors(block_id) {
-                visible_nodes.insert(ancestor);
-            }
-        }
-
         let root = tree.root();
-        visible_nodes.insert(root);
-
         Ok(Self {
+            visible_nodes: visible_nodes_from_blocks(&tree, unreviewed_blocks),
             tree,
-            visible_nodes,
             current: root,
         })
     }
@@ -32,8 +22,16 @@ impl ReviewNavigator {
         self.current
     }
 
+    pub fn visible_nodes(&self) -> &HashSet<TreeNodeId> {
+        &self.visible_nodes
+    }
+
+    pub fn is_visible(&self, id: TreeNodeId) -> bool {
+        self.visible_nodes.contains(&id)
+    }
+
     pub fn set_current(&mut self, id: TreeNodeId) {
-        if self.visible_nodes.contains(&id) {
+        if self.is_visible(id) {
             self.current = id;
         }
     }
@@ -42,22 +40,24 @@ impl ReviewNavigator {
         self.current = self.tree.root();
     }
 
-    pub fn descend(&mut self) {
-        if let Some(child) = self
-            .tree
-            .node(self.current)
+    pub fn first_visible_child(&self, parent: TreeNodeId) -> Option<TreeNodeId> {
+        self.tree
+            .node(parent)
             .children
             .iter()
             .copied()
-            .find(|child| self.visible_nodes.contains(child))
-        {
+            .find(|child| self.is_visible(*child))
+    }
+
+    pub fn descend(&mut self) {
+        if let Some(child) = self.first_visible_child(self.current) {
             self.current = child;
         }
     }
 
     pub fn ascend(&mut self) {
         if let Some(parent) = self.tree.parent(self.current)
-            && self.visible_nodes.contains(&parent)
+            && self.is_visible(parent)
         {
             self.current = parent;
         }
@@ -75,6 +75,39 @@ impl ReviewNavigator {
         }
     }
 
+    pub fn remove_visible(&mut self, id: TreeNodeId) -> bool {
+        self.visible_nodes.remove(&id)
+    }
+
+    pub fn prune_visible_to_block_ancestors(&mut self) {
+        self.visible_nodes = visible_block_ancestors(&self.tree, &self.visible_nodes);
+        if !self.is_visible(self.current) {
+            self.jump_root();
+        }
+    }
+
+    pub fn visible_descendant_block_ids(&self, root: TreeNodeId) -> Vec<TreeNodeId> {
+        let mut stack = vec![root];
+        let mut blocks = Vec::new();
+        while let Some(node_id) = stack.pop() {
+            if !self.is_visible(node_id) {
+                continue;
+            }
+            let node = self.tree.node(node_id);
+            if matches!(node.kind, TreeNodeKind::Block) {
+                blocks.push(node_id);
+            }
+            for child in &node.children {
+                stack.push(*child);
+            }
+        }
+        blocks
+    }
+
+    pub fn count_visible_descendant_blocks(&self, root: TreeNodeId) -> usize {
+        self.visible_descendant_block_ids(root).len()
+    }
+
     fn sibling_at_offset(&self, node_id: TreeNodeId, offset: isize) -> Option<TreeNodeId> {
         let parent = self.tree.parent(node_id)?;
         let siblings: Vec<TreeNodeId> = self
@@ -83,7 +116,7 @@ impl ReviewNavigator {
             .children
             .iter()
             .copied()
-            .filter(|child| self.visible_nodes.contains(child))
+            .filter(|child| self.is_visible(*child))
             .collect();
         let index = siblings
             .iter()
@@ -91,6 +124,39 @@ impl ReviewNavigator {
             .checked_add_signed(offset)?;
         siblings.get(index).copied()
     }
+}
+
+fn visible_nodes_from_blocks(
+    tree: &Tree,
+    block_ids: impl IntoIterator<Item = TreeNodeId>,
+) -> HashSet<TreeNodeId> {
+    let mut visible_nodes = HashSet::new();
+    for block_id in block_ids {
+        visible_nodes.insert(block_id);
+        for ancestor in tree.ancestors(block_id) {
+            visible_nodes.insert(ancestor);
+        }
+    }
+    visible_nodes.insert(tree.root());
+    visible_nodes
+}
+
+fn visible_block_ancestors(
+    tree: &Tree,
+    visible_nodes: &HashSet<TreeNodeId>,
+) -> HashSet<TreeNodeId> {
+    let mut pruned = HashSet::new();
+    for node_id in visible_nodes
+        .iter()
+        .copied()
+        .filter(|id| matches!(tree.node(*id).kind, TreeNodeKind::Block))
+    {
+        for ancestor in tree.ancestors(node_id) {
+            pruned.insert(ancestor);
+        }
+    }
+    pruned.insert(tree.root());
+    pruned
 }
 
 #[cfg(test)]
@@ -178,14 +244,14 @@ mod tests {
             panic!("failed to create navigator: {error}");
         });
 
-        assert!(navigator.visible_nodes.contains(&fixture.root));
-        assert!(navigator.visible_nodes.contains(&fixture.src));
-        assert!(navigator.visible_nodes.contains(&fixture.lib_file));
-        assert!(navigator.visible_nodes.contains(&fixture.block_b));
-        assert!(!navigator.visible_nodes.contains(&fixture.block_a));
-        assert!(!navigator.visible_nodes.contains(&fixture.docs));
-        assert!(!navigator.visible_nodes.contains(&fixture.readme_file));
-        assert!(!navigator.visible_nodes.contains(&fixture.block_docs));
+        assert!(navigator.is_visible(fixture.root));
+        assert!(navigator.is_visible(fixture.src));
+        assert!(navigator.is_visible(fixture.lib_file));
+        assert!(navigator.is_visible(fixture.block_b));
+        assert!(!navigator.is_visible(fixture.block_a));
+        assert!(!navigator.is_visible(fixture.docs));
+        assert!(!navigator.is_visible(fixture.readme_file));
+        assert!(!navigator.is_visible(fixture.block_docs));
         assert_eq!(navigator.current_id(), fixture.root);
     }
 
@@ -245,5 +311,26 @@ mod tests {
 
         navigator.set_current(fixture.block_docs);
         assert_eq!(navigator.current_id(), fixture.root);
+    }
+
+    #[test]
+    fn prune_visible_to_block_ancestors_resets_current_when_selection_becomes_hidden() {
+        let fixture = build_fixture();
+        let unreviewed = HashSet::from([fixture.block_a, fixture.block_b]);
+        let mut navigator =
+            ReviewNavigator::new(fixture.tree, unreviewed).unwrap_or_else(|error| {
+                panic!("failed to create navigator: {error}");
+            });
+        navigator.set_current(fixture.block_b);
+
+        assert!(navigator.remove_visible(fixture.block_b));
+        navigator.prune_visible_to_block_ancestors();
+
+        assert_eq!(navigator.current_id(), fixture.root);
+        assert!(navigator.is_visible(fixture.root));
+        assert!(navigator.is_visible(fixture.src));
+        assert!(navigator.is_visible(fixture.lib_file));
+        assert!(navigator.is_visible(fixture.block_a));
+        assert!(!navigator.is_visible(fixture.block_b));
     }
 }
