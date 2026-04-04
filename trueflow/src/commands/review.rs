@@ -5,6 +5,7 @@ use crate::context::TrueflowContext;
 use crate::path_utils;
 use crate::policy::{should_skip_container_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
+use crate::review_scope::CliSemanticReviewScope;
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, ReviewTargetRef};
 use crate::sub_splitter;
@@ -14,6 +15,7 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
+use std::str::FromStr;
 use tracing::info;
 
 #[derive(Serialize)]
@@ -73,6 +75,11 @@ pub enum ReviewTarget {
 
 impl ReviewTarget {
     fn from_cli(raw: &str) -> Result<Self> {
+        match raw {
+            "dirty" => return Ok(Self::DirtyWorktree),
+            "main" => return Ok(Self::MainDiff),
+            _ => {}
+        }
         if let Some(rest) = raw.strip_prefix("file:") {
             return Ok(Self::File(RepoPath::new(rest)?));
         }
@@ -104,6 +111,14 @@ impl ReviewTarget {
             Self::RevisionRange(range) => Some(ReviewDiffTarget::RevisionRange(range.clone())),
             Self::DirtyWorktree | Self::File(_) => None,
         }
+    }
+}
+
+impl FromStr for ReviewTarget {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::from_cli(raw)
     }
 }
 
@@ -216,25 +231,8 @@ pub struct CollectedReview {
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
 }
 
-pub fn parse_review_request(all: bool, values: &[String]) -> Result<ReviewRequest> {
-    if all {
-        if !values.is_empty() {
-            return Err(anyhow!(
-                "Explicit review targets cannot be combined with --all"
-            ));
-        }
-        return Ok(ReviewRequest::AllFiles);
-    }
-
-    if values.is_empty() {
-        return Ok(ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree]));
-    }
-
-    let targets = values
-        .iter()
-        .map(|raw| ReviewTarget::from_cli(raw))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(ReviewRequest::Targets(targets))
+pub fn parse_review_request(all: bool, values: &[ReviewTarget]) -> Result<ReviewRequest> {
+    Ok(CliSemanticReviewScope::from_cli(all, values)?.review_request())
 }
 
 pub fn resolve_review_request(
@@ -644,7 +642,7 @@ pub fn run(
     _context: &TrueflowContext,
     json: bool,
     all: bool,
-    target: &[String],
+    target: &[ReviewTarget],
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<()> {
@@ -771,7 +769,11 @@ mod tests {
 
     #[test]
     fn parse_review_request_all_rejects_explicit_targets() {
-        let err = parse_review_request(true, &["file:src/lib.rs".to_string()]).unwrap_err();
+        let err = parse_review_request(
+            true,
+            &[ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap())],
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("Explicit review targets cannot be combined with --all")
@@ -793,8 +795,8 @@ mod tests {
         let request = parse_review_request(
             false,
             &[
-                "file:src/lib.rs".to_string(),
-                "rev:abc1234..def5678".to_string(),
+                ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
+                ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "def5678").unwrap()),
             ],
         )
         .unwrap_or_else(|error| panic!("expected typed targets: {error}"));
@@ -805,6 +807,18 @@ mod tests {
                 ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
                 ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "def5678").unwrap()),
             ])
+        );
+    }
+
+    #[test]
+    fn review_target_from_str_supports_dirty_and_main() {
+        assert_eq!(
+            ReviewTarget::from_str("dirty").unwrap(),
+            ReviewTarget::DirtyWorktree
+        );
+        assert_eq!(
+            ReviewTarget::from_str("main").unwrap(),
+            ReviewTarget::MainDiff
         );
     }
 

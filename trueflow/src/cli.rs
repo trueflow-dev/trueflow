@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 use crate::block::BlockKind;
 use crate::build_info;
+use crate::commands::review::ReviewTarget;
 use crate::logging::LoggingMode;
 
 #[derive(Parser)]
@@ -89,9 +90,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Review targets (file:`<path>`, rev:`<sha>`, rev:`<start>..<end>`)
+        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, or `rev:abc1234..def5678`
         #[arg(long, value_name = "TARGET")]
-        target: Vec<String>,
+        target: Vec<ReviewTarget>,
 
         /// Only include block types (e.g. "function", "struct")
         #[arg(long)]
@@ -150,9 +151,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Review targets (file:`<path>`, rev:`<sha>`, rev:`<start>..<end>`)
+        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, or `rev:abc1234..def5678`
         #[arg(long, value_name = "TARGET")]
-        target: Vec<String>,
+        target: Vec<ReviewTarget>,
 
         /// Only include block types (e.g. "function", "struct")
         #[arg(long)]
@@ -169,6 +170,8 @@ mod tests {
     use super::{Cli, Commands};
     use crate::block::BlockKind;
     use crate::build_info;
+    use crate::commands::review::{ReviewTarget, RevisionSpec};
+    use crate::repo_path::RepoPath;
     use chrono::DateTime;
     use clap::{CommandFactory, Parser};
 
@@ -229,7 +232,10 @@ mod tests {
                 assert!(!all);
                 assert_eq!(
                     target,
-                    vec!["file:src/lib.rs".to_string(), "rev:abc1234".to_string()]
+                    vec![
+                        ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
+                        ReviewTarget::Revision(RevisionSpec::new("abc1234").unwrap()),
+                    ]
                 );
                 assert_eq!(only, vec![BlockKind::Function]);
                 assert_eq!(exclude, vec![BlockKind::Comment]);
@@ -279,6 +285,30 @@ mod tests {
                 assert!(exclude.is_empty());
             }
             _ => panic!("expected feedback command"),
+        }
+    }
+
+    #[test]
+    fn review_command_parses_explicit_dirty_and_main_targets() {
+        let cli = Cli::parse_from([
+            "trueflow", "review", "--target", "dirty", "--target", "main",
+        ]);
+
+        match cli.command {
+            Commands::Review {
+                target,
+                only,
+                exclude,
+                ..
+            } => {
+                assert_eq!(
+                    target,
+                    vec![ReviewTarget::DirtyWorktree, ReviewTarget::MainDiff]
+                );
+                assert!(only.is_empty());
+                assert!(exclude.is_empty());
+            }
+            _ => panic!("expected review command"),
         }
     }
 

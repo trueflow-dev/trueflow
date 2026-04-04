@@ -2,8 +2,7 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    CollectedReview, ReviewRequest, ReviewTarget, collect_review, parse_review_request,
-    resolve_review_request,
+    CollectedReview, ReviewTarget, collect_review, resolve_review_request,
 };
 use crate::config::{
     BlockFilters, TuiConfig, TuiDiffFocusMode, TuiSpeedReadConfig, TuiSpeedReadPunctuationDwell,
@@ -15,7 +14,9 @@ use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
-use crate::review_scope::{DiffQuery, ReviewScope, ScopeOption, default_scope_options};
+use crate::review_scope::{
+    CliSemanticReviewScope, DiffQuery, ReviewScope, ScopeOption, default_scope_options,
+};
 use crate::review_session;
 use crate::review_speedread::{
     PlaybackState, PunctuationDwellMode, SpeedReadModel, new_model as build_speed_read_model,
@@ -96,9 +97,7 @@ struct LaunchSelection {
 
 #[derive(Debug, Clone)]
 struct CliReviewRequest {
-    review_scope: ReviewScope,
-    review_request: ReviewRequest,
-    scope_label: String,
+    review_scope: CliSemanticReviewScope,
 }
 
 // --- Application Logic ---
@@ -336,7 +335,7 @@ impl ContentNodeSnapshot {
 pub fn run(
     context: &TrueflowContext,
     all: bool,
-    target: &[String],
+    target: &[ReviewTarget],
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<()> {
@@ -347,13 +346,17 @@ pub fn run(
         let launch = if let Some(request) = cli_review_request(all, target, only, exclude)? {
             let filters = config.review.resolve_filters(only, exclude);
             let review = {
-                let query = resolve_review_request(request.review_request, filters, scan_options)?;
+                let query = resolve_review_request(
+                    request.review_scope.review_request(),
+                    filters,
+                    scan_options,
+                )?;
                 collect_review(&query)?
             };
             LaunchSelection {
-                scope: request.review_scope,
+                scope: request.review_scope.tui_scope(),
                 review,
-                scope_label: request.scope_label,
+                scope_label: request.review_scope.label(),
             }
         } else {
             let scope_options = load_scope_options()?;
@@ -393,7 +396,7 @@ pub fn run(
 
 fn cli_review_request(
     all: bool,
-    target: &[String],
+    target: &[ReviewTarget],
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<Option<CliReviewRequest>> {
@@ -402,47 +405,8 @@ fn cli_review_request(
         return Ok(None);
     }
 
-    let review_request = parse_review_request(all, target)?;
-    let review_scope = review_scope_for_cli_request(&review_request);
-    let scope_label = cli_scope_label(&review_request);
-    Ok(Some(CliReviewRequest {
-        review_scope,
-        review_request,
-        scope_label,
-    }))
-}
-
-fn review_scope_for_cli_request(request: &ReviewRequest) -> ReviewScope {
-    match request {
-        ReviewRequest::AllFiles => ReviewScope::All,
-        ReviewRequest::Targets(targets) => match targets.as_slice() {
-            [ReviewTarget::Revision(id)] => ReviewScope::Commit {
-                id: id.as_str().to_string(),
-                summary: String::new(),
-            },
-            [ReviewTarget::RevisionRange(range)] => ReviewScope::RevisionRange {
-                start: range.start.as_str().to_string(),
-                end: range.end.as_str().to_string(),
-            },
-            _ => ReviewScope::MainDiff,
-        },
-    }
-}
-
-fn cli_scope_label(request: &ReviewRequest) -> String {
-    match request {
-        ReviewRequest::AllFiles => "all files (CLI)".to_string(),
-        ReviewRequest::Targets(targets) => match targets.as_slice() {
-            [ReviewTarget::File(path)] => format!("file {path}"),
-            [ReviewTarget::Revision(revision)] => format!("revision {revision}"),
-            [ReviewTarget::RevisionRange(range)] => {
-                format!("revisions {}..{}", range.start, range.end)
-            }
-            [ReviewTarget::MainDiff] => "diff vs main".to_string(),
-            [ReviewTarget::DirtyWorktree] => "dirty worktree".to_string(),
-            multiple => format!("{} targets", multiple.len()),
-        },
-    }
+    let review_scope = CliSemanticReviewScope::from_cli(all, target)?;
+    Ok(Some(CliReviewRequest { review_scope }))
 }
 
 fn build_review_state(
@@ -3329,26 +3293,24 @@ mod diff_scope_tests {
     }
     #[test]
     fn cli_review_request_file_target_uses_main_diff_scope() {
-        let targets = vec!["file:src/lib.rs".to_string()];
+        let targets = vec![ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap())];
         let request = cli_review_request(false, &targets, &[], &[])
             .unwrap_or_else(|error| panic!("expected file target request: {error}"));
         let Some(request) = request else {
             panic!("expected cli request");
         };
 
-        assert_eq!(request.review_scope, ReviewScope::MainDiff);
-        assert_eq!(request.scope_label, "file src/lib.rs");
         assert_eq!(
-            request.review_request,
-            ReviewRequest::Targets(vec![ReviewTarget::File(
-                RepoPath::new("src/lib.rs").unwrap()
-            )])
+            request.review_scope,
+            CliSemanticReviewScope::File(RepoPath::new("src/lib.rs").unwrap())
         );
     }
 
     #[test]
     fn cli_review_request_revision_range_target_uses_revision_range_scope() {
-        let targets = vec!["rev:abc1234..def5678".to_string()];
+        let targets = vec![ReviewTarget::RevisionRange(
+            crate::commands::review::RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+        )];
         let request = cli_review_request(false, &targets, &[], &[])
             .unwrap_or_else(|error| panic!("expected revision range request: {error}"));
         let Some(request) = request else {
@@ -3357,17 +3319,9 @@ mod diff_scope_tests {
 
         assert_eq!(
             request.review_scope,
-            ReviewScope::RevisionRange {
-                start: "abc1234".to_string(),
-                end: "def5678".to_string(),
-            }
-        );
-        assert_eq!(request.scope_label, "revisions abc1234..def5678");
-        assert_eq!(
-            request.review_request,
-            ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
+            CliSemanticReviewScope::RevisionRange(
                 crate::commands::review::RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
-            )])
+            )
         );
     }
 
@@ -3381,17 +3335,12 @@ mod diff_scope_tests {
             panic!("expected cli request");
         };
 
-        assert_eq!(request.review_scope, ReviewScope::MainDiff);
-        assert_eq!(request.scope_label, "dirty worktree");
-        assert_eq!(
-            request.review_request,
-            ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree])
-        );
+        assert_eq!(request.review_scope, CliSemanticReviewScope::DirtyWorktree);
     }
     #[test]
-    fn cli_review_request_errors_for_unknown_target_format() {
-        let targets = vec!["src/lib.rs".to_string()];
-        let request = cli_review_request(false, &targets, &[], &[]);
+    fn cli_review_request_errors_when_all_is_combined_with_targets() {
+        let targets = vec![ReviewTarget::DirtyWorktree];
+        let request = cli_review_request(true, &targets, &[], &[]);
         assert!(request.is_err());
     }
 

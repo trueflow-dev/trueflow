@@ -1,11 +1,23 @@
 use crate::commands::review::{ReviewRequest, ReviewTarget, RevisionRangeSpec, RevisionSpec};
+use crate::repo_path::RepoPath;
 use crate::vcs::CommitInfo;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeOption {
     pub label: String,
     pub scope: ReviewScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliSemanticReviewScope {
+    All,
+    DirtyWorktree,
+    MainDiff,
+    File(RepoPath),
+    Revision(RevisionSpec),
+    RevisionRange(RevisionRangeSpec),
+    MultiTarget(Vec<ReviewTarget>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +55,76 @@ pub enum ReviewDiffSelection {
 pub enum ReviewContentSelection {
     EntireReview,
     DiffOnly(ReviewDiffSelection),
+}
+
+impl CliSemanticReviewScope {
+    pub fn from_cli(all: bool, targets: &[ReviewTarget]) -> Result<Self> {
+        if all {
+            if !targets.is_empty() {
+                return Err(anyhow!(
+                    "Explicit review targets cannot be combined with --all"
+                ));
+            }
+            return Ok(Self::All);
+        }
+
+        Ok(match targets {
+            [] => Self::DirtyWorktree,
+            [ReviewTarget::DirtyWorktree] => Self::DirtyWorktree,
+            [ReviewTarget::MainDiff] => Self::MainDiff,
+            [ReviewTarget::File(path)] => Self::File(path.clone()),
+            [ReviewTarget::Revision(revision)] => Self::Revision(revision.clone()),
+            [ReviewTarget::RevisionRange(range)] => Self::RevisionRange(range.clone()),
+            _ => Self::MultiTarget(targets.to_vec()),
+        })
+    }
+
+    pub fn review_request(&self) -> ReviewRequest {
+        match self {
+            Self::All => ReviewRequest::AllFiles,
+            Self::DirtyWorktree => ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree]),
+            Self::MainDiff => ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
+            Self::File(path) => ReviewRequest::Targets(vec![ReviewTarget::File(path.clone())]),
+            Self::Revision(revision) => {
+                ReviewRequest::Targets(vec![ReviewTarget::Revision(revision.clone())])
+            }
+            Self::RevisionRange(range) => {
+                ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(range.clone())])
+            }
+            Self::MultiTarget(targets) => ReviewRequest::Targets(targets.clone()),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::All => "all files (CLI)".to_string(),
+            Self::DirtyWorktree => "dirty worktree".to_string(),
+            Self::MainDiff => "diff vs main".to_string(),
+            Self::File(path) => format!("file {path}"),
+            Self::Revision(revision) => format!("revision {revision}"),
+            Self::RevisionRange(range) => {
+                format!("revisions {}..{}", range.start, range.end)
+            }
+            Self::MultiTarget(targets) => format!("{} targets", targets.len()),
+        }
+    }
+
+    pub fn tui_scope(&self) -> ReviewScope {
+        match self {
+            Self::All => ReviewScope::All,
+            Self::Revision(revision) => ReviewScope::Commit {
+                id: revision.as_str().to_string(),
+                summary: String::new(),
+            },
+            Self::RevisionRange(range) => ReviewScope::RevisionRange {
+                start: range.start.as_str().to_string(),
+                end: range.end.as_str().to_string(),
+            },
+            Self::DirtyWorktree | Self::MainDiff | Self::File(_) | Self::MultiTarget(_) => {
+                ReviewScope::MainDiff
+            }
+        }
+    }
 }
 
 impl ReviewScope {
@@ -206,6 +288,82 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_semantic_review_scope_defaults_to_dirty_worktree() {
+        let scope = CliSemanticReviewScope::from_cli(false, &[])
+            .unwrap_or_else(|error| panic!("expected default cli scope: {error}"));
+        assert_eq!(scope, CliSemanticReviewScope::DirtyWorktree);
+        assert_eq!(
+            scope.review_request(),
+            ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree])
+        );
+        assert_eq!(scope.label(), "dirty worktree");
+        assert_eq!(scope.tui_scope(), ReviewScope::MainDiff);
+    }
+
+    #[test]
+    fn cli_semantic_review_scope_preserves_single_file_target() {
+        let scope = CliSemanticReviewScope::from_cli(
+            false,
+            &[ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap())],
+        )
+        .unwrap_or_else(|error| panic!("expected file cli scope: {error}"));
+        assert_eq!(
+            scope,
+            CliSemanticReviewScope::File(RepoPath::new("src/lib.rs").unwrap())
+        );
+        assert_eq!(scope.label(), "file src/lib.rs");
+        assert_eq!(scope.tui_scope(), ReviewScope::MainDiff);
+    }
+
+    #[test]
+    fn cli_semantic_review_scope_preserves_revision_range_target() {
+        let scope = CliSemanticReviewScope::from_cli(
+            false,
+            &[ReviewTarget::RevisionRange(
+                RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("expected revision range cli scope: {error}"));
+        assert_eq!(
+            scope,
+            CliSemanticReviewScope::RevisionRange(
+                RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+            )
+        );
+        assert_eq!(scope.label(), "revisions abc1234..def5678");
+        assert_eq!(
+            scope.tui_scope(),
+            ReviewScope::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn cli_semantic_review_scope_tracks_multiple_targets_without_downgrading_request() {
+        let targets = vec![
+            ReviewTarget::MainDiff,
+            ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
+        ];
+        let scope = CliSemanticReviewScope::from_cli(false, &targets)
+            .unwrap_or_else(|error| panic!("expected multi-target cli scope: {error}"));
+        assert_eq!(scope, CliSemanticReviewScope::MultiTarget(targets.clone()));
+        assert_eq!(scope.review_request(), ReviewRequest::Targets(targets));
+        assert_eq!(scope.label(), "2 targets");
+    }
+
+    #[test]
+    fn cli_semantic_review_scope_rejects_all_with_explicit_targets() {
+        let error = CliSemanticReviewScope::from_cli(true, &[ReviewTarget::MainDiff]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Explicit review targets cannot be combined with --all")
+        );
+    }
 
     #[test]
     fn all_scope_uses_entire_review_content_and_main_diff_selection() {
