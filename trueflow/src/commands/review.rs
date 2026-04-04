@@ -604,6 +604,20 @@ pub fn collect_main_diff_summary() -> Result<ReviewSummary> {
     collect_review_summary(&query)
 }
 
+pub(crate) fn run_request(
+    json: bool,
+    request: ReviewRequest,
+    only: &[BlockKind],
+    exclude: &[BlockKind],
+) -> Result<()> {
+    let config = load_config()?;
+    let filters = config.review.resolve_filters(only, exclude);
+    let scan_options = config.scan.resolve_options()?;
+    let query = resolve_review_request(request, filters, scan_options)?;
+    let summary = collect_review_summary(&query)?;
+    print_review_summary(summary, json)
+}
+
 pub fn print_review_summary(summary: ReviewSummary, json: bool) -> Result<()> {
     for diagnostic in &summary.diagnostics {
         eprintln!("warning: {}", diagnostic.display_message());
@@ -649,13 +663,8 @@ pub fn run(
     info!(
         "review start (json={json}, all={all}, target={target:?}, only={only:?}, exclude={exclude:?})"
     );
-    let config = load_config()?;
-    let filters = config.review.resolve_filters(only, exclude);
-    let scan_options = config.scan.resolve_options()?;
     let request = parse_review_request(all, target)?;
-    let query = resolve_review_request(request, filters, scan_options)?;
-    let summary = collect_review_summary(&query)?;
-    print_review_summary(summary, json)
+    run_request(json, request, only, exclude)
 }
 
 fn get_dirty_files() -> Result<HashSet<RepoPath>> {

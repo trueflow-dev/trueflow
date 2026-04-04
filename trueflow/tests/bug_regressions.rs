@@ -103,7 +103,7 @@ fn test_optimizer_small_file_collapses_mixed_semantic_blocks_e2e() -> Result<()>
 }
 
 #[test]
-fn test_diff_reports_updated_block_content() -> Result<()> {
+fn test_diff_blocks_match_post_hunk_file_content() -> Result<()> {
     // GIVEN: a change that replaces a line in the working tree
     let repo = TestRepo::new("diff_new_content")?;
     let initial = include_str!("fixtures/diff_new_content_initial.rs");
@@ -118,23 +118,15 @@ fn test_diff_reports_updated_block_content() -> Result<()> {
 
     // WHEN: we compute semantic diff JSON
     let output = repo.run(&["diff", "--json"])?;
-    let files: Value = serde_json::from_str(&output)?;
-    let file = files
-        .as_array()
-        .context("Expected array")?
-        .first()
-        .context("Expected file")?;
-    let block = file["blocks"]
-        .as_array()
-        .context("Expected blocks array")?
-        .first()
-        .context("Expected block")?;
-    let block_content = block["content"].as_str().context("content")?;
+    let blocks = first_file_blocks(&output)?;
 
-    // THEN: the semantic block content reflects the post-hunk file content
-    assert!(block_content.contains("Trueflow"));
+    // THEN: semantic block content reflects the post-hunk file content
     let file_content = fs::read_to_string(repo.path.join("src/main.rs"))?;
-    assert!(file_content.contains(block_content.trim()));
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0]["content"].as_str().context("content")?,
+        file_content.trim_end_matches('\n')
+    );
     Ok(())
 }
 
@@ -1250,10 +1242,8 @@ fn test_diff_uses_merge_base() -> Result<()> {
     repo.git(&["checkout", "feature/one"])?;
 
     let output = repo.run(&["diff", "--json"])?;
-    let changes: Value = serde_json::from_str(&output)?;
+    let changes = json_array(&output)?;
     let files: Vec<&str> = changes
-        .as_array()
-        .context("Expected array")?
         .iter()
         .filter_map(|entry| entry["path"].as_str())
         .collect();

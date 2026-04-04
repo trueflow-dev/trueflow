@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Show unreviewed blocks (semantic diff view)
+    /// Compatibility alias for review scoped to diff vs main
     Diff {
         /// Output format (default is text, use --json for machine parsing)
         #[arg(long)]

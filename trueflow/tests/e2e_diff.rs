@@ -25,7 +25,7 @@ fn checkout_branch(repo: &TestRepo, branch: &str) -> Result<()> {
 }
 
 #[test]
-fn test_diff_reports_unreviewed_blocks_for_main_diff() -> Result<()> {
+fn test_diff_json_uses_semantic_review_shape() -> Result<()> {
     let repo = TestRepo::new("initial_state")?;
     repo.write("src/main.rs", "fn main() { println!(\"Hello\"); }")?;
     repo.commit_all("Initial commit")?;
@@ -39,16 +39,20 @@ fn test_diff_reports_unreviewed_blocks_for_main_diff() -> Result<()> {
 
     let file = &files[0];
     assert_eq!(file["path"].as_str().context("path")?, "src/main.rs");
+    assert!(file.get("language").is_some(), "expected language field");
+    assert!(file.get("fingerprint").is_none());
+    assert!(file.get("status").is_none());
+    assert!(file.get("diff_content").is_none());
+
     let blocks = file["blocks"].as_array().context("blocks")?;
-    assert!(
-        !blocks.is_empty(),
-        "expected changed block in semantic diff"
-    );
+    assert!(!blocks.is_empty(), "expected changed semantic blocks");
     assert!(blocks.iter().any(|block| {
         block["content"]
             .as_str()
             .is_some_and(|content| content.contains("Hello World"))
     }));
+    assert!(blocks.iter().all(|block| block["hash"].as_str().is_some()));
+    assert!(blocks.iter().all(|block| block["kind"].as_str().is_some()));
 
     Ok(())
 }
@@ -104,7 +108,6 @@ fn test_check_command_gates_semantic_main_diff_blocks() -> Result<()> {
     repo.commit_all("Initial")?;
 
     checkout_branch(&repo, "feature/check")?;
-
     repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
@@ -179,7 +182,6 @@ fn test_diff_ignores_non_review_checks() -> Result<()> {
     repo.commit_all("Initial")?;
 
     checkout_branch(&repo, "feature/security")?;
-
     repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
