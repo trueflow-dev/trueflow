@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "fs_support.rs"]
+mod fs_support;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -8,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use trueflow::store::{Record, ReviewTargetRef};
 use uuid::Uuid;
+
+pub use fs_support::copy_dir_all;
 
 pub struct TestRepo {
     pub path: PathBuf,
@@ -35,18 +40,7 @@ impl TestRepo {
             fs::create_dir_all(&src)?;
         }
 
-        fs::create_dir_all(&path)?;
-
-        // Copy contents
-        let status = Command::new("cp")
-            .arg("-R")
-            .arg(format!("{}/.", src.display()))
-            .arg(&path)
-            .status()?;
-
-        if !status.success() {
-            anyhow::bail!("Failed to copy fixture");
-        }
+        copy_dir_all(&src, &path)?;
 
         init_git(&path)?;
         Ok(Self { path })

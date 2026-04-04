@@ -5,6 +5,9 @@ use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use uuid::Uuid;
 
+#[path = "fs_support.rs"]
+mod fs_support;
+
 use trueflow::commands::review::{
     ReviewRequest, ReviewSummary, collect_review_summary, resolve_review_request,
 };
@@ -27,7 +30,7 @@ impl ReviewBenchRepo {
         }
 
         let path = temp_dir("trueflow_review_bench", name);
-        copy_dir_all(&src, &path)?;
+        fs_support::copy_dir_all(&src, &path)?;
         init_git(&path)?;
 
         Ok(Self { path })
@@ -102,31 +105,5 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(())
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .with_context(|| format!("failed to create fixture dir {}", dst.display()))?;
-
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("failed to read fixture dir {}", src.display()))?
-    {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let target = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &target).with_context(|| {
-                format!(
-                    "failed to copy fixture file {} -> {}",
-                    entry.path().display(),
-                    target.display()
-                )
-            })?;
-        }
-    }
-
     Ok(())
 }
