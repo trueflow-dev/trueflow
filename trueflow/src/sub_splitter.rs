@@ -8,7 +8,64 @@ use tracing::info;
 use tree_sitter::Parser;
 use tree_sitter_md;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubSplitSemantics {
+    /// The returned blocks are the direct review units for the parent block.
+    ReviewUnits,
+    /// The returned blocks are semantic children that may themselves be split further.
+    StructuralChildren,
+}
+
+impl SubSplitSemantics {
+    pub fn supports_review_unit_invariant(self) -> bool {
+        matches!(self, Self::ReviewUnits)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubSplitResult {
+    pub blocks: Vec<Block>,
+    pub semantics: SubSplitSemantics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitPlan {
+    IdentityReviewUnit,
+    MarkdownChildren,
+    MarkdownReviewUnits,
+    SentenceReviewUnits,
+    CodeReviewUnits,
+    RustFunctionReviewUnits,
+    RustImplReviewUnits,
+    SwiftFunctionReviewUnits,
+    SwiftTypeReviewUnits,
+    PythonFunctionReviewUnits,
+    JsFunctionReviewUnits,
+}
+
+impl SplitPlan {
+    fn semantics(self) -> SubSplitSemantics {
+        match self {
+            Self::MarkdownChildren => SubSplitSemantics::StructuralChildren,
+            Self::IdentityReviewUnit
+            | Self::MarkdownReviewUnits
+            | Self::SentenceReviewUnits
+            | Self::CodeReviewUnits
+            | Self::RustFunctionReviewUnits
+            | Self::RustImplReviewUnits
+            | Self::SwiftFunctionReviewUnits
+            | Self::SwiftTypeReviewUnits
+            | Self::PythonFunctionReviewUnits
+            | Self::JsFunctionReviewUnits => SubSplitSemantics::ReviewUnits,
+        }
+    }
+}
+
 pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
+    split_result(block, lang).map(|result| result.blocks)
+}
+
+pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
     info!(
         "sub_splitter start (lang={:?}, kind={}, bytes={}, hash={})",
         lang,
@@ -17,22 +74,62 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
         block.hash
     );
 
-    let blocks = match lang {
-        Language::Markdown => split_markdown(block)?,
-        Language::Text => split_sentences(block)?,
-        Language::Toml | Language::Nix | Language::Just => split_code(block)?,
-        Language::Rust if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
-            split_rust_function(block)?
+    let plan = determine_split_plan(block.kind, lang);
+    let blocks = match plan {
+        SplitPlan::IdentityReviewUnit => vec![block.clone()],
+        SplitPlan::MarkdownChildren => split_markdown_tree(block)?,
+        SplitPlan::MarkdownReviewUnits => split_markdown_sentences(block)?,
+        SplitPlan::SentenceReviewUnits => split_sentences(block)?,
+        SplitPlan::CodeReviewUnits => split_code(block)?,
+        SplitPlan::RustFunctionReviewUnits => split_rust_function(block)?,
+        SplitPlan::RustImplReviewUnits => split_rust_impl(block)?,
+        SplitPlan::SwiftFunctionReviewUnits => split_swift_function(block)?,
+        SplitPlan::SwiftTypeReviewUnits => split_swift_type(block)?,
+        SplitPlan::PythonFunctionReviewUnits => split_python_function(block)?,
+        SplitPlan::JsFunctionReviewUnits => split_js_function(block, lang)?,
+    };
+
+    let result = SubSplitResult {
+        blocks,
+        semantics: plan.semantics(),
+    };
+
+    info!(
+        "sub_splitter done (blocks={}, semantics={:?})",
+        result.blocks.len(),
+        result.semantics
+    );
+    Ok(result)
+}
+
+fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
+    match lang {
+        Language::Markdown if matches!(kind, BlockKind::Paragraph | BlockKind::ListItem) => {
+            SplitPlan::MarkdownReviewUnits
         }
-        Language::Rust if matches!(block.kind, BlockKind::Impl | BlockKind::Interface) => {
-            split_rust_impl(block)?
+        Language::Markdown
+            if matches!(
+                kind,
+                BlockKind::Header | BlockKind::CodeBlock | BlockKind::Quote | BlockKind::Element
+            ) =>
+        {
+            SplitPlan::IdentityReviewUnit
         }
-        Language::Swift if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
-            split_swift_function(block)?
+        Language::Markdown => SplitPlan::MarkdownChildren,
+        Language::Text => SplitPlan::SentenceReviewUnits,
+        Language::Toml | Language::Nix | Language::Just => SplitPlan::CodeReviewUnits,
+        Language::Rust if matches!(kind, BlockKind::Function | BlockKind::Method) => {
+            SplitPlan::RustFunctionReviewUnits
+        }
+        Language::Rust if matches!(kind, BlockKind::Impl | BlockKind::Interface) => {
+            SplitPlan::RustImplReviewUnits
+        }
+        Language::Swift if matches!(kind, BlockKind::Function | BlockKind::Method) => {
+            SplitPlan::SwiftFunctionReviewUnits
         }
         Language::Swift
             if matches!(
-                block.kind,
+                kind,
                 BlockKind::Impl
                     | BlockKind::Interface
                     | BlockKind::Class
@@ -40,24 +137,21 @@ pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
                     | BlockKind::Enum
             ) =>
         {
-            split_swift_type(block)?
+            SplitPlan::SwiftTypeReviewUnits
         }
-        Language::Python if matches!(block.kind, BlockKind::Function | BlockKind::Method) => {
-            split_python_function(block)?
+        Language::Python if matches!(kind, BlockKind::Function | BlockKind::Method) => {
+            SplitPlan::PythonFunctionReviewUnits
         }
         Language::JavaScript | Language::TypeScript
             if matches!(
-                block.kind,
+                kind,
                 BlockKind::Function | BlockKind::Method | BlockKind::Export
             ) =>
         {
-            split_js_function(block, lang)?
+            SplitPlan::JsFunctionReviewUnits
         }
-        _ => split_code(block)?, // Default for Rust, Python, etc.
-    };
-
-    info!("sub_splitter done (blocks={})", blocks.len());
-    Ok(blocks)
+        _ => SplitPlan::CodeReviewUnits,
+    }
 }
 
 fn split_code(block: &Block) -> Result<Vec<Block>> {
@@ -184,13 +278,6 @@ fn split_markdown_sentences(block: &Block) -> Result<Vec<Block>> {
     }
 
     Ok(blocks)
-}
-
-fn split_markdown(block: &Block) -> Result<Vec<Block>> {
-    match block.kind {
-        BlockKind::Paragraph | BlockKind::ListItem => split_markdown_sentences(block),
-        _ => split_markdown_tree(block),
-    }
 }
 
 fn split_sentences(block: &Block) -> Result<Vec<Block>> {

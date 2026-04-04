@@ -5,7 +5,7 @@ use trueflow::analysis::Language;
 use trueflow::block::BlockKind;
 use trueflow::block_splitter;
 use trueflow::finder::fuzzy_find_block;
-use trueflow::sub_splitter;
+use trueflow::sub_splitter::{self, SubSplitSemantics};
 
 fn assert_subblock_kinds(
     path: &Path,
@@ -101,6 +101,25 @@ fn test_swift_function_subblock_types() -> Result<()> {
 }
 
 #[test]
+fn test_function_subblocks_are_review_units() -> Result<()> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let file_path = repo_root.join("example_repos/complex_blocks/src/lib.rs");
+    let block = fuzzy_find_block(&file_path, "process_data")?;
+
+    let result = sub_splitter::split_result(&block, Language::Rust)?;
+
+    assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
+    assert!(
+        result
+            .blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::FunctionSignature)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_markdown_subblocks_and_sentences() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks_md/README.md");
@@ -112,7 +131,13 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
         .find(|block| block.kind == BlockKind::Section)
         .unwrap();
 
-    let sub_blocks = sub_splitter::split(section, Language::Markdown)?;
+    let section_result = sub_splitter::split_result(section, Language::Markdown)?;
+    assert_eq!(
+        section_result.semantics,
+        SubSplitSemantics::StructuralChildren
+    );
+
+    let sub_blocks = section_result.blocks;
     let kinds: Vec<BlockKind> = sub_blocks
         .iter()
         .filter(|sub| sub.kind != BlockKind::Gap)
@@ -135,7 +160,10 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
         .iter()
         .find(|block| block.kind == BlockKind::Paragraph)
         .unwrap();
-    let sentence_blocks = sub_splitter::split(paragraph, Language::Markdown)?;
+    let sentence_result = sub_splitter::split_result(paragraph, Language::Markdown)?;
+    assert_eq!(sentence_result.semantics, SubSplitSemantics::ReviewUnits);
+
+    let sentence_blocks = sentence_result.blocks;
     let sentence_kinds: Vec<BlockKind> = sentence_blocks
         .iter()
         .filter(|sub| sub.kind != BlockKind::Gap)

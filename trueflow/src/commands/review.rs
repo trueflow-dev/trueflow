@@ -409,24 +409,16 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                     workdir_prefix.as_deref(),
                 )
                 .is_none()
-                && let Ok(sub_blocks) = sub_splitter::split(&block, language)
-                && !sub_blocks.is_empty()
+                && is_subblock_covered(
+                    &block,
+                    language,
+                    query,
+                    &review_index,
+                    &file.path,
+                    workdir_prefix.as_deref(),
+                )
             {
-                let all_approved = sub_blocks.iter().all(|sb| {
-                    if !query.filters.allows_subblock(sb.kind) {
-                        return true;
-                    }
-                    review_index.is_block_approved(
-                        &sb.hash,
-                        &file.path,
-                        sb.start_line,
-                        workdir_prefix.as_deref(),
-                    )
-                });
-
-                if all_approved {
-                    continue;
-                }
+                continue;
             }
 
             if let Some(node_id) = node_id {
@@ -661,6 +653,54 @@ fn kind_rank(block: &Block) -> u8 {
         return 10;
     }
     block.kind.default_review_priority()
+}
+
+fn is_subblock_covered(
+    block: &Block,
+    language: Language,
+    query: &ResolvedReviewQuery,
+    review_index: &crate::store::ReviewIndex,
+    file_path: &RepoPath,
+    workdir_prefix: Option<&str>,
+) -> bool {
+    if !query.filters.allows_subblock(block.kind) {
+        return true;
+    }
+
+    if review_index.is_block_approved(&block.hash, file_path, block.start_line, workdir_prefix) {
+        return true;
+    }
+
+    let Ok(sub_split) = sub_splitter::split_result(block, language) else {
+        return false;
+    };
+    if sub_split.blocks.is_empty() {
+        return false;
+    }
+
+    match sub_split.semantics {
+        sub_splitter::SubSplitSemantics::ReviewUnits => sub_split.blocks.iter().all(|sub_block| {
+            !query.filters.allows_subblock(sub_block.kind)
+                || review_index.is_block_approved(
+                    &sub_block.hash,
+                    file_path,
+                    sub_block.start_line,
+                    workdir_prefix,
+                )
+        }),
+        sub_splitter::SubSplitSemantics::StructuralChildren => {
+            sub_split.blocks.iter().all(|sub_block| {
+                is_subblock_covered(
+                    sub_block,
+                    language,
+                    query,
+                    review_index,
+                    file_path,
+                    workdir_prefix,
+                )
+            })
+        }
+    }
 }
 
 #[cfg(test)]
