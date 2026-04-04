@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::process::Command;
 
 mod common;
 use common::*;
-use trueflow::store::BlockState;
+use trueflow::store::{BlockState, ReviewTargetRef};
 
 #[test]
 fn test_mark_uncommitted_state() -> Result<()> {
@@ -96,6 +96,48 @@ fn test_mark_unknown_state_no_path() -> Result<()> {
     assert_eq!(records.len(), 1);
 
     assert_eq!(records[0].block_state, BlockState::Unknown);
+
+    Ok(())
+}
+
+#[test]
+fn test_mark_diff_fingerprint_records_block_target() -> Result<()> {
+    let repo = TestRepo::new("mark_diff_fingerprint_block_target")?;
+    repo.write("src/lib.rs", "pub fn value() -> i32 { 1 }\n")?;
+    repo.commit_all("Initial")?;
+    repo.git(&["checkout", "-B", "main"])?;
+    repo.git(&["checkout", "-b", "feature/diff-fingerprint"])?;
+
+    repo.write("src/lib.rs", "pub fn value() -> i32 { 2 }\n")?;
+    repo.commit_all("Change value")?;
+
+    let diff_output = repo.run(&["diff", "--json"])?;
+    let changes = json_array(&diff_output)?;
+    let fingerprint = changes[0]["fingerprint"]
+        .as_str()
+        .context("diff fingerprint")?
+        .to_string();
+
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &fingerprint,
+        "--verdict",
+        "approved",
+        "--quiet",
+    ])?;
+
+    let db_path = repo.path.join(".trueflow").join("reviews.jsonl");
+    let records = read_review_records(&db_path)?;
+    assert_eq!(records.len(), 1);
+    match &records[0].target {
+        ReviewTargetRef::Block { hash } => assert_eq!(hash.as_str(), fingerprint),
+        other => panic!("expected block target, got {other:?}"),
+    }
+
+    let changes_after = json_array(&repo.run(&["diff", "--json"])?)?;
+    assert_eq!(changes_after.len(), 1);
+    assert_eq!(changes_after[0]["status"].as_str(), Some("unreviewed"));
 
     Ok(())
 }
