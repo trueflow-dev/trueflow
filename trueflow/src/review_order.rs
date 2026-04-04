@@ -198,7 +198,8 @@ fn is_test_path(path: &RepoPath) -> bool {
     let path = Path::new(path.as_str());
     if path
         .components()
-        .any(|component| component.as_os_str() == "tests")
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|component| component.eq_ignore_ascii_case("tests"))
     {
         return true;
     }
@@ -206,15 +207,16 @@ fn is_test_path(path: &RepoPath) -> bool {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
+    let lower = file_name.to_ascii_lowercase();
 
-    file_name.starts_with("test_")
-        || file_name.ends_with("_test.rs")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with("_test.js")
-        || file_name.ends_with("_test.ts")
-        || file_name.ends_with("_test.swift")
-        || file_name.ends_with("Tests.swift")
-        || file_name.ends_with("Test.swift")
+    lower.starts_with("test_")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.js")
+        || lower.ends_with("_test.ts")
+        || lower.ends_with("_test.swift")
+        || lower.ends_with("tests.swift")
+        || lower.ends_with("test.swift")
 }
 
 #[cfg(test)]
@@ -390,6 +392,57 @@ mod tests {
             order.ordered_ids(),
             vec![test_block_id, source_block_id, manifest_block_id]
         );
+    }
+
+    #[test]
+    fn review_order_treats_swiftpm_tests_directory_as_test_even_without_suffix() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+
+        let sources = builder.add_dir(root, "Sources".to_string(), "Sources".to_string());
+        let app = builder.add_dir(sources, "App".to_string(), "Sources/App".to_string());
+        let tests = builder.add_dir(root, "Tests".to_string(), "Tests".to_string());
+        let support = builder.add_dir(
+            tests,
+            "Support".to_string(),
+            "Tests/Support".to_string(),
+        );
+
+        let source_file = builder.add_file(
+            app,
+            "Core.swift".to_string(),
+            "Sources/App/Core.swift".to_string(),
+            "file-source".to_string(),
+            Language::Swift,
+        );
+        let helper_file = builder.add_file(
+            support,
+            "Fixtures.swift".to_string(),
+            "Tests/Support/Fixtures.swift".to_string(),
+            "file-helper".to_string(),
+            Language::Swift,
+        );
+
+        let source_block_id = builder.add_block(
+            source_file,
+            "source".to_string(),
+            "Sources/App/Core.swift".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Swift,
+        );
+        let helper_block_id = builder.add_block(
+            helper_file,
+            "helper".to_string(),
+            "Tests/Support/Fixtures.swift".to_string(),
+            test_block(BlockKind::Const, 1, &[]),
+            Language::Swift,
+        );
+
+        let tree = builder.finalize();
+        let unreviewed = HashSet::from([source_block_id, helper_block_id]);
+        let order = ReviewOrder::from_tree(&tree, &unreviewed);
+
+        assert_eq!(order.ordered_ids(), vec![helper_block_id, source_block_id]);
     }
 
     #[test]
