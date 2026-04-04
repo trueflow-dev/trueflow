@@ -1,4 +1,4 @@
-use crate::block::{Block, BlockKind};
+use crate::block::Block;
 use crate::config::BlockFilters;
 
 pub fn should_skip_imports_by_default(path: &str, block: &Block, filters: &BlockFilters) -> bool {
@@ -8,9 +8,12 @@ pub fn should_skip_imports_by_default(path: &str, block: &Block, filters: &Block
     false
 }
 
-pub fn should_skip_impl_by_default(block: &Block, filters: &BlockFilters) -> bool {
-    matches!(block.kind, BlockKind::Impl | BlockKind::Interface)
-        && !filters.only_contains(block.kind)
+pub fn should_skip_container_by_default(
+    is_container: bool,
+    block: &Block,
+    filters: &BlockFilters,
+) -> bool {
+    is_container && !filters.only_contains(block.kind)
 }
 
 fn is_lib_rs(path: &str) -> bool {

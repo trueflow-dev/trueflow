@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, FileState};
+use crate::block::{Block, FileState};
 use crate::hashing::{TreeHash, hash_str};
 use crate::repo_path::RepoPath;
 use crate::store::ApprovedTargets;
@@ -147,6 +147,17 @@ impl Tree {
     #[allow(dead_code)]
     pub fn file_paths(&self) -> impl Iterator<Item = &RepoPath> {
         self.file_paths.iter()
+    }
+
+    pub fn block_has_child_blocks(&self, id: TreeNodeId) -> bool {
+        self.node(id)
+            .children
+            .iter()
+            .any(|child| matches!(self.node(*child).kind, TreeNodeKind::Block))
+    }
+
+    pub fn is_container_block(&self, id: TreeNodeId) -> bool {
+        matches!(self.node(id).kind, TreeNodeKind::Block) && self.block_has_child_blocks(id)
     }
 
     pub fn is_node_covered(
@@ -462,15 +473,15 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                     file.tree_hash.clone(),
                     file.language,
                 );
-                let mut impl_stack: Vec<(TreeNodeId, usize, usize)> = Vec::new();
+                let mut container_stack: Vec<(TreeNodeId, usize, usize)> = Vec::new();
                 for block in file.blocks.clone() {
-                    while let Some((_, _, end_line)) = impl_stack.last()
+                    while let Some((_, _, end_line)) = container_stack.last()
                         && block.start_line > *end_line
                     {
-                        impl_stack.pop();
+                        container_stack.pop();
                     }
 
-                    let parent = impl_stack
+                    let parent = container_stack
                         .iter()
                         .rev()
                         .find(|(_, start, end)| {
@@ -486,8 +497,8 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                     let node_id =
                         builder.add_block(parent, name, next_path.clone(), block, file.language);
 
-                    if matches!(kind, BlockKind::Impl | BlockKind::Interface) {
-                        impl_stack.push((node_id, start_line, end_line));
+                    if kind.can_contain_review_children() {
+                        container_stack.push((node_id, start_line, end_line));
                     }
                 }
             } else {
@@ -512,6 +523,7 @@ pub fn build_tree_from_path(root: &str) -> anyhow::Result<Tree> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockKind;
     use crate::hashing::BytesHash;
 
     #[test]
@@ -535,6 +547,43 @@ mod tests {
         assert!(first_id.is_some());
         assert!(second_id.is_some());
         assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn build_tree_nests_swift_type_members_under_container_block() {
+        let container = Block::new(
+            "struct Worker {\n    func start() {}\n\n    func stop() {}\n}\n".to_string(),
+            BlockKind::Struct,
+            0,
+            5,
+        );
+        let first_method = Block::new("func start() {}\n".to_string(), BlockKind::Method, 1, 2);
+        let second_method = Block::new("func stop() {}\n".to_string(), BlockKind::Method, 3, 4);
+
+        let files = vec![FileState::new(
+            RepoPath::new("Sources/App/Core.swift").unwrap(),
+            Language::Swift,
+            BytesHash::new("bytes-hash"),
+            vec![
+                container.clone(),
+                first_method.clone(),
+                second_method.clone(),
+            ],
+        )];
+
+        let tree = build_tree_from_files(&files);
+        let container_id = tree
+            .find_block_node("Sources/App/Core.swift", &container)
+            .expect("expected Swift container block");
+        let first_method_id = tree
+            .find_block_node("Sources/App/Core.swift", &first_method)
+            .expect("expected first Swift member block");
+        let second_method_id = tree
+            .find_block_node("Sources/App/Core.swift", &second_method)
+            .expect("expected second Swift member block");
+
+        assert_eq!(tree.parent(first_method_id), Some(container_id));
+        assert_eq!(tree.parent(second_method_id), Some(container_id));
     }
 
     #[test]

@@ -91,6 +91,17 @@ impl BlockKind {
         )
     }
 
+    pub fn can_contain_review_children(self) -> bool {
+        matches!(
+            self,
+            BlockKind::Impl
+                | BlockKind::Interface
+                | BlockKind::Class
+                | BlockKind::Struct
+                | BlockKind::Enum
+        )
+    }
+
     pub fn default_review_priority(self) -> u8 {
         if self.is_import_like() {
             return 70;

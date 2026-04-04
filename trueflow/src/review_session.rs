@@ -1,4 +1,3 @@
-use crate::block::BlockKind;
 use crate::review_order::ReviewOrder;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use std::collections::HashSet;
@@ -11,7 +10,7 @@ pub fn action_block_ids(
     let node = tree.node(node_id);
     match node.kind {
         TreeNodeKind::Block => {
-            if is_impl_or_interface_block(tree, node_id) {
+            if tree.is_container_block(node_id) {
                 block_ids_in_visible_subtree(tree, visible_nodes, node_id)
             } else {
                 vec![node_id]
@@ -31,7 +30,7 @@ pub fn next_review_target(
     let node = tree.node(node_id);
     match node.kind {
         TreeNodeKind::Block => {
-            if is_impl_or_interface_block(tree, node_id) {
+            if tree.is_container_block(node_id) {
                 let subtree_blocks = block_ids_in_visible_subtree(tree, visible_nodes, node_id)
                     .into_iter()
                     .collect::<HashSet<_>>();
@@ -88,13 +87,6 @@ fn block_ids_in_visible_subtree(
         }
     }
     blocks
-}
-
-fn is_impl_or_interface_block(tree: &Tree, node_id: TreeNodeId) -> bool {
-    tree.node(node_id)
-        .block
-        .as_ref()
-        .is_some_and(|block| matches!(block.kind, BlockKind::Impl | BlockKind::Interface))
 }
 
 #[cfg(test)]
@@ -185,6 +177,49 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>();
         let expected = HashSet::from([impl_block, method_a, method_b]);
+        assert_eq!(selected, expected);
+    }
+
+    #[test]
+    fn action_block_ids_for_class_container_includes_descendants() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.swift".to_string(),
+            "src/lib.swift".to_string(),
+            "file-hash".to_string(),
+            Language::Swift,
+        );
+        let class_block = builder.add_block(
+            file,
+            "class".to_string(),
+            "src/lib.swift".to_string(),
+            test_block(BlockKind::Class, 1, 50),
+            Language::Swift,
+        );
+        let method_a = builder.add_block(
+            class_block,
+            "method_a".to_string(),
+            "src/lib.swift".to_string(),
+            test_block(BlockKind::Method, 3, 10),
+            Language::Swift,
+        );
+        let method_b = builder.add_block(
+            class_block,
+            "method_b".to_string(),
+            "src/lib.swift".to_string(),
+            test_block(BlockKind::Method, 20, 28),
+            Language::Swift,
+        );
+        let tree = builder.finalize();
+        let visible = visible_nodes_from_blocks(&tree, &[class_block, method_a, method_b]);
+
+        let selected = action_block_ids(&tree, &visible, class_block)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let expected = HashSet::from([class_block, method_a, method_b]);
         assert_eq!(selected, expected);
     }
 
@@ -305,6 +340,48 @@ mod tests {
         let order = ReviewOrder::from_tree(&tree, &remaining);
 
         let next = next_review_target(&tree, &visible, &order, &remaining, impl_block);
+        assert_eq!(next, Some(tail));
+    }
+
+    #[test]
+    fn next_review_target_for_class_block_skips_class_subtree() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.swift".to_string(),
+            "src/lib.swift".to_string(),
+            "file-hash".to_string(),
+            Language::Swift,
+        );
+        let class_block = builder.add_block(
+            file,
+            "class".to_string(),
+            "src/lib.swift".to_string(),
+            test_block(BlockKind::Class, 1, 80),
+            Language::Swift,
+        );
+        let method = builder.add_block(
+            class_block,
+            "method".to_string(),
+            "src/lib.swift".to_string(),
+            test_block(BlockKind::Method, 3, 9),
+            Language::Swift,
+        );
+        let tail = builder.add_block(
+            file,
+            "tail".to_string(),
+            "src/lib.swift".to_string(),
+            test_block(BlockKind::Function, 100, 110),
+            Language::Swift,
+        );
+        let tree = builder.finalize();
+        let visible = visible_nodes_from_blocks(&tree, &[class_block, method, tail]);
+        let remaining = HashSet::from([class_block, method, tail]);
+        let order = ReviewOrder::from_tree(&tree, &remaining);
+
+        let next = next_review_target(&tree, &visible, &order, &remaining, class_block);
         assert_eq!(next, Some(tail));
     }
 

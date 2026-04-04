@@ -12,7 +12,7 @@ pub fn block_breadcrumb(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
 
     let mut parts = Vec::new();
     let mut file_path = None;
-    let mut impl_parts = Vec::new();
+    let mut container_parts = Vec::new();
     let mut current = None;
 
     for ancestor_id in ancestors {
@@ -31,8 +31,8 @@ pub fn block_breadcrumb(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
                 if label.is_empty() {
                     continue;
                 }
-                if matches!(block.kind, BlockKind::Impl | BlockKind::Interface) {
-                    impl_parts.push(label.clone());
+                if tree.is_container_block(ancestor_id) {
+                    container_parts.push(label.clone());
                 }
                 if ancestor.id == node_id {
                     current = Some(label);
@@ -45,7 +45,7 @@ pub fn block_breadcrumb(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
     if let Some(path) = file_path {
         parts.push(format!("File ({path})"));
     }
-    parts.extend(impl_parts);
+    parts.extend(container_parts);
     if let Some(current) = current
         && parts.last().is_none_or(|part| part != &current)
     {

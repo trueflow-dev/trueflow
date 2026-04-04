@@ -155,6 +155,30 @@ fn test_mark_flow() -> Result<()> {
 }
 
 #[test]
+fn test_review_skips_non_trivial_swift_type_container_by_default() -> Result<()> {
+    let repo = TestRepo::new("swift_type_container")?;
+    repo.write(
+        "Sources/App/Core.swift",
+        "struct Worker {\n    func start() {}\n\n    func stop() {}\n}\n",
+    )?;
+    repo.commit_all("Add swift container")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let files = json_array(&output)?;
+    assert_eq!(files.len(), 1, "expected one Swift file");
+
+    let blocks = files[0]["blocks"].as_array().context("blocks")?;
+    let kinds = blocks
+        .iter()
+        .filter_map(|block| block["kind"].as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(kinds, vec!["method", "method"]);
+
+    Ok(())
+}
+
+#[test]
 fn test_feedback_export() -> Result<()> {
     let repo = TestRepo::fixture("empty")?;
 

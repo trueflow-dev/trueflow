@@ -3,7 +3,7 @@ use crate::block::{Block, BlockKind};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::path_utils;
-use crate::policy::{should_skip_impl_by_default, should_skip_imports_by_default};
+use crate::policy::{should_skip_container_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, ReviewTargetRef};
@@ -360,7 +360,12 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             if should_skip_imports_by_default(file.path.as_str(), &block, &query.filters) {
                 continue;
             }
-            if should_skip_impl_by_default(&block, &query.filters) {
+            let node_id = tree.find_block_node(&file.path, &block);
+            if should_skip_container_by_default(
+                node_id.is_some_and(|node_id| tree.is_container_block(node_id)),
+                &block,
+                &query.filters,
+            ) {
                 continue;
             }
             if let Some(hunks) = file_diff_hunks.as_deref()
@@ -369,7 +374,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             {
                 continue;
             }
-            reviewable_blocks.push(block);
+            reviewable_blocks.push((block, node_id));
         }
         total_blocks += reviewable_blocks.len();
 
@@ -380,8 +385,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
 
         let mut unreviewed_blocks = Vec::new();
-        for block in reviewable_blocks {
-            let node_id = tree.find_block_node(&file.path, &block);
+        for (block, node_id) in reviewable_blocks {
             if let Some(node_id) = node_id
                 && tree.is_node_covered(node_id, &approved_targets, workdir_prefix.as_deref())
             {

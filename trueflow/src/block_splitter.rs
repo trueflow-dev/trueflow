@@ -1116,18 +1116,24 @@ fn map_swift_property_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockK
 fn map_swift_member_kind(node: tree_sitter::Node<'_>, content: &str) -> Option<BlockKind> {
     match node.kind() {
         "attribute" | "comment" | "multiline_comment" => None,
-        "class_declaration"
-        | "protocol_declaration"
-        | "function_declaration"
-        | "property_declaration"
-        | "protocol_property_declaration"
+        "class_declaration" => Some(match swift_declaration_keyword(node) {
+            Some("struct") => BlockKind::Struct,
+            Some("enum") => BlockKind::Enum,
+            Some("extension") => BlockKind::Impl,
+            Some("actor" | "class") => BlockKind::Class,
+            _ => BlockKind::Code,
+        }),
+        "protocol_declaration" => Some(BlockKind::Interface),
+        "function_declaration"
         | "init_declaration"
         | "deinit_declaration"
-        | "subscript_declaration"
-        | "protocol_function_declaration"
-        | "typealias_declaration"
-        | "associatedtype_declaration"
-        | "import_declaration" => Some(map_swift_kind(node, content)),
+        | "subscript_declaration" => Some(BlockKind::Method),
+        "protocol_function_declaration" => Some(BlockKind::FunctionSignature),
+        "typealias_declaration" | "associatedtype_declaration" => Some(BlockKind::Type),
+        "property_declaration" | "protocol_property_declaration" => {
+            Some(map_swift_property_kind(node, content))
+        }
+        "import_declaration" => Some(BlockKind::Import),
         _ => None,
     }
 }
