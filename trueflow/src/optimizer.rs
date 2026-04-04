@@ -47,7 +47,7 @@ fn optimize_imports(blocks: Vec<Block>) -> Vec<Block> {
                 if buffer.is_empty() {
                     return Decision::FlushAndEmit;
                 }
-                if line_span(block) > MAX_IMPORT_GAP_LINES {
+                if block.line_span().len() > MAX_IMPORT_GAP_LINES {
                     return Decision::FlushAndEmit;
                 }
                 return Decision::Buffer;
@@ -264,10 +264,6 @@ fn merged_metadata(blocks: &[Block]) -> (Vec<String>, u32) {
     }
 
     (tags, complexity)
-}
-
-fn line_span(block: &Block) -> usize {
-    block.end_line.saturating_sub(block.start_line)
 }
 
 fn should_merge_small_file(blocks: &[Block]) -> bool {

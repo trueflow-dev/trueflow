@@ -295,6 +295,10 @@ impl LineSpan {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.end_line.saturating_sub(self.start_line)
+    }
+
     pub fn overlaps(&self, other: &LineSpan) -> bool {
         self.start_line < other.end_line && self.end_line > other.start_line
     }
@@ -487,6 +491,7 @@ mod tests {
         let touch = LineSpan::new(10, 12);
         let disjoint = LineSpan::new(12, 15);
 
+        assert_eq!(base.len(), 10);
         assert!(base.overlaps(&overlap));
         assert!(!base.overlaps(&touch));
         assert!(!base.overlaps(&disjoint));
