@@ -99,37 +99,6 @@ pub use crate::hashing::TreeHash;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct DiffFingerprint(String);
-
-impl DiffFingerprint {
-    pub fn new(value: impl AsRef<str>) -> Result<Self> {
-        let value = value.as_ref().trim();
-        if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            return Err(anyhow!(
-                "diff fingerprint must be a 64-character hex string: {value}"
-            ));
-        }
-        Ok(Self(value.to_ascii_lowercase()))
-    }
-
-    pub fn from_computed(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for DiffFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
-#[serde(transparent)]
-#[schemars(transparent)]
 pub struct ReviewCheck(String);
 
 impl ReviewCheck {
@@ -163,7 +132,6 @@ pub enum ReviewTargetKind {
     Block,
     File,
     Tree,
-    Diff,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
@@ -173,7 +141,6 @@ pub enum ReviewTargetRef {
     Block { hash: TreeHash },
     File { hash: TreeHash },
     Tree { hash: TreeHash },
-    Diff { fingerprint: DiffFingerprint },
 }
 
 impl ReviewTargetRef {
@@ -182,7 +149,6 @@ impl ReviewTargetRef {
             ReviewTargetRef::Block { hash }
             | ReviewTargetRef::File { hash }
             | ReviewTargetRef::Tree { hash } => hash.as_str(),
-            ReviewTargetRef::Diff { fingerprint } => fingerprint.as_str(),
         }
     }
 }
@@ -198,9 +164,6 @@ impl ReviewTargetKind {
             }),
             ReviewTargetKind::Tree => Ok(ReviewTargetRef::Tree {
                 hash: TreeHash::parse(raw)?,
-            }),
-            ReviewTargetKind::Diff => Ok(ReviewTargetRef::Diff {
-                fingerprint: DiffFingerprint::new(raw)?,
             }),
         }
     }
@@ -366,7 +329,6 @@ pub struct ApprovedTargets {
     exact_block_targets: HashSet<ExactBlockTarget>,
     file_hashes: HashSet<TreeHash>,
     tree_hashes: HashSet<TreeHash>,
-    diff_fingerprints: HashSet<DiffFingerprint>,
 }
 
 impl ApprovedTargets {
@@ -375,7 +337,6 @@ impl ApprovedTargets {
             ReviewTargetRef::Block { hash } => self.block_hashes.contains(hash),
             ReviewTargetRef::File { hash } => self.file_hashes.contains(hash),
             ReviewTargetRef::Tree { hash } => self.tree_hashes.contains(hash),
-            ReviewTargetRef::Diff { fingerprint } => self.diff_fingerprints.contains(fingerprint),
         }
     }
 
@@ -565,9 +526,6 @@ impl ReviewIndex {
                 }
                 ReviewTargetRef::Tree { hash } => {
                     approved.tree_hashes.insert(hash.clone());
-                }
-                ReviewTargetRef::Diff { fingerprint } => {
-                    approved.diff_fingerprints.insert(fingerprint.clone());
                 }
             }
         }
@@ -909,10 +867,11 @@ mod tests {
     }
 
     #[test]
-    fn review_target_kind_parses_typed_hash_and_diff_targets() {
+    fn review_target_kind_parses_typed_hash_targets() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let block = ReviewTargetKind::Block.parse_target(hash).unwrap();
-        let diff = ReviewTargetKind::Diff.parse_target(hash).unwrap();
+        let file = ReviewTargetKind::File.parse_target(hash).unwrap();
+        let tree = ReviewTargetKind::Tree.parse_target(hash).unwrap();
 
         assert_eq!(
             block,
@@ -921,9 +880,15 @@ mod tests {
             }
         );
         assert_eq!(
-            diff,
-            ReviewTargetRef::Diff {
-                fingerprint: DiffFingerprint::new(hash).unwrap(),
+            file,
+            ReviewTargetRef::File {
+                hash: TreeHash::parse(hash).unwrap()
+            }
+        );
+        assert_eq!(
+            tree,
+            ReviewTargetRef::Tree {
+                hash: TreeHash::parse(hash).unwrap()
             }
         );
     }

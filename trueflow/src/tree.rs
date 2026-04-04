@@ -76,6 +76,7 @@ pub struct TreeNode {
 pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
+    #[allow(dead_code)]
     nodes_by_path: HashMap<RepoPath, TreeNodeId>,
     block_nodes_by_path_hash_start:
         HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>>,
@@ -118,6 +119,7 @@ impl Tree {
         })
     }
 
+    #[allow(dead_code)]
     pub fn find_by_path(&self, path: &str) -> Option<TreeNodeId> {
         let path = RepoPath::new(path).ok()?;
         self.nodes_by_path.get(&path).copied()
@@ -543,12 +545,6 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
     }
 
     builder.finalize()
-}
-
-pub fn build_tree_from_path(root: &str) -> anyhow::Result<Tree> {
-    let scan_result =
-        crate::scanner::scan_directory(root, &crate::scanner::ScanOptions::default())?;
-    Ok(build_tree_from_files(&scan_result.files))
 }
 
 #[cfg(test)]

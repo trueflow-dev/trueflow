@@ -11,7 +11,6 @@ mod commands;
 mod complexity;
 mod config;
 mod context;
-mod diff_logic;
 mod hashing;
 mod logging;
 mod optimizer;

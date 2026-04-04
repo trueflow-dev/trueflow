@@ -7,7 +7,6 @@ pub mod commands;
 pub mod complexity;
 pub mod config;
 pub mod context;
-pub mod diff_logic;
 pub mod finder;
 pub mod hashing;
 pub mod logging;

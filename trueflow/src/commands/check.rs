@@ -1,21 +1,22 @@
+use crate::commands::review;
 use crate::context::TrueflowContext;
-use crate::diff_logic::get_unreviewed_changes;
 use anyhow::{Result, bail};
 use tracing::{info, warn};
 
 pub fn run(_context: &TrueflowContext) -> Result<()> {
-    let unreviewed_changes = get_unreviewed_changes()?;
+    let summary = review::collect_main_diff_summary()?;
 
-    if unreviewed_changes.is_empty() {
-        info!("All clear! No unreviewed changes found.");
+    if summary.files.is_empty() {
+        info!("All clear! No unreviewed blocks found.");
         Ok(())
     } else {
-        warn!("Found {} unreviewed change(s):", unreviewed_changes.len());
-        for change in &unreviewed_changes {
-            warn!(
-                "  {} ({}:{}) - {}",
-                change.fingerprint, change.file, change.line, change.status
-            );
+        warn!(
+            "Found {} unreviewed file(s) covering {} block(s).",
+            summary.files.len(),
+            summary.total_blocks
+        );
+        for file in &summary.files {
+            warn!("  {} ({} block(s))", file.path, file.blocks.len());
         }
         bail!("CI Check Failed: Unreviewed code detected.");
     }

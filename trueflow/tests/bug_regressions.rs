@@ -103,7 +103,7 @@ fn test_optimizer_small_file_collapses_mixed_semantic_blocks_e2e() -> Result<()>
 }
 
 #[test]
-fn test_diff_new_content_matches_post_hunk() -> Result<()> {
+fn test_diff_reports_updated_block_content() -> Result<()> {
     // GIVEN: a change that replaces a line in the working tree
     let repo = TestRepo::new("diff_new_content")?;
     let initial = include_str!("fixtures/diff_new_content_initial.rs");
@@ -116,19 +116,25 @@ fn test_diff_new_content_matches_post_hunk() -> Result<()> {
     repo.write("src/main.rs", updated)?;
     repo.commit_all("Update message")?;
 
-    // WHEN: we compute diff JSON
+    // WHEN: we compute semantic diff JSON
     let output = repo.run(&["diff", "--json"])?;
-    let changes: Value = serde_json::from_str(&output)?;
-    let change = changes
+    let files: Value = serde_json::from_str(&output)?;
+    let file = files
         .as_array()
         .context("Expected array")?
         .first()
-        .context("Expected change")?;
-    let new_content = change["new_content"].as_str().context("new_content")?;
+        .context("Expected file")?;
+    let block = file["blocks"]
+        .as_array()
+        .context("Expected blocks array")?
+        .first()
+        .context("Expected block")?;
+    let block_content = block["content"].as_str().context("content")?;
 
-    // THEN: new_content reflects the post-hunk file content
+    // THEN: the semantic block content reflects the post-hunk file content
+    assert!(block_content.contains("Trueflow"));
     let file_content = fs::read_to_string(repo.path.join("src/main.rs"))?;
-    assert_eq!(new_content, file_content);
+    assert!(file_content.contains(block_content.trim()));
     Ok(())
 }
 
@@ -1249,7 +1255,7 @@ fn test_diff_uses_merge_base() -> Result<()> {
         .as_array()
         .context("Expected array")?
         .iter()
-        .filter_map(|entry| entry["file"].as_str())
+        .filter_map(|entry| entry["path"].as_str())
         .collect();
 
     assert!(files.contains(&"src/file1.rs"));

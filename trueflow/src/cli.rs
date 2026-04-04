@@ -37,7 +37,7 @@ pub enum Commands {
     /// Mark a review target with a verdict
     Mark {
         /// Current CLI field name for the review-target identifier
-        /// (content-addressed block hash; distinct from diff fingerprints)
+        /// (typically a content-addressed semantic review hash)
         #[arg(long)]
         fingerprint: String,
 

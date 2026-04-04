@@ -1,5 +1,4 @@
 use crate::context::TrueflowContext;
-use crate::hashing::compute_fingerprint;
 use crate::repo_path::RepoPath;
 use crate::scanner::ScanOptions;
 use crate::store::{
@@ -189,10 +188,6 @@ fn infer_target_kind(
         return Ok(kind);
     }
 
-    if looks_like_current_diff_fingerprint(fingerprint)? {
-        return Ok(ReviewTargetKind::Diff);
-    }
-
     if let Some(kind) =
         infer_target_kind_from_current_tree_location(fingerprint, path_hint, line_hint)?
     {
@@ -272,40 +267,4 @@ fn infer_target_kind_from_current_tree(fingerprint: &str) -> Result<Option<Revie
     }
 
     Ok(None)
-}
-
-fn looks_like_current_diff_fingerprint(fingerprint: &str) -> Result<bool> {
-    let diff_hunks = match vcs::diff_main_to_head() {
-        Ok(hunks) => hunks,
-        Err(_) => return Ok(false),
-    };
-
-    for hunk in diff_hunks {
-        let (_, context, hash_body) = parse_diff_fingerprint_inputs(&hunk.lines);
-        let computed = compute_fingerprint(&hash_body, &context).as_string();
-        if computed == fingerprint {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn parse_diff_fingerprint_inputs(lines: &[vcs::DiffHunkLine]) -> (String, String, String) {
-    let mut diff_content = String::new();
-    let mut context = String::new();
-    let mut hash_body = String::new();
-
-    for line in lines {
-        match line.kind {
-            vcs::DiffLineKind::Context => context.push_str(&line.as_unified_line()),
-            vcs::DiffLineKind::Added | vcs::DiffLineKind::Removed => {
-                let unified = line.as_unified_line();
-                diff_content.push_str(&unified);
-                hash_body.push_str(&unified);
-            }
-        }
-    }
-
-    (diff_content, context, hash_body)
 }

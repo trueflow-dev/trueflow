@@ -56,6 +56,7 @@ impl DiffHunkLine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_unified_line(&self) -> String {
         let prefix = match self.kind {
             DiffLineKind::Context => ' ',
@@ -378,23 +379,6 @@ fn file_state_for_path_in_tree(
         &blob.data,
         blocks,
     )))
-}
-
-pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
-    Ok(diff_main_to_head_files()?
-        .into_iter()
-        .filter_map(|file_diff| match file_diff {
-            FileDiff::Text { hunks, .. } => Some(hunks),
-            FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => None,
-        })
-        .flatten()
-        .collect())
-}
-
-pub(crate) fn diff_main_to_head_files() -> Result<Vec<FileDiff>> {
-    let repo = repo_from_workdir()?;
-    let (base_tree, head_tree) = main_and_head_trees(&repo)?;
-    diff_trees(&repo, &base_tree, &head_tree)
 }
 
 pub fn diff_hunks_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<DiffHunk>> {
@@ -779,35 +763,6 @@ pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<RepoPath
     let start_tree = start_commit.tree()?;
     let end_tree = end_commit.tree()?;
     collect_changed_paths(&repo, Some(&start_tree), Some(&end_tree))
-}
-
-fn diff_trees(
-    repo: &gix::Repository,
-    base_tree: &gix::Tree<'_>,
-    head_tree: &gix::Tree<'_>,
-) -> Result<Vec<FileDiff>> {
-    let mut file_diffs = Vec::new();
-    let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
-    let changes = repo.diff_tree_to_tree(Some(base_tree), Some(head_tree), None)?;
-
-    for change in changes {
-        let change_ref = change.to_ref();
-        let location = change_ref.location();
-        if location.is_empty() {
-            continue;
-        }
-        if !is_blob_change(&change_ref) {
-            continue;
-        }
-
-        let path = RepoPath::new(location.to_str_lossy().as_ref())?;
-        diff_cache.set_resource_by_change(change_ref, &repo.objects)?;
-        let file_diff = file_diff_from_change(&mut diff_cache, path)?;
-        diff_cache.clear_resource_cache_keep_allocation();
-        file_diffs.push(file_diff);
-    }
-
-    Ok(file_diffs)
 }
 
 fn file_diff_from_change(

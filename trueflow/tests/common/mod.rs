@@ -337,7 +337,6 @@ pub fn record_target_key(record: &Record) -> &str {
         ReviewTargetRef::Block { hash }
         | ReviewTargetRef::File { hash }
         | ReviewTargetRef::Tree { hash } => hash.as_str(),
-        ReviewTargetRef::Diff { fingerprint } => fingerprint.as_str(),
     }
 }
 

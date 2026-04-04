@@ -10,6 +10,11 @@ fn get_diff_json(repo: &TestRepo) -> Result<Vec<Value>> {
     json_array(&output)
 }
 
+fn first_diff_block_hash(repo: &TestRepo) -> Result<String> {
+    let output = repo.run(&["diff", "--json"])?;
+    first_block_hash(&output)
+}
+
 const LIB_ADD: &str = include_str!("fixtures/diff_lib_add.rs");
 const LIB_ADD_SUB: &str = include_str!("fixtures/diff_lib_add_sub.rs");
 const RENAME_NEW: &str = include_str!("fixtures/diff_rename_new.rs");
@@ -20,102 +25,74 @@ fn checkout_branch(repo: &TestRepo, branch: &str) -> Result<()> {
 }
 
 #[test]
-fn test_vet_diff_initial_state() -> Result<()> {
+fn test_diff_reports_unreviewed_blocks_for_main_diff() -> Result<()> {
     let repo = TestRepo::new("initial_state")?;
-
-    // 1. Create a file and commit it to main
     repo.write("src/main.rs", "fn main() { println!(\"Hello\"); }")?;
     repo.commit_all("Initial commit")?;
 
-    // 2. Run `vet diff --json`
-    // Since we just added code and haven't reviewed it, vet should show it as unreviewed.
-    // Wait... if it's the initial commit, does it show up in diff?
-    // "vet diff" usually compares HEAD vs main.
-    // If we are ON main, diff main..HEAD is empty.
-    // Ah, design says: "Get diff HEAD vs main".
-    // If I just committed to main, HEAD == main.
-    // So usually we vet a feature branch.
-
-    // Let's create a feature branch.
     checkout_branch(&repo, "feature/add-greeting")?;
-
     repo.write("src/main.rs", "fn main() { println!(\"Hello World\"); }")?;
     repo.commit_all("Update greeting")?;
 
-    // Now main has "Hello", feature has "Hello World".
-    // vet diff should show the hunk.
+    let files = get_diff_json(&repo)?;
+    assert_eq!(files.len(), 1);
 
-    let changes = get_diff_json(&repo)?;
-
-    // Validate we have 1 change
-    assert_eq!(changes.len(), 1);
-
-    let change = &changes[0];
-    assert_eq!(change["file"].as_str().context("file")?, "src/main.rs");
-    assert_eq!(change["status"].as_str().context("status")?, "unreviewed");
-
-    let content = change["diff_content"].as_str().unwrap();
-    assert!(content.contains("Hello World"));
-    assert!(content.contains("-fn main() { println!(\"Hello\"); }"));
+    let file = &files[0];
+    assert_eq!(file["path"].as_str().context("path")?, "src/main.rs");
+    let blocks = file["blocks"].as_array().context("blocks")?;
+    assert!(
+        !blocks.is_empty(),
+        "expected changed block in semantic diff"
+    );
+    assert!(blocks.iter().any(|block| {
+        block["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Hello World"))
+    }));
 
     Ok(())
 }
 
 #[test]
-fn test_vet_mark_flow() -> Result<()> {
+fn test_diff_and_mark_flow_uses_block_reviews() -> Result<()> {
     let repo = TestRepo::new("mark_flow")?;
     repo.write("src/lib.rs", LIB_ADD)?;
     repo.commit_all("Initial")?;
 
-    // Feature
     checkout_branch(&repo, "feature/sub")?;
     repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
-    // 1. Get Diff
-    let changes = get_diff_json(&repo)?;
-    let output = repo.run(&["diff"])?;
-    assert!(
-        output.trim().is_empty(),
-        "Expected diff to be silent on stdout"
-    );
-    let fp = changes[0]["fingerprint"].as_str().unwrap().to_string();
+    let hash = first_diff_block_hash(&repo)?;
 
-    // 2. Mark Approved
+    let output = repo.run(&["diff"])?;
+    assert!(output.contains("File: src/lib.rs"));
+    assert!(output.contains("[Unreviewed]"));
+
     repo.run(&[
         "mark",
         "--fingerprint",
-        &fp,
+        &hash,
         "--verdict",
         "approved",
         "--quiet",
     ])?;
 
-    // 3. Verify Diff is Empty
     let changes = get_diff_json(&repo)?;
     assert!(changes.is_empty());
 
-    // 4. Mark Rejected
     repo.run(&[
         "mark",
         "--fingerprint",
-        &fp,
+        &hash,
         "--verdict",
         "rejected",
         "--quiet",
     ])?;
 
-    // 5. Verify Diff shows Rejected
     let changes = get_diff_json(&repo)?;
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0]["status"].as_str().context("status")?, "rejected");
-
-    // 6. Non-JSON diff is silent on stdout
-    let output = repo.run(&["diff"])?;
-    assert!(
-        output.trim().is_empty(),
-        "Expected diff to be silent on stdout"
-    );
+    assert_eq!(changes[0]["path"].as_str().context("path")?, "src/lib.rs");
 
     Ok(())
 }
@@ -141,19 +118,15 @@ fn test_check_command_gates_unreviewed_changes() -> Result<()> {
     );
 
     let diff_output = repo.run(&["diff"])?;
-    assert!(
-        diff_output.trim().is_empty(),
-        "Expected diff to be silent on stdout"
-    );
+    assert!(diff_output.contains("File: src/lib.rs"));
 
-    let changes = get_diff_json(&repo)?;
-    let fp = changes[0]["fingerprint"].as_str().unwrap();
+    let fp = first_diff_block_hash(&repo)?;
 
     // Mark approved
     repo.run(&[
         "mark",
         "--fingerprint",
-        fp,
+        &fp,
         "--verdict",
         "approved",
         "--quiet",
@@ -180,13 +153,12 @@ fn test_diff_ignores_non_review_checks() -> Result<()> {
     repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
-    let changes = get_diff_json(&repo)?;
-    let fp = changes[0]["fingerprint"].as_str().context("fingerprint")?;
+    let fp = first_diff_block_hash(&repo)?;
 
     repo.run(&[
         "mark",
         "--fingerprint",
-        fp,
+        &fp,
         "--verdict",
         "approved",
         "--check",
@@ -196,10 +168,7 @@ fn test_diff_ignores_non_review_checks() -> Result<()> {
 
     let changes = get_diff_json(&repo)?;
     assert_eq!(changes.len(), 1);
-    assert_eq!(
-        changes[0]["status"].as_str().context("status")?,
-        "unreviewed"
-    );
+    assert_eq!(changes[0]["path"].as_str().context("path")?, "src/lib.rs");
 
     Ok(())
 }
@@ -233,7 +202,7 @@ fn test_diff_handles_renamed_file() -> Result<()> {
     let changes = get_diff_json(&repo)?;
     assert!(!changes.is_empty());
     assert!(changes.iter().any(|change| {
-        change["file"]
+        change["path"]
             .as_str()
             .map(|path| path == "src/new.rs")
             .unwrap_or(false)

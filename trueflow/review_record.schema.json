@@ -156,23 +156,6 @@
             "hash"
           ],
           "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "fingerprint": {
-              "type": "string"
-            },
-            "kind": {
-              "const": "diff",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "fingerprint"
-          ],
-          "type": "object"
         }
       ]
     },

@@ -75,12 +75,6 @@ define_hash_type!(ContentHash);
 define_hash_type!(BytesHash);
 define_hash_type!(TreeHash);
 
-impl ContentHash {
-    pub fn from_content(input: &str) -> Self {
-        Self::new(hash_str(input))
-    }
-}
-
 impl BytesHash {
     pub fn from_bytes(input: &[u8]) -> Self {
         Self::new(hash_bytes(input))
@@ -105,30 +99,6 @@ impl TreeHash {
             hasher.update(hash.as_str());
         }
         Self::new(format!("{:x}", hasher.finalize()))
-    }
-}
-
-pub struct Fingerprint {
-    pub content_hash: ContentHash,
-    pub context_hash: ContentHash,
-}
-
-impl Fingerprint {
-    pub fn as_string(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.content_hash.as_str());
-        hasher.update(self.context_hash.as_str());
-        format!("{:x}", hasher.finalize())
-    }
-}
-
-pub fn compute_fingerprint(body: &str, context: &str) -> Fingerprint {
-    let content_hash = ContentHash::from_content(body);
-    let context_hash = ContentHash::from_content(context);
-
-    Fingerprint {
-        content_hash,
-        context_hash,
     }
 }
 
@@ -170,27 +140,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stability_snapshot() {
-        let body = "fn main() {\n    println!(\"hello\");\n}";
-        let context = "use std::io;";
-
-        let fp = compute_fingerprint(body, context);
-
-        assert_eq!(
-            fp.as_string(),
-            "dc1c606ceaac3fe3f3e6c11d170d950e290cbf509cf87b905c08b0f0503178c7",
-            "Fingerprint hash changed! This will break existing review records."
-        );
-    }
-
-    #[test]
-    fn test_context_separation() {
-        let fp1 = compute_fingerprint("AB", "");
-        let fp2 = compute_fingerprint("A", "B");
-        assert_ne!(fp1.as_string(), fp2.as_string());
-    }
-
-    #[test]
     fn test_hash_str_snapshot() {
         let raw_hello_hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         assert_ne!(hash_str("hello"), raw_hello_hash);
@@ -221,16 +170,6 @@ mod tests {
         assert_eq!(canonicalize("foo  \n"), "foo\n");
         assert_eq!(canonicalize("  foo"), "  foo\n");
         assert_eq!(canonicalize(""), "");
-    }
-
-    #[test]
-    fn test_fingerprint_components() {
-        let body = "fn main() {}\n";
-        let context = "use std::fmt;";
-        let fp = compute_fingerprint(body, context);
-
-        assert_eq!(fp.content_hash, ContentHash::from_content(body));
-        assert_eq!(fp.context_hash, ContentHash::from_content(context));
     }
 
     #[test]

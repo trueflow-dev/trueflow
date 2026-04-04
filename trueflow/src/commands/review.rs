@@ -594,23 +594,19 @@ fn workdir_prefix_from_git_root() -> Option<String> {
     path_utils::current_workdir_prefix_for_repo_root(&repo_root)
 }
 
-pub fn run(
-    _context: &TrueflowContext,
-    json: bool,
-    all: bool,
-    target: &[String],
-    only: &[BlockKind],
-    exclude: &[BlockKind],
-) -> Result<()> {
-    info!(
-        "review start (json={json}, all={all}, target={target:?}, only={only:?}, exclude={exclude:?})"
-    );
+pub fn collect_main_diff_summary() -> Result<ReviewSummary> {
     let config = load_config()?;
-    let filters = config.review.resolve_filters(only, exclude);
+    let filters = config.review.resolve_filters(&[], &[]);
     let scan_options = config.scan.resolve_options()?;
-    let request = parse_review_request(all, target)?;
-    let query = resolve_review_request(request, filters, scan_options)?;
-    let summary = collect_review_summary(&query)?;
+    let query = resolve_review_request(
+        ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
+        filters,
+        scan_options,
+    )?;
+    collect_review_summary(&query)
+}
+
+pub fn print_review_summary(summary: ReviewSummary, json: bool) -> Result<()> {
     for diagnostic in &summary.diagnostics {
         eprintln!("warning: {}", diagnostic.display_message());
     }
@@ -642,6 +638,26 @@ pub fn run(
     }
 
     Ok(())
+}
+
+pub fn run(
+    _context: &TrueflowContext,
+    json: bool,
+    all: bool,
+    target: &[String],
+    only: &[BlockKind],
+    exclude: &[BlockKind],
+) -> Result<()> {
+    info!(
+        "review start (json={json}, all={all}, target={target:?}, only={only:?}, exclude={exclude:?})"
+    );
+    let config = load_config()?;
+    let filters = config.review.resolve_filters(only, exclude);
+    let scan_options = config.scan.resolve_options()?;
+    let request = parse_review_request(all, target)?;
+    let query = resolve_review_request(request, filters, scan_options)?;
+    let summary = collect_review_summary(&query)?;
+    print_review_summary(summary, json)
 }
 
 fn get_dirty_files() -> Result<HashSet<RepoPath>> {

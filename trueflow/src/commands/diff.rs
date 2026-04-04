@@ -1,21 +1,8 @@
+use crate::commands::review;
 use crate::context::TrueflowContext;
-use crate::diff_logic::get_unreviewed_changes;
 use anyhow::Result;
-use tracing::warn;
 
 pub fn run(_context: &TrueflowContext, json: bool) -> Result<()> {
-    let unreviewed_changes = get_unreviewed_changes()?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&unreviewed_changes)?);
-    } else {
-        for change in unreviewed_changes {
-            warn!("File: {}:{}", change.file, change.line);
-            warn!("Fingerprint: {}", change.fingerprint);
-            warn!("Status: {}", change.status);
-            warn!("---");
-        }
-    }
-
-    Ok(())
+    let summary = review::collect_main_diff_summary()?;
+    review::print_review_summary(summary, json)
 }
