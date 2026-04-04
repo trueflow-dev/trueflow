@@ -7,6 +7,7 @@ mod block;
 mod block_splitter;
 mod build_info;
 mod cli;
+mod code_comments;
 mod commands;
 mod complexity;
 mod config;

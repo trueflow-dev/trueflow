@@ -1,5 +1,6 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
+use crate::code_comments;
 use crate::complexity;
 use crate::hashing::TreeHash;
 use crate::optimizer;
@@ -533,15 +534,7 @@ fn classify_code_paragraph(chunk: &str) -> BlockKind {
         return BlockKind::Gap;
     }
 
-    let is_comment = trimmed.lines().all(|line| {
-        let line = line.trim_start();
-        line.starts_with("//")
-            || line.starts_with('#')
-            || line.starts_with("/*")
-            || line.starts_with('*')
-    });
-
-    if is_comment {
+    if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph
@@ -962,10 +955,7 @@ fn looks_like_cpp_function(chunk: &str, signature_line: &str) -> bool {
 }
 
 fn is_comment_line(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("//")
-        || trimmed_line.starts_with("/*")
-        || trimmed_line.starts_with('*')
-        || trimmed_line.starts_with("*/")
+    code_comments::line_is_c_style_comment(trimmed_line)
 }
 
 #[derive(Debug, Clone)]

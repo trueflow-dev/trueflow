@@ -1,5 +1,6 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
+use crate::code_comments;
 use crate::hashing::TreeHash;
 use crate::review_units::{MAX_REVIEW_UNIT_SPAN_LINES, block_line_span};
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
@@ -722,14 +723,7 @@ fn classify_code_chunk(chunk: &str) -> BlockKind {
         return BlockKind::Gap;
     }
 
-    let is_comment = trimmed.lines().all(|line| {
-        line.trim_start().starts_with("//")
-            || line.trim_start().starts_with("/*")
-            || line.trim_start().starts_with('*')
-            || line.trim_start().starts_with('#')
-    });
-
-    if is_comment {
+    if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph
