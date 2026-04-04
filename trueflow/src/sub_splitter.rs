@@ -1,6 +1,7 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::hashing::TreeHash;
+use crate::swift;
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
 use anyhow::{Context, Result};
 use tracing::info;
@@ -386,7 +387,7 @@ fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
         return split_code(block);
     };
-    if !swift_body_is_non_trivial(body, content) {
+    if !swift::body_is_non_trivial(body, content) {
         return split_code(block);
     }
 
@@ -642,140 +643,24 @@ fn collect_body_nodes<'a>(
     nodes
 }
 
-fn swift_body_is_non_trivial(body: tree_sitter::Node<'_>, content: &str) -> bool {
-    let mut cursor = body.walk();
-    let member_count = body
-        .children(&mut cursor)
-        .filter(|child| map_swift_member_kind(*child, content).is_some())
-        .count();
-    if member_count >= 2 {
-        return true;
-    }
-
-    let body_content = &content[body.start_byte()..body.end_byte()];
-    body_content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-        >= 10
-}
-
 fn collect_swift_type_items(
     parent: &Block,
     body: tree_sitter::Node<'_>,
     content: &str,
 ) -> Vec<Block> {
     let mut blocks = Vec::new();
-    let mut cursor = body.walk();
-    let mut pending_start: Option<usize> = None;
-    let mut pending_end: usize = 0;
-
-    for child in body.children(&mut cursor) {
-        let ts_kind = child.kind();
-        if matches!(ts_kind, "{" | "}") {
-            continue;
-        }
-
-        let start_byte = child.start_byte();
-        let end_byte = child.end_byte();
-        if is_swift_attribute_node(ts_kind) {
-            if pending_start.is_none() {
-                pending_start = Some(start_byte);
-            }
-            pending_end = end_byte;
-            continue;
-        }
-
-        let Some(kind) = map_swift_member_kind(child, content) else {
-            continue;
-        };
-
-        let block_start = pending_start.unwrap_or(start_byte);
-        let chunk = &parent.content[block_start..end_byte];
+    for member in swift::collect_type_member_spans(body, content) {
+        let chunk = &parent.content[member.start_byte..member.end_byte];
         blocks.push(create_sub_block_with_kind(
             parent,
             chunk,
-            block_start,
-            end_byte,
-            kind,
+            member.start_byte,
+            member.end_byte,
+            member.kind,
         ));
-
-        pending_start = None;
-        pending_end = 0;
-    }
-
-    if let Some(start) = pending_start {
-        let end = pending_end.max(start);
-        if end > start {
-            let chunk = &parent.content[start..end];
-            blocks.push(create_sub_block_with_kind(
-                parent,
-                chunk,
-                start,
-                end,
-                BlockKind::Code,
-            ));
-        }
     }
 
     blocks
-}
-
-fn map_swift_member_kind(node: tree_sitter::Node<'_>, content: &str) -> Option<BlockKind> {
-    match node.kind() {
-        "attribute" | "comment" | "multiline_comment" => None,
-        "class_declaration" => Some(match swift_declaration_keyword(node) {
-            Some("struct") => BlockKind::Struct,
-            Some("enum") => BlockKind::Enum,
-            Some("extension") => BlockKind::Impl,
-            Some("actor" | "class") => BlockKind::Class,
-            _ => BlockKind::Code,
-        }),
-        "protocol_declaration" => Some(BlockKind::Interface),
-        "function_declaration"
-        | "init_declaration"
-        | "deinit_declaration"
-        | "subscript_declaration" => Some(BlockKind::Method),
-        "protocol_function_declaration" => Some(BlockKind::FunctionSignature),
-        "typealias_declaration" | "associatedtype_declaration" => Some(BlockKind::Type),
-        "property_declaration" | "protocol_property_declaration" => {
-            Some(map_swift_property_kind(node, content))
-        }
-        "import_declaration" => Some(BlockKind::Import),
-        _ => None,
-    }
-}
-
-fn swift_declaration_keyword(node: tree_sitter::Node<'_>) -> Option<&str> {
-    node.child_by_field_name("declaration_kind")
-        .map(|child| child.kind())
-}
-
-fn map_swift_property_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() != "value_binding_pattern" {
-            continue;
-        }
-        if let Some(mutability) = child.child_by_field_name("mutability") {
-            return if mutability.kind() == "let" {
-                BlockKind::Const
-            } else {
-                BlockKind::Variable
-            };
-        }
-    }
-
-    let node_content = &content[node.start_byte()..node.end_byte()];
-    if node_content.contains("let ") {
-        BlockKind::Const
-    } else {
-        BlockKind::Variable
-    }
-}
-
-fn is_swift_attribute_node(kind: &str) -> bool {
-    matches!(kind, "attribute" | "comment" | "multiline_comment")
 }
 
 fn gap_prefix_length(gap: &str) -> usize {

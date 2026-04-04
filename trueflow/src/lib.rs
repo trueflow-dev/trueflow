@@ -23,6 +23,7 @@ pub mod review_speedread;
 pub mod scanner;
 pub mod store;
 pub mod sub_splitter;
+pub(crate) mod swift;
 pub mod text_split;
 pub mod tree;
 pub mod vcs;

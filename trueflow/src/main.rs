@@ -26,6 +26,7 @@ mod review_speedread;
 mod scanner;
 mod store;
 pub mod sub_splitter;
+mod swift;
 mod text_split;
 mod tree;
 mod vcs;
