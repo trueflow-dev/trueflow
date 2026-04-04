@@ -5,6 +5,7 @@ use tracing::info;
 mod analysis;
 mod block;
 mod block_splitter;
+mod build_info;
 mod cli;
 mod commands;
 mod complexity;

@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod block;
 pub mod block_splitter;
+pub mod build_info;
 pub mod cli;
 pub mod commands;
 pub mod complexity;

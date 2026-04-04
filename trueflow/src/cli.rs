@@ -1,11 +1,14 @@
 use clap::{Parser, Subcommand};
 
 use crate::block::BlockKind;
+use crate::build_info;
 use crate::logging::LoggingMode;
 
 #[derive(Parser)]
 #[command(name = "trueflow")]
+#[command(version = build_info::VERSION, long_version = build_info::LONG_VERSION)]
 #[command(about = "Semantic review for the agent era", long_about = None)]
+#[command(after_help = build_info::HELP_FOOTER)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -165,6 +168,8 @@ pub enum Commands {
 mod tests {
     use super::{Cli, Commands};
     use crate::block::BlockKind;
+    use crate::build_info;
+    use chrono::DateTime;
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -178,6 +183,25 @@ mod tests {
             .unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
         assert!(help.contains("configured storage branch"));
         assert!(!help.contains("trueflow-db branch"));
+    }
+
+    #[test]
+    fn long_help_includes_build_metadata_footer() {
+        let mut command = Cli::command();
+        let mut help = Vec::new();
+        command
+            .write_long_help(&mut help)
+            .unwrap_or_else(|error| panic!("failed to render help output: {error}"));
+        let help = String::from_utf8(help)
+            .unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
+
+        assert!(help.contains(build_info::HELP_FOOTER));
+    }
+
+    #[test]
+    fn build_timestamp_is_rfc3339() {
+        DateTime::parse_from_rfc3339(build_info::BUILD_TIMESTAMP)
+            .unwrap_or_else(|error| panic!("build timestamp was not RFC3339: {error}"));
     }
 
     #[test]
