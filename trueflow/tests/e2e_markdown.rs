@@ -3,7 +3,7 @@ mod common;
 use common::*;
 
 #[test]
-fn test_markdown_split_hierarchy() -> Result<()> {
+fn test_small_markdown_section_stays_whole() -> Result<()> {
     let repo = TestRepo::new("markdown_split")?;
     repo.write(
         "README.md",
@@ -32,28 +32,7 @@ fn test_markdown_split_hierarchy() -> Result<()> {
     let output = repo.run(&["inspect", "--fingerprint", section_hash, "--split"])?;
     let subblocks = json_array(&output)?;
     let kinds = block_kinds_without_gaps(&subblocks);
-    assert_eq!(
-        kinds,
-        vec![
-            "Header",
-            "Paragraph",
-            "Header",
-            "Paragraph",
-            "ListItem",
-            "ListItem"
-        ]
-    );
-
-    let paragraph = subblocks
-        .iter()
-        .find(|block| block["kind"] == "Paragraph")
-        .context("Paragraph block")?;
-    let paragraph_hash = paragraph["hash"].as_str().context("hash")?;
-    let output = repo.run(&["inspect", "--fingerprint", paragraph_hash, "--split"])?;
-    let sentence_blocks = json_array(&output)?;
-    let sentence_kinds = block_kinds_without_gaps(&sentence_blocks);
-    assert!(sentence_kinds.iter().all(|kind| *kind == "Sentence"));
-    assert_eq!(sentence_kinds.len(), 2);
+    assert_eq!(kinds, vec!["Section"]);
 
     Ok(())
 }

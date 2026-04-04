@@ -1,9 +1,11 @@
 use crate::block::{Block, BlockKind};
+use crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use std::mem;
 
 const MAX_IMPORT_SPAN_LINES: usize = 24;
 const MAX_IMPORT_GAP_LINES: usize = 3;
-const SMALL_FILE_MAX_SPAN_LINES: usize = 64;
+const MAX_CODE_PARAGRAPH_SPAN_LINES: usize = MAX_REVIEW_UNIT_SPAN_LINES;
+const SMALL_FILE_MAX_SPAN_LINES: usize = MAX_REVIEW_UNIT_SPAN_LINES;
 const SMALL_FILE_MAX_NON_TRIVIAL_BLOCKS: usize = 12;
 
 pub fn optimize(blocks: Vec<Block>) -> Vec<Block> {
@@ -82,7 +84,7 @@ fn optimize_code_paragraphs(blocks: Vec<Block>) -> Vec<Block> {
             let end_line = block.end_line;
             let size = end_line.saturating_sub(start_line);
 
-            if size > 8 {
+            if size > MAX_CODE_PARAGRAPH_SPAN_LINES {
                 Decision::FlushAndBuffer
             } else {
                 Decision::Buffer
@@ -331,7 +333,6 @@ fn is_non_collapsible_small_file_kind(kind: BlockKind) -> bool {
         BlockKind::TextBlock
             | BlockKind::CodeParagraph
             | BlockKind::Header
-            | BlockKind::Paragraph
             | BlockKind::CodeBlock
             | BlockKind::List
             | BlockKind::ListItem
@@ -416,13 +417,26 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_code_paragraphs_up_to_small_file_threshold() {
+        let blocks = vec![
+            make_block(BlockKind::CodeParagraph, "P1\n", 0, 16),
+            make_block(BlockKind::Gap, "\n", 16, 17),
+            make_block(BlockKind::CodeParagraph, "P2\n", 17, 32),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(optimized[0].content, "P1\n\nP2\n");
+    }
+
+    #[test]
     fn test_dont_merge_large_paragraphs() {
         let blocks = vec![
-            make_block(BlockKind::CodeParagraph, "P1\nP1\nP1\nP1\n", 0, 4), // 4 lines
-            make_block(BlockKind::Gap, "\n", 4, 5),                         // 1 line
-            make_block(BlockKind::CodeParagraph, "P2\nP2\nP2\nP2\n", 5, 9), // 4 lines
+            make_block(BlockKind::CodeParagraph, "P1\n", 0, 16),
+            make_block(BlockKind::Gap, "\n", 16, 17),
+            make_block(BlockKind::CodeParagraph, "P2\n", 17, 33),
         ];
-        // Total span: 9 - 0 = 9 lines. Should NOT merge.
 
         let optimized = optimize(blocks);
         assert_eq!(optimized.len(), 3);
@@ -432,17 +446,31 @@ mod tests {
     }
 
     #[test]
+    fn test_small_paragraph_files_collapse_to_single_review_block() {
+        let blocks = vec![
+            make_block(BlockKind::Paragraph, "P1\n", 0, 10),
+            make_block(BlockKind::Gap, "\n", 10, 11),
+            make_block(BlockKind::Paragraph, "P2\n", 11, 20),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].kind, BlockKind::Paragraph);
+        assert_eq!(optimized[0].content, "P1\n\nP2\n");
+    }
+
+    #[test]
     fn test_merge_sequence_greedy() {
         let blocks = vec![
             make_block(BlockKind::CodeParagraph, "P1\n", 0, 1), // 1 line
             make_block(BlockKind::Gap, "\n", 1, 2),             // 1 line
             make_block(BlockKind::CodeParagraph, "P2\n", 2, 3), // 1 line
             // Span 0..3 = 3 lines. Merge P1+Gap+P2.
-            make_block(BlockKind::Gap, "\n\n\n\n\n\n", 3, 9), // 6 lines
-            make_block(BlockKind::CodeParagraph, "P3\n", 9, 10), // 1 line
+            make_block(BlockKind::Gap, "\n", 3, 70),
+            make_block(BlockKind::CodeParagraph, "P3\n", 70, 71), // 1 line
         ];
-        // Adding P3: Span 0..10 = 10 lines. Too big.
-        // Should flush P1+Gap+P2. Then emit Gap(6). Then buffer P3.
+        // Adding P3: Span 0..71 = 71 lines. Too big.
+        // Should flush P1+Gap+P2. Then emit the large gap. Then buffer P3.
 
         let optimized = optimize(blocks);
         // P1+Gap+P2 merged = 1 block.
@@ -555,8 +583,8 @@ mod tests {
             make_block(BlockKind::CodeParagraph, "P1\n", 0, 1),
             make_block(BlockKind::Gap, "\n", 1, 2),
             make_block(BlockKind::CodeParagraph, "P2\n", 2, 3),
-            make_block(BlockKind::Gap, "\n\n\n\n\n\n", 3, 9),
-            make_block(BlockKind::CodeParagraph, "P3\n", 9, 10),
+            make_block(BlockKind::Gap, "\n", 3, 70),
+            make_block(BlockKind::CodeParagraph, "P3\n", 70, 71),
         ];
 
         let optimized = optimize(blocks);

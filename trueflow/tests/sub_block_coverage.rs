@@ -23,7 +23,7 @@ fn is_gap(sub_block: &Value) -> bool {
 }
 
 #[test]
-fn test_implicit_approval() -> Result<()> {
+fn test_small_block_approval_marks_the_parent_review_unit() -> Result<()> {
     let repo = TestRepo::new("subblock_implicit")?;
     repo.write("main.rs", "fn seed() {}\n")?;
     repo.commit_all("Seed main")?;
@@ -34,29 +34,19 @@ fn test_implicit_approval() -> Result<()> {
 
     let output = repo.run(&["inspect", "--fingerprint", &parent_hash, "--split"])?;
     let sub_blocks = json_array(&output)?;
+    assert_eq!(sub_blocks.len(), 1);
 
     let first_hash = sub_blocks
         .first()
         .and_then(|sb| sb["hash"].as_str())
         .context("first sub-block is missing a hash")?;
+    assert_eq!(first_hash, parent_hash);
 
     let output = repo.run(&["review", "--exclude", "Gap", "--exclude", "gap"])?;
     assert!(output.contains("[Unreviewed]"));
     assert!(output.contains(&parent_hash));
 
     mark(&repo, first_hash)?;
-
-    let output = repo.run(&["review", "--exclude", "Gap", "--exclude", "gap"])?;
-    assert!(output.contains("[Unreviewed]"));
-    assert!(output.contains(&parent_hash));
-
-    for sb in sub_blocks.iter().skip(1) {
-        if is_gap(sb) {
-            continue;
-        }
-        let hash = sb["hash"].as_str().context("sub-block is missing a hash")?;
-        mark(&repo, hash)?;
-    }
 
     let output = repo.run(&["review", "--exclude", "Gap", "--exclude", "gap"])?;
     assert!(output.contains("All clear"));

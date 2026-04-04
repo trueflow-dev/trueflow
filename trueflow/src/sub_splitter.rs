@@ -1,6 +1,7 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::hashing::TreeHash;
+use crate::review_units::{MAX_REVIEW_UNIT_SPAN_LINES, block_line_span};
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
 use crate::{rust, swift};
 use anyhow::{Context, Result};
@@ -75,6 +76,18 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
     );
 
     let plan = determine_split_plan(block.kind, lang);
+    if should_keep_parent_review_unit(plan, block) {
+        let result = SubSplitResult {
+            blocks: vec![block.clone()],
+            semantics: SubSplitSemantics::ReviewUnits,
+        };
+        info!(
+            "sub_splitter kept parent review unit (lines={}, max_lines={})",
+            block_line_span(block),
+            MAX_REVIEW_UNIT_SPAN_LINES
+        );
+        return Ok(result);
+    }
     let blocks = match plan {
         SplitPlan::IdentityReviewUnit => vec![block.clone()],
         SplitPlan::MarkdownChildren => split_markdown_tree(block)?,
@@ -100,6 +113,11 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         result.semantics
     );
     Ok(result)
+}
+
+fn should_keep_parent_review_unit(plan: SplitPlan, block: &Block) -> bool {
+    !matches!(plan, SplitPlan::IdentityReviewUnit)
+        && block_line_span(block) <= MAX_REVIEW_UNIT_SPAN_LINES
 }
 
 fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
@@ -760,15 +778,33 @@ mod tests {
     use crate::block::Block;
 
     fn make_block(content: &str, kind: BlockKind) -> Block {
+        make_block_with_span(content, kind, 0, content.lines().count())
+    }
+
+    fn make_block_with_span(
+        content: &str,
+        kind: BlockKind,
+        start_line: usize,
+        end_line: usize,
+    ) -> Block {
         Block {
             hash: TreeHash::new("test"),
             content: content.to_string(),
             kind,
             tags: Vec::new(),
             complexity: 0,
-            start_line: 0,
-            end_line: content.lines().count(),
+            start_line,
+            end_line,
         }
+    }
+
+    fn make_large_block(content: &str, kind: BlockKind) -> Block {
+        make_block_with_span(
+            content,
+            kind,
+            0,
+            crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES + 8,
+        )
     }
 
     fn merge_blocks(blocks: Vec<Block>) -> String {
@@ -781,14 +817,14 @@ mod tests {
         let block = make_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Rust).unwrap();
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(chunks[0].kind, BlockKind::Code);
         assert_eq!(chunks[0].content, content);
     }
 
     #[test]
     fn test_split_code_multiple() {
         let content = "fn foo() {\n    part1();\n\n    part2();\n}";
-        let block = make_block(content, BlockKind::Code);
+        let block = make_large_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Rust).unwrap();
 
         // "fn foo() {\n    part1();" (CodeParagraph)
@@ -805,7 +841,7 @@ mod tests {
     #[test]
     fn test_split_markdown() {
         let content = "# Header\n\nPara 1.\n\nPara 2.";
-        let block = make_block(content, BlockKind::Code);
+        let block = make_large_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Markdown).unwrap();
 
         // Header
@@ -834,6 +870,16 @@ mod tests {
         let content = "Line one. Line two?";
         let block = make_block(content, BlockKind::Paragraph);
         let chunks = split(&block, Language::Text).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, BlockKind::Paragraph);
+        assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_text_sentences_when_block_exceeds_threshold() {
+        let content = "Line one. Line two?";
+        let block = make_large_block(content, BlockKind::Paragraph);
+        let chunks = split(&block, Language::Text).unwrap();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].kind, BlockKind::Sentence);
         assert_eq!(merge_blocks(chunks), content);
@@ -842,7 +888,7 @@ mod tests {
     #[test]
     fn test_split_toml_paragraphs_preserve_content() {
         let content = "key = \"value\"\n\nother = \"value\"";
-        let block = make_block(content, BlockKind::Code);
+        let block = make_large_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Toml).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
@@ -854,7 +900,7 @@ mod tests {
     #[test]
     fn test_split_rust_impl_into_items() {
         let content = "impl Foo {\n    fn read_heavy(&self) {}\n    const MAX: usize = 1;\n}\n";
-        let block = make_block(content, BlockKind::Impl);
+        let block = make_large_block(content, BlockKind::Impl);
         let chunks = split(&block, Language::Rust).unwrap();
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Const));
@@ -864,7 +910,7 @@ mod tests {
     #[test]
     fn test_split_swift_extension_into_members_when_non_trivial() {
         let content = "extension Context {\n    func fetchWorld() -> World {\n        world\n    }\n\n    func reset() async -> [UInt8] {\n        await world.transform([])\n    }\n}\n";
-        let block = make_block(content, BlockKind::Impl);
+        let block = make_large_block(content, BlockKind::Impl);
         let chunks = split(&block, Language::Swift).unwrap();
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Impl));
@@ -873,7 +919,7 @@ mod tests {
     #[test]
     fn test_split_nix_paragraphs_preserve_content() {
         let content = "{ foo = \"bar\"; }\n\n{ baz = \"qux\"; }";
-        let block = make_block(content, BlockKind::Code);
+        let block = make_large_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Nix).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
@@ -885,7 +931,7 @@ mod tests {
     #[test]
     fn test_split_just_paragraphs_preserve_content() {
         let content = "build:\n\techo ok\n\ntest:\n\techo ok";
-        let block = make_block(content, BlockKind::Code);
+        let block = make_large_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Just).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);

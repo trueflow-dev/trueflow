@@ -25,7 +25,7 @@ pub enum Language {
 
 impl Language {
     pub fn uses_text_fallback(self) -> bool {
-        matches!(self, Language::Text | Language::Toml | Language::Just)
+        matches!(self, Language::Text | Language::Toml)
     }
 
     pub fn from_file_name(file_name: &str) -> Option<Self> {

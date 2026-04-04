@@ -20,6 +20,7 @@ pub mod review_order;
 pub mod review_scope;
 pub mod review_session;
 pub mod review_speedread;
+pub mod review_units;
 pub(crate) mod rust;
 pub mod scanner;
 pub mod store;

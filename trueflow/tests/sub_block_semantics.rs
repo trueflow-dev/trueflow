@@ -2,10 +2,16 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use trueflow::analysis::Language;
-use trueflow::block::BlockKind;
+use trueflow::block::{Block, BlockKind};
 use trueflow::block_splitter;
 use trueflow::finder::fuzzy_find_block;
+use trueflow::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use trueflow::sub_splitter::{self, SubSplitSemantics};
+
+fn expand_block_for_review_splitting(mut block: Block) -> Block {
+    block.end_line = block.start_line + MAX_REVIEW_UNIT_SPAN_LINES + 8;
+    block
+}
 
 fn assert_subblock_kinds(
     path: &Path,
@@ -13,7 +19,7 @@ fn assert_subblock_kinds(
     language: Language,
     expected: &[BlockKind],
 ) -> Result<()> {
-    let block = fuzzy_find_block(path, ident)?;
+    let block = expand_block_for_review_splitting(fuzzy_find_block(path, ident)?);
     let sub_blocks = sub_splitter::split(&block, language)?;
     let kinds: Vec<BlockKind> = sub_blocks
         .iter()
@@ -104,7 +110,7 @@ fn test_swift_function_subblock_types() -> Result<()> {
 fn test_function_subblocks_are_review_units() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks/src/lib.rs");
-    let block = fuzzy_find_block(&file_path, "process_data")?;
+    let block = expand_block_for_review_splitting(fuzzy_find_block(&file_path, "process_data")?);
 
     let result = sub_splitter::split_result(&block, Language::Rust)?;
 
@@ -115,6 +121,22 @@ fn test_function_subblocks_are_review_units() -> Result<()> {
             .iter()
             .any(|block| block.kind == BlockKind::FunctionSignature)
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_small_function_stays_whole_under_threshold() -> Result<()> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let file_path = repo_root.join("example_repos/complex_blocks/src/lib.rs");
+    let block = fuzzy_find_block(&file_path, "process_data")?;
+
+    let result = sub_splitter::split_result(&block, Language::Rust)?;
+
+    assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
+    assert_eq!(result.blocks.len(), 1);
+    assert_eq!(result.blocks[0].kind, BlockKind::Function);
+    assert_eq!(result.blocks[0].content, block.content);
 
     Ok(())
 }
@@ -142,7 +164,8 @@ fn test_rust_impl_subblocks_match_top_level_impl_members() -> Result<()> {
         })
         .collect();
 
-    let sub_members: Vec<_> = sub_splitter::split(impl_block, Language::Rust)?
+    let large_impl_block = expand_block_for_review_splitting(impl_block.clone());
+    let sub_members: Vec<_> = sub_splitter::split(&large_impl_block, Language::Rust)?
         .into_iter()
         .filter(|block| matches!(block.kind, BlockKind::Method | BlockKind::Const))
         .map(|block| {
@@ -161,7 +184,7 @@ fn test_rust_impl_subblocks_match_top_level_impl_members() -> Result<()> {
 }
 
 #[test]
-fn test_markdown_subblocks_and_sentences() -> Result<()> {
+fn test_small_markdown_section_stays_whole() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let file_path = repo_root.join("example_repos/complex_blocks_md/README.md");
     let content = std::fs::read_to_string(&file_path)?;
@@ -173,50 +196,10 @@ fn test_markdown_subblocks_and_sentences() -> Result<()> {
         .unwrap();
 
     let section_result = sub_splitter::split_result(section, Language::Markdown)?;
-    assert_eq!(
-        section_result.semantics,
-        SubSplitSemantics::StructuralChildren
-    );
-
-    let sub_blocks = section_result.blocks;
-    let kinds: Vec<BlockKind> = sub_blocks
-        .iter()
-        .filter(|sub| sub.kind != BlockKind::Gap)
-        .map(|sub| sub.kind)
-        .collect();
-
-    assert_eq!(
-        kinds,
-        vec![
-            BlockKind::Header,
-            BlockKind::Paragraph,
-            BlockKind::Header,
-            BlockKind::Paragraph,
-            BlockKind::ListItem,
-            BlockKind::ListItem,
-        ]
-    );
-
-    let paragraph = sub_blocks
-        .iter()
-        .find(|block| block.kind == BlockKind::Paragraph)
-        .unwrap();
-    let sentence_result = sub_splitter::split_result(paragraph, Language::Markdown)?;
-    assert_eq!(sentence_result.semantics, SubSplitSemantics::ReviewUnits);
-
-    let sentence_blocks = sentence_result.blocks;
-    let sentence_kinds: Vec<BlockKind> = sentence_blocks
-        .iter()
-        .filter(|sub| sub.kind != BlockKind::Gap)
-        .map(|sub| sub.kind)
-        .collect();
-
-    assert!(
-        sentence_kinds
-            .iter()
-            .all(|kind| *kind == BlockKind::Sentence)
-    );
-    assert_eq!(sentence_kinds.len(), 2);
+    assert_eq!(section_result.semantics, SubSplitSemantics::ReviewUnits);
+    assert_eq!(section_result.blocks.len(), 1);
+    assert_eq!(section_result.blocks[0].kind, BlockKind::Section);
+    assert_eq!(section_result.blocks[0].content, section.content);
 
     Ok(())
 }

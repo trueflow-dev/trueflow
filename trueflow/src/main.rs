@@ -23,6 +23,7 @@ mod review_order;
 mod review_scope;
 mod review_session;
 mod review_speedread;
+mod review_units;
 mod rust;
 mod scanner;
 mod store;

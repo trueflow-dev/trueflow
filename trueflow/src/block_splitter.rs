@@ -192,6 +192,11 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         Language::Markdown => {
             attempt_split(content, lang, split_markdown(content), FallbackMode::Text)
         }
+        Language::Just => complete_split(
+            fallback_split_blocks(content, FallbackMode::Code, lang),
+            BlockSplitStrategy::Heuristic,
+            Vec::new(),
+        ),
         Language::Go => {
             complete_split(split_go(content), BlockSplitStrategy::Heuristic, Vec::new())
         }
@@ -1651,8 +1656,21 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
     }
 
     #[test]
-    fn test_split_just_paragraphs() {
-        assert_paragraph_split(Language::Just);
+    fn test_split_just_uses_code_fallback() {
+        let content = "build:\n\t echo ok\n\ntest:\n\t echo ok";
+        let result = split_result(content, Language::Just);
+        assert_eq!(result.strategy, BlockSplitStrategy::Heuristic);
+
+        let blocks = result.blocks;
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(blocks[1].kind, BlockKind::Gap);
+        assert_eq!(blocks[2].kind, BlockKind::CodeParagraph);
+        assert_eq!(blocks[0].content, "build:\n\t echo ok");
+        assert_eq!(blocks[1].content, "\n\n");
+        assert_eq!(blocks[2].content, "test:\n\t echo ok");
+        let merged: String = blocks.into_iter().map(|block| block.content).collect();
+        assert_eq!(merged, content);
     }
 
     #[test]
