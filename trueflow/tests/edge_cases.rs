@@ -137,6 +137,52 @@ fn test_scan_surfaces_unsupported_code_fallback_diagnostic() -> Result<()> {
 }
 
 #[test]
+fn test_unknown_code_extension_falls_back_to_text_and_review_still_works() -> Result<()> {
+    let repo = TestRepo::new("unknown_code_extension")?;
+    repo.write("main.bf", "++++[>++++<-]>+.\n\n[-]\n")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let scan_result: ScanResult = serde_json::from_str(&output)?;
+    let file_state = scan_result
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "main.bf")
+        .context("missing scan output for main.bf")?;
+
+    assert_eq!(file_state.language, trueflow::analysis::Language::Text);
+    assert!(!file_state.blocks.is_empty());
+    assert!(
+        file_state
+            .blocks
+            .iter()
+            .any(|block| block.kind == trueflow::block::BlockKind::Paragraph)
+    );
+    assert!(
+        !scan_result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.as_ref().map(|path| path.as_str()) == Some("main.bf")
+        }),
+        "did not expect fallback diagnostics for unknown text-classified files"
+    );
+
+    let review_output = repo.run(&["review", "--all", "--json"])?;
+    let review_files = json_array(&review_output)?;
+    let review_file = review_files
+        .iter()
+        .find(|file| file["path"].as_str() == Some("main.bf"))
+        .context("missing review output for main.bf")?;
+    let review_blocks = review_file["blocks"].as_array().context("blocks")?;
+
+    assert!(!review_blocks.is_empty());
+    assert!(
+        review_blocks
+            .iter()
+            .any(|block| block["kind"].as_str() == Some("Paragraph"))
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
     let repo = TestRepo::new("sub_splitter_empty")?;
     let test_cases = [
