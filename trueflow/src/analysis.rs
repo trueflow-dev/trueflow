@@ -28,6 +28,13 @@ impl Language {
         matches!(self, Language::Text | Language::Toml | Language::Just)
     }
 
+    pub fn from_file_name(file_name: &str) -> Option<Self> {
+        match file_name {
+            name if name.eq_ignore_ascii_case("justfile") => Some(Language::Just),
+            _ => None,
+        }
+    }
+
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "rs" => Some(Language::Rust),
@@ -70,7 +77,14 @@ pub fn analyze_file(path: &Path) -> FileType {
         return FileType::Code(CodeFile { language });
     }
 
-    // 2. Check for Binary (Heuristic: Read first 8kb, look for NULL)
+    // 2. Check for canonical filename-based Code detection.
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str())
+        && let Some(language) = Language::from_file_name(file_name)
+    {
+        return FileType::Code(CodeFile { language });
+    }
+
+    // 3. Check for Binary (Heuristic: Read first 8kb, look for NULL)
     // We only want to read a small chunk, not the whole file if it's huge.
     // However, in `scanner.rs` we read the whole file anyway to hash it.
     // So we can pass the content if available, but `scanner.rs` calls us before chunking.
@@ -84,6 +98,9 @@ pub fn analyze_file(path: &Path) -> FileType {
             if slice.contains(&0) {
                 return FileType::Binary;
             }
+            if let Some(language) = language_from_shebang(slice) {
+                return FileType::Code(CodeFile { language });
+            }
         }
     }
 
@@ -91,9 +108,75 @@ pub fn analyze_file(path: &Path) -> FileType {
     FileType::Text
 }
 
+fn language_from_shebang(header: &[u8]) -> Option<Language> {
+    let line = std::str::from_utf8(header)
+        .ok()?
+        .lines()
+        .next()?
+        .strip_prefix("#!")?
+        .trim();
+    let mut tokens = line.split_whitespace();
+    let command = tokens.next()?;
+    let interpreter = if command.ends_with("/env") {
+        tokens
+            .find(|token| !token.starts_with('-'))
+            .map(|token| token.rsplit('/').next().unwrap_or(token))?
+    } else {
+        command.rsplit('/').next()?
+    };
+
+    match interpreter {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => Some(Language::Shell),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use uuid::Uuid;
+
+    struct TempPath {
+        path: PathBuf,
+    }
+
+    impl TempPath {
+        fn new(path: PathBuf) -> Self {
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            let mut current = self.path.parent();
+            while let Some(dir) = current {
+                if !dir.starts_with(std::env::temp_dir()) {
+                    break;
+                }
+                if fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                current = dir.parent();
+            }
+        }
+    }
+
+    fn write_temp_file(name: &str, contents: &[u8]) -> TempPath {
+        let dir = std::env::temp_dir()
+            .join("trueflow-analysis-tests")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&dir).expect("create temp directory");
+        let path = dir.join(name);
+        fs::write(&path, contents).expect("write temp file");
+        TempPath::new(path)
+    }
 
     #[test]
     fn test_language_from_extension() {
@@ -124,5 +207,36 @@ mod tests {
         assert_eq!(Language::from_extension("org"), Some(Language::Text));
         assert_eq!(Language::from_extension("txt"), Some(Language::Text));
         assert_eq!(Language::from_extension("unknown_ext"), None);
+    }
+
+    #[test]
+    fn test_language_from_file_name() {
+        assert_eq!(Language::from_file_name("Justfile"), Some(Language::Just));
+        assert_eq!(Language::from_file_name("justfile"), Some(Language::Just));
+        assert_eq!(Language::from_file_name("main.rs"), None);
+    }
+
+    #[test]
+    fn analyze_file_detects_justfile_without_extension() {
+        let file = write_temp_file("Justfile", b"default:\n    echo hello\n");
+
+        assert!(matches!(
+            analyze_file(file.path()),
+            FileType::Code(CodeFile {
+                language: Language::Just
+            })
+        ));
+    }
+
+    #[test]
+    fn analyze_file_detects_shell_shebang_without_extension() {
+        let file = write_temp_file("script", b"#!/usr/bin/env bash\necho hello\n");
+
+        assert!(matches!(
+            analyze_file(file.path()),
+            FileType::Code(CodeFile {
+                language: Language::Shell
+            })
+        ));
     }
 }
