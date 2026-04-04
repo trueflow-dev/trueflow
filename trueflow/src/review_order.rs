@@ -402,11 +402,7 @@ mod tests {
         let sources = builder.add_dir(root, "Sources".to_string(), "Sources".to_string());
         let app = builder.add_dir(sources, "App".to_string(), "Sources/App".to_string());
         let tests = builder.add_dir(root, "Tests".to_string(), "Tests".to_string());
-        let support = builder.add_dir(
-            tests,
-            "Support".to_string(),
-            "Tests/Support".to_string(),
-        );
+        let support = builder.add_dir(tests, "Support".to_string(), "Tests/Support".to_string());
 
         let source_file = builder.add_file(
             app,

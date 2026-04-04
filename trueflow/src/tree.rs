@@ -574,13 +574,13 @@ mod tests {
         let tree = build_tree_from_files(&files);
         let container_id = tree
             .find_block_node("Sources/App/Core.swift", &container)
-            .expect("expected Swift container block");
+            .unwrap_or_else(|| panic!("expected Swift container block"));
         let first_method_id = tree
             .find_block_node("Sources/App/Core.swift", &first_method)
-            .expect("expected first Swift member block");
+            .unwrap_or_else(|| panic!("expected first Swift member block"));
         let second_method_id = tree
             .find_block_node("Sources/App/Core.swift", &second_method)
-            .expect("expected second Swift member block");
+            .unwrap_or_else(|| panic!("expected second Swift member block"));
 
         assert_eq!(tree.parent(first_method_id), Some(container_id));
         assert_eq!(tree.parent(second_method_id), Some(container_id));

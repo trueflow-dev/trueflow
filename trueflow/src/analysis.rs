@@ -172,9 +172,9 @@ mod tests {
         let dir = std::env::temp_dir()
             .join("trueflow-analysis-tests")
             .join(Uuid::new_v4().to_string());
-        fs::create_dir_all(&dir).expect("create temp directory");
+        fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("create temp directory: {error}"));
         let path = dir.join(name);
-        fs::write(&path, contents).expect("write temp file");
+        fs::write(&path, contents).unwrap_or_else(|error| panic!("write temp file: {error}"));
         TempPath::new(path)
     }
 

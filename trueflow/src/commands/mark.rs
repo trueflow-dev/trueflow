@@ -122,10 +122,10 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         line,
     } = params;
 
-    let target_kind = infer_target_kind(target_kind, &fingerprint)?;
+    let path_hint = path.map(RepoPath::new).transpose()?;
+    let target_kind = infer_target_kind(target_kind, &fingerprint, path_hint.as_ref(), line)?;
     let target = target_kind.parse_target(&fingerprint)?;
     let check = ReviewCheck::new(check)?;
-    let path_hint = path.map(RepoPath::new).transpose()?;
     let block_state: BlockState = vcs::block_state_for_path(
         &repo_snapshot,
         path_hint.as_ref().map(RepoPath::as_str),
@@ -182,6 +182,8 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
 fn infer_target_kind(
     explicit: Option<ReviewTargetKind>,
     fingerprint: &str,
+    path_hint: Option<&RepoPath>,
+    line_hint: Option<u32>,
 ) -> Result<ReviewTargetKind> {
     if let Some(kind) = explicit {
         return Ok(kind);
@@ -191,11 +193,63 @@ fn infer_target_kind(
         return Ok(ReviewTargetKind::Diff);
     }
 
+    if let Some(kind) =
+        infer_target_kind_from_current_tree_location(fingerprint, path_hint, line_hint)?
+    {
+        return Ok(kind);
+    }
+
     if let Some(kind) = infer_target_kind_from_current_tree(fingerprint)? {
         return Ok(kind);
     }
 
     Ok(ReviewTargetKind::Block)
+}
+
+fn infer_target_kind_from_current_tree_location(
+    fingerprint: &str,
+    path_hint: Option<&RepoPath>,
+    line_hint: Option<u32>,
+) -> Result<Option<ReviewTargetKind>> {
+    let Some(path_hint) = path_hint else {
+        return Ok(None);
+    };
+    let scan_result = match crate::scanner::scan_directory(".", &ScanOptions::default()) {
+        Ok(scan_result) => scan_result,
+        Err(_) => return Ok(None),
+    };
+    let tree = tree::build_tree_from_files(&scan_result.files);
+
+    if let Some(line_hint) = line_hint {
+        for node in tree.nodes() {
+            if node.kind != TreeNodeKind::Block
+                || node.path != *path_hint
+                || node.hash.as_str() != fingerprint
+            {
+                continue;
+            }
+            let Some(block) = node.block.as_ref() else {
+                continue;
+            };
+            if u32::try_from(block.start_line).ok() == Some(line_hint) {
+                return Ok(Some(ReviewTargetKind::Block));
+            }
+        }
+    }
+
+    for node in tree.nodes() {
+        if node.path != *path_hint || node.hash.as_str() != fingerprint {
+            continue;
+        }
+        let kind = match node.kind {
+            TreeNodeKind::Root | TreeNodeKind::Directory => ReviewTargetKind::Tree,
+            TreeNodeKind::File => ReviewTargetKind::File,
+            TreeNodeKind::Block => ReviewTargetKind::Block,
+        };
+        return Ok(Some(kind));
+    }
+
+    Ok(None)
 }
 
 fn infer_target_kind_from_current_tree(fingerprint: &str) -> Result<Option<ReviewTargetKind>> {
@@ -237,17 +291,19 @@ fn looks_like_current_diff_fingerprint(fingerprint: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn parse_diff_fingerprint_inputs(lines: &[String]) -> (String, String, String) {
+fn parse_diff_fingerprint_inputs(lines: &[vcs::DiffHunkLine]) -> (String, String, String) {
     let mut diff_content = String::new();
     let mut context = String::new();
     let mut hash_body = String::new();
 
     for line in lines {
-        if line.starts_with(' ') {
-            context.push_str(line);
-        } else if line.starts_with('+') || line.starts_with('-') {
-            diff_content.push_str(line);
-            hash_body.push_str(line);
+        match line.kind {
+            vcs::DiffLineKind::Context => context.push_str(&line.as_unified_line()),
+            vcs::DiffLineKind::Added | vcs::DiffLineKind::Removed => {
+                let unified = line.as_unified_line();
+                diff_content.push_str(&unified);
+                hash_body.push_str(&unified);
+            }
         }
     }
 

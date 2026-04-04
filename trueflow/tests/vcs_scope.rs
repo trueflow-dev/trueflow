@@ -63,17 +63,17 @@ fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
     )?;
 
     assert!(!hunks.is_empty(), "expected at least one hunk");
-    let lines: Vec<&str> = hunks
+    let lines = hunks
         .iter()
         .flat_map(|hunk| hunk.lines.iter())
-        .map(String::as_str)
-        .collect();
+        .map(|line| line.as_unified_line())
+        .collect::<Vec<_>>();
     assert!(
-        lines.contains(&"+    2\n"),
+        lines.iter().any(|line| line == "+    2\n"),
         "expected selected revision diff to include value 2"
     );
     assert!(
-        !lines.contains(&"+    3\n"),
+        !lines.iter().any(|line| line == "+    3\n"),
         "selected revision diff should not include later HEAD changes"
     );
 

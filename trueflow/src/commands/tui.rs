@@ -198,7 +198,7 @@ struct AppState {
     viewport_height: u16,
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
-    file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
+    file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     speed_read_config: TuiSpeedReadConfig,
@@ -2398,31 +2398,41 @@ fn build_block_diff_lines(
     let diff_path =
         repo_relative_path_for_diff(node.path.as_str(), state.workdir_prefix.as_deref());
     let path = PathBuf::from(&diff_path);
-    let hunks = ensure_cached_diff_hunks(&mut state.file_diff_cache, &path, || {
+    let file_diff = ensure_cached_file_diff(&mut state.file_diff_cache, &path, || {
         let query = diff_query_for_scope(&state.review_scope, &diff_path);
         let repo = vcs::repo_from_workdir()?;
         match query {
-            DiffQuery::MainDiff { path } => vcs::diff_hunks_for_file(&repo, &RepoPath::new(path)?),
+            DiffQuery::MainDiff { path } => vcs::diff_for_file(&repo, &RepoPath::new(path)?),
             DiffQuery::Revision { revision, path } => {
-                vcs::diff_hunks_for_file_in_revision(&repo, &revision, &RepoPath::new(path)?)
+                vcs::diff_for_file_in_revision(&repo, &revision, &RepoPath::new(path)?)
             }
             DiffQuery::RevisionRange { start, end, path } => {
-                vcs::diff_hunks_for_file_in_range(&repo, &start, &end, &RepoPath::new(path)?)
+                vcs::diff_for_file_in_range(&repo, &start, &end, &RepoPath::new(path)?)
             }
         }
     });
-    let diff_view =
-        vcs::extract_block_diff_view_for_block(block, hunks, state.block_diff_focus_mode);
+    let diff_analysis =
+        vcs::analyze_block_diff_for_file(block, file_diff, state.block_diff_focus_mode);
 
-    let Some(view) = diff_view else {
-        // Fallback to source view if no diff overlap found (e.g. new file not in diff, or moved code?)
-        // Or should we say "(No diff changes in this block)"?
-        // User requested diff view. If block is pure addition, maybe diff covers it?
-        // If the block is unchanged in the diff (e.g. we are reviewing it for other reasons),
-        // we should probably say so.
+    let Some(view) = diff_analysis.view else {
+        let message = match diff_analysis.change_kind {
+            vcs::BlockDiffChangeKind::NoTextChanges => "(No diff changes in this block)",
+            vcs::BlockDiffChangeKind::OnlyNonreviewableChurn => {
+                "(Only nonreviewable formatting churn in this block)"
+            }
+            vcs::BlockDiffChangeKind::ReviewableChanges => {
+                "(Diff analysis did not produce view output)"
+            }
+            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::Binary) => {
+                "(Diff unavailable for binary file)"
+            }
+            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::External) => {
+                "(Diff unavailable from external diff command)"
+            }
+        };
         return (
             vec![Line::from(Span::styled(
-                "(No diff changes in this block)",
+                message,
                 Style::default().fg(palette.dim).bg(palette.code_bg),
             ))],
             1,
@@ -2482,18 +2492,20 @@ fn format_diff_line_number(line: Option<u32>) -> String {
     }
 }
 
-fn ensure_cached_diff_hunks<'a, F>(
-    cache: &'a mut HashMap<PathBuf, Vec<vcs::DiffHunk>>,
+fn ensure_cached_file_diff<'a, F>(
+    cache: &'a mut HashMap<PathBuf, vcs::FileDiff>,
     path: &Path,
-    load_hunks: F,
-) -> &'a [vcs::DiffHunk]
+    load_file_diff: F,
+) -> &'a vcs::FileDiff
 where
-    F: FnOnce() -> Result<Vec<vcs::DiffHunk>>,
+    F: FnOnce() -> Result<vcs::FileDiff>,
 {
-    let entry = cache
-        .entry(path.to_path_buf())
-        .or_insert_with(|| load_hunks().unwrap_or_default());
-    entry.as_slice()
+    cache.entry(path.to_path_buf()).or_insert_with(|| {
+        load_file_diff().unwrap_or_else(|_| vcs::FileDiff::NoTextChanges {
+            path: RepoPath::new(path.to_string_lossy().as_ref())
+                .unwrap_or_else(|_| RepoPath::root()),
+        })
+    })
 }
 
 fn build_file_lines(
@@ -2999,7 +3011,7 @@ mod diff_scope_tests {
     fn build_test_state(
         review_scope: ReviewScope,
         workdir_prefix: Option<String>,
-        file_diff_cache: HashMap<PathBuf, Vec<vcs::DiffHunk>>,
+        file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
     ) -> AppState {
         let tree = TreeBuilder::new().finalize();
         let review_order = ReviewOrder::from_tree(&tree, &HashSet::new());
@@ -3298,18 +3310,21 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn ensure_cached_diff_hunks_inserts_empty_on_loader_error() {
+    fn ensure_cached_file_diff_inserts_no_text_changes_on_loader_error() {
         let mut cache = HashMap::new();
         let path = PathBuf::from("src/lib.rs");
 
-        let hunks = ensure_cached_diff_hunks(&mut cache, &path, || {
+        let file_diff = ensure_cached_file_diff(&mut cache, &path, || {
             Err(anyhow::anyhow!("repo unavailable"))
         });
 
-        assert!(hunks.is_empty(), "expected empty hunks on load failure");
+        assert!(
+            matches!(file_diff, vcs::FileDiff::NoTextChanges { .. }),
+            "expected no-text-changes fallback on load failure"
+        );
         assert!(
             cache.contains_key(&path),
-            "failed loads should still cache empty hunks"
+            "failed loads should still cache a fallback diff result"
         );
     }
 
@@ -3864,7 +3879,13 @@ mod diff_scope_tests {
                 summary: "Update greeting".to_string(),
             },
             Some("pkg".to_string()),
-            HashMap::from([(PathBuf::from("pkg/src/lib.rs"), hunks)]),
+            HashMap::from([(
+                PathBuf::from("pkg/src/lib.rs"),
+                vcs::FileDiff::Text {
+                    path: RepoPath::new("pkg/src/lib.rs").unwrap(),
+                    hunks,
+                },
+            )]),
         );
 
         let block = Block {

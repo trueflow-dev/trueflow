@@ -1032,9 +1032,12 @@ mod tests {
         let index = ReviewIndex::from_records(&approved, Some(&ReviewCheck::review()));
         let approved_targets = index.approved_targets();
 
-        assert!(approved_targets.contains_target(&ReviewTargetRef::Block {
-            hash: TreeHash::new("block-hash")
-        }));
+        assert!(approved_targets.contains_block(
+            &TreeHash::new("block-hash"),
+            &RepoPath::new("src/lib.rs").unwrap(),
+            1,
+            None,
+        ));
         assert!(approved_targets.contains_target(&ReviewTargetRef::File {
             hash: TreeHash::new("file-hash")
         }));

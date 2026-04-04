@@ -194,16 +194,18 @@ mod tests {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_swift::LANGUAGE.into())
-            .expect("load swift grammar");
-        parser.parse(source, None).expect("parse swift")
+            .unwrap_or_else(|error| panic!("load swift grammar: {error}"));
+        parser
+            .parse(source, None)
+            .unwrap_or_else(|| panic!("parse swift"))
     }
 
     fn find_type_body(root: Node<'_>) -> Node<'_> {
         let type_node = find_named_descendant(root, "class_declaration")
-            .expect("expected swift class_declaration");
+            .unwrap_or_else(|| panic!("expected swift class_declaration"));
         type_node
             .child_by_field_name("body")
-            .expect("expected swift type body")
+            .unwrap_or_else(|| panic!("expected swift type body"))
     }
 
     fn find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {

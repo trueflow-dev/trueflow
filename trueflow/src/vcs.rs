@@ -19,19 +19,76 @@ pub struct RepoSnapshot {
     repo: Option<gix::Repository>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DiffHunk {
-    pub file_path: RepoPath,
-    pub old_start: u32,
-    pub new_start: u32,
-    pub lines: Vec<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
     Context,
     Added,
     Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffHunkLine {
+    pub kind: DiffLineKind,
+    /// Original line content without the leading unified-diff prefix.
+    /// Trailing newlines are preserved if present.
+    pub text: String,
+}
+
+impl DiffHunkLine {
+    pub fn context(text: impl Into<String>) -> Self {
+        Self {
+            kind: DiffLineKind::Context,
+            text: text.into(),
+        }
+    }
+
+    pub fn added(text: impl Into<String>) -> Self {
+        Self {
+            kind: DiffLineKind::Added,
+            text: text.into(),
+        }
+    }
+
+    pub fn removed(text: impl Into<String>) -> Self {
+        Self {
+            kind: DiffLineKind::Removed,
+            text: text.into(),
+        }
+    }
+
+    pub fn as_unified_line(&self) -> String {
+        let prefix = match self.kind {
+            DiffLineKind::Context => ' ',
+            DiffLineKind::Added => '+',
+            DiffLineKind::Removed => '-',
+        };
+        format!("{prefix}{}", self.text)
+    }
+
+    fn from_unified_line(line: &str) -> Option<Self> {
+        if let Some(text) = line.strip_prefix(' ') {
+            return Some(Self::context(format!("{text}\n")));
+        }
+        if let Some(text) = line.strip_prefix('+') {
+            return Some(Self::added(format!("{text}\n")));
+        }
+        if let Some(text) = line.strip_prefix('-') {
+            return Some(Self::removed(format!("{text}\n")));
+        }
+        None
+    }
+
+    fn display_text(&self) -> &str {
+        self.text.trim_end_matches('\n')
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffHunk {
+    pub file_path: RepoPath,
+    pub old_start: u32,
+    pub new_start: u32,
+    pub lines: Vec<DiffHunkLine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +100,27 @@ pub struct DiffLine {
     pub is_focus: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileDiffUnavailableReason {
+    Binary,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileDiff {
+    Text {
+        path: RepoPath,
+        hunks: Vec<DiffHunk>,
+    },
+    NoTextChanges {
+        path: RepoPath,
+    },
+    Unavailable {
+        path: RepoPath,
+        reason: FileDiffUnavailableReason,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockDiffFocusMode {
     WholeBlock,
@@ -52,6 +130,20 @@ pub enum BlockDiffFocusMode {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockDiffView {
     pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockDiffChangeKind {
+    NoTextChanges,
+    OnlyNonreviewableChurn,
+    ReviewableChanges,
+    DiffUnavailable(FileDiffUnavailableReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockDiffAnalysis {
+    pub change_kind: BlockDiffChangeKind,
+    pub view: Option<BlockDiffView>,
 }
 
 pub struct GitConfig {
@@ -289,14 +381,32 @@ fn file_state_for_path_in_tree(
 }
 
 pub fn diff_main_to_head() -> Result<Vec<DiffHunk>> {
+    Ok(diff_main_to_head_files()?
+        .into_iter()
+        .filter_map(|file_diff| match file_diff {
+            FileDiff::Text { hunks, .. } => Some(hunks),
+            FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => None,
+        })
+        .flatten()
+        .collect())
+}
+
+pub(crate) fn diff_main_to_head_files() -> Result<Vec<FileDiff>> {
     let repo = repo_from_workdir()?;
     let (base_tree, head_tree) = main_and_head_trees(&repo)?;
     diff_trees(&repo, &base_tree, &head_tree)
 }
 
 pub fn diff_hunks_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<DiffHunk>> {
+    Ok(match diff_for_file(repo, path)? {
+        FileDiff::Text { hunks, .. } => hunks,
+        FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => Vec::new(),
+    })
+}
+
+pub(crate) fn diff_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<FileDiff> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
-    diff_hunks_for_file_between_trees(repo, &base_tree, &head_tree, path)
+    diff_for_file_between_trees(repo, &base_tree, &head_tree, path)
 }
 
 pub fn diff_hunks_for_file_in_revision(
@@ -304,6 +414,17 @@ pub fn diff_hunks_for_file_in_revision(
     revision: &str,
     path: &RepoPath,
 ) -> Result<Vec<DiffHunk>> {
+    Ok(match diff_for_file_in_revision(repo, revision, path)? {
+        FileDiff::Text { hunks, .. } => hunks,
+        FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => Vec::new(),
+    })
+}
+
+pub(crate) fn diff_for_file_in_revision(
+    repo: &gix::Repository,
+    revision: &str,
+    path: &RepoPath,
+) -> Result<FileDiff> {
     let object = repo.rev_parse_single(revision)?;
     let commit = object
         .object()?
@@ -315,7 +436,7 @@ pub fn diff_hunks_for_file_in_revision(
     } else {
         repo.empty_tree()
     };
-    diff_hunks_for_file_between_trees(repo, &base_tree, &head_tree, path)
+    diff_for_file_between_trees(repo, &base_tree, &head_tree, path)
 }
 
 pub fn diff_hunks_for_file_in_range(
@@ -324,6 +445,18 @@ pub fn diff_hunks_for_file_in_range(
     end: &str,
     path: &RepoPath,
 ) -> Result<Vec<DiffHunk>> {
+    Ok(match diff_for_file_in_range(repo, start, end, path)? {
+        FileDiff::Text { hunks, .. } => hunks,
+        FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => Vec::new(),
+    })
+}
+
+pub(crate) fn diff_for_file_in_range(
+    repo: &gix::Repository,
+    start: &str,
+    end: &str,
+    path: &RepoPath,
+) -> Result<FileDiff> {
     let start_obj = repo.rev_parse_single(start)?;
     let end_obj = repo.rev_parse_single(end)?;
     let start_commit = start_obj
@@ -336,16 +469,15 @@ pub fn diff_hunks_for_file_in_range(
         .context("end revision must resolve to a commit")?;
     let start_tree = start_commit.tree()?;
     let end_tree = end_commit.tree()?;
-    diff_hunks_for_file_between_trees(repo, &start_tree, &end_tree, path)
+    diff_for_file_between_trees(repo, &start_tree, &end_tree, path)
 }
 
-fn diff_hunks_for_file_between_trees(
+fn diff_for_file_between_trees(
     repo: &gix::Repository,
     base_tree: &gix::Tree<'_>,
     head_tree: &gix::Tree<'_>,
     path: &RepoPath,
-) -> Result<Vec<DiffHunk>> {
-    let mut hunks = Vec::new();
+) -> Result<FileDiff> {
     let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
 
     let changes = repo.diff_tree_to_tree(Some(base_tree), Some(head_tree), None)?;
@@ -357,30 +489,52 @@ fn diff_hunks_for_file_between_trees(
         }
 
         diff_cache.set_resource_by_change(change_ref, &repo.objects)?;
-        let prep = diff_cache.prepare_diff()?;
-        if let gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } =
-            prep.operation
-        {
-            let input = prep.interned_input();
-            let sink = gix::diff::blob::UnifiedDiff::new(
-                &input,
-                gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(String::new(), "\n"),
-                gix::diff::blob::unified_diff::ContextSize::symmetrical(3),
-            );
-            let unified = gix::diff::blob::diff(algorithm, &input, sink)?;
-            collect_hunks(&mut hunks, path, &unified)?;
-        }
-        break; // Found our file
+        let file_diff = file_diff_from_change(&mut diff_cache, path.clone())?;
+        diff_cache.clear_resource_cache_keep_allocation();
+        return Ok(file_diff);
     }
 
-    Ok(hunks)
+    Ok(FileDiff::NoTextChanges { path: path.clone() })
 }
 
-pub fn extract_block_diff_view_for_block(
+pub(crate) fn extract_block_diff_view_for_block(
     block: &Block,
     hunks: &[DiffHunk],
     focus_mode: BlockDiffFocusMode,
-) -> Option<BlockDiffView> {
+) -> BlockDiffAnalysis {
+    analyze_block_diff_hunks(block, hunks, focus_mode)
+}
+
+pub(crate) fn analyze_block_diff_for_file(
+    block: &Block,
+    file_diff: &FileDiff,
+    focus_mode: BlockDiffFocusMode,
+) -> BlockDiffAnalysis {
+    match file_diff {
+        FileDiff::Text { hunks, .. } => extract_block_diff_view_for_block(block, hunks, focus_mode),
+        FileDiff::NoTextChanges { .. } => BlockDiffAnalysis {
+            change_kind: BlockDiffChangeKind::NoTextChanges,
+            view: None,
+        },
+        FileDiff::Unavailable { reason, .. } => BlockDiffAnalysis {
+            change_kind: BlockDiffChangeKind::DiffUnavailable(*reason),
+            view: None,
+        },
+    }
+}
+
+pub(crate) fn block_has_changed_lines_in_diff(
+    block: &Block,
+    hunks: &[DiffHunk],
+) -> BlockDiffChangeKind {
+    analyze_block_diff_hunks(block, hunks, BlockDiffFocusMode::WholeBlock).change_kind
+}
+
+fn analyze_block_diff_hunks(
+    block: &Block,
+    hunks: &[DiffHunk],
+    focus_mode: BlockDiffFocusMode,
+) -> BlockDiffAnalysis {
     let start = usize_to_u32_saturating(block.start_line).saturating_add(1); // 1-based for diff
     let end_exclusive = usize_to_u32_saturating(block.end_line).saturating_add(1);
 
@@ -402,36 +556,35 @@ pub fn extract_block_diff_view_for_block(
     }
 
     if lines.is_empty() {
-        return None;
+        return BlockDiffAnalysis {
+            change_kind: BlockDiffChangeKind::NoTextChanges,
+            view: None,
+        };
     }
 
     if let BlockDiffFocusMode::ChangedWithContext { context_lines } = focus_mode {
         lines = keep_changed_with_context(lines, context_lines);
-        if lines.is_empty() {
-            return None;
-        }
     }
 
-    Some(BlockDiffView { lines })
-}
-
-pub fn block_has_changed_lines_in_diff(block: &Block, hunks: &[DiffHunk]) -> bool {
-    let Some(view) =
-        extract_block_diff_view_for_block(block, hunks, BlockDiffFocusMode::WholeBlock)
-    else {
-        return false;
-    };
-
+    let view = BlockDiffView { lines };
     let changed_lines = view
         .lines
         .iter()
         .filter(|line| line.kind != DiffLineKind::Context)
         .collect::<Vec<_>>();
-    if changed_lines.is_empty() {
-        return false;
-    }
 
-    !all_changed_lines_are_nonreviewable(&changed_lines)
+    let change_kind = if changed_lines.is_empty() {
+        BlockDiffChangeKind::NoTextChanges
+    } else if all_changed_lines_are_nonreviewable(&changed_lines) {
+        BlockDiffChangeKind::OnlyNonreviewableChurn
+    } else {
+        BlockDiffChangeKind::ReviewableChanges
+    };
+
+    BlockDiffAnalysis {
+        change_kind,
+        view: Some(view),
+    }
 }
 
 fn all_changed_lines_are_nonreviewable(changed_lines: &[&DiffLine]) -> bool {
@@ -443,10 +596,8 @@ fn all_changed_lines_are_nonreviewable(changed_lines: &[&DiffLine]) -> bool {
             continue;
         }
 
-        if let Some(next) = changed_lines.get(index + 1)
-            && is_trivial_formatting_only_replacement(line, next)
-        {
-            index += 2;
+        if let Some(consumed) = trivial_formatting_only_replacement_run(&changed_lines[index..]) {
+            index += consumed;
             continue;
         }
 
@@ -454,6 +605,66 @@ fn all_changed_lines_are_nonreviewable(changed_lines: &[&DiffLine]) -> bool {
     }
 
     true
+}
+
+fn trivial_formatting_only_replacement_run(changed_lines: &[&DiffLine]) -> Option<usize> {
+    trivial_formatting_only_replacement_run_for_order(
+        changed_lines,
+        DiffLineKind::Removed,
+        DiffLineKind::Added,
+    )
+    .or_else(|| {
+        trivial_formatting_only_replacement_run_for_order(
+            changed_lines,
+            DiffLineKind::Added,
+            DiffLineKind::Removed,
+        )
+    })
+}
+
+fn trivial_formatting_only_replacement_run_for_order(
+    changed_lines: &[&DiffLine],
+    first_kind: DiffLineKind,
+    second_kind: DiffLineKind,
+) -> Option<usize> {
+    let mut first_run = Vec::new();
+    let mut second_run = Vec::new();
+    let mut index = 0;
+
+    while let Some(line) = changed_lines.get(index).copied() {
+        if line.kind != first_kind {
+            break;
+        }
+        first_run.push(line);
+        index += 1;
+    }
+
+    while let Some(line) = changed_lines.get(index).copied() {
+        if line.kind != second_kind {
+            break;
+        }
+        second_run.push(line);
+        index += 1;
+    }
+
+    if first_run.is_empty() || second_run.is_empty() {
+        return None;
+    }
+
+    let first_trimmed = first_run
+        .iter()
+        .map(|line| line.text.trim())
+        .collect::<Vec<_>>();
+    let second_trimmed = second_run
+        .iter()
+        .map(|line| line.text.trim())
+        .collect::<Vec<_>>();
+
+    if first_trimmed == second_trimmed && first_trimmed.iter().any(|line| !line.is_empty()) {
+        Some(index)
+    } else {
+        None
+    }
 }
 
 fn is_trivial_closing_brace_addition(line: &DiffLine) -> bool {
@@ -485,18 +696,6 @@ fn is_trivial_closing_brace_addition(line: &DiffLine) -> bool {
 
 fn is_trivial_whitespace_only_change(line: &DiffLine) -> bool {
     matches!(line.kind, DiffLineKind::Added | DiffLineKind::Removed) && line.text.trim().is_empty()
-}
-
-fn is_trivial_formatting_only_replacement(first: &DiffLine, second: &DiffLine) -> bool {
-    // This conservative comparison intentionally treats leading/trailing trivia as
-    // non-reviewable churn for replacement pairs. That includes indentation-only,
-    // trailing-whitespace-only, CRLF/LF-only, and missing-final-newline-only diffs,
-    // while still keeping internal spacing changes reviewable.
-    matches!(
-        (first.kind, second.kind),
-        (DiffLineKind::Removed, DiffLineKind::Added) | (DiffLineKind::Added, DiffLineKind::Removed)
-    ) && !first.text.trim().is_empty()
-        && first.text.trim() == second.text.trim()
 }
 
 pub fn files_changed_main_to_head() -> Result<HashSet<RepoPath>> {
@@ -586,8 +785,8 @@ fn diff_trees(
     repo: &gix::Repository,
     base_tree: &gix::Tree<'_>,
     head_tree: &gix::Tree<'_>,
-) -> Result<Vec<DiffHunk>> {
-    let mut hunks = Vec::new();
+) -> Result<Vec<FileDiff>> {
+    let mut file_diffs = Vec::new();
     let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
     let changes = repo.diff_tree_to_tree(Some(base_tree), Some(head_tree), None)?;
 
@@ -601,31 +800,51 @@ fn diff_trees(
             continue;
         }
 
+        let path = RepoPath::new(location.to_str_lossy().as_ref())?;
         diff_cache.set_resource_by_change(change_ref, &repo.objects)?;
-        let prep = diff_cache.prepare_diff()?;
-        match prep.operation {
-            gix::diff::blob::platform::prepare_diff::Operation::SourceOrDestinationIsBinary
-            | gix::diff::blob::platform::prepare_diff::Operation::ExternalCommand { .. } => {
-                diff_cache.clear_resource_cache_keep_allocation();
-                continue;
-            }
-            gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } => {
-                let input = prep.interned_input();
-                let sink = gix::diff::blob::UnifiedDiff::new(
-                    &input,
-                    gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(String::new(), "\n"),
-                    gix::diff::blob::unified_diff::ContextSize::symmetrical(3),
-                );
-                let unified = gix::diff::blob::diff(algorithm, &input, sink)?;
-                let path = RepoPath::new(location.to_str_lossy().as_ref())?;
-                collect_hunks(&mut hunks, &path, &unified)?;
-            }
-        }
-
+        let file_diff = file_diff_from_change(&mut diff_cache, path)?;
         diff_cache.clear_resource_cache_keep_allocation();
+        file_diffs.push(file_diff);
     }
 
-    Ok(hunks)
+    Ok(file_diffs)
+}
+
+fn file_diff_from_change(
+    diff_cache: &mut gix::diff::blob::Platform,
+    path: RepoPath,
+) -> Result<FileDiff> {
+    let prep = diff_cache.prepare_diff()?;
+    match prep.operation {
+        gix::diff::blob::platform::prepare_diff::Operation::SourceOrDestinationIsBinary => {
+            Ok(FileDiff::Unavailable {
+                path,
+                reason: FileDiffUnavailableReason::Binary,
+            })
+        }
+        gix::diff::blob::platform::prepare_diff::Operation::ExternalCommand { .. } => {
+            Ok(FileDiff::Unavailable {
+                path,
+                reason: FileDiffUnavailableReason::External,
+            })
+        }
+        gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } => {
+            let input = prep.interned_input();
+            let sink = gix::diff::blob::UnifiedDiff::new(
+                &input,
+                gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(String::new(), "\n"),
+                gix::diff::blob::unified_diff::ContextSize::symmetrical(3),
+            );
+            let unified = gix::diff::blob::diff(algorithm, &input, sink)?;
+            let mut hunks = Vec::new();
+            collect_hunks(&mut hunks, &path, &unified)?;
+            if hunks.is_empty() {
+                Ok(FileDiff::NoTextChanges { path })
+            } else {
+                Ok(FileDiff::Text { path, hunks })
+            }
+        }
+    }
 }
 
 fn main_and_head_trees<'repo>(
@@ -698,9 +917,9 @@ fn collect_hunks(hunks: &mut Vec<DiffHunk>, path: &RepoPath, unified: &str) -> R
             continue;
         }
         if let Some(hunk) = &mut current
-            && (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
+            && let Some(line) = DiffHunkLine::from_unified_line(line)
         {
-            hunk.lines.push(format!("{line}\n"));
+            hunk.lines.push(line);
         }
     }
     if let Some(hunk) = current {
@@ -745,40 +964,38 @@ fn positioned_hunk_lines(hunk: &DiffHunk) -> Vec<PositionedDiffLine> {
     let mut lines = Vec::new();
 
     for line in &hunk.lines {
-        if let Some(text) = line.strip_prefix(' ') {
-            lines.push(PositionedDiffLine {
-                kind: DiffLineKind::Context,
-                old_line: Some(old_line),
-                new_line: Some(new_line),
-                anchor_new_line: new_line,
-                text: text.trim_end_matches('\n').to_string(),
-            });
-            old_line = old_line.saturating_add(1);
-            new_line = new_line.saturating_add(1);
-            continue;
-        }
-
-        if let Some(text) = line.strip_prefix('+') {
-            lines.push(PositionedDiffLine {
-                kind: DiffLineKind::Added,
-                old_line: None,
-                new_line: Some(new_line),
-                anchor_new_line: new_line,
-                text: text.trim_end_matches('\n').to_string(),
-            });
-            new_line = new_line.saturating_add(1);
-            continue;
-        }
-
-        if let Some(text) = line.strip_prefix('-') {
-            lines.push(PositionedDiffLine {
-                kind: DiffLineKind::Removed,
-                old_line: Some(old_line),
-                new_line: None,
-                anchor_new_line: new_line,
-                text: text.trim_end_matches('\n').to_string(),
-            });
-            old_line = old_line.saturating_add(1);
+        match line.kind {
+            DiffLineKind::Context => {
+                lines.push(PositionedDiffLine {
+                    kind: DiffLineKind::Context,
+                    old_line: Some(old_line),
+                    new_line: Some(new_line),
+                    anchor_new_line: new_line,
+                    text: line.display_text().to_string(),
+                });
+                old_line = old_line.saturating_add(1);
+                new_line = new_line.saturating_add(1);
+            }
+            DiffLineKind::Added => {
+                lines.push(PositionedDiffLine {
+                    kind: DiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(new_line),
+                    anchor_new_line: new_line,
+                    text: line.display_text().to_string(),
+                });
+                new_line = new_line.saturating_add(1);
+            }
+            DiffLineKind::Removed => {
+                lines.push(PositionedDiffLine {
+                    kind: DiffLineKind::Removed,
+                    old_line: Some(old_line),
+                    new_line: None,
+                    anchor_new_line: new_line,
+                    text: line.display_text().to_string(),
+                });
+                old_line = old_line.saturating_add(1);
+            }
         }
     }
 
@@ -824,6 +1041,12 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
 mod tests {
     use super::*;
 
+    fn unified(line: &str) -> DiffHunkLine {
+        let line = line.trim_end_matches('\n');
+        DiffHunkLine::from_unified_line(line)
+            .unwrap_or_else(|| panic!("expected valid unified diff line: {line:?}"))
+    }
+
     #[test]
     fn parse_hunk_header_extracts_positions() {
         let header = "@@ -10,2 +12,4 @@";
@@ -842,10 +1065,13 @@ mod tests {
         assert_eq!(hunks[0].file_path, RepoPath::new("src/main.rs").unwrap());
         assert_eq!(hunks[0].old_start, 1);
         assert_eq!(hunks[0].new_start, 1);
-        assert_eq!(hunks[0].lines, vec!["-foo\n", "+foo\n", "+bar\n"]);
+        assert_eq!(
+            hunks[0].lines,
+            vec![unified("-foo\n"), unified("+foo\n"), unified("+bar\n")]
+        );
         assert_eq!(hunks[1].old_start, 5);
         assert_eq!(hunks[1].new_start, 6);
-        assert_eq!(hunks[1].lines, vec!["-baz\n", "+qux\n"]);
+        assert_eq!(hunks[1].lines, vec![unified("-baz\n"), unified("+qux\n")]);
     }
 
     #[test]
@@ -866,21 +1092,21 @@ mod tests {
             file_path: RepoPath::root(),
             old_start: 12,
             new_start: 12, // Inside block
-            lines: vec!["+line12\n".to_string()],
+            lines: vec![unified("+line12\n")],
         };
 
         let hunk_before = DiffHunk {
             file_path: RepoPath::root(),
             old_start: 5,
             new_start: 5,
-            lines: vec!["+line5\n".to_string()],
+            lines: vec![unified("+line5\n")],
         };
 
         let hunk_after = DiffHunk {
             file_path: RepoPath::root(),
             old_start: 25,
             new_start: 25,
-            lines: vec!["+line25\n".to_string()],
+            lines: vec![unified("+line25\n")],
         };
 
         // Case 1: Overlap
@@ -889,11 +1115,11 @@ mod tests {
             std::slice::from_ref(&hunk_inside),
             BlockDiffFocusMode::WholeBlock,
         );
-        assert!(result.is_some());
-        let lines = match result {
-            Some(view) => view.lines,
-            None => panic!("expected overlap"),
-        };
+        assert_eq!(result.change_kind, BlockDiffChangeKind::ReviewableChanges);
+        let lines = result
+            .view
+            .unwrap_or_else(|| panic!("expected overlap"))
+            .lines;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].kind, DiffLineKind::Added);
         assert_eq!(lines[0].text, "line12".to_string());
@@ -904,7 +1130,8 @@ mod tests {
             &[hunk_before.clone(), hunk_after.clone()],
             BlockDiffFocusMode::WholeBlock,
         );
-        assert!(result.is_none());
+        assert_eq!(result.change_kind, BlockDiffChangeKind::NoTextChanges);
+        assert!(result.view.is_none());
 
         // Case 3: Mixed
         let result = extract_block_diff_view_for_block(
@@ -912,11 +1139,11 @@ mod tests {
             &[hunk_before, hunk_inside, hunk_after],
             BlockDiffFocusMode::WholeBlock,
         );
-        assert!(result.is_some());
-        let lines = match result {
-            Some(view) => view.lines,
-            None => panic!("expected overlap"),
-        };
+        assert_eq!(result.change_kind, BlockDiffChangeKind::ReviewableChanges);
+        let lines = result
+            .view
+            .unwrap_or_else(|| panic!("expected overlap"))
+            .lines;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].kind, DiffLineKind::Added);
         assert_eq!(lines[0].text, "line12".to_string());
@@ -940,7 +1167,7 @@ mod tests {
             file_path: RepoPath::root(),
             old_start: 21,
             new_start: 21, // outside the block range
-            lines: vec!["+line21\n".to_string()],
+            lines: vec![unified("+line21\n")],
         };
 
         let result = extract_block_diff_view_for_block(
@@ -948,7 +1175,8 @@ mod tests {
             &[hunk_at_exclusive_end],
             BlockDiffFocusMode::WholeBlock,
         );
-        assert!(result.is_none(), "exclusive end_line must not overlap");
+        assert_eq!(result.change_kind, BlockDiffChangeKind::NoTextChanges);
+        assert!(result.view.is_none(), "exclusive end_line must not overlap");
     }
 
     #[test]
@@ -970,21 +1198,17 @@ mod tests {
             old_start: 10,
             new_start: 10,
             lines: vec![
-                " keep_before\n".to_string(),
-                "-old_value\n".to_string(),
-                "+new_value\n".to_string(),
-                " keep_after\n".to_string(),
+                unified(" keep_before\n"),
+                unified("-old_value\n"),
+                unified("+new_value\n"),
+                unified(" keep_after\n"),
             ],
         };
 
-        let view = match extract_block_diff_view_for_block(
-            &block,
-            &[hunk],
-            BlockDiffFocusMode::WholeBlock,
-        ) {
-            Some(view) => view,
-            None => panic!("expected overlap"),
-        };
+        let view =
+            extract_block_diff_view_for_block(&block, &[hunk], BlockDiffFocusMode::WholeBlock)
+                .view
+                .unwrap_or_else(|| panic!("expected overlap"));
 
         assert_eq!(view.lines.len(), 4);
         assert_eq!(view.lines[0].kind, DiffLineKind::Context);
@@ -1024,23 +1248,22 @@ mod tests {
             old_start: 11,
             new_start: 11,
             lines: vec![
-                " ctx1\n".to_string(),
-                " ctx2\n".to_string(),
-                "-old\n".to_string(),
-                "+new\n".to_string(),
-                " ctx3\n".to_string(),
-                " ctx4\n".to_string(),
+                unified(" ctx1\n"),
+                unified(" ctx2\n"),
+                unified("-old\n"),
+                unified("+new\n"),
+                unified(" ctx3\n"),
+                unified(" ctx4\n"),
             ],
         };
 
-        let view = match extract_block_diff_view_for_block(
+        let view = extract_block_diff_view_for_block(
             &block,
             &[hunk],
             BlockDiffFocusMode::ChangedWithContext { context_lines: 1 },
-        ) {
-            Some(view) => view,
-            None => panic!("expected overlap"),
-        };
+        )
+        .view
+        .unwrap_or_else(|| panic!("expected overlap"));
 
         let rendered = view
             .lines
@@ -1077,21 +1300,17 @@ mod tests {
             old_start: 10,
             new_start: 10,
             lines: vec![
-                " before\n".to_string(),
-                "-removed\n".to_string(),
-                "+added\n".to_string(),
-                " after\n".to_string(),
+                unified(" before\n"),
+                unified("-removed\n"),
+                unified("+added\n"),
+                unified(" after\n"),
             ],
         };
 
-        let view = match extract_block_diff_view_for_block(
-            &block,
-            &[hunk],
-            BlockDiffFocusMode::WholeBlock,
-        ) {
-            Some(view) => view,
-            None => panic!("expected overlap"),
-        };
+        let view =
+            extract_block_diff_view_for_block(&block, &[hunk], BlockDiffFocusMode::WholeBlock)
+                .view
+                .unwrap_or_else(|| panic!("expected overlap"));
         assert!(
             view.lines
                 .iter()
@@ -1102,20 +1321,21 @@ mod tests {
 
     #[test]
     fn collect_hunks_ignores_no_newline_metadata_lines() {
-        let unified =
+        let unified_text =
             "@@ -1 +1 @@\n-let value = 42;\n\\ No newline at end of file\n+let value = 42;\n";
         let mut hunks = Vec::new();
 
-        collect_hunks(&mut hunks, &RepoPath::new("src/lib.rs").unwrap(), unified)
-            .unwrap_or_else(|error| panic!("collect hunks should succeed: {error}"));
+        collect_hunks(
+            &mut hunks,
+            &RepoPath::new("src/lib.rs").unwrap(),
+            unified_text,
+        )
+        .unwrap_or_else(|error| panic!("collect hunks should succeed: {error}"));
 
         assert_eq!(hunks.len(), 1);
         assert_eq!(
             hunks[0].lines,
-            vec![
-                "-let value = 42;\n".to_string(),
-                "+let value = 42;\n".to_string()
-            ]
+            vec![unified("-let value = 42;\n"), unified("+let value = 42;\n")]
         );
     }
 
@@ -1137,11 +1357,12 @@ mod tests {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
-            lines: vec!["+}\n".to_string()],
+            lines: vec![unified("+}\n")],
         };
 
-        assert!(
-            !block_has_changed_lines_in_diff(&block, &[hunk]),
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
             "brace-only additions should not mark a block as changed for review"
         );
     }
@@ -1164,11 +1385,12 @@ mod tests {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
-            lines: vec!["+    \n".to_string(), "+\t\n".to_string()],
+            lines: vec![unified("+    \n"), unified("+\t\n")],
         };
 
-        assert!(
-            !block_has_changed_lines_in_diff(&block, &[hunk]),
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
             "whitespace-only additions should not mark a block as changed for review"
         );
     }
@@ -1191,11 +1413,12 @@ mod tests {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
-            lines: vec!["-    \n".to_string(), "-\t\n".to_string()],
+            lines: vec![unified("-    \n"), unified("-\t\n")],
         };
 
-        assert!(
-            !block_has_changed_lines_in_diff(&block, &[hunk]),
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
             "whitespace-only removals should not mark a block as changed for review"
         );
     }
@@ -1218,11 +1441,12 @@ mod tests {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
-            lines: vec!["+    \n".to_string(), "+let value = 42;\n".to_string()],
+            lines: vec![unified("+    \n"), unified("+let value = 42;\n")],
         };
 
-        assert!(
+        assert_eq!(
             block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::ReviewableChanges,
             "mixed whitespace and non-whitespace changes must remain reviewable"
         );
     }
@@ -1246,13 +1470,14 @@ mod tests {
             old_start: 3,
             new_start: 3,
             lines: vec![
-                "-let value = 42;\n".to_string(),
-                "+    let value = 42;\n".to_string(),
+                unified("-let value = 42;\n"),
+                unified("+    let value = 42;\n"),
             ],
         };
 
-        assert!(
-            !block_has_changed_lines_in_diff(&block, &[hunk]),
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
             "indentation-only replacements should not mark a block as changed for review"
         );
     }
@@ -1276,13 +1501,14 @@ mod tests {
             old_start: 3,
             new_start: 3,
             lines: vec![
-                "-let value = 42;\n".to_string(),
-                "+let value = 42;   \n".to_string(),
+                unified("-let value = 42;\n"),
+                unified("+let value = 42;   \n"),
             ],
         };
 
-        assert!(
-            !block_has_changed_lines_in_diff(&block, &[hunk]),
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
             "trailing-whitespace-only replacements should not mark a block as changed for review"
         );
     }
@@ -1306,13 +1532,14 @@ mod tests {
             old_start: 3,
             new_start: 3,
             lines: vec![
-                "-let value = compute(a, b);\n".to_string(),
-                "+let value = compute(a,  b);\n".to_string(),
+                unified("-let value = compute(a, b);\n"),
+                unified("+let value = compute(a,  b);\n"),
             ],
         };
 
-        assert!(
+        assert_eq!(
             block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::ReviewableChanges,
             "internal spacing replacements should remain reviewable under conservative filtering"
         );
     }
@@ -1336,13 +1563,14 @@ mod tests {
             old_start: 3,
             new_start: 3,
             lines: vec![
-                "-let value = 42;\r\n".to_string(),
-                "+let value = 42;\n".to_string(),
+                unified("-let value = 42;\r\n"),
+                unified("+let value = 42;\n"),
             ],
         };
 
-        assert!(
-            !block_has_changed_lines_in_diff(&block, &[hunk]),
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
             "CRLF/LF-only replacements should not mark a block as changed for review"
         );
     }
@@ -1365,15 +1593,74 @@ mod tests {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
             old_start: 3,
             new_start: 3,
+            lines: vec![unified("-let value = 42;\n"), unified("+let value = 42;\n")],
+        };
+
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
+            "missing-final-newline-only replacements should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_multiline_indentation_only_replacements() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: TreeHash::default(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 2,
+            end_line: 8,
+        };
+
+        let hunk = DiffHunk {
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
+            old_start: 3,
+            new_start: 3,
             lines: vec![
-                "-let value = 42;\n".to_string(),
-                "+let value = 42;\n".to_string(),
+                unified("-let value = 42;\n"),
+                unified("-return value;\n"),
+                unified("+    let value = 42;\n"),
+                unified("+    return value;\n"),
             ],
         };
 
-        assert!(
-            !block_has_changed_lines_in_diff(&block, &[hunk]),
-            "missing-final-newline-only replacements should not mark a block as changed for review"
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
+            "multiline indentation-only replacements should not mark a block as changed for review"
         );
+    }
+
+    #[test]
+    fn analyze_block_diff_for_unavailable_file_reports_explicit_reason() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: TreeHash::default(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: 0,
+            start_line: 0,
+            end_line: 2,
+        };
+
+        let file_diff = FileDiff::Unavailable {
+            path: RepoPath::new("src/lib.rs").unwrap(),
+            reason: FileDiffUnavailableReason::Binary,
+        };
+
+        let analysis =
+            analyze_block_diff_for_file(&block, &file_diff, BlockDiffFocusMode::WholeBlock);
+        assert_eq!(
+            analysis.change_kind,
+            BlockDiffChangeKind::DiffUnavailable(FileDiffUnavailableReason::Binary)
+        );
+        assert!(analysis.view.is_none());
     }
 }
