@@ -1188,41 +1188,61 @@ fn execute_action(
     };
 
     let next_id = compute_next_review_target(state, node_id);
+    let params = mark_params_for_action(state, node_id, verdict.clone(), note);
 
-    with_terminal_suspend(terminal, || {
-        let node = state.navigator.tree.node(node_id);
-        let (fingerprint, target_kind) = fingerprint_and_target_kind_for_node(node);
-
-        // For root/dir, path might be empty or a dir path.
-        // For file/block, it's the file path.
-        let path_hint = if node.path.is_root() {
-            None
-        } else {
-            Some(node.path.to_string())
-        };
-
-        let line_hint = node
-            .block
-            .as_ref()
-            .map(|block| usize_to_u32_saturating(block.start_line));
-
-        mark::run(
-            context,
-            mark::MarkParams {
-                fingerprint,
-                target_kind: Some(target_kind),
-                verdict: verdict.clone(),
-                check: "review".to_string(),
-                note,
-                path: path_hint,
-                line: line_hint,
-            },
-        )
-    })?;
+    if action_requires_terminal_suspend() {
+        with_terminal_suspend(terminal, || mark::run(context, params))?;
+    } else {
+        mark::run(context, params)?;
+    }
 
     let impact = apply_action_locally(state, node_id, &verdict, next_id);
     state.session_recap.record_action(&verdict, impact);
     Ok(())
+}
+
+fn mark_params_for_action(
+    state: &AppState,
+    node_id: TreeNodeId,
+    verdict: Verdict,
+    note: Option<String>,
+) -> mark::MarkParams {
+    let node = state.navigator.tree.node(node_id);
+    let (fingerprint, target_kind) = fingerprint_and_target_kind_for_node(node);
+
+    // For root/dir, path might be empty or a dir path.
+    // For file/block, it's the file path.
+    let path_hint = if node.path.is_root() {
+        None
+    } else {
+        Some(node.path.to_string())
+    };
+
+    let line_hint = node
+        .block
+        .as_ref()
+        .map(|block| usize_to_u32_saturating(block.start_line));
+
+    mark::MarkParams {
+        fingerprint,
+        target_kind: Some(target_kind),
+        verdict,
+        check: "review".to_string(),
+        note,
+        path: path_hint,
+        line: line_hint,
+    }
+}
+
+fn action_requires_terminal_suspend() -> bool {
+    let signing_key = vcs::git_config_from_workdir()
+        .ok()
+        .and_then(|config| config.signing_key);
+    action_requires_terminal_suspend_for_signing_key(signing_key.as_deref())
+}
+
+fn action_requires_terminal_suspend_for_signing_key(signing_key: Option<&str>) -> bool {
+    signing_key.is_some()
 }
 
 fn fingerprint_and_target_kind_for_node(
@@ -4276,6 +4296,18 @@ mod diff_scope_tests {
         assert!(recap_key_should_exit(KeyCode::Char('d')));
         assert!(recap_key_should_exit(KeyCode::Esc));
         assert!(!recap_key_should_exit(KeyCode::Char('a')));
+    }
+
+    #[test]
+    fn action_requires_terminal_suspend_without_signing_key_is_false() {
+        assert!(!action_requires_terminal_suspend_for_signing_key(None));
+    }
+
+    #[test]
+    fn action_requires_terminal_suspend_with_signing_key_is_true() {
+        assert!(action_requires_terminal_suspend_for_signing_key(Some(
+            "ABC123"
+        )));
     }
 
     #[test]
