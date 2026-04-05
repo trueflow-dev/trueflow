@@ -129,9 +129,12 @@ See `trueflow.example.toml` for the default settings.
 
 Main review actions:
 
-- `j`/`k` scroll down/up by default, and arrow keys mirror those actions
-- `h`/`l` move to previous/next semantic sibling
-- `p`/`c` move to semantic parent/child
+- In the root view, `j`/`k` and Up/Down move the selection through the visible file/dir list
+- In the root view, `l`, Right, Enter, and `c` open the selected item; `h`, Left, and `p` are back/leftward actions and are a no-op at the repository root
+- Outside the root view, `j`/`k` and Up/Down scroll code line-by-line
+- `PageUp`, `PageDown`, `Space`, `Home`, and `End` scroll by page or jump to the top/bottom of the current code view
+- Outside the root view, `h`/`l` and Left/Right move to the previous/next semantic sibling
+- `p`/`c` move to the semantic parent/child
 - `a` approve
 - `n` add a note (empty note is allowed)
 - `m` toggle diff/source

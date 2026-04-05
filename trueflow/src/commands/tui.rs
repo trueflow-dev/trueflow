@@ -764,9 +764,7 @@ fn run_app(
                 }
 
                 match key_code {
-                    KeyCode::Char(' ')
-                        if state.navigator.current_id() != state.navigator.tree.root() =>
-                    {
+                    KeyCode::Char(' ') => {
                         handle_scroll_page_down(&mut state);
                         needs_render = true;
                     }
@@ -787,14 +785,8 @@ fn run_app(
                             state.content_height.saturating_sub(state.viewport_height);
                         needs_render = true;
                     }
-                    KeyCode::Enter | KeyCode::Char(' ')
-                        if state.navigator.current_id() == state.navigator.tree.root() =>
-                    {
-                        if let Some(first) = state.review_order.first_reviewable_block() {
-                            state.navigator.set_current(first);
-                            set_focus_for_current_node(&mut state, None);
-                            clear_speed_read_if_not_on_current_node(&mut state);
-                        }
+                    KeyCode::Enter if state.navigator.current_id() == state.navigator.tree.root() => {
+                        handle_child(&mut state);
                         needs_render = true;
                     }
                     _ => {}
@@ -1025,33 +1017,42 @@ fn handle_child(state: &mut AppState) {
 }
 
 fn handle_scroll_line_up(state: &mut AppState) {
-    scroll_up_by(state, 1);
+    if state.navigator.current_id() == state.navigator.tree.root() {
+        move_root_cursor(state, -1);
+    } else {
+        scroll_up_by(state, 1);
+    }
 }
 
 fn handle_scroll_line_down(state: &mut AppState) {
-    scroll_down_by(state, 1);
+    if state.navigator.current_id() == state.navigator.tree.root() {
+        move_root_cursor(state, 1);
+    } else {
+        scroll_down_by(state, 1);
+    }
 }
 
 fn handle_prev(state: &mut AppState) {
     if state.navigator.current_id() == state.navigator.tree.root() {
-        move_root_cursor(state, -1);
-    } else {
-        state.navigator.move_prev();
-        state.scroll_offset = 0;
-        set_focus_for_current_node(state, None);
-        clear_speed_read_if_not_on_current_node(state);
+        return;
     }
+
+    state.navigator.move_prev();
+    state.scroll_offset = 0;
+    set_focus_for_current_node(state, None);
+    clear_speed_read_if_not_on_current_node(state);
 }
 
 fn handle_next(state: &mut AppState) {
     if state.navigator.current_id() == state.navigator.tree.root() {
-        move_root_cursor(state, 1);
-    } else {
-        state.navigator.move_next();
-        state.scroll_offset = 0;
-        set_focus_for_current_node(state, None);
-        clear_speed_read_if_not_on_current_node(state);
+        handle_child(state);
+        return;
     }
+
+    state.navigator.move_next();
+    state.scroll_offset = 0;
+    set_focus_for_current_node(state, None);
+    clear_speed_read_if_not_on_current_node(state);
 }
 
 fn handle_scroll_page_up(state: &mut AppState) {
@@ -1626,7 +1627,17 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let header_lines = build_header_lines(node, state, palette);
 
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
-    let actions_lines = build_action_lines(focus_layout.actions.width, &state.keybinds, palette);
+    let actions_context = if matches!(node.kind, TreeNodeKind::Root) {
+        ActionLineContext::Root
+    } else {
+        ActionLineContext::Review
+    };
+    let actions_lines = build_action_lines(
+        focus_layout.actions.width,
+        actions_context,
+        &state.keybinds,
+        palette,
+    );
     let node_snapshot = ContentNodeSnapshot::from_node(node);
     let content = if let Some((lines, total_lines)) =
         build_speed_read_lines(state, node_snapshot.id, palette, focus_layout.code.width)
@@ -1967,33 +1978,67 @@ fn scope_selector_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionLineContext {
+    Root,
+    Review,
+}
+
 fn build_action_lines(
     _width: u16,
+    context: ActionLineContext,
     keybinds: &TuiKeybindsConfig,
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
-    let compact = format!(
-        "[{}]approve [{}]note [{}]diff/source [{}/{}]prev/next [{}]parent [{}]child [{}/{}]down/up [{}]root [{}]speed-read [{}]quit",
-        keybinds.approve,
-        keybinds.note,
-        keybinds.toggle_view,
-        keybinds.prev,
-        keybinds.next,
-        keybinds.parent,
-        keybinds.child,
-        keybinds.scroll_down,
-        keybinds.scroll_up,
-        keybinds.root,
-        keybinds.speed_read,
-        keybinds.quit
-    );
-    vec![Line::from(Span::styled(
-        compact,
-        Style::default()
-            .fg(palette.dim)
-            .bg(palette.bg)
-            .add_modifier(Modifier::BOLD),
-    ))]
+    let lines = match context {
+        ActionLineContext::Root => vec![
+            format!(
+                "[{}/{}/\u{2193}/\u{2191}]move [{}/{}/\u{2192}/Enter]open [{}/{}/\u{2190}]back",
+                keybinds.scroll_down,
+                keybinds.scroll_up,
+                keybinds.next,
+                keybinds.child,
+                keybinds.prev,
+                keybinds.parent,
+            ),
+            format!(
+                "[{}]approve [{}]note [{}]root [{}]quit",
+                keybinds.approve, keybinds.note, keybinds.root, keybinds.quit
+            ),
+        ],
+        ActionLineContext::Review => vec![
+            format!(
+                "[{}/{}/\u{2193}/\u{2191}]line-scroll [PgUp/PgDn/Space/Home/End]page-scroll",
+                keybinds.scroll_down, keybinds.scroll_up,
+            ),
+            format!(
+                "[{}/{}/\u{2190}/\u{2192}]prev/next [{}/{}]parent/child [{}]approve [{}]note [{}]view [{}]speed-read [{}]root [{}]quit",
+                keybinds.prev,
+                keybinds.next,
+                keybinds.parent,
+                keybinds.child,
+                keybinds.approve,
+                keybinds.note,
+                keybinds.toggle_view,
+                keybinds.speed_read,
+                keybinds.root,
+                keybinds.quit,
+            ),
+        ],
+    };
+
+    lines
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                line,
+                Style::default()
+                    .fg(palette.dim)
+                    .bg(palette.bg)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect()
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -2433,14 +2478,22 @@ fn render_contextual_diff_lines(
         .collect()
 }
 
-fn content_message(message: &str, include_source_hint: bool, palette: &UiPalette) -> BuiltContent {
+fn source_hint_text(keybinds: &TuiKeybindsConfig) -> String {
+    format!("Press [{}] to view source", keybinds.toggle_view)
+}
+
+fn content_message(
+    message: &str,
+    source_hint_keybinds: Option<&TuiKeybindsConfig>,
+    palette: &UiPalette,
+) -> BuiltContent {
     let mut lines = vec![Line::from(Span::styled(
         message.to_string(),
         Style::default().fg(palette.dim).bg(palette.code_bg),
     ))];
-    if include_source_hint {
+    if let Some(keybinds) = source_hint_keybinds {
         lines.push(Line::from(Span::styled(
-            "Press [d] to view source".to_string(),
+            source_hint_text(keybinds),
             Style::default().fg(palette.dim).bg(palette.code_bg),
         )));
     }
@@ -2457,12 +2510,12 @@ fn build_diff_context_content(
     palette: &UiPalette,
 ) -> BuiltContent {
     let Some(file_lines) = load_file_lines(state, &node.path) else {
-        return content_message("(File missing)", false, palette);
+        return content_message("(File missing)", None, palette);
     };
     let focus_line_span = focus_line_span_for_node(state, node, file_lines.len());
 
     let Some(file_diff) = cached_file_diff_for_node(state, node) else {
-        return content_message("(No path for diff)", false, palette);
+        return content_message("(No path for diff)", None, palette);
     };
 
     match file_diff {
@@ -2478,19 +2531,21 @@ fn build_diff_context_content(
                 focus_row_range,
             }
         }
-        vcs::FileDiff::NoTextChanges { .. } => {
-            content_message("(No diff changes in this file)", true, palette)
-        }
+        vcs::FileDiff::NoTextChanges { .. } => content_message(
+            "(No diff changes in this file)",
+            Some(&state.keybinds),
+            palette,
+        ),
         vcs::FileDiff::Unavailable {
             reason: vcs::FileDiffUnavailableReason::Binary,
             ..
-        } => content_message("(Diff unavailable for binary file)", false, palette),
+        } => content_message("(Diff unavailable for binary file)", None, palette),
         vcs::FileDiff::Unavailable {
             reason: vcs::FileDiffUnavailableReason::External,
             ..
         } => content_message(
             "(Diff unavailable from external diff command)",
-            false,
+            None,
             palette,
         ),
     }
@@ -2925,7 +2980,7 @@ struct FocusLayout {
     actions: Rect,
 }
 
-const ACTIONS_HEIGHT: u16 = 1;
+const ACTIONS_HEIGHT: u16 = 2;
 
 fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let code_width = area.width.min(120);
@@ -3001,7 +3056,7 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 3);
         assert_eq!(layout.code.width, 120);
-        assert_eq!(layout.actions.height, 1);
+        assert_eq!(layout.actions.height, 2);
         assert!(layout.code.y > area.y);
     }
 
@@ -3184,6 +3239,82 @@ mod diff_scope_tests {
         };
 
         (state, block_id)
+    }
+
+    fn build_state_at_root_with_two_files() -> (AppState, TreeNodeId, TreeNodeId) {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let first_file = builder.add_file(
+            root,
+            "a.rs".to_string(),
+            "a.rs".to_string(),
+            "a-file-hash".to_string(),
+            Language::Rust,
+        );
+        let first_block = builder.add_block(
+            first_file,
+            "first".to_string(),
+            "a.rs".to_string(),
+            Block::new("fn a() {}".to_string(), BlockKind::Function, 0, 1),
+            Language::Rust,
+        );
+        let second_file = builder.add_file(
+            root,
+            "b.rs".to_string(),
+            "b.rs".to_string(),
+            "b-file-hash".to_string(),
+            Language::Rust,
+        );
+        let second_block = builder.add_block(
+            second_file,
+            "second".to_string(),
+            "b.rs".to_string(),
+            Block::new("fn b() {}".to_string(), BlockKind::Function, 0, 1),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let visible = HashSet::from([first_block, second_block]);
+        let review_order = ReviewOrder::from_tree(&tree, &visible);
+        let mut navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        navigator.jump_root();
+
+        let state = AppState {
+            review_scope: ReviewScope::All,
+            navigator,
+            review_order,
+            total_blocks: 2,
+            initial_remaining_blocks: 2,
+            remaining_blocks: 2,
+            reviewable_nodes: visible,
+            session_recap: SessionRecap::default(),
+            scope_label: "All".to_string(),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            confirm_batch: false,
+            repo_name: "repo".to_string(),
+            workdir_prefix: None,
+            file_cache: HashMap::new(),
+            root_cursor: Some(first_file),
+            focus_block: None,
+            pending_focus_scroll: false,
+            scroll_offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            code_rect: Rect::default(),
+            view_mode: ViewMode::Diff,
+            block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            keybinds: TuiKeybindsConfig::default(),
+            file_diff_cache: HashMap::new(),
+            content_frame_cache: HashMap::new(),
+            highlighted_line_cache: HashMap::new(),
+            speed_read: SpeedReadController::new(
+                TuiSpeedReadConfig::default(),
+                PathBuf::from("trueflow.toml"),
+            ),
+        };
+
+        (state, first_file, second_file)
     }
 
     fn build_state_with_block_file(
@@ -3528,7 +3659,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn build_action_lines_uses_configured_keybinds() {
+    fn build_action_lines_use_root_spatial_navigation_labels() {
         let keybinds = crate::config::TuiKeybindsConfig {
             scroll_up: 'i',
             scroll_down: 'm',
@@ -3544,19 +3675,93 @@ mod diff_scope_tests {
             quit: 'x',
         };
         let palette = UiPalette::default();
-        let lines = build_action_lines(80, &keybinds, &palette);
+        let lines = build_action_lines(80, ActionLineContext::Root, &keybinds, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let joined = rendered.join(" ");
 
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].to_string().contains("[y]approve"));
-        assert!(lines[0].to_string().contains("[e]note"));
-        assert!(lines[0].to_string().contains("[v]diff/source"));
-        assert!(lines[0].to_string().contains("[j/l]prev/next"));
-        assert!(lines[0].to_string().contains("[u]parent"));
-        assert!(lines[0].to_string().contains("[o]child"));
-        assert!(lines[0].to_string().contains("[m/i]down/up"));
-        assert!(lines[0].to_string().contains("[z]root"));
-        assert!(lines[0].to_string().contains("[s]speed-read"));
-        assert!(lines[0].to_string().contains("[x]quit"));
+        assert_eq!(lines.len(), 2);
+        assert!(joined.contains("[m/i/↓/↑]move"));
+        assert!(joined.contains("[l/o/→/Enter]open"));
+        assert!(joined.contains("[j/u/←]back"));
+        assert!(joined.contains("[y]approve"));
+        assert!(joined.contains("[e]note"));
+        assert!(joined.contains("[x]quit"));
+        assert!(!joined.contains("prev/next"));
+        assert!(!joined.contains("line-scroll"));
+    }
+
+    #[test]
+    fn build_action_lines_for_review_nodes_advertise_line_and_page_scroll() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            scroll_up: 'i',
+            scroll_down: 'm',
+            prev: 'j',
+            next: 'l',
+            parent: 'u',
+            child: 'o',
+            approve: 'y',
+            note: 'e',
+            toggle_view: 'v',
+            speed_read: 's',
+            root: 'z',
+            quit: 'x',
+        };
+        let palette = UiPalette::default();
+        let lines = build_action_lines(80, ActionLineContext::Review, &keybinds, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let joined = rendered.join(" ");
+
+        assert_eq!(lines.len(), 2);
+        assert!(joined.contains("[m/i/↓/↑]line-scroll"));
+        assert!(joined.contains("[PgUp/PgDn/Space/Home/End]page-scroll"));
+        assert!(joined.contains("[j/l/←/→]prev/next"));
+        assert!(joined.contains("[u/o]parent/child"));
+        assert!(joined.contains("[v]view"));
+        assert!(joined.contains("[s]speed-read"));
+        assert!(joined.contains("[z]root"));
+        assert!(joined.contains("[x]quit"));
+    }
+
+    #[test]
+    fn handle_scroll_line_down_moves_root_cursor_down() {
+        let (mut state, _first_file, second_file) = build_state_at_root_with_two_files();
+
+        handle_scroll_line_down(&mut state);
+
+        assert_eq!(state.navigator.current_id(), state.navigator.tree.root());
+        assert_eq!(state.root_cursor, Some(second_file));
+    }
+
+    #[test]
+    fn handle_scroll_line_up_moves_root_cursor_up() {
+        let (mut state, first_file, second_file) = build_state_at_root_with_two_files();
+        state.root_cursor = Some(second_file);
+
+        handle_scroll_line_up(&mut state);
+
+        assert_eq!(state.navigator.current_id(), state.navigator.tree.root());
+        assert_eq!(state.root_cursor, Some(first_file));
+    }
+
+    #[test]
+    fn handle_prev_is_noop_at_root() {
+        let (mut state, _first_file, second_file) = build_state_at_root_with_two_files();
+        state.root_cursor = Some(second_file);
+
+        handle_prev(&mut state);
+
+        assert_eq!(state.navigator.current_id(), state.navigator.tree.root());
+        assert_eq!(state.root_cursor, Some(second_file));
+    }
+
+    #[test]
+    fn handle_next_opens_selected_root_item() {
+        let (mut state, _first_file, second_file) = build_state_at_root_with_two_files();
+        state.root_cursor = Some(second_file);
+
+        handle_next(&mut state);
+
+        assert_eq!(state.navigator.current_id(), second_file);
     }
 
     #[test]
@@ -4176,8 +4381,41 @@ mod diff_scope_tests {
         assert_eq!(content.total_lines, 2);
         assert_eq!(
             rendered,
-            vec!["(No diff changes in this file)", "Press [d] to view source"]
+            vec!["(No diff changes in this file)", "Press [m] to view source"]
         );
+    }
+
+    #[test]
+    fn build_file_lines_diff_mode_uses_configured_toggle_view_key_for_source_hint() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_file_diff_toggle_hint")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\nline2\n";
+        let block_content = "line1\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        state.view_mode = ViewMode::Diff;
+        state.keybinds.toggle_view = 'v';
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::NoTextChanges {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+            },
+        );
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[1], "Press [v] to view source");
     }
 
     #[test]
@@ -4212,7 +4450,7 @@ mod diff_scope_tests {
         assert_eq!(content.total_lines, 2);
         assert_eq!(
             rendered,
-            vec!["(No diff changes in this file)", "Press [d] to view source"]
+            vec!["(No diff changes in this file)", "Press [m] to view source"]
         );
     }
 
