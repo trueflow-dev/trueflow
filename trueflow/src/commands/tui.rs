@@ -193,6 +193,8 @@ struct AppState {
     workdir_prefix: Option<String>,
     file_cache: HashMap<PathBuf, Arc<[String]>>,
     root_cursor: Option<TreeNodeId>,
+    focus_block: Option<TreeNodeId>,
+    pending_focus_scroll: bool,
     scroll_offset: u16,
     content_height: u16,
     viewport_height: u16,
@@ -283,6 +285,7 @@ enum ViewMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ContentFrameCacheKey {
     node_id: TreeNodeId,
+    focus_block: Option<TreeNodeId>,
     variant: ContentFrameCacheVariant,
 }
 
@@ -298,6 +301,14 @@ enum ContentFrameCacheVariant {
 struct ContentFrameCacheEntry {
     lines: Vec<Line<'static>>,
     total_lines: usize,
+    focus_row_range: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone)]
+struct BuiltContent {
+    lines: Vec<Line<'static>>,
+    total_lines: usize,
+    focus_row_range: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone)]
@@ -452,6 +463,8 @@ fn build_review_state(
         workdir_prefix: options.workdir_prefix,
         file_cache: HashMap::new(),
         root_cursor,
+        focus_block: None,
+        pending_focus_scroll: false,
         scroll_offset: 0,
         content_height: 0,
         viewport_height: 0,
@@ -732,11 +745,13 @@ fn run_app(
                                 ViewMode::Source => ViewMode::Diff,
                                 ViewMode::Diff => ViewMode::Source,
                             };
-                            state.scroll_offset = 0;
+                            let preferred_focus = state.focus_block;
+                            set_focus_for_current_node(&mut state, preferred_focus);
                         }
                         KeybindAction::SpeedRead => toggle_speed_read_mode(&mut state),
                         KeybindAction::Root => {
                             state.navigator.jump_root();
+                            clear_focus_scroll(&mut state);
                             clear_speed_read_if_not_on_current_node(&mut state);
                         }
                         KeybindAction::Quit => {
@@ -777,6 +792,7 @@ fn run_app(
                     {
                         if let Some(first) = state.review_order.first_reviewable_block() {
                             state.navigator.set_current(first);
+                            set_focus_for_current_node(&mut state, None);
                             clear_speed_read_if_not_on_current_node(&mut state);
                         }
                         needs_render = true;
@@ -976,11 +992,13 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
 }
 
 fn handle_parent(state: &mut AppState) {
-    if state.navigator.current_id() == state.navigator.tree.root() {
+    let previous_current = state.navigator.current_id();
+    if previous_current == state.navigator.tree.root() {
         return;
     }
     state.navigator.ascend();
     state.scroll_offset = 0;
+    set_focus_for_current_node(state, Some(previous_current));
     clear_speed_read_if_not_on_current_node(state);
 }
 
@@ -995,11 +1013,13 @@ fn handle_child(state: &mut AppState) {
         if let Some(target) = state.root_cursor {
             state.navigator.set_current(target);
             state.scroll_offset = 0;
+            set_focus_for_current_node(state, None);
             clear_speed_read_if_not_on_current_node(state);
         }
     } else {
         state.navigator.descend();
         state.scroll_offset = 0;
+        set_focus_for_current_node(state, None);
         clear_speed_read_if_not_on_current_node(state);
     }
 }
@@ -1018,6 +1038,7 @@ fn handle_prev(state: &mut AppState) {
     } else {
         state.navigator.move_prev();
         state.scroll_offset = 0;
+        set_focus_for_current_node(state, None);
         clear_speed_read_if_not_on_current_node(state);
     }
 }
@@ -1028,6 +1049,7 @@ fn handle_next(state: &mut AppState) {
     } else {
         state.navigator.move_next();
         state.scroll_offset = 0;
+        set_focus_for_current_node(state, None);
         clear_speed_read_if_not_on_current_node(state);
     }
 }
@@ -1055,6 +1077,95 @@ fn scroll_down_by(state: &mut AppState, scroll_amount: u16) {
 
 fn max_scroll_offset(state: &AppState) -> u16 {
     state.content_height.saturating_sub(state.viewport_height)
+}
+
+fn node_contains_block(tree: &Tree, node_id: TreeNodeId, block_id: TreeNodeId) -> bool {
+    tree.ancestors(block_id).contains(&node_id)
+}
+
+fn first_focusable_descendant_block(state: &AppState, node_id: TreeNodeId) -> Option<TreeNodeId> {
+    let tree = &state.navigator.tree;
+    let mut block_ids = state.navigator.visible_descendant_block_ids(node_id);
+    block_ids.sort_by(|a, b| {
+        let a_node = tree.node(*a);
+        let b_node = tree.node(*b);
+        let a_start = a_node
+            .block
+            .as_ref()
+            .map(|block| block.start_line)
+            .unwrap_or(usize::MAX);
+        let b_start = b_node
+            .block
+            .as_ref()
+            .map(|block| block.start_line)
+            .unwrap_or(usize::MAX);
+        (a_node.path.as_str(), a_start).cmp(&(b_node.path.as_str(), b_start))
+    });
+    block_ids.into_iter().next()
+}
+
+fn focus_block_for_node(
+    state: &AppState,
+    node_id: TreeNodeId,
+    preferred_child: Option<TreeNodeId>,
+) -> Option<TreeNodeId> {
+    let tree = &state.navigator.tree;
+    match tree.node(node_id).kind {
+        TreeNodeKind::Root | TreeNodeKind::Directory => None,
+        TreeNodeKind::Block => preferred_child
+            .filter(|child| {
+                matches!(tree.node(*child).kind, TreeNodeKind::Block)
+                    && node_contains_block(tree, node_id, *child)
+            })
+            .or(Some(node_id)),
+        TreeNodeKind::File => preferred_child
+            .filter(|child| {
+                matches!(tree.node(*child).kind, TreeNodeKind::Block)
+                    && node_contains_block(tree, node_id, *child)
+            })
+            .or_else(|| first_focusable_descendant_block(state, node_id)),
+    }
+}
+
+fn set_focus_for_current_node(state: &mut AppState, preferred_child: Option<TreeNodeId>) {
+    let current = state.navigator.current_id();
+    state.focus_block = focus_block_for_node(state, current, preferred_child);
+    state.pending_focus_scroll = matches!(
+        state.navigator.tree.node(current).kind,
+        TreeNodeKind::File | TreeNodeKind::Block
+    ) && state.focus_block.is_some();
+}
+
+fn clear_focus_scroll(state: &mut AppState) {
+    state.focus_block = None;
+    state.pending_focus_scroll = false;
+}
+
+fn scroll_offset_for_focus_range(
+    focus_row_range: &std::ops::Range<usize>,
+    viewport_height: u16,
+    total_lines: usize,
+) -> u16 {
+    if viewport_height == 0 || total_lines <= usize::from(viewport_height) {
+        return 0;
+    }
+
+    let focus_start = focus_row_range.start.min(total_lines.saturating_sub(1));
+    let focus_end = focus_row_range
+        .end
+        .max(focus_start.saturating_add(1))
+        .min(total_lines);
+    let focus_height = focus_end.saturating_sub(focus_start);
+    let viewport_height = usize::from(viewport_height);
+
+    let target = if focus_height > viewport_height {
+        focus_start
+    } else {
+        focus_start.saturating_sub((viewport_height.saturating_sub(focus_height)) / 2)
+    };
+
+    let max_scroll = total_lines.saturating_sub(viewport_height);
+    usize_to_u16_saturating(target.min(max_scroll))
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -1329,9 +1440,11 @@ fn apply_action_locally(
     if let Some(node_id) = next_id {
         state.navigator.set_current(node_id);
         state.scroll_offset = 0;
+        set_focus_for_current_node(state, None);
     } else {
         state.navigator.jump_root();
         state.scroll_offset = 0;
+        clear_focus_scroll(state);
     }
     clear_speed_read_if_not_on_current_node(state);
 
@@ -1515,10 +1628,14 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
     let actions_lines = build_action_lines(focus_layout.actions.width, &state.keybinds, palette);
     let node_snapshot = ContentNodeSnapshot::from_node(node);
-    let (content_lines, total_lines) = if let Some(speed_lines) =
+    let content = if let Some((lines, total_lines)) =
         build_speed_read_lines(state, node_snapshot.id, palette, focus_layout.code.width)
     {
-        speed_lines
+        BuiltContent {
+            lines,
+            total_lines,
+            focus_row_range: None,
+        }
     } else {
         build_content_lines_with_frame_cache(
             state,
@@ -1528,9 +1645,19 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         )
     };
 
-    state.content_height = usize_to_u16_saturating(total_lines);
+    state.content_height = usize_to_u16_saturating(content.total_lines);
     state.viewport_height = focus_layout.code.height;
     state.code_rect = focus_layout.code;
+    if state.pending_focus_scroll {
+        state.scroll_offset = content
+            .focus_row_range
+            .as_ref()
+            .map(|range| {
+                scroll_offset_for_focus_range(range, state.viewport_height, content.total_lines)
+            })
+            .unwrap_or(0);
+        state.pending_focus_scroll = false;
+    }
     state.scroll_offset = state
         .scroll_offset
         .min(state.content_height.saturating_sub(state.viewport_height));
@@ -1548,7 +1675,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     );
 
     frame.render_widget(
-        Paragraph::new(content_lines)
+        Paragraph::new(content.lines)
             .block(UiBlock::default().style(Style::default().bg(palette.code_bg)))
             .scroll((state.scroll_offset, 0))
             .wrap(Wrap { trim: false }),
@@ -1677,6 +1804,7 @@ fn center_text(text: &str, width: usize) -> String {
 
 fn content_frame_cache_key(
     node_id: TreeNodeId,
+    focus_block: Option<TreeNodeId>,
     node_kind: TreeNodeKind,
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
@@ -1700,7 +1828,11 @@ fn content_frame_cache_key(
         TreeNodeKind::Directory | TreeNodeKind::Root => return None,
     };
 
-    Some(ContentFrameCacheKey { node_id, variant })
+    Some(ContentFrameCacheKey {
+        node_id,
+        focus_block,
+        variant,
+    })
 }
 
 fn is_content_kind_cacheable(kind: TreeNodeKind) -> bool {
@@ -1712,9 +1844,10 @@ fn build_content_lines_with_frame_cache(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     code_height: u16,
-) -> (Vec<Line<'static>>, usize) {
+) -> BuiltContent {
     let key = content_frame_cache_key(
         node.id,
+        state.focus_block,
         node.kind,
         state.view_mode,
         state.block_diff_focus_mode,
@@ -1723,18 +1856,23 @@ fn build_content_lines_with_frame_cache(
 
     if let Some(key) = key {
         if let Some(cached) = state.content_frame_cache.get(&key) {
-            return (cached.lines.clone(), cached.total_lines);
+            return BuiltContent {
+                lines: cached.lines.clone(),
+                total_lines: cached.total_lines,
+                focus_row_range: cached.focus_row_range.clone(),
+            };
         }
 
-        let (lines, total_lines) = build_content_lines(state, node, palette, code_height);
+        let content = build_content_lines(state, node, palette, code_height);
         state.content_frame_cache.insert(
             key,
             ContentFrameCacheEntry {
-                lines: lines.clone(),
-                total_lines,
+                lines: content.lines.clone(),
+                total_lines: content.total_lines,
+                focus_row_range: content.focus_row_range.clone(),
             },
         );
-        return (lines, total_lines);
+        return content;
     }
 
     build_content_lines(state, node, palette, code_height)
@@ -1979,12 +2117,26 @@ fn build_content_lines(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     code_height: u16,
-) -> (Vec<Line<'static>>, usize) {
+) -> BuiltContent {
     match node.kind {
         TreeNodeKind::Block => build_block_lines(state, node, palette, code_height),
         TreeNodeKind::File => build_file_lines(state, node, palette, code_height),
-        TreeNodeKind::Directory => build_directory_lines(state, node, palette, code_height),
-        TreeNodeKind::Root => build_root_lines(state, palette, code_height),
+        TreeNodeKind::Directory => {
+            let (lines, total_lines) = build_directory_lines(state, node, palette, code_height);
+            BuiltContent {
+                lines,
+                total_lines,
+                focus_row_range: None,
+            }
+        }
+        TreeNodeKind::Root => {
+            let (lines, total_lines) = build_root_lines(state, palette, code_height);
+            BuiltContent {
+                lines,
+                total_lines,
+                focus_row_range: None,
+            }
+        }
     }
 }
 
@@ -2008,128 +2160,239 @@ fn load_file_lines(state: &mut AppState, path: &RepoPath) -> Option<Arc<[String]
     Some(lines)
 }
 
-fn build_block_lines(
+fn focus_block_for_content_node(
+    state: &AppState,
+    node: &ContentNodeSnapshot,
+) -> Option<crate::block::Block> {
+    if let Some(focus_block_id) = state
+        .focus_block
+        .filter(|block_id| node_contains_block(&state.navigator.tree, node.id, *block_id))
+    {
+        return state.navigator.tree.node(focus_block_id).block.clone();
+    }
+
+    if matches!(node.kind, TreeNodeKind::Block) {
+        node.block.clone()
+    } else {
+        None
+    }
+}
+
+fn focus_line_span_for_node(
+    state: &AppState,
+    node: &ContentNodeSnapshot,
+    file_line_count: usize,
+) -> Option<std::ops::Range<usize>> {
+    let focus_block = focus_block_for_content_node(state, node)?;
+    let mut start = focus_block.start_line.min(file_line_count);
+    let mut end = focus_block.end_line.min(file_line_count);
+    if start >= end {
+        return None;
+    }
+
+    if state.view_mode == ViewMode::Diff {
+        if let vcs::BlockDiffFocusMode::ChangedWithContext { context_lines } =
+            state.block_diff_focus_mode
+        {
+            start = start.saturating_sub(context_lines);
+            end = end.saturating_add(context_lines).min(file_line_count);
+        }
+    }
+
+    Some(start..end)
+}
+
+fn build_source_context_content(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
-    _code_height: u16,
-) -> (Vec<Line<'static>>, usize) {
-    let Some(block) = &node.block else {
-        return (
-            vec![Line::from(Span::styled(
-                "(No content)",
-                Style::default().fg(palette.dim).bg(palette.code_bg),
-            ))],
-            1,
-        );
-    };
-
-    if state.view_mode == ViewMode::Diff {
-        return build_block_diff_lines(state, node, block, palette);
-    }
-
+) -> BuiltContent {
     let language = node.language;
-    let file_lines = match load_file_lines(state, &node.path) {
-        Some(lines) => lines,
-        None => {
-            let block_line_count = block.content.lines().count();
-            let mut lines = Vec::with_capacity(block_line_count);
-            for line in block.content.lines() {
-                lines.push(format_code_line(
-                    &mut state.highlighted_line_cache,
-                    line,
-                    palette,
-                    language.as_ref(),
-                ));
-            }
-            let len = lines.len();
-            return (lines, len);
+    let focus_line_span = load_file_lines(state, &node.path)
+        .as_ref()
+        .and_then(|lines| focus_line_span_for_node(state, node, lines.len()));
+
+    let Some(file_lines) = load_file_lines(state, &node.path) else {
+        if let Some(block) = &node.block {
+            let lines = block
+                .content
+                .lines()
+                .map(|line| {
+                    format_code_line(
+                        &mut state.highlighted_line_cache,
+                        line,
+                        palette,
+                        language.as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let total_lines = lines.len();
+            return BuiltContent {
+                lines,
+                total_lines,
+                focus_row_range: Some(0..total_lines),
+            };
         }
+        return BuiltContent {
+            lines: vec![Line::from(Span::styled(
+                "(File missing)",
+                Style::default().fg(palette.context).bg(palette.code_bg),
+            ))],
+            total_lines: 1,
+            focus_row_range: None,
+        };
     };
 
-    let start_line = block.start_line.min(file_lines.len());
-    let end_line = block.end_line.min(file_lines.len());
-    if start_line >= end_line {
-        let block_line_count = block.content.lines().count();
-        let mut lines = Vec::with_capacity(block_line_count);
-        for line in block.content.lines() {
-            lines.push(format_code_line(
-                &mut state.highlighted_line_cache,
-                line,
-                palette,
-                language.as_ref(),
-            ));
-        }
-        let len = lines.len();
-        return (lines, len);
-    }
-
-    // With scrolling, keep the full file context and let the viewport clip.
     let mut lines = Vec::with_capacity(file_lines.len());
     for (index, line) in file_lines.iter().enumerate() {
-        if (start_line..end_line).contains(&index) {
+        if focus_line_span
+            .as_ref()
+            .is_some_and(|focus| focus.contains(&index))
+        {
             lines.push(format_code_line(
                 &mut state.highlighted_line_cache,
                 line,
                 palette,
                 language.as_ref(),
             ));
-        } else {
+        } else if focus_line_span.is_some() {
             lines.push(format_context_line(
                 &mut state.highlighted_line_cache,
                 line,
                 palette,
                 language.as_ref(),
             ));
+        } else {
+            lines.push(format_code_line(
+                &mut state.highlighted_line_cache,
+                line,
+                palette,
+                language.as_ref(),
+            ));
         }
     }
 
-    let len = lines.len();
-    (lines, len)
+    BuiltContent {
+        total_lines: lines.len(),
+        lines,
+        focus_row_range: focus_line_span,
+    }
 }
 
-fn build_block_diff_lines(
-    state: &mut AppState,
-    node: &ContentNodeSnapshot,
-    block: &crate::block::Block,
-    palette: &UiPalette,
-) -> (Vec<Line<'static>>, usize) {
-    let focus_mode = state.block_diff_focus_mode;
-    let Some(file_diff) = cached_file_diff_for_node(state, node) else {
-        return single_diff_message_line("(No path for diff)", palette);
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextualDiffRow {
+    kind: vcs::DiffLineKind,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    text: String,
+    anchor_index: usize,
+}
 
-    let diff_analysis = vcs::analyze_block_diff_for_file(block, file_diff, focus_mode);
+fn build_contextual_diff_rows(
+    file_lines: &[String],
+    hunks: &[vcs::DiffHunk],
+) -> Vec<ContextualDiffRow> {
+    let mut rows = Vec::new();
+    let mut old_line: u32 = 1;
+    let mut new_line: u32 = 1;
 
-    let Some(view) = diff_analysis.view else {
-        return match diff_analysis.change_kind {
-            vcs::BlockDiffChangeKind::NoTextChanges => {
-                diff_message_lines("(No diff changes in this block)", true, palette)
+    for hunk in hunks {
+        while new_line < hunk.new_start {
+            let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(usize::MAX);
+            if let Some(text) = file_lines.get(line_index) {
+                rows.push(ContextualDiffRow {
+                    kind: vcs::DiffLineKind::Context,
+                    old_line: Some(old_line),
+                    new_line: Some(new_line),
+                    text: text.clone(),
+                    anchor_index: line_index,
+                });
             }
-            vcs::BlockDiffChangeKind::OnlyNonreviewableChurn => diff_message_lines(
-                "(Only nonreviewable formatting churn in this block)",
-                true,
-                palette,
-            ),
-            vcs::BlockDiffChangeKind::ReviewableChanges => {
-                single_diff_message_line("(Diff analysis did not produce view output)", palette)
+            old_line = old_line.saturating_add(1);
+            new_line = new_line.saturating_add(1);
+        }
+
+        for line in &hunk.lines {
+            match line.kind {
+                vcs::DiffLineKind::Context => {
+                    let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(0);
+                    rows.push(ContextualDiffRow {
+                        kind: vcs::DiffLineKind::Context,
+                        old_line: Some(old_line),
+                        new_line: Some(new_line),
+                        text: line.text.trim_end_matches('\n').to_string(),
+                        anchor_index: line_index,
+                    });
+                    old_line = old_line.saturating_add(1);
+                    new_line = new_line.saturating_add(1);
+                }
+                vcs::DiffLineKind::Added => {
+                    let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(0);
+                    rows.push(ContextualDiffRow {
+                        kind: vcs::DiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(new_line),
+                        text: line.text.trim_end_matches('\n').to_string(),
+                        anchor_index: line_index,
+                    });
+                    new_line = new_line.saturating_add(1);
+                }
+                vcs::DiffLineKind::Removed => {
+                    let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(0);
+                    rows.push(ContextualDiffRow {
+                        kind: vcs::DiffLineKind::Removed,
+                        old_line: Some(old_line),
+                        new_line: None,
+                        text: line.text.trim_end_matches('\n').to_string(),
+                        anchor_index: line_index,
+                    });
+                    old_line = old_line.saturating_add(1);
+                }
             }
-            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::Binary) => {
-                single_diff_message_line("(Diff unavailable for binary file)", palette)
-            }
-            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::External) => {
-                single_diff_message_line("(Diff unavailable from external diff command)", palette)
-            }
+        }
+    }
+
+    while let Ok(line_index) = usize::try_from(new_line.saturating_sub(1)) {
+        let Some(text) = file_lines.get(line_index) else {
+            break;
         };
-    };
+        rows.push(ContextualDiffRow {
+            kind: vcs::DiffLineKind::Context,
+            old_line: Some(old_line),
+            new_line: Some(new_line),
+            text: text.clone(),
+            anchor_index: line_index,
+        });
+        old_line = old_line.saturating_add(1);
+        new_line = new_line.saturating_add(1);
+    }
 
-    let formatted = render_diff_overlay_lines(&view.lines, palette);
-    let len = formatted.len();
-    (formatted, len)
+    rows
 }
 
-fn style_for_diff_overlay_line(line: &vcs::DiffLine, palette: &UiPalette) -> Style {
-    match line.kind {
+fn focus_row_range_for_contextual_diff_rows(
+    rows: &[ContextualDiffRow],
+    focus_line_span: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let mut first = None;
+    let mut last = None;
+
+    for (index, row) in rows.iter().enumerate() {
+        if focus_line_span.contains(&row.anchor_index) {
+            first.get_or_insert(index);
+            last = Some(index.saturating_add(1));
+        }
+    }
+
+    first.zip(last).map(|(start, end)| start..end)
+}
+
+fn style_for_contextual_diff_row(
+    row: &ContextualDiffRow,
+    focus_line_span: Option<&std::ops::Range<usize>>,
+    palette: &UiPalette,
+) -> Style {
+    match row.kind {
         vcs::DiffLineKind::Added => Style::default()
             .fg(palette.add)
             .bg(palette.code_bg)
@@ -2139,14 +2402,110 @@ fn style_for_diff_overlay_line(line: &vcs::DiffLine, palette: &UiPalette) -> Sty
             .bg(palette.code_bg)
             .add_modifier(Modifier::BOLD),
         vcs::DiffLineKind::Context => {
-            let style = Style::default().fg(palette.dim).bg(palette.code_bg);
-            if line.is_focus {
-                style
+            if focus_line_span.is_some_and(|focus| focus.contains(&row.anchor_index)) {
+                Style::default().fg(palette.fg).bg(palette.code_bg)
             } else {
-                style.add_modifier(Modifier::DIM)
+                Style::default().fg(palette.context).bg(palette.code_bg)
             }
         }
     }
+}
+
+fn render_contextual_diff_lines(
+    rows: &[ContextualDiffRow],
+    focus_line_span: Option<&std::ops::Range<usize>>,
+    palette: &UiPalette,
+) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| {
+            let text = format_diff_overlay_row(&vcs::DiffLine {
+                kind: row.kind,
+                old_line: row.old_line,
+                new_line: row.new_line,
+                text: row.text.clone(),
+                is_focus: false,
+            });
+            Line::from(Span::styled(
+                text,
+                style_for_contextual_diff_row(row, focus_line_span, palette),
+            ))
+        })
+        .collect()
+}
+
+fn content_message(message: &str, include_source_hint: bool, palette: &UiPalette) -> BuiltContent {
+    let mut lines = vec![Line::from(Span::styled(
+        message.to_string(),
+        Style::default().fg(palette.dim).bg(palette.code_bg),
+    ))];
+    if include_source_hint {
+        lines.push(Line::from(Span::styled(
+            "Press [d] to view source".to_string(),
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        )));
+    }
+    BuiltContent {
+        total_lines: lines.len(),
+        lines,
+        focus_row_range: None,
+    }
+}
+
+fn build_diff_context_content(
+    state: &mut AppState,
+    node: &ContentNodeSnapshot,
+    palette: &UiPalette,
+) -> BuiltContent {
+    let Some(file_lines) = load_file_lines(state, &node.path) else {
+        return content_message("(File missing)", false, palette);
+    };
+    let focus_line_span = focus_line_span_for_node(state, node, file_lines.len());
+
+    let Some(file_diff) = cached_file_diff_for_node(state, node) else {
+        return content_message("(No path for diff)", false, palette);
+    };
+
+    match file_diff {
+        vcs::FileDiff::Text { hunks, .. } => {
+            let rows = build_contextual_diff_rows(&file_lines, hunks);
+            let focus_row_range = focus_line_span
+                .as_ref()
+                .and_then(|focus| focus_row_range_for_contextual_diff_rows(&rows, focus));
+            let lines = render_contextual_diff_lines(&rows, focus_line_span.as_ref(), palette);
+            BuiltContent {
+                total_lines: lines.len(),
+                lines,
+                focus_row_range,
+            }
+        }
+        vcs::FileDiff::NoTextChanges { .. } => {
+            content_message("(No diff changes in this file)", true, palette)
+        }
+        vcs::FileDiff::Unavailable {
+            reason: vcs::FileDiffUnavailableReason::Binary,
+            ..
+        } => content_message("(Diff unavailable for binary file)", false, palette),
+        vcs::FileDiff::Unavailable {
+            reason: vcs::FileDiffUnavailableReason::External,
+            ..
+        } => content_message(
+            "(Diff unavailable from external diff command)",
+            false,
+            palette,
+        ),
+    }
+}
+
+fn build_block_lines(
+    state: &mut AppState,
+    node: &ContentNodeSnapshot,
+    palette: &UiPalette,
+    _code_height: u16,
+) -> BuiltContent {
+    if state.view_mode == ViewMode::Diff {
+        return build_diff_context_content(state, node, palette);
+    }
+    build_source_context_content(state, node, palette)
 }
 
 fn format_diff_overlay_row(line: &vcs::DiffLine) -> String {
@@ -2215,161 +2574,16 @@ fn cached_file_diff_for_node<'a>(
     ))
 }
 
-fn render_diff_overlay_lines(lines: &[vcs::DiffLine], palette: &UiPalette) -> Vec<Line<'static>> {
-    lines
-        .iter()
-        .map(|line| {
-            let style = style_for_diff_overlay_line(line, palette);
-            let text = format_diff_overlay_row(line);
-            Line::from(Span::styled(text, style))
-        })
-        .collect()
-}
-
-fn diff_lines_from_hunks(hunks: &[vcs::DiffHunk]) -> Vec<vcs::DiffLine> {
-    let mut rendered = Vec::new();
-
-    for hunk in hunks {
-        let mut old_line = hunk.old_start;
-        let mut new_line = hunk.new_start;
-
-        for line in &hunk.lines {
-            let text = line.text.trim_end_matches('\n').to_string();
-            match line.kind {
-                vcs::DiffLineKind::Context => {
-                    rendered.push(vcs::DiffLine {
-                        kind: vcs::DiffLineKind::Context,
-                        old_line: Some(old_line),
-                        new_line: Some(new_line),
-                        text,
-                        is_focus: false,
-                    });
-                    old_line = old_line.saturating_add(1);
-                    new_line = new_line.saturating_add(1);
-                }
-                vcs::DiffLineKind::Added => {
-                    rendered.push(vcs::DiffLine {
-                        kind: vcs::DiffLineKind::Added,
-                        old_line: None,
-                        new_line: Some(new_line),
-                        text,
-                        is_focus: true,
-                    });
-                    new_line = new_line.saturating_add(1);
-                }
-                vcs::DiffLineKind::Removed => {
-                    rendered.push(vcs::DiffLine {
-                        kind: vcs::DiffLineKind::Removed,
-                        old_line: Some(old_line),
-                        new_line: None,
-                        text,
-                        is_focus: true,
-                    });
-                    old_line = old_line.saturating_add(1);
-                }
-            }
-        }
-    }
-
-    rendered
-}
-
-fn single_diff_message_line(message: &str, palette: &UiPalette) -> (Vec<Line<'static>>, usize) {
-    (
-        vec![Line::from(Span::styled(
-            message.to_string(),
-            Style::default().fg(palette.dim).bg(palette.code_bg),
-        ))],
-        1,
-    )
-}
-
-fn diff_message_lines(
-    message: &str,
-    include_source_hint: bool,
-    palette: &UiPalette,
-) -> (Vec<Line<'static>>, usize) {
-    let mut lines = vec![Line::from(Span::styled(
-        message.to_string(),
-        Style::default().fg(palette.dim).bg(palette.code_bg),
-    ))];
-    if include_source_hint {
-        lines.push(Line::from(Span::styled(
-            "Press [d] to view source".to_string(),
-            Style::default().fg(palette.dim).bg(palette.code_bg),
-        )));
-    }
-    let len = lines.len();
-    (lines, len)
-}
-
-fn build_file_diff_lines(
-    state: &mut AppState,
-    node: &ContentNodeSnapshot,
-    palette: &UiPalette,
-) -> (Vec<Line<'static>>, usize) {
-    let Some(file_diff) = cached_file_diff_for_node(state, node) else {
-        return single_diff_message_line("(No path for diff)", palette);
-    };
-
-    match file_diff {
-        vcs::FileDiff::Text { hunks, .. } => {
-            let diff_lines = diff_lines_from_hunks(hunks);
-            if diff_lines.is_empty() {
-                return diff_message_lines("(No diff changes in this file)", true, palette);
-            }
-            let formatted = render_diff_overlay_lines(&diff_lines, palette);
-            let len = formatted.len();
-            (formatted, len)
-        }
-        vcs::FileDiff::NoTextChanges { .. } => {
-            diff_message_lines("(No diff changes in this file)", true, palette)
-        }
-        vcs::FileDiff::Unavailable {
-            reason: vcs::FileDiffUnavailableReason::Binary,
-            ..
-        } => single_diff_message_line("(Diff unavailable for binary file)", palette),
-        vcs::FileDiff::Unavailable {
-            reason: vcs::FileDiffUnavailableReason::External,
-            ..
-        } => single_diff_message_line("(Diff unavailable from external diff command)", palette),
-    }
-}
-
 fn build_file_lines(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
-) -> (Vec<Line<'static>>, usize) {
+) -> BuiltContent {
     if state.view_mode == ViewMode::Diff {
-        return build_file_diff_lines(state, node, palette);
+        return build_diff_context_content(state, node, palette);
     }
-
-    let language = node.language;
-    let Some(file_lines) = load_file_lines(state, &node.path) else {
-        return (
-            vec![Line::from(Span::styled(
-                "(File missing)",
-                Style::default().fg(palette.context).bg(palette.code_bg),
-            ))],
-            1,
-        );
-    };
-
-    // With scrolling enabled, we return all lines and let the viewport clip them.
-    let mut lines = Vec::with_capacity(file_lines.len());
-    for line in file_lines.iter() {
-        lines.push(format_code_line(
-            &mut state.highlighted_line_cache,
-            line,
-            palette,
-            language.as_ref(),
-        ));
-    }
-
-    let len = lines.len();
-    (lines, len)
+    build_source_context_content(state, node, palette)
 }
 
 fn build_directory_lines(
@@ -2889,6 +3103,8 @@ mod diff_scope_tests {
             workdir_prefix,
             file_cache: HashMap::new(),
             root_cursor: None,
+            focus_block: None,
+            pending_focus_scroll: false,
             scroll_offset: 0,
             content_height: 0,
             viewport_height: 0,
@@ -2949,6 +3165,8 @@ mod diff_scope_tests {
             workdir_prefix: None,
             file_cache: HashMap::new(),
             root_cursor: None,
+            focus_block: Some(block_id),
+            pending_focus_scroll: false,
             scroll_offset: 0,
             content_height: 0,
             viewport_height: 0,
@@ -3042,6 +3260,8 @@ mod diff_scope_tests {
                 ),
             )]),
             root_cursor: None,
+            focus_block: Some(block_id),
+            pending_focus_scroll: false,
             scroll_offset: 0,
             content_height: 0,
             viewport_height: 0,
@@ -3767,6 +3987,7 @@ mod diff_scope_tests {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Block,
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -3774,6 +3995,7 @@ mod diff_scope_tests {
         );
         let key_b = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Block,
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -3781,6 +4003,7 @@ mod diff_scope_tests {
         );
         let key_c = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Block,
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -3807,10 +4030,14 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let (lines, total_lines) = build_block_lines(&mut state, &snapshot, &palette, 2);
-        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let content = build_block_lines(&mut state, &snapshot, &palette, 2);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
 
-        assert_eq!(total_lines, 6);
+        assert_eq!(content.total_lines, 6);
         assert_eq!(rendered.len(), 6);
         assert!(rendered[0].contains("line1"));
         assert!(rendered[1].contains("line2"));
@@ -3835,11 +4062,18 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let (lines, total_lines) = build_file_lines(&mut state, &snapshot, &palette, 3);
-        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
 
-        assert_eq!(total_lines, 3);
-        assert_eq!(rendered, vec!["line1", "line2", "line3"]);
+        assert_eq!(content.total_lines, 3);
+        assert!(rendered[0].contains("line1"));
+        assert_eq!(rendered[1], "line2");
+        assert!(rendered[2].contains("line3"));
+        assert_eq!(content.focus_row_range, Some(1..2));
     }
 
     #[test]
@@ -3874,10 +4108,14 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let (lines, total_lines) = build_file_lines(&mut state, &snapshot, &palette, 3);
-        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
 
-        assert_eq!(total_lines, 3);
+        assert_eq!(content.total_lines, 3);
         assert_eq!(
             rendered,
             vec![
@@ -3928,10 +4166,14 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let (lines, total_lines) = build_file_lines(&mut state, &snapshot, &palette, 3);
-        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
 
-        assert_eq!(total_lines, 2);
+        assert_eq!(content.total_lines, 2);
         assert_eq!(
             rendered,
             vec!["(No diff changes in this file)", "Press [d] to view source"]
@@ -3957,21 +4199,20 @@ mod diff_scope_tests {
         );
         let node = state.navigator.tree.node(block_id);
         let snapshot = ContentNodeSnapshot::from_node(node);
-        let Some(block) = snapshot.block.clone() else {
-            panic!("expected block snapshot");
-        };
         let palette = UiPalette::default();
 
-        let (lines, total_lines) = build_block_diff_lines(&mut state, &snapshot, &block, &palette);
-        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        state.view_mode = ViewMode::Diff;
+        let content = build_block_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
 
-        assert_eq!(total_lines, 2);
+        assert_eq!(content.total_lines, 2);
         assert_eq!(
             rendered,
-            vec![
-                "(No diff changes in this block)",
-                "Press [d] to view source"
-            ]
+            vec!["(No diff changes in this file)", "Press [d] to view source"]
         );
     }
 
@@ -4009,6 +4250,7 @@ mod diff_scope_tests {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Block,
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -4016,6 +4258,7 @@ mod diff_scope_tests {
         );
         let key_b = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Block,
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -4030,6 +4273,7 @@ mod diff_scope_tests {
         let node_id = crate::tree::TreeBuilder::new().root();
         let diff_key = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::File,
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -4037,6 +4281,7 @@ mod diff_scope_tests {
         );
         let source_key = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::File,
             ViewMode::Source,
             vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 3 },
@@ -4047,10 +4292,65 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn content_cache_key_distinguishes_focus_blocks() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            Some(node_id),
+            TreeNodeKind::File,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            None,
+            TreeNodeKind::File,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn scroll_offset_for_focus_range_centers_short_focus_span() {
+        let offset = scroll_offset_for_focus_range(&(10..12), 8, 40);
+        assert_eq!(offset, 7);
+    }
+
+    #[test]
+    fn scroll_offset_for_focus_range_top_aligns_tall_focus_span() {
+        let offset = scroll_offset_for_focus_range(&(10..20), 5, 40);
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn handle_parent_preserves_child_focus_block_for_parent_file() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_parent_focus_anchor")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\nline2\nline3\n";
+        let block_content = "line2\n";
+        let (mut state, file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 1, 2);
+
+        handle_parent(&mut state);
+
+        assert_eq!(state.navigator.current_id(), file_id);
+        assert_eq!(state.focus_block, Some(block_id));
+        assert!(state.pending_focus_scroll);
+    }
+
+    #[test]
     fn content_cache_key_ignores_height_for_file_modes() {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::File,
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -4058,6 +4358,7 @@ mod diff_scope_tests {
         );
         let key_b = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::File,
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 3 },
@@ -4072,6 +4373,7 @@ mod diff_scope_tests {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Directory,
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -4085,6 +4387,7 @@ mod diff_scope_tests {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Block,
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -4092,6 +4395,7 @@ mod diff_scope_tests {
         );
         let key_b = content_frame_cache_key(
             node_id,
+            None,
             TreeNodeKind::Block,
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
@@ -4111,6 +4415,7 @@ mod diff_scope_tests {
             ContentFrameCacheEntry {
                 lines: vec![Line::from("a")],
                 total_lines: 1,
+                focus_row_range: None,
             },
         );
         cache.insert(
@@ -4118,6 +4423,7 @@ mod diff_scope_tests {
             ContentFrameCacheEntry {
                 lines: vec![Line::from("b")],
                 total_lines: 1,
+                focus_row_range: None,
             },
         );
 
@@ -4277,8 +4583,12 @@ mod diff_scope_tests {
         };
         let palette = UiPalette::default();
 
-        let (lines, _len) = build_block_diff_lines(&mut state, &node, &block, &palette);
-        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let content = build_block_lines(&mut state, &node, &palette, 3);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
 
         assert!(
             rendered
