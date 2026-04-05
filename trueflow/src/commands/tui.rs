@@ -27,7 +27,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -580,10 +581,35 @@ fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> Stri
     path_utils::repo_relative_path_for_diff(path, workdir_prefix)
 }
 
+fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
+
+fn enter_tui_mode<W: io::Write>(writer: &mut W) -> Result<()> {
+    execute!(
+        writer,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(tui_keyboard_enhancement_flags())
+    )?;
+    Ok(())
+}
+
+fn leave_tui_mode<W: io::Write>(writer: &mut W) -> Result<()> {
+    execute!(
+        writer,
+        DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    )?;
+    Ok(())
+}
+
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    enter_tui_mode(&mut stdout)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -592,11 +618,7 @@ fn restore_terminal(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    leave_tui_mode(terminal.backend_mut())?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -1390,17 +1412,9 @@ where
     F: FnOnce() -> Result<()>,
 {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    leave_tui_mode(terminal.backend_mut())?;
     let result = action();
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
+    enter_tui_mode(terminal.backend_mut())?;
     enable_raw_mode()?;
     terminal.clear()?;
     result
@@ -4095,6 +4109,41 @@ mod diff_scope_tests {
         let key =
             crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
         assert_eq!(editing_key_action_for_event(&key), EditingKeyAction::Submit);
+    }
+
+    #[test]
+    fn tui_keyboard_enhancement_flags_enable_shift_enter_disambiguation() {
+        let flags = tui_keyboard_enhancement_flags();
+        assert!(
+            flags.contains(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        assert!(flags.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    }
+
+    #[test]
+    fn enter_tui_mode_requests_keyboard_enhancement_flags() {
+        let mut output = Vec::new();
+        enter_tui_mode(&mut output).unwrap_or_else(|err| panic!("enter tui mode: {err}"));
+
+        let rendered =
+            String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
+        assert!(
+            rendered.contains("\u{1b}[>3u"),
+            "expected keyboard enhancement push sequence in output: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn leave_tui_mode_pops_keyboard_enhancement_flags() {
+        let mut output = Vec::new();
+        leave_tui_mode(&mut output).unwrap_or_else(|err| panic!("leave tui mode: {err}"));
+
+        let rendered =
+            String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
+        assert!(
+            rendered.contains("\u{1b}[<1u"),
+            "expected keyboard enhancement pop sequence in output: {rendered:?}"
+        );
     }
 
     #[test]
