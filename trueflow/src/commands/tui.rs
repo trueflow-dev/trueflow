@@ -25,7 +25,10 @@ use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -190,6 +193,7 @@ struct AppState {
     scroll_offset: u16,
     content_height: u16,
     viewport_height: u16,
+    code_rect: Rect,
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     keybinds: TuiKeybindsConfig,
@@ -198,6 +202,8 @@ struct AppState {
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     speed_read: SpeedReadController,
 }
+
+const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
 
 struct ReviewStateBuildOptions {
     confirm_batch: bool,
@@ -271,7 +277,8 @@ struct ContentFrameCacheKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ContentFrameCacheVariant {
-    File,
+    FileDiff,
+    FileSource,
     BlockDiff { focus_mode: vcs::BlockDiffFocusMode },
     BlockSource { code_height: u16 },
 }
@@ -437,6 +444,7 @@ fn build_review_state(
         scroll_offset: 0,
         content_height: 0,
         viewport_height: 0,
+        code_rect: Rect::default(),
         view_mode: ViewMode::Diff,
         block_diff_focus_mode: options.block_diff_focus_mode,
         keybinds: options.keybinds,
@@ -543,7 +551,7 @@ fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> Stri
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -552,7 +560,11 @@ fn restore_terminal(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -643,6 +655,13 @@ fn run_app(
         };
         if should_rerender_on_event(&event) {
             needs_render = true;
+            continue;
+        }
+
+        if let Event::Mouse(mouse_event) = &event {
+            if handle_mouse_event(&mut state, *mouse_event) {
+                needs_render = true;
+            }
             continue;
         }
 
@@ -900,6 +919,30 @@ fn should_rerender_on_event(event: &Event) -> bool {
     matches!(event, Event::Resize(_, _))
 }
 
+fn handle_mouse_event(state: &mut AppState, mouse_event: MouseEvent) -> bool {
+    if !matches!(state.input_mode, InputMode::Normal) || is_recap_mode(state) {
+        return false;
+    }
+    if !rect_contains(state.code_rect, mouse_event.column, mouse_event.row) {
+        return false;
+    }
+    if state.content_height <= state.viewport_height {
+        return false;
+    }
+
+    match mouse_event.kind {
+        MouseEventKind::ScrollUp => {
+            scroll_up_by(state, MOUSE_WHEEL_SCROLL_LINES);
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            scroll_down_by(state, MOUSE_WHEEL_SCROLL_LINES);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn is_recap_mode(state: &AppState) -> bool {
     matches!(state.input_mode, InputMode::Normal) && state.remaining_blocks == 0
 }
@@ -972,13 +1015,37 @@ fn handle_next(state: &mut AppState) {
 
 fn handle_scroll_page_up(state: &mut AppState) {
     let scroll_amount = state.viewport_height.saturating_sub(1);
-    state.scroll_offset = state.scroll_offset.saturating_sub(scroll_amount);
+    scroll_up_by(state, scroll_amount);
 }
 
 fn handle_scroll_page_down(state: &mut AppState) {
     let scroll_amount = state.viewport_height.saturating_sub(1);
-    let max_scroll = state.content_height.saturating_sub(state.viewport_height);
-    state.scroll_offset = (state.scroll_offset + scroll_amount).min(max_scroll);
+    scroll_down_by(state, scroll_amount);
+}
+
+fn scroll_up_by(state: &mut AppState, scroll_amount: u16) {
+    state.scroll_offset = state.scroll_offset.saturating_sub(scroll_amount);
+}
+
+fn scroll_down_by(state: &mut AppState, scroll_amount: u16) {
+    state.scroll_offset = state
+        .scroll_offset
+        .saturating_add(scroll_amount)
+        .min(max_scroll_offset(state));
+}
+
+fn max_scroll_offset(state: &AppState) -> u16 {
+    state.content_height.saturating_sub(state.viewport_height)
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    if rect.width == 0 || rect.height == 0 {
+        return false;
+    }
+
+    let right = rect.x.saturating_add(rect.width);
+    let bottom = rect.y.saturating_add(rect.height);
+    column >= rect.x && column < right && row >= rect.y && row < bottom
 }
 
 fn move_root_cursor(state: &mut AppState, offset: isize) {
@@ -1178,9 +1245,17 @@ where
     F: FnOnce() -> Result<()>,
 {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     let result = action();
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     enable_raw_mode()?;
     terminal.clear()?;
     result
@@ -1364,6 +1439,7 @@ fn scope_selector_content_layout(inner: Rect) -> ScopeSelectorContentLayout {
 fn ui(frame: &mut Frame, state: &mut AppState) {
     let palette = UiPalette::default();
     let area = frame.area();
+    state.code_rect = Rect::default();
 
     // 1. Background
     frame.render_widget(
@@ -1421,6 +1497,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     state.content_height = usize_to_u16_saturating(total_lines);
     state.viewport_height = focus_layout.code.height;
+    state.code_rect = focus_layout.code;
     state.scroll_offset = state
         .scroll_offset
         .min(state.content_height.saturating_sub(state.viewport_height));
@@ -1577,7 +1654,10 @@ fn content_frame_cache_key(
     }
 
     let variant = match node_kind {
-        TreeNodeKind::File => ContentFrameCacheVariant::File,
+        TreeNodeKind::File => match view_mode {
+            ViewMode::Diff => ContentFrameCacheVariant::FileDiff,
+            ViewMode::Source => ContentFrameCacheVariant::FileSource,
+        },
         TreeNodeKind::Block => match view_mode {
             ViewMode::Diff => ContentFrameCacheVariant::BlockDiff {
                 focus_mode: block_diff_focus_mode,
@@ -1655,6 +1735,11 @@ fn build_header_lines(
     };
 
     lines.push(format_header_row(&header_text, palette, true));
+    lines.push(format_header_row(
+        &format!("Mode: {}", view_mode_label(state.view_mode)),
+        palette,
+        false,
+    ));
 
     if matches!(node.kind, TreeNodeKind::Block)
         && let Some(breadcrumb) = review_metadata::block_breadcrumb(&state.navigator.tree, node.id)
@@ -1685,6 +1770,13 @@ fn build_header_lines(
     lines
 }
 
+fn view_mode_label(view_mode: ViewMode) -> &'static str {
+    match view_mode {
+        ViewMode::Diff => "Diff",
+        ViewMode::Source => "Source",
+    }
+}
+
 fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'static> {
     let style = if bold {
         Style::default()
@@ -1705,55 +1797,21 @@ fn scope_selector_hint_text(keybinds: &TuiKeybindsConfig) -> String {
 }
 
 fn build_action_lines(
-    width: u16,
+    _width: u16,
     keybinds: &TuiKeybindsConfig,
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
-    let top_left = "[a]pprove [c]omment [x]reject";
-    let top_right = format!("[{}]ascend  [g]root [q]uit", keybinds.up);
-    let top_spacing = top_line_spacing(width, top_left, &top_right);
-
-    let top_line = Line::from(vec![
-        Span::styled(top_left.to_string(), Style::default().fg(palette.dim)),
-        Span::styled(top_spacing, Style::default().bg(palette.bg)),
-        Span::styled(top_right, Style::default().fg(palette.dim)),
-    ]);
-
-    let pyramid_style = Style::default()
-        .fg(palette.dim)
-        .add_modifier(Modifier::BOLD);
-
-    let middle_left = "[d]toggle diff/source";
-    let middle_right = format!(
-        "[{}]prev            [{}]next",
-        keybinds.left, keybinds.right
+    let compact = format!(
+        "[a]approve [c]comment [x]reject [d]diff/source [{}/{}]prev/next [{}/{}]asc/desc [g]root [q]quit",
+        keybinds.left, keybinds.right, keybinds.up, keybinds.down
     );
-    let middle_spacing = top_line_spacing(width, middle_left, &middle_right);
-
-    let pyramid_lines = vec![
-        Line::from(vec![
-            Span::styled(middle_left.to_string(), pyramid_style),
-            Span::styled(middle_spacing, Style::default().bg(palette.bg)),
-            Span::styled(middle_right, pyramid_style),
-        ]),
-        Line::from(Span::styled(
-            format!("  [{}]descend", keybinds.down),
-            pyramid_style,
-        )),
-    ];
-
-    let mut lines = Vec::with_capacity(1 + pyramid_lines.len());
-    lines.push(top_line);
-    lines.extend(pyramid_lines);
-    lines
-}
-
-fn top_line_spacing(width: u16, left: &str, right: &str) -> String {
-    let total = left.len() + right.len();
-    if width as usize <= total {
-        return " ".to_string();
-    }
-    " ".repeat(width as usize - total)
+    vec![Line::from(Span::styled(
+        compact,
+        Style::default()
+            .fg(palette.dim)
+            .bg(palette.bg)
+            .add_modifier(Modifier::BOLD),
+    ))]
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -1996,73 +2054,36 @@ fn build_block_diff_lines(
     block: &crate::block::Block,
     palette: &UiPalette,
 ) -> (Vec<Line<'static>>, usize) {
-    if node.path.is_root() {
-        return (
-            vec![Line::from(Span::styled(
-                "(No path for diff)",
-                Style::default().fg(palette.dim).bg(palette.code_bg),
-            ))],
-            1,
-        );
-    }
-
-    let diff_path =
-        repo_relative_path_for_diff(node.path.as_str(), state.workdir_prefix.as_deref());
-    let path = PathBuf::from(&diff_path);
-    let file_diff = ensure_cached_file_diff(&mut state.file_diff_cache, &path, || {
-        let query = state
-            .review_scope
-            .diff_selection()
-            .query_for_path(&diff_path);
-        let repo = vcs::repo_from_workdir()?;
-        match query {
-            DiffQuery::MainDiff { path } => vcs::diff_for_file(&repo, &RepoPath::new(path)?),
-            DiffQuery::Revision { revision, path } => {
-                vcs::diff_for_file_in_revision(&repo, &revision, &RepoPath::new(path)?)
-            }
-            DiffQuery::RevisionRange { start, end, path } => {
-                vcs::diff_for_file_in_range(&repo, &start, &end, &RepoPath::new(path)?)
-            }
-        }
-    });
-    let diff_analysis =
-        vcs::analyze_block_diff_for_file(block, file_diff, state.block_diff_focus_mode);
-
-    let Some(view) = diff_analysis.view else {
-        let message = match diff_analysis.change_kind {
-            vcs::BlockDiffChangeKind::NoTextChanges => "(No diff changes in this block)",
-            vcs::BlockDiffChangeKind::OnlyNonreviewableChurn => {
-                "(Only nonreviewable formatting churn in this block)"
-            }
-            vcs::BlockDiffChangeKind::ReviewableChanges => {
-                "(Diff analysis did not produce view output)"
-            }
-            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::Binary) => {
-                "(Diff unavailable for binary file)"
-            }
-            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::External) => {
-                "(Diff unavailable from external diff command)"
-            }
-        };
-        return (
-            vec![Line::from(Span::styled(
-                message,
-                Style::default().fg(palette.dim).bg(palette.code_bg),
-            ))],
-            1,
-        );
+    let focus_mode = state.block_diff_focus_mode;
+    let Some(file_diff) = cached_file_diff_for_node(state, node) else {
+        return single_diff_message_line("(No path for diff)", palette);
     };
 
-    let formatted = view
-        .lines
-        .iter()
-        .map(|line| {
-            let style = style_for_diff_overlay_line(line, palette);
-            let text = format_diff_overlay_row(line);
-            Line::from(Span::styled(text, style))
-        })
-        .collect::<Vec<_>>();
+    let diff_analysis = vcs::analyze_block_diff_for_file(block, file_diff, focus_mode);
 
+    let Some(view) = diff_analysis.view else {
+        return match diff_analysis.change_kind {
+            vcs::BlockDiffChangeKind::NoTextChanges => {
+                diff_message_lines("(No diff changes in this block)", true, palette)
+            }
+            vcs::BlockDiffChangeKind::OnlyNonreviewableChurn => diff_message_lines(
+                "(Only nonreviewable formatting churn in this block)",
+                true,
+                palette,
+            ),
+            vcs::BlockDiffChangeKind::ReviewableChanges => {
+                single_diff_message_line("(Diff analysis did not produce view output)", palette)
+            }
+            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::Binary) => {
+                single_diff_message_line("(Diff unavailable for binary file)", palette)
+            }
+            vcs::BlockDiffChangeKind::DiffUnavailable(vcs::FileDiffUnavailableReason::External) => {
+                single_diff_message_line("(Diff unavailable from external diff command)", palette)
+            }
+        };
+    };
+
+    let formatted = render_diff_overlay_lines(&view.lines, palette);
     let len = formatted.len();
     (formatted, len)
 }
@@ -2122,12 +2143,169 @@ where
     })
 }
 
+fn cached_file_diff_for_node<'a>(
+    state: &'a mut AppState,
+    node: &ContentNodeSnapshot,
+) -> Option<&'a vcs::FileDiff> {
+    if node.path.is_root() {
+        return None;
+    }
+
+    let review_scope = state.review_scope.clone();
+    let workdir_prefix = state.workdir_prefix.clone();
+    let diff_path = repo_relative_path_for_diff(node.path.as_str(), workdir_prefix.as_deref());
+    let path = PathBuf::from(&diff_path);
+
+    Some(ensure_cached_file_diff(
+        &mut state.file_diff_cache,
+        &path,
+        || {
+            let query = review_scope.diff_selection().query_for_path(&diff_path);
+            let repo = vcs::repo_from_workdir()?;
+            match query {
+                DiffQuery::MainDiff { path } => vcs::diff_for_file(&repo, &RepoPath::new(path)?),
+                DiffQuery::Revision { revision, path } => {
+                    vcs::diff_for_file_in_revision(&repo, &revision, &RepoPath::new(path)?)
+                }
+                DiffQuery::RevisionRange { start, end, path } => {
+                    vcs::diff_for_file_in_range(&repo, &start, &end, &RepoPath::new(path)?)
+                }
+            }
+        },
+    ))
+}
+
+fn render_diff_overlay_lines(lines: &[vcs::DiffLine], palette: &UiPalette) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            let style = style_for_diff_overlay_line(line, palette);
+            let text = format_diff_overlay_row(line);
+            Line::from(Span::styled(text, style))
+        })
+        .collect()
+}
+
+fn diff_lines_from_hunks(hunks: &[vcs::DiffHunk]) -> Vec<vcs::DiffLine> {
+    let mut rendered = Vec::new();
+
+    for hunk in hunks {
+        let mut old_line = hunk.old_start;
+        let mut new_line = hunk.new_start;
+
+        for line in &hunk.lines {
+            let text = line.text.trim_end_matches('\n').to_string();
+            match line.kind {
+                vcs::DiffLineKind::Context => {
+                    rendered.push(vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Context,
+                        old_line: Some(old_line),
+                        new_line: Some(new_line),
+                        text,
+                        is_focus: false,
+                    });
+                    old_line = old_line.saturating_add(1);
+                    new_line = new_line.saturating_add(1);
+                }
+                vcs::DiffLineKind::Added => {
+                    rendered.push(vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(new_line),
+                        text,
+                        is_focus: true,
+                    });
+                    new_line = new_line.saturating_add(1);
+                }
+                vcs::DiffLineKind::Removed => {
+                    rendered.push(vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Removed,
+                        old_line: Some(old_line),
+                        new_line: None,
+                        text,
+                        is_focus: true,
+                    });
+                    old_line = old_line.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    rendered
+}
+
+fn single_diff_message_line(message: &str, palette: &UiPalette) -> (Vec<Line<'static>>, usize) {
+    (
+        vec![Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        ))],
+        1,
+    )
+}
+
+fn diff_message_lines(
+    message: &str,
+    include_source_hint: bool,
+    palette: &UiPalette,
+) -> (Vec<Line<'static>>, usize) {
+    let mut lines = vec![Line::from(Span::styled(
+        message.to_string(),
+        Style::default().fg(palette.dim).bg(palette.code_bg),
+    ))];
+    if include_source_hint {
+        lines.push(Line::from(Span::styled(
+            "Press [d] to view source".to_string(),
+            Style::default().fg(palette.dim).bg(palette.code_bg),
+        )));
+    }
+    let len = lines.len();
+    (lines, len)
+}
+
+fn build_file_diff_lines(
+    state: &mut AppState,
+    node: &ContentNodeSnapshot,
+    palette: &UiPalette,
+) -> (Vec<Line<'static>>, usize) {
+    let Some(file_diff) = cached_file_diff_for_node(state, node) else {
+        return single_diff_message_line("(No path for diff)", palette);
+    };
+
+    match file_diff {
+        vcs::FileDiff::Text { hunks, .. } => {
+            let diff_lines = diff_lines_from_hunks(hunks);
+            if diff_lines.is_empty() {
+                return diff_message_lines("(No diff changes in this file)", true, palette);
+            }
+            let formatted = render_diff_overlay_lines(&diff_lines, palette);
+            let len = formatted.len();
+            (formatted, len)
+        }
+        vcs::FileDiff::NoTextChanges { .. } => {
+            diff_message_lines("(No diff changes in this file)", true, palette)
+        }
+        vcs::FileDiff::Unavailable {
+            reason: vcs::FileDiffUnavailableReason::Binary,
+            ..
+        } => single_diff_message_line("(Diff unavailable for binary file)", palette),
+        vcs::FileDiff::Unavailable {
+            reason: vcs::FileDiffUnavailableReason::External,
+            ..
+        } => single_diff_message_line("(Diff unavailable from external diff command)", palette),
+    }
+}
+
 fn build_file_lines(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
+    if state.view_mode == ViewMode::Diff {
+        return build_file_diff_lines(state, node, palette);
+    }
+
     let language = node.language;
     let Some(file_lines) = load_file_lines(state, &node.path) else {
         return (
@@ -2488,7 +2666,7 @@ struct FocusLayout {
     actions: Rect,
 }
 
-const ACTIONS_HEIGHT: u16 = 3;
+const ACTIONS_HEIGHT: u16 = 1;
 
 fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let code_width = area.width.min(120);
@@ -2564,7 +2742,7 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 3);
         assert_eq!(layout.code.width, 120);
-        assert_eq!(layout.actions.height, 3);
+        assert_eq!(layout.actions.height, 1);
         assert!(layout.code.y > area.y);
     }
 
@@ -2669,6 +2847,7 @@ mod diff_scope_tests {
             scroll_offset: 0,
             content_height: 0,
             viewport_height: 0,
+            code_rect: Rect::default(),
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             keybinds: TuiKeybindsConfig::default(),
@@ -2728,6 +2907,7 @@ mod diff_scope_tests {
             scroll_offset: 0,
             content_height: 0,
             viewport_height: 0,
+            code_rect: Rect::default(),
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             keybinds: TuiKeybindsConfig::default(),
@@ -2749,7 +2929,7 @@ mod diff_scope_tests {
         block_content: &str,
         block_start_line: usize,
         block_end_line: usize,
-    ) -> (AppState, TreeNodeId) {
+    ) -> (AppState, TreeNodeId, TreeNodeId) {
         fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
             .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
         fs::write(file_path, file_content)
@@ -2820,6 +3000,7 @@ mod diff_scope_tests {
             scroll_offset: 0,
             content_height: 0,
             viewport_height: 0,
+            code_rect: Rect::default(),
             view_mode: ViewMode::Source,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             keybinds: TuiKeybindsConfig::default(),
@@ -2832,7 +3013,7 @@ mod diff_scope_tests {
             ),
         };
 
-        (state, block_id)
+        (state, file, block_id)
     }
 
     #[test]
@@ -3052,17 +3233,15 @@ mod diff_scope_tests {
         let palette = UiPalette::default();
         let lines = build_action_lines(80, &keybinds, &palette);
 
-        assert_eq!(lines.len(), 3);
-        assert!(
-            lines[0]
-                .to_string()
-                .contains("[a]pprove [c]omment [x]reject")
-        );
-        assert!(lines[0].to_string().contains("[i]ascend"));
-        assert!(lines[0].to_string().contains("[g]root [q]uit"));
-        assert!(lines[1].to_string().contains("[d]toggle diff/source"));
-        assert!(lines[1].to_string().contains("[j]prev            [l]next"));
-        assert_eq!(lines[2].to_string(), "  [k]descend");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].to_string().contains("[a]approve"));
+        assert!(lines[0].to_string().contains("[c]comment"));
+        assert!(lines[0].to_string().contains("[x]reject"));
+        assert!(lines[0].to_string().contains("[d]diff/source"));
+        assert!(lines[0].to_string().contains("[j/l]prev/next"));
+        assert!(lines[0].to_string().contains("[i/k]asc/desc"));
+        assert!(lines[0].to_string().contains("[g]root"));
+        assert!(lines[0].to_string().contains("[q]quit"));
     }
 
     #[test]
@@ -3167,6 +3346,103 @@ mod diff_scope_tests {
         ));
         assert!(should_rerender_on_event(&resize));
         assert!(!should_rerender_on_event(&key));
+    }
+
+    #[test]
+    fn handle_mouse_event_scrolls_when_pointer_is_inside_code_pane() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.code_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 12,
+        };
+        state.total_blocks = 1;
+        state.initial_remaining_blocks = 1;
+        state.remaining_blocks = 1;
+        state.content_height = 40;
+        state.viewport_height = 12;
+        state.scroll_offset = 4;
+
+        let rerender = handle_mouse_event(
+            &mut state,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 12,
+                row: 8,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+
+        assert!(rerender);
+        assert_eq!(state.scroll_offset, 7);
+    }
+
+    #[test]
+    fn handle_mouse_event_ignores_scroll_outside_code_pane() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.code_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 12,
+        };
+        state.total_blocks = 1;
+        state.initial_remaining_blocks = 1;
+        state.remaining_blocks = 1;
+        state.content_height = 40;
+        state.viewport_height = 12;
+        state.scroll_offset = 4;
+
+        let rerender = handle_mouse_event(
+            &mut state,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 4,
+                row: 8,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+
+        assert!(!rerender);
+        assert_eq!(state.scroll_offset, 4);
+    }
+
+    #[test]
+    fn handle_mouse_event_ignores_scroll_while_editing() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.code_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 12,
+        };
+        state.total_blocks = 1;
+        state.initial_remaining_blocks = 1;
+        state.remaining_blocks = 1;
+        state.content_height = 40;
+        state.viewport_height = 12;
+        state.scroll_offset = 4;
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+
+        let rerender = handle_mouse_event(
+            &mut state,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 12,
+                row: 8,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+
+        assert!(!rerender);
+        assert_eq!(state.scroll_offset, 4);
     }
 
     #[test]
@@ -3401,7 +3677,7 @@ mod diff_scope_tests {
         let file_path = temp_root.join("src/lib.rs");
         let file_content = "line1\nline2\nline3\nline4\nline5\nline6\n";
         let block_content = "line3\nline4\n";
-        let (mut state, block_id) =
+        let (mut state, _file_id, block_id) =
             build_state_with_block_file(&file_path, file_content, block_content, 2, 4);
         let node = state.navigator.tree.node(block_id);
         let snapshot = ContentNodeSnapshot::from_node(node);
@@ -3417,6 +3693,189 @@ mod diff_scope_tests {
         assert!(rendered[2].contains("line3"));
         assert!(rendered[3].contains("line4"));
         assert!(rendered[5].contains("line6"));
+    }
+
+    #[test]
+    fn build_file_lines_source_mode_renders_full_file_source() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_file_source_mode")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\nline2\nline3\n";
+        let block_content = "line2\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 1, 2);
+        state.view_mode = ViewMode::Source;
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let (lines, total_lines) = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        assert_eq!(total_lines, 3);
+        assert_eq!(rendered, vec!["line1", "line2", "line3"]);
+    }
+
+    #[test]
+    fn build_file_lines_diff_mode_renders_diff_rows() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_file_diff_mode")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1 changed\nline2\n";
+        let block_content = "line1 changed\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        state.view_mode = ViewMode::Diff;
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::removed("line1\n"),
+                        vcs::DiffHunkLine::added("line1 changed\n"),
+                        vcs::DiffHunkLine::context("line2\n"),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let (lines, total_lines) = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        assert_eq!(total_lines, 3);
+        assert_eq!(
+            rendered,
+            vec![
+                format_diff_overlay_row(&vcs::DiffLine {
+                    kind: vcs::DiffLineKind::Removed,
+                    old_line: Some(1),
+                    new_line: None,
+                    text: "line1".to_string(),
+                    is_focus: true,
+                }),
+                format_diff_overlay_row(&vcs::DiffLine {
+                    kind: vcs::DiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    text: "line1 changed".to_string(),
+                    is_focus: true,
+                }),
+                format_diff_overlay_row(&vcs::DiffLine {
+                    kind: vcs::DiffLineKind::Context,
+                    old_line: Some(2),
+                    new_line: Some(2),
+                    text: "line2".to_string(),
+                    is_focus: false,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_file_lines_diff_mode_shows_no_changes_hint() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_file_diff_empty")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\nline2\n";
+        let block_content = "line1\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        state.view_mode = ViewMode::Diff;
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::NoTextChanges {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+            },
+        );
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let (lines, total_lines) = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        assert_eq!(total_lines, 2);
+        assert_eq!(
+            rendered,
+            vec!["(No diff changes in this file)", "Press [d] to view source"]
+        );
+    }
+
+    #[test]
+    fn build_block_diff_lines_no_changes_include_source_hint() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_block_diff_empty")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\nline2\n";
+        let block_content = "line1\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::NoTextChanges {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+            },
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let block = snapshot.block.clone().expect("expected block snapshot");
+        let palette = UiPalette::default();
+
+        let (lines, total_lines) = build_block_diff_lines(&mut state, &snapshot, &block, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        assert_eq!(total_lines, 2);
+        assert_eq!(
+            rendered,
+            vec![
+                "(No diff changes in this block)",
+                "Press [d] to view source"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_header_lines_include_current_view_mode_for_file_nodes() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_header_mode_label")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\n";
+        let block_content = "line1\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        state.view_mode = ViewMode::Diff;
+        let palette = UiPalette::default();
+        let file_node = state.navigator.tree.node(file_id);
+
+        let diff_header = build_header_lines(file_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert!(diff_header.iter().any(|line| line == "Mode: Diff"));
+
+        state.view_mode = ViewMode::Source;
+        let source_header = build_header_lines(file_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert!(source_header.iter().any(|line| line == "Mode: Source"));
     }
 
     #[test]
@@ -3441,7 +3900,28 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn content_cache_key_ignores_mode_and_height_for_file_nodes() {
+    fn content_cache_key_distinguishes_file_modes() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let diff_key = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::File,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+        );
+        let source_key = content_frame_cache_key(
+            node_id,
+            TreeNodeKind::File,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 3 },
+            40,
+        );
+
+        assert_ne!(diff_key, source_key);
+    }
+
+    #[test]
+    fn content_cache_key_ignores_height_for_file_modes() {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
@@ -3453,7 +3933,7 @@ mod diff_scope_tests {
         let key_b = content_frame_cache_key(
             node_id,
             TreeNodeKind::File,
-            ViewMode::Source,
+            ViewMode::Diff,
             vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 3 },
             40,
         );
