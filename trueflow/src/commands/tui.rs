@@ -566,7 +566,7 @@ fn run_scope_selector(
 
     loop {
         if needs_render {
-            terminal.draw(|f| render_scope_selector(f, &selector))?;
+            terminal.draw(|f| render_scope_selector(f, &selector, keybinds))?;
             needs_render = false;
         }
 
@@ -1257,7 +1257,11 @@ fn detect_repo_name(context: &TrueflowContext) -> String {
 
 // --- UI Rendering ---
 
-fn render_scope_selector(frame: &mut Frame, selector: &ScopeSelector) {
+fn render_scope_selector(
+    frame: &mut Frame,
+    selector: &ScopeSelector,
+    keybinds: &TuiKeybindsConfig,
+) {
     let palette = UiPalette::default();
     let area = frame.area();
 
@@ -1314,7 +1318,7 @@ fn render_scope_selector(frame: &mut Frame, selector: &ScopeSelector) {
     if layout.hints.height > 0 && layout.hints.width > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "[Enter] select  [j/k] move  [q] quit",
+                scope_selector_hint_text(keybinds),
                 Style::default().fg(palette.dim).bg(palette.bg),
             )))
             .alignment(Alignment::Left)
@@ -1400,7 +1404,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let header_lines = build_header_lines(node, state, palette);
 
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
-    let actions_lines = build_action_lines(focus_layout.actions.width, palette);
+    let actions_lines = build_action_lines(focus_layout.actions.width, &state.keybinds, palette);
     let node_snapshot = ContentNodeSnapshot::from_node(node);
     let (content_lines, total_lines) = if let Some(speed_lines) =
         build_speed_read_lines(state, node_snapshot.id, palette, focus_layout.code.width)
@@ -1693,7 +1697,18 @@ fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'stati
     Line::from(Span::styled(text.to_string(), style))
 }
 
-fn build_action_lines(width: u16, palette: &UiPalette) -> Vec<Line<'static>> {
+fn scope_selector_hint_text(keybinds: &TuiKeybindsConfig) -> String {
+    format!(
+        "[Enter] select  [{}/{}] move  [q] quit",
+        keybinds.up, keybinds.down
+    )
+}
+
+fn build_action_lines(
+    width: u16,
+    keybinds: &TuiKeybindsConfig,
+    palette: &UiPalette,
+) -> Vec<Line<'static>> {
     let top_left = "[a]pprove [c]omment [x]reject";
     let top_right = "[g]root [q]uit";
     let top_spacing = top_line_spacing(width, top_left, top_right);
@@ -1709,9 +1724,21 @@ fn build_action_lines(width: u16, palette: &UiPalette) -> Vec<Line<'static>> {
         .add_modifier(Modifier::BOLD);
 
     let pyramid_lines = vec![
-        Line::from(Span::styled("[i]ascend", pyramid_style)),
-        Line::from(Span::styled("[j]prev            [l]next", pyramid_style)),
-        Line::from(Span::styled("  [k]descend", pyramid_style)),
+        Line::from(Span::styled(
+            format!("[{}]ascend", keybinds.up),
+            pyramid_style,
+        )),
+        Line::from(Span::styled(
+            format!(
+                "[{}]prev            [{}]next",
+                keybinds.left, keybinds.right
+            ),
+            pyramid_style,
+        )),
+        Line::from(Span::styled(
+            format!("  [{}]descend", keybinds.down),
+            pyramid_style,
+        )),
         Line::from(Span::styled("  [d]toggle diff/source", pyramid_style)),
     ];
 
@@ -2983,6 +3010,36 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn scope_selector_hint_text_uses_configured_keybinds() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            up: 'i',
+            down: 'k',
+            left: 'j',
+            right: 'l',
+        };
+        assert_eq!(
+            scope_selector_hint_text(&keybinds),
+            "[Enter] select  [i/k] move  [q] quit"
+        );
+    }
+
+    #[test]
+    fn build_action_lines_uses_configured_keybinds() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            up: 'i',
+            down: 'k',
+            left: 'j',
+            right: 'l',
+        };
+        let palette = UiPalette::default();
+        let lines = build_action_lines(80, &keybinds, &palette);
+
+        assert_eq!(lines[1].to_string(), "[i]ascend");
+        assert_eq!(lines[2].to_string(), "[j]prev            [l]next");
+        assert_eq!(lines[3].to_string(), "  [k]descend");
+    }
+
+    #[test]
     fn cli_review_request_returns_none_without_cli_overrides() {
         let request = cli_review_request(false, &[], &[], &[])
             .unwrap_or_else(|error| panic!("expected no parse error: {error}"));
@@ -3909,6 +3966,10 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: TYPESCRIPT_KEYWORDS,
             line_comment_start: Some("//"),
         },
+        Language::Java => LanguageHighlightRules {
+            keywords: JAVA_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
         Language::Python => LanguageHighlightRules {
             keywords: PYTHON_KEYWORDS,
             line_comment_start: Some("#"),
@@ -4114,6 +4175,63 @@ const TYPESCRIPT_KEYWORDS: &[&str] = &[
     "switch",
     "type",
     "var",
+    "while",
+];
+const JAVA_KEYWORDS: &[&str] = &[
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "native",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "record",
+    "return",
+    "sealed",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "true",
+    "try",
+    "var",
+    "void",
+    "volatile",
     "while",
 ];
 const PYTHON_KEYWORDS: &[&str] = &[

@@ -221,6 +221,6 @@ int process(int[] values) {
     return total;
 }";
         let score = calculate(code, Language::Java);
-        assert_eq!(score, 3);
+        assert_eq!(score, Some(3));
     }
 }
