@@ -16,12 +16,12 @@ use trueflow::scanner::ScanOptions;
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-pub struct ReviewBenchRepo {
+pub(crate) struct ReviewBenchRepo {
     pub path: PathBuf,
 }
 
 impl ReviewBenchRepo {
-    pub fn fixture(name: &str) -> Result<Self> {
+    pub(crate) fn fixture(name: &str) -> Result<Self> {
         let src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("example_repos")
             .join(name);
@@ -36,7 +36,7 @@ impl ReviewBenchRepo {
         Ok(Self { path })
     }
 
-    pub fn full_review_summary(&self) -> Result<ReviewSummary> {
+    pub(crate) fn full_review_summary(&self) -> Result<ReviewSummary> {
         run_full_review(&self.path)
     }
 }
@@ -47,7 +47,7 @@ impl Drop for ReviewBenchRepo {
     }
 }
 
-pub fn run_full_review(path: &Path) -> Result<ReviewSummary> {
+pub(crate) fn run_full_review(path: &Path) -> Result<ReviewSummary> {
     with_current_dir(path, || {
         let query = resolve_review_request(
             ReviewRequest::AllFiles,
