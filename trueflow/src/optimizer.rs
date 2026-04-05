@@ -250,9 +250,9 @@ fn flush_blocks(
     result
 }
 
-fn merged_metadata(blocks: &[Block]) -> (Vec<String>, u32) {
+fn merged_metadata(blocks: &[Block]) -> (Vec<String>, Option<u32>) {
     let mut tags = Vec::new();
-    let mut complexity = 0_u32;
+    let mut complexity = None;
 
     for block in blocks {
         for tag in &block.tags {
@@ -260,7 +260,10 @@ fn merged_metadata(blocks: &[Block]) -> (Vec<String>, u32) {
                 tags.push(tag.clone());
             }
         }
-        complexity = complexity.saturating_add(block.complexity);
+
+        if let Some(block_complexity) = block.complexity {
+            complexity = Some(complexity.unwrap_or(0_u32).saturating_add(block_complexity));
+        }
     }
 
     (tags, complexity)
@@ -485,11 +488,11 @@ mod tests {
     fn test_merge_preserves_union_tags_and_complexity() {
         let mut module_a = make_block(BlockKind::Module, "mod tests {\n}\n", 0, 2);
         module_a.tags = vec!["test".to_string()];
-        module_a.complexity = 2;
+        module_a.complexity = Some(2);
 
         let mut module_b = make_block(BlockKind::Module, "mod helper {\n}\n", 3, 5);
         module_b.tags = vec!["test".to_string(), "integration".to_string()];
-        module_b.complexity = 3;
+        module_b.complexity = Some(3);
 
         let blocks = vec![module_a, make_block(BlockKind::Gap, "\n", 2, 3), module_b];
 
@@ -500,7 +503,20 @@ mod tests {
             optimized[0].tags,
             vec!["test".to_string(), "integration".to_string()]
         );
-        assert_eq!(optimized[0].complexity, 5);
+        assert_eq!(optimized[0].complexity, Some(5));
+    }
+
+    #[test]
+    fn test_merge_keeps_complexity_unknown_when_no_inputs_have_scores() {
+        let blocks = vec![
+            make_block(BlockKind::Module, "mod tests {\n}\n", 0, 2),
+            make_block(BlockKind::Gap, "\n", 2, 3),
+            make_block(BlockKind::Module, "mod helper {\n}\n", 3, 5),
+        ];
+
+        let optimized = optimize(blocks);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].complexity, None);
     }
 
     #[test]

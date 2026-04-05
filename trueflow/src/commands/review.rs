@@ -737,7 +737,7 @@ mod tests {
             content: "content".to_string(),
             kind,
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
-            complexity: 0,
+            complexity: None,
             start_line: 0,
             end_line: 1,
         }

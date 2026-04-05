@@ -1038,7 +1038,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 10, // 0-based, so lines 11-20
             end_line: 20,
         };
@@ -1113,7 +1113,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 10, // 0-based, so lines 11-20
             end_line: 20,   // exclusive
         };
@@ -1143,7 +1143,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 9, // 0-based, so lines 10-14
             end_line: 14,  // exclusive
         };
@@ -1193,7 +1193,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 10, // 0-based, so lines 11-16
             end_line: 16,
         };
@@ -1245,7 +1245,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 10, // 0-based, so lines 11-12
             end_line: 12,
         };
@@ -1303,7 +1303,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2, // 0-based, lines 3..=5
             end_line: 5,
         };
@@ -1331,7 +1331,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1359,7 +1359,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1387,7 +1387,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1415,7 +1415,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1446,7 +1446,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1477,7 +1477,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1508,7 +1508,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1539,7 +1539,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 5,
         };
@@ -1567,7 +1567,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 2,
             end_line: 8,
         };
@@ -1600,7 +1600,7 @@ mod tests {
             content: String::new(),
             kind: BlockKind::Code,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 0,
             end_line: 2,
         };

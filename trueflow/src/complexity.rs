@@ -1,9 +1,12 @@
 use crate::analysis::Language;
 use tree_sitter::{Node, Parser};
 
-pub fn calculate(content: &str, lang: Language) -> u32 {
-    if lang == Language::Unknown || lang == Language::Text || lang == Language::Markdown {
-        return 0;
+pub fn calculate(content: &str, lang: Language) -> Option<u32> {
+    if matches!(
+        lang,
+        Language::Unknown | Language::Text | Language::Markdown
+    ) {
+        return None;
     }
 
     let mut parser = Parser::new();
@@ -15,20 +18,15 @@ pub fn calculate(content: &str, lang: Language) -> u32 {
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
-    };
-
-    let Some(language) = language else {
-        return 0;
-    };
+    }?;
 
     if parser.set_language(&language).is_err() {
-        return 0;
+        return None;
     }
 
-    match parser.parse(content, None) {
-        Some(tree) => calculate_node(tree.root_node(), 0, lang),
-        None => 0,
-    }
+    parser
+        .parse(content, None)
+        .map(|tree| calculate_node(tree.root_node(), 0, lang))
 }
 
 fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
@@ -135,7 +133,7 @@ mod tests {
         let code = "fn foo() { if true { for x in 0..10 { } } }";
         // if (+1) + for (+1 + nesting 1) = 3
         let score = calculate(code, Language::Rust);
-        assert_eq!(score, 3);
+        assert_eq!(score, Some(3));
     }
 
     #[test]
@@ -152,7 +150,7 @@ mod tests {
         // if c: +1 + 2 (nesting) = 3
         // Total: 6
         let score = calculate(code, Language::Rust);
-        assert_eq!(score, 6);
+        assert_eq!(score, Some(6));
     }
 
     #[test]
@@ -170,7 +168,7 @@ def foo():
         // except: +1 + 2 (nesting 2, child of try) = 3
         // Total: 6
         let score = calculate(code, Language::Python);
-        assert_eq!(score, 6);
+        assert_eq!(score, Some(6));
     }
 
     #[test]
@@ -186,6 +184,14 @@ func run(_ values: [Int]) -> Int {
     return result
 }";
         let score = calculate(code, Language::Swift);
-        assert_eq!(score, 3);
+        assert_eq!(score, Some(3));
+    }
+
+    #[test]
+    fn test_calculate_complexity_returns_none_for_textual_or_unsupported_languages() {
+        assert_eq!(calculate("plain text", Language::Text), None);
+        assert_eq!(calculate("# heading", Language::Markdown), None);
+        assert_eq!(calculate("whatever", Language::Unknown), None);
+        assert_eq!(calculate("key = \"value\"", Language::Toml), None);
     }
 }

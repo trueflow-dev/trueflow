@@ -244,9 +244,9 @@ pub struct Block {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Optional complexity score
-    #[serde(default)]
-    pub complexity: u32,
+    /// Complexity score for this exact block when explicitly computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<u32>,
 
     /// 0-indexed start line (inclusive)
     pub start_line: usize,
@@ -262,7 +262,7 @@ impl Block {
             content,
             kind,
             tags: Vec::new(),
-            complexity: 0,
+            complexity: None,
             start_line,
             end_line,
         }
@@ -538,5 +538,13 @@ mod tests {
             )
         );
         assert_ne!(file.bytes_hash.as_str(), file.tree_hash.as_str());
+    }
+
+    #[test]
+    fn test_block_serialization_omits_unknown_complexity() {
+        let block = Block::new("fn a() {}".to_string(), BlockKind::Function, 0, 1);
+        let value = serde_json::to_value(&block).unwrap();
+
+        assert!(value.get("complexity").is_none());
     }
 }

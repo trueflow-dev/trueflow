@@ -749,17 +749,7 @@ fn create_sub_block_with_kind(
         content: content.to_string(),
         kind,
         tags: parent.tags.clone(),
-        complexity: parent.complexity, // Simplified: inherit complexity or re-calculate?
-        // Re-calculation might be better if we split functions.
-        // But for sub-blocks which are just parts of a function (paragraphs),
-        // maybe we should just split the complexity proportionally or re-calc.
-        // For now, let's inherit.
-        // Or actually, `create_sub_block` implies it is smaller.
-        // Let's set complexity to 0 for sub-blocks for now, as they are "sub-units".
-        // Or re-calculate if we passed lang.
-        // `create_sub_block_with_kind` doesn't have lang.
-        // We can update it to take lang, or just set 0.
-        // Let's set 0 for MVP to fix compilation.
+        complexity: None,
         start_line,
         end_line,
     }
@@ -786,7 +776,7 @@ mod tests {
             content: content.to_string(),
             kind,
             tags: Vec::new(),
-            complexity: 0,
+            complexity: None,
             start_line,
             end_line,
         }
@@ -940,5 +930,17 @@ mod tests {
         let block = make_block(content, BlockKind::Code);
         let chunks = split(&block, Language::Rust).unwrap();
         assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_sub_blocks_do_not_inherit_parent_complexity() {
+        let content = "fn foo() {\n    if true {\n        run();\n    }\n\n    finish();\n}";
+        let mut block = make_large_block(content, BlockKind::Function);
+        block.complexity = Some(7);
+
+        let chunks = split(&block, Language::Rust).unwrap();
+
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.complexity.is_none()));
     }
 }

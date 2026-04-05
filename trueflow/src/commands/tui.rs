@@ -3510,7 +3510,7 @@ mod diff_scope_tests {
             content: "fn main() {\n    println!(\"Hello from commit scope\");\n}".to_string(),
             kind: BlockKind::Function,
             tags: vec![],
-            complexity: 0,
+            complexity: None,
             start_line: 0,
             end_line: 3,
         };
