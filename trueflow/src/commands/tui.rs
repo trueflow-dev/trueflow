@@ -3448,6 +3448,70 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn highlight_line_rust_recognizes_keyword_number_and_comment() {
+        let tokens = highlight_line("let value = 42; // note", Some(&Language::Rust));
+        let rendered = tokens
+            .iter()
+            .map(|token| (token.text.as_str(), token.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                ("let", TokenKind::Keyword),
+                (" value = ", TokenKind::Base),
+                ("42", TokenKind::Number),
+                ("; ", TokenKind::Base),
+                ("// note", TokenKind::Comment),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_line_rust_recognizes_string_literals() {
+        let tokens = highlight_line("println!(\"hi\");", Some(&Language::Rust));
+        let rendered = tokens
+            .iter()
+            .map(|token| (token.text.as_str(), token.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                ("println!(", TokenKind::Base),
+                ("\"hi\"", TokenKind::String),
+                (");", TokenKind::Base),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_line_unknown_language_falls_back_to_plain_text() {
+        let tokens = highlight_line("let value = 42; // note", Some(&Language::Unknown));
+
+        assert_eq!(
+            tokens,
+            vec![HighlightToken {
+                text: "let value = 42; // note".to_string(),
+                kind: TokenKind::Base,
+            }]
+        );
+    }
+
+    #[test]
+    fn highlight_line_without_language_falls_back_to_plain_text() {
+        let tokens = highlight_line("let value = 42;", None);
+
+        assert_eq!(
+            tokens,
+            vec![HighlightToken {
+                text: "let value = 42;".to_string(),
+                kind: TokenKind::Base,
+            }]
+        );
+    }
+
+    #[test]
     fn build_block_diff_lines_uses_repo_relative_path_for_commit_scope_blocks() {
         let repo_root = std::env::temp_dir()
             .join("trueflow_tests")
@@ -3687,11 +3751,11 @@ struct UiPalette {
     code_fg: Color,
     dim: Color,
     add: Color,
-    #[allow(dead_code)]
     del: Color,
     keyword: Color,
     string: Color,
     number: Color,
+    comment: Color,
     code_bg: Color,
     meta_bg: Color,
     meta_border: Color,
@@ -3710,6 +3774,7 @@ impl Default for UiPalette {
             keyword: Color::Rgb(69, 133, 136),
             string: Color::Rgb(215, 153, 33),
             number: Color::Rgb(177, 98, 134),
+            comment: Color::Rgb(124, 111, 100),
             code_bg: Color::Rgb(240, 240, 238),
             meta_bg: Color::Rgb(244, 244, 242),
             meta_border: Color::Rgb(204, 204, 200),
@@ -3722,10 +3787,8 @@ impl Default for UiPalette {
 enum TokenKind {
     Base,
     Keyword,
-    #[allow(dead_code)]
     String,
     Number,
-    #[allow(dead_code)]
     Comment,
 }
 
@@ -3741,45 +3804,379 @@ struct HighlightLineCacheKey {
     language: Option<Language>,
 }
 
-fn highlight_line(line: &str, _language: Option<&Language>) -> Vec<HighlightToken> {
-    // Very basic highlighting for now
-    let mut tokens = Vec::new();
-    let mut current_word = String::new();
+#[derive(Debug, Clone, Copy)]
+struct LanguageHighlightRules {
+    keywords: &'static [&'static str],
+    line_comment_start: Option<&'static str>,
+}
 
-    for c in line.chars() {
-        if c.is_alphanumeric() || c == '_' {
-            current_word.push(c);
-        } else {
-            if !current_word.is_empty() {
-                tokens.push(classify_token(&current_word));
-                current_word.clear();
+#[derive(Debug, Clone, Copy)]
+struct LineHighlighter {
+    rules: LanguageHighlightRules,
+}
+
+impl LineHighlighter {
+    fn tokenize_line(self, line: &str) -> Vec<HighlightToken> {
+        if line.is_empty() {
+            return Vec::new();
+        }
+
+        let mut tokens = Vec::new();
+        let mut index = 0;
+
+        while index < line.len() {
+            let rest = &line[index..];
+
+            if let Some(comment_start) = self.rules.line_comment_start
+                && rest.starts_with(comment_start)
+            {
+                tokens.push(HighlightToken {
+                    text: rest.to_string(),
+                    kind: TokenKind::Comment,
+                });
+                break;
             }
-            tokens.push(HighlightToken {
-                text: c.to_string(),
-                kind: TokenKind::Base,
-            });
+
+            if let Some(string_end) = consume_string_literal(rest) {
+                tokens.push(HighlightToken {
+                    text: rest[..string_end].to_string(),
+                    kind: TokenKind::String,
+                });
+                index += string_end;
+                continue;
+            }
+
+            if let Some(number_end) = consume_number(rest) {
+                tokens.push(HighlightToken {
+                    text: rest[..number_end].to_string(),
+                    kind: TokenKind::Number,
+                });
+                index += number_end;
+                continue;
+            }
+
+            if let Some(identifier_end) = consume_identifier(rest) {
+                let text = &rest[..identifier_end];
+                let kind = if self.rules.keywords.contains(&text) {
+                    TokenKind::Keyword
+                } else {
+                    TokenKind::Base
+                };
+                push_token(&mut tokens, text, kind);
+                index += identifier_end;
+                continue;
+            }
+
+            let char_end = rest
+                .char_indices()
+                .nth(1)
+                .map(|(next, _)| next)
+                .unwrap_or(rest.len());
+            push_token(&mut tokens, &rest[..char_end], TokenKind::Base);
+            index += char_end;
+        }
+
+        tokens
+    }
+}
+
+fn highlight_line(line: &str, language: Option<&Language>) -> Vec<HighlightToken> {
+    match line_highlighter_for(language) {
+        Some(highlighter) => highlighter.tokenize_line(line),
+        None => plain_text_tokens(line),
+    }
+}
+
+fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> {
+    let rules = match language.copied()? {
+        Language::Rust => LanguageHighlightRules {
+            keywords: RUST_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
+        Language::Swift => LanguageHighlightRules {
+            keywords: SWIFT_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
+        Language::Elisp => LanguageHighlightRules {
+            keywords: ELISP_KEYWORDS,
+            line_comment_start: Some(";"),
+        },
+        Language::JavaScript => LanguageHighlightRules {
+            keywords: JAVASCRIPT_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
+        Language::TypeScript => LanguageHighlightRules {
+            keywords: TYPESCRIPT_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
+        Language::Python => LanguageHighlightRules {
+            keywords: PYTHON_KEYWORDS,
+            line_comment_start: Some("#"),
+        },
+        Language::Go => LanguageHighlightRules {
+            keywords: GO_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
+        Language::Cpp => LanguageHighlightRules {
+            keywords: CPP_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
+        Language::Shell => LanguageHighlightRules {
+            keywords: SHELL_KEYWORDS,
+            line_comment_start: Some("#"),
+        },
+        Language::Nix => LanguageHighlightRules {
+            keywords: NIX_KEYWORDS,
+            line_comment_start: Some("#"),
+        },
+        Language::Just => LanguageHighlightRules {
+            keywords: JUST_KEYWORDS,
+            line_comment_start: Some("#"),
+        },
+        Language::Markdown | Language::Toml | Language::Text | Language::Unknown => return None,
+    };
+
+    Some(LineHighlighter { rules })
+}
+
+fn plain_text_tokens(line: &str) -> Vec<HighlightToken> {
+    if line.is_empty() {
+        Vec::new()
+    } else {
+        vec![HighlightToken {
+            text: line.to_string(),
+            kind: TokenKind::Base,
+        }]
+    }
+}
+
+fn consume_string_literal(rest: &str) -> Option<usize> {
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '"' {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (index, ch) in chars {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(index + ch.len_utf8()),
+            _ => {}
         }
     }
-    if !current_word.is_empty() {
-        tokens.push(classify_token(&current_word));
-    }
-    tokens
+
+    Some(rest.len())
 }
 
-fn classify_token(word: &str) -> HighlightToken {
-    let kind = match word {
-        "fn" | "struct" | "enum" | "impl" | "use" | "mod" | "pub" | "let" | "mut" | "if"
-        | "else" | "match" | "for" | "while" | "return" | "break" | "continue" | "const"
-        | "static" | "trait" | "type" => TokenKind::Keyword,
-        "true" | "false" => TokenKind::Number,
-        _ if word.chars().all(char::is_numeric) => TokenKind::Number,
-        _ => TokenKind::Base,
-    };
-    HighlightToken {
-        text: word.to_string(),
-        kind,
+fn consume_number(rest: &str) -> Option<usize> {
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if !first.is_ascii_digit() {
+        return None;
     }
+
+    let mut end = first.len_utf8();
+    for (index, ch) in chars {
+        if ch.is_ascii_digit() || matches!(ch, '_' | '.') {
+            end = index + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(end)
 }
+
+fn consume_identifier(rest: &str) -> Option<usize> {
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first.is_alphabetic() || first == '_') {
+        return None;
+    }
+
+    let mut end = first.len_utf8();
+    for (index, ch) in chars {
+        if ch.is_alphanumeric() || ch == '_' {
+            end = index + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(end)
+}
+
+fn push_token(tokens: &mut Vec<HighlightToken>, text: &str, kind: TokenKind) {
+    if text.is_empty() {
+        return;
+    }
+
+    if kind == TokenKind::Base
+        && let Some(last) = tokens.last_mut()
+        && last.kind == TokenKind::Base
+    {
+        last.text.push_str(text);
+        return;
+    }
+
+    tokens.push(HighlightToken {
+        text: text.to_string(),
+        kind,
+    });
+}
+
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "else", "enum", "fn", "for", "if",
+    "impl", "in", "let", "loop", "match", "mod", "mut", "pub", "return", "self", "Self", "static",
+    "struct", "trait", "type", "unsafe", "use", "where", "while",
+];
+const SWIFT_KEYWORDS: &[&str] = &[
+    "actor",
+    "break",
+    "case",
+    "class",
+    "continue",
+    "default",
+    "defer",
+    "do",
+    "else",
+    "enum",
+    "extension",
+    "for",
+    "func",
+    "guard",
+    "if",
+    "import",
+    "in",
+    "let",
+    "mutating",
+    "protocol",
+    "return",
+    "struct",
+    "switch",
+    "throw",
+    "try",
+    "var",
+    "where",
+    "while",
+];
+const ELISP_KEYWORDS: &[&str] = &[
+    "defconst",
+    "defcustom",
+    "defgroup",
+    "defmacro",
+    "defun",
+    "if",
+    "lambda",
+    "let",
+    "let*",
+    "progn",
+    "setq",
+    "when",
+    "unless",
+    "while",
+];
+const JAVASCRIPT_KEYWORDS: &[&str] = &[
+    "async", "await", "break", "case", "class", "const", "continue", "default", "else", "export",
+    "extends", "for", "function", "if", "import", "in", "let", "new", "return", "switch", "this",
+    "throw", "try", "var", "while", "yield",
+];
+const TYPESCRIPT_KEYWORDS: &[&str] = &[
+    "abstract",
+    "async",
+    "await",
+    "break",
+    "case",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "for",
+    "function",
+    "if",
+    "implements",
+    "import",
+    "interface",
+    "let",
+    "new",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "return",
+    "switch",
+    "type",
+    "var",
+    "while",
+];
+const PYTHON_KEYWORDS: &[&str] = &[
+    "and", "as", "async", "await", "class", "def", "elif", "else", "except", "False", "for",
+    "from", "if", "import", "in", "is", "lambda", "None", "not", "or", "pass", "return", "True",
+    "try", "while", "with", "yield",
+];
+const GO_KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+];
+const CPP_KEYWORDS: &[&str] = &[
+    "auto",
+    "break",
+    "case",
+    "class",
+    "const",
+    "continue",
+    "else",
+    "enum",
+    "for",
+    "if",
+    "include",
+    "namespace",
+    "return",
+    "struct",
+    "switch",
+    "template",
+    "typename",
+    "using",
+    "virtual",
+    "while",
+];
+const SHELL_KEYWORDS: &[&str] = &[
+    "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in", "local",
+    "return", "then", "while",
+];
+const NIX_KEYWORDS: &[&str] = &[
+    "assert", "else", "if", "in", "inherit", "let", "or", "rec", "then", "with",
+];
+const JUST_KEYWORDS: &[&str] = &["alias", "export", "import", "mod", "set", "unexport"];
 
 fn style_for_token(kind: TokenKind, palette: &UiPalette) -> Style {
     match kind {
@@ -3789,7 +4186,7 @@ fn style_for_token(kind: TokenKind, palette: &UiPalette) -> Style {
             .add_modifier(Modifier::BOLD),
         TokenKind::String => Style::default().fg(palette.string),
         TokenKind::Number => Style::default().fg(palette.number),
-        TokenKind::Comment => Style::default().fg(palette.dim),
+        TokenKind::Comment => Style::default().fg(palette.comment),
     }
 }
 
