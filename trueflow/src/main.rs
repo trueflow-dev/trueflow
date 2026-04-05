@@ -1,42 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
-
-mod analysis;
-mod block;
-mod block_splitter;
-mod build_info;
-mod cli;
-mod code_comments;
-mod commands;
-mod complexity;
-mod config;
-mod context;
-mod coverage;
-mod hashing;
-mod logging;
-mod optimizer;
-mod path_utils;
-mod policy;
-mod repo_path;
-mod review_metadata;
-mod review_navigator;
-mod review_order;
-mod review_scope;
-mod review_session;
-mod review_speedread;
-mod review_units;
-mod rust;
-mod scanner;
-mod store;
-pub mod sub_splitter;
-mod swift;
-mod text_split;
-mod tree;
-mod vcs;
-
-use crate::cli::{Cli, Commands};
-use crate::context::TrueflowContext;
+use trueflow::cli::{Cli, Commands};
+use trueflow::commands;
+use trueflow::context::TrueflowContext;
+use trueflow::logging;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
