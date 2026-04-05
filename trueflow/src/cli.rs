@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn build_timestamp_is_rfc3339() {
-        DateTime::parse_from_rfc3339(build_info::BUILD_TIMESTAMP)
+        DateTime::parse_from_rfc3339(env!("TRUEFLOW_BUILD_TIMESTAMP"))
             .unwrap_or_else(|error| panic!("build timestamp was not RFC3339: {error}"));
     }
 

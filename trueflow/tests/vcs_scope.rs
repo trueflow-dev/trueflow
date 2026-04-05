@@ -66,14 +66,17 @@ fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
     let lines = hunks
         .iter()
         .flat_map(|hunk| hunk.lines.iter())
-        .map(|line| line.as_unified_line())
         .collect::<Vec<_>>();
     assert!(
-        lines.iter().any(|line| line == "+    2\n"),
+        lines.iter().any(|line| {
+            line.kind == trueflow::vcs::DiffLineKind::Added && line.text == "    2\n"
+        }),
         "expected selected revision diff to include value 2"
     );
     assert!(
-        !lines.iter().any(|line| line == "+    3\n"),
+        !lines.iter().any(|line| {
+            line.kind == trueflow::vcs::DiffLineKind::Added && line.text == "    3\n"
+        }),
         "selected revision diff should not include later HEAD changes"
     );
 

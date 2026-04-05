@@ -325,13 +325,14 @@ impl ByteSpan {
             end_byte,
         }
     }
+}
 
-    #[allow(dead_code)]
+#[cfg(test)]
+impl ByteSpan {
     pub fn overlaps(&self, other: &ByteSpan) -> bool {
         self.start_byte < other.end_byte && self.end_byte > other.start_byte
     }
 
-    #[allow(dead_code)]
     pub fn contains(&self, other: &ByteSpan) -> bool {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
     }

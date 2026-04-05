@@ -56,16 +56,6 @@ impl DiffHunkLine {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn as_unified_line(&self) -> String {
-        let prefix = match self.kind {
-            DiffLineKind::Context => ' ',
-            DiffLineKind::Added => '+',
-            DiffLineKind::Removed => '-',
-        };
-        format!("{prefix}{}", self.text)
-    }
-
     fn from_unified_line(line: &str) -> Option<Self> {
         if let Some(text) = line.strip_prefix(' ') {
             return Some(Self::context(format!("{text}\n")));

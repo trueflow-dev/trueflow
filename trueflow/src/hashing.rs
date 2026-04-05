@@ -28,18 +28,6 @@ macro_rules! define_hash_type {
                 Self(value.into())
             }
 
-            #[allow(dead_code)]
-            pub fn parse(value: impl AsRef<str>) -> Result<Self> {
-                let value = value.as_ref().trim();
-                if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-                    return Err(anyhow!(
-                        "{} must be a 64-character hex string: {value}",
-                        stringify!($name)
-                    ));
-                }
-                Ok(Self(value.to_ascii_lowercase()))
-            }
-
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -71,7 +59,6 @@ macro_rules! define_hash_type {
     };
 }
 
-define_hash_type!(ContentHash);
 define_hash_type!(BytesHash);
 define_hash_type!(TreeHash);
 
@@ -81,7 +68,19 @@ impl BytesHash {
     }
 }
 
+fn parse_hash_value(kind: &str, value: impl AsRef<str>) -> Result<String> {
+    let value = value.as_ref().trim();
+    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(anyhow!("{kind} must be a 64-character hex string: {value}"));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 impl TreeHash {
+    pub fn parse(value: impl AsRef<str>) -> Result<Self> {
+        Ok(Self::new(parse_hash_value("TreeHash", value)?))
+    }
+
     pub fn from_content(input: &str) -> Self {
         Self::new(hash_str(input))
     }
@@ -173,10 +172,10 @@ mod tests {
     }
 
     #[test]
-    fn test_content_hash_serializes_as_string() -> Result<(), serde_json::Error> {
-        let hash = ContentHash::new("abc123");
+    fn test_bytes_hash_serializes_as_string() -> Result<(), serde_json::Error> {
+        let hash = BytesHash::new("abc123");
         let json = serde_json::to_string(&hash)?;
-        let round_trip: ContentHash = serde_json::from_str(&json)?;
+        let round_trip: BytesHash = serde_json::from_str(&json)?;
 
         assert_eq!(json, "\"abc123\"");
         assert_eq!(round_trip, hash);
