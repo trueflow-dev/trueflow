@@ -63,3 +63,85 @@ fn test_inspect_split_preserves_order() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_inspect_coverage_reports_direct_and_effective_review_facts() -> Result<()> {
+    let repo = TestRepo::new("inspect_coverage")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Add lib")?;
+
+    let scan_output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&scan_output)?;
+    let file_hash = first_file_tree_hash(&scan_output)?;
+    let file = files.first().context("expected file")?;
+    let block = file["blocks"].as_array().context("blocks")?[0].clone();
+    let block_hash = block["hash"].as_str().context("block hash")?;
+    let start_line = block["start_line"]
+        .as_u64()
+        .context("block start line")?
+        .to_string();
+
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &file_hash,
+        "--verdict",
+        "approved",
+        "--path",
+        "src/lib.rs",
+        "--quiet",
+    ])?;
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        block_hash,
+        "--verdict",
+        "approved",
+        "--check",
+        "security",
+        "--path",
+        "src/lib.rs",
+        "--line",
+        &start_line,
+        "--quiet",
+    ])?;
+
+    let output = repo.run(&["inspect", "--fingerprint", block_hash, "--coverage"])?;
+    let inspected: Value = serde_json::from_str(&output)?;
+
+    assert_eq!(inspected["block"]["hash"].as_str(), Some(block_hash));
+    assert_eq!(
+        inspected["coverage"]["checks"]["review"]["direct_latest_verdict"],
+        Value::Null
+    );
+    assert_eq!(
+        inspected["coverage"]["checks"]["review"]["effective_latest_verdict"].as_str(),
+        Some("approved")
+    );
+    assert_eq!(
+        inspected["coverage"]["checks"]["review"]["direct_identity_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        inspected["coverage"]["checks"]["review"]["effective_identity_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        inspected["coverage"]["checks"]["security"]["direct_latest_verdict"].as_str(),
+        Some("approved")
+    );
+    assert_eq!(
+        inspected["coverage"]["checks"]["security"]["effective_latest_verdict"].as_str(),
+        Some("approved")
+    );
+    assert_eq!(
+        inspected["coverage"]["policies"]["single_review_effective"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        inspected["coverage"]["policies"]["single_review_direct"].as_bool(),
+        Some(false)
+    );
+
+    Ok(())
+}

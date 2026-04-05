@@ -2,12 +2,13 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
+use crate::coverage::{CoverageBuildOptions, CoverageIndex};
 use crate::path_utils;
 use crate::policy::{should_skip_container_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
 use crate::review_scope::CliSemanticReviewScope;
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
-use crate::store::{FileStore, ReviewCheck, ReviewStore, ReviewTargetRef};
+use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
 use crate::tree;
 use crate::vcs;
@@ -284,8 +285,6 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     info!("loaded {} review records", database.records().len());
 
     let review_check = ReviewCheck::review();
-    let review_index = database.latest_index(Some(&review_check));
-    let approved_targets = review_index.approved_targets();
 
     let (files, diagnostics) = match &query.content_source {
         ReviewContentSource::Workdir => {
@@ -324,6 +323,13 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     };
     info!("scanned {} files", files.len());
     let tree = tree::build_tree_from_files(&files);
+    let coverage = CoverageIndex::build(
+        &tree,
+        &database,
+        &CoverageBuildOptions {
+            workdir_prefix: workdir_prefix.clone(),
+        },
+    )?;
 
     let mut unreviewed_files = Vec::new();
     let mut total_blocks = 0;
@@ -376,44 +382,36 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
         total_blocks += reviewable_blocks.len();
 
-        if review_index.is_approved(&ReviewTargetRef::File {
-            hash: file.tree_hash.clone(),
-        }) {
+        let Some(file_node_id) = tree.find_by_path(file.path.as_str()) else {
+            continue;
+        };
+        if coverage
+            .node(file_node_id)
+            .effective_latest_verdict_for(&review_check)
+            == Some(&Verdict::Approved)
+        {
             continue;
         }
 
         let mut unreviewed_blocks = Vec::new();
         for (block, node_id) in reviewable_blocks {
-            if let Some(node_id) = node_id
-                && tree.is_node_covered(node_id, &approved_targets, workdir_prefix.as_deref())
+            let block_coverage = coverage.block(&file.path, &block);
+            if block_coverage.effective_latest_verdict_for(&review_check)
+                == Some(&Verdict::Approved)
             {
                 continue;
             }
 
-            if review_index.is_block_approved(
-                &block.hash,
-                &file.path,
-                block.start_line,
-                workdir_prefix.as_deref(),
-            ) {
-                continue;
-            }
-
-            if review_index
-                .block_verdict_for(
-                    &block.hash,
-                    &file.path,
-                    block.start_line,
-                    workdir_prefix.as_deref(),
-                )
+            if block_coverage
+                .direct_latest_verdict_for(&review_check)
                 .is_none()
                 && is_subblock_covered(
                     &block,
                     language,
                     query,
-                    &review_index,
+                    &coverage,
+                    &review_check,
                     &file.path,
-                    workdir_prefix.as_deref(),
                 )
             {
                 continue;
@@ -682,15 +680,19 @@ fn is_subblock_covered(
     block: &Block,
     language: Language,
     query: &ResolvedReviewQuery,
-    review_index: &crate::store::ReviewIndex,
+    coverage: &CoverageIndex<'_>,
+    review_check: &ReviewCheck,
     file_path: &RepoPath,
-    workdir_prefix: Option<&str>,
 ) -> bool {
     if !query.filters.allows_subblock(block.kind) {
         return true;
     }
 
-    if review_index.is_block_approved(&block.hash, file_path, block.start_line, workdir_prefix) {
+    if coverage
+        .block(file_path, block)
+        .direct_latest_verdict_for(review_check)
+        == Some(&Verdict::Approved)
+    {
         return true;
     }
 
@@ -704,12 +706,10 @@ fn is_subblock_covered(
     match sub_split.semantics {
         sub_splitter::SubSplitSemantics::ReviewUnits => sub_split.blocks.iter().all(|sub_block| {
             !query.filters.allows_subblock(sub_block.kind)
-                || review_index.is_block_approved(
-                    &sub_block.hash,
-                    file_path,
-                    sub_block.start_line,
-                    workdir_prefix,
-                )
+                || coverage
+                    .block(file_path, sub_block)
+                    .direct_latest_verdict_for(review_check)
+                    == Some(&Verdict::Approved)
         }),
         sub_splitter::SubSplitSemantics::StructuralChildren => {
             sub_split.blocks.iter().all(|sub_block| {
@@ -717,9 +717,9 @@ fn is_subblock_covered(
                     sub_block,
                     language,
                     query,
-                    review_index,
+                    coverage,
+                    review_check,
                     file_path,
-                    workdir_prefix,
                 )
             })
         }

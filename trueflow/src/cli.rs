@@ -349,7 +349,13 @@ mod tests {
 
     #[test]
     fn inspect_command_parses_coverage_flag() {
-        let cli = Cli::parse_from(["trueflow", "inspect", "--fingerprint", "abc1234", "--coverage"]);
+        let cli = Cli::parse_from([
+            "trueflow",
+            "inspect",
+            "--fingerprint",
+            "abc1234",
+            "--coverage",
+        ]);
         match cli.command {
             Commands::Inspect {
                 fingerprint,

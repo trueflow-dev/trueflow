@@ -12,6 +12,7 @@ mod commands;
 mod complexity;
 mod config;
 mod context;
+mod coverage;
 mod hashing;
 mod logging;
 mod optimizer;
@@ -93,9 +94,11 @@ fn main() -> Result<()> {
             only,
             exclude,
         ),
-        Commands::Inspect { fingerprint, split } => {
-            commands::inspect::run(&context, fingerprint, *split)
-        }
+        Commands::Inspect {
+            fingerprint,
+            split,
+            coverage,
+        } => commands::inspect::run(&context, fingerprint, *split, *coverage),
         Commands::Verify { all, id } => commands::verify::run(*all, id.as_deref()),
         Commands::Tui {
             all,

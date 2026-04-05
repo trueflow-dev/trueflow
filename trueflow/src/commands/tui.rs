@@ -2523,7 +2523,6 @@ mod diff_scope_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::Duration;
     use uuid::Uuid;
 
     fn run_git(path: &Path, args: &[&str]) {
@@ -3582,7 +3581,7 @@ mod diff_scope_tests {
 
         let updated = handle_speed_read_autoplay_timeout(
             &mut state,
-            Instant::now() + Duration::from_millis(5),
+            Instant::now() + std::time::Duration::from_millis(5),
         );
         assert!(updated);
         assert!(state.speed_read.is_none());

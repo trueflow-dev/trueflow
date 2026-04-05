@@ -463,14 +463,12 @@ impl ReviewIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn verdict_for(&self, target: &ReviewTargetRef) -> Option<&Verdict> {
         self.latest_verdicts.get(target)
     }
 
-    pub fn is_approved(&self, target: &ReviewTargetRef) -> bool {
-        self.verdict_for(target) == Some(&Verdict::Approved)
-    }
-
+    #[cfg(test)]
     pub fn block_verdict_for(
         &self,
         hash: &TreeHash,
@@ -502,17 +500,6 @@ impl ReviewIndex {
 
         self.block_hash_verdicts.get(hash)
     }
-
-    pub fn is_block_approved(
-        &self,
-        hash: &TreeHash,
-        path: &RepoPath,
-        start_line: usize,
-        workdir_prefix: Option<&str>,
-    ) -> bool {
-        self.block_verdict_for(hash, path, start_line, workdir_prefix) == Some(&Verdict::Approved)
-    }
-
     pub fn approved_targets(&self) -> ApprovedTargets {
         let mut approved = ApprovedTargets::default();
         for (target, verdict) in &self.latest_verdicts {
@@ -602,6 +589,10 @@ pub struct ReviewDatabase {
 }
 
 impl ReviewDatabase {
+    pub fn from_records(records: Vec<Record>) -> Self {
+        Self { records }
+    }
+
     pub fn load(store: &impl ReviewStore) -> Result<Self> {
         Ok(Self {
             records: store.read_history()?,
@@ -619,25 +610,9 @@ impl ReviewDatabase {
     pub fn latest_index(&self, check_filter: Option<&ReviewCheck>) -> ReviewIndex {
         ReviewIndex::from_records(&self.records, check_filter)
     }
-
-    pub fn records_by_target_since(
-        &self,
-        threshold: Option<i64>,
-    ) -> HashMap<ReviewTargetRef, Vec<Record>> {
-        let mut grouped = HashMap::new();
-        for record in &self.records {
-            if threshold.is_some_and(|threshold| record.timestamp <= threshold) {
-                continue;
-            }
-            grouped
-                .entry(record.target.clone())
-                .or_insert_with(Vec::new)
-                .push(record.clone());
-        }
-        grouped
-    }
 }
 
+#[cfg(test)]
 pub fn merge_record_histories<I, J>(left: I, right: J) -> Vec<Record>
 where
     I: IntoIterator<Item = Record>,
@@ -656,15 +631,7 @@ where
     all_records
 }
 
-pub fn serialize_records_jsonl(records: &[Record]) -> Result<String> {
-    let mut content = String::new();
-    for record in records {
-        content.push_str(&serde_json::to_string(record)?);
-        content.push('\n');
-    }
-    Ok(content)
-}
-
+#[cfg(test)]
 pub fn parse_records_jsonl(content: &str) -> Vec<Record> {
     content
         .lines()
@@ -682,7 +649,6 @@ pub fn parse_records_jsonl(content: &str) -> Vec<Record> {
 pub trait ReviewStore {
     fn read_history(&self) -> Result<Vec<Record>>;
     fn append(&self, record: &Record) -> Result<()>;
-    fn replace_all(&self, records: &[Record]) -> Result<()>;
 
     fn load_database(&self) -> Result<ReviewDatabase>
     where
@@ -783,18 +749,6 @@ impl JsonlStoreBackend {
         file.write_all(line.as_bytes())?;
         Ok(())
     }
-
-    fn replace_all(&self, records: &[Record]) -> Result<()> {
-        let content = serialize_records_jsonl(records)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.db_path)?;
-        file.lock_exclusive()?;
-        file.write_all(content.as_bytes())?;
-        Ok(())
-    }
 }
 
 pub struct FileStore {
@@ -825,10 +779,6 @@ impl ReviewStore for FileStore {
 
     fn append(&self, record: &Record) -> Result<()> {
         self.backend.append(record)
-    }
-
-    fn replace_all(&self, records: &[Record]) -> Result<()> {
-        self.backend.replace_all(records)
     }
 }
 

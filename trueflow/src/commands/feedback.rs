@@ -1,11 +1,11 @@
 use crate::block::{Block, BlockKind};
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
+use crate::coverage::{CoverageBuildOptions, CoverageIndex};
 use crate::path_utils;
 use crate::policy::should_skip_imports_by_default;
-use crate::repo_path::RepoPath;
 use crate::scanner;
-use crate::store::{FileStore, Identity, Record, ReviewStore, ReviewTargetRef};
+use crate::store::{FileStore, Identity, Record, ReviewStore};
 use crate::tree;
 use crate::vcs;
 use anyhow::Result;
@@ -20,6 +20,14 @@ enum FeedbackSince {
     All,
     Timestamp(i64),
     Last,
+}
+
+#[derive(Debug, Clone)]
+struct FeedbackEntry {
+    file_path: String,
+    block: Block,
+    reviews: Vec<Record>,
+    latest_verdict: String,
 }
 
 pub fn run(
@@ -47,149 +55,48 @@ pub fn run(
     let since_mode = parse_feedback_since(effective_since)?;
     let since_threshold = resolve_since_threshold(&store, since_mode)?;
 
-    let latest_verdict = database.latest_index(None);
-    let reviews_by_target = database.records_by_target_since(since_threshold);
-    let approved_targets = latest_verdict.approved_targets();
     let workdir_prefix = workdir_prefix_from_git_root();
+    let entries = collect_feedback_entries(
+        &files,
+        &tree,
+        &database,
+        since_threshold,
+        &filters,
+        include_approved,
+        workdir_prefix.as_deref(),
+    )?;
 
     if format == "json" {
-        // Output JSON
-        // Structure: List of objects with { path, block, reviews }
-        let mut export_list = Vec::new();
-
-        for file in files {
-            for block in file.blocks {
-                if !filters.allows_block(block.kind) {
-                    continue;
-                }
-                if should_skip_imports_by_default(file.path.as_str(), &block, &filters) {
-                    continue;
-                }
-
-                let block_target = ReviewTargetRef::Block {
-                    hash: block.hash.clone(),
-                };
-                let verdict = latest_verdict
-                    .block_verdict_for(
-                        &block.hash,
-                        &file.path,
-                        block.start_line,
-                        workdir_prefix.as_deref(),
-                    )
-                    .map_or("unreviewed", crate::store::Verdict::as_str);
-
-                if !include_approved && verdict == "approved" {
-                    continue;
-                }
-
-                if !include_approved
-                    && tree
-                        .find_block_node(&file.path, &block)
-                        .is_some_and(|node_id| {
-                            tree.is_node_covered(
-                                node_id,
-                                &approved_targets,
-                                workdir_prefix.as_deref(),
-                            )
-                        })
-                {
-                    continue;
-                }
-
-                if let Some(reviews) = reviews_by_target.get(&block_target) {
-                    let reviews = matching_reviews_for_block(
-                        reviews,
-                        &block.hash,
-                        &file.path,
-                        block.start_line,
-                        workdir_prefix.as_deref(),
-                    );
-                    if reviews.is_empty() {
-                        continue;
-                    }
-                    export_list.push(serde_json::json!({
-                        "file": file.path,
-                        "block": block,
-                        "reviews": reviews,
-                        "latest_verdict": verdict
-                    }));
-                }
-            }
-        }
+        let export_list = entries
+            .into_iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "file": entry.file_path,
+                    "block": entry.block,
+                    "reviews": entry.reviews,
+                    "latest_verdict": entry.latest_verdict,
+                })
+            })
+            .collect::<Vec<_>>();
         println!("{}", serde_json::to_string_pretty(&export_list)?);
     } else {
-        // Output XML
         println!("<trueflow_feedback>");
 
-        for file in files {
-            // Buffer block output so we only print <file> tag if needed?
-            // Actually, XML structure <file path="..."> is better if it wraps blocks.
-            // But we can just print blocks flat inside root if easier?
-            // User requested hierarchical.
-
-            // Let's iterate blocks first to see if we have anything to print
-            let mut blocks_to_print = Vec::new();
-
-            for block in file.blocks {
-                if !filters.allows_block(block.kind) {
-                    continue;
+        let mut current_file_path: Option<String> = None;
+        for entry in entries {
+            if current_file_path.as_deref() != Some(entry.file_path.as_str()) {
+                if current_file_path.is_some() {
+                    println!("  </file>");
                 }
-                if should_skip_imports_by_default(file.path.as_str(), &block, &filters) {
-                    continue;
-                }
-
-                let block_target = ReviewTargetRef::Block {
-                    hash: block.hash.clone(),
-                };
-                let verdict = latest_verdict
-                    .block_verdict_for(
-                        &block.hash,
-                        &file.path,
-                        block.start_line,
-                        workdir_prefix.as_deref(),
-                    )
-                    .map_or("unreviewed", crate::store::Verdict::as_str);
-
-                if !include_approved && verdict == "approved" {
-                    continue;
-                }
-
-                if !include_approved
-                    && tree
-                        .find_block_node(&file.path, &block)
-                        .is_some_and(|node_id| {
-                            tree.is_node_covered(
-                                node_id,
-                                &approved_targets,
-                                workdir_prefix.as_deref(),
-                            )
-                        })
-                {
-                    continue;
-                }
-
-                if let Some(reviews) = reviews_by_target.get(&block_target) {
-                    let reviews = matching_reviews_for_block(
-                        reviews,
-                        &block.hash,
-                        &file.path,
-                        block.start_line,
-                        workdir_prefix.as_deref(),
-                    );
-                    if reviews.is_empty() {
-                        continue;
-                    }
-                    blocks_to_print.push((block, reviews));
-                }
+                println!("  <file path=\"{}\">", escape_xml(&entry.file_path));
+                current_file_path = Some(entry.file_path.clone());
             }
 
-            if !blocks_to_print.is_empty() {
-                println!("  <file path=\"{}\">", escape_xml(file.path.as_str()));
-                for (block, reviews) in blocks_to_print {
-                    print_block_xml(&block, &reviews);
-                }
-                println!("  </file>");
-            }
+            print_block_xml(&entry.block, &entry.reviews);
+        }
+
+        if current_file_path.is_some() {
+            println!("  </file>");
         }
 
         println!("</trueflow_feedback>");
@@ -245,50 +152,76 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn matching_reviews_for_block(
-    reviews: &[Record],
-    hash: &crate::store::TreeHash,
-    path: &RepoPath,
-    start_line: usize,
+fn collect_feedback_entries(
+    files: &[crate::block::FileState],
+    tree: &tree::Tree,
+    database: &crate::store::ReviewDatabase,
+    since_threshold: Option<i64>,
+    filters: &crate::config::BlockFilters,
+    include_approved: bool,
     workdir_prefix: Option<&str>,
-) -> Vec<Record> {
-    let candidates = path_utils::candidate_repo_paths_for_hint(path.as_str(), workdir_prefix, None);
-    let Ok(start_line) = u32::try_from(start_line) else {
-        return Vec::new();
+) -> Result<Vec<FeedbackEntry>> {
+    let build_options = CoverageBuildOptions {
+        workdir_prefix: workdir_prefix.map(str::to_string),
     };
-
-    reviews
+    let coverage = CoverageIndex::build(tree, database, &build_options)?;
+    let approved_targets = database.latest_index(None).approved_targets();
+    let since_records = database
+        .records()
         .iter()
-        .filter(|record| record_matches_block(record, hash, start_line, &candidates))
+        .filter(|record| since_threshold.is_none_or(|threshold| record.timestamp > threshold))
         .cloned()
-        .collect()
-}
+        .collect::<Vec<_>>();
+    let since_database = crate::store::ReviewDatabase::from_records(since_records);
+    let since_coverage = CoverageIndex::build(tree, &since_database, &build_options)?;
 
-fn record_matches_block(
-    record: &Record,
-    hash: &crate::store::TreeHash,
-    start_line: u32,
-    candidate_paths: &[String],
-) -> bool {
-    let ReviewTargetRef::Block { hash: record_hash } = &record.target else {
-        return false;
-    };
-    if record_hash != hash {
-        return false;
-    }
+    let mut entries = Vec::new();
+    for file in files {
+        for block in &file.blocks {
+            if !filters.allows_block(block.kind) {
+                continue;
+            }
+            if should_skip_imports_by_default(file.path.as_str(), block, filters) {
+                continue;
+            }
 
-    match (&record.path_hint, record.line_hint) {
-        (Some(path_hint), Some(line_hint)) => {
-            line_hint == start_line
-                && candidate_paths
-                    .iter()
-                    .any(|candidate| candidate == path_hint.as_str())
+            let Some(node_id) = tree.find_block_node(file.path.as_str(), block) else {
+                continue;
+            };
+            let latest_verdict = coverage
+                .node(node_id)
+                .linked_records()
+                .last()
+                .map_or("unreviewed", |record| record.verdict.as_str());
+
+            if !include_approved && latest_verdict == "approved" {
+                continue;
+            }
+            if !include_approved && tree.is_node_covered(node_id, &approved_targets, workdir_prefix)
+            {
+                continue;
+            }
+
+            let reviews = since_coverage
+                .node(node_id)
+                .linked_records()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if reviews.is_empty() {
+                continue;
+            }
+
+            entries.push(FeedbackEntry {
+                file_path: file.path.as_str().to_string(),
+                block: block.clone(),
+                reviews,
+                latest_verdict: latest_verdict.to_string(),
+            });
         }
-        (Some(path_hint), None) => candidate_paths
-            .iter()
-            .any(|candidate| candidate == path_hint.as_str()),
-        (None, _) => true,
     }
+
+    Ok(entries)
 }
 
 fn parse_feedback_since(raw: Option<&str>) -> Result<FeedbackSince> {

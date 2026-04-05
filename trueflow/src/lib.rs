@@ -8,6 +8,7 @@ pub mod commands;
 pub mod complexity;
 pub mod config;
 pub mod context;
+pub mod coverage;
 pub mod finder;
 pub mod hashing;
 pub mod logging;
