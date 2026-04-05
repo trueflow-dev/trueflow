@@ -299,6 +299,10 @@ impl LineSpan {
         self.end_line.saturating_sub(self.start_line)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn overlaps(&self, other: &LineSpan) -> bool {
         self.start_line < other.end_line && self.end_line > other.start_line
     }
