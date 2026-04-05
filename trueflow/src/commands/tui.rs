@@ -2488,42 +2488,45 @@ struct FocusLayout {
     actions: Rect,
 }
 
+const ACTIONS_HEIGHT: u16 = 5;
+
 fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let code_width = area.width.min(120);
     let desired_code_height = area.height.min(32);
     let padding = u16::try_from((u32::from(area.height) * 5 + 50) / 100).unwrap_or(u16::MAX);
 
     let available_height = area.height.saturating_sub(padding * 2).max(1);
-    let min_header_height = 3.min(available_height);
+    let actions_height = ACTIONS_HEIGHT.min(available_height.saturating_sub(2));
+    let available_for_header_and_code = available_height.saturating_sub(actions_height);
+    let min_header_height = 3.min(available_for_header_and_code);
     let desired_header_height = header_lines.saturating_add(2).max(min_header_height);
-    let total_height = (desired_header_height + desired_code_height + 1).min(available_height);
-    let header_height = desired_header_height.min(total_height.saturating_sub(1).max(1));
-    let remaining = total_height.saturating_sub(header_height + 1);
-    let code_height = desired_code_height.min(remaining.max(1));
+    let header_height = desired_header_height.min(available_for_header_and_code.saturating_sub(1));
+    let code_height =
+        desired_code_height.min(available_for_header_and_code.saturating_sub(header_height));
+    let total_height = header_height + code_height + actions_height;
 
     let content_top = area.y + (area.height.saturating_sub(total_height)) / 2;
     let content_left = area.x + (area.width.saturating_sub(code_width)) / 2;
 
-    let meta_height = header_height.max(1);
     let meta = Rect {
         x: content_left,
         y: content_top,
         width: code_width,
-        height: meta_height,
+        height: header_height,
     };
 
     let code = Rect {
         x: content_left,
-        y: content_top + meta_height,
+        y: content_top + header_height,
         width: code_width,
         height: code_height,
     };
 
     let actions = Rect {
         x: content_left,
-        y: content_top + meta_height + code_height,
+        y: content_top + header_height + code_height,
         width: code_width,
-        height: 4,
+        height: actions_height,
     };
 
     FocusLayout {
@@ -2561,7 +2564,7 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 3);
         assert_eq!(layout.code.width, 120);
-        assert_eq!(layout.actions.height, 4);
+        assert_eq!(layout.actions.height, 5);
         assert!(layout.code.y > area.y);
     }
 
@@ -2575,6 +2578,21 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 1);
         assert_eq!(layout.meta.height, 3);
+    }
+
+    #[test]
+    fn focus_layout_keeps_actions_within_content_area() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        let layout = compute_focus_layout(area, 3);
+        assert!(
+            layout.actions.y + layout.actions.height <= area.y + area.height,
+            "actions rect should fit within content area"
+        );
     }
 }
 
