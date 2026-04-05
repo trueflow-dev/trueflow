@@ -110,7 +110,7 @@ parent = "p"
 child = "c"
 approve = "a"
 note = "n"
-toggle_view = "d"
+toggle_view = "m"
 speed_read = "r"
 root = "g"
 quit = "q"
@@ -134,7 +134,7 @@ Main review actions:
 - `p`/`c` move to semantic parent/child
 - `a` approve
 - `n` add a note (empty note is allowed)
-- `d` toggle diff/source
+- `m` toggle diff/source
 - `r` toggle speed-reading
 - `g` jump to root
 - `q` quit

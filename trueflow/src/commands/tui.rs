@@ -4364,12 +4364,12 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn recap_key_handler_exits_on_q_and_d() {
+    fn recap_key_handler_exits_on_q_and_mode() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         assert!(recap_key_should_exit(&keybinds, KeyCode::Char('q')));
-        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('d')));
+        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('m')));
         assert!(recap_key_should_exit(&keybinds, KeyCode::Esc));
-        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('a')));
+        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('d')));
     }
 
     #[test]

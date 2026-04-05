@@ -287,7 +287,7 @@ fn default_tui_keybind_note() -> char {
 }
 
 fn default_tui_keybind_toggle_view() -> char {
-    'd'
+    'm'
 }
 
 fn default_tui_keybind_speed_read() -> char {
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(cfg.tui.keybinds.child, 'c');
         assert_eq!(cfg.tui.keybinds.approve, 'a');
         assert_eq!(cfg.tui.keybinds.note, 'n');
-        assert_eq!(cfg.tui.keybinds.toggle_view, 'd');
+        assert_eq!(cfg.tui.keybinds.toggle_view, 'm');
         assert_eq!(cfg.tui.keybinds.speed_read, 'r');
         assert_eq!(cfg.tui.keybinds.root, 'g');
         assert_eq!(cfg.tui.keybinds.quit, 'q');
