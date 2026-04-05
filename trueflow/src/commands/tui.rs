@@ -807,7 +807,9 @@ fn run_app(
                             state.content_height.saturating_sub(state.viewport_height);
                         needs_render = true;
                     }
-                    KeyCode::Enter if state.navigator.current_id() == state.navigator.tree.root() => {
+                    KeyCode::Enter
+                        if state.navigator.current_id() == state.navigator.tree.root() =>
+                    {
                         handle_child(&mut state);
                         needs_render = true;
                     }
@@ -2241,13 +2243,12 @@ fn focus_line_span_for_node(
         return None;
     }
 
-    if state.view_mode == ViewMode::Diff {
-        if let vcs::BlockDiffFocusMode::ChangedWithContext { context_lines } =
+    if state.view_mode == ViewMode::Diff
+        && let vcs::BlockDiffFocusMode::ChangedWithContext { context_lines } =
             state.block_diff_focus_mode
-        {
-            start = start.saturating_sub(context_lines);
-            end = end.saturating_add(context_lines).min(file_line_count);
-        }
+    {
+        start = start.saturating_sub(context_lines);
+        end = end.saturating_add(context_lines).min(file_line_count);
     }
 
     Some(start..end)
@@ -4843,21 +4844,20 @@ mod diff_scope_tests {
             )]),
         );
 
-        let block = Block {
-            hash: crate::hashing::TreeHash::new("block"),
-            content: "fn main() {\n    println!(\"Hello from commit scope\");\n}".to_string(),
-            kind: BlockKind::Function,
-            tags: vec![],
-            complexity: None,
-            start_line: 0,
-            end_line: 3,
-        };
         let node = ContentNodeSnapshot {
             id: state.navigator.tree.root(),
             kind: TreeNodeKind::Block,
             path: RepoPath::new("src/lib.rs").unwrap(),
             children: Vec::new(),
-            block: Some(block.clone()),
+            block: Some(Block {
+                hash: crate::hashing::TreeHash::new("block"),
+                content: "fn main() {\n    println!(\"Hello from commit scope\");\n}".to_string(),
+                kind: BlockKind::Function,
+                tags: vec![],
+                complexity: None,
+                start_line: 0,
+                end_line: 3,
+            }),
             language: Some(Language::Rust),
         };
         let palette = UiPalette::default();
