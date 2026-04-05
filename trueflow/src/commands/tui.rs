@@ -2529,16 +2529,20 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
                 content,
             )
         }
-        InputMode::ConfirmBatch { count, action } => (
-            InputOverlayKind::ConfirmBatch,
-            " Batch Action ",
-            "Enter to confirm • Esc to cancel",
-            format!(
+        InputMode::ConfirmBatch { count, action } => {
+            let content = format!(
                 "This will apply '{}' to {} unreviewed descendant block(s).",
                 action.verdict_label(),
                 count
-            ),
-        ),
+            );
+            let message_lines = editing_input_lines(&content, input_overlay_width(area.width));
+            (
+                InputOverlayKind::ConfirmBatch { message_lines },
+                " Batch Action ",
+                "Enter to confirm • Esc to cancel",
+                content,
+            )
+        }
         InputMode::Normal => return,
     };
     let popup_area = input_overlay_rect(area, overlay_kind);
@@ -2562,7 +2566,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputOverlayKind {
     Editing { input_lines: u16 },
-    ConfirmBatch,
+    ConfirmBatch { message_lines: u16 },
 }
 
 fn input_overlay_width(area_width: u16) -> u16 {
@@ -2586,7 +2590,9 @@ fn editing_input_lines(content: &str, overlay_width: u16) -> u16 {
 fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
     let preferred_height = match kind {
         InputOverlayKind::Editing { input_lines } => input_lines.saturating_add(4).clamp(5, 12),
-        InputOverlayKind::ConfirmBatch => 4,
+        InputOverlayKind::ConfirmBatch { message_lines } => {
+            message_lines.saturating_add(4).clamp(5, 12)
+        }
     };
     let height = area.height.min(preferred_height);
     let width = input_overlay_width(area.width);
@@ -3492,6 +3498,31 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn input_overlay_rect_grows_for_confirm_batch_message_and_hint() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch { message_lines: 1 });
+        assert_eq!(rect.height, 5);
+    }
+
+    #[test]
+    fn input_overlay_rect_grows_for_soft_wrapped_confirm_batch_content() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+        let message_lines = editing_input_lines(&"x".repeat(200), input_overlay_width(area.width));
+        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch { message_lines });
+        assert!(rect.height > 5);
+    }
+
+    #[test]
     fn input_overlay_rect_clamps_with_small_viewport() {
         let area = Rect {
             x: 3,
@@ -3499,7 +3530,7 @@ mod diff_scope_tests {
             width: 18,
             height: 3,
         };
-        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch);
+        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch { message_lines: 1 });
         assert_eq!(rect.width, 18);
         assert_eq!(rect.height, 3);
         assert_eq!(rect.x, 3);
@@ -3833,7 +3864,9 @@ mod diff_scope_tests {
         );
         let node = state.navigator.tree.node(block_id);
         let snapshot = ContentNodeSnapshot::from_node(node);
-        let block = snapshot.block.clone().expect("expected block snapshot");
+        let Some(block) = snapshot.block.clone() else {
+            panic!("expected block snapshot");
+        };
         let palette = UiPalette::default();
 
         let (lines, total_lines) = build_block_diff_lines(&mut state, &snapshot, &block, &palette);
