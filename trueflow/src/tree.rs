@@ -5,7 +5,7 @@ use crate::repo_path::RepoPath;
 use crate::store::ApprovedTargets;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct TreeNodeId(usize);
@@ -61,7 +61,6 @@ impl TreeNodeKind {
 
 #[derive(Debug, Clone)]
 pub struct TreeNode {
-    #[allow(dead_code)]
     pub id: TreeNodeId,
     pub parent: Option<TreeNodeId>,
     pub kind: TreeNodeKind,
@@ -76,16 +75,12 @@ pub struct TreeNode {
 pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
-    #[allow(dead_code)]
     nodes_by_path: HashMap<RepoPath, TreeNodeId>,
     block_nodes_by_path_hash_start:
         HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>>,
-    #[allow(dead_code)]
-    file_paths: HashSet<RepoPath>,
 }
 
 impl Tree {
-    #[allow(dead_code)]
     pub fn root(&self) -> TreeNodeId {
         self.root
     }
@@ -94,7 +89,6 @@ impl Tree {
         &self.nodes[id.0]
     }
 
-    #[allow(dead_code)]
     pub fn nodes(&self) -> &[TreeNode] {
         &self.nodes
     }
@@ -119,7 +113,6 @@ impl Tree {
         })
     }
 
-    #[allow(dead_code)]
     pub fn find_by_path(&self, path: &str) -> Option<TreeNodeId> {
         let path = RepoPath::new(path).ok()?;
         self.nodes_by_path.get(&path).copied()
@@ -139,13 +132,6 @@ impl Tree {
         ancestors
     }
 
-    #[allow(dead_code)]
-    pub fn file_nodes(&self) -> impl Iterator<Item = &TreeNode> {
-        self.nodes
-            .iter()
-            .filter(|node| matches!(node.kind, TreeNodeKind::File))
-    }
-
     pub fn find_block_node(&self, path: impl AsRef<str>, block: &Block) -> Option<TreeNodeId> {
         let path = RepoPath::new(path.as_ref()).ok()?;
         self.block_nodes_by_path_hash_start
@@ -153,11 +139,6 @@ impl Tree {
             .get(&block.hash)?
             .get(&block.start_line)
             .copied()
-    }
-
-    #[allow(dead_code)]
-    pub fn file_paths(&self) -> impl Iterator<Item = &RepoPath> {
-        self.file_paths.iter()
     }
 
     pub fn block_has_child_blocks(&self, id: TreeNodeId) -> bool {
@@ -223,7 +204,6 @@ pub struct TreeBuilder {
     root: TreeNodeId,
     children_by_id: HashMap<TreeNodeId, Vec<TreeNodeId>>,
     nodes_by_path: HashMap<RepoPath, TreeNodeId>,
-    file_paths: HashSet<RepoPath>,
 }
 
 impl Default for TreeBuilder {
@@ -253,7 +233,6 @@ impl TreeBuilder {
             root,
             children_by_id: HashMap::new(),
             nodes_by_path,
-            file_paths: HashSet::new(),
         }
     }
 
@@ -338,7 +317,6 @@ impl TreeBuilder {
 
         let id = TreeNodeId(self.nodes.len());
         let is_hash_entry = kind.is_hash_entry();
-        let is_file = matches!(kind, TreeNodeKind::File);
         let index_path = path.clone();
         let node = TreeNode {
             id,
@@ -359,10 +337,6 @@ impl TreeBuilder {
                 "tree node path must be unique: {index_path}"
             );
         }
-        if is_file {
-            let inserted = self.file_paths.insert(index_path);
-            assert!(inserted, "file path must be unique");
-        }
         self.children_by_id.entry(parent).or_default().push(id);
         id
     }
@@ -381,7 +355,6 @@ impl TreeBuilder {
             root: self.root,
             nodes_by_path: self.nodes_by_path,
             block_nodes_by_path_hash_start,
-            file_paths: self.file_paths,
         }
     }
 
