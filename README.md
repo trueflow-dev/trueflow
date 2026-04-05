@@ -43,7 +43,7 @@ With Cargo:
 
 ```sh
 # Install Rust and Cargo first: https://rustup.rs
-git clone https://github.com/trueflow-dev/trueflow.git
+git clone git@github.com:trueflow-dev/trueflow.git
 cd trueflow
 cargo install --path trueflow --locked
 ```
