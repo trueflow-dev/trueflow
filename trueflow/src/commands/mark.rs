@@ -72,6 +72,51 @@ pub struct MarkParams {
     pub line: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSuspendRequirement {
+    NotRequired,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeConfig {
+    email: String,
+    signing_key: Option<String>,
+    terminal_suspend_requirement: TerminalSuspendRequirement,
+}
+
+fn runtime_config_from_git_config(config: Option<vcs::GitConfig>) -> RuntimeConfig {
+    match config {
+        Some(config) => {
+            let terminal_suspend_requirement =
+                terminal_suspend_requirement_for_signing_key(config.signing_key.as_deref());
+            RuntimeConfig {
+                email: config.email,
+                signing_key: config.signing_key,
+                terminal_suspend_requirement,
+            }
+        }
+        None => RuntimeConfig {
+            email: "unknown@localhost".to_string(),
+            signing_key: None,
+            terminal_suspend_requirement: TerminalSuspendRequirement::NotRequired,
+        },
+    }
+}
+
+pub(crate) fn terminal_suspend_requirement_for_signing_key(
+    signing_key: Option<&str>,
+) -> TerminalSuspendRequirement {
+    match signing_key {
+        Some(_) => TerminalSuspendRequirement::Required,
+        None => TerminalSuspendRequirement::NotRequired,
+    }
+}
+
+pub fn terminal_suspend_requirement_from_workdir() -> TerminalSuspendRequirement {
+    runtime_config_from_git_config(vcs::git_config_from_workdir().ok()).terminal_suspend_requirement
+}
+
 pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     info!(
         "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?})",
@@ -84,11 +129,13 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     );
     let store = FileStore::new()?;
 
-    // We still use git config for Identity if available, but fall back gracefully
-    let (email, signing_key) = match vcs::git_config_from_workdir() {
-        Ok(config) => (config.email, config.signing_key),
-        Err(_) => ("unknown@localhost".to_string(), None),
-    };
+    let runtime_config = runtime_config_from_git_config(vcs::git_config_from_workdir().ok());
+    let should_sign = matches!(
+        runtime_config.terminal_suspend_requirement,
+        TerminalSuspendRequirement::Required
+    );
+    let email = runtime_config.email;
+    let signing_key = runtime_config.signing_key;
 
     let now =
         i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()).unwrap_or(i64::MAX);
@@ -149,7 +196,7 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         attestations: None,
     };
 
-    if signing_key.is_some() {
+    if should_sign {
         let payload = record.signing_payload()?;
         let signature = sign_data(&payload, signing_key.as_deref())?;
         let public_key = export_public_key(signing_key.as_deref())?;
@@ -169,11 +216,7 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         verdict.as_str()
     );
 
-    let signed_msg = if signing_key.is_some() {
-        " (Signed)"
-    } else {
-        ""
-    };
+    let signed_msg = if should_sign { " (Signed)" } else { "" };
     info!("Recorded verdict '{verdict}' for {fingerprint} by {email}{signed_msg}");
     Ok(())
 }
@@ -267,4 +310,51 @@ fn infer_target_kind_from_current_tree(fingerprint: &str) -> Result<Option<Revie
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_without_signing_key_does_not_require_terminal_suspend() {
+        let config = runtime_config_from_git_config(Some(vcs::GitConfig {
+            email: "reviewer@example.com".to_string(),
+            signing_key: None,
+        }));
+
+        assert_eq!(config.email, "reviewer@example.com");
+        assert_eq!(config.signing_key, None);
+        assert_eq!(
+            config.terminal_suspend_requirement,
+            TerminalSuspendRequirement::NotRequired
+        );
+    }
+
+    #[test]
+    fn runtime_config_with_signing_key_requires_terminal_suspend() {
+        let config = runtime_config_from_git_config(Some(vcs::GitConfig {
+            email: "reviewer@example.com".to_string(),
+            signing_key: Some("ABC123".to_string()),
+        }));
+
+        assert_eq!(config.email, "reviewer@example.com");
+        assert_eq!(config.signing_key.as_deref(), Some("ABC123"));
+        assert_eq!(
+            config.terminal_suspend_requirement,
+            TerminalSuspendRequirement::Required
+        );
+    }
+
+    #[test]
+    fn runtime_config_without_git_config_falls_back_to_unsigned_defaults() {
+        let config = runtime_config_from_git_config(None);
+
+        assert_eq!(config.email, "unknown@localhost");
+        assert_eq!(config.signing_key, None);
+        assert_eq!(
+            config.terminal_suspend_requirement,
+            TerminalSuspendRequirement::NotRequired
+        );
+    }
 }

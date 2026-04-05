@@ -1337,10 +1337,13 @@ fn execute_action(
     let next_id = compute_next_review_target(state, node_id);
     let params = mark_params_for_action(state, node_id, verdict.clone(), note);
 
-    if action_requires_terminal_suspend() {
-        with_terminal_suspend(terminal, || mark::run(context, params))?;
-    } else {
-        mark::run(context, params)?;
+    match mark::terminal_suspend_requirement_from_workdir() {
+        mark::TerminalSuspendRequirement::Required => {
+            with_terminal_suspend(terminal, || mark::run(context, params))?;
+        }
+        mark::TerminalSuspendRequirement::NotRequired => {
+            mark::run(context, params)?;
+        }
     }
 
     let impact = apply_action_locally(state, node_id, &verdict, next_id);
@@ -1379,17 +1382,6 @@ fn mark_params_for_action(
         path: path_hint,
         line: line_hint,
     }
-}
-
-fn action_requires_terminal_suspend() -> bool {
-    let signing_key = vcs::git_config_from_workdir()
-        .ok()
-        .and_then(|config| config.signing_key);
-    action_requires_terminal_suspend_for_signing_key(signing_key.as_deref())
-}
-
-fn action_requires_terminal_suspend_for_signing_key(signing_key: Option<&str>) -> bool {
-    signing_key.is_some()
 }
 
 fn fingerprint_and_target_kind_for_node(
@@ -4970,15 +4962,19 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn action_requires_terminal_suspend_without_signing_key_is_false() {
-        assert!(!action_requires_terminal_suspend_for_signing_key(None));
+    fn mark_terminal_suspend_requirement_without_signing_key_is_not_required() {
+        assert_eq!(
+            mark::terminal_suspend_requirement_for_signing_key(None),
+            mark::TerminalSuspendRequirement::NotRequired
+        );
     }
 
     #[test]
-    fn action_requires_terminal_suspend_with_signing_key_is_true() {
-        assert!(action_requires_terminal_suspend_for_signing_key(Some(
-            "ABC123"
-        )));
+    fn mark_terminal_suspend_requirement_with_signing_key_is_required() {
+        assert_eq!(
+            mark::terminal_suspend_requirement_for_signing_key(Some("ABC123")),
+            mark::TerminalSuspendRequirement::Required
+        );
     }
 
     #[test]
