@@ -6,7 +6,8 @@ use crate::commands::review::{
     CollectedReview, ReviewTarget, collect_review, resolve_review_request,
 };
 use crate::config::{
-    BlockFilters, TuiConfig, TuiDiffFocusMode, TuiSpeedReadConfig, load as load_config,
+    BlockFilters, TuiConfig, TuiDiffFocusMode, TuiKeybindsConfig, TuiSpeedReadConfig,
+    load as load_config,
 };
 use crate::context::TrueflowContext;
 use crate::path_utils;
@@ -191,6 +192,7 @@ struct AppState {
     viewport_height: u16,
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
+    keybinds: TuiKeybindsConfig,
     file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
@@ -200,10 +202,19 @@ struct AppState {
 struct ReviewStateBuildOptions {
     confirm_batch: bool,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
+    keybinds: TuiKeybindsConfig,
     scope_label: String,
     workdir_prefix: Option<String>,
     speed_read_config: TuiSpeedReadConfig,
     speed_read_config_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectionKeyAction {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -332,7 +343,11 @@ pub fn run(
             }
         } else {
             let scope_options = load_scope_options()?;
-            let selection = run_scope_selector(&mut terminal, ScopeSelector::new(scope_options))?;
+            let selection = run_scope_selector(
+                &mut terminal,
+                ScopeSelector::new(scope_options),
+                &config.tui.keybinds,
+            )?;
             match selection {
                 ScopeSelection::Quit => return Ok(()),
                 ScopeSelection::Selected(scope) => {
@@ -354,6 +369,7 @@ pub fn run(
             ReviewStateBuildOptions {
                 confirm_batch: config.tui.confirm_batch,
                 block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
+                keybinds: config.tui.keybinds,
                 scope_label: launch.scope_label,
                 workdir_prefix: workdir_prefix_from_git_root(),
                 speed_read_config: config.tui.speed_read.clone(),
@@ -423,6 +439,7 @@ fn build_review_state(
         viewport_height: 0,
         view_mode: ViewMode::Diff,
         block_diff_focus_mode: options.block_diff_focus_mode,
+        keybinds: options.keybinds,
         file_diff_cache: HashMap::new(),
         content_frame_cache: HashMap::new(),
         highlighted_line_cache: HashMap::new(),
@@ -439,6 +456,23 @@ fn block_diff_focus_mode_from_config(config: &TuiConfig) -> vcs::BlockDiffFocusM
         TuiDiffFocusMode::ChangedWithContext => vcs::BlockDiffFocusMode::ChangedWithContext {
             context_lines: config.diff_focus_context_lines,
         },
+    }
+}
+
+fn direction_key_action_for_key_code(
+    keybinds: &TuiKeybindsConfig,
+    key_code: KeyCode,
+) -> Option<DirectionKeyAction> {
+    match key_code {
+        KeyCode::Up => Some(DirectionKeyAction::Up),
+        KeyCode::Down => Some(DirectionKeyAction::Down),
+        KeyCode::Left => Some(DirectionKeyAction::Left),
+        KeyCode::Right => Some(DirectionKeyAction::Right),
+        KeyCode::Char(ch) if ch == keybinds.up => Some(DirectionKeyAction::Up),
+        KeyCode::Char(ch) if ch == keybinds.down => Some(DirectionKeyAction::Down),
+        KeyCode::Char(ch) if ch == keybinds.left => Some(DirectionKeyAction::Left),
+        KeyCode::Char(ch) if ch == keybinds.right => Some(DirectionKeyAction::Right),
+        _ => None,
     }
 }
 
@@ -526,6 +560,7 @@ fn restore_terminal(
 fn run_scope_selector(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     mut selector: ScopeSelector,
+    keybinds: &TuiKeybindsConfig,
 ) -> Result<ScopeSelection> {
     let mut needs_render = true;
 
@@ -546,16 +581,24 @@ fn run_scope_selector(
         };
         let key_code = key_event.code;
 
+        if let Some(action) = direction_key_action_for_key_code(keybinds, key_code) {
+            match action {
+                DirectionKeyAction::Up => {
+                    selector.move_prev();
+                    needs_render = true;
+                    continue;
+                }
+                DirectionKeyAction::Down => {
+                    selector.move_next();
+                    needs_render = true;
+                    continue;
+                }
+                DirectionKeyAction::Left | DirectionKeyAction::Right => {}
+            }
+        }
+
         match key_code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(ScopeSelection::Quit),
-            KeyCode::Char('k') | KeyCode::Up => {
-                selector.move_prev();
-                needs_render = true;
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                selector.move_next();
-                needs_render = true;
-            }
             KeyCode::Enter => {
                 if let Some(scope) = selector.selected_scope() {
                     return Ok(ScopeSelection::Selected(scope));
@@ -623,26 +666,21 @@ fn run_app(
                     continue;
                 }
 
+                if let Some(action) = direction_key_action_for_key_code(&state.keybinds, key_code) {
+                    match action {
+                        DirectionKeyAction::Up => handle_ascend(&mut state),
+                        DirectionKeyAction::Down => handle_descend(&mut state),
+                        DirectionKeyAction::Left => handle_prev(&mut state),
+                        DirectionKeyAction::Right => handle_next(&mut state),
+                    }
+                    needs_render = true;
+                    continue;
+                }
+
                 match key_code {
                     KeyCode::Char('q') => {
                         flush_pending_speed_read_defaults(&mut state)?;
                         return Ok(());
-                    }
-                    KeyCode::Char('k') | KeyCode::Down => {
-                        handle_descend(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('i') | KeyCode::Up => {
-                        handle_ascend(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        handle_next(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('j') | KeyCode::Left => {
-                        handle_prev(&mut state);
-                        needs_render = true;
                     }
                     KeyCode::Char('n') => {
                         handle_next(&mut state);
@@ -2588,6 +2626,7 @@ mod diff_scope_tests {
             viewport_height: 0,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            keybinds: TuiKeybindsConfig::default(),
             file_diff_cache,
             content_frame_cache: HashMap::new(),
             highlighted_line_cache: HashMap::new(),
@@ -2646,6 +2685,7 @@ mod diff_scope_tests {
             viewport_height: 0,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            keybinds: TuiKeybindsConfig::default(),
             file_diff_cache: HashMap::new(),
             content_frame_cache: HashMap::new(),
             highlighted_line_cache: HashMap::new(),
@@ -2737,6 +2777,7 @@ mod diff_scope_tests {
             viewport_height: 0,
             view_mode: ViewMode::Source,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            keybinds: TuiKeybindsConfig::default(),
             file_diff_cache: HashMap::new(),
             content_frame_cache: HashMap::new(),
             highlighted_line_cache: HashMap::new(),
@@ -2880,12 +2921,64 @@ mod diff_scope_tests {
             confirm_batch: true,
             diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
             diff_focus_context_lines: 7,
+            keybinds: crate::config::TuiKeybindsConfig::default(),
             speed_read: crate::config::TuiSpeedReadConfig::default(),
         };
         let mode = block_diff_focus_mode_from_config(&config);
         assert_eq!(
             mode,
             vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 7 }
+        );
+    }
+
+    #[test]
+    fn direction_key_action_uses_hjkl_defaults() {
+        let keybinds = crate::config::TuiKeybindsConfig::default();
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('h')),
+            Some(DirectionKeyAction::Left)
+        );
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('j')),
+            Some(DirectionKeyAction::Down)
+        );
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('k')),
+            Some(DirectionKeyAction::Up)
+        );
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('l')),
+            Some(DirectionKeyAction::Right)
+        );
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('i')),
+            None
+        );
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Left),
+            Some(DirectionKeyAction::Left)
+        );
+    }
+
+    #[test]
+    fn direction_key_action_uses_configured_overrides() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            up: 'i',
+            down: 'k',
+            left: 'j',
+            right: 'l',
+        };
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('j')),
+            Some(DirectionKeyAction::Left)
+        );
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('k')),
+            Some(DirectionKeyAction::Down)
+        );
+        assert_eq!(
+            direction_key_action_for_key_code(&keybinds, KeyCode::Char('i')),
+            Some(DirectionKeyAction::Up)
         );
     }
 

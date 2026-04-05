@@ -101,6 +101,12 @@ exclude = ["gap", "comment"]
 [feedback]
 exclude = ["gap"]
 
+[tui.keybinds]
+up = "k"
+down = "j"
+left = "h"
+right = "l"
+
 [tui.speed_read]
 enabled = true
 default_wpm = 320
@@ -115,12 +121,24 @@ See `trueflow.example.toml` for the default settings.
 
 Main review actions:
 
+- `h`/`j`/`k`/`l` navigate by default, and arrow keys also work
 - `a` approve
 - `x` reject
 - `c` comment
 - `s` split
 - `r` toggle speed-reading
 - `q` quit
+
+To override the default navigation keys, add a `[tui.keybinds]` section to
+`trueflow.toml`:
+
+```toml
+[tui.keybinds]
+up = "i"
+down = "k"
+left = "j"
+right = "l"
+```
 
 ### Emacs
 

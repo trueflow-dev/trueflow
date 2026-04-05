@@ -29,6 +29,13 @@ ignore_globs = []
 # Require confirmation modal before batch actions.
 confirm_batch = true
 
+[tui.keybinds]
+# Navigation defaults. Arrow keys also work.
+up = "k"
+down = "j"
+left = "h"
+right = "l"
+
 [tui.speed_read]
 # Enable speed-reading mode in the TUI (`r` to toggle on block nodes).
 enabled = true

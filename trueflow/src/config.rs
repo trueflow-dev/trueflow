@@ -32,7 +32,33 @@ pub struct TuiConfig {
     #[serde(default = "default_diff_focus_context_lines")]
     pub diff_focus_context_lines: usize,
     #[serde(default)]
+    pub keybinds: TuiKeybindsConfig,
+    #[serde(default)]
     pub speed_read: TuiSpeedReadConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct TuiKeybindsConfig {
+    #[serde(
+        default = "default_tui_keybind_up",
+        deserialize_with = "deserialize_single_char"
+    )]
+    pub up: char,
+    #[serde(
+        default = "default_tui_keybind_down",
+        deserialize_with = "deserialize_single_char"
+    )]
+    pub down: char,
+    #[serde(
+        default = "default_tui_keybind_left",
+        deserialize_with = "deserialize_single_char"
+    )]
+    pub left: char,
+    #[serde(
+        default = "default_tui_keybind_right",
+        deserialize_with = "deserialize_single_char"
+    )]
+    pub right: char,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,7 +135,19 @@ impl Default for TuiConfig {
             confirm_batch: true,
             diff_focus_mode: default_tui_diff_focus_mode(),
             diff_focus_context_lines: default_diff_focus_context_lines(),
+            keybinds: TuiKeybindsConfig::default(),
             speed_read: TuiSpeedReadConfig::default(),
+        }
+    }
+}
+
+impl Default for TuiKeybindsConfig {
+    fn default() -> Self {
+        Self {
+            up: default_tui_keybind_up(),
+            down: default_tui_keybind_down(),
+            left: default_tui_keybind_left(),
+            right: default_tui_keybind_right(),
         }
     }
 }
@@ -166,6 +204,22 @@ fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {
 
 fn default_diff_focus_context_lines() -> usize {
     3
+}
+
+fn default_tui_keybind_up() -> char {
+    'k'
+}
+
+fn default_tui_keybind_down() -> char {
+    'j'
+}
+
+fn default_tui_keybind_left() -> char {
+    'h'
+}
+
+fn default_tui_keybind_right() -> char {
+    'l'
 }
 
 fn default_tui_speed_read_enabled() -> bool {
@@ -392,6 +446,21 @@ where
         .collect()
 }
 
+fn deserialize_single_char<'de, D>(deserializer: D) -> std::result::Result<char, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let mut chars = value.chars();
+    let Some(ch) = chars.next() else {
+        return Err(serde::de::Error::custom("expected a single character"));
+    };
+    if chars.next().is_some() {
+        return Err(serde::de::Error::custom("expected a single character"));
+    }
+    Ok(ch)
+}
+
 fn validate_ignore_globs(patterns: &[String]) -> Result<()> {
     let mut builder = GitignoreBuilder::new(".");
     builder.allow_unclosed_class(false);
@@ -468,6 +537,10 @@ mod tests {
         assert!(cfg.tui.confirm_batch);
         assert_eq!(cfg.tui.diff_focus_mode, TuiDiffFocusMode::WholeBlock);
         assert_eq!(cfg.tui.diff_focus_context_lines, 3);
+        assert_eq!(cfg.tui.keybinds.up, 'k');
+        assert_eq!(cfg.tui.keybinds.down, 'j');
+        assert_eq!(cfg.tui.keybinds.left, 'h');
+        assert_eq!(cfg.tui.keybinds.right, 'l');
     }
 
     #[test]
@@ -483,6 +556,41 @@ mod tests {
             TuiDiffFocusMode::ChangedWithContext
         );
         assert_eq!(cfg.tui.diff_focus_context_lines, 5);
+    }
+
+    #[test]
+    fn tui_config_parses_keybind_overrides() {
+        let cfg: TrueflowConfig = match toml::from_str(
+            r#"
+[tui.keybinds]
+up = "i"
+down = "k"
+left = "j"
+right = "l"
+"#,
+        ) {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert_eq!(cfg.tui.keybinds.up, 'i');
+        assert_eq!(cfg.tui.keybinds.down, 'k');
+        assert_eq!(cfg.tui.keybinds.left, 'j');
+        assert_eq!(cfg.tui.keybinds.right, 'l');
+    }
+
+    #[test]
+    fn tui_config_rejects_multi_character_keybinds() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.keybinds]
+up = "jk"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected a single character"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]
