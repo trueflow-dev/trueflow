@@ -1723,11 +1723,16 @@ fn build_action_lines(
         .fg(palette.dim)
         .add_modifier(Modifier::BOLD);
 
+    let nav_top_left = "[d]toggle diff/source";
+    let nav_top_right = format!("[{}]ascend", keybinds.up);
+    let nav_top_spacing = top_line_spacing(width, nav_top_left, &nav_top_right);
+
     let pyramid_lines = vec![
-        Line::from(Span::styled(
-            format!("[{}]ascend", keybinds.up),
-            pyramid_style,
-        )),
+        Line::from(vec![
+            Span::styled(nav_top_left.to_string(), pyramid_style),
+            Span::styled(nav_top_spacing, Style::default().bg(palette.bg)),
+            Span::styled(nav_top_right, pyramid_style),
+        ]),
         Line::from(Span::styled(
             format!(
                 "[{}]prev            [{}]next",
@@ -1739,7 +1744,6 @@ fn build_action_lines(
             format!("  [{}]descend", keybinds.down),
             pyramid_style,
         )),
-        Line::from(Span::styled("  [d]toggle diff/source", pyramid_style)),
     ];
 
     let mut lines = Vec::with_capacity(1 + pyramid_lines.len());
@@ -2488,7 +2492,7 @@ struct FocusLayout {
     actions: Rect,
 }
 
-const ACTIONS_HEIGHT: u16 = 5;
+const ACTIONS_HEIGHT: u16 = 4;
 
 fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let code_width = area.width.min(120);
@@ -2564,7 +2568,7 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 3);
         assert_eq!(layout.code.width, 120);
-        assert_eq!(layout.actions.height, 5);
+        assert_eq!(layout.actions.height, 4);
         assert!(layout.code.y > area.y);
     }
 
@@ -3052,7 +3056,9 @@ mod diff_scope_tests {
         let palette = UiPalette::default();
         let lines = build_action_lines(80, &keybinds, &palette);
 
-        assert_eq!(lines[1].to_string(), "[i]ascend");
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].to_string().contains("[d]toggle diff/source"));
+        assert!(lines[1].to_string().contains("[i]ascend"));
         assert_eq!(lines[2].to_string(), "[j]prev            [l]next");
         assert_eq!(lines[3].to_string(), "  [k]descend");
     }
