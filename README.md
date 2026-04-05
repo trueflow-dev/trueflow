@@ -31,6 +31,26 @@ Still some rough edges.
 - Diff fingerprints and content-addressed block identities both exist today and
   are not fully unified yet.
 
+## Install
+
+With Nix:
+
+```sh
+nix profile install github:trueflow-dev/trueflow
+```
+
+With Cargo:
+
+```sh
+# Install Rust and Cargo first: https://rustup.rs
+git clone https://github.com/trueflow-dev/trueflow.git
+cd trueflow
+cargo install --path trueflow --locked
+```
+
+`cargo install` usually puts the `trueflow` binary in `~/.cargo/bin`, so make
+sure that directory is on your `PATH`.
+
 ## Quick start
 
 ```sh
