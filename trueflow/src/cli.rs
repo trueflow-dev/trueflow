@@ -29,12 +29,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Compatibility alias for review scoped to diff vs main
-    Diff {
-        /// Output format (default is text, use --json for machine parsing)
-        #[arg(long)]
-        json: bool,
-    },
     /// Mark a review target with a verdict
     Mark {
         /// Current CLI field name for the review-target identifier
@@ -66,8 +60,6 @@ pub enum Commands {
         #[arg(long)]
         quiet: bool,
     },
-    /// Sync reviews with remote (fetch & push configured storage branch)
-    Sync,
     /// CI gate check
     Check,
     /// Scan the directory and build the Merkle tree (Audit mode)
@@ -134,6 +126,10 @@ pub enum Commands {
         /// Split into sub-blocks
         #[arg(long)]
         split: bool,
+
+        /// Include review coverage details
+        #[arg(long)]
+        coverage: bool,
     },
     /// Verify record attestations
     Verify {
@@ -176,7 +172,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
-    fn sync_help_mentions_configured_storage_branch() {
+    fn long_help_omits_removed_diff_and_sync_commands() {
         let mut command = Cli::command();
         let mut help = Vec::new();
         command
@@ -184,8 +180,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to render help output: {error}"));
         let help = String::from_utf8(help)
             .unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
-        assert!(help.contains("configured storage branch"));
-        assert!(!help.contains("trueflow-db branch"));
+        assert!(!help.contains("\n  diff"));
+        assert!(!help.contains("\n  sync"));
     }
 
     #[test]
@@ -205,6 +201,32 @@ mod tests {
     fn build_timestamp_is_rfc3339() {
         DateTime::parse_from_rfc3339(build_info::BUILD_TIMESTAMP)
             .unwrap_or_else(|error| panic!("build timestamp was not RFC3339: {error}"));
+    }
+
+    #[test]
+    fn diff_command_is_rejected() {
+        let err = match Cli::try_parse_from(["trueflow", "diff", "--json"]) {
+            Ok(_) => panic!("expected clap to reject removed diff command"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("unrecognized subcommand") && rendered.contains("diff"),
+            "unexpected clap error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sync_command_is_rejected() {
+        let err = match Cli::try_parse_from(["trueflow", "sync"]) {
+            Ok(_) => panic!("expected clap to reject removed sync command"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("unrecognized subcommand") && rendered.contains("sync"),
+            "unexpected clap error: {rendered}"
+        );
     }
 
     #[test]
@@ -323,5 +345,22 @@ mod tests {
             rendered.contains("Unknown block kind: not-a-kind"),
             "unexpected clap error: {rendered}"
         );
+    }
+
+    #[test]
+    fn inspect_command_parses_coverage_flag() {
+        let cli = Cli::parse_from(["trueflow", "inspect", "--fingerprint", "abc1234", "--coverage"]);
+        match cli.command {
+            Commands::Inspect {
+                fingerprint,
+                split,
+                coverage,
+            } => {
+                assert_eq!(fingerprint, "abc1234");
+                assert!(!split);
+                assert!(coverage);
+            }
+            _ => panic!("expected inspect command"),
+        }
     }
 }

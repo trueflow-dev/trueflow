@@ -111,8 +111,8 @@ fn test_mark_diff_block_hash_records_block_target() -> Result<()> {
     repo.write("src/lib.rs", "pub fn value() -> i32 { 2 }\n")?;
     repo.commit_all("Change value")?;
 
-    let diff_output = repo.run(&["diff", "--json"])?;
-    let fingerprint = first_block_hash(&diff_output)?;
+    let review_output = repo.run(&["review", "--target", "main", "--json"])?;
+    let fingerprint = first_block_hash(&review_output)?;
 
     repo.run(&[
         "mark",
@@ -131,7 +131,7 @@ fn test_mark_diff_block_hash_records_block_target() -> Result<()> {
         other => panic!("expected block target, got {other:?}"),
     }
 
-    let changes_after = json_array(&repo.run(&["diff", "--json"])?)?;
+    let changes_after = json_array(&repo.run(&["review", "--target", "main", "--json"])?)?;
     assert!(changes_after.is_empty());
 
     Ok(())

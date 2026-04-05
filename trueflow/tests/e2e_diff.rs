@@ -5,13 +5,13 @@ use std::fs;
 mod common;
 use common::*;
 
-fn get_diff_json(repo: &TestRepo) -> Result<Vec<Value>> {
-    let output = repo.run(&["diff", "--json"])?;
+fn get_main_review_json(repo: &TestRepo) -> Result<Vec<Value>> {
+    let output = repo.run(&["review", "--target", "main", "--json"])?;
     json_array(&output)
 }
 
-fn first_diff_block_hash(repo: &TestRepo) -> Result<String> {
-    let output = repo.run(&["diff", "--json"])?;
+fn first_main_review_block_hash(repo: &TestRepo) -> Result<String> {
+    let output = repo.run(&["review", "--target", "main", "--json"])?;
     first_block_hash(&output)
 }
 
@@ -25,7 +25,7 @@ fn checkout_branch(repo: &TestRepo, branch: &str) -> Result<()> {
 }
 
 #[test]
-fn test_diff_json_uses_semantic_review_shape() -> Result<()> {
+fn test_main_review_json_uses_semantic_review_shape() -> Result<()> {
     let repo = TestRepo::new("initial_state")?;
     repo.write("src/main.rs", "fn main() { println!(\"Hello\"); }")?;
     repo.commit_all("Initial commit")?;
@@ -34,7 +34,7 @@ fn test_diff_json_uses_semantic_review_shape() -> Result<()> {
     repo.write("src/main.rs", "fn main() { println!(\"Hello World\"); }")?;
     repo.commit_all("Update greeting")?;
 
-    let files = get_diff_json(&repo)?;
+    let files = get_main_review_json(&repo)?;
     assert_eq!(files.len(), 1);
 
     let file = &files[0];
@@ -58,7 +58,7 @@ fn test_diff_json_uses_semantic_review_shape() -> Result<()> {
 }
 
 #[test]
-fn test_diff_and_mark_flow_uses_block_reviews() -> Result<()> {
+fn test_main_review_and_mark_flow_uses_block_reviews() -> Result<()> {
     let repo = TestRepo::new("mark_flow")?;
     repo.write("src/lib.rs", LIB_ADD)?;
     repo.commit_all("Initial")?;
@@ -67,9 +67,9 @@ fn test_diff_and_mark_flow_uses_block_reviews() -> Result<()> {
     repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
-    let hash = first_diff_block_hash(&repo)?;
+    let hash = first_main_review_block_hash(&repo)?;
 
-    let output = repo.run(&["diff"])?;
+    let output = repo.run(&["review", "--target", "main"])?;
     assert!(output.contains("File: src/lib.rs"));
     assert!(output.contains("[Unreviewed]"));
 
@@ -82,7 +82,7 @@ fn test_diff_and_mark_flow_uses_block_reviews() -> Result<()> {
         "--quiet",
     ])?;
 
-    let changes = get_diff_json(&repo)?;
+    let changes = get_main_review_json(&repo)?;
     assert!(changes.is_empty());
 
     repo.run(&[
@@ -94,7 +94,7 @@ fn test_diff_and_mark_flow_uses_block_reviews() -> Result<()> {
         "--quiet",
     ])?;
 
-    let changes = get_diff_json(&repo)?;
+    let changes = get_main_review_json(&repo)?;
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0]["path"].as_str().context("path")?, "src/lib.rs");
 
@@ -119,10 +119,10 @@ fn test_check_command_gates_semantic_main_diff_blocks() -> Result<()> {
         "Expected check to be silent on stdout"
     );
 
-    let diff_output = repo.run(&["diff"])?;
-    assert!(diff_output.contains("File: src/lib.rs"));
+    let review_output = repo.run(&["review", "--target", "main"])?;
+    assert!(review_output.contains("File: src/lib.rs"));
 
-    let fp = first_diff_block_hash(&repo)?;
+    let fp = first_main_review_block_hash(&repo)?;
     repo.run(&[
         "mark",
         "--fingerprint",
@@ -177,7 +177,7 @@ fn test_check_ignores_legacy_diff_like_fingerprint_marks() -> Result<()> {
 }
 
 #[test]
-fn test_diff_ignores_non_review_checks() -> Result<()> {
+fn test_main_review_ignores_non_review_checks() -> Result<()> {
     let repo = TestRepo::new("diff_non_review")?;
     repo.write("src/lib.rs", LIB_ADD)?;
     repo.commit_all("Initial")?;
@@ -186,7 +186,7 @@ fn test_diff_ignores_non_review_checks() -> Result<()> {
     repo.write("src/lib.rs", LIB_ADD_SUB)?;
     repo.commit_all("Add sub")?;
 
-    let fp = first_diff_block_hash(&repo)?;
+    let fp = first_main_review_block_hash(&repo)?;
 
     repo.run(&[
         "mark",
@@ -199,7 +199,7 @@ fn test_diff_ignores_non_review_checks() -> Result<()> {
         "--quiet",
     ])?;
 
-    let changes = get_diff_json(&repo)?;
+    let changes = get_main_review_json(&repo)?;
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0]["path"].as_str().context("path")?, "src/lib.rs");
 
@@ -207,21 +207,21 @@ fn test_diff_ignores_non_review_checks() -> Result<()> {
 }
 
 #[test]
-fn test_diff_ignores_untracked_files() -> Result<()> {
+fn test_main_review_ignores_untracked_files() -> Result<()> {
     let repo = TestRepo::new("diff_untracked")?;
     repo.write("src/lib.rs", "pub fn stable() {}\n")?;
     repo.commit_all("Initial")?;
 
     repo.write("src/untracked.rs", "pub fn draft() {}\n")?;
 
-    let changes = get_diff_json(&repo)?;
+    let changes = get_main_review_json(&repo)?;
     assert!(changes.is_empty());
 
     Ok(())
 }
 
 #[test]
-fn test_diff_handles_renamed_file() -> Result<()> {
+fn test_main_review_handles_renamed_file() -> Result<()> {
     let repo = TestRepo::new("diff_rename")?;
     repo.write("src/old.rs", RENAME_OLD)?;
     repo.commit_all("Add alpha")?;
@@ -232,7 +232,7 @@ fn test_diff_handles_renamed_file() -> Result<()> {
     repo.write("src/new.rs", RENAME_NEW)?;
     repo.commit_all("Rename and expand")?;
 
-    let changes = get_diff_json(&repo)?;
+    let changes = get_main_review_json(&repo)?;
     assert!(!changes.is_empty());
     assert!(changes.iter().any(|change| {
         change["path"]
@@ -245,7 +245,7 @@ fn test_diff_handles_renamed_file() -> Result<()> {
 }
 
 #[test]
-fn test_diff_skips_binary_changes() -> Result<()> {
+fn test_main_review_skips_binary_changes() -> Result<()> {
     let repo = TestRepo::new("diff_binary")?;
     let binary_path = repo.path.join("binary.bin");
     fs::write(&binary_path, [0, 255, 0, 1])?;
@@ -256,21 +256,21 @@ fn test_diff_skips_binary_changes() -> Result<()> {
     fs::write(&binary_path, [0, 255, 2, 3])?;
     repo.commit_all("Update binary")?;
 
-    let changes = get_diff_json(&repo)?;
+    let changes = get_main_review_json(&repo)?;
     assert!(changes.is_empty());
 
     Ok(())
 }
 
 #[test]
-fn test_diff_errors_without_main_branch() -> Result<()> {
+fn test_main_review_errors_without_main_branch() -> Result<()> {
     let repo = TestRepo::new("diff_no_main")?;
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
     repo.commit_all("Initial")?;
 
     repo.git(&["branch", "-m", "trunk"])?;
 
-    let output = repo.run_err(&["diff", "--json"])?;
+    let output = repo.run_err(&["review", "--target", "main", "--json"])?;
     assert!(output.contains("main") || output.contains("master"));
 
     Ok(())

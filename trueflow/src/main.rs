@@ -50,7 +50,6 @@ fn main() -> Result<()> {
     }
 
     match &context.invocation.command {
-        Commands::Diff { json } => commands::diff::run(&context, *json),
         Commands::Mark {
             fingerprint,
             verdict,
@@ -71,7 +70,6 @@ fn main() -> Result<()> {
                 line: *line,
             },
         ),
-        Commands::Sync => commands::sync::run(&context),
         Commands::Check => commands::check::run(&context),
         Commands::Scan { json, tree } => commands::scan::run(&context, *json, *tree),
         Commands::Review {

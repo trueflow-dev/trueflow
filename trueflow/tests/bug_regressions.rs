@@ -117,7 +117,7 @@ fn test_diff_blocks_match_post_hunk_file_content() -> Result<()> {
     repo.commit_all("Update message")?;
 
     // WHEN: we compute semantic diff JSON
-    let output = repo.run(&["diff", "--json"])?;
+    let output = repo.run(&["review", "--target", "main", "--json"])?;
     let blocks = first_file_blocks(&output)?;
 
     // THEN: semantic block content reflects the post-hunk file content
@@ -1223,7 +1223,7 @@ fn test_filestore_uses_repo_root_from_subdir() -> Result<()> {
 }
 
 #[test]
-fn test_diff_uses_merge_base() -> Result<()> {
+fn test_main_review_uses_merge_base() -> Result<()> {
     let repo = TestRepo::new("diff_merge_base")?;
     repo.write("src/file1.rs", "fn one() {}\n")?;
     repo.commit_all("Add file1")?;
@@ -1241,7 +1241,7 @@ fn test_diff_uses_merge_base() -> Result<()> {
 
     repo.git(&["checkout", "feature/one"])?;
 
-    let output = repo.run(&["diff", "--json"])?;
+    let output = repo.run(&["review", "--target", "main", "--json"])?;
     let changes = json_array(&output)?;
     let files: Vec<&str> = changes
         .iter()
@@ -1261,7 +1261,7 @@ fn test_diff_uses_merge_base() -> Result<()> {
 }
 
 #[test]
-fn test_diff_respects_file_coverage_from_subdir() -> Result<()> {
+fn test_main_review_respects_file_coverage_from_subdir() -> Result<()> {
     let repo = TestRepo::new("diff_file_coverage_subdir")?;
     repo.write("pkg/src/lib.rs", "pub fn value() { println!(\"one\"); }\n")?;
     repo.commit_all("Initial")?;
@@ -1289,11 +1289,14 @@ fn test_diff_respects_file_coverage_from_subdir() -> Result<()> {
     );
     write_reviews_jsonl(&repo.path.join(".trueflow"), &[approved_file])?;
 
-    let root_output = repo.run(&["diff", "--json"])?;
+    let root_output = repo.run(&["review", "--target", "main", "--json"])?;
     let root_changes = json_array(&root_output)?;
     assert!(root_changes.is_empty(), "expected root diff to be covered");
 
-    let pkg_output = repo.run_in(&["diff", "--json"], &repo.path.join("pkg"))?;
+    let pkg_output = repo.run_in(
+        &["review", "--target", "main", "--json"],
+        &repo.path.join("pkg"),
+    )?;
     let pkg_changes = json_array(&pkg_output)?;
     assert!(
         pkg_changes.is_empty(),
