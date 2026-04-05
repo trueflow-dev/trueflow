@@ -154,7 +154,10 @@ impl PendingAction {
     fn verdict_label(&self) -> &'static str {
         match self {
             PendingAction::Single { verdict, .. } | PendingAction::Batch { verdict, .. } => {
-                verdict.as_str()
+                match verdict {
+                    Verdict::Comment => "note",
+                    _ => verdict.as_str(),
+                }
             }
         }
     }
@@ -216,11 +219,19 @@ struct ReviewStateBuildOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectionKeyAction {
+enum KeybindAction {
     Up,
     Down,
-    Left,
-    Right,
+    Prev,
+    Next,
+    Parent,
+    Child,
+    Approve,
+    Note,
+    ToggleView,
+    SpeedRead,
+    Root,
+    Quit,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -467,19 +478,27 @@ fn block_diff_focus_mode_from_config(config: &TuiConfig) -> vcs::BlockDiffFocusM
     }
 }
 
-fn direction_key_action_for_key_code(
+fn keybind_action_for_key_code(
     keybinds: &TuiKeybindsConfig,
     key_code: KeyCode,
-) -> Option<DirectionKeyAction> {
+) -> Option<KeybindAction> {
     match key_code {
-        KeyCode::Up => Some(DirectionKeyAction::Up),
-        KeyCode::Down => Some(DirectionKeyAction::Down),
-        KeyCode::Left => Some(DirectionKeyAction::Left),
-        KeyCode::Right => Some(DirectionKeyAction::Right),
-        KeyCode::Char(ch) if ch == keybinds.up => Some(DirectionKeyAction::Up),
-        KeyCode::Char(ch) if ch == keybinds.down => Some(DirectionKeyAction::Down),
-        KeyCode::Char(ch) if ch == keybinds.left => Some(DirectionKeyAction::Left),
-        KeyCode::Char(ch) if ch == keybinds.right => Some(DirectionKeyAction::Right),
+        KeyCode::Up => Some(KeybindAction::Up),
+        KeyCode::Down => Some(KeybindAction::Down),
+        KeyCode::Left => Some(KeybindAction::Prev),
+        KeyCode::Right => Some(KeybindAction::Next),
+        KeyCode::Char(ch) if ch == keybinds.scroll_up => Some(KeybindAction::Up),
+        KeyCode::Char(ch) if ch == keybinds.scroll_down => Some(KeybindAction::Down),
+        KeyCode::Char(ch) if ch == keybinds.prev => Some(KeybindAction::Prev),
+        KeyCode::Char(ch) if ch == keybinds.next => Some(KeybindAction::Next),
+        KeyCode::Char(ch) if ch == keybinds.parent => Some(KeybindAction::Parent),
+        KeyCode::Char(ch) if ch == keybinds.child => Some(KeybindAction::Child),
+        KeyCode::Char(ch) if ch == keybinds.approve => Some(KeybindAction::Approve),
+        KeyCode::Char(ch) if ch == keybinds.note => Some(KeybindAction::Note),
+        KeyCode::Char(ch) if ch == keybinds.toggle_view => Some(KeybindAction::ToggleView),
+        KeyCode::Char(ch) if ch == keybinds.speed_read => Some(KeybindAction::SpeedRead),
+        KeyCode::Char(ch) if ch == keybinds.root => Some(KeybindAction::Root),
+        KeyCode::Char(ch) if ch == keybinds.quit => Some(KeybindAction::Quit),
         _ => None,
     }
 }
@@ -593,24 +612,33 @@ fn run_scope_selector(
         };
         let key_code = key_event.code;
 
-        if let Some(action) = direction_key_action_for_key_code(keybinds, key_code) {
+        if let Some(action) = keybind_action_for_key_code(keybinds, key_code) {
             match action {
-                DirectionKeyAction::Up => {
+                KeybindAction::Up => {
                     selector.move_prev();
                     needs_render = true;
                     continue;
                 }
-                DirectionKeyAction::Down => {
+                KeybindAction::Down => {
                     selector.move_next();
                     needs_render = true;
                     continue;
                 }
-                DirectionKeyAction::Left | DirectionKeyAction::Right => {}
+                KeybindAction::Quit => return Ok(ScopeSelection::Quit),
+                KeybindAction::Prev
+                | KeybindAction::Next
+                | KeybindAction::Parent
+                | KeybindAction::Child
+                | KeybindAction::Approve
+                | KeybindAction::Note
+                | KeybindAction::ToggleView
+                | KeybindAction::SpeedRead
+                | KeybindAction::Root => {}
             }
         }
 
         match key_code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(ScopeSelection::Quit),
+            KeyCode::Esc => return Ok(ScopeSelection::Quit),
             KeyCode::Enter => {
                 if let Some(scope) = selector.selected_scope() {
                     return Ok(ScopeSelection::Selected(scope));
@@ -673,7 +701,7 @@ fn run_app(
         match &state.input_mode {
             InputMode::Normal => {
                 if is_recap_mode(&state) {
-                    if recap_key_should_exit(key_code) {
+                    if recap_key_should_exit(&state.keybinds, key_code) {
                         flush_pending_speed_read_defaults(&mut state)?;
                         return Ok(());
                     }
@@ -685,42 +713,42 @@ fn run_app(
                     continue;
                 }
 
-                if let Some(action) = direction_key_action_for_key_code(&state.keybinds, key_code) {
+                if let Some(action) = keybind_action_for_key_code(&state.keybinds, key_code) {
                     match action {
-                        DirectionKeyAction::Up => handle_ascend(&mut state),
-                        DirectionKeyAction::Down => handle_descend(&mut state),
-                        DirectionKeyAction::Left => handle_prev(&mut state),
-                        DirectionKeyAction::Right => handle_next(&mut state),
+                        KeybindAction::Up => handle_scroll_line_up(&mut state),
+                        KeybindAction::Down => handle_scroll_line_down(&mut state),
+                        KeybindAction::Prev => handle_prev(&mut state),
+                        KeybindAction::Next => handle_next(&mut state),
+                        KeybindAction::Parent => handle_parent(&mut state),
+                        KeybindAction::Child => handle_child(&mut state),
+                        KeybindAction::Approve => {
+                            handle_action(terminal, context, &mut state, Verdict::Approved)?;
+                        }
+                        KeybindAction::Note => {
+                            handle_note_action(&mut state)?;
+                        }
+                        KeybindAction::ToggleView => {
+                            state.view_mode = match state.view_mode {
+                                ViewMode::Source => ViewMode::Diff,
+                                ViewMode::Diff => ViewMode::Source,
+                            };
+                            state.scroll_offset = 0;
+                        }
+                        KeybindAction::SpeedRead => toggle_speed_read_mode(&mut state),
+                        KeybindAction::Root => {
+                            state.navigator.jump_root();
+                            clear_speed_read_if_not_on_current_node(&mut state);
+                        }
+                        KeybindAction::Quit => {
+                            flush_pending_speed_read_defaults(&mut state)?;
+                            return Ok(());
+                        }
                     }
                     needs_render = true;
                     continue;
                 }
 
                 match key_code {
-                    KeyCode::Char('q') => {
-                        flush_pending_speed_read_defaults(&mut state)?;
-                        return Ok(());
-                    }
-                    KeyCode::Char('n') => {
-                        handle_next(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('b') => {
-                        handle_prev(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('a') => {
-                        handle_action(terminal, context, &mut state, Verdict::Approved)?;
-                        needs_render = true;
-                    }
-                    KeyCode::Char('x') => {
-                        handle_action(terminal, context, &mut state, Verdict::Rejected)?;
-                        needs_render = true;
-                    }
-                    KeyCode::Char('c') => {
-                        handle_comment_action(&mut state)?;
-                        needs_render = true;
-                    }
                     KeyCode::Char(' ')
                         if state.navigator.current_id() != state.navigator.tree.root() =>
                     {
@@ -744,20 +772,6 @@ fn run_app(
                             state.content_height.saturating_sub(state.viewport_height);
                         needs_render = true;
                     }
-                    KeyCode::Char('g') => {
-                        state.navigator.jump_root();
-                        clear_speed_read_if_not_on_current_node(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char('d') => {
-                        state.view_mode = match state.view_mode {
-                            ViewMode::Source => ViewMode::Diff,
-                            ViewMode::Diff => ViewMode::Source,
-                        };
-                        // Reset scroll when switching views because content height changes
-                        state.scroll_offset = 0;
-                        needs_render = true;
-                    }
                     KeyCode::Enter | KeyCode::Char(' ')
                         if state.navigator.current_id() == state.navigator.tree.root() =>
                     {
@@ -765,10 +779,6 @@ fn run_app(
                             state.navigator.set_current(first);
                             clear_speed_read_if_not_on_current_node(&mut state);
                         }
-                        needs_render = true;
-                    }
-                    KeyCode::Char('r') => {
-                        toggle_speed_read_mode(&mut state);
                         needs_render = true;
                     }
                     _ => {}
@@ -947,11 +957,12 @@ fn is_recap_mode(state: &AppState) -> bool {
     matches!(state.input_mode, InputMode::Normal) && state.remaining_blocks == 0
 }
 
-fn recap_key_should_exit(key_code: KeyCode) -> bool {
-    matches!(
-        key_code,
-        KeyCode::Char('q') | KeyCode::Char('d') | KeyCode::Esc
-    )
+fn recap_key_should_exit(keybinds: &TuiKeybindsConfig, key_code: KeyCode) -> bool {
+    matches!(key_code, KeyCode::Esc)
+        || matches!(
+            keybind_action_for_key_code(keybinds, key_code),
+            Some(KeybindAction::Quit | KeybindAction::ToggleView)
+        )
 }
 
 // ... helper functions for actions ...
@@ -964,7 +975,7 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-fn handle_ascend(state: &mut AppState) {
+fn handle_parent(state: &mut AppState) {
     if state.navigator.current_id() == state.navigator.tree.root() {
         return;
     }
@@ -973,7 +984,7 @@ fn handle_ascend(state: &mut AppState) {
     clear_speed_read_if_not_on_current_node(state);
 }
 
-fn handle_descend(state: &mut AppState) {
+fn handle_child(state: &mut AppState) {
     if state.navigator.current_id() == state.navigator.tree.root() {
         let root = state.navigator.tree.root();
         state.root_cursor = state
@@ -991,6 +1002,14 @@ fn handle_descend(state: &mut AppState) {
         state.scroll_offset = 0;
         clear_speed_read_if_not_on_current_node(state);
     }
+}
+
+fn handle_scroll_line_up(state: &mut AppState) {
+    scroll_up_by(state, 1);
+}
+
+fn handle_scroll_line_down(state: &mut AppState) {
+    scroll_down_by(state, 1);
 }
 
 fn handle_prev(state: &mut AppState) {
@@ -1097,7 +1116,7 @@ fn handle_action(
     Ok(())
 }
 
-fn handle_comment_action(state: &mut AppState) -> Result<()> {
+fn handle_note_action(state: &mut AppState) -> Result<()> {
     let action = PendingAction::from_node(
         &state.navigator.tree,
         state.navigator.current_id(),
@@ -1117,13 +1136,7 @@ fn handle_editing_submit(
         return Ok(());
     };
 
-    let action = match submit {
-        EditingSubmitDecision::Empty => {
-            state.input_buffer.clear();
-            return Ok(());
-        }
-        EditingSubmitDecision::Ready(action) => action,
-    };
+    let EditingSubmitDecision::Ready(action) = submit;
 
     if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
         let count = state
@@ -1811,8 +1824,8 @@ fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'stati
 
 fn scope_selector_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     format!(
-        "[Enter] select  [{}/{}] move  [q] quit",
-        keybinds.up, keybinds.down
+        "[Enter] select  [{}/{}] move  [{}] quit",
+        keybinds.scroll_down, keybinds.scroll_up, keybinds.quit
     )
 }
 
@@ -1822,8 +1835,19 @@ fn build_action_lines(
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
     let compact = format!(
-        "[a]approve [c]comment [x]reject [d]diff/source [{}/{}]prev/next [{}/{}]asc/desc [g]root [q]quit",
-        keybinds.left, keybinds.right, keybinds.up, keybinds.down
+        "[{}]approve [{}]note [{}]diff/source [{}/{}]prev/next [{}]parent [{}]child [{}/{}]down/up [{}]root [{}]speed-read [{}]quit",
+        keybinds.approve,
+        keybinds.note,
+        keybinds.toggle_view,
+        keybinds.prev,
+        keybinds.next,
+        keybinds.parent,
+        keybinds.child,
+        keybinds.scroll_down,
+        keybinds.scroll_up,
+        keybinds.root,
+        keybinds.speed_read,
+        keybinds.quit
     );
     vec![Line::from(Span::styled(
         compact,
@@ -1935,11 +1959,7 @@ fn recap_summary_lines(state: &AppState) -> Vec<String> {
         "Approvals: {} blocks",
         state.session_recap.approved_blocks
     ));
-    lines.push(format!(
-        "Rejections: {} blocks",
-        state.session_recap.rejected_blocks
-    ));
-    lines.push(format!("Comments: {}", state.session_recap.comments));
+    lines.push(format!("Notes: {}", state.session_recap.comments));
     lines.push(format!(
         "Blocks touched: {}",
         state.session_recap.blocks_touched
@@ -2544,7 +2564,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             let input_lines = editing_input_lines(&content, input_overlay_width(area.width));
             (
                 InputOverlayKind::Editing { input_lines },
-                " Comment ",
+                " Note ",
                 editing_overlay_hint(&content),
                 content,
             )
@@ -2644,7 +2664,6 @@ fn input_overlay_lines(content: &str, hints: &str, palette: &UiPalette) -> Vec<L
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditingSubmitDecision {
-    Empty,
     Ready(PendingAction),
 }
 
@@ -2657,14 +2676,14 @@ fn editing_submit_decision(
     };
     let note = input_buffer.trim().to_string();
     if note.is_empty() {
-        return Some(EditingSubmitDecision::Empty);
+        return Some(EditingSubmitDecision::Ready(action.clone()));
     }
     Some(EditingSubmitDecision::Ready(action.with_note(note)))
 }
 
 fn editing_overlay_hint(content: &str) -> &'static str {
     if content.trim().is_empty() {
-        "Comment required • Enter keeps editor open • Esc to cancel"
+        "Enter to submit note • Shift+Enter newline • Esc to cancel"
     } else {
         "Enter to submit • Shift+Enter newline • Esc to cancel"
     }
@@ -3184,90 +3203,140 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn direction_key_action_uses_hjkl_defaults() {
+    fn keybind_action_uses_default_review_and_scroll_bindings() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('h')),
-            Some(DirectionKeyAction::Left)
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('h')),
+            Some(KeybindAction::Prev)
         );
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('j')),
-            Some(DirectionKeyAction::Down)
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('j')),
+            Some(KeybindAction::Down)
         );
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('k')),
-            Some(DirectionKeyAction::Up)
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('k')),
+            Some(KeybindAction::Up)
         );
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('l')),
-            Some(DirectionKeyAction::Right)
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('l')),
+            Some(KeybindAction::Next)
         );
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('i')),
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('p')),
+            Some(KeybindAction::Parent)
+        );
+        assert_eq!(
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('c')),
+            Some(KeybindAction::Child)
+        );
+        assert_eq!(
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('n')),
+            Some(KeybindAction::Note)
+        );
+        assert_eq!(
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('x')),
             None
         );
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Left),
-            Some(DirectionKeyAction::Left)
+            keybind_action_for_key_code(&keybinds, KeyCode::Left),
+            Some(KeybindAction::Prev)
+        );
+        assert_eq!(
+            keybind_action_for_key_code(&keybinds, KeyCode::Up),
+            Some(KeybindAction::Up)
         );
     }
 
     #[test]
-    fn direction_key_action_uses_configured_overrides() {
+    fn keybind_action_uses_configured_overrides() {
         let keybinds = crate::config::TuiKeybindsConfig {
-            up: 'i',
-            down: 'k',
-            left: 'j',
-            right: 'l',
+            scroll_up: 'i',
+            scroll_down: 'm',
+            prev: 'j',
+            next: 'l',
+            parent: 'u',
+            child: 'o',
+            approve: 'y',
+            note: 'e',
+            toggle_view: 'v',
+            speed_read: 's',
+            root: 'z',
+            quit: 'x',
         };
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('j')),
-            Some(DirectionKeyAction::Left)
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('j')),
+            Some(KeybindAction::Prev)
         );
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('k')),
-            Some(DirectionKeyAction::Down)
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('m')),
+            Some(KeybindAction::Down)
         );
         assert_eq!(
-            direction_key_action_for_key_code(&keybinds, KeyCode::Char('i')),
-            Some(DirectionKeyAction::Up)
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('i')),
+            Some(KeybindAction::Up)
+        );
+        assert_eq!(
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('u')),
+            Some(KeybindAction::Parent)
+        );
+        assert_eq!(
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('e')),
+            Some(KeybindAction::Note)
         );
     }
 
     #[test]
     fn scope_selector_hint_text_uses_configured_keybinds() {
         let keybinds = crate::config::TuiKeybindsConfig {
-            up: 'i',
-            down: 'k',
-            left: 'j',
-            right: 'l',
+            scroll_up: 'i',
+            scroll_down: 'm',
+            prev: 'j',
+            next: 'l',
+            parent: 'u',
+            child: 'o',
+            approve: 'y',
+            note: 'e',
+            toggle_view: 'v',
+            speed_read: 's',
+            root: 'z',
+            quit: 'x',
         };
         assert_eq!(
             scope_selector_hint_text(&keybinds),
-            "[Enter] select  [i/k] move  [q] quit"
+            "[Enter] select  [m/i] move  [x] quit"
         );
     }
 
     #[test]
     fn build_action_lines_uses_configured_keybinds() {
         let keybinds = crate::config::TuiKeybindsConfig {
-            up: 'i',
-            down: 'k',
-            left: 'j',
-            right: 'l',
+            scroll_up: 'i',
+            scroll_down: 'm',
+            prev: 'j',
+            next: 'l',
+            parent: 'u',
+            child: 'o',
+            approve: 'y',
+            note: 'e',
+            toggle_view: 'v',
+            speed_read: 's',
+            root: 'z',
+            quit: 'x',
         };
         let palette = UiPalette::default();
         let lines = build_action_lines(80, &keybinds, &palette);
 
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].to_string().contains("[a]approve"));
-        assert!(lines[0].to_string().contains("[c]comment"));
-        assert!(lines[0].to_string().contains("[x]reject"));
-        assert!(lines[0].to_string().contains("[d]diff/source"));
+        assert!(lines[0].to_string().contains("[y]approve"));
+        assert!(lines[0].to_string().contains("[e]note"));
+        assert!(lines[0].to_string().contains("[v]diff/source"));
         assert!(lines[0].to_string().contains("[j/l]prev/next"));
-        assert!(lines[0].to_string().contains("[i/k]asc/desc"));
-        assert!(lines[0].to_string().contains("[g]root"));
-        assert!(lines[0].to_string().contains("[q]quit"));
+        assert!(lines[0].to_string().contains("[u]parent"));
+        assert!(lines[0].to_string().contains("[o]child"));
+        assert!(lines[0].to_string().contains("[m/i]down/up"));
+        assert!(lines[0].to_string().contains("[z]root"));
+        assert!(lines[0].to_string().contains("[s]speed-read"));
+        assert!(lines[0].to_string().contains("[x]quit"));
     }
 
     #[test]
@@ -3622,7 +3691,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn editing_submit_decision_returns_empty_for_blank_input() {
+    fn editing_submit_decision_returns_ready_for_blank_note_input() {
         let action = PendingAction::Single {
             node_id: TreeBuilder::new().root(),
             verdict: Verdict::Comment,
@@ -3630,7 +3699,11 @@ mod diff_scope_tests {
         };
         let input_mode = InputMode::Editing { action };
         let decision = editing_submit_decision(&input_mode, "   \n\t");
-        assert_eq!(decision, Some(EditingSubmitDecision::Empty));
+        let Some(EditingSubmitDecision::Ready(PendingAction::Single { note, .. })) = decision
+        else {
+            panic!("expected ready single action");
+        };
+        assert_eq!(note, None);
     }
 
     #[test]
@@ -3650,10 +3723,10 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn editing_overlay_hint_requires_comment_for_empty_input() {
+    fn editing_overlay_hint_allows_empty_note_input() {
         assert_eq!(
             editing_overlay_hint(""),
-            "Comment required • Enter keeps editor open • Esc to cancel"
+            "Enter to submit note • Shift+Enter newline • Esc to cancel"
         );
         assert_eq!(
             editing_overlay_hint("note"),
@@ -4281,8 +4354,8 @@ mod diff_scope_tests {
             "expected approvals rollup, got: {lines:?}"
         );
         assert!(
-            lines.iter().any(|line| line.contains("Comments: 2")),
-            "expected comments rollup, got: {lines:?}"
+            lines.iter().any(|line| line.contains("Notes: 2")),
+            "expected notes rollup, got: {lines:?}"
         );
         assert!(
             !lines.iter().any(|line| line.contains("Questions:")),
@@ -4292,10 +4365,11 @@ mod diff_scope_tests {
 
     #[test]
     fn recap_key_handler_exits_on_q_and_d() {
-        assert!(recap_key_should_exit(KeyCode::Char('q')));
-        assert!(recap_key_should_exit(KeyCode::Char('d')));
-        assert!(recap_key_should_exit(KeyCode::Esc));
-        assert!(!recap_key_should_exit(KeyCode::Char('a')));
+        let keybinds = crate::config::TuiKeybindsConfig::default();
+        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('q')));
+        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('d')));
+        assert!(recap_key_should_exit(&keybinds, KeyCode::Esc));
+        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('a')));
     }
 
     #[test]

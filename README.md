@@ -102,10 +102,18 @@ exclude = ["gap", "comment"]
 exclude = ["gap"]
 
 [tui.keybinds]
-up = "k"
-down = "j"
-left = "h"
-right = "l"
+scroll_up = "k"
+scroll_down = "j"
+prev = "h"
+next = "l"
+parent = "p"
+child = "c"
+approve = "a"
+note = "n"
+toggle_view = "d"
+speed_read = "r"
+root = "g"
+quit = "q"
 
 [tui.speed_read]
 enabled = true
@@ -121,23 +129,33 @@ See `trueflow.example.toml` for the default settings.
 
 Main review actions:
 
-- `h`/`j`/`k`/`l` navigate by default, and arrow keys also work
+- `j`/`k` scroll down/up by default, and arrow keys mirror those actions
+- `h`/`l` move to previous/next semantic sibling
+- `p`/`c` move to semantic parent/child
 - `a` approve
-- `x` reject
-- `c` comment
-- `s` split
+- `n` add a note (empty note is allowed)
+- `d` toggle diff/source
 - `r` toggle speed-reading
+- `g` jump to root
 - `q` quit
 
-To override the default navigation keys, add a `[tui.keybinds]` section to
+To override the default TUI keys, add a `[tui.keybinds]` section to
 `trueflow.toml`:
 
 ```toml
 [tui.keybinds]
-up = "i"
-down = "k"
-left = "j"
-right = "l"
+scroll_up = "i"
+scroll_down = "m"
+prev = "j"
+next = "l"
+parent = "u"
+child = "o"
+approve = "y"
+note = "e"
+toggle_view = "v"
+speed_read = "s"
+root = "z"
+quit = "x"
 ```
 
 ### Emacs
