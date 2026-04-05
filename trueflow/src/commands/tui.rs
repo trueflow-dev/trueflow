@@ -1710,36 +1710,32 @@ fn build_action_lines(
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
     let top_left = "[a]pprove [c]omment [x]reject";
-    let top_right = "[g]root [q]uit";
-    let top_spacing = top_line_spacing(width, top_left, top_right);
+    let top_right = format!("[{}]ascend  [g]root [q]uit", keybinds.up);
+    let top_spacing = top_line_spacing(width, top_left, &top_right);
 
     let top_line = Line::from(vec![
         Span::styled(top_left.to_string(), Style::default().fg(palette.dim)),
         Span::styled(top_spacing, Style::default().bg(palette.bg)),
-        Span::styled(top_right.to_string(), Style::default().fg(palette.dim)),
+        Span::styled(top_right, Style::default().fg(palette.dim)),
     ]);
 
     let pyramid_style = Style::default()
         .fg(palette.dim)
         .add_modifier(Modifier::BOLD);
 
-    let nav_top_left = "[d]toggle diff/source";
-    let nav_top_right = format!("[{}]ascend", keybinds.up);
-    let nav_top_spacing = top_line_spacing(width, nav_top_left, &nav_top_right);
+    let middle_left = "[d]toggle diff/source";
+    let middle_right = format!(
+        "[{}]prev            [{}]next",
+        keybinds.left, keybinds.right
+    );
+    let middle_spacing = top_line_spacing(width, middle_left, &middle_right);
 
     let pyramid_lines = vec![
         Line::from(vec![
-            Span::styled(nav_top_left.to_string(), pyramid_style),
-            Span::styled(nav_top_spacing, Style::default().bg(palette.bg)),
-            Span::styled(nav_top_right, pyramid_style),
+            Span::styled(middle_left.to_string(), pyramid_style),
+            Span::styled(middle_spacing, Style::default().bg(palette.bg)),
+            Span::styled(middle_right, pyramid_style),
         ]),
-        Line::from(Span::styled(
-            format!(
-                "[{}]prev            [{}]next",
-                keybinds.left, keybinds.right
-            ),
-            pyramid_style,
-        )),
         Line::from(Span::styled(
             format!("  [{}]descend", keybinds.down),
             pyramid_style,
@@ -2492,7 +2488,7 @@ struct FocusLayout {
     actions: Rect,
 }
 
-const ACTIONS_HEIGHT: u16 = 4;
+const ACTIONS_HEIGHT: u16 = 3;
 
 fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let code_width = area.width.min(120);
@@ -2568,7 +2564,7 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 3);
         assert_eq!(layout.code.width, 120);
-        assert_eq!(layout.actions.height, 4);
+        assert_eq!(layout.actions.height, 3);
         assert!(layout.code.y > area.y);
     }
 
@@ -3056,11 +3052,17 @@ mod diff_scope_tests {
         let palette = UiPalette::default();
         let lines = build_action_lines(80, &keybinds, &palette);
 
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0]
+                .to_string()
+                .contains("[a]pprove [c]omment [x]reject")
+        );
+        assert!(lines[0].to_string().contains("[i]ascend"));
+        assert!(lines[0].to_string().contains("[g]root [q]uit"));
         assert!(lines[1].to_string().contains("[d]toggle diff/source"));
-        assert!(lines[1].to_string().contains("[i]ascend"));
-        assert_eq!(lines[2].to_string(), "[j]prev            [l]next");
-        assert_eq!(lines[3].to_string(), "  [k]descend");
+        assert!(lines[1].to_string().contains("[j]prev            [l]next"));
+        assert_eq!(lines[2].to_string(), "  [k]descend");
     }
 
     #[test]
