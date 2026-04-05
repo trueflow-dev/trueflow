@@ -34,6 +34,7 @@ fn test_all_languages_detection() -> Result<()> {
         ("main.cpp", "Cpp"),
         ("main.js", "JavaScript"),
         ("main.ts", "TypeScript"),
+        ("main.java", "Java"),
         ("main.py", "Python"),
         ("main.sh", "Shell"),
         ("main.md", "Markdown"),
@@ -98,6 +99,52 @@ fn test_all_languages_nix_blocks_are_structural() -> Result<()> {
     assert!(
         !kinds.contains(&"Paragraph"),
         "did not expect paragraph fallback blocks in main.nix (kinds={kinds:?})"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_all_languages_java_blocks_are_structural() -> Result<()> {
+    let repo = TestRepo::fixture("all_languages")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&output)?;
+
+    let java_file = files
+        .iter()
+        .find(|file| {
+            file["path"].as_str().map(|path| path.replace("./", ""))
+                == Some("main.java".to_string())
+        })
+        .context("missing scan output for main.java")?;
+    let blocks = java_file["blocks"]
+        .as_array()
+        .context("blocks should be array")?;
+    let kinds = blocks
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+
+    assert!(
+        kinds.contains(&"module"),
+        "expected a package/module block in main.java (kinds={kinds:?})"
+    );
+    assert!(
+        kinds.contains(&"import"),
+        "expected an import block in main.java (kinds={kinds:?})"
+    );
+    assert!(
+        kinds.contains(&"class"),
+        "expected a class block in main.java (kinds={kinds:?})"
+    );
+    assert!(
+        kinds.contains(&"method"),
+        "expected a method block in main.java (kinds={kinds:?})"
+    );
+    assert!(
+        !kinds.contains(&"Paragraph"),
+        "did not expect paragraph fallback blocks in main.java (kinds={kinds:?})"
     );
 
     Ok(())

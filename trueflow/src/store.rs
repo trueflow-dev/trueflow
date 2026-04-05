@@ -631,19 +631,58 @@ where
     all_records
 }
 
+#[derive(Debug, Clone, Default)]
+struct JsonlParseReport {
+    records: Vec<Record>,
+    skipped_legacy_diff_target_records: usize,
+    skipped_malformed_records: usize,
+}
+
+fn parse_record_line(line: &str) -> Option<Result<Record, anyhow::Error>> {
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err.into())),
+    };
+
+    let is_legacy_diff_target = value
+        .get("target")
+        .and_then(|target| target.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("diff");
+    if is_legacy_diff_target {
+        return None;
+    }
+
+    Some(serde_json::from_value(value).map_err(Into::into))
+}
+
+fn parse_records_jsonl_report_impl(content: &str) -> JsonlParseReport {
+    let mut report = JsonlParseReport::default();
+
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        match parse_record_line(line) {
+            Some(Ok(record)) => report.records.push(record),
+            Some(Err(err)) => {
+                report.skipped_malformed_records += 1;
+                warn!("Skipping malformed record: {err}");
+            }
+            None => {
+                report.skipped_legacy_diff_target_records += 1;
+            }
+        }
+    }
+
+    report
+}
+
+#[cfg(test)]
+fn parse_records_jsonl_report(content: &str) -> JsonlParseReport {
+    parse_records_jsonl_report_impl(content)
+}
+
 #[cfg(test)]
 pub fn parse_records_jsonl(content: &str) -> Vec<Record> {
-    content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| match serde_json::from_str::<Record>(line) {
-            Ok(record) => Some(record),
-            Err(err) => {
-                warn!("Skipping malformed record: {err}");
-                None
-            }
-        })
-        .collect()
+    parse_records_jsonl_report_impl(content).records
 }
 
 pub trait ReviewStore {
@@ -722,19 +761,20 @@ impl JsonlStoreBackend {
         let file = fs::File::open(&self.db_path)?;
         file.lock_shared()?;
 
-        let reader = BufReader::new(file);
-        let mut records = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Record>(&line) {
-                Ok(record) => records.push(record),
-                Err(err) => warn!("Skipping malformed record: {err}"),
-            }
+        let mut content = String::new();
+        for line in BufReader::new(file).lines() {
+            content.push_str(&line?);
+            content.push('\n');
         }
-        Ok(records)
+
+        let report = parse_records_jsonl_report_impl(&content);
+        if report.skipped_legacy_diff_target_records > 0 {
+            warn!(
+                "Skipped {} legacy diff-target review records for compatibility",
+                report.skipped_legacy_diff_target_records
+            );
+        }
+        Ok(report.records)
     }
 
     fn append(&self, record: &Record) -> Result<()> {
@@ -847,7 +887,20 @@ mod tests {
     fn parse_records_jsonl_skips_legacy_diff_target_records() {
         let content = "{\"id\":\"legacy-diff\",\"version\":2,\"target\":{\"kind\":\"diff\",\"fingerprint\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},\"check\":\"review\",\"verdict\":\"approved\",\"identity\":{\"type\":\"email\",\"email\":\"dev@example.com\"},\"repo_ref\":{\"type\":\"vcs\",\"system\":\"git\",\"revision\":\"0123456789abcdef\"},\"block_state\":\"committed\",\"timestamp\":1,\"path_hint\":null,\"line_hint\":null,\"note\":null,\"tags\":null}\n";
 
-        assert!(parse_records_jsonl(content).is_empty());
+        let parsed = parse_records_jsonl(content);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_records_jsonl_reports_skipped_legacy_diff_target_records() {
+        let content = concat!(
+            "{\"id\":\"legacy-diff\",\"version\":2,\"target\":{\"kind\":\"diff\",\"fingerprint\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},\"check\":\"review\",\"verdict\":\"approved\",\"identity\":{\"type\":\"email\",\"email\":\"dev@example.com\"},\"repo_ref\":{\"type\":\"vcs\",\"system\":\"git\",\"revision\":\"0123456789abcdef\"},\"block_state\":\"committed\",\"timestamp\":1,\"path_hint\":null,\"line_hint\":null,\"note\":null,\"tags\":null}\n",
+            "{\"id\":\"typed\",\"version\":2,\"target\":{\"kind\":\"block\",\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},\"check\":\"review\",\"verdict\":\"approved\",\"identity\":{\"type\":\"email\",\"email\":\"dev@example.com\"},\"repo_ref\":{\"type\":\"vcs\",\"system\":\"git\",\"revision\":\"0123456789abcdef\"},\"block_state\":\"committed\",\"timestamp\":2,\"path_hint\":null,\"line_hint\":null,\"note\":null,\"tags\":null}\n"
+        );
+
+        let report = parse_records_jsonl_report(content);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.skipped_legacy_diff_target_records, 1);
     }
 
     #[test]

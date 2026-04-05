@@ -8,6 +8,7 @@ pub enum Language {
     Elisp,
     JavaScript,
     TypeScript,
+    Java,
     Python,
     Go,
     Cpp,
@@ -20,8 +21,6 @@ pub enum Language {
     #[default]
     Unknown,
 }
-
-// TODO: add Language::Java once tree-sitter support is wired.
 
 impl Language {
     pub fn uses_text_fallback(self) -> bool {
@@ -42,6 +41,7 @@ impl Language {
             "el" => Some(Language::Elisp),
             "js" => Some(Language::JavaScript),
             "ts" => Some(Language::TypeScript),
+            "java" => Some(Language::Java),
             "py" => Some(Language::Python),
             "go" => Some(Language::Go),
             "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" => Some(Language::Cpp),
@@ -195,6 +195,7 @@ mod tests {
         assert_eq!(Language::from_extension("el"), Some(Language::Elisp));
         assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("java"), Some(Language::Java));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
@@ -245,6 +246,18 @@ mod tests {
             analyze_file(file.path()),
             FileType::Code(CodeFile {
                 language: Language::Shell
+            })
+        ));
+    }
+
+    #[test]
+    fn analyze_file_detects_java_by_extension() {
+        let file = write_temp_file("Main.java", b"class Main {}\n");
+
+        assert!(matches!(
+            analyze_file(file.path()),
+            FileType::Code(CodeFile {
+                language: Language::Java
             })
         ));
     }

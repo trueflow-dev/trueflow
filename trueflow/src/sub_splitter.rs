@@ -43,6 +43,8 @@ enum SplitPlan {
     SwiftTypeReviewUnits,
     PythonFunctionReviewUnits,
     JsFunctionReviewUnits,
+    JavaFunctionReviewUnits,
+    JavaTypeReviewUnits,
 }
 
 impl SplitPlan {
@@ -58,7 +60,9 @@ impl SplitPlan {
             | Self::SwiftFunctionReviewUnits
             | Self::SwiftTypeReviewUnits
             | Self::PythonFunctionReviewUnits
-            | Self::JsFunctionReviewUnits => SubSplitSemantics::ReviewUnits,
+            | Self::JsFunctionReviewUnits
+            | Self::JavaFunctionReviewUnits
+            | Self::JavaTypeReviewUnits => SubSplitSemantics::ReviewUnits,
         }
     }
 }
@@ -101,6 +105,8 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         SplitPlan::SwiftTypeReviewUnits => split_swift_type(block)?,
         SplitPlan::PythonFunctionReviewUnits => split_python_function(block)?,
         SplitPlan::JsFunctionReviewUnits => split_js_function(block, lang)?,
+        SplitPlan::JavaFunctionReviewUnits => split_java_function(block)?,
+        SplitPlan::JavaTypeReviewUnits => split_java_type(block)?,
     };
 
     let result = SubSplitResult {
@@ -168,6 +174,21 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
             ) =>
         {
             SplitPlan::JsFunctionReviewUnits
+        }
+        Language::Java if matches!(kind, BlockKind::Function | BlockKind::Method) => {
+            SplitPlan::JavaFunctionReviewUnits
+        }
+        Language::Java
+            if matches!(
+                kind,
+                BlockKind::Class
+                    | BlockKind::Interface
+                    | BlockKind::Enum
+                    | BlockKind::Struct
+                    | BlockKind::Type
+            ) =>
+        {
+            SplitPlan::JavaTypeReviewUnits
         }
         _ => SplitPlan::CodeReviewUnits,
     }
@@ -305,7 +326,7 @@ fn split_sentences(block: &Block) -> Result<Vec<Block>> {
 
 struct FunctionSplitConfig<'a> {
     language: tree_sitter::Language,
-    function_kind: &'a str,
+    function_kinds: &'a [&'a str],
     body_kind: &'a str,
     body_statement_kind: Option<&'a str>,
     signature_end: fn(&str, usize) -> usize,
@@ -318,7 +339,7 @@ fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
         block,
         &FunctionSplitConfig {
             language: tree_sitter_rust::LANGUAGE.into(),
-            function_kind: "function_item",
+            function_kinds: &["function_item"],
             body_kind: "block",
             body_statement_kind: None,
             signature_end: signature_end_offset,
@@ -369,7 +390,7 @@ fn split_python_function(block: &Block) -> Result<Vec<Block>> {
         block,
         &FunctionSplitConfig {
             language: tree_sitter_python::LANGUAGE.into(),
-            function_kind: "function_definition",
+            function_kinds: &["function_definition"],
             body_kind: "block",
             body_statement_kind: None,
             signature_end: signature_end_before_body,
@@ -388,7 +409,7 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
         block,
         &FunctionSplitConfig {
             language,
-            function_kind: "function_declaration",
+            function_kinds: &["function_declaration"],
             body_kind: "statement_block",
             body_statement_kind: None,
             signature_end: signature_end_offset,
@@ -403,7 +424,7 @@ fn split_swift_function(block: &Block) -> Result<Vec<Block>> {
         block,
         &FunctionSplitConfig {
             language: tree_sitter_swift::LANGUAGE.into(),
-            function_kind: "function_declaration",
+            function_kinds: &["function_declaration"],
             body_kind: "function_body",
             body_statement_kind: Some("statements"),
             signature_end: signature_end_offset,
@@ -441,6 +462,58 @@ fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
     }
 }
 
+fn split_java_function(block: &Block) -> Result<Vec<Block>> {
+    split_function_with_parser(
+        block,
+        &FunctionSplitConfig {
+            language: tree_sitter_java::LANGUAGE.into(),
+            function_kinds: &[
+                "method_declaration",
+                "constructor_declaration",
+                "compact_constructor_declaration",
+            ],
+            body_kind: "block",
+            body_statement_kind: None,
+            signature_end: signature_end_offset,
+            comment_kinds: &["line_comment", "block_comment"],
+            trim_closing_brace: true,
+        },
+    )
+}
+
+fn split_java_type(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse java type")?;
+    let root = tree.root_node();
+    let type_node = find_named_descendant_any(
+        root,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+            "annotation_type_declaration",
+        ],
+    );
+    let Some(type_node) = type_node else {
+        return split_code(block);
+    };
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return split_code(block);
+    };
+
+    let items = collect_java_type_items(block, body);
+    if items.is_empty() {
+        split_code(block)
+    } else {
+        Ok(items)
+    }
+}
+
 fn split_function_with_parser(
     block: &Block,
     config: &FunctionSplitConfig<'_>,
@@ -452,7 +525,7 @@ fn split_function_with_parser(
         .parse(&block.content, None)
         .context("Failed to parse function block")?;
     let root = tree.root_node();
-    let Some(function_node) = find_named_descendant(root, config.function_kind) else {
+    let Some(function_node) = find_named_descendant_any(root, config.function_kinds) else {
         return split_code(block);
     };
     let Some(body_node) = find_named_descendant(function_node, config.body_kind) else {
@@ -657,13 +730,20 @@ fn find_named_descendant<'a>(
     node: tree_sitter::Node<'a>,
     kind: &str,
 ) -> Option<tree_sitter::Node<'a>> {
-    if node.kind() == kind {
+    find_named_descendant_any(node, &[kind])
+}
+
+fn find_named_descendant_any<'a>(
+    node: tree_sitter::Node<'a>,
+    kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    if kinds.iter().any(|kind| *kind == node.kind()) {
         return Some(node);
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant(child, kind) {
+        if let Some(found) = find_named_descendant_any(child, kinds) {
             return Some(found);
         }
     }
@@ -703,6 +783,34 @@ fn collect_swift_type_items(
     }
 
     blocks
+}
+
+fn collect_java_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<Block> {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "field_declaration" => BlockKind::Variable,
+                "constant_declaration" => BlockKind::Const,
+                "method_declaration"
+                | "constructor_declaration"
+                | "compact_constructor_declaration" => BlockKind::Method,
+                "class_declaration" => BlockKind::Class,
+                "interface_declaration" => BlockKind::Interface,
+                "enum_declaration" => BlockKind::Enum,
+                "record_declaration" => BlockKind::Struct,
+                "annotation_type_declaration" => BlockKind::Type,
+                _ => return None,
+            };
+            Some(create_sub_block_with_kind(
+                parent,
+                &parent.content[child.start_byte()..child.end_byte()],
+                child.start_byte(),
+                child.end_byte(),
+                kind,
+            ))
+        })
+        .collect()
 }
 
 fn gap_prefix_length(gap: &str) -> usize {
@@ -898,6 +1006,37 @@ mod tests {
         let chunks = split(&block, Language::Swift).unwrap();
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Impl));
+    }
+
+    #[test]
+    fn test_split_java_class_into_members() {
+        let content = "class Worker {\n    private final int scale;\n\n    Worker(int scale) {\n        this.scale = scale;\n    }\n\n    int process(int value) {\n        if (value > 0) {\n            return value * scale;\n        }\n        return 0;\n    }\n}\n";
+        let block = make_large_block(content, BlockKind::Class);
+        let chunks = split(&block, Language::Java).unwrap();
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Variable));
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
+        assert!(!chunks.iter().any(|b| b.kind == BlockKind::Class));
+    }
+
+    #[test]
+    fn test_split_java_method_into_review_units() {
+        let content = "int process(int value) {\n    int total = value;\n\n    // only positive values count\n    if (value > 0) {\n        total += scale;\n    }\n\n    return total;\n}\n";
+        let block = make_large_block(content, BlockKind::Method);
+        let chunks = split(&block, Language::Java).unwrap();
+        let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::FunctionSignature,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::Comment,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::CodeParagraph,
+            ]
+        );
+        assert_eq!(merge_blocks(chunks), content);
     }
 
     #[test]

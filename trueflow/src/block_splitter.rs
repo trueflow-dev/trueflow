@@ -216,6 +216,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         | Language::Swift
         | Language::JavaScript
         | Language::TypeScript
+        | Language::Java
         | Language::Python
         | Language::Shell => attempt_split(
             content,
@@ -379,6 +380,18 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         {
             blocks.extend(collect_swift_type_items(child, content, lang));
         }
+        if matches!(lang, Language::Java)
+            && matches!(
+                ts_kind,
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            )
+        {
+            blocks.extend(collect_java_type_items(child, content, lang));
+        }
 
         last_end_byte = end_byte;
         pending_start = None;
@@ -423,6 +436,7 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
         Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -1039,6 +1053,21 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             "decorated_definition" => BlockKind::Decorator,
             _ => BlockKind::Code,
         },
+        Language::Java => match kind {
+            "package_declaration" | "module_declaration" => BlockKind::Module,
+            "import_declaration" => BlockKind::Import,
+            "class_declaration" => BlockKind::Class,
+            "interface_declaration" => BlockKind::Interface,
+            "enum_declaration" => BlockKind::Enum,
+            "record_declaration" => BlockKind::Struct,
+            "annotation_type_declaration" => BlockKind::Type,
+            "field_declaration" => BlockKind::Variable,
+            "constant_declaration" => BlockKind::Const,
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => BlockKind::Method,
+            _ => BlockKind::Code,
+        },
         Language::JavaScript | Language::TypeScript => match kind {
             "function_declaration" => BlockKind::Function,
             "class_declaration" => BlockKind::Class,
@@ -1101,6 +1130,33 @@ fn collect_rust_impl_items(
                 member.end_byte,
                 lang,
             )
+        })
+        .collect()
+}
+
+fn collect_java_type_items(
+    type_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = map_kind(lang, child.kind());
+            (!matches!(kind, BlockKind::Code)).then(|| {
+                create_block(
+                    &content[child.start_byte()..child.end_byte()],
+                    kind,
+                    content,
+                    child.start_byte(),
+                    child.end_byte(),
+                    lang,
+                )
+            })
         })
         .collect()
 }
@@ -1513,6 +1569,24 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         let kinds: Vec<_> = result.blocks.iter().map(|block| block.kind).collect();
         assert!(kinds.contains(&BlockKind::Import));
         assert!(kinds.contains(&BlockKind::Const) || kinds.contains(&BlockKind::Variable));
+    }
+
+    #[test]
+    fn test_java_structural_blocks() {
+        let content = "package demo;\n\nimport java.util.List;\n\npublic class Worker {\n    private final int scale;\n\n    public Worker(int scale) {\n        this.scale = scale;\n    }\n\n    public int process(List<Integer> values) {\n        int total = 0;\n        for (int value : values) {\n            if (value > 0) {\n                total += value * scale;\n            }\n        }\n        return total;\n    }\n}\n";
+        let result = split_result(content, Language::Java);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Variable));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Paragraph)
+        );
     }
 
     fn assert_paragraph_split(language: Language) {

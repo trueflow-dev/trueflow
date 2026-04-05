@@ -37,6 +37,7 @@ tracing-subscriber = "0.3.22"
 ignore = "0.4.25"
 toml_edit = "0.25.3"
 tree-sitter-swift = "0.7.1"
+tree-sitter-java = "0.23.5"
 
 # [dependencies]
 # dioxus = "0.4.3"
