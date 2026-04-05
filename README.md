@@ -1,6 +1,6 @@
 # trueflow
 
-![trueflow logo](./design/trueflow.jpg)
+<img src="./design/trueflow.jpg" alt="trueflow logo" width="341">
 
 ![trueflow TUI screenshot](./tui.png)
 
