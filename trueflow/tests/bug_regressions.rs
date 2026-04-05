@@ -1004,6 +1004,77 @@ fn test_scan_cache_detects_new_untracked_files() -> Result<()> {
 }
 
 #[test]
+fn test_scan_cache_reuses_unchanged_files_when_one_file_changes() -> Result<()> {
+    let repo = TestRepo::new("scan_cache_incremental_reuse")?;
+    repo.write("src/a.rs", "pub fn a() -> u32 { 1 }\n")?;
+    repo.write("src/b.rs", "pub fn b() -> u32 { 2 }\n")?;
+    repo.commit_all("Add files")?;
+
+    let home = repo.path.join("cache-home");
+    fs::create_dir_all(&home)?;
+    let home_value = home.to_string_lossy().to_string();
+
+    let initial = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
+    let initial_scan = json(&initial)?;
+    assert_eq!(initial_scan["cache"]["read"].as_str(), Some("miss"));
+    assert_eq!(initial_scan["cache"]["reused_files"].as_u64(), Some(0));
+    assert_eq!(initial_scan["cache"]["rescanned_files"].as_u64(), Some(2));
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    repo.write("src/b.rs", "pub fn b() -> u32 { 22 }\n")?;
+
+    let rescanned = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
+    let rescanned_scan = json(&rescanned)?;
+    assert_eq!(rescanned_scan["cache"]["read"].as_str(), Some("hit"));
+    assert_eq!(rescanned_scan["cache"]["reused_files"].as_u64(), Some(1));
+    assert_eq!(rescanned_scan["cache"]["rescanned_files"].as_u64(), Some(1));
+
+    Ok(())
+}
+
+#[test]
+fn test_scan_cache_reuses_invalid_utf8_diagnostic_for_unchanged_file() -> Result<()> {
+    let repo = TestRepo::new("scan_cache_invalid_utf8_reuse")?;
+    fs::write(repo.path.join("bad.txt"), [0xFF, 0xFE, 0xFD])?;
+
+    let home = repo.path.join("cache-home");
+    fs::create_dir_all(&home)?;
+    let home_value = home.to_string_lossy().to_string();
+
+    let initial = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
+    let initial_scan = json(&initial)?;
+    let initial_diagnostics = initial_scan["diagnostics"]
+        .as_array()
+        .context("diagnostics should be array")?;
+    assert!(initial_diagnostics.iter().any(|diagnostic| {
+        diagnostic["path"].as_str() == Some("bad.txt")
+            && diagnostic["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid UTF-8")
+    }));
+    assert_eq!(initial_scan["cache"]["rescanned_files"].as_u64(), Some(1));
+
+    let reused = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
+    let reused_scan = json(&reused)?;
+    let reused_diagnostics = reused_scan["diagnostics"]
+        .as_array()
+        .context("diagnostics should be array")?;
+    assert!(reused_diagnostics.iter().any(|diagnostic| {
+        diagnostic["path"].as_str() == Some("bad.txt")
+            && diagnostic["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid UTF-8")
+    }));
+    assert_eq!(reused_scan["cache"]["read"].as_str(), Some("hit"));
+    assert_eq!(reused_scan["cache"]["reused_files"].as_u64(), Some(1));
+    assert_eq!(reused_scan["cache"]["rescanned_files"].as_u64(), Some(0));
+
+    Ok(())
+}
+
+#[test]
 fn test_scan_ignores_mutants_out_directory() -> Result<()> {
     let repo = TestRepo::new("scan_ignores_mutants_out")?;
     repo.write("src/main.rs", "fn main() {}\n")?;
