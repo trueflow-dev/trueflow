@@ -261,8 +261,8 @@ Behavior changes:
   - `bench = ["dep:criterion"]`
 - the Criterion bench target now requires that feature
 - the bench smoke test (`e2e_bench_fixture`) is also gated behind that feature
-- ordinary developer recipes now use the explicit non-bench feature set:
-  - `--features tui-test-support`
+- ordinary developer recipes now enable `--features tui-test-support`
+  - this keeps the hidden vt100/PTy TUI regression harness compiled in the normal local gates
 - `just bench` now owns the benchmark-specific path:
   - bench fixture smoke test
   - `cargo bench --features bench`
@@ -276,20 +276,20 @@ Verification:
   - `cargo check --features tui-test-support --lib --bins --tests --examples`
   - `cargo nextest list --features tui-test-support --lib --bins --tests --examples`
 
-This means bench-only dependencies and targets are now structurally outside the normal developer verification path, instead of merely being omitted by recipe shape.
+This means bench-only dependencies and targets are now structurally outside the normal developer verification path, instead of only being absent from a few recipe command lines.
 
 ## Packaging split follow-up
 
-The next gate-shape change moved host-default Nix packaging verification out of the normal heavy code iteration path.
+The next change moved host-default Nix packaging verification out of the regular heavy code path.
 
 That was changed in:
 
 - `deede96` — `build: split packaging from heavy code checks`
 
-New gate shape:
+New gate layout (using the current recipe names):
 
 - `check-heavy` -> `audit doc coverage-check`
-- `check-full` -> `test-full lint-all-targets fmt-check audit doc coverage-check`
+- `check-code` -> `test-code lint-code fmt-check audit doc coverage-check`
 - `check-packaging` -> `nix-check`
 
 This keeps packaging validation available, but no longer pays for it on every heavy code-oriented local run.
@@ -300,9 +300,9 @@ Fresh clean-tree profile measurements after `deede96`:
   - `audit`: `3s`
   - `doc`: `15s`
   - `coverage-check`: `59s`
-- `check-full`: **1m25s**
-  - `test-full`: `30s`
-  - `lint-all-targets`: `7s`
+- `check-code`: **1m25s**
+  - `test-code`: `30s`
+  - `lint-code`: `7s`
   - `fmt-check`: `0s`
   - `audit`: `3s`
   - `doc`: `2s`
@@ -312,7 +312,7 @@ Fresh clean-tree profile measurements after `deede96`:
 
 Measurement outputs:
 - `.trueflow/measurements/packaging-split-check-heavy/`
-- `.trueflow/measurements/packaging-split-check-full/`
+- `.trueflow/measurements/packaging-split-check-full/` (historical directory name from before the later recipe rename)
 - `.trueflow/measurements/packaging-split-check-packaging/`
 
 ## Net effect on the heavyweight path
@@ -328,19 +328,19 @@ Compared to the pre-Nix-optimization clean-tree heavyweight baseline:
 - after narrowing docs and coverage, the cold heavy path in the clean green worktree dropped from **11m29s** to **2m33s**
 - after splitting packaging out, the cold code-only heavy path dropped again to:
   - `check-heavy`: **1m17s**
-  - `check-full`: **1m25s**
+  - `check-code`: **1m25s**
 - packaging still exists as a separate explicit cost:
   - `check-packaging`: **54s**
 - the main remaining local heavy code costs are now:
   - `coverage-check`
-  - `test-full`
+  - `test-code`
   - `doc` on cold worktrees
   - explicit package-build and package-build-with-tests reruns when intentionally requested
 
 ## Next optimization target
 
 The next likely high-value directions are now:
-1. investigate whether `test-full` still needs examples, or whether examples should move out of the heavyweight local code path too
+1. investigate whether `test-code` still needs examples, or whether examples should move out of the heavyweight local code path too
 2. investigate whether coverage can be made cheaper still without weakening the intended signal
 3. decide whether package-build-with-tests should also be grouped under an explicit packaging-full gate for pre-release / CI-oriented work
 

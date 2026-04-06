@@ -136,7 +136,7 @@ Main review actions:
 - Outside the root view, `h`/`l` and Left/Right move to the previous/next semantic sibling
 - `p`/`c` move to the semantic parent/child
 - `a` approve
-- `n` add a note (empty note is allowed)
+- `n` add a note (`Enter` submits, `Ctrl+J` inserts a newline, and the TUI requires note text before submit)
 - `m` toggle diff/source
 - `r` toggle speed-reading
 - `g` jump to root
@@ -187,8 +187,8 @@ nix develop -c just check
 # Faster no-test local gate
 nix develop -c just check-fast
 
-# Full local code verification path
-nix develop -c just check-full
+# Broad local code verification path
+nix develop -c just check-code
 
 # Separate Nix packaging verification
 nix develop -c just check-packaging
@@ -205,7 +205,7 @@ nix develop -c just nix-check-with-tests
 # Capture timing breakdowns for the current gate definitions
 nix develop -c just measure-check
 nix develop -c just measure-check-fast
-nix develop -c just measure-check-full
+nix develop -c just measure-check-code
 
 # Generate a coverage report
 nix develop -c just coverage
@@ -213,11 +213,11 @@ nix develop -c just coverage
 
 `just check` is the default local gate: tests, lint, and format checks.
 `just check-fast` keeps the faster compile-only path for cases where you want a quicker no-test loop.
-The heavier code-only work lives behind `just check-full`.
-That heavyweight path builds only this crate's docs (not dependency docs) and measures coverage for the main lib/bin/test target set.
+`just check-code` runs the broader lib/bin/test/example code path plus audit, docs, and coverage, while still excluding benches.
+That code-focused path builds only this crate's docs (not dependency docs) and measures coverage for the main lib/bin/test target set.
 Bench targets are opt-in and only run through `just bench`.
-Normal compile/test/lint/coverage recipes use the explicit non-bench feature set.
-`just check-packaging` runs host-default Nix packaging verification separately from the normal code iteration path.
+Normal compile/test/lint/doc/coverage recipes enable `tui-test-support` so the hidden vt100/PTy TUI regression harness keeps compiling in ordinary local gates.
+`just check-packaging` runs host-default Nix packaging verification separately from the regular code checks.
 `just nix-check` validates the host-default flake package (`native` on Darwin, release/static on Linux).
 `just nix-check-release` is the explicit release/static package build.
 `just nix-check-with-tests` is the explicit opt-in path for rerunning crate tests inside the host-default Nix package build.
