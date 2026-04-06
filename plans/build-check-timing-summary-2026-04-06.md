@@ -13,6 +13,7 @@ This note captures the measured state after splitting the local check gates, res
 - `01ab510` — `build: use SOURCE_DATE_EPOCH for build metadata`
 - `f6fe7f0` — `nix: remap rust build paths for reproducibility`
 - `8e48dd6` — `nix: make darwin default package native`
+- `5aa67c4` — `nix: drop unnecessary darwin package inputs`
 
 ## Original baseline
 
@@ -161,6 +162,30 @@ Forced rebuild timings on current `main`:
 
 This means the default local Darwin Nix path now validates the native package instead of paying the static/release package cost.
 
+## Darwin release package closure follow-up
+
+The remaining Darwin release/static package bloat turned out to be caused by unnecessary explicit package `buildInputs`.
+
+That was fixed in:
+
+- `5aa67c4` — `nix: drop unnecessary darwin package inputs`
+
+Resulting package/output changes on Darwin:
+
+- `.#release` / `.#static` closure size: **1.2 GiB** -> **19.9 MiB**
+- `.#release` references: now empty
+- `.#release` binary links only:
+  - `CoreFoundation`
+  - `/usr/lib/libSystem.B.dylib`
+
+Forced rebuild timings in a clean worktree at the same code state:
+
+- `nix build --rebuild --no-link .#release`: **55s**
+- `nix build --rebuild --no-link .#default`: **50s**
+- `nix build --rebuild --no-link .#default-with-tests`: **87s**
+
+This reduced the Darwin release/static package from a giant propagated SDK closure to a small executable output while preserving successful native and release builds.
+
 ## Net effect on the heavyweight path
 
 Compared to the pre-Nix-optimization clean-tree heavyweight baseline:
@@ -168,19 +193,19 @@ Compared to the pre-Nix-optimization clean-tree heavyweight baseline:
 - `current-check` improved from **4m29s** to **2m58s** after the first gate split / Nix package-test change
 - reproducible forced rebuilds now succeed again
 - on Darwin, the default local Nix path dropped from the old static/release-style cost to the native package cost:
-  - `.#default` forced rebuild: **35s**
-  - `.#release` forced rebuild: **3m02s**
+  - `.#default` forced rebuild: **50s**
+  - `.#release` forced rebuild: **55s**
 - the main remaining local heavy costs are now:
   - `test-full`
   - `doc` / `coverage-check` on colder runs
-  - the explicit Darwin release/static package path when it is intentionally requested
+  - explicit package-build-with-tests reruns when intentionally requested
 
 ## Next optimization target
 
 The next likely high-value directions are now:
-1. investigate why the Darwin `release` / `static` package closure is still **1.2 GiB**
-2. decide whether the Darwin release/static package should remain part of local developer workflows at all, or live purely behind explicit release/CI paths
-3. investigate whether the Darwin static package can drop propagated SDK / `pkg-config-wrapper` references from its runtime closure
+1. remeasure full `check-heavy` / `check-full` clean-tree timings after the Darwin release closure reduction
+2. investigate whether the native Darwin package can also drop its explicit `libiconv` runtime dependency safely
+3. decide whether any explicit release/static package build should remain in default local developer workflows on Darwin, or live purely behind opt-in release/CI paths
 
 Related investigation note:
 - `plans/nix-build-time-investigation-candidate-plan-2026-04-06.md`
