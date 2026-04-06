@@ -20,6 +20,11 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         Language::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         Language::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+        Language::Php => Some(if content.contains("<?") {
+            tree_sitter_php::LANGUAGE_PHP.into()
+        } else {
+            tree_sitter_php::LANGUAGE_PHP_ONLY.into()
+        }),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -121,6 +126,18 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
                         | "conditional"
                 )
         }
+        Language::Php => matches!(
+            kind,
+            "if_statement"
+                | "switch_statement"
+                | "match_expression"
+                | "for_statement"
+                | "foreach_statement"
+                | "while_statement"
+                | "do_statement"
+                | "catch_clause"
+                | "conditional_expression"
+        ),
         Language::Python => matches!(
             kind,
             "if_statement"
@@ -150,6 +167,7 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         Language::Kotlin => matches!(kind, "&&" | "||" | "?:"),
         Language::CSharp => matches!(kind, "&&" | "||" | "??"),
         Language::Ruby => matches!(kind, "&&" | "||" | "and" | "or"),
+        Language::Php => matches!(kind, "&&" | "||" | "??"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
@@ -357,5 +375,27 @@ end
         // Total: 4
         let score = calculate(code, Language::Ruby);
         assert_eq!(score, Some(4));
+    }
+
+    #[test]
+    fn test_calculate_complexity_php() {
+        let code = "
+function processData(array $values, bool $ready): int {
+    foreach ($values as $value) {
+        $current = $value ?? 0;
+        if ($ready && $current > 0) {
+            return $current;
+        }
+    }
+    return 0;
+}
+";
+        // foreach: +1
+        // ??: +1
+        // if inside foreach: +1 + nesting 1 = 2
+        // &&: +1
+        // Total: 5
+        let score = calculate(code, Language::Php);
+        assert_eq!(score, Some(5));
     }
 }

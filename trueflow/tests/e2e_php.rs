@@ -62,10 +62,27 @@ fn test_php_fixture_scan_detects_language_and_structural_blocks() -> Result<()> 
         !kinds.contains(&"Paragraph"),
         "did not expect paragraph fallback blocks in php fixture (kinds={kinds:?})"
     );
-    assert!(
-        blocks.iter().all(|block| block.get("complexity").is_none()),
-        "expected php blocks to keep unknown complexity: {blocks:#?}"
-    );
+    let report_builder = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("class")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("final class ReportBuilder"))
+        })
+        .context("missing ReportBuilder class block")?;
+    assert_eq!(report_builder["complexity"].as_u64(), Some(4));
+
+    let process_data = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("method")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("function processData(array $values)"))
+        })
+        .context("missing processData method block")?;
+    assert_eq!(process_data["complexity"].as_u64(), Some(3));
 
     Ok(())
 }
