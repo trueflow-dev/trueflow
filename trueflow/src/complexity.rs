@@ -19,6 +19,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
         Language::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        Language::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -105,6 +106,21 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
                 | "catch_clause"
                 | "conditional_expression"
         ),
+        Language::Ruby => {
+            node.is_named()
+                && matches!(
+                    kind,
+                    "if" | "if_modifier"
+                        | "unless"
+                        | "unless_modifier"
+                        | "case"
+                        | "for"
+                        | "while"
+                        | "until"
+                        | "rescue"
+                        | "conditional"
+                )
+        }
         Language::Python => matches!(
             kind,
             "if_statement"
@@ -133,6 +149,7 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         Language::Java => matches!(kind, "&&" | "||"),
         Language::Kotlin => matches!(kind, "&&" | "||" | "?:"),
         Language::CSharp => matches!(kind, "&&" | "||" | "??"),
+        Language::Ruby => matches!(kind, "&&" | "||" | "and" | "or"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
@@ -321,5 +338,24 @@ int process(int[] values) {
 }";
         let score = calculate(code, Language::Java);
         assert_eq!(score, Some(3));
+    }
+
+    #[test]
+    fn test_calculate_complexity_ruby() {
+        let code = "
+def process(ready, value)
+  if ready && value > 0
+    if value.zero?
+      return 0
+    end
+  end
+end
+";
+        // outer if: +1
+        // &&: +1
+        // inner if inside outer if: +1 + nesting 1 = 2
+        // Total: 4
+        let score = calculate(code, Language::Ruby);
+        assert_eq!(score, Some(4));
     }
 }

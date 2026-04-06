@@ -2389,7 +2389,12 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
                 .iter()
                 .any(|block| matches!(block.kind, BlockKind::Paragraph))
         );
-        assert!(blocks.iter().all(|block| block.complexity.is_none()));
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| block.kind != BlockKind::Gap)
+                .all(|block| block.complexity.is_some())
+        );
     }
 
     #[test]

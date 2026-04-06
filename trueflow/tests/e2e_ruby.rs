@@ -53,10 +53,27 @@ fn test_ruby_fixture_detects_language_and_structural_blocks() -> Result<()> {
         }),
         "expected a Ruby test method block"
     );
-    assert!(
-        blocks.iter().all(|block| block.get("complexity").is_none()),
-        "expected Ruby block complexity to remain absent"
-    );
+    let processor_class = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("class")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("class Processor"))
+        })
+        .context("expected Processor class block")?;
+    assert_eq!(processor_class["complexity"].as_u64(), Some(1));
+
+    let process_method = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("method")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("def process(values)"))
+        })
+        .context("expected process method block")?;
+    assert_eq!(process_method["complexity"].as_u64(), Some(1));
 
     Ok(())
 }
