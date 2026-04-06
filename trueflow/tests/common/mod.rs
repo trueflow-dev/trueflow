@@ -2,6 +2,8 @@
 
 #[path = "fs_support.rs"]
 mod fs_support;
+#[path = "vt100_backend.rs"]
+pub(crate) mod vt100_backend;
 
 use anyhow::{Context, Result};
 use serde_json::Value;

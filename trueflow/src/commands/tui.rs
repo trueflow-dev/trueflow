@@ -46,6 +46,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, feature = "tui-test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
 // --- Core Structs ---
 
 #[derive(Debug, Clone)]
@@ -1062,6 +1066,14 @@ fn editing_key_action_for_event(key_event: &KeyEvent) -> EditingKeyAction {
         KeyCode::Enter => EditingKeyAction::Submit,
         KeyCode::Esc => EditingKeyAction::Cancel,
         KeyCode::Backspace => EditingKeyAction::Backspace,
+        KeyCode::Char('j')
+            if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                && !key_event
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            EditingKeyAction::InsertNewline
+        }
         KeyCode::Char(c) => {
             if key_event
                 .modifiers
@@ -1376,9 +1388,9 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < right && row >= rect.y && row < bottom
 }
 
-fn move_root_cursor(state: &mut AppState, offset: isize) {
+fn visible_root_children(state: &AppState) -> Vec<TreeNodeId> {
     let root = state.navigator.tree.root();
-    let root_children: Vec<TreeNodeId> = state
+    state
         .navigator
         .tree
         .node(root)
@@ -1386,10 +1398,89 @@ fn move_root_cursor(state: &mut AppState, offset: isize) {
         .iter()
         .copied()
         .filter(|child| state.navigator.is_visible(*child))
-        .collect();
+        .collect()
+}
+
+fn root_listing_prefix_line_count(state: &AppState) -> usize {
+    let mut line_count = 2usize;
+    let kind_counts = review_metadata::sorted_visible_block_kind_counts(
+        &state.navigator.tree,
+        state.navigator.visible_nodes(),
+    );
+
+    let mut last_parent = "";
+    for (kind, _) in kind_counts {
+        let parent = review_metadata::parent_kind_label(kind);
+        if parent != last_parent {
+            if !last_parent.is_empty() {
+                line_count = line_count.saturating_add(1);
+            }
+            line_count = line_count.saturating_add(1);
+            last_parent = parent;
+        }
+        line_count = line_count.saturating_add(1);
+    }
+
+    line_count.saturating_add(1)
+}
+
+fn root_selected_line_index(state: &AppState, root_children: &[TreeNodeId]) -> Option<usize> {
+    let selected_index = state
+        .root_cursor
+        .and_then(|id| root_children.iter().position(|&child| child == id))?;
+    Some(root_listing_prefix_line_count(state).saturating_add(selected_index))
+}
+
+fn root_total_line_count(state: &AppState, root_children: &[TreeNodeId]) -> usize {
+    root_listing_prefix_line_count(state).saturating_add(root_children.len().max(1))
+}
+
+fn scroll_offset_to_keep_line_visible(
+    current_scroll_offset: u16,
+    viewport_height: u16,
+    line_index: usize,
+    total_lines: usize,
+) -> u16 {
+    if viewport_height == 0 || total_lines <= usize::from(viewport_height) {
+        return 0;
+    }
+
+    let viewport_height = usize::from(viewport_height);
+    let current_top = usize::from(current_scroll_offset);
+    let next_top = if line_index < current_top {
+        line_index
+    } else if line_index >= current_top.saturating_add(viewport_height) {
+        line_index.saturating_add(1).saturating_sub(viewport_height)
+    } else {
+        current_top
+    };
+    let max_scroll = total_lines.saturating_sub(viewport_height);
+    usize_to_u16_saturating(next_top.min(max_scroll))
+}
+
+fn ensure_root_cursor_visible(state: &mut AppState) {
+    let root_children = visible_root_children(state);
+    let Some(selected_line_index) = root_selected_line_index(state, &root_children) else {
+        if root_total_line_count(state, &root_children) <= usize::from(state.viewport_height) {
+            state.scroll_offset = 0;
+        }
+        return;
+    };
+
+    state.scroll_offset = scroll_offset_to_keep_line_visible(
+        state.scroll_offset,
+        state.viewport_height,
+        selected_line_index,
+        root_total_line_count(state, &root_children),
+    );
+}
+
+fn move_root_cursor(state: &mut AppState, offset: isize) {
+    let root_children = visible_root_children(state);
 
     if root_children.is_empty() {
         state.root_cursor = None;
+        state.scroll_offset = 0;
         return;
     }
 
@@ -1403,6 +1494,7 @@ fn move_root_cursor(state: &mut AppState, offset: isize) {
         .unwrap_or(if offset.is_negative() { 0 } else { last_index })
         .min(last_index);
     state.root_cursor = root_children.get(next).copied();
+    ensure_root_cursor_visible(state);
 }
 
 fn handle_action(
@@ -2902,16 +2994,7 @@ fn build_root_lines(
     palette: &UiPalette,
     _code_height: u16,
 ) -> (Vec<Line<'static>>, usize) {
-    let root = state.navigator.tree.root();
-    let root_children: Vec<TreeNodeId> = state
-        .navigator
-        .tree
-        .node(root)
-        .children
-        .iter()
-        .copied()
-        .filter(|child| state.navigator.is_visible(*child))
-        .collect();
+    let root_children = visible_root_children(state);
 
     if state.root_cursor.is_none() {
         state.root_cursor = root_children.first().copied();
@@ -3166,9 +3249,9 @@ fn editing_submit_decision(
 
 fn editing_overlay_hint(content: &str) -> &'static str {
     if content.trim().is_empty() {
-        "Enter to submit note • Shift+Enter newline • Esc to cancel"
+        "Type a note • Enter to submit • Ctrl+J newline • Esc to cancel"
     } else {
-        "Enter to submit • Shift+Enter newline • Esc to cancel"
+        "Enter to submit • Ctrl+J newline • Esc to cancel"
     }
 }
 
@@ -3969,6 +4052,18 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn scroll_offset_to_keep_line_visible_scrolls_down_for_offscreen_selection() {
+        let offset = scroll_offset_to_keep_line_visible(0, 4, 8, 16);
+        assert_eq!(offset, 5);
+    }
+
+    #[test]
+    fn scroll_offset_to_keep_line_visible_keeps_visible_selection_stable() {
+        let offset = scroll_offset_to_keep_line_visible(4, 6, 7, 20);
+        assert_eq!(offset, 4);
+    }
+
+    #[test]
     fn handle_scroll_line_up_moves_root_cursor_up() {
         let (mut state, first_file, second_file) = build_state_at_root_with_two_files();
         state.root_cursor = Some(second_file);
@@ -4499,6 +4594,18 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn editing_key_action_ctrl_j_inserts_newline() {
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert_eq!(
+            editing_key_action_for_event(&key),
+            EditingKeyAction::InsertNewline
+        );
+    }
+
+    #[test]
     fn editing_key_action_plain_enter_submits() {
         let key =
             crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
@@ -4615,7 +4722,7 @@ mod diff_scope_tests {
         let palette = UiPalette::default();
         let lines = input_overlay_lines(
             "first line\nsecond line",
-            "Enter to submit • Shift+Enter newline • Esc to cancel",
+            "Enter to submit • Ctrl+J newline • Esc to cancel",
             &palette,
         );
 
@@ -4623,8 +4730,8 @@ mod diff_scope_tests {
         assert_eq!(lines[1].to_string(), "second line");
         assert_eq!(lines[2].to_string(), "");
         assert!(
-            lines[3].to_string().contains("Shift+Enter newline"),
-            "expected multiline hint line to include Shift+Enter guidance"
+            lines[3].to_string().contains("Ctrl+J newline"),
+            "expected multiline hint line to include Ctrl+J guidance"
         );
     }
 
@@ -4664,11 +4771,11 @@ mod diff_scope_tests {
     fn editing_overlay_hint_allows_empty_note_input() {
         assert_eq!(
             editing_overlay_hint(""),
-            "Enter to submit note • Shift+Enter newline • Esc to cancel"
+            "Type a note • Enter to submit • Ctrl+J newline • Esc to cancel"
         );
         assert_eq!(
             editing_overlay_hint("note"),
-            "Enter to submit • Shift+Enter newline • Esc to cancel"
+            "Enter to submit • Ctrl+J newline • Esc to cancel"
         );
     }
 
@@ -5817,10 +5924,6 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: GO_KEYWORDS,
             line_comment_start: Some("//"),
         },
-        Language::C => LanguageHighlightRules {
-            keywords: CPP_KEYWORDS,
-            line_comment_start: Some("//"),
-        },
         Language::Cpp => LanguageHighlightRules {
             keywords: CPP_KEYWORDS,
             line_comment_start: Some("//"),
@@ -5837,16 +5940,7 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: JUST_KEYWORDS,
             line_comment_start: Some("#"),
         },
-        Language::Kotlin
-        | Language::CSharp
-        | Language::Ruby
-        | Language::Php
-        | Language::Markdown
-        | Language::Toml
-        | Language::Text
-        | Language::Unknown => {
-            return None;
-        }
+        Language::Markdown | Language::Toml | Language::Text | Language::Unknown => return None,
     };
 
     Some(LineHighlighter { rules })
