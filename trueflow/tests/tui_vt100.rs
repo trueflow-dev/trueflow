@@ -5,8 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use trueflow::commands::tui::test_support::ScriptedTui;
 
 mod common;
-use common::TestRepo;
 use common::vt100_backend::VT100Backend;
+use common::{TestRepo, read_review_records};
 
 fn press_text(app: &mut ScriptedTui<VT100Backend>, text: &str) -> Result<()> {
     for ch in text.chars() {
@@ -78,6 +78,34 @@ fn comment_overlay_hint_uses_portable_multiline_copy() -> Result<()> {
 }
 
 #[test]
+fn empty_note_submit_shows_validation_message_and_keeps_editor_open() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(120, 20),
+        "src/lib.rs",
+        "fn demo() {\n    work();\n}\n",
+        "fn demo() {\n    work();\n}\n",
+        0,
+        3,
+    )?;
+
+    app.open_note_overlay()?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        app.is_editing(),
+        "expected empty submit to keep the editor open"
+    );
+    assert!(
+        screen.contains("Note required • Type a note • Ctrl+J newline • Esc to cancel"),
+        "expected explicit validation copy after empty submit:\n{screen}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn ctrl_j_inserts_multiline_comment_content_in_overlay() -> Result<()> {
     let repo = TestRepo::new("tui_vt100_comment_newline")?;
     repo.write("src/lib.rs", "fn demo() {\n    work();\n}\n")?;
@@ -107,6 +135,49 @@ fn ctrl_j_inserts_multiline_comment_content_in_overlay() -> Result<()> {
         rows.iter().any(|row| row.contains("beta")),
         "expected second line of note to render in overlay: {rows:?}"
     );
+
+    Ok(())
+}
+
+#[test]
+fn multiline_note_submit_persists_to_review_store_and_feedback_output() -> Result<()> {
+    let repo = TestRepo::new("tui_vt100_comment_submit")?;
+    let file_content = "fn demo() {\n    work();\n}\n";
+    repo.write("src/lib.rs", file_content)?;
+
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(120, 20),
+        "src/lib.rs",
+        file_content,
+        file_content,
+        0,
+        3,
+    )?;
+    app.install_mark_action_runner(
+        trueflow::commands::tui::test_support::CliMarkActionRunner::new(
+            env!("CARGO_BIN_EXE_trueflow"),
+            &repo.path,
+        ),
+    );
+
+    app.open_note_overlay()?;
+    press_text(&mut app, "alpha")?;
+    app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))?;
+    press_text(&mut app, "beta")?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+    assert!(
+        !app.is_editing(),
+        "expected successful submit to close the editor"
+    );
+
+    let records = read_review_records(&repo.path.join(".trueflow").join("reviews.jsonl"))?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].verdict.as_str(), "comment");
+    assert_eq!(records[0].note.as_deref(), Some("alpha\nbeta"));
+
+    let feedback = repo.run(&["feedback", "--format", "xml", "--since", "all"])?;
+    assert!(feedback.contains("<comment>alpha\nbeta</comment>"));
 
     Ok(())
 }

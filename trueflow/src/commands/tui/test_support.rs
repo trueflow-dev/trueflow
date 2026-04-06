@@ -2,16 +2,18 @@ use super::{
     AppState, EditingKeyAction, Event, InputMode, KeyCode, KeyEvent, KeyEventKind, KeybindAction,
     Rect, SessionRecap, SpeedReadController, TuiKeybindsConfig, TuiSpeedReadConfig, ViewMode,
     clear_focus_scroll, clear_speed_read_if_not_on_current_node, editing_key_action_for_event,
-    handle_child, handle_confirm_cancel, handle_editing_cancel, handle_mouse_event, handle_next,
-    handle_note_action, handle_parent, handle_paste_event, handle_prev, handle_scroll_line_down,
-    handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
-    handle_speed_read_key_binding, is_recap_mode, key_code_accepts_repeat_in_normal_mode,
-    key_event_for_press_event, key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
+    execute_action_with, handle_child, handle_confirm_cancel, handle_editing_cancel,
+    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
+    handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
+    handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding, is_recap_mode,
+    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
+    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
     keybind_action_for_key_code, set_focus_for_current_node, should_rerender_on_event,
     toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
+use crate::commands::mark;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::ReviewScope;
@@ -19,8 +21,63 @@ use crate::tree::TreeBuilder;
 use anyhow::{Result, bail};
 use ratatui::{Terminal, backend::Backend};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+
+pub trait MarkActionRunner {
+    fn run_mark(&mut self, params: &mark::MarkParams) -> Result<()>;
+}
+
+pub struct CliMarkActionRunner {
+    bin_path: PathBuf,
+    repo_root: PathBuf,
+}
+
+impl CliMarkActionRunner {
+    pub fn new(bin_path: impl AsRef<Path>, repo_root: impl AsRef<Path>) -> Self {
+        Self {
+            bin_path: bin_path.as_ref().to_path_buf(),
+            repo_root: repo_root.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl MarkActionRunner for CliMarkActionRunner {
+    fn run_mark(&mut self, params: &mark::MarkParams) -> Result<()> {
+        let mut command = Command::new(&self.bin_path);
+        command
+            .current_dir(&self.repo_root)
+            .arg("mark")
+            .arg("--fingerprint")
+            .arg(&params.fingerprint)
+            .arg("--verdict")
+            .arg(params.verdict.as_str())
+            .arg("--check")
+            .arg(&params.check)
+            .arg("--quiet");
+
+        if let Some(note) = &params.note {
+            command.arg("--note").arg(note);
+        }
+        if let Some(path) = &params.path {
+            command.arg("--path").arg(path);
+        }
+        if let Some(line) = params.line {
+            command.arg("--line").arg(line.to_string());
+        }
+
+        let output = command.output()?;
+        if !output.status.success() {
+            bail!(
+                "trueflow mark failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+}
 
 /// Hidden test support for scripted TUI rendering/integration tests.
 pub struct ScriptedTui<B>
@@ -29,6 +86,7 @@ where
 {
     terminal: Terminal<B>,
     state: AppState,
+    mark_action_runner: Option<Box<dyn MarkActionRunner>>,
 }
 
 impl<B> ScriptedTui<B>
@@ -42,7 +100,11 @@ where
     {
         let terminal = Terminal::new(backend)?;
         let state = build_root_state(file_names)?;
-        Ok(Self { terminal, state })
+        Ok(Self {
+            terminal,
+            state,
+            mark_action_runner: None,
+        })
     }
 
     pub fn with_single_rust_block_file(
@@ -62,7 +124,11 @@ where
             block_start_line,
             block_end_line,
         )?;
-        Ok(Self { terminal, state })
+        Ok(Self {
+            terminal,
+            state,
+            mark_action_runner: None,
+        })
     }
 
     pub fn render(&mut self) -> Result<()> {
@@ -81,6 +147,17 @@ where
 
     pub fn backend(&self) -> &B {
         self.terminal.backend()
+    }
+
+    pub fn install_mark_action_runner<R>(&mut self, runner: R)
+    where
+        R: MarkActionRunner + 'static,
+    {
+        self.mark_action_runner = Some(Box::new(runner));
+    }
+
+    pub fn is_editing(&self) -> bool {
+        matches!(self.state.input_mode, InputMode::Editing { .. })
     }
 
     pub fn scroll_offset(&self) -> u16 {
@@ -210,7 +287,13 @@ where
 
         match editing_key_action_for_event(&key_event) {
             EditingKeyAction::Submit => {
-                bail!("submit is not supported in the scripted test harness")
+                let runner = &mut self.mark_action_runner;
+                handle_editing_submit_with(&mut self.state, |action, state| {
+                    let Some(runner) = runner.as_mut() else {
+                        bail!("submit is not supported in the scripted test harness")
+                    };
+                    execute_action_with(state, action, |params| runner.run_mark(&params))
+                })?;
             }
             EditingKeyAction::InsertNewline => {
                 self.state.input_buffer.push('\n');
@@ -296,6 +379,7 @@ where
         scope_label: "All".to_string(),
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
+        editing_validation: None,
         confirm_batch: false,
         repo_name: "repo".to_string(),
         workdir_prefix: None,
@@ -374,6 +458,7 @@ fn build_state_with_single_rust_block_file(
         scope_label: "All".to_string(),
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
+        editing_validation: None,
         confirm_batch: false,
         repo_name: "repo".to_string(),
         workdir_prefix: None,

@@ -57,9 +57,9 @@ test:
 test-full:
     cd trueflow && cargo nextest run --all-features --all-targets
 
-# Run the vt100-backed TUI integration suite
+# Run the vt100-backed and PTY-backed TUI integration suite
 test-tui-e2e:
-    cd trueflow && cargo nextest run --all-features --test tui_vt100
+    cd trueflow && cargo nextest run --all-features --test tui_vt100 --test tui_pty_smoke
 
 # Run mutation tests
 mutants:
