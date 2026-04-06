@@ -83,14 +83,27 @@ fn test_c_fixture_blocks_are_structural_and_long_function_splits() -> Result<()>
         .context("tags should be array")?;
     assert!(test_tags.iter().any(|tag| tag.as_str() == Some("test")));
 
+    let worker_type = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("type")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("typedef struct Worker"))
+        })
+        .context("expected Worker type block")?;
+    assert_eq!(worker_type["complexity"].as_u64(), Some(0));
+
     let function_block = blocks
         .iter()
         .find(|block| {
-            block["content"]
-                .as_str()
-                .is_some_and(|content| content.contains("process_worker"))
+            block["kind"].as_str() == Some("function")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("int process_worker(Worker worker)"))
         })
         .context("expected process_worker block")?;
+    assert_eq!(function_block["complexity"].as_u64(), Some(1));
     let fingerprint = function_block["hash"]
         .as_str()
         .context("function hash should be string")?;

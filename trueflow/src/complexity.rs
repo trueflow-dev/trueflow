@@ -25,6 +25,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         } else {
             tree_sitter_php::LANGUAGE_PHP_ONLY.into()
         }),
+        Language::C => Some(tree_sitter_c::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -138,6 +139,19 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
                 | "catch_clause"
                 | "conditional_expression"
         ),
+        Language::C => matches!(
+            kind,
+            "if_statement"
+                | "switch_statement"
+                | "for_statement"
+                | "while_statement"
+                | "do_statement"
+                | "conditional_expression"
+                | "preproc_if"
+                | "preproc_ifdef"
+                | "preproc_elif"
+                | "preproc_else"
+        ),
         Language::Python => matches!(
             kind,
             "if_statement"
@@ -168,6 +182,7 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         Language::CSharp => matches!(kind, "&&" | "||" | "??"),
         Language::Ruby => matches!(kind, "&&" | "||" | "and" | "or"),
         Language::Php => matches!(kind, "&&" | "||" | "??"),
+        Language::C => matches!(kind, "&&" | "||"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
@@ -397,5 +412,25 @@ function processData(array $values, bool $ready): int {
         // Total: 5
         let score = calculate(code, Language::Php);
         assert_eq!(score, Some(5));
+    }
+
+    #[test]
+    fn test_calculate_complexity_c() {
+        let code = "
+#if ENABLE_FEATURE
+int run(int flag, int ready) {
+    if (flag && ready) {
+        return 1;
+    }
+    return 0;
+}
+#endif
+";
+        // preproc_if: +1
+        // if inside preproc_if: +1 + nesting 1 = 2
+        // &&: +1
+        // Total: 4
+        let score = calculate(code, Language::C);
+        assert_eq!(score, Some(4));
     }
 }
