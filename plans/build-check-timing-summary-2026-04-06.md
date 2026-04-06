@@ -15,6 +15,7 @@ This note captures the measured state after splitting the local check gates, res
 - `8e48dd6` — `nix: make darwin default package native`
 - `5aa67c4` — `nix: drop unnecessary darwin package inputs`
 - `3b2fa46` — `build: narrow doc and coverage heavy checks`
+- `e5bc770` — `build: isolate benches from normal test paths`
 
 ## Original baseline
 
@@ -244,6 +245,37 @@ Measurement outputs:
 - `.trueflow/measurements/doccov-optimized-check-heavy/`
 - `.trueflow/measurements/doccov-optimized-current-check/`
 - `.trueflow/measurements/doccov-optimized-stages/`
+
+## Bench isolation follow-up
+
+The next build-path cleanup removed benchmark-only dependencies and targets from ordinary compile / test / lint / coverage recipes.
+
+That was changed in:
+
+- `e5bc770` — `build: isolate benches from normal test paths`
+
+Behavior changes:
+
+- `criterion` moved behind an explicit Cargo feature:
+  - `bench = ["dep:criterion"]`
+- the Criterion bench target now requires that feature
+- the bench smoke test (`e2e_bench_fixture`) is also gated behind that feature
+- ordinary developer recipes now use the explicit non-bench feature set:
+  - `--features tui-test-support`
+- `just bench` now owns the benchmark-specific path:
+  - bench fixture smoke test
+  - `cargo bench --features bench`
+
+Verification:
+
+- `cargo test --quiet --test tooling_recipes`
+- `cargo test --features bench --test e2e_bench_fixture`
+- `cargo bench --features bench --no-run`
+- fresh normal-path compile checks no longer compile `criterion`:
+  - `cargo check --features tui-test-support --lib --bins --tests --examples`
+  - `cargo nextest list --features tui-test-support --lib --bins --tests --examples`
+
+This means bench-only dependencies and targets are now structurally outside the normal developer verification path, instead of merely being omitted by recipe shape.
 
 ## Net effect on the heavyweight path
 
