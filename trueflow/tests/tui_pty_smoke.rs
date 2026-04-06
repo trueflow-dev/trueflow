@@ -1,7 +1,7 @@
 #![cfg(feature = "tui-test-support")]
 
 use anyhow::{Result, bail};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -21,12 +21,22 @@ fn captured_output(output: &Arc<Mutex<Vec<u8>>>) -> String {
     String::from_utf8_lossy(&lock_output(output).clone()).to_string()
 }
 
-fn wait_for_output(output: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> Result<()> {
+fn wait_for_output(
+    output: &Arc<Mutex<Vec<u8>>>,
+    needle: &str,
+    timeout: Duration,
+    child: &mut (dyn Child + Send + Sync),
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let current = captured_output(output);
         if current.contains(needle) {
             return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "trueflow tui exited before PTY output contained {needle:?}: {status}; output: {current}"
+            );
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for PTY output to contain {needle:?}; output: {current}");
@@ -85,14 +95,24 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
         }
     });
 
-    wait_for_output(&output, "0/1 reviewed", Duration::from_secs(5))?;
+    wait_for_output(
+        &output,
+        "0/1 reviewed",
+        Duration::from_secs(10),
+        &mut *child,
+    )?;
     send_and_flush(&mut *writer, b"n")?;
-    wait_for_output(&output, "Type a note", Duration::from_secs(5))?;
+    wait_for_output(&output, "Type a note", Duration::from_secs(5), &mut *child)?;
     send_and_flush(&mut *writer, b"a")?;
     send_and_flush(&mut *writer, b"\n")?;
     send_and_flush(&mut *writer, b"b")?;
     send_and_flush(&mut *writer, b"\r")?;
-    wait_for_output(&output, "Files/dirs: 1", Duration::from_secs(5))?;
+    wait_for_output(
+        &output,
+        "Files/dirs: 1",
+        Duration::from_secs(5),
+        &mut *child,
+    )?;
     send_and_flush(&mut *writer, b"q")?;
     drop(writer);
 
