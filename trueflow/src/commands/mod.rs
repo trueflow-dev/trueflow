@@ -6,4 +6,5 @@ pub mod review;
 pub mod scan;
 pub mod tui;
 mod tui_speedread;
+mod tui_terminal;
 pub mod verify;

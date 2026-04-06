@@ -1,4 +1,9 @@
 use super::tui_speedread::SpeedReadController;
+#[cfg(test)]
+use super::tui_terminal::{
+    TerminalCapabilities, enter_tui_mode, leave_tui_mode, tui_keyboard_enhancement_flags,
+};
+use super::tui_terminal::{TerminalSession, TuiTerminal};
 use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
@@ -24,17 +29,11 @@ use crate::store::{ReviewTargetKind, Verdict};
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
 use anyhow::Result;
-use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    },
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::{
-    Frame, Terminal,
+    Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -43,7 +42,6 @@ use ratatui::{
     },
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -353,7 +351,7 @@ pub fn run(
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<()> {
-    let mut terminal = setup_terminal()?;
+    let mut session = TerminalSession::enter()?;
     let config = load_config()?;
     let run_result = (|| {
         let scan_options = config.scan.resolve_options()?;
@@ -375,7 +373,7 @@ pub fn run(
         } else {
             let scope_options = load_scope_options()?;
             let selection = run_scope_selector(
-                &mut terminal,
+                session.terminal_mut(),
                 ScopeSelector::new(scope_options),
                 &config.tui.keybinds,
             )?;
@@ -407,10 +405,17 @@ pub fn run(
                 speed_read_config_path: speed_read_config_path_for_repo_root(),
             },
         )?;
-        run_app(context, &mut terminal, state)
+        run_app(context, &mut session, state)
     })();
-    restore_terminal(&mut terminal)?;
-    run_result
+    let restore_result = session.restore();
+    match (run_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(restore)) => Err(anyhow::anyhow!(
+            "{primary:#}\nterminal restore also failed: {restore:#}"
+        )),
+    }
 }
 
 fn cli_review_request(
@@ -617,51 +622,8 @@ fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> Stri
     path_utils::repo_relative_path_for_diff(path, workdir_prefix)
 }
 
-fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-}
-
-fn enter_tui_mode<W: io::Write>(writer: &mut W) -> Result<()> {
-    execute!(
-        writer,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        PushKeyboardEnhancementFlags(tui_keyboard_enhancement_flags())
-    )?;
-    Ok(())
-}
-
-fn leave_tui_mode<W: io::Write>(writer: &mut W) -> Result<()> {
-    execute!(
-        writer,
-        DisableMouseCapture,
-        PopKeyboardEnhancementFlags,
-        LeaveAlternateScreen
-    )?;
-    Ok(())
-}
-
-fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
-    let mut stdout = io::stdout();
-    enable_raw_mode()?;
-    enter_tui_mode(&mut stdout)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
-}
-
-fn restore_terminal(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
-) -> Result<()> {
-    disable_raw_mode()?;
-    leave_tui_mode(terminal.backend_mut())?;
-    terminal.show_cursor()?;
-    Ok(())
-}
-
 fn run_scope_selector(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    terminal: &mut TuiTerminal,
     mut selector: ScopeSelector,
     keybinds: &TuiKeybindsConfig,
 ) -> Result<ScopeSelection> {
@@ -679,12 +641,16 @@ fn run_scope_selector(
             continue;
         }
 
-        let Some(key_event) = key_event_for_press_event(&event) else {
+        let Some(key_event) = key_event_for_press_or_repeat_event(&event) else {
             continue;
         };
         let key_code = key_event.code;
 
         if let Some(action) = keybind_action_for_key_code(keybinds, key_code) {
+            if key_event.kind == KeyEventKind::Repeat && !keybind_action_accepts_repeat(action) {
+                continue;
+            }
+
             match action {
                 KeybindAction::Up => {
                     selector.move_prev();
@@ -709,6 +675,10 @@ fn run_scope_selector(
             }
         }
 
+        if key_event.kind == KeyEventKind::Repeat {
+            continue;
+        }
+
         match key_code {
             KeyCode::Esc => return Ok(ScopeSelection::Quit),
             KeyCode::Enter => {
@@ -723,14 +693,14 @@ fn run_scope_selector(
 
 fn run_app(
     context: &TrueflowContext,
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    session: &mut TerminalSession,
     mut state: AppState,
 ) -> Result<()> {
     let mut needs_render = true;
 
     loop {
         if needs_render {
-            terminal.draw(|f| ui(f, &mut state))?;
+            session.terminal_mut().draw(|f| ui(f, &mut state))?;
             needs_render = false;
         }
 
@@ -758,6 +728,13 @@ fn run_app(
             continue;
         }
 
+        if let Event::Paste(pasted) = &event {
+            if handle_paste_event(&mut state, pasted) {
+                needs_render = true;
+            }
+            continue;
+        }
+
         if let Event::Mouse(mouse_event) = &event {
             if handle_mouse_event(&mut state, *mouse_event) {
                 needs_render = true;
@@ -765,27 +742,37 @@ fn run_app(
             continue;
         }
 
-        let Some(key_event) = key_event_for_press_event(&event) else {
-            continue;
-        };
-        let key_code = key_event.code;
-
         match &state.input_mode {
             InputMode::Normal => {
+                let Some(key_event) = key_event_for_press_or_repeat_event(&event) else {
+                    continue;
+                };
+                let key_code = key_event.code;
+
                 if is_recap_mode(&state) {
-                    if recap_key_should_exit(&state.keybinds, key_code) {
+                    if key_event.kind == KeyEventKind::Press
+                        && recap_key_should_exit(&state.keybinds, key_code)
+                    {
                         flush_pending_speed_read_defaults(&mut state)?;
                         return Ok(());
                     }
                     continue;
                 }
 
-                if handle_speed_read_key_binding(&mut state, key_code) {
+                if key_event.kind == KeyEventKind::Press
+                    && handle_speed_read_key_binding(&mut state, key_code)
+                {
                     needs_render = true;
                     continue;
                 }
 
                 if let Some(action) = keybind_action_for_key_code(&state.keybinds, key_code) {
+                    if key_event.kind == KeyEventKind::Repeat
+                        && !keybind_action_accepts_repeat(action)
+                    {
+                        continue;
+                    }
+
                     match action {
                         KeybindAction::Up => handle_scroll_line_up(&mut state),
                         KeybindAction::Down => handle_scroll_line_down(&mut state),
@@ -794,7 +781,7 @@ fn run_app(
                         KeybindAction::Parent => handle_parent(&mut state),
                         KeybindAction::Child => handle_child(&mut state),
                         KeybindAction::Approve => {
-                            handle_action(terminal, context, &mut state, Verdict::Approved)?;
+                            handle_action(session, context, &mut state, Verdict::Approved)?;
                         }
                         KeybindAction::Note => {
                             handle_note_action(&mut state)?;
@@ -822,6 +809,12 @@ fn run_app(
                     continue;
                 }
 
+                if key_event.kind == KeyEventKind::Repeat
+                    && !key_code_accepts_repeat_in_normal_mode(key_code)
+                {
+                    continue;
+                }
+
                 match key_code {
                     KeyCode::Char(' ') => {
                         handle_scroll_page_down(&mut state);
@@ -845,7 +838,8 @@ fn run_app(
                         needs_render = true;
                     }
                     KeyCode::Enter
-                        if state.navigator.current_id() == state.navigator.tree.root() =>
+                        if key_event.kind == KeyEventKind::Press
+                            && state.navigator.current_id() == state.navigator.tree.root() =>
                     {
                         handle_child(&mut state);
                         needs_render = true;
@@ -853,40 +847,52 @@ fn run_app(
                     _ => {}
                 }
             }
-            InputMode::Editing { .. } => match editing_key_action_for_event(&key_event) {
-                EditingKeyAction::Submit => {
-                    handle_editing_submit(terminal, context, &mut state)?;
-                    needs_render = true;
+            InputMode::Editing { .. } => {
+                let Some(key_event) = key_event_for_press_or_repeat_event(&event) else {
+                    continue;
+                };
+
+                match editing_key_action_for_event(&key_event) {
+                    EditingKeyAction::Submit => {
+                        handle_editing_submit(session, context, &mut state)?;
+                        needs_render = true;
+                    }
+                    EditingKeyAction::InsertNewline => {
+                        state.input_buffer.push('\n');
+                        needs_render = true;
+                    }
+                    EditingKeyAction::Cancel => {
+                        handle_editing_cancel(&mut state);
+                        needs_render = true;
+                    }
+                    EditingKeyAction::Backspace => {
+                        state.input_buffer.pop();
+                        needs_render = true;
+                    }
+                    EditingKeyAction::InsertChar(c) => {
+                        state.input_buffer.push(c);
+                        needs_render = true;
+                    }
+                    EditingKeyAction::Ignore => {}
                 }
-                EditingKeyAction::InsertNewline => {
-                    state.input_buffer.push('\n');
-                    needs_render = true;
+            }
+            InputMode::ConfirmBatch { .. } => {
+                let Some(key_event) = key_event_for_press_event(&event) else {
+                    continue;
+                };
+
+                match key_event.code {
+                    KeyCode::Enter => {
+                        handle_confirm_batch(session, context, &mut state)?;
+                        needs_render = true;
+                    }
+                    KeyCode::Esc => {
+                        handle_confirm_cancel(&mut state);
+                        needs_render = true;
+                    }
+                    _ => {}
                 }
-                EditingKeyAction::Cancel => {
-                    handle_editing_cancel(&mut state);
-                    needs_render = true;
-                }
-                EditingKeyAction::Backspace => {
-                    state.input_buffer.pop();
-                    needs_render = true;
-                }
-                EditingKeyAction::InsertChar(c) => {
-                    state.input_buffer.push(c);
-                    needs_render = true;
-                }
-                EditingKeyAction::Ignore => {}
-            },
-            InputMode::ConfirmBatch { .. } => match key_code {
-                KeyCode::Enter => {
-                    handle_confirm_batch(terminal, context, &mut state)?;
-                    needs_render = true;
-                }
-                KeyCode::Esc => {
-                    handle_confirm_cancel(&mut state);
-                    needs_render = true;
-                }
-                _ => {}
-            },
+            }
         }
     }
 }
@@ -961,6 +967,24 @@ enum EditingKeyAction {
 }
 
 fn editing_key_action_for_event(key_event: &KeyEvent) -> EditingKeyAction {
+    match key_event.kind {
+        KeyEventKind::Release => return EditingKeyAction::Ignore,
+        KeyEventKind::Repeat => match key_event.code {
+            KeyCode::Backspace => return EditingKeyAction::Backspace,
+            KeyCode::Char(c) => {
+                if key_event
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    return EditingKeyAction::Ignore;
+                }
+                return EditingKeyAction::InsertChar(c);
+            }
+            _ => return EditingKeyAction::Ignore,
+        },
+        KeyEventKind::Press => {}
+    }
+
     match key_event.code {
         KeyCode::Enter if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
             EditingKeyAction::InsertNewline
@@ -989,13 +1013,55 @@ fn key_event_for_press_event(event: &Event) -> Option<KeyEvent> {
     }
 }
 
+fn key_event_for_press_or_repeat_event(event: &Event) -> Option<KeyEvent> {
+    match event {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            Some(*key)
+        }
+        _ => None,
+    }
+}
+
+fn keybind_action_accepts_repeat(action: KeybindAction) -> bool {
+    matches!(
+        action,
+        KeybindAction::Up
+            | KeybindAction::Down
+            | KeybindAction::Prev
+            | KeybindAction::Next
+            | KeybindAction::Parent
+            | KeybindAction::Child
+    )
+}
+
+fn key_code_accepts_repeat_in_normal_mode(key_code: KeyCode) -> bool {
+    matches!(
+        key_code,
+        KeyCode::Char(' ') | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+    )
+}
+
 #[cfg(test)]
 fn key_code_for_press_event(event: &Event) -> Option<KeyCode> {
     key_event_for_press_event(event).map(|key| key.code)
 }
 
+#[cfg(test)]
+fn key_code_for_press_or_repeat_event(event: &Event) -> Option<KeyCode> {
+    key_event_for_press_or_repeat_event(event).map(|key| key.code)
+}
+
 fn should_rerender_on_event(event: &Event) -> bool {
     matches!(event, Event::Resize(_, _))
+}
+
+fn handle_paste_event(state: &mut AppState, pasted: &str) -> bool {
+    if pasted.is_empty() || !matches!(state.input_mode, InputMode::Editing { .. }) {
+        return false;
+    }
+
+    state.input_buffer.push_str(pasted);
+    true
 }
 
 fn handle_mouse_event(state: &mut AppState, mouse_event: MouseEvent) -> bool {
@@ -1270,7 +1336,7 @@ fn move_root_cursor(state: &mut AppState, offset: isize) {
 }
 
 fn handle_action(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    session: &mut TerminalSession,
     context: &TrueflowContext,
     state: &mut AppState,
     verdict: Verdict,
@@ -1284,7 +1350,7 @@ fn handle_action(
             .count_visible_descendant_blocks(state.navigator.current_id());
         state.input_mode = InputMode::ConfirmBatch { action, count };
     } else {
-        execute_action(terminal, context, state, action)?;
+        execute_action(session, context, state, action)?;
     }
     Ok(())
 }
@@ -1301,7 +1367,7 @@ fn handle_note_action(state: &mut AppState) -> Result<()> {
 }
 
 fn handle_editing_submit(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    session: &mut TerminalSession,
     context: &TrueflowContext,
     state: &mut AppState,
 ) -> Result<()> {
@@ -1324,7 +1390,7 @@ fn handle_editing_submit(
     } else {
         state.input_mode = InputMode::Normal;
         state.input_buffer.clear();
-        execute_action(terminal, context, state, action)?;
+        execute_action(session, context, state, action)?;
     }
     Ok(())
 }
@@ -1338,7 +1404,7 @@ fn handle_editing_cancel(state: &mut AppState) {
 }
 
 fn handle_confirm_batch(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    session: &mut TerminalSession,
     context: &TrueflowContext,
     state: &mut AppState,
 ) -> Result<()> {
@@ -1347,7 +1413,7 @@ fn handle_confirm_batch(
         _ => return Ok(()),
     };
     state.input_mode = InputMode::Normal;
-    execute_action(terminal, context, state, action)
+    execute_action(session, context, state, action)
 }
 
 fn handle_confirm_cancel(state: &mut AppState) {
@@ -1355,7 +1421,7 @@ fn handle_confirm_cancel(state: &mut AppState) {
 }
 
 fn execute_action(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    session: &mut TerminalSession,
     context: &TrueflowContext,
     state: &mut AppState,
     action: PendingAction,
@@ -1378,7 +1444,7 @@ fn execute_action(
 
     match mark::terminal_suspend_requirement_from_workdir() {
         mark::TerminalSuspendRequirement::Required => {
-            with_terminal_suspend(terminal, || mark::run(context, params))?;
+            session.suspend(|| mark::run(context, params))?;
         }
         mark::TerminalSuspendRequirement::NotRequired => {
             mark::run(context, params)?;
@@ -1433,22 +1499,6 @@ fn fingerprint_and_target_kind_for_node(
         TreeNodeKind::File => (node.hash.to_string(), ReviewTargetKind::File),
         TreeNodeKind::Block => (node.hash.to_string(), ReviewTargetKind::Block),
     }
-}
-
-fn with_terminal_suspend<F>(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
-    action: F,
-) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-{
-    disable_raw_mode()?;
-    leave_tui_mode(terminal.backend_mut())?;
-    let result = action();
-    enter_tui_mode(terminal.backend_mut())?;
-    enable_raw_mode()?;
-    terminal.clear()?;
-    result
 }
 
 fn load_review_state(
@@ -4030,6 +4080,19 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn key_code_for_press_or_repeat_event_extracts_repeat_key_code() {
+        let event = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(
+            key_code_for_press_or_repeat_event(&event),
+            Some(KeyCode::Char('j'))
+        );
+    }
+
+    #[test]
     fn should_rerender_on_event_handles_resize_only() {
         let resize = Event::Resize(120, 40);
         let key = Event::Key(crossterm::event::KeyEvent::new(
@@ -4270,6 +4333,29 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn editing_key_action_repeat_char_inserts_char() {
+        let key = crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(
+            editing_key_action_for_event(&key),
+            EditingKeyAction::InsertChar('x')
+        );
+    }
+
+    #[test]
+    fn editing_key_action_repeat_enter_is_ignored() {
+        let key = crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(editing_key_action_for_event(&key), EditingKeyAction::Ignore);
+    }
+
+    #[test]
     fn tui_keyboard_enhancement_flags_report_modified_enter_events() {
         let flags = tui_keyboard_enhancement_flags();
         assert!(
@@ -4286,7 +4372,11 @@ mod diff_scope_tests {
     #[test]
     fn enter_tui_mode_requests_keyboard_enhancement_flags() {
         let mut output = Vec::new();
-        enter_tui_mode(&mut output).unwrap_or_else(|err| panic!("enter tui mode: {err}"));
+        enter_tui_mode(
+            &mut output,
+            TerminalCapabilities::with_keyboard_enhancement_supported(true),
+        )
+        .unwrap_or_else(|err| panic!("enter tui mode: {err}"));
 
         let rendered =
             String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
@@ -4297,15 +4387,53 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn enter_tui_mode_enables_bracketed_paste() {
+        let mut output = Vec::new();
+        enter_tui_mode(
+            &mut output,
+            TerminalCapabilities::with_keyboard_enhancement_supported(true),
+        )
+        .unwrap_or_else(|err| panic!("enter tui mode: {err}"));
+
+        let rendered =
+            String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
+        assert!(
+            rendered.contains("\u{1b}[?2004h"),
+            "expected bracketed paste enable sequence in output: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn leave_tui_mode_pops_keyboard_enhancement_flags() {
         let mut output = Vec::new();
-        leave_tui_mode(&mut output).unwrap_or_else(|err| panic!("leave tui mode: {err}"));
+        leave_tui_mode(
+            &mut output,
+            TerminalCapabilities::with_keyboard_enhancement_supported(true),
+        )
+        .unwrap_or_else(|err| panic!("leave tui mode: {err}"));
 
         let rendered =
             String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
         assert!(
             rendered.contains("\u{1b}[<1u"),
             "expected keyboard enhancement pop sequence in output: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn leave_tui_mode_disables_bracketed_paste() {
+        let mut output = Vec::new();
+        leave_tui_mode(
+            &mut output,
+            TerminalCapabilities::with_keyboard_enhancement_supported(true),
+        )
+        .unwrap_or_else(|err| panic!("leave tui mode: {err}"));
+
+        let rendered =
+            String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
+        assert!(
+            rendered.contains("\u{1b}[?2004l"),
+            "expected bracketed paste disable sequence in output: {rendered:?}"
         );
     }
 
@@ -4389,6 +4517,71 @@ mod diff_scope_tests {
 
         handle_editing_cancel(&mut state);
         assert!(matches!(state.input_mode, InputMode::Normal));
+    }
+
+    #[test]
+    fn handle_paste_event_appends_single_line_text_while_editing() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = "note".to_string();
+
+        let rerender = handle_paste_event(&mut state, " plus");
+
+        assert!(rerender);
+        assert_eq!(state.input_buffer, "note plus");
+    }
+
+    #[test]
+    fn handle_paste_event_preserves_multiline_text_while_editing() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+
+        let rerender = handle_paste_event(&mut state, "first line\nsecond line");
+
+        assert!(rerender);
+        assert_eq!(state.input_buffer, "first line\nsecond line");
+    }
+
+    #[test]
+    fn handle_paste_event_ignores_normal_mode() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.input_buffer = "note".to_string();
+
+        let rerender = handle_paste_event(&mut state, " plus");
+
+        assert!(!rerender);
+        assert_eq!(state.input_buffer, "note");
+    }
+
+    #[test]
+    fn handle_paste_event_ignores_confirm_batch_mode() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.input_mode = InputMode::ConfirmBatch {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Approved,
+                note: None,
+            },
+            count: 3,
+        };
+        state.input_buffer = "note".to_string();
+
+        let rerender = handle_paste_event(&mut state, " plus");
+
+        assert!(!rerender);
+        assert_eq!(state.input_buffer, "note");
     }
 
     #[test]
