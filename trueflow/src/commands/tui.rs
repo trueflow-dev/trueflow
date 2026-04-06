@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[cfg(any(test, feature = "tui-test-support"))]
 #[doc(hidden)]
@@ -1948,15 +1948,27 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         )
     };
 
-    state.content_height = usize_to_u16_saturating(content.total_lines);
+    let (display_total_lines, display_focus_row_range) =
+        if matches!(state.view_mode, ViewMode::Source)
+            && matches!(node_snapshot.kind, TreeNodeKind::File | TreeNodeKind::Block)
+        {
+            wrapped_display_metrics_for_lines(
+                &content.lines,
+                content.focus_row_range.as_ref(),
+                focus_layout.code.width,
+            )
+        } else {
+            (content.total_lines, content.focus_row_range.clone())
+        };
+
+    state.content_height = usize_to_u16_saturating(display_total_lines);
     state.viewport_height = focus_layout.code.height;
     state.code_rect = focus_layout.code;
     if state.pending_focus_scroll {
-        state.scroll_offset = content
-            .focus_row_range
+        state.scroll_offset = display_focus_row_range
             .as_ref()
             .map(|range| {
-                scroll_offset_for_focus_range(range, state.viewport_height, content.total_lines)
+                scroll_offset_for_focus_range(range, state.viewport_height, display_total_lines)
             })
             .unwrap_or(0);
         state.pending_focus_scroll = false;
@@ -2016,6 +2028,32 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         .style(Style::default().bg(palette.bg));
 
     frame.render_widget(actions_paragraph, focus_layout.actions);
+}
+
+fn wrapped_display_metrics_for_lines(
+    lines: &[Line<'static>],
+    focus_line_range: Option<&std::ops::Range<usize>>,
+    width: u16,
+) -> (usize, Option<std::ops::Range<usize>>) {
+    let wrap_width = usize::from(width.max(1));
+    let mut display_row_prefixes = Vec::with_capacity(lines.len().saturating_add(1));
+    let mut total_rows = 0usize;
+    display_row_prefixes.push(total_rows);
+
+    for line in lines {
+        let line_text = line.to_string();
+        let line_width = UnicodeWidthStr::width(line_text.as_str()).max(1);
+        total_rows = total_rows.saturating_add(line_width.div_ceil(wrap_width));
+        display_row_prefixes.push(total_rows);
+    }
+
+    let focus_row_range = focus_line_range.and_then(|range| {
+        let start = range.start.min(lines.len());
+        let end = range.end.max(start).min(lines.len());
+        (start < end).then_some(display_row_prefixes[start]..display_row_prefixes[end])
+    });
+
+    (total_rows, focus_row_range)
 }
 
 fn build_speed_read_lines(
@@ -5100,6 +5138,32 @@ mod diff_scope_tests {
         assert_eq!(rendered[1], "line2");
         assert!(rendered[2].contains("line3"));
         assert_eq!(content.focus_row_range, Some(1..2));
+    }
+
+    #[test]
+    fn wrapped_display_metrics_account_for_context_gutter_wrapping() {
+        let palette = UiPalette::default();
+        let mut highlighted_line_cache = HashMap::new();
+        let lines = vec![
+            format_context_line(
+                &mut highlighted_line_cache,
+                "abcdefghijklmnop",
+                &palette,
+                Some(&Language::Rust),
+            ),
+            format_code_line(
+                &mut highlighted_line_cache,
+                "focus()",
+                &palette,
+                Some(&Language::Rust),
+            ),
+        ];
+
+        let (total_lines, focus_row_range) =
+            wrapped_display_metrics_for_lines(&lines, Some(&(1..2)), 20);
+
+        assert_eq!(total_lines, 3);
+        assert_eq!(focus_row_range, Some(2..3));
     }
 
     #[test]
