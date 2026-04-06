@@ -91,6 +91,33 @@ fn root_selection_stays_visible_when_scrolling_past_viewport_height() -> Result<
 }
 
 #[test]
+fn scrollbar_does_not_overwrite_wrapped_source_tail_characters() -> Result<()> {
+    let long_line = format!("{}TAIL", "a".repeat(39));
+    let file_content = format!(
+        "{long_line}\nline-02\nline-03\nline-04\nline-05\nline-06\nline-07\nline-08\nline-09\nline-10\nline-11\nline-12\nline-13\nline-14\n"
+    );
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(40, 20),
+        "src/lib.rs",
+        &file_content,
+        &file_content,
+        0,
+        14,
+    )?;
+
+    app.render()?;
+
+    let rows = app.backend().rows();
+    assert!(
+        rows.iter().any(|row| row.contains("TAIL")),
+        "expected wrapped tail to remain visible instead of being clipped by scrollbar:\n{}",
+        app.backend().screen_contents()
+    );
+
+    Ok(())
+}
+
+#[test]
 fn comment_overlay_hint_uses_portable_multiline_copy() -> Result<()> {
     let repo = TestRepo::new("tui_vt100_comment_hint")?;
     repo.write("src/lib.rs", "fn demo() {\n    work();\n}\n")?;

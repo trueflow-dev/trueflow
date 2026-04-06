@@ -1975,15 +1975,25 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         focus_layout.meta,
     );
 
+    let show_scrollbar = state.content_height > state.viewport_height;
+    let code_content_area = if show_scrollbar {
+        Rect {
+            width: focus_layout.code.width.saturating_sub(1),
+            ..focus_layout.code
+        }
+    } else {
+        focus_layout.code
+    };
+
     frame.render_widget(
         Paragraph::new(content.lines)
             .block(UiBlock::default().style(Style::default().bg(palette.code_bg)))
             .scroll((state.scroll_offset, 0))
             .wrap(Wrap { trim: false }),
-        focus_layout.code,
+        code_content_area,
     );
 
-    if state.content_height > state.viewport_height {
+    if show_scrollbar {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
