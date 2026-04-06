@@ -191,6 +191,7 @@ struct AppState {
     scope_label: String,
     input_mode: InputMode,
     input_buffer: String,
+    editing_validation: Option<EditingValidation>,
     confirm_batch: bool,
     repo_name: String,
     workdir_prefix: Option<String>,
@@ -237,6 +238,11 @@ enum KeybindAction {
     SpeedRead,
     Root,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditingValidation {
+    NoteRequired,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +498,7 @@ fn build_review_state(
         scope_label: options.scope_label,
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
+        editing_validation: None,
         confirm_batch: options.confirm_batch,
         repo_name: detect_repo_name(context),
         workdir_prefix: options.workdir_prefix,
@@ -943,6 +950,7 @@ fn run_app(
                         needs_render = true;
                     }
                     EditingKeyAction::InsertNewline => {
+                        clear_editing_validation(&mut state);
                         state.input_buffer.push('\n');
                         needs_render = true;
                     }
@@ -951,10 +959,12 @@ fn run_app(
                         needs_render = true;
                     }
                     EditingKeyAction::Backspace => {
+                        clear_editing_validation(&mut state);
                         state.input_buffer.pop();
                         needs_render = true;
                     }
                     EditingKeyAction::InsertChar(c) => {
+                        clear_editing_validation(&mut state);
                         state.input_buffer.push(c);
                         needs_render = true;
                     }
@@ -1142,6 +1152,7 @@ fn handle_paste_event(state: &mut AppState, pasted: &str) -> bool {
         return false;
     }
 
+    clear_editing_validation(state);
     state.input_buffer.push_str(pasted);
     true
 }
@@ -1525,6 +1536,7 @@ fn handle_note_action(state: &mut AppState) -> Result<()> {
     );
     state.input_mode = InputMode::Editing { action };
     state.input_buffer.clear();
+    clear_editing_validation(state);
     Ok(())
 }
 
@@ -1533,31 +1545,46 @@ fn handle_editing_submit(
     context: &TrueflowContext,
     state: &mut AppState,
 ) -> Result<()> {
+    handle_editing_submit_with(state, |action, state| {
+        execute_action(session, context, state, action)
+    })
+}
+
+fn handle_editing_submit_with<F>(state: &mut AppState, on_action: F) -> Result<()>
+where
+    F: FnOnce(PendingAction, &mut AppState) -> Result<()>,
+{
     let Some(submit) = editing_submit_decision(&state.input_mode, &state.input_buffer) else {
         return Ok(());
     };
 
-    let EditingSubmitDecision::Ready(action) = submit;
-
-    if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
-        let count = state
-            .navigator
-            .count_visible_descendant_blocks(match &action {
-                PendingAction::Single { node_id, .. } | PendingAction::Batch { node_id, .. } => {
-                    *node_id
-                }
-            });
-        state.input_buffer.clear();
-        state.input_mode = InputMode::ConfirmBatch { action, count };
-    } else {
-        state.input_mode = InputMode::Normal;
-        state.input_buffer.clear();
-        execute_action(session, context, state, action)?;
+    match submit {
+        EditingSubmitDecision::Empty => {
+            state.editing_validation = Some(EditingValidation::NoteRequired);
+        }
+        EditingSubmitDecision::Ready(action) => {
+            clear_editing_validation(state);
+            if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
+                let count = state
+                    .navigator
+                    .count_visible_descendant_blocks(match &action {
+                        PendingAction::Single { node_id, .. }
+                        | PendingAction::Batch { node_id, .. } => *node_id,
+                    });
+                state.input_buffer.clear();
+                state.input_mode = InputMode::ConfirmBatch { action, count };
+            } else {
+                state.input_mode = InputMode::Normal;
+                state.input_buffer.clear();
+                on_action(action, state)?;
+            }
+        }
     }
     Ok(())
 }
 
 fn handle_editing_cancel(state: &mut AppState) {
+    clear_editing_validation(state);
     if state.input_buffer.is_empty() {
         state.input_mode = InputMode::Normal;
     } else {
@@ -1588,6 +1615,20 @@ fn execute_action(
     state: &mut AppState,
     action: PendingAction,
 ) -> Result<()> {
+    execute_action_with(state, action, |params| {
+        match mark::terminal_suspend_requirement_from_workdir() {
+            mark::TerminalSuspendRequirement::Required => {
+                session.suspend(|| mark::run(context, params))
+            }
+            mark::TerminalSuspendRequirement::NotRequired => mark::run(context, params),
+        }
+    })
+}
+
+fn execute_action_with<F>(state: &mut AppState, action: PendingAction, run_mark: F) -> Result<()>
+where
+    F: FnOnce(mark::MarkParams) -> Result<()>,
+{
     let (node_id, verdict, note) = match action {
         PendingAction::Single {
             node_id,
@@ -1603,15 +1644,7 @@ fn execute_action(
 
     let next_id = compute_next_review_target(state, node_id);
     let params = mark_params_for_action(state, node_id, verdict.clone(), note);
-
-    match mark::terminal_suspend_requirement_from_workdir() {
-        mark::TerminalSuspendRequirement::Required => {
-            session.suspend(|| mark::run(context, params))?;
-        }
-        mark::TerminalSuspendRequirement::NotRequired => {
-            mark::run(context, params)?;
-        }
-    }
+    run_mark(params)?;
 
     let impact = apply_action_locally(state, node_id, &verdict, next_id);
     state.session_recap.record_action(&verdict, impact);
@@ -3131,7 +3164,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             (
                 InputOverlayKind::Editing { input_lines },
                 " Note ",
-                editing_overlay_hint(&content),
+                editing_overlay_hint(&content, state.editing_validation),
                 content,
             )
         }
@@ -3230,6 +3263,7 @@ fn input_overlay_lines(content: &str, hints: &str, palette: &UiPalette) -> Vec<L
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditingSubmitDecision {
+    Empty,
     Ready(PendingAction),
 }
 
@@ -3242,13 +3276,19 @@ fn editing_submit_decision(
     };
     let note = input_buffer.trim().to_string();
     if note.is_empty() {
-        return Some(EditingSubmitDecision::Ready(action.clone()));
+        return Some(EditingSubmitDecision::Empty);
     }
     Some(EditingSubmitDecision::Ready(action.with_note(note)))
 }
 
-fn editing_overlay_hint(content: &str) -> &'static str {
-    if content.trim().is_empty() {
+fn clear_editing_validation(state: &mut AppState) {
+    state.editing_validation = None;
+}
+
+fn editing_overlay_hint(content: &str, validation: Option<EditingValidation>) -> &'static str {
+    if matches!(validation, Some(EditingValidation::NoteRequired)) {
+        "Note required • Type a note • Ctrl+J newline • Esc to cancel"
+    } else if content.trim().is_empty() {
         "Type a note • Enter to submit • Ctrl+J newline • Esc to cancel"
     } else {
         "Enter to submit • Ctrl+J newline • Esc to cancel"
@@ -3457,6 +3497,7 @@ mod diff_scope_tests {
             scope_label: String::new(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            editing_validation: None,
             confirm_batch: false,
             repo_name: "repo".to_string(),
             workdir_prefix,
@@ -3519,6 +3560,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            editing_validation: None,
             confirm_batch: false,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
@@ -3595,6 +3637,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            editing_validation: None,
             confirm_batch: false,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
@@ -3681,6 +3724,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            editing_validation: None,
             confirm_batch: false,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
@@ -4736,7 +4780,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn editing_submit_decision_returns_ready_for_blank_note_input() {
+    fn editing_submit_decision_returns_empty_for_blank_note_input() {
         let action = PendingAction::Single {
             node_id: TreeBuilder::new().root(),
             verdict: Verdict::Comment,
@@ -4744,11 +4788,7 @@ mod diff_scope_tests {
         };
         let input_mode = InputMode::Editing { action };
         let decision = editing_submit_decision(&input_mode, "   \n\t");
-        let Some(EditingSubmitDecision::Ready(PendingAction::Single { note, .. })) = decision
-        else {
-            panic!("expected ready single action");
-        };
-        assert_eq!(note, None);
+        assert_eq!(decision, Some(EditingSubmitDecision::Empty));
     }
 
     #[test]
@@ -4770,12 +4810,39 @@ mod diff_scope_tests {
     #[test]
     fn editing_overlay_hint_allows_empty_note_input() {
         assert_eq!(
-            editing_overlay_hint(""),
+            editing_overlay_hint("", None),
             "Type a note • Enter to submit • Ctrl+J newline • Esc to cancel"
         );
         assert_eq!(
-            editing_overlay_hint("note"),
+            editing_overlay_hint("note", None),
             "Enter to submit • Ctrl+J newline • Esc to cancel"
+        );
+        assert_eq!(
+            editing_overlay_hint("", Some(EditingValidation::NoteRequired)),
+            "Note required • Type a note • Ctrl+J newline • Esc to cancel"
+        );
+    }
+
+    #[test]
+    fn handle_editing_submit_with_empty_note_sets_validation_and_keeps_editing() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+
+        handle_editing_submit_with(&mut state, |_action, _state| {
+            panic!("empty note should not execute an action");
+        })
+        .unwrap_or_else(|error| panic!("expected empty submit to stay in editor: {error}"));
+
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert_eq!(
+            state.editing_validation,
+            Some(EditingValidation::NoteRequired)
         );
     }
 
@@ -4790,10 +4857,12 @@ mod diff_scope_tests {
             },
         };
         state.input_buffer = "note".to_string();
+        state.editing_validation = Some(EditingValidation::NoteRequired);
 
         handle_editing_cancel(&mut state);
         assert!(matches!(state.input_mode, InputMode::Editing { .. }));
         assert!(state.input_buffer.is_empty());
+        assert_eq!(state.editing_validation, None);
 
         handle_editing_cancel(&mut state);
         assert!(matches!(state.input_mode, InputMode::Normal));
@@ -4810,11 +4879,13 @@ mod diff_scope_tests {
             },
         };
         state.input_buffer = "note".to_string();
+        state.editing_validation = Some(EditingValidation::NoteRequired);
 
         let rerender = handle_paste_event(&mut state, " plus");
 
         assert!(rerender);
         assert_eq!(state.input_buffer, "note plus");
+        assert_eq!(state.editing_validation, None);
     }
 
     #[test]
@@ -5912,23 +5983,27 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: TYPESCRIPT_KEYWORDS,
             line_comment_start: Some("//"),
         },
-        Language::Java => LanguageHighlightRules {
+        Language::Java | Language::Kotlin => LanguageHighlightRules {
             keywords: JAVA_KEYWORDS,
             line_comment_start: Some("//"),
         },
-        Language::Python => LanguageHighlightRules {
+        Language::CSharp => LanguageHighlightRules {
+            keywords: JAVA_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
+        Language::Python | Language::Ruby => LanguageHighlightRules {
             keywords: PYTHON_KEYWORDS,
             line_comment_start: Some("#"),
+        },
+        Language::Php => LanguageHighlightRules {
+            keywords: JAVA_KEYWORDS,
+            line_comment_start: Some("//"),
         },
         Language::Go => LanguageHighlightRules {
             keywords: GO_KEYWORDS,
             line_comment_start: Some("//"),
         },
-        Language::C => LanguageHighlightRules {
-            keywords: CPP_KEYWORDS,
-            line_comment_start: Some("//"),
-        },
-        Language::Cpp => LanguageHighlightRules {
+        Language::C | Language::Cpp => LanguageHighlightRules {
             keywords: CPP_KEYWORDS,
             line_comment_start: Some("//"),
         },
@@ -5944,14 +6019,7 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: JUST_KEYWORDS,
             line_comment_start: Some("#"),
         },
-        Language::Kotlin
-        | Language::CSharp
-        | Language::Ruby
-        | Language::Php
-        | Language::Markdown
-        | Language::Toml
-        | Language::Text
-        | Language::Unknown => return None,
+        Language::Markdown | Language::Toml | Language::Text | Language::Unknown => return None,
     };
 
     Some(LineHighlighter { rules })
