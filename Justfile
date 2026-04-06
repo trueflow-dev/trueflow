@@ -11,10 +11,10 @@ check-fast: compile-check lint fmt-check
 # Run heavyweight code checks that are useful before CI / release work
 check-heavy: audit doc coverage-check
 
-# Run the full local code verification path
-check-full: test-full lint-all-targets fmt-check audit doc coverage-check
+# Run the broad local code gate (tests/examples/lint/docs/coverage; benches excluded)
+check-code: test-code lint-code fmt-check audit doc coverage-check
 
-# Run Nix packaging verification separately from the normal code iteration path
+# Run Nix packaging verification separately from the regular code checks
 check-packaging: nix-check
 
 # Measure check pipeline timings (writes under .trueflow/measurements/)
@@ -29,9 +29,9 @@ measure-check-fast:
 measure-check-heavy:
     ./scripts/measure-checks.sh --profile check-heavy
 
-# Measure the full local gate
-measure-check-full:
-    ./scripts/measure-checks.sh --profile check-full
+# Measure the broad local code gate
+measure-check-code:
+    ./scripts/measure-checks.sh --profile check-code
 
 # Measure the separate packaging gate
 measure-check-packaging:
@@ -52,16 +52,19 @@ fix: fix-clippy fix-fmt fix-audit fix-cargo
 compile-check:
     cd trueflow && cargo check --features tui-test-support --lib --bins --tests
 
-# Compile the broader target set without benches
-compile-check-all-targets:
+# Normal local cargo gates enable tui-test-support so the hidden vt100/PTy
+# TUI regression harness keeps compiling in the ordinary developer loop.
+
+# Compile the broad code target set without benches
+compile-check-code:
     cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples
 
 # Run the local test suite with nextest
 test:
     cd trueflow && cargo nextest run --features tui-test-support
 
-# Run the broader local test path without benches
-test-full:
+# Run the broad local test path without benches
+test-code:
     cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples
 
 # Run the vt100-backed and PTY-backed TUI integration suite
@@ -76,8 +79,8 @@ mutants:
 lint:
     cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests -- -D warnings
 
-# Run clippy across the broader local target set without benches
-lint-all-targets:
+# Run clippy across the broad local code target set without benches
+lint-code:
     cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings
 
 # Check formatting

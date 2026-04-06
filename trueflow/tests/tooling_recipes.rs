@@ -162,7 +162,7 @@ fn cargo_manifest_bench_support_is_opt_in() -> Result<()> {
 }
 
 #[test]
-fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
+fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
     let justfile_path = repo_root()?.join("Justfile");
     if !justfile_path.exists() {
         return Ok(());
@@ -186,8 +186,8 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "check-full: test-full lint-all-targets fmt-check audit doc coverage-check",
-        "Justfile check-full recipe",
+        "check-code: test-code lint-code fmt-check audit doc coverage-check",
+        "Justfile check-code recipe",
     );
     assert_contains(
         &justfile,
@@ -206,8 +206,8 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "test-full:\n    cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples\n",
-        "Justfile test-full recipe",
+        "test-code:\n    cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples\n",
+        "Justfile test-code recipe",
     );
     assert_contains(
         &justfile,
@@ -221,13 +221,13 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "compile-check-all-targets:\n    cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples\n",
-        "Justfile compile-check-all-targets recipe",
+        "compile-check-code:\n    cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples\n",
+        "Justfile compile-check-code recipe",
     );
     assert_contains(
         &justfile,
-        "lint-all-targets:\n    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings\n",
-        "Justfile lint-all-targets recipe",
+        "lint-code:\n    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings\n",
+        "Justfile lint-code recipe",
     );
     assert_contains(
         &justfile,
@@ -290,6 +290,27 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
         "Justfile nix-check-release-with-tests recipe",
     );
 
+    assert_contains(
+        &justfile,
+        "tui-test-support so the hidden vt100/PTy\n# TUI regression harness keeps compiling in the ordinary developer loop.",
+        "Justfile tui-test-support explanation",
+    );
+    assert_not_contains(
+        &justfile,
+        "compile-check-all-targets:",
+        "Justfile legacy compile-check-all-targets recipe",
+    );
+    assert_not_contains(
+        &justfile,
+        "lint-all-targets:",
+        "Justfile legacy lint-all-targets recipe",
+    );
+    assert_not_contains(
+        &justfile,
+        "test-full:",
+        "Justfile legacy test-full recipe",
+    );
+
     Ok(())
 }
 
@@ -303,12 +324,12 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
 
     assert_contains(
         &measure_script,
-        "check\ncheck-fast\ncheck-heavy\ncheck-full\ncheck-packaging\ncurrent-check\nlocal-minimum\nlocal-dev",
+        "check\ncheck-fast\ncheck-heavy\ncheck-code\ncheck-packaging\nlocal-minimum\nlocal-dev",
         "measure-check profile list",
     );
     assert_contains(
         &measure_script,
-        "compile-check-all-targets\ntest\ntest-full\nlint\nlint-all-targets",
+        "compile-check-code\ntest\ntest-code\nlint\nlint-code",
         "measure-check stage list",
     );
     assert_contains(
@@ -328,13 +349,13 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    compile-check-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples'",
-        "measure-check compile-check-all-targets stage",
+        "    compile-check-code|compile-check-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples'",
+        "measure-check compile-check-code stage",
     );
     assert_contains(
         &measure_script,
-        "    test-full)\n      printf '%s\\n' 'cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples'",
-        "measure-check test-full stage",
+        "    test-code|test-full)\n      printf '%s\\n' 'cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples'",
+        "measure-check test-code stage",
     );
     assert_contains(
         &measure_script,
@@ -353,8 +374,8 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    lint-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'",
-        "measure-check lint-all-targets stage",
+        "    lint-code|lint-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'",
+        "measure-check lint-code stage",
     );
     assert_contains(
         &measure_script,
@@ -413,8 +434,8 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    check-full|current-check)\n      printf '%s\\n' test-full lint-all-targets fmt-check audit doc coverage-check",
-        "measure-check check-full profile",
+        "    check-code|check-full|current-check)\n      printf '%s\\n' test-code lint-code fmt-check audit doc coverage-check",
+        "measure-check check-code profile",
     );
 
     Ok(())

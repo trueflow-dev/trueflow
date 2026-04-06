@@ -12,16 +12,17 @@ Profiles:
   check           Default local gate (tests, lint, fmt)
   check-fast      Faster no-test local gate (compile, lint, fmt)
   check-heavy     Heavyweight code-only checks (audit, doc, coverage)
-  check-full      Full local code verification path
+  check-code      Broad local code verification (tests/examples/lint/docs/coverage; benches excluded)
   check-packaging Separate host-default Nix package verification
-  current-check   Legacy alias for check-full
+  current-check   Legacy alias for check-code
+  check-full      Legacy alias for check-code
   local-minimum   Legacy alias for check-fast
   local-dev       Legacy alias for check
 
 Examples:
   scripts/measure-checks.sh --profile check
   scripts/measure-checks.sh --profile check-fast
-  scripts/measure-checks.sh --profile check-full
+  scripts/measure-checks.sh --profile check-code
 EOF
 }
 
@@ -30,9 +31,8 @@ list_profiles() {
 check
 check-fast
 check-heavy
-check-full
+check-code
 check-packaging
-current-check
 local-minimum
 local-dev
 EOF
@@ -41,11 +41,11 @@ EOF
 list_stages() {
   cat <<'EOF'
 compile-check
-compile-check-all-targets
+compile-check-code
 test
-test-full
+test-code
 lint
-lint-all-targets
+lint-code
 fmt-check
 audit
 doc
@@ -67,19 +67,19 @@ stage_command() {
     compile-check)
       printf '%s\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests'
       ;;
-    compile-check-all-targets)
+    compile-check-code|compile-check-all-targets)
       printf '%s\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples'
       ;;
     test)
       printf '%s\n' 'cd trueflow && cargo nextest run --features tui-test-support'
       ;;
-    test-full)
+    test-code|test-full)
       printf '%s\n' 'cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples'
       ;;
     lint)
       printf '%s\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests -- -D warnings'
       ;;
-    lint-all-targets)
+    lint-code|lint-all-targets)
       printf '%s\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'
       ;;
     fmt-check)
@@ -142,8 +142,8 @@ profile_stages() {
     check-packaging)
       printf '%s\n' nix-check
       ;;
-    check-full|current-check)
-      printf '%s\n' test-full lint-all-targets fmt-check audit doc coverage-check
+    check-code|check-full|current-check)
+      printf '%s\n' test-code lint-code fmt-check audit doc coverage-check
       ;;
     *)
       echo "unknown profile: $1" >&2
