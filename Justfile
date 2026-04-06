@@ -43,23 +43,23 @@ fix: fix-clippy fix-fmt fix-audit fix-cargo
 
 # Compile the local developer target set without running tests
 compile-check:
-    cd trueflow && cargo check --all-features --lib --bins --tests
+    cd trueflow && cargo check --features tui-test-support --lib --bins --tests
 
-# Compile every target, including benches
+# Compile the broader target set without benches
 compile-check-all-targets:
-    cd trueflow && cargo check --all-features --all-targets
+    cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples
 
 # Run the local test suite with nextest
 test:
-    cd trueflow && cargo nextest run --all-features
+    cd trueflow && cargo nextest run --features tui-test-support
 
-# Run the broader all-targets test compile path
+# Run the broader local test path without benches
 test-full:
-    cd trueflow && cargo nextest run --all-features --all-targets
+    cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples
 
 # Run the vt100-backed and PTY-backed TUI integration suite
 test-tui-e2e:
-    cd trueflow && cargo nextest run --all-features --test tui_vt100 --test tui_pty_smoke
+    cd trueflow && cargo nextest run --features tui-test-support --test tui_vt100 --test tui_pty_smoke
 
 # Run mutation tests
 mutants:
@@ -67,11 +67,11 @@ mutants:
 
 # Run clippy lints for the fast local gate
 lint:
-    cd trueflow && cargo clippy --all-features --lib --bins --tests -- -D warnings
+    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests -- -D warnings
 
-# Run clippy across all targets, including benches
+# Run clippy across the broader local target set without benches
 lint-all-targets:
-    cd trueflow && cargo clippy --all-features --all-targets -- -D warnings
+    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings
 
 # Check formatting
 fmt-check:
@@ -84,11 +84,11 @@ audit:
 # Build this crate's documentation without dependency docs
 # to keep the heavyweight local path focused and fast.
 doc:
-    cd trueflow && cargo doc --all-features --no-deps
+    cd trueflow && cargo doc --features tui-test-support --no-deps
 
 # Enforce minimum test coverage (line coverage) for the main crate target set.
 coverage-check:
-    cd trueflow && cargo llvm-cov --all-features --lib --bins --tests --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
+    cd trueflow && cargo llvm-cov --features tui-test-support --lib --bins --tests --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
 
 # Verify the default flake package builds for this host
 nix-check:
@@ -130,9 +130,9 @@ nix-check-static-with-tests:
 nix-check-release-with-tests:
     nix build --no-link .#release-with-tests
 
-# Fix clippy issues
+# Fix clippy issues without pulling benches into the normal fix path
 fix-clippy:
-    cd trueflow && cargo clippy --all-targets --all-features --fix --allow-dirty
+    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples --fix --allow-dirty
 
 # Format code
 fix-fmt:
@@ -142,15 +142,15 @@ fix-fmt:
 fix-audit:
     cd trueflow && cargo audit fix
 
-# Run cargo fix
+# Run cargo fix without pulling benches into the normal fix path
 fix-cargo:
-    cd trueflow && cargo fix --all-targets --all-features --allow-dirty
+    cd trueflow && cargo fix --features tui-test-support --lib --bins --tests --examples --allow-dirty
 
-# Run benchmarks
+# Run benchmark fixture validation and benchmarks
 bench:
-    cd trueflow && cargo bench
+    cd trueflow && cargo test --features bench --test e2e_bench_fixture && cargo bench --features bench
 
-# Generate coverage report
+# Generate coverage report without pulling benches into the normal coverage path
 coverage:
-    cd trueflow && cargo llvm-cov --all-targets --html
+    cd trueflow && cargo llvm-cov --features tui-test-support --lib --bins --tests --examples --html
     @echo "Coverage report at trueflow/target/llvm-cov/html/index.html"

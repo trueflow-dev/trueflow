@@ -15,6 +15,13 @@ fn assert_contains(haystack: &str, needle: &str, context: &str) {
     );
 }
 
+fn assert_not_contains(haystack: &str, needle: &str, context: &str) {
+    assert!(
+        !haystack.contains(needle),
+        "expected {context} to not contain {needle:?}"
+    );
+}
+
 #[test]
 fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
     let flake_path = repo_root()?.join("flake.nix");
@@ -123,6 +130,38 @@ fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
 }
 
 #[test]
+fn cargo_manifest_bench_support_is_opt_in() -> Result<()> {
+    let cargo_toml_path = repo_root()?.join("trueflow/Cargo.toml");
+    if !cargo_toml_path.exists() {
+        return Ok(());
+    }
+    let cargo_toml = fs::read_to_string(cargo_toml_path)?;
+
+    assert_contains(
+        &cargo_toml,
+        "bench = [\"dep:criterion\"]",
+        "Cargo.toml bench feature",
+    );
+    assert_contains(
+        &cargo_toml,
+        "criterion = { version = \"0.8.2\", optional = true, default-features = false, features = [\"cargo_bench_support\"] }",
+        "Cargo.toml optional criterion dependency",
+    );
+    assert_not_contains(
+        &cargo_toml,
+        "[dev-dependencies]\ncriterion =",
+        "Cargo.toml dev-dependencies criterion leak",
+    );
+    assert_contains(
+        &cargo_toml,
+        "required-features = [\"bench\"]",
+        "Cargo.toml bench target required feature",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     let justfile_path = repo_root()?.join("Justfile");
     if !justfile_path.exists() {
@@ -152,33 +191,58 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "compile-check:\n    cd trueflow && cargo check --all-features --lib --bins --tests\n",
+        "compile-check:\n    cd trueflow && cargo check --features tui-test-support --lib --bins --tests\n",
         "Justfile compile-check recipe",
     );
     assert_contains(
         &justfile,
-        "test:\n    cd trueflow && cargo nextest run --all-features\n",
+        "test:\n    cd trueflow && cargo nextest run --features tui-test-support\n",
         "Justfile test recipe",
     );
     assert_contains(
         &justfile,
-        "test-full:\n    cd trueflow && cargo nextest run --all-features --all-targets\n",
+        "test-full:\n    cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples\n",
         "Justfile test-full recipe",
     );
     assert_contains(
         &justfile,
-        "doc:\n    cd trueflow && cargo doc --all-features --no-deps\n",
+        "doc:\n    cd trueflow && cargo doc --features tui-test-support --no-deps\n",
         "Justfile doc recipe",
     );
     assert_contains(
         &justfile,
-        "lint:\n    cd trueflow && cargo clippy --all-features --lib --bins --tests -- -D warnings\n",
+        "lint:\n    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests -- -D warnings\n",
         "Justfile lint recipe",
     );
     assert_contains(
         &justfile,
-        "lint-all-targets:\n    cd trueflow && cargo clippy --all-features --all-targets -- -D warnings\n",
+        "compile-check-all-targets:\n    cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples\n",
+        "Justfile compile-check-all-targets recipe",
+    );
+    assert_contains(
+        &justfile,
+        "lint-all-targets:\n    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings\n",
         "Justfile lint-all-targets recipe",
+    );
+    assert_contains(
+        &justfile,
+        "fix-clippy:\n    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples --fix --allow-dirty\n",
+        "Justfile fix-clippy recipe",
+    );
+    assert_contains(
+        &justfile,
+        "fix-cargo:\n    cd trueflow && cargo fix --features tui-test-support --lib --bins --tests --examples --allow-dirty\n",
+        "Justfile fix-cargo recipe",
+    );
+    assert_contains(
+        &justfile,
+        "bench:\n    cd trueflow && cargo test --features bench --test e2e_bench_fixture && cargo bench --features bench\n",
+        "Justfile bench recipe",
+    );
+    assert_contains(
+        &justfile,
+        "coverage:\n    cd trueflow && cargo llvm-cov --features tui-test-support --lib --bins --tests --examples --html\n",
+        "Justfile coverage recipe",
     );
     assert_contains(
         &justfile,
@@ -249,37 +313,42 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    compile-check)\n      printf '%s\\n' 'cd trueflow && cargo check --all-features --lib --bins --tests'",
+        "    compile-check)\n      printf '%s\\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests'",
         "measure-check compile-check stage",
     );
     assert_contains(
         &measure_script,
-        "    test)\n      printf '%s\\n' 'cd trueflow && cargo nextest run --all-features'",
+        "    test)\n      printf '%s\\n' 'cd trueflow && cargo nextest run --features tui-test-support'",
         "measure-check test stage",
     );
     assert_contains(
         &measure_script,
-        "    test-full)\n      printf '%s\\n' 'cd trueflow && cargo nextest run --all-features --all-targets'",
+        "    compile-check-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples'",
+        "measure-check compile-check-all-targets stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    test-full)\n      printf '%s\\n' 'cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples'",
         "measure-check test-full stage",
     );
     assert_contains(
         &measure_script,
-        "    doc)\n      printf '%s\\n' 'cd trueflow && cargo doc --all-features --no-deps'",
+        "    doc)\n      printf '%s\\n' 'cd trueflow && cargo doc --features tui-test-support --no-deps'",
         "measure-check doc stage",
     );
     assert_contains(
         &measure_script,
-        "    lint)\n      printf '%s\\n' 'cd trueflow && cargo clippy --all-features --lib --bins --tests -- -D warnings'",
+        "    lint)\n      printf '%s\\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests -- -D warnings'",
         "measure-check lint stage",
     );
     assert_contains(
         &measure_script,
-        "    coverage-check)\n      printf '%s\\n' 'cd trueflow && cargo llvm-cov --all-features --lib --bins --tests --summary-only --ignore-filename-regex \"src/commands/tui.rs\" --fail-under-lines 80'",
+        "    coverage-check)\n      printf '%s\\n' 'cd trueflow && cargo llvm-cov --features tui-test-support --lib --bins --tests --summary-only --ignore-filename-regex \"src/commands/tui.rs\" --fail-under-lines 80'",
         "measure-check coverage-check stage",
     );
     assert_contains(
         &measure_script,
-        "    lint-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'",
+        "    lint-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'",
         "measure-check lint-all-targets stage",
     );
     assert_contains(

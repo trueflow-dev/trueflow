@@ -63,22 +63,22 @@ EOF
 stage_command() {
   case "$1" in
     compile-check)
-      printf '%s\n' 'cd trueflow && cargo check --all-features --lib --bins --tests'
+      printf '%s\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests'
       ;;
     compile-check-all-targets)
-      printf '%s\n' 'cd trueflow && cargo check --all-features --all-targets'
+      printf '%s\n' 'cd trueflow && cargo check --features tui-test-support --lib --bins --tests --examples'
       ;;
     test)
-      printf '%s\n' 'cd trueflow && cargo nextest run --all-features'
+      printf '%s\n' 'cd trueflow && cargo nextest run --features tui-test-support'
       ;;
     test-full)
-      printf '%s\n' 'cd trueflow && cargo nextest run --all-features --all-targets'
+      printf '%s\n' 'cd trueflow && cargo nextest run --features tui-test-support --lib --bins --tests --examples'
       ;;
     lint)
-      printf '%s\n' 'cd trueflow && cargo clippy --all-features --lib --bins --tests -- -D warnings'
+      printf '%s\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests -- -D warnings'
       ;;
     lint-all-targets)
-      printf '%s\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'
+      printf '%s\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'
       ;;
     fmt-check)
       printf '%s\n' 'cd trueflow && cargo fmt --check --all'
@@ -87,10 +87,10 @@ stage_command() {
       printf '%s\n' 'cd trueflow && cargo audit'
       ;;
     doc)
-      printf '%s\n' 'cd trueflow && cargo doc --all-features --no-deps'
+      printf '%s\n' 'cd trueflow && cargo doc --features tui-test-support --no-deps'
       ;;
     coverage-check)
-      printf '%s\n' 'cd trueflow && cargo llvm-cov --all-features --lib --bins --tests --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80'
+      printf '%s\n' 'cd trueflow && cargo llvm-cov --features tui-test-support --lib --bins --tests --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80'
       ;;
     nix-check)
       printf '%s\n' 'nix build --no-link .#default'

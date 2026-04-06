@@ -1,3 +1,5 @@
+#![cfg(feature = "bench")]
+
 #[path = "common/review_bench_support.rs"]
 mod review_bench_support;
 

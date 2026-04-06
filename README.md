@@ -212,6 +212,8 @@ nix develop -c just coverage
 `just check-fast` keeps the faster compile-only path for cases where you want a quicker no-test loop.
 The heavier non-inner-loop work lives behind `just check-full`.
 That heavyweight path builds only this crate's docs (not dependency docs) and measures coverage for the main lib/bin/test target set.
+Bench targets are opt-in and only run through `just bench`.
+Normal compile/test/lint/coverage recipes use the explicit non-bench feature set.
 `just nix-check` validates the host-default flake package (`native` on Darwin, release/static on Linux).
 `just nix-check-release` is the explicit release/static package build.
 `just nix-check-with-tests` is the explicit opt-in path for rerunning crate tests inside the host-default Nix package build.
