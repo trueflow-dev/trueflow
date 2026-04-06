@@ -10,6 +10,9 @@ This note captures the measured state after splitting the local check gates, res
 - `ebc5557` — `build: make recipe tests repo-aware`
 - `e1b36d6` — `build: restore tests to default check gate`
 - `73be453` — `build: speed up nix package verification`
+- `01ab510` — `build: use SOURCE_DATE_EPOCH for build metadata`
+- `f6fe7f0` — `nix: remap rust build paths for reproducibility`
+- `8e48dd6` — `nix: make darwin default package native`
 
 ## Original baseline
 
@@ -110,25 +113,74 @@ For a stricter package-build view, the forced rebuild investigation showed:
   - `nix build --rebuild --no-link .#native`: **55s**
   - `nix build --rebuild --no-link .#default`: **58s**
 
-Both forced rebuild commands currently end with a Nix nondeterminism check failure rather than a clean success, so these rebuild timings are useful for comparison but also indicate a separate reproducibility problem to investigate.
+Those rebuild timings directly identified the later reproducibility work.
+
+## Nix reproducibility follow-up
+
+The Nix nondeterminism was later fixed in two steps:
+
+- `01ab510` — switched build metadata to `SOURCE_DATE_EPOCH` instead of wall-clock time
+- `f6fe7f0` — added Rust `--remap-path-prefix` flags in the flake package builds
+
+After those two changes, forced rebuilds succeeded cleanly again for both package outputs:
+
+- `nix build --rebuild --no-link .#native`
+- `nix build --rebuild --no-link .#default`
+
+## Darwin default package follow-up
+
+The remaining large local performance issue on `aarch64-darwin` was that `packages.default` still pointed at the static/release-style package.
+
+That was changed in:
+
+- `8e48dd6` — `nix: make darwin default package native`
+
+Current package shape on Darwin:
+
+- `packages.default` -> `native`
+- explicit `packages.release` / `packages.static` -> static Darwin package
+- `apps.default` follows `packages.default`
+
+Current output sizes on Darwin:
+
+- `.#default` / `.#native`: **63.5 MiB**
+- `.#release`: **1.2 GiB**
+
+Clean-tree custom stage timing run (cache-warm after build):
+
+- `.trueflow/measurements/darwin-default-stage-compare/`
+  - `nix-check`: `0s`
+  - `nix-check-release`: `1s`
+  - `nix-check-default-with-tests`: `1s`
+
+Forced rebuild timings on current `main`:
+
+- `nix build --rebuild --no-link .#default`: **35s**
+- `nix build --rebuild --no-link .#release`: **3m02s**
+- `nix build --rebuild --no-link .#default-with-tests`: **58s**
+
+This means the default local Darwin Nix path now validates the native package instead of paying the static/release package cost.
 
 ## Net effect on the heavyweight path
 
 Compared to the pre-Nix-optimization clean-tree heavyweight baseline:
 
-- `current-check` improved from **4m29s** to **2m58s**
-- the heavyweight path is no longer dominated by local Nix package verification after the first build
-- the main remaining costs are now:
+- `current-check` improved from **4m29s** to **2m58s** after the first gate split / Nix package-test change
+- reproducible forced rebuilds now succeed again
+- on Darwin, the default local Nix path dropped from the old static/release-style cost to the native package cost:
+  - `.#default` forced rebuild: **35s**
+  - `.#release` forced rebuild: **3m02s**
+- the main remaining local heavy costs are now:
   - `test-full`
   - `doc` / `coverage-check` on colder runs
-  - a separate Nix nondeterminism issue during forced rebuilds
+  - the explicit Darwin release/static package path when it is intentionally requested
 
 ## Next optimization target
 
 The next likely high-value directions are now:
-1. investigate the Nix nondeterminism reported by `nix build --rebuild --no-link`
-2. decide whether Darwin should really build both `native` and `default` package shapes in local heavy checks
-3. investigate why the Darwin `default` package closure is so much larger than `native`
+1. investigate why the Darwin `release` / `static` package closure is still **1.2 GiB**
+2. decide whether the Darwin release/static package should remain part of local developer workflows at all, or live purely behind explicit release/CI paths
+3. investigate whether the Darwin static package can drop propagated SDK / `pkg-config-wrapper` references from its runtime closure
 
 Related investigation note:
 - `plans/nix-build-time-investigation-candidate-plan-2026-04-06.md`
