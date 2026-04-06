@@ -53,6 +53,22 @@ fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
         "packages.\"default-with-tests\" = trueflowMuslWithTests;",
         "flake explicit default package-with-tests output",
     );
+    assert_contains(
+        &flake,
+        "\"--remap-path-prefix=$NIX_BUILD_TOP=/build\"",
+        "flake nix build root remap flag",
+    );
+    assert_contains(
+        &flake,
+        "\"--remap-path-prefix=$PWD=/build/source\"",
+        "flake source root remap flag",
+    );
+    assert_contains(&flake, "preConfigure = ''", "flake rust path remap hook");
+    assert_contains(
+        &flake,
+        "export RUSTFLAGS=\"''${RUSTFLAGS:+$RUSTFLAGS }${rustPathRemapFlagsString}\"",
+        "flake rustflags export with remap prefixes",
+    );
 
     Ok(())
 }

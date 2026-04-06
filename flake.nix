@@ -33,6 +33,12 @@
           [ pkg-config ]
           ++ lib.optionals stdenv.isDarwin [ apple-sdk libiconv ];
 
+        rustPathRemapFlags = [
+          "--remap-path-prefix=$NIX_BUILD_TOP=/build"
+          "--remap-path-prefix=$PWD=/build/source"
+        ];
+        rustPathRemapFlagsString = pkgs.lib.concatStringsSep " " rustPathRemapFlags;
+
         mkTrueflowPackage = {
           rustPlatform,
           cargoBuildTarget ? null,
@@ -47,6 +53,9 @@
             nativeBuildInputs = [ pkgs.pkg-config ];
             nativeCheckInputs = [ pkgs.gitMinimal ];
             buildInputs = commonBuildInputs;
+            preConfigure = ''
+              export RUSTFLAGS="''${RUSTFLAGS:+$RUSTFLAGS }${rustPathRemapFlagsString}"
+            '';
             inherit doCheck;
           } // pkgs.lib.optionalAttrs (cargoBuildTarget != null) {
             CARGO_BUILD_TARGET = cargoBuildTarget;
