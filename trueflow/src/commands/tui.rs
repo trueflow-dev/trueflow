@@ -2364,6 +2364,16 @@ fn focus_line_span_for_node(
     Some(start..end)
 }
 
+fn block_line_span_for_node(
+    node: &ContentNodeSnapshot,
+    file_line_count: usize,
+) -> Option<std::ops::Range<usize>> {
+    let block = node.block.as_ref()?;
+    let start = block.start_line.min(file_line_count);
+    let end = block.end_line.min(file_line_count);
+    (start < end).then_some(start..end)
+}
+
 fn build_source_context_content(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
@@ -2629,7 +2639,8 @@ fn build_diff_context_content(
     let Some(file_lines) = load_file_lines(state, &node.path) else {
         return content_message("(File missing)", None, palette);
     };
-    let focus_line_span = focus_line_span_for_node(state, node, file_lines.len());
+    let display_line_span = focus_line_span_for_node(state, node, file_lines.len());
+    let block_line_span = block_line_span_for_node(node, file_lines.len());
 
     let Some(file_diff) = cached_file_diff_for_node(state, node) else {
         return content_message("(No path for diff)", None, palette);
@@ -2638,10 +2649,26 @@ fn build_diff_context_content(
     match file_diff {
         vcs::FileDiff::Text { hunks, .. } => {
             let rows = build_contextual_diff_rows(&file_lines, hunks);
-            let focus_row_range = focus_line_span
-                .as_ref()
-                .and_then(|focus| focus_row_range_for_contextual_diff_rows(&rows, focus));
-            let lines = render_contextual_diff_lines(&rows, focus_line_span.as_ref(), palette);
+            let rows = match (&node.kind, display_line_span.as_ref()) {
+                (TreeNodeKind::Block, Some(display_span)) => rows
+                    .into_iter()
+                    .filter(|row| display_span.contains(&row.anchor_index))
+                    .collect::<Vec<_>>(),
+                _ => rows,
+            };
+            let focus_row_range = match node.kind {
+                TreeNodeKind::Block => block_line_span
+                    .as_ref()
+                    .and_then(|focus| focus_row_range_for_contextual_diff_rows(&rows, focus)),
+                _ => display_line_span
+                    .as_ref()
+                    .and_then(|focus| focus_row_range_for_contextual_diff_rows(&rows, focus)),
+            };
+            let highlight_span = match node.kind {
+                TreeNodeKind::Block => block_line_span.as_ref(),
+                _ => display_line_span.as_ref(),
+            };
+            let lines = render_contextual_diff_lines(&rows, highlight_span, palette);
             BuiltContent {
                 total_lines: lines.len(),
                 lines,
@@ -4856,6 +4883,71 @@ mod diff_scope_tests {
         assert_eq!(
             rendered,
             vec!["(No diff changes in this file)", "Press [m] to view source"]
+        );
+    }
+
+    #[test]
+    fn build_block_lines_diff_mode_excludes_previous_function_rows() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_block_diff_scoped")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = concat!(
+            "fn previous() {\n",
+            "    Ok(());\n",
+            "}\n",
+            "fn myfun() {\n",
+            "    new_body();\n",
+            "}\n"
+        );
+        let block_content = "fn myfun() {\n    new_body();\n}\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 3, 6);
+        state.view_mode = ViewMode::Diff;
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::context("fn previous()\n"),
+                        vcs::DiffHunkLine::removed("    old_previous();\n"),
+                        vcs::DiffHunkLine::added("    Ok(());\n"),
+                        vcs::DiffHunkLine::context("}\n"),
+                        vcs::DiffHunkLine::context("fn myfun() {\n"),
+                        vcs::DiffHunkLine::removed("    old_body();\n"),
+                        vcs::DiffHunkLine::added("    new_body();\n"),
+                        vcs::DiffHunkLine::context("}\n"),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_block_lines(&mut state, &snapshot, &palette, 6);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().all(|line| !line.contains("Ok(())")),
+            "block diff should not include previous-function rows: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("fn myfun() {")),
+            "expected block diff to include the current function signature: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("new_body();")),
+            "expected block diff to include the current function change: {rendered:?}"
         );
     }
 
