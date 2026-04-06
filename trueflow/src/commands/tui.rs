@@ -1574,9 +1574,9 @@ where
                 state.input_buffer.clear();
                 state.input_mode = InputMode::ConfirmBatch { action, count };
             } else {
+                on_action(action, state)?;
                 state.input_mode = InputMode::Normal;
                 state.input_buffer.clear();
-                on_action(action, state)?;
             }
         }
     }
@@ -3274,6 +3274,10 @@ fn editing_submit_decision(
     let InputMode::Editing { action } = input_mode else {
         return None;
     };
+    // The TUI intentionally requires visible note text before it will submit a
+    // comment action. Lower layers still model notes as optional so non-TUI
+    // callers can pass `None`, but the overlay UX treats blank submit as
+    // validation failure instead of as an empty comment.
     let note = input_buffer.trim().to_string();
     if note.is_empty() {
         return Some(EditingSubmitDecision::Empty);
@@ -4844,6 +4848,29 @@ mod diff_scope_tests {
             state.editing_validation,
             Some(EditingValidation::NoteRequired)
         );
+    }
+
+    #[test]
+    fn handle_editing_submit_with_action_error_preserves_editor_state() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = "keep me".to_string();
+
+        let error = handle_editing_submit_with(&mut state, |_action, _state| {
+            Err(anyhow::anyhow!("mark failed"))
+        })
+        .expect_err("expected submit failure to preserve editor state");
+
+        assert!(error.to_string().contains("mark failed"));
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert_eq!(state.input_buffer, "keep me");
+        assert_eq!(state.editing_validation, None);
     }
 
     #[test]

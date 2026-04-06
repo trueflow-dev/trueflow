@@ -1,13 +1,13 @@
 use super::{
     AppState, EditingKeyAction, Event, InputMode, KeyCode, KeyEvent, KeyEventKind, KeybindAction,
     Rect, SessionRecap, SpeedReadController, TuiKeybindsConfig, TuiSpeedReadConfig, ViewMode,
-    clear_focus_scroll, clear_speed_read_if_not_on_current_node, editing_key_action_for_event,
-    execute_action_with, handle_child, handle_confirm_cancel, handle_editing_cancel,
-    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
-    handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
-    handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding, is_recap_mode,
-    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
-    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
+    clear_editing_validation, clear_focus_scroll, clear_speed_read_if_not_on_current_node,
+    editing_key_action_for_event, execute_action_with, handle_child, handle_confirm_cancel,
+    handle_editing_cancel, handle_editing_submit_with, handle_mouse_event, handle_next,
+    handle_note_action, handle_parent, handle_paste_event, handle_prev, handle_scroll_line_down,
+    handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
+    handle_speed_read_key_binding, is_recap_mode, key_code_accepts_repeat_in_normal_mode,
+    key_event_for_press_event, key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
     keybind_action_for_key_code, set_focus_for_current_node, should_rerender_on_event,
     toggle_speed_read_mode, ui, vcs,
 };
@@ -17,6 +17,7 @@ use crate::commands::mark;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::ReviewScope;
+use crate::store::Verdict;
 use crate::tree::TreeBuilder;
 use anyhow::{Result, bail};
 use ratatui::{Terminal, backend::Backend};
@@ -25,8 +26,31 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedMarkAction {
+    pub fingerprint: String,
+    pub verdict: Verdict,
+    pub check: String,
+    pub note: Option<String>,
+    pub path: Option<String>,
+    pub line: Option<u32>,
+}
+
+impl From<mark::MarkParams> for ScriptedMarkAction {
+    fn from(params: mark::MarkParams) -> Self {
+        Self {
+            fingerprint: params.fingerprint,
+            verdict: params.verdict,
+            check: params.check,
+            note: params.note,
+            path: params.path,
+            line: params.line,
+        }
+    }
+}
+
 pub trait MarkActionRunner {
-    fn run_mark(&mut self, params: &mark::MarkParams) -> Result<()>;
+    fn run_mark(&mut self, action: &ScriptedMarkAction) -> Result<()>;
 }
 
 pub struct CliMarkActionRunner {
@@ -44,26 +68,26 @@ impl CliMarkActionRunner {
 }
 
 impl MarkActionRunner for CliMarkActionRunner {
-    fn run_mark(&mut self, params: &mark::MarkParams) -> Result<()> {
+    fn run_mark(&mut self, action: &ScriptedMarkAction) -> Result<()> {
         let mut command = Command::new(&self.bin_path);
         command
             .current_dir(&self.repo_root)
             .arg("mark")
             .arg("--fingerprint")
-            .arg(&params.fingerprint)
+            .arg(&action.fingerprint)
             .arg("--verdict")
-            .arg(params.verdict.as_str())
+            .arg(action.verdict.as_str())
             .arg("--check")
-            .arg(&params.check)
+            .arg(&action.check)
             .arg("--quiet");
 
-        if let Some(note) = &params.note {
+        if let Some(note) = &action.note {
             command.arg("--note").arg(note);
         }
-        if let Some(path) = &params.path {
+        if let Some(path) = &action.path {
             command.arg("--path").arg(path);
         }
-        if let Some(line) = params.line {
+        if let Some(line) = action.line {
             command.arg("--line").arg(line.to_string());
         }
 
@@ -87,6 +111,12 @@ where
     terminal: Terminal<B>,
     state: AppState,
     mark_action_runner: Option<Box<dyn MarkActionRunner>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScriptedSessionRecap {
+    pub comments: usize,
+    pub blocks_touched: usize,
 }
 
 impl<B> ScriptedTui<B>
@@ -145,6 +175,10 @@ where
         handle_note_action(&mut self.state)
     }
 
+    pub fn send_paste(&mut self, pasted: impl Into<String>) -> Result<()> {
+        self.apply_event(&Event::Paste(pasted.into()))
+    }
+
     pub fn backend(&self) -> &B {
         self.terminal.backend()
     }
@@ -166,6 +200,17 @@ where
 
     pub fn input_buffer(&self) -> &str {
         &self.state.input_buffer
+    }
+
+    pub fn remaining_blocks(&self) -> usize {
+        self.state.remaining_blocks
+    }
+
+    pub fn session_recap(&self) -> ScriptedSessionRecap {
+        ScriptedSessionRecap {
+            comments: self.state.session_recap.comments,
+            blocks_touched: self.state.session_recap.blocks_touched,
+        }
     }
 
     pub fn root_cursor_label(&self) -> Option<String> {
@@ -292,17 +337,25 @@ where
                     let Some(runner) = runner.as_mut() else {
                         bail!("submit is not supported in the scripted test harness")
                     };
-                    execute_action_with(state, action, |params| runner.run_mark(&params))
+                    execute_action_with(state, action, |params| {
+                        let scripted_action = ScriptedMarkAction::from(params);
+                        runner.run_mark(&scripted_action)
+                    })
                 })?;
             }
             EditingKeyAction::InsertNewline => {
+                clear_editing_validation(&mut self.state);
                 self.state.input_buffer.push('\n');
             }
             EditingKeyAction::Cancel => handle_editing_cancel(&mut self.state),
             EditingKeyAction::Backspace => {
+                clear_editing_validation(&mut self.state);
                 self.state.input_buffer.pop();
             }
-            EditingKeyAction::InsertChar(c) => self.state.input_buffer.push(c),
+            EditingKeyAction::InsertChar(c) => {
+                clear_editing_validation(&mut self.state);
+                self.state.input_buffer.push(c)
+            }
             EditingKeyAction::Ignore => {}
         }
 
