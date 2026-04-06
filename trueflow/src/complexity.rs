@@ -18,6 +18,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
         Language::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -92,6 +93,18 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
                 | "do_while_statement"
                 | "catch_block"
         ),
+        Language::CSharp => matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "foreach_statement"
+                | "while_statement"
+                | "do_statement"
+                | "switch_statement"
+                | "switch_expression"
+                | "catch_clause"
+                | "conditional_expression"
+        ),
         Language::Python => matches!(
             kind,
             "if_statement"
@@ -119,6 +132,7 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         Language::JavaScript | Language::TypeScript => matches!(kind, "&&" | "||" | "??"),
         Language::Java => matches!(kind, "&&" | "||"),
         Language::Kotlin => matches!(kind, "&&" | "||" | "?:"),
+        Language::CSharp => matches!(kind, "&&" | "||" | "??"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
@@ -269,6 +283,28 @@ fun run(values: List<Int>): Int {
         assert_eq!(calculate("# heading", Language::Markdown), None);
         assert_eq!(calculate("whatever", Language::Unknown), None);
         assert_eq!(calculate("key = \"value\"", Language::Toml), None);
+    }
+
+    #[test]
+    fn test_calculate_complexity_csharp() {
+        let code = "
+int Build(int?[] values, bool ready) {
+    for (var index = 0; index < values.Length; index++) {
+        var current = values[index] ?? 0;
+        if (current > 0 && ready) {
+            return current;
+        }
+    }
+    return 0;
+}
+";
+        // for: +1
+        // ??: +1
+        // if inside for: +1 + nesting 1 = 2
+        // &&: +1
+        // Total: 5
+        let score = calculate(code, Language::CSharp);
+        assert_eq!(score, Some(5));
     }
 
     #[test]

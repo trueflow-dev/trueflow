@@ -2410,7 +2410,12 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Variable));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
-        assert!(blocks.iter().all(|block| block.complexity.is_none()));
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| block.kind != BlockKind::Gap)
+                .all(|block| block.complexity.is_some())
+        );
         assert!(
             blocks.iter().any(|block| block.kind == BlockKind::Method
                 && block.tags.iter().any(|tag| tag == "test"))

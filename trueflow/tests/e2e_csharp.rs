@@ -62,10 +62,27 @@ fn test_csharp_fixture_detects_language_and_structural_blocks() -> Result<()> {
         kinds.contains(&"variable"),
         "expected property block: {kinds:?}"
     );
-    assert!(
-        blocks.iter().all(|block| block.get("complexity").is_none()),
-        "expected complexity to remain None for C#: {blocks:#?}"
-    );
+    let greeter_class = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("class")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("class Greeter : IGreeter"))
+        })
+        .context("missing Greeter class block")?;
+    assert_eq!(greeter_class["complexity"].as_u64(), Some(5));
+
+    let build_greeting = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("method")
+                && block["content"].as_str().is_some_and(|content| {
+                    content.contains("public GreetingResult BuildGreeting(string target)")
+                })
+        })
+        .context("missing BuildGreeting method block")?;
+    assert_eq!(build_greeting["complexity"].as_u64(), Some(5));
 
     let test_file = files
         .iter()
