@@ -181,8 +181,25 @@ labels.
 ## Development
 
 ```sh
+# Fast default local gate
 nix develop -c just check
+
+# Fast local developer loop with tests
+nix develop -c just check-dev
+
+# Full local verification path
+nix develop -c just check-full
+
+# Capture timing breakdowns for the current gate definitions
+nix develop -c just measure-check
+nix develop -c just measure-check-full
+
+# Generate a coverage report
 nix develop -c just coverage
 ```
+
+`just check` is the fast local default: compile, lint, and format checks.
+The heavier non-inner-loop work lives behind `just check-full`.
+Timing artifacts are written under `.trueflow/measurements/`.
 
     The coverage report is written to `trueflow/target/llvm-cov/html/index.html`.

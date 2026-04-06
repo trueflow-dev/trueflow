@@ -9,19 +9,27 @@ Usage:
   scripts/measure-checks.sh --list-stages
 
 Profiles:
-  current-check   Current heavyweight local gate (test, lint, fmt, audit, doc, coverage, nix builds)
-  local-minimum   Minimum fast local correctness gate (compile, lint, fmt)
-  local-dev       Faster local developer loop (compile, test, lint, fmt)
+  check           Fast default local gate (compile, lint, fmt)
+  check-dev       Fast local developer loop (tests, lint, fmt)
+  check-heavy     Heavyweight non-inner-loop checks (audit, doc, coverage, nix builds)
+  check-full      Full local verification path
+  current-check   Legacy alias for check-full
+  local-minimum   Legacy alias for check
+  local-dev       Legacy alias for check-dev
 
 Examples:
-  scripts/measure-checks.sh --profile current-check
-  scripts/measure-checks.sh --profile local-minimum
+  scripts/measure-checks.sh --profile check
+  scripts/measure-checks.sh --profile check-full
   scripts/measure-checks.sh lint test
 EOF
 }
 
 list_profiles() {
   cat <<'EOF'
+check
+check-dev
+check-heavy
+check-full
 current-check
 local-minimum
 local-dev
@@ -31,8 +39,11 @@ EOF
 list_stages() {
   cat <<'EOF'
 compile-check
+compile-check-all-targets
 test
+test-full
 lint
+lint-all-targets
 fmt-check
 audit
 doc
@@ -45,12 +56,21 @@ EOF
 stage_command() {
   case "$1" in
     compile-check)
+      printf '%s\n' 'cd trueflow && cargo check --all-features --lib --bins --tests'
+      ;;
+    compile-check-all-targets)
       printf '%s\n' 'cd trueflow && cargo check --all-features --all-targets'
       ;;
     test)
+      printf '%s\n' 'cd trueflow && cargo nextest run --all-features'
+      ;;
+    test-full)
       printf '%s\n' 'cd trueflow && cargo nextest run --all-features --all-targets'
       ;;
     lint)
+      printf '%s\n' 'cd trueflow && cargo clippy --all-features --lib --bins --tests -- -D warnings'
+      ;;
+    lint-all-targets)
       printf '%s\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'
       ;;
     fmt-check)
@@ -80,14 +100,17 @@ stage_command() {
 
 profile_stages() {
   case "$1" in
-    current-check)
-      printf '%s\n' test lint fmt-check audit doc coverage-check nix-check-native nix-check-default
-      ;;
-    local-minimum)
+    check|local-minimum)
       printf '%s\n' compile-check lint fmt-check
       ;;
-    local-dev)
-      printf '%s\n' compile-check test lint fmt-check
+    check-dev|local-dev)
+      printf '%s\n' test lint fmt-check
+      ;;
+    check-heavy)
+      printf '%s\n' audit doc coverage-check nix-check-native nix-check-default
+      ;;
+    check-full|current-check)
+      printf '%s\n' test-full lint-all-targets fmt-check audit doc coverage-check nix-check-native nix-check-default
       ;;
     *)
       echo "unknown profile: $1" >&2
@@ -111,7 +134,7 @@ format_duration() {
   fi
 }
 
-profile="current-check"
+profile="check"
 output_dir=""
 run_name=""
 custom_stages=()
