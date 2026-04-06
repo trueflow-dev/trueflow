@@ -5924,6 +5924,10 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: GO_KEYWORDS,
             line_comment_start: Some("//"),
         },
+        Language::C => LanguageHighlightRules {
+            keywords: CPP_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
         Language::Cpp => LanguageHighlightRules {
             keywords: CPP_KEYWORDS,
             line_comment_start: Some("//"),
@@ -5940,7 +5944,14 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: JUST_KEYWORDS,
             line_comment_start: Some("#"),
         },
-        Language::Markdown | Language::Toml | Language::Text | Language::Unknown => return None,
+        Language::Kotlin
+        | Language::CSharp
+        | Language::Ruby
+        | Language::Php
+        | Language::Markdown
+        | Language::Toml
+        | Language::Text
+        | Language::Unknown => return None,
     };
 
     Some(LineHighlighter { rules })
