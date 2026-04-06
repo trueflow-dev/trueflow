@@ -44,7 +44,7 @@ use ratatui::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // --- Core Structs ---
 
@@ -622,12 +622,91 @@ fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> Stri
     path_utils::repo_relative_path_for_diff(path, workdir_prefix)
 }
 
+#[derive(Default)]
+struct EventPump {
+    pending: Option<Event>,
+}
+
+impl EventPump {
+    fn read_blocking(&mut self) -> Result<Event> {
+        if let Some(event) = self.pending.take() {
+            return Ok(event);
+        }
+        Ok(event::read()?)
+    }
+
+    fn read_with_deadline(&mut self, deadline: Option<Instant>) -> Result<Option<Event>> {
+        if let Some(event) = self.pending.take() {
+            return Ok(Some(event));
+        }
+
+        let Some(deadline) = deadline else {
+            return Ok(Some(event::read()?));
+        };
+
+        let now = Instant::now();
+        if deadline <= now {
+            return Ok(None);
+        }
+
+        let timeout = deadline.saturating_duration_since(now);
+        if event::poll(timeout)? {
+            Ok(Some(event::read()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn coalesce_resize_burst(&mut self, first_event: Event) -> Result<Event> {
+        coalesce_resize_event_with(
+            first_event,
+            &mut self.pending,
+            || Ok(event::poll(Duration::from_millis(0))?),
+            || Ok(event::read()?),
+        )
+    }
+}
+
+fn coalesce_resize_event_with<P, R>(
+    first_event: Event,
+    pending: &mut Option<Event>,
+    mut poll_ready: P,
+    mut read_event: R,
+) -> Result<Event>
+where
+    P: FnMut() -> Result<bool>,
+    R: FnMut() -> Result<Event>,
+{
+    let mut event = first_event;
+    if !matches!(event, Event::Resize(_, _)) {
+        return Ok(event);
+    }
+
+    while poll_ready()? {
+        let next_event = read_event()?;
+        if matches!(next_event, Event::Resize(_, _)) {
+            event = next_event;
+            continue;
+        }
+
+        let previous = pending.replace(next_event);
+        debug_assert!(
+            previous.is_none(),
+            "pending event slot was unexpectedly occupied"
+        );
+        break;
+    }
+
+    Ok(event)
+}
+
 fn run_scope_selector(
     terminal: &mut TuiTerminal,
     mut selector: ScopeSelector,
     keybinds: &TuiKeybindsConfig,
 ) -> Result<ScopeSelection> {
     let mut needs_render = true;
+    let mut event_pump = EventPump::default();
 
     loop {
         if needs_render {
@@ -635,7 +714,8 @@ fn run_scope_selector(
             needs_render = false;
         }
 
-        let event = event::read()?;
+        let event = event_pump.read_blocking()?;
+        let event = event_pump.coalesce_resize_burst(event)?;
         if should_rerender_on_event(&event) {
             needs_render = true;
             continue;
@@ -697,6 +777,7 @@ fn run_app(
     mut state: AppState,
 ) -> Result<()> {
     let mut needs_render = true;
+    let mut event_pump = EventPump::default();
 
     loop {
         if needs_render {
@@ -704,7 +785,7 @@ fn run_app(
             needs_render = false;
         }
 
-        let event = read_next_app_event(&state)?;
+        let event = read_next_app_event(&state, &mut event_pump)?;
         if event.is_none() {
             let now = Instant::now();
             let mut rerender = false;
@@ -897,22 +978,11 @@ fn run_app(
     }
 }
 
-fn read_next_app_event(state: &AppState) -> Result<Option<Event>> {
-    let Some(deadline) = next_app_deadline(state) else {
-        return Ok(Some(event::read()?));
-    };
-
-    let now = Instant::now();
-    if deadline <= now {
+fn read_next_app_event(state: &AppState, event_pump: &mut EventPump) -> Result<Option<Event>> {
+    let Some(event) = event_pump.read_with_deadline(next_app_deadline(state))? else {
         return Ok(None);
-    }
-
-    let timeout = deadline.saturating_duration_since(now);
-    if event::poll(timeout)? {
-        Ok(Some(event::read()?))
-    } else {
-        Ok(None)
-    }
+    };
+    Ok(Some(event_pump.coalesce_resize_burst(event)?))
 }
 
 fn next_app_deadline(state: &AppState) -> Option<Instant> {
@@ -4128,6 +4198,82 @@ mod diff_scope_tests {
         ));
         assert!(should_rerender_on_event(&resize));
         assert!(!should_rerender_on_event(&key));
+    }
+
+    #[test]
+    fn coalesce_resize_event_returns_last_resize_in_burst() {
+        let mut pending = None;
+        let queued = std::cell::RefCell::new(std::collections::VecDeque::from([
+            Event::Resize(121, 40),
+            Event::Resize(122, 41),
+        ]));
+
+        let event = coalesce_resize_event_with(
+            Event::Resize(120, 40),
+            &mut pending,
+            || Ok(!queued.borrow().is_empty()),
+            || {
+                let event = queued
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| panic!("expected queued event"));
+                Ok(event)
+            },
+        )
+        .unwrap_or_else(|error| panic!("expected coalesced resize: {error}"));
+
+        assert_eq!(event, Event::Resize(122, 41));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn coalesce_resize_event_preserves_following_non_resize_event() {
+        let key_event = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut pending = None;
+        let queued = std::cell::RefCell::new(std::collections::VecDeque::from([
+            Event::Resize(122, 41),
+            key_event,
+        ]));
+
+        let event = coalesce_resize_event_with(
+            Event::Resize(120, 40),
+            &mut pending,
+            || Ok(!queued.borrow().is_empty()),
+            || {
+                let event = queued
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| panic!("expected queued event"));
+                Ok(event)
+            },
+        )
+        .unwrap_or_else(|error| panic!("expected coalesced resize: {error}"));
+
+        assert_eq!(event, Event::Resize(122, 41));
+        let pending = pending.unwrap_or_else(|| panic!("expected pending key"));
+        assert_eq!(key_code_for_press_event(&pending), Some(KeyCode::Char('j')));
+    }
+
+    #[test]
+    fn event_pump_read_with_deadline_returns_pending_event_before_timeout() {
+        let pending_key = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut event_pump = EventPump {
+            pending: Some(pending_key),
+        };
+
+        let event = event_pump
+            .read_with_deadline(Some(Instant::now()))
+            .unwrap_or_else(|error| panic!("expected pending event: {error}"));
+
+        let event = event.unwrap_or_else(|| panic!("expected pending event"));
+        assert_eq!(key_code_for_press_event(&event), Some(KeyCode::Char('j')));
+        assert!(event_pump.pending.is_none());
     }
 
     #[test]
