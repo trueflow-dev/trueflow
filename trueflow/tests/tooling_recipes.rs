@@ -16,6 +16,48 @@ fn assert_contains(haystack: &str, needle: &str, context: &str) {
 }
 
 #[test]
+fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
+    let flake_path = repo_root()?.join("flake.nix");
+    if !flake_path.exists() {
+        return Ok(());
+    }
+    let flake = fs::read_to_string(flake_path)?;
+
+    assert_contains(
+        &flake,
+        "trueflow = mkTrueflowPackage {\n          rustPlatform = rustPlatform;\n          doCheck = false;\n        };",
+        "flake native package build policy",
+    );
+    assert_contains(
+        &flake,
+        "trueflowWithTests = mkTrueflowPackage {\n          rustPlatform = rustPlatform;\n          doCheck = true;\n        };",
+        "flake native package with tests policy",
+    );
+    assert_contains(
+        &flake,
+        "trueflowMusl = mkTrueflowPackage {\n          rustPlatform = pkgs.pkgsStatic.rustPlatform;\n          cargoBuildTarget = \"${pkgs.pkgsStatic.stdenv.hostPlatform.config}\";\n          doCheck = false;\n        };",
+        "flake default package build policy",
+    );
+    assert_contains(
+        &flake,
+        "trueflowMuslWithTests = mkTrueflowPackage {\n          rustPlatform = pkgs.pkgsStatic.rustPlatform;\n          cargoBuildTarget = \"${pkgs.pkgsStatic.stdenv.hostPlatform.config}\";\n          doCheck = true;\n        };",
+        "flake default package with tests policy",
+    );
+    assert_contains(
+        &flake,
+        "packages.\"native-with-tests\" = trueflowWithTests;",
+        "flake explicit native package-with-tests output",
+    );
+    assert_contains(
+        &flake,
+        "packages.\"default-with-tests\" = trueflowMuslWithTests;",
+        "flake explicit default package-with-tests output",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     let justfile_path = repo_root()?.join("Justfile");
     if !justfile_path.exists() {
@@ -68,6 +110,26 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
         "lint-all-targets:\n    cd trueflow && cargo clippy --all-features --all-targets -- -D warnings\n",
         "Justfile lint-all-targets recipe",
     );
+    assert_contains(
+        &justfile,
+        "nix-check:\n    nix build --no-link .#native .#default\n",
+        "Justfile nix-check recipe",
+    );
+    assert_contains(
+        &justfile,
+        "nix-check-with-tests:\n    nix build --no-link .#native-with-tests .#default-with-tests\n",
+        "Justfile nix-check-with-tests recipe",
+    );
+    assert_contains(
+        &justfile,
+        "nix-check-native-with-tests:\n    nix build --no-link .#native-with-tests\n",
+        "Justfile nix-check-native-with-tests recipe",
+    );
+    assert_contains(
+        &justfile,
+        "nix-check-default-with-tests:\n    nix build --no-link .#default-with-tests\n",
+        "Justfile nix-check-default-with-tests recipe",
+    );
 
     Ok(())
 }
@@ -89,6 +151,11 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
         &measure_script,
         "compile-check-all-targets\ntest\ntest-full\nlint\nlint-all-targets",
         "measure-check stage list",
+    );
+    assert_contains(
+        &measure_script,
+        "nix-check\nnix-check-native\nnix-check-default\nnix-check-native-with-tests\nnix-check-default-with-tests",
+        "measure-check nix stage list",
     );
     assert_contains(
         &measure_script,
@@ -127,7 +194,22 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    check-full|current-check)\n      printf '%s\\n' test-full lint-all-targets fmt-check audit doc coverage-check nix-check-native nix-check-default",
+        "    nix-check)\n      printf '%s\\n' 'nix build --no-link .#native .#default'",
+        "measure-check nix-check stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    nix-check-native-with-tests)\n      printf '%s\\n' 'nix build --no-link .#native-with-tests'",
+        "measure-check nix-check-native-with-tests stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    nix-check-default-with-tests)\n      printf '%s\\n' 'nix build --no-link .#default-with-tests'",
+        "measure-check nix-check-default-with-tests stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    check-full|current-check)\n      printf '%s\\n' test-full lint-all-targets fmt-check audit doc coverage-check nix-check",
         "measure-check check-full profile",
     );
 

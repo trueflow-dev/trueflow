@@ -85,16 +85,29 @@ doc:
 coverage-check:
     cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
 
-# Verify flake packages build
-nix-check: nix-check-native nix-check-default
+# Verify both flake packages build in one Nix invocation
+nix-check:
+    nix build --no-link .#native .#default
 
-# Verify the native flake package builds
+# Verify only the native flake package builds
 nix-check-native:
-    nix build .#native
+    nix build --no-link .#native
 
-# Verify the default flake package builds
+# Verify only the default flake package builds
 nix-check-default:
-    nix build .#default
+    nix build --no-link .#default
+
+# Explicitly rerun package-build tests for both flake package variants
+nix-check-with-tests:
+    nix build --no-link .#native-with-tests .#default-with-tests
+
+# Explicitly rerun package-build tests for the native flake package
+nix-check-native-with-tests:
+    nix build --no-link .#native-with-tests
+
+# Explicitly rerun package-build tests for the default flake package
+nix-check-default-with-tests:
+    nix build --no-link .#default-with-tests
 
 # Fix clippy issues
 fix-clippy:

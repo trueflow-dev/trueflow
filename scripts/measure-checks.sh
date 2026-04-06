@@ -48,8 +48,11 @@ fmt-check
 audit
 doc
 coverage-check
+nix-check
 nix-check-native
 nix-check-default
+nix-check-native-with-tests
+nix-check-default-with-tests
 EOF
 }
 
@@ -85,11 +88,20 @@ stage_command() {
     coverage-check)
       printf '%s\n' 'cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80'
       ;;
+    nix-check)
+      printf '%s\n' 'nix build --no-link .#native .#default'
+      ;;
     nix-check-native)
-      printf '%s\n' 'nix build .#native'
+      printf '%s\n' 'nix build --no-link .#native'
       ;;
     nix-check-default)
-      printf '%s\n' 'nix build .#default'
+      printf '%s\n' 'nix build --no-link .#default'
+      ;;
+    nix-check-native-with-tests)
+      printf '%s\n' 'nix build --no-link .#native-with-tests'
+      ;;
+    nix-check-default-with-tests)
+      printf '%s\n' 'nix build --no-link .#default-with-tests'
       ;;
     *)
       echo "unknown stage: $1" >&2
@@ -107,10 +119,10 @@ profile_stages() {
       printf '%s\n' compile-check lint fmt-check
       ;;
     check-heavy)
-      printf '%s\n' audit doc coverage-check nix-check-native nix-check-default
+      printf '%s\n' audit doc coverage-check nix-check
       ;;
     check-full|current-check)
-      printf '%s\n' test-full lint-all-targets fmt-check audit doc coverage-check nix-check-native nix-check-default
+      printf '%s\n' test-full lint-all-targets fmt-check audit doc coverage-check nix-check
       ;;
     *)
       echo "unknown profile: $1" >&2

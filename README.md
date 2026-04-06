@@ -190,6 +190,9 @@ nix develop -c just check-fast
 # Full local verification path
 nix develop -c just check-full
 
+# Optional: rerun buildRustPackage's package-level test phase explicitly
+nix develop -c just nix-check-with-tests
+
 # Capture timing breakdowns for the current gate definitions
 nix develop -c just measure-check
 nix develop -c just measure-check-fast
@@ -202,6 +205,7 @@ nix develop -c just coverage
 `just check` is the default local gate: tests, lint, and format checks.
 `just check-fast` keeps the faster compile-only path for cases where you want a quicker no-test loop.
 The heavier non-inner-loop work lives behind `just check-full`.
+`just nix-check-with-tests` is the explicit opt-in path for rerunning crate tests inside the Nix package builds themselves.
 Timing artifacts are written under `.trueflow/measurements/`.
 
     The coverage report is written to `trueflow/target/llvm-cov/html/index.html`.

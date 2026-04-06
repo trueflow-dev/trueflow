@@ -33,32 +33,57 @@
           [ pkg-config ]
           ++ lib.optionals stdenv.isDarwin [ apple-sdk libiconv ];
 
-        trueflow = rustPlatform.buildRustPackage {
-          pname = "trueflow";
-          version = "0.1.0";
-          src = ./trueflow;
-          cargoLock = { lockFile = ./trueflow/Cargo.lock; };
+        mkTrueflowPackage = {
+          rustPlatform,
+          cargoBuildTarget ? null,
+          doCheck ? false,
+        }:
+          rustPlatform.buildRustPackage ({
+            pname = "trueflow";
+            version = "0.1.0";
+            src = ./trueflow;
+            cargoLock = { lockFile = ./trueflow/Cargo.lock; };
 
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          nativeCheckInputs = [ pkgs.gitMinimal ];
-          buildInputs = commonBuildInputs;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeCheckInputs = [ pkgs.gitMinimal ];
+            buildInputs = commonBuildInputs;
+            inherit doCheck;
+          } // pkgs.lib.optionalAttrs (cargoBuildTarget != null) {
+            CARGO_BUILD_TARGET = cargoBuildTarget;
+          });
+
+        # Keep ordinary package builds focused on packaging work. The cargo-based
+        # local check path already runs tests, and the explicit *-with-tests
+        # outputs below preserve the heavier buildRustPackage checkPhase when
+        # needed.
+        trueflow = mkTrueflowPackage {
+          rustPlatform = rustPlatform;
+          doCheck = false;
         };
 
-        trueflowMusl = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
-          pname = "trueflow";
-          version = "0.1.0";
-          src = ./trueflow;
-          cargoLock = { lockFile = ./trueflow/Cargo.lock; };
+        trueflowWithTests = mkTrueflowPackage {
+          rustPlatform = rustPlatform;
+          doCheck = true;
+        };
 
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          nativeCheckInputs = [ pkgs.gitMinimal ];
-          buildInputs = commonBuildInputs;
-          CARGO_BUILD_TARGET = "${pkgs.pkgsStatic.stdenv.hostPlatform.config}";
+        trueflowMusl = mkTrueflowPackage {
+          rustPlatform = pkgs.pkgsStatic.rustPlatform;
+          cargoBuildTarget = "${pkgs.pkgsStatic.stdenv.hostPlatform.config}";
+          doCheck = false;
+        };
+
+        trueflowMuslWithTests = mkTrueflowPackage {
+          rustPlatform = pkgs.pkgsStatic.rustPlatform;
+          cargoBuildTarget = "${pkgs.pkgsStatic.stdenv.hostPlatform.config}";
+          doCheck = true;
         };
       in {
         packages.default = trueflowMusl;
         packages.native = trueflow;
         packages.musl = trueflowMusl;
+        packages."native-with-tests" = trueflowWithTests;
+        packages."default-with-tests" = trueflowMuslWithTests;
+        packages."musl-with-tests" = trueflowMuslWithTests;
         apps.default = flake-utils.lib.mkApp { drv = trueflowMusl; };
 
         devShells.default = pkgs.mkShell {
