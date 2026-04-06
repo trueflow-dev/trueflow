@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+use vt100::Parser;
 
 mod common;
 use common::{TestRepo, read_review_records};
@@ -45,9 +46,112 @@ fn wait_for_output(
     }
 }
 
+fn parsed_screen_contents(output: &Arc<Mutex<Vec<u8>>>, rows: u16, cols: u16) -> String {
+    let bytes = lock_output(output).clone();
+    let mut parser = Parser::new(rows, cols, 0);
+    parser.process(&bytes);
+    parser.screen().contents()
+}
+
 fn send_and_flush(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     writer.write_all(bytes)?;
     writer.flush()?;
+    Ok(())
+}
+
+#[test]
+fn pty_smoke_diff_mode_keeps_wrapped_rows_readable_in_narrow_terminal() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo = TestRepo::new("tui_pty_smoke_diff_wrap")?;
+    repo.git(&["checkout", "-b", "main"])?;
+    repo.write("src/lib.rs", "fn demo() {\n    let value = \"short\";\n}\n")?;
+    repo.add("src/lib.rs")?;
+    repo.commit("add demo")?;
+    repo.git(&["checkout", "-b", "feature"])?;
+    repo.write(
+        "src/lib.rs",
+        "fn demo() {\n    let value = \"this_is_a_very_long_changed_line_that_should_wrap_in_a_narrow_terminal\";\n}\n",
+    )?;
+    repo.add("src/lib.rs")?;
+    repo.commit("long change")?;
+
+    let rows = 20;
+    let cols = 12;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
+    cmd.arg("tui");
+    cmd.arg("--all");
+    cmd.cwd(&repo.path);
+    cmd.env("TERM", "xterm-256color");
+
+    let mut child = pair.slave.spawn_command(cmd)?;
+    let mut writer = pair.master.take_writer()?;
+    let mut reader = pair.master.try_clone_reader()?;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let output_reader = Arc::clone(&output);
+    let reader_thread = thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut output = lock_output(&output_reader);
+                    output.extend_from_slice(&buf[..count]);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    wait_for_output(&output, "Mode: Diff", Duration::from_secs(5))?;
+    let screen = parsed_screen_contents(&output, rows, cols);
+    assert!(
+        screen.lines().any(|row| row.starts_with('-')),
+        "expected a compact removed diff row in a narrow terminal:\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|row| row.starts_with('+')),
+        "expected a compact added diff row in a narrow terminal:\n{screen}"
+    );
+    assert!(
+        screen.lines().all(|row| row.trim() != "2"),
+        "did not expect narrow diff rows to split line-number gutters across rows:\n{screen}"
+    );
+
+    send_and_flush(&mut *writer, b"q")?;
+    drop(writer);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                let output = captured_output(&output);
+                bail!("trueflow tui exited unsuccessfully: {status}; output: {output}");
+            }
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = captured_output(&output);
+            bail!("timed out waiting for TUI PTY smoke test to exit; output: {output}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if let Err(_panic) = reader_thread.join() {
+        bail!("reader thread panicked");
+    }
+
     Ok(())
 }
 

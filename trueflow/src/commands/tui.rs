@@ -302,10 +302,17 @@ struct ContentFrameCacheKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ContentFrameCacheVariant {
-    FileDiff,
+    FileDiff {
+        code_width: u16,
+    },
     FileSource,
-    BlockDiff { focus_mode: vcs::BlockDiffFocusMode },
-    BlockSource { code_height: u16 },
+    BlockDiff {
+        focus_mode: vcs::BlockDiffFocusMode,
+        code_width: u16,
+    },
+    BlockSource {
+        code_height: u16,
+    },
 }
 
 #[derive(Clone)]
@@ -1931,36 +1938,42 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         palette,
     );
     let node_snapshot = ContentNodeSnapshot::from_node(node);
-    let content = if let Some((lines, total_lines)) =
-        build_speed_read_lines(state, node_snapshot.id, palette, focus_layout.code.width)
-    {
-        BuiltContent {
-            lines,
-            total_lines,
-            focus_row_range: None,
+    let full_code_width = focus_layout.code.width.max(1);
+    let mut render_code_width = full_code_width;
+    let mut content = build_render_content(
+        state,
+        &node_snapshot,
+        palette,
+        focus_layout.code.height,
+        render_code_width,
+    );
+    let mut display_metrics =
+        display_metrics_for_content(state, &node_snapshot, &content, render_code_width);
+
+    loop {
+        let show_scrollbar = display_metrics.0 > usize::from(focus_layout.code.height);
+        let desired_code_width = if show_scrollbar {
+            full_code_width.saturating_sub(1).max(1)
+        } else {
+            full_code_width
+        };
+        if desired_code_width == render_code_width {
+            break;
         }
-    } else {
-        build_content_lines_with_frame_cache(
+
+        render_code_width = desired_code_width;
+        content = build_render_content(
             state,
             &node_snapshot,
             palette,
             focus_layout.code.height,
-        )
-    };
+            render_code_width,
+        );
+        display_metrics =
+            display_metrics_for_content(state, &node_snapshot, &content, render_code_width);
+    }
 
-    let (display_total_lines, display_focus_row_range) =
-        if matches!(state.view_mode, ViewMode::Source)
-            && matches!(node_snapshot.kind, TreeNodeKind::File | TreeNodeKind::Block)
-        {
-            wrapped_display_metrics_for_lines(
-                &content.lines,
-                content.focus_row_range.as_ref(),
-                focus_layout.code.width,
-            )
-        } else {
-            (content.total_lines, content.focus_row_range.clone())
-        };
-
+    let (display_total_lines, display_focus_row_range) = display_metrics;
     state.content_height = usize_to_u16_saturating(display_total_lines);
     state.viewport_height = focus_layout.code.height;
     state.code_rect = focus_layout.code;
@@ -1992,7 +2005,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let show_scrollbar = state.content_height > state.viewport_height;
     let code_content_area = if show_scrollbar {
         Rect {
-            width: focus_layout.code.width.saturating_sub(1),
+            width: render_code_width,
             ..focus_layout.code
         }
     } else {
@@ -2028,6 +2041,41 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         .style(Style::default().bg(palette.bg));
 
     frame.render_widget(actions_paragraph, focus_layout.actions);
+}
+
+fn build_render_content(
+    state: &mut AppState,
+    node: &ContentNodeSnapshot,
+    palette: &UiPalette,
+    code_height: u16,
+    code_width: u16,
+) -> BuiltContent {
+    if let Some((lines, total_lines)) =
+        build_speed_read_lines(state, node.id, palette, code_width)
+    {
+        BuiltContent {
+            lines,
+            total_lines,
+            focus_row_range: None,
+        }
+    } else {
+        build_content_lines_with_frame_cache(state, node, palette, code_height, code_width)
+    }
+}
+
+fn display_metrics_for_content(
+    state: &AppState,
+    node: &ContentNodeSnapshot,
+    content: &BuiltContent,
+    code_width: u16,
+) -> (usize, Option<std::ops::Range<usize>>) {
+    if matches!(state.view_mode, ViewMode::Source)
+        && matches!(node.kind, TreeNodeKind::File | TreeNodeKind::Block)
+    {
+        wrapped_display_metrics_for_lines(&content.lines, content.focus_row_range.as_ref(), code_width)
+    } else {
+        (content.total_lines, content.focus_row_range.clone())
+    }
 }
 
 fn wrapped_display_metrics_for_lines(
@@ -2160,6 +2208,7 @@ fn content_frame_cache_key(
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     code_height: u16,
+    code_width: u16,
 ) -> Option<ContentFrameCacheKey> {
     if !is_content_kind_cacheable(node_kind) {
         return None;
@@ -2167,12 +2216,13 @@ fn content_frame_cache_key(
 
     let variant = match node_kind {
         TreeNodeKind::File => match view_mode {
-            ViewMode::Diff => ContentFrameCacheVariant::FileDiff,
+            ViewMode::Diff => ContentFrameCacheVariant::FileDiff { code_width },
             ViewMode::Source => ContentFrameCacheVariant::FileSource,
         },
         TreeNodeKind::Block => match view_mode {
             ViewMode::Diff => ContentFrameCacheVariant::BlockDiff {
                 focus_mode: block_diff_focus_mode,
+                code_width,
             },
             ViewMode::Source => ContentFrameCacheVariant::BlockSource { code_height },
         },
@@ -2195,6 +2245,7 @@ fn build_content_lines_with_frame_cache(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     code_height: u16,
+    code_width: u16,
 ) -> BuiltContent {
     let key = content_frame_cache_key(
         node.id,
@@ -2203,6 +2254,7 @@ fn build_content_lines_with_frame_cache(
         state.view_mode,
         state.block_diff_focus_mode,
         code_height,
+        code_width,
     );
 
     if let Some(key) = key {
@@ -2214,7 +2266,7 @@ fn build_content_lines_with_frame_cache(
             };
         }
 
-        let content = build_content_lines(state, node, palette, code_height);
+        let content = build_content_lines(state, node, palette, code_height, code_width);
         state.content_frame_cache.insert(
             key,
             ContentFrameCacheEntry {
@@ -2226,7 +2278,7 @@ fn build_content_lines_with_frame_cache(
         return content;
     }
 
-    build_content_lines(state, node, palette, code_height)
+    build_content_lines(state, node, palette, code_height, code_width)
 }
 
 fn build_header_lines(
@@ -2535,10 +2587,11 @@ fn build_content_lines(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     code_height: u16,
+    code_width: u16,
 ) -> BuiltContent {
     match node.kind {
-        TreeNodeKind::Block => build_block_lines(state, node, palette, code_height),
-        TreeNodeKind::File => build_file_lines(state, node, palette, code_height),
+        TreeNodeKind::Block => build_block_lines(state, node, palette, code_height, code_width),
+        TreeNodeKind::File => build_file_lines(state, node, palette, code_height, code_width),
         TreeNodeKind::Directory => {
             let (lines, total_lines) = build_directory_lines(state, node, palette, code_height);
             BuiltContent {
@@ -2838,26 +2891,181 @@ fn style_for_contextual_diff_row(
     }
 }
 
+struct RenderedContextualDiffLines {
+    lines: Vec<Line<'static>>,
+    row_ranges: Vec<std::ops::Range<usize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffOverlayFormat {
+    Full,
+    Compact,
+}
+
+const FULL_DIFF_OVERLAY_GUTTER_WIDTH: usize = 14;
+
 fn render_contextual_diff_lines(
     rows: &[ContextualDiffRow],
     focus_line_span: Option<&std::ops::Range<usize>>,
     palette: &UiPalette,
+    code_width: u16,
+) -> RenderedContextualDiffLines {
+    let mut lines = Vec::new();
+    let mut row_ranges = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let style = style_for_contextual_diff_row(row, focus_line_span, palette);
+        let row_lines = wrap_contextual_diff_row(row, style, code_width);
+        let start = lines.len();
+        lines.extend(row_lines);
+        row_ranges.push(start..lines.len());
+    }
+
+    RenderedContextualDiffLines { lines, row_ranges }
+}
+
+fn wrap_contextual_diff_row(
+    row: &ContextualDiffRow,
+    style: Style,
+    code_width: u16,
 ) -> Vec<Line<'static>> {
-    rows.iter()
-        .map(|row| {
-            let text = format_diff_overlay_row(&vcs::DiffLine {
-                kind: row.kind,
-                old_line: row.old_line,
-                new_line: row.new_line,
-                text: row.text.clone(),
-                is_focus: false,
-            });
-            Line::from(Span::styled(
-                text,
-                style_for_contextual_diff_row(row, focus_line_span, palette),
-            ))
-        })
-        .collect()
+    let diff_line = vcs::DiffLine {
+        kind: row.kind,
+        old_line: row.old_line,
+        new_line: row.new_line,
+        text: row.text.clone(),
+        is_focus: false,
+    };
+
+    wrap_diff_overlay_row(&diff_line, style, code_width)
+}
+
+fn wrap_diff_overlay_row(
+    line: &vcs::DiffLine,
+    style: Style,
+    code_width: u16,
+) -> Vec<Line<'static>> {
+    let available_width = usize::from(code_width.max(1));
+    let format = diff_overlay_format_for_width(code_width);
+    let prefix = diff_overlay_prefix(line, format, available_width);
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let text = expand_tabs_for_display(&line.text);
+
+    if prefix_width >= available_width {
+        let mut lines = vec![Line::from(Span::styled(prefix, style))];
+        if text.is_empty() {
+            return lines;
+        }
+        lines.extend(
+            wrap_text_to_width(&text, available_width)
+                .into_iter()
+                .map(|chunk| Line::from(Span::styled(chunk, style))),
+        );
+        return lines;
+    }
+
+    let continuation_prefix = " ".repeat(prefix_width);
+    let text_width = available_width.saturating_sub(prefix_width).max(1);
+    let wrapped_text = wrap_text_to_width(&text, text_width);
+
+    if wrapped_text.is_empty() {
+        return vec![Line::from(Span::styled(prefix, style))];
+    }
+
+    let mut lines = Vec::with_capacity(wrapped_text.len());
+    for (index, chunk) in wrapped_text.into_iter().enumerate() {
+        let row_text = if index == 0 {
+            format!("{prefix}{chunk}")
+        } else {
+            format!("{continuation_prefix}{chunk}")
+        };
+        lines.push(Line::from(Span::styled(row_text, style)));
+    }
+    lines
+}
+
+fn diff_overlay_format_for_width(code_width: u16) -> DiffOverlayFormat {
+    if usize::from(code_width) <= FULL_DIFF_OVERLAY_GUTTER_WIDTH {
+        DiffOverlayFormat::Compact
+    } else {
+        DiffOverlayFormat::Full
+    }
+}
+
+fn diff_overlay_prefix(
+    line: &vcs::DiffLine,
+    format: DiffOverlayFormat,
+    available_width: usize,
+) -> String {
+    let marker = diff_overlay_marker(line.kind);
+    match format {
+        DiffOverlayFormat::Full if available_width > FULL_DIFF_OVERLAY_GUTTER_WIDTH => {
+            let old_col = format_diff_line_number(line.old_line);
+            let new_col = format_diff_line_number(line.new_line);
+            format!("{old_col} {new_col} {marker} ")
+        }
+        DiffOverlayFormat::Full | DiffOverlayFormat::Compact => {
+            if available_width > 1 {
+                format!("{marker} ")
+            } else {
+                marker.to_string()
+            }
+        }
+    }
+}
+
+fn diff_overlay_marker(kind: vcs::DiffLineKind) -> char {
+    match kind {
+        vcs::DiffLineKind::Context => ' ',
+        vcs::DiffLineKind::Added => '+',
+        vcs::DiffLineKind::Removed => '-',
+    }
+}
+
+fn wrap_text_to_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width.saturating_add(ch_width) > width {
+            wrapped.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+
+        current.push(ch);
+        current_width = current_width.saturating_add(ch_width);
+
+        if current_width >= width {
+            wrapped.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+    }
+
+    if !current.is_empty() || wrapped.is_empty() {
+        wrapped.push(current);
+    }
+
+    wrapped
+}
+
+fn focus_row_range_for_wrapped_contextual_diff_rows(
+    row_ranges: &[std::ops::Range<usize>],
+    focus_row_range: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    if focus_row_range.is_empty() {
+        return None;
+    }
+
+    let start = row_ranges.get(focus_row_range.start)?.start;
+    let end = row_ranges.get(focus_row_range.end.saturating_sub(1))?.end;
+    Some(start..end)
 }
 
 fn source_hint_text(keybinds: &TuiKeybindsConfig) -> String {
@@ -2890,6 +3098,7 @@ fn build_diff_context_content(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
+    code_width: u16,
 ) -> BuiltContent {
     let Some(file_lines) = load_file_lines(state, &node.path) else {
         return content_message("(File missing)", None, palette);
@@ -2923,10 +3132,13 @@ fn build_diff_context_content(
                 TreeNodeKind::Block => block_line_span.as_ref(),
                 _ => display_line_span.as_ref(),
             };
-            let lines = render_contextual_diff_lines(&rows, highlight_span, palette);
+            let rendered = render_contextual_diff_lines(&rows, highlight_span, palette, code_width);
+            let focus_row_range = focus_row_range.as_ref().and_then(|focus| {
+                focus_row_range_for_wrapped_contextual_diff_rows(&rendered.row_ranges, focus)
+            });
             BuiltContent {
-                total_lines: lines.len(),
-                lines,
+                total_lines: rendered.lines.len(),
+                lines: rendered.lines,
                 focus_row_range,
             }
         }
@@ -2955,21 +3167,19 @@ fn build_block_lines(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
+    code_width: u16,
 ) -> BuiltContent {
     if state.view_mode == ViewMode::Diff {
-        return build_diff_context_content(state, node, palette);
+        return build_diff_context_content(state, node, palette, code_width);
     }
     build_source_context_content(state, node, palette)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn format_diff_overlay_row(line: &vcs::DiffLine) -> String {
     let old_col = format_diff_line_number(line.old_line);
     let new_col = format_diff_line_number(line.new_line);
-    let marker = match line.kind {
-        vcs::DiffLineKind::Context => ' ',
-        vcs::DiffLineKind::Added => '+',
-        vcs::DiffLineKind::Removed => '-',
-    };
+    let marker = diff_overlay_marker(line.kind);
     let text = expand_tabs_for_display(&line.text);
     format!("{old_col} {new_col} {marker} {text}")
 }
@@ -3034,9 +3244,10 @@ fn build_file_lines(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
+    code_width: u16,
 ) -> BuiltContent {
     if state.view_mode == ViewMode::Diff {
-        return build_diff_context_content(state, node, palette);
+        return build_diff_context_content(state, node, palette, code_width);
     }
     build_source_context_content(state, node, palette)
 }
@@ -5066,6 +5277,7 @@ mod diff_scope_tests {
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
         let key_b = content_frame_cache_key(
             node_id,
@@ -5074,6 +5286,7 @@ mod diff_scope_tests {
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
         let key_c = content_frame_cache_key(
             node_id,
@@ -5082,6 +5295,7 @@ mod diff_scope_tests {
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             25,
+            80,
         );
 
         assert!(key_a.is_some());
@@ -5104,7 +5318,7 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let content = build_block_lines(&mut state, &snapshot, &palette, 2);
+        let content = build_block_lines(&mut state, &snapshot, &palette, 2, 80);
         let rendered = content
             .lines
             .iter()
@@ -5136,7 +5350,7 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3, 80);
         let rendered = content
             .lines
             .iter()
@@ -5208,7 +5422,7 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3, 80);
         let rendered = content
             .lines
             .iter()
@@ -5245,6 +5459,63 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn build_file_lines_diff_mode_uses_compact_gutter_when_code_width_is_narrow() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_file_diff_mode_narrow_gutter")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content =
+            "fn demo() {\n    let value = \"this_is_a_very_long_changed_line\";\n}\n";
+        let block_content = file_content;
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 3);
+        state.view_mode = ViewMode::Diff;
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::context("fn demo() {\n"),
+                        vcs::DiffHunkLine::removed("    let value = \"short\";\n"),
+                        vcs::DiffHunkLine::added(
+                            "    let value = \"this_is_a_very_long_changed_line\";\n",
+                        ),
+                        vcs::DiffHunkLine::context("}\n"),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3, 12);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.starts_with('-')),
+            "expected compact removed gutter in narrow diff mode: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.starts_with('+')),
+            "expected compact added gutter in narrow diff mode: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|line| line.trim() != "2"),
+            "did not expect wrapped rows to split line-number gutters: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn build_file_lines_diff_mode_shows_no_changes_hint() {
         let temp_root = std::env::temp_dir()
             .join("trueflow_tests")
@@ -5266,7 +5537,7 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3, 80);
         let rendered = content
             .lines
             .iter()
@@ -5303,7 +5574,7 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let content = build_file_lines(&mut state, &snapshot, &palette, 3);
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3, 80);
         let rendered = content
             .lines
             .iter()
@@ -5335,7 +5606,7 @@ mod diff_scope_tests {
         let palette = UiPalette::default();
 
         state.view_mode = ViewMode::Diff;
-        let content = build_block_lines(&mut state, &snapshot, &palette, 3);
+        let content = build_block_lines(&mut state, &snapshot, &palette, 3, 80);
         let rendered = content
             .lines
             .iter()
@@ -5393,7 +5664,7 @@ mod diff_scope_tests {
         let snapshot = ContentNodeSnapshot::from_node(node);
         let palette = UiPalette::default();
 
-        let content = build_block_lines(&mut state, &snapshot, &palette, 6);
+        let content = build_block_lines(&mut state, &snapshot, &palette, 6, 80);
         let rendered = content
             .lines
             .iter()
@@ -5456,7 +5727,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn content_cache_key_ignores_height_for_block_diff() {
+    fn content_cache_key_ignores_height_for_block_diff_when_width_matches() {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
@@ -5465,6 +5736,7 @@ mod diff_scope_tests {
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
         let key_b = content_frame_cache_key(
             node_id,
@@ -5473,9 +5745,35 @@ mod diff_scope_tests {
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
             40,
+            80,
         );
 
         assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn content_cache_key_tracks_block_diff_width() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            None,
+            TreeNodeKind::Block,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+            80,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            None,
+            TreeNodeKind::Block,
+            ViewMode::Diff,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+            40,
+        );
+
+        assert_ne!(key_a, key_b);
     }
 
     #[test]
@@ -5488,6 +5786,7 @@ mod diff_scope_tests {
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
         let source_key = content_frame_cache_key(
             node_id,
@@ -5496,6 +5795,7 @@ mod diff_scope_tests {
             ViewMode::Source,
             vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 3 },
             40,
+            80,
         );
 
         assert_ne!(diff_key, source_key);
@@ -5511,6 +5811,7 @@ mod diff_scope_tests {
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
         let key_b = content_frame_cache_key(
             node_id,
@@ -5519,6 +5820,7 @@ mod diff_scope_tests {
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
 
         assert_ne!(key_a, key_b);
@@ -5565,14 +5867,16 @@ mod diff_scope_tests {
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
         let key_b = content_frame_cache_key(
             node_id,
             None,
             TreeNodeKind::File,
             ViewMode::Diff,
-            vcs::BlockDiffFocusMode::ChangedWithContext { context_lines: 3 },
+            vcs::BlockDiffFocusMode::WholeBlock,
             40,
+            80,
         );
 
         assert_eq!(key_a, key_b);
@@ -5588,6 +5892,7 @@ mod diff_scope_tests {
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
             12,
+            80,
         );
         assert!(key.is_none());
     }
@@ -5602,6 +5907,7 @@ mod diff_scope_tests {
             ViewMode::Diff,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
         let key_b = content_frame_cache_key(
             node_id,
@@ -5610,6 +5916,7 @@ mod diff_scope_tests {
             ViewMode::Source,
             vcs::BlockDiffFocusMode::WholeBlock,
             20,
+            80,
         );
 
         let Some(key_a) = key_a else {
@@ -5792,7 +6099,7 @@ mod diff_scope_tests {
         };
         let palette = UiPalette::default();
 
-        let content = build_block_lines(&mut state, &node, &palette, 3);
+        let content = build_block_lines(&mut state, &node, &palette, 3, 80);
         let rendered = content
             .lines
             .iter()
