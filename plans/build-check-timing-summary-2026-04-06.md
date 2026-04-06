@@ -14,6 +14,7 @@ This note captures the measured state after splitting the local check gates, res
 - `f6fe7f0` — `nix: remap rust build paths for reproducibility`
 - `8e48dd6` — `nix: make darwin default package native`
 - `5aa67c4` — `nix: drop unnecessary darwin package inputs`
+- `3b2fa46` — `build: narrow doc and coverage heavy checks`
 
 ## Original baseline
 
@@ -186,26 +187,87 @@ Forced rebuild timings in a clean worktree at the same code state:
 
 This reduced the Darwin release/static package from a giant propagated SDK closure to a small executable output while preserving successful native and release builds.
 
+## Native Darwin libiconv follow-up
+
+I also investigated whether the native Darwin package could drop its `libiconv` reference.
+
+Result: no safe project-level change was landed.
+
+Reason:
+
+- the native output directly references `/nix/store/.../libiconv.2.dylib`
+- `nix why-depends` shows a direct dependency edge from the package output to `libiconv`
+- `otool -L` shows a direct `LC_LOAD_DYLIB` entry for the Nix `libiconv` dylib
+
+So unlike the release/static closure issue, this is not propagated metadata bloat. It is a real runtime link in the native binary.
+
+## Heavy-path doc / coverage follow-up
+
+The next heavy-path optimization targeted the two remaining cold-path bottlenecks:
+
+- dependency doc generation
+- all-targets coverage instrumentation
+
+That was changed in:
+
+- `3b2fa46` — `build: narrow doc and coverage heavy checks`
+
+New behavior:
+
+- `doc` -> `cargo doc --all-features --no-deps`
+- `coverage-check` -> `cargo llvm-cov --all-features --lib --bins --tests --summary-only ...`
+
+Cold-path experiments in the clean green worktree showed:
+
+- `cargo doc --all-features`: **8m54s**
+- `cargo doc --all-features --no-deps`: **16s**
+- old coverage-check (`--all-targets`): **2m29s**
+- new coverage-check (`--lib --bins --tests`): **54s**
+
+Fresh clean-tree profile measurements after `3b2fa46`:
+
+- `check-heavy`: **2m33s**
+  - `audit`: `3s`
+  - `doc`: `24s`
+  - `coverage-check`: `1m00s`
+  - `nix-check`: `1m06s`
+- `current-check`: **1m18s**
+  - `test-full`: `31s`
+  - `lint-all-targets`: `6s`
+  - `fmt-check`: `0s`
+  - `audit`: `3s`
+  - `doc`: `2s`
+  - `coverage-check`: `35s`
+  - `nix-check`: `1s`
+
+Measurement outputs:
+- `.trueflow/measurements/doccov-optimized-check-heavy/`
+- `.trueflow/measurements/doccov-optimized-current-check/`
+- `.trueflow/measurements/doccov-optimized-stages/`
+
 ## Net effect on the heavyweight path
 
 Compared to the pre-Nix-optimization clean-tree heavyweight baseline:
 
 - `current-check` improved from **4m29s** to **2m58s** after the first gate split / Nix package-test change
+- in the later clean green worktree with narrowed docs and coverage, `current-check` measured **1m18s**
 - reproducible forced rebuilds now succeed again
 - on Darwin, the default local Nix path dropped from the old static/release-style cost to the native package cost:
   - `.#default` forced rebuild: **50s**
   - `.#release` forced rebuild: **55s**
+- after narrowing docs and coverage, the cold heavy path in the clean green worktree dropped from **11m29s** to **2m33s**
 - the main remaining local heavy costs are now:
+  - `nix-check` on cold clean worktrees
+  - `coverage-check`
   - `test-full`
-  - `doc` / `coverage-check` on colder runs
   - explicit package-build-with-tests reruns when intentionally requested
 
 ## Next optimization target
 
 The next likely high-value directions are now:
-1. remeasure full `check-heavy` / `check-full` clean-tree timings after the Darwin release closure reduction
-2. investigate whether the native Darwin package can also drop its explicit `libiconv` runtime dependency safely
-3. decide whether any explicit release/static package build should remain in default local developer workflows on Darwin, or live purely behind opt-in release/CI paths
+1. decide whether host-default `nix-check` still belongs inside `check-heavy` / `check-full`, or should become an explicit opt-in / CI-oriented stage
+2. investigate whether `test-full` still needs `--all-targets`, or whether benches/examples can move out of the heavyweight local path
+3. investigate whether coverage can be made cheaper still without weakening the intended signal
 
 Related investigation note:
 - `plans/nix-build-time-investigation-candidate-plan-2026-04-06.md`
