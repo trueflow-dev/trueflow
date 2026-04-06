@@ -79,10 +79,16 @@ fn test_elisp_fixture_scans_as_structured_language() -> Result<()> {
         "expected at least one test-tagged block in elisp fixture"
     );
 
-    assert!(
-        blocks.iter().all(|block| block.get("complexity").is_none()),
-        "expected elisp blocks to leave complexity unset"
-    );
+    let run_block = blocks
+        .iter()
+        .find(|block| {
+            block["kind"].as_str() == Some("function")
+                && block["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("(defun elisp-support-run"))
+        })
+        .context("missing elisp-support-run block")?;
+    assert_eq!(run_block["complexity"].as_u64(), Some(2));
 
     Ok(())
 }

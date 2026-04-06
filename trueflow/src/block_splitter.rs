@@ -2666,7 +2666,12 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
                 .iter()
                 .any(|block| block.content.contains("ert-deftest") && block.has_tag("test"))
         );
-        assert!(blocks.iter().all(|block| block.complexity.is_none()));
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| block.kind != BlockKind::Gap)
+                .all(|block| block.complexity.is_some())
+        );
         assert!(
             !blocks
                 .iter()

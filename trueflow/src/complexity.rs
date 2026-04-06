@@ -13,6 +13,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
     let language = match lang {
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
         Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
+        Language::Elisp => Some(tree_sitter_elisp::LANGUAGE.into()),
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
@@ -27,10 +28,10 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
 
     parser
         .parse(content, None)
-        .map(|tree| calculate_node(tree.root_node(), 0, lang))
+        .map(|tree| calculate_node(tree.root_node(), 0, lang, content))
 }
 
-fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
+fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) -> u32 {
     let mut score = 0;
     let kind = node.kind();
 
@@ -43,6 +44,12 @@ fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
                 | "loop_expression"
                 | "match_expression"
         ),
+        Language::Elisp => {
+            matches!(kind, "if" | "cond" | "while")
+                || elisp_list_head_symbol(node, source).is_some_and(|head| {
+                    matches!(head, "when" | "unless" | "dolist" | "dotimes" | "pcase")
+                })
+        }
         Language::Swift => matches!(
             kind,
             "if_statement"
@@ -92,6 +99,7 @@ fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
 
     let is_logical_op = match lang {
         Language::Rust => matches!(kind, "&&" | "||"),
+        Language::Elisp => matches!(kind, "and" | "or"),
         Language::Swift => {
             matches!(
                 kind,
@@ -115,7 +123,7 @@ fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
         // Increase nesting for children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            score += calculate_node(child, nesting + 1, lang);
+            score += calculate_node(child, nesting + 1, lang, source);
         }
     } else {
         // Just recurse without increasing nesting, unless it's a function definition which resets nesting?
@@ -127,7 +135,7 @@ fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            score += calculate_node(child, nesting, lang);
+            score += calculate_node(child, nesting, lang, source);
         }
     }
 
@@ -135,6 +143,13 @@ fn calculate_node(node: Node, nesting: u32, lang: Language) -> u32 {
     // Simplified: Just +1 + nesting for now.
 
     score
+}
+
+fn elisp_list_head_symbol<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {
+    let head = node.named_child(0)?;
+    (head.kind() == "symbol")
+        .then(|| head.utf8_text(source.as_bytes()).ok())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -182,6 +197,23 @@ def foo():
         // Total: 6
         let score = calculate(code, Language::Python);
         assert_eq!(score, Some(6));
+    }
+
+    #[test]
+    fn test_calculate_complexity_elisp() {
+        let code = "
+(defun run (items)
+  (dolist (item items)
+    (when item
+      (message \"%s\" item)))
+  (and items t))
+";
+        // dolist: +1
+        // when inside dolist: +1 + nesting 1 = 2
+        // and: +1
+        // Total: 4
+        let score = calculate(code, Language::Elisp);
+        assert_eq!(score, Some(4));
     }
 
     #[test]
