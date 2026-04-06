@@ -13,6 +13,7 @@ pub enum Language {
     CSharp,
     Python,
     Ruby,
+    Php,
     Go,
     Cpp,
     Shell,
@@ -49,6 +50,7 @@ impl Language {
             "cs" => Some(Language::CSharp),
             "py" => Some(Language::Python),
             "rb" => Some(Language::Ruby),
+            "php" => Some(Language::Php),
             "go" => Some(Language::Go),
             "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" => Some(Language::Cpp),
             "sh" => Some(Language::Shell),
@@ -207,6 +209,7 @@ mod tests {
         assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("rb"), Some(Language::Ruby));
+        assert_eq!(Language::from_extension("php"), Some(Language::Php));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
@@ -316,6 +319,18 @@ mod tests {
             analyze_file(file.path()),
             FileType::Code(CodeFile {
                 language: Language::Ruby
+            })
+        ));
+    }
+
+    #[test]
+    fn analyze_file_detects_php_by_extension() {
+        let file = write_temp_file("index.php", b"<?php\nfunction main() {}\n");
+
+        assert!(matches!(
+            analyze_file(file.path()),
+            FileType::Code(CodeFile {
+                language: Language::Php
             })
         ));
     }

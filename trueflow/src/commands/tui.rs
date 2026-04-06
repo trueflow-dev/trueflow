@@ -5836,6 +5836,7 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
         Language::Kotlin
         | Language::CSharp
         | Language::Ruby
+        | Language::Php
         | Language::Markdown
         | Language::Toml
         | Language::Text

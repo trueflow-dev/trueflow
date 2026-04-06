@@ -236,6 +236,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         | Language::CSharp
         | Language::Python
         | Language::Ruby
+        | Language::Php
         | Language::Shell => attempt_split(
             content,
             lang,
@@ -306,8 +307,11 @@ fn complete_split(
 
 fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
-    let language = tree_sitter_language_for(lang)
-        .ok_or_else(|| anyhow::anyhow!("No tree-sitter grammar configured for {lang:?}"))?;
+    let language = match lang {
+        Language::Php => php_tree_sitter_language(content),
+        _ => tree_sitter_language_for(lang)
+            .ok_or_else(|| anyhow::anyhow!("No tree-sitter grammar configured for {lang:?}"))?,
+    };
     parser.set_language(&language)?;
 
     let tree = parser
@@ -338,6 +342,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
             Language::Python => ts_kind == "decorator",
             Language::Swift => swift::is_attribute_node(ts_kind),
             Language::CSharp => ts_kind == "attribute_list",
+            Language::Php => ts_kind == "php_tag",
             _ => false,
         };
 
@@ -439,6 +444,17 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         if matches!(lang, Language::Ruby) && matches!(ts_kind, "class" | "module") {
             blocks.extend(collect_ruby_scope_items(child, content, lang));
         }
+        if matches!(lang, Language::Php)
+            && matches!(
+                ts_kind,
+                "class_declaration"
+                    | "interface_declaration"
+                    | "trait_declaration"
+                    | "enum_declaration"
+            )
+        {
+            blocks.extend(collect_php_type_items(child, content, lang));
+        }
 
         last_end_byte = end_byte;
         pending_start = None;
@@ -491,6 +507,14 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
         Language::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
+    }
+}
+
+fn php_tree_sitter_language(content: &str) -> TsLanguage {
+    if content.contains("<?") {
+        tree_sitter_php::LANGUAGE_PHP.into()
+    } else {
+        tree_sitter_php::LANGUAGE_PHP_ONLY.into()
     }
 }
 
@@ -1180,6 +1204,20 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             "method_declaration" | "constructor_declaration" => BlockKind::Method,
             _ => BlockKind::Code,
         },
+        Language::Php => match kind {
+            "namespace_definition" => BlockKind::Module,
+            "namespace_use_declaration" => BlockKind::Import,
+            "class_declaration" => BlockKind::Class,
+            "interface_declaration" => BlockKind::Interface,
+            "trait_declaration" => BlockKind::Impl,
+            "enum_declaration" => BlockKind::Enum,
+            "function_definition" => BlockKind::Function,
+            "method_declaration" => BlockKind::Method,
+            "const_declaration" | "enum_case" => BlockKind::Const,
+            "property_declaration" => BlockKind::Variable,
+            "use_declaration" => BlockKind::Impl,
+            _ => BlockKind::Code,
+        },
         Language::JavaScript | Language::TypeScript => match kind {
             "function_declaration" => BlockKind::Function,
             "class_declaration" => BlockKind::Class,
@@ -1537,6 +1575,33 @@ fn collect_csharp_type_items(
     blocks
 }
 
+fn collect_php_type_items(
+    type_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = map_kind(lang, child.kind());
+            (!matches!(kind, BlockKind::Code)).then(|| {
+                create_block(
+                    &content[child.start_byte()..child.end_byte()],
+                    kind,
+                    content,
+                    child.start_byte(),
+                    child.end_byte(),
+                    lang,
+                )
+            })
+        })
+        .collect()
+}
+
 fn create_block(
     text: &str,
     kind: BlockKind,
@@ -1642,6 +1707,9 @@ fn collect_test_ranges(
         Language::Elisp => collect_elisp_test_ranges(tree.root_node(), source, &mut ranges)?,
         Language::Kotlin => {
             collect_kotlin_test_ranges(tree.root_node(), source, &mut ranges)?;
+        }
+        Language::Php => {
+            collect_php_test_ranges(tree.root_node(), source, &mut ranges)?;
         }
         Language::CSharp => {
             collect_csharp_test_ranges(tree, source, &mut ranges)?;
@@ -1911,6 +1979,28 @@ fn collect_shell_test_ranges(
     Ok(())
 }
 
+fn collect_php_test_ranges(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    ranges: &mut Vec<ByteSpan>,
+) -> Result<()> {
+    if matches!(node.kind(), "function_definition" | "method_declaration")
+        && let Some(name_node) = node.child_by_field_name("name")
+    {
+        let name = name_node.utf8_text(source.as_bytes())?;
+        if name.starts_with("test") {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_php_test_ranges(child, source, ranges)?;
+    }
+
+    Ok(())
+}
+
 fn collect_csharp_test_ranges(
     tree: &tree_sitter::Tree,
     source: &str,
@@ -2144,8 +2234,18 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Variable));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Interface));
-        assert!(blocks.iter().filter(|block| block.kind == BlockKind::Class).count() >= 2);
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Interface)
+        );
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Class)
+                .count()
+                >= 2
+        );
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
         let test_block = blocks
             .iter()
@@ -2192,7 +2292,11 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Interface));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Interface)
+        );
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Struct));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
@@ -2207,6 +2311,42 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
             !blocks
                 .iter()
                 .any(|block| block.kind == BlockKind::Paragraph)
+        );
+    }
+
+    #[test]
+    fn test_php_structural_blocks_and_test_detection() {
+        let content = "<?php\n\nnamespace Demo\\Example;\n\nuse RuntimeException;\n\ninterface Formatter\n{\n    public function format(array $values): string;\n}\n\ntrait NormalizesValues\n{\n    protected function normalize(int $value): int\n    {\n        return max($value, 0);\n    }\n}\n\nenum ReportMode: string\n{\n    case Summary = 'summary';\n\n    public function label(): string\n    {\n        return 'summary';\n    }\n}\n\nfinal class ReportBuilder implements Formatter\n{\n    public function format(array $values): string\n    {\n        return implode(',', $values);\n    }\n\n    public function testFormatsRecords(): void\n    {\n        if ($this->format([1, 2]) !== '1,2') {\n            throw new RuntimeException('unexpected format');\n        }\n    }\n}\n\nfunction test_standalone_helper(): void\n{\n    if (true !== true) {\n        throw new RuntimeException('bad test');\n    }\n}\n";
+        let result = split_result(content, Language::Php);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
+
+        assert_eq!(
+            blocks.first().map(|block| block.kind),
+            Some(BlockKind::Module)
+        );
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Interface)
+        );
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Impl));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| block.tags.iter().any(|tag| tag == "test"))
+                .count()
+                >= 2
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Paragraph))
         );
     }
 
