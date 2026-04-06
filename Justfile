@@ -8,11 +8,14 @@ check: test lint fmt-check
 # Run the faster no-test local gate (compile, lint, fmt)
 check-fast: compile-check lint fmt-check
 
-# Run heavyweight checks that are useful before CI / release work
-check-heavy: audit doc coverage-check nix-check
+# Run heavyweight code checks that are useful before CI / release work
+check-heavy: audit doc coverage-check
 
-# Run the full local verification path
-check-full: test-full lint-all-targets fmt-check audit doc coverage-check nix-check
+# Run the full local code verification path
+check-full: test-full lint-all-targets fmt-check audit doc coverage-check
+
+# Run Nix packaging verification separately from the normal code iteration path
+check-packaging: nix-check
 
 # Measure check pipeline timings (writes under .trueflow/measurements/)
 measure-check profile="check":
@@ -29,6 +32,10 @@ measure-check-heavy:
 # Measure the full local gate
 measure-check-full:
     ./scripts/measure-checks.sh --profile check-full
+
+# Measure the separate packaging gate
+measure-check-packaging:
+    ./scripts/measure-checks.sh --profile check-packaging
 
 # Measure the legacy local developer alias
 measure-local-dev:

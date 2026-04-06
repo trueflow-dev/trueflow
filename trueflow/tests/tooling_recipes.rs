@@ -181,13 +181,18 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "check-heavy: audit doc coverage-check nix-check",
+        "check-heavy: audit doc coverage-check",
         "Justfile check-heavy recipe",
     );
     assert_contains(
         &justfile,
-        "check-full: test-full lint-all-targets fmt-check audit doc coverage-check nix-check",
+        "check-full: test-full lint-all-targets fmt-check audit doc coverage-check",
         "Justfile check-full recipe",
+    );
+    assert_contains(
+        &justfile,
+        "check-packaging: nix-check",
+        "Justfile check-packaging recipe",
     );
     assert_contains(
         &justfile,
@@ -298,7 +303,7 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
 
     assert_contains(
         &measure_script,
-        "check\ncheck-fast\ncheck-heavy\ncheck-full\ncurrent-check\nlocal-minimum\nlocal-dev",
+        "check\ncheck-fast\ncheck-heavy\ncheck-full\ncheck-packaging\ncurrent-check\nlocal-minimum\nlocal-dev",
         "measure-check profile list",
     );
     assert_contains(
@@ -398,7 +403,17 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    check-full|current-check)\n      printf '%s\\n' test-full lint-all-targets fmt-check audit doc coverage-check nix-check",
+        "    check-heavy)\n      printf '%s\\n' audit doc coverage-check",
+        "measure-check check-heavy profile",
+    );
+    assert_contains(
+        &measure_script,
+        "    check-packaging)\n      printf '%s\\n' nix-check",
+        "measure-check check-packaging profile",
+    );
+    assert_contains(
+        &measure_script,
+        "    check-full|current-check)\n      printf '%s\\n' test-full lint-all-targets fmt-check audit doc coverage-check",
         "measure-check check-full profile",
     );
 

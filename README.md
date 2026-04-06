@@ -187,10 +187,13 @@ nix develop -c just check
 # Faster no-test local gate
 nix develop -c just check-fast
 
-# Full local verification path
+# Full local code verification path
 nix develop -c just check-full
 
-# Verify the host-default flake package
+# Separate Nix packaging verification
+nix develop -c just check-packaging
+
+# Verify the host-default flake package directly
 nix develop -c just nix-check
 
 # Optional: verify the explicit release/static flake package
@@ -210,10 +213,11 @@ nix develop -c just coverage
 
 `just check` is the default local gate: tests, lint, and format checks.
 `just check-fast` keeps the faster compile-only path for cases where you want a quicker no-test loop.
-The heavier non-inner-loop work lives behind `just check-full`.
+The heavier code-only work lives behind `just check-full`.
 That heavyweight path builds only this crate's docs (not dependency docs) and measures coverage for the main lib/bin/test target set.
 Bench targets are opt-in and only run through `just bench`.
 Normal compile/test/lint/coverage recipes use the explicit non-bench feature set.
+`just check-packaging` runs host-default Nix packaging verification separately from the normal code iteration path.
 `just nix-check` validates the host-default flake package (`native` on Darwin, release/static on Linux).
 `just nix-check-release` is the explicit release/static package build.
 `just nix-check-with-tests` is the explicit opt-in path for rerunning crate tests inside the host-default Nix package build.

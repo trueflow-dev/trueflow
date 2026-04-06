@@ -11,8 +11,9 @@ Usage:
 Profiles:
   check           Default local gate (tests, lint, fmt)
   check-fast      Faster no-test local gate (compile, lint, fmt)
-  check-heavy     Heavyweight non-inner-loop checks (audit, doc, coverage, nix builds)
-  check-full      Full local verification path
+  check-heavy     Heavyweight code-only checks (audit, doc, coverage)
+  check-full      Full local code verification path
+  check-packaging Separate host-default Nix package verification
   current-check   Legacy alias for check-full
   local-minimum   Legacy alias for check-fast
   local-dev       Legacy alias for check
@@ -30,6 +31,7 @@ check
 check-fast
 check-heavy
 check-full
+check-packaging
 current-check
 local-minimum
 local-dev
@@ -135,10 +137,13 @@ profile_stages() {
       printf '%s\n' compile-check lint fmt-check
       ;;
     check-heavy)
-      printf '%s\n' audit doc coverage-check nix-check
+      printf '%s\n' audit doc coverage-check
+      ;;
+    check-packaging)
+      printf '%s\n' nix-check
       ;;
     check-full|current-check)
-      printf '%s\n' test-full lint-all-targets fmt-check audit doc coverage-check nix-check
+      printf '%s\n' test-full lint-all-targets fmt-check audit doc coverage-check
       ;;
     *)
       echo "unknown profile: $1" >&2
