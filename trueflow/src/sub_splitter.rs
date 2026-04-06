@@ -48,6 +48,8 @@ enum SplitPlan {
     JsFunctionReviewUnits,
     JavaFunctionReviewUnits,
     JavaTypeReviewUnits,
+    CSharpFunctionReviewUnits,
+    CSharpTypeReviewUnits,
 }
 
 impl SplitPlan {
@@ -68,7 +70,9 @@ impl SplitPlan {
             | Self::PythonFunctionReviewUnits
             | Self::JsFunctionReviewUnits
             | Self::JavaFunctionReviewUnits
-            | Self::JavaTypeReviewUnits => SubSplitSemantics::ReviewUnits,
+            | Self::JavaTypeReviewUnits
+            | Self::CSharpFunctionReviewUnits
+            | Self::CSharpTypeReviewUnits => SubSplitSemantics::ReviewUnits,
         }
     }
 }
@@ -116,6 +120,8 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         SplitPlan::JsFunctionReviewUnits => split_js_function(block, lang)?,
         SplitPlan::JavaFunctionReviewUnits => split_java_function(block)?,
         SplitPlan::JavaTypeReviewUnits => split_java_type(block)?,
+        SplitPlan::CSharpFunctionReviewUnits => split_csharp_function(block)?,
+        SplitPlan::CSharpTypeReviewUnits => split_csharp_type(block)?,
     };
 
     let result = SubSplitResult {
@@ -212,6 +218,17 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
             ) =>
         {
             SplitPlan::JavaTypeReviewUnits
+        }
+        Language::CSharp if matches!(kind, BlockKind::Function | BlockKind::Method) => {
+            SplitPlan::CSharpFunctionReviewUnits
+        }
+        Language::CSharp
+            if matches!(
+                kind,
+                BlockKind::Class | BlockKind::Interface | BlockKind::Enum | BlockKind::Struct
+            ) =>
+        {
+            SplitPlan::CSharpTypeReviewUnits
         }
         _ => SplitPlan::CodeReviewUnits,
     }
@@ -692,6 +709,129 @@ fn split_java_type(block: &Block) -> Result<Vec<Block>> {
     }
 }
 
+fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let Some(body_start) = content.find('{') else {
+        return split_code(block);
+    };
+
+    let signature_end = signature_end_offset(content, body_start);
+    if signature_end == 0 || signature_end > content.len() {
+        return split_code(block);
+    }
+
+    let mut blocks = vec![create_sub_block_with_kind(
+        block,
+        &content[..signature_end],
+        0,
+        signature_end,
+        BlockKind::FunctionSignature,
+    )];
+
+    let rest = &content[signature_end..];
+    let mut push_chunk = |chunk: &str, start: usize, end: usize, is_gap: bool| {
+        if is_gap {
+            blocks.push(create_sub_block_with_kind(
+                block,
+                chunk,
+                signature_end + start,
+                signature_end + end,
+                BlockKind::Gap,
+            ));
+            return;
+        }
+
+        if let Some(comment_end) = leading_comment_prefix_len(chunk) {
+            let comment = &chunk[..comment_end];
+            blocks.push(create_sub_block_with_kind(
+                block,
+                comment,
+                signature_end + start,
+                signature_end + start + comment_end,
+                BlockKind::Comment,
+            ));
+
+            let remainder = &chunk[comment_end..];
+            if !remainder.trim().is_empty() {
+                blocks.push(create_sub_block_with_kind(
+                    block,
+                    remainder,
+                    signature_end + start + comment_end,
+                    signature_end + end,
+                    BlockKind::CodeParagraph,
+                ));
+            }
+            return;
+        }
+
+        let kind = classify_code_chunk(chunk);
+        blocks.push(create_sub_block_with_kind(
+            block,
+            chunk,
+            signature_end + start,
+            signature_end + end,
+            kind,
+        ));
+    };
+
+    let re = paragraph_break_regex();
+    let mut start = 0;
+    for mat in re.find_iter(rest) {
+        if start < mat.start() {
+            let chunk = &rest[start..mat.start()];
+            if !chunk.is_empty() {
+                push_chunk(chunk, start, mat.start(), false);
+            }
+        }
+
+        let gap = &rest[mat.start()..mat.end()];
+        push_chunk(gap, mat.start(), mat.end(), true);
+        start = mat.end();
+    }
+
+    if start < rest.len() {
+        let chunk = &rest[start..];
+        if !chunk.is_empty() {
+            push_chunk(chunk, start, rest.len(), false);
+        }
+    }
+
+    Ok(blocks)
+}
+
+fn split_csharp_type(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse csharp type")?;
+    let root = tree.root_node();
+    let type_node = find_named_descendant_any(
+        root,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+            "struct_declaration",
+        ],
+    );
+    let Some(type_node) = type_node else {
+        return split_code(block);
+    };
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return split_code(block);
+    };
+
+    let items = collect_csharp_type_items(block, body);
+    if items.is_empty() {
+        split_code(block)
+    } else {
+        Ok(items)
+    }
+}
+
 fn split_function_with_parser(
     block: &Block,
     config: &FunctionSplitConfig<'_>,
@@ -1039,6 +1179,32 @@ fn collect_kotlin_type_items(
         .collect()
 }
 
+fn collect_csharp_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<Block> {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "field_declaration" | "property_declaration" | "event_declaration" => {
+                    BlockKind::Variable
+                }
+                "method_declaration" | "constructor_declaration" => BlockKind::Method,
+                "class_declaration" => BlockKind::Class,
+                "interface_declaration" => BlockKind::Interface,
+                "enum_declaration" => BlockKind::Enum,
+                "record_declaration" | "struct_declaration" => BlockKind::Struct,
+                _ => return None,
+            };
+            Some(create_sub_block_with_kind(
+                parent,
+                &parent.content[child.start_byte()..child.end_byte()],
+                child.start_byte(),
+                child.end_byte(),
+                kind,
+            ))
+        })
+        .collect()
+}
+
 fn classify_kotlin_class_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
     let name_start = node
         .child_by_field_name("name")
@@ -1061,6 +1227,28 @@ fn classify_kotlin_property_kind(text: &str) -> BlockKind {
     } else {
         BlockKind::Const
     }
+}
+
+fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut saw_comment = false;
+
+    for line in chunk.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.trim().is_empty() {
+            offset += line.len();
+            continue;
+        }
+        if code_comments::line_is_c_style_comment(trimmed) || trimmed.starts_with('#') {
+            saw_comment = true;
+            offset += line.len();
+            continue;
+        }
+
+        return saw_comment.then_some(offset);
+    }
+
+    None
 }
 
 fn gap_prefix_length(gap: &str) -> usize {
@@ -1305,6 +1493,37 @@ mod tests {
         let content = "int process(int value) {\n    int total = value;\n\n    // only positive values count\n    if (value > 0) {\n        total += scale;\n    }\n\n    return total;\n}\n";
         let block = make_large_block(content, BlockKind::Method);
         let chunks = split(&block, Language::Java).unwrap();
+        let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::FunctionSignature,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::Comment,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::CodeParagraph,
+            ]
+        );
+        assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_csharp_class_into_members() {
+        let content = "public class Greeter {\n    public string Name { get; }\n\n    public WorkflowStatus Status { get; private set; }\n\n    public Greeter(string name) {\n        Name = name;\n    }\n\n    public GreetingResult BuildGreeting(string target) {\n        return new GreetingResult(target, 1);\n    }\n}\n";
+        let block = make_large_block(content, BlockKind::Class);
+        let chunks = split(&block, Language::CSharp).unwrap();
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Variable));
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
+        assert!(!chunks.iter().any(|b| b.kind == BlockKind::Class));
+    }
+
+    #[test]
+    fn test_split_csharp_method_into_review_units() {
+        let content = "public GreetingResult BuildGreeting(string target) {\n    var parts = new List<string>();\n\n    // normalize the target before storing it\n    if (target.Length > 0) {\n        parts.Add(target.ToUpperInvariant());\n    }\n\n    return new GreetingResult(string.Join(\",\", parts), parts.Count);\n}\n";
+        let block = make_large_block(content, BlockKind::Method);
+        let chunks = split(&block, Language::CSharp).unwrap();
         let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
         assert_eq!(
             kinds,

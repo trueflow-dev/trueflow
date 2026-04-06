@@ -10,6 +10,7 @@ pub enum Language {
     TypeScript,
     Java,
     Kotlin,
+    CSharp,
     Python,
     Go,
     Cpp,
@@ -44,6 +45,7 @@ impl Language {
             "ts" => Some(Language::TypeScript),
             "java" => Some(Language::Java),
             "kt" | "kts" => Some(Language::Kotlin),
+            "cs" => Some(Language::CSharp),
             "py" => Some(Language::Python),
             "go" => Some(Language::Go),
             "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" => Some(Language::Cpp),
@@ -200,6 +202,7 @@ mod tests {
         assert_eq!(Language::from_extension("java"), Some(Language::Java));
         assert_eq!(Language::from_extension("kt"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
+        assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
@@ -286,6 +289,18 @@ mod tests {
             analyze_file(file.path()),
             FileType::Code(CodeFile {
                 language: Language::Kotlin
+            })
+        ));
+    }
+
+    #[test]
+    fn analyze_file_detects_csharp_by_extension() {
+        let file = write_temp_file("Program.cs", b"class Program {}\n");
+
+        assert!(matches!(
+            analyze_file(file.path()),
+            FileType::Code(CodeFile {
+                language: Language::CSharp
             })
         ));
     }

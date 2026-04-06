@@ -5834,6 +5834,7 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             line_comment_start: Some("#"),
         },
         Language::Kotlin
+        | Language::CSharp
         | Language::Markdown
         | Language::Toml
         | Language::Text

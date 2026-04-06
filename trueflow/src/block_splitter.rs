@@ -25,6 +25,20 @@ static SWIFT_ATTR_QUERY: LazyLock<Query> = LazyLock::new(|| {
         "swift attribute query",
     )
 });
+static CSHARP_ATTR_METHOD_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_c_sharp::LANGUAGE.into(),
+        "(method_declaration (attribute_list) @attr name: (identifier) @name) @method",
+        "csharp attribute method test query",
+    )
+});
+static CSHARP_METHOD_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
+    compile_query(
+        &tree_sitter_c_sharp::LANGUAGE.into(),
+        "(method_declaration name: (identifier) @name) @method",
+        "csharp method test query",
+    )
+});
 static PYTHON_DECORATED_TEST_QUERY: LazyLock<Query> = LazyLock::new(|| {
     compile_query(
         &tree_sitter_python::LANGUAGE.into(),
@@ -219,6 +233,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         | Language::TypeScript
         | Language::Java
         | Language::Kotlin
+        | Language::CSharp
         | Language::Python
         | Language::Shell => attempt_split(
             content,
@@ -321,6 +336,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
             }
             Language::Python => ts_kind == "decorator",
             Language::Swift => swift::is_attribute_node(ts_kind),
+            Language::CSharp => ts_kind == "attribute_list",
             _ => false,
         };
 
@@ -399,6 +415,26 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         {
             blocks.extend(collect_kotlin_type_items(child, content, lang));
         }
+        if matches!(lang, Language::CSharp)
+            && matches!(
+                ts_kind,
+                "namespace_declaration" | "file_scoped_namespace_declaration"
+            )
+        {
+            blocks.extend(collect_csharp_namespace_items(child, content, lang));
+        }
+        if matches!(lang, Language::CSharp)
+            && matches!(
+                ts_kind,
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "struct_declaration"
+            )
+        {
+            blocks.extend(collect_csharp_type_items(child, content, lang));
+        }
 
         last_end_byte = end_byte;
         pending_start = None;
@@ -446,6 +482,7 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
         Language::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -1124,6 +1161,19 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             | "compact_constructor_declaration" => BlockKind::Method,
             _ => BlockKind::Code,
         },
+        Language::CSharp => match kind {
+            "namespace_declaration" | "file_scoped_namespace_declaration" => BlockKind::Module,
+            "using_directive" => BlockKind::Import,
+            "class_declaration" => BlockKind::Class,
+            "interface_declaration" => BlockKind::Interface,
+            "enum_declaration" => BlockKind::Enum,
+            "record_declaration" | "struct_declaration" => BlockKind::Struct,
+            "field_declaration" | "property_declaration" | "event_declaration" => {
+                BlockKind::Variable
+            }
+            "method_declaration" | "constructor_declaration" => BlockKind::Method,
+            _ => BlockKind::Code,
+        },
         Language::JavaScript | Language::TypeScript => match kind {
             "function_declaration" => BlockKind::Function,
             "class_declaration" => BlockKind::Class,
@@ -1323,6 +1373,76 @@ fn find_named_descendant_of_kind<'a>(
     None
 }
 
+fn collect_csharp_namespace_items(
+    namespace_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let Some(body) = namespace_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        blocks.extend(collect_csharp_declaration_blocks(child, content, lang));
+    }
+    blocks
+}
+
+fn collect_csharp_declaration_blocks(
+    node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let kind = map_kind(lang, node.kind());
+    let mut blocks = Vec::new();
+
+    if !matches!(kind, BlockKind::Code) {
+        blocks.push(create_block(
+            &content[node.start_byte()..node.end_byte()],
+            kind,
+            content,
+            node.start_byte(),
+            node.end_byte(),
+            lang,
+        ));
+    }
+
+    match node.kind() {
+        "namespace_declaration" | "file_scoped_namespace_declaration" => {
+            blocks.extend(collect_csharp_namespace_items(node, content, lang));
+        }
+        "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "struct_declaration" => {
+            blocks.extend(collect_csharp_type_items(node, content, lang));
+        }
+        _ => {}
+    }
+
+    blocks
+}
+
+fn collect_csharp_type_items(
+    type_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        blocks.extend(collect_csharp_declaration_blocks(child, content, lang));
+    }
+    blocks
+}
+
 fn create_block(
     text: &str,
     kind: BlockKind,
@@ -1428,6 +1548,9 @@ fn collect_test_ranges(
         Language::Elisp => collect_elisp_test_ranges(tree.root_node(), source, &mut ranges)?,
         Language::Kotlin => {
             collect_kotlin_test_ranges(tree.root_node(), source, &mut ranges)?;
+        }
+        Language::CSharp => {
+            collect_csharp_test_ranges(tree, source, &mut ranges)?;
         }
         Language::JavaScript => {
             collect_js_test_ranges(&JAVASCRIPT_ARROW_TEST_QUERY, tree, source, &mut ranges)?;
@@ -1691,6 +1814,74 @@ fn collect_shell_test_ranges(
     Ok(())
 }
 
+fn collect_csharp_test_ranges(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    ranges: &mut Vec<ByteSpan>,
+) -> Result<()> {
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(
+        &CSHARP_ATTR_METHOD_TEST_QUERY,
+        tree.root_node(),
+        source.as_bytes(),
+    );
+    while let Some(match_) = matches.next() {
+        let mut attr_text = None;
+        let mut method_range = None;
+        for capture in match_.captures {
+            let cap_name = &CSHARP_ATTR_METHOD_TEST_QUERY.capture_names()[capture.index as usize];
+            match *cap_name {
+                "attr" => {
+                    attr_text = Some(capture.node.utf8_text(source.as_bytes())?.to_string());
+                }
+                "method" => {
+                    method_range = Some((capture.node.start_byte(), capture.node.end_byte()));
+                }
+                _ => {}
+            }
+        }
+        if let (Some(attr_text), Some(range)) = (attr_text, method_range)
+            && csharp_attribute_text_looks_like_test(&attr_text)
+        {
+            ranges.push(ByteSpan::new(range.0, range.1));
+        }
+    }
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(
+        &CSHARP_METHOD_TEST_QUERY,
+        tree.root_node(),
+        source.as_bytes(),
+    );
+    while let Some(match_) = matches.next() {
+        let mut name = None;
+        let mut method_range = None;
+        for capture in match_.captures {
+            let cap_name = &CSHARP_METHOD_TEST_QUERY.capture_names()[capture.index as usize];
+            match *cap_name {
+                "name" => name = Some(capture.node.utf8_text(source.as_bytes())?.to_string()),
+                "method" => {
+                    method_range = Some((capture.node.start_byte(), capture.node.end_byte()));
+                }
+                _ => {}
+            }
+        }
+        if let (Some(name), Some(range)) = (name, method_range)
+            && name.starts_with("Test")
+        {
+            ranges.push(ByteSpan::new(range.0, range.1));
+        }
+    }
+
+    Ok(())
+}
+
+fn csharp_attribute_text_looks_like_test(attr_text: &str) -> bool {
+    ["Fact", "Theory", "Test", "TestMethod"]
+        .iter()
+        .any(|name| attr_text.contains(name))
+}
+
 fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
     let pre = &source[..start];
     let start_line = pre.lines().count();
@@ -1822,28 +2013,44 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Variable));
-        assert!(
-            blocks
-                .iter()
-                .any(|block| block.kind == BlockKind::Interface)
-        );
-        assert!(
-            blocks
-                .iter()
-                .filter(|block| block.kind == BlockKind::Class)
-                .count()
-                >= 2
-        );
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Interface));
+        assert!(blocks.iter().filter(|block| block.kind == BlockKind::Class).count() >= 2);
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
         let test_block = blocks
             .iter()
-            .find(|block| block.content.contains("fun testWorker"));
-        assert!(test_block.is_some(), "expected Kotlin test block");
-        assert!(test_block.is_some_and(|block| block.tags.iter().any(|tag| tag == "test")));
+            .find(|block| block.content.contains("fun testWorker"))
+            .expect("expected Kotlin test block");
+        assert!(test_block.tags.iter().any(|tag| tag == "test"));
         assert!(
             !blocks
                 .iter()
                 .any(|block| matches!(block.kind, BlockKind::Paragraph))
+        );
+    }
+
+    #[test]
+    fn test_csharp_structural_blocks_and_test_detection() {
+        let content = "using System;\nusing Xunit;\n\nnamespace Demo.Workflow {\n    public interface IGreeter {\n        string Name { get; }\n        string BuildGreeting(string target);\n    }\n\n    public readonly record struct GreetingResult(string Message, int Parts);\n\n    public enum WorkflowStatus {\n        Idle,\n        Running,\n    }\n\n    public readonly struct GreetingOptions {\n        public string Prefix { get; }\n    }\n\n    public class GreeterTests {\n        public string Name { get; }\n\n        [Fact]\n        public void BuildGreeting_uses_the_target_name() {\n        }\n    }\n}\n";
+        let result = split_result(content, Language::CSharp);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Interface));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Struct));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Variable));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
+        assert!(blocks.iter().all(|block| block.complexity.is_none()));
+        assert!(
+            blocks.iter().any(|block| block.kind == BlockKind::Method
+                && block.tags.iter().any(|tag| tag == "test"))
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Paragraph)
         );
     }
 
