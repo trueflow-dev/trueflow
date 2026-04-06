@@ -619,6 +619,7 @@ fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> Stri
 
 fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
@@ -4269,10 +4270,15 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn tui_keyboard_enhancement_flags_enable_shift_enter_disambiguation() {
+    fn tui_keyboard_enhancement_flags_report_modified_enter_events() {
         let flags = tui_keyboard_enhancement_flags();
         assert!(
             flags.contains(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        assert!(
+            flags.contains(
+                crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
         );
         assert!(flags.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
     }
@@ -4285,7 +4291,7 @@ mod diff_scope_tests {
         let rendered =
             String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
         assert!(
-            rendered.contains("\u{1b}[>3u"),
+            rendered.contains("\u{1b}[>11u"),
             "expected keyboard enhancement push sequence in output: {rendered:?}"
         );
     }
