@@ -235,6 +235,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         | Language::Kotlin
         | Language::CSharp
         | Language::Python
+        | Language::Ruby
         | Language::Shell => attempt_split(
             content,
             lang,
@@ -435,6 +436,9 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         {
             blocks.extend(collect_csharp_type_items(child, content, lang));
         }
+        if matches!(lang, Language::Ruby) && matches!(ts_kind, "class" | "module") {
+            blocks.extend(collect_ruby_scope_items(child, content, lang));
+        }
 
         last_end_byte = end_byte;
         pending_start = None;
@@ -484,6 +488,7 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
         Language::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
+        Language::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
     }
@@ -1073,6 +1078,7 @@ fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str)
         Language::Swift => swift::map_kind(node, content),
         Language::Elisp => map_elisp_kind(node, content),
         Language::Kotlin => map_kotlin_kind(node, content),
+        Language::Ruby => map_ruby_kind(node, content),
         _ => map_kind(lang, node.kind()),
     }
 }
@@ -1227,6 +1233,60 @@ fn classify_kotlin_property_kind(text: &str) -> BlockKind {
         BlockKind::Variable
     } else {
         BlockKind::Const
+    }
+}
+
+fn map_ruby_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match node.kind() {
+        "class" => BlockKind::Class,
+        "module" => BlockKind::Module,
+        "method" | "singleton_method" => BlockKind::Method,
+        "assignment" => {
+            if ruby_assignment_targets_constant(node) {
+                BlockKind::Const
+            } else {
+                BlockKind::Code
+            }
+        }
+        "call" => ruby_call_kind(node, content),
+        "comment" => BlockKind::Comment,
+        _ => BlockKind::Code,
+    }
+}
+
+fn ruby_call_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match ruby_call_method_name(node, content).as_deref() {
+        Some("require") | Some("require_relative") => BlockKind::Import,
+        _ => BlockKind::Code,
+    }
+}
+
+fn ruby_call_method_name(node: tree_sitter::Node<'_>, content: &str) -> Option<String> {
+    node.child_by_field_name("method")
+        .and_then(|method| method.utf8_text(content.as_bytes()).ok())
+        .map(str::to_string)
+}
+
+fn ruby_assignment_targets_constant(node: tree_sitter::Node<'_>) -> bool {
+    let Some(left) = node.child_by_field_name("left") else {
+        return false;
+    };
+
+    ruby_lhs_targets_constant(left)
+}
+
+fn ruby_lhs_targets_constant(node: tree_sitter::Node<'_>) -> bool {
+    match node.kind() {
+        "constant" => true,
+        "scope_resolution" => node
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() == "constant"),
+        "left_assignment_list" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .all(ruby_lhs_targets_constant)
+        }
+        _ => false,
     }
 }
 
@@ -1426,6 +1486,40 @@ fn collect_csharp_declaration_blocks(
     blocks
 }
 
+fn collect_ruby_scope_items(
+    scope_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let Some(body) = scope_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        let kind = map_kind_for_node(lang, child, content);
+        if matches!(kind, BlockKind::Code) {
+            continue;
+        }
+
+        blocks.push(create_block(
+            &content[child.start_byte()..child.end_byte()],
+            kind,
+            content,
+            child.start_byte(),
+            child.end_byte(),
+            lang,
+        ));
+
+        if matches!(child.kind(), "class" | "module") {
+            blocks.extend(collect_ruby_scope_items(child, content, lang));
+        }
+    }
+
+    blocks
+}
+
 fn collect_csharp_type_items(
     type_node: tree_sitter::Node<'_>,
     content: &str,
@@ -1559,6 +1653,9 @@ fn collect_test_ranges(
         Language::TypeScript => {
             collect_js_test_ranges(&TYPESCRIPT_ARROW_TEST_QUERY, tree, source, &mut ranges)?;
             collect_js_test_ranges(&TYPESCRIPT_MEMBER_TEST_QUERY, tree, source, &mut ranges)?;
+        }
+        Language::Ruby => {
+            collect_ruby_test_ranges(tree.root_node(), source, &mut ranges)?;
         }
         Language::Shell => {
             collect_shell_test_ranges(&SHELL_FUNCTION_TEST_QUERY, tree, source, &mut ranges)?;
@@ -1882,6 +1979,40 @@ fn csharp_attribute_text_looks_like_test(attr_text: &str) -> bool {
         .any(|name| attr_text.contains(name))
 }
 
+fn collect_ruby_test_ranges(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    ranges: &mut Vec<ByteSpan>,
+) -> Result<()> {
+    if matches!(node.kind(), "method" | "singleton_method")
+        && let Some(name) = ruby_definition_name(node, source)?
+        && name.starts_with("test_")
+    {
+        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+    }
+
+    if node.kind() == "class"
+        && let Some(name) = ruby_definition_name(node, source)?
+        && matches!(name.as_str(), value if value.ends_with("Test") || value.ends_with("Tests"))
+    {
+        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_ruby_test_ranges(child, source, ranges)?;
+    }
+
+    Ok(())
+}
+
+fn ruby_definition_name(node: tree_sitter::Node<'_>, source: &str) -> Result<Option<String>> {
+    node.child_by_field_name("name")
+        .map(|name| name.utf8_text(source.as_bytes()).map(str::to_string))
+        .transpose()
+        .map_err(Into::into)
+}
+
 fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
     let pre = &source[..start];
     let start_line = pre.lines().count();
@@ -2026,6 +2157,31 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
                 .iter()
                 .any(|block| matches!(block.kind, BlockKind::Paragraph))
         );
+    }
+
+    #[test]
+    fn test_ruby_structural_blocks_and_test_detection() {
+        let content = "require \"json\"\n\nmodule Trueflow\n  DEFAULT_LIMIT = 4\n\n  class Processor\n    SCALE = 2\n\n    def process(values)\n      values.map { |value| value * SCALE }\n    end\n  end\nend\n\nclass ProcessorTest\n  def test_process_formats_non_zero_values\n    processor = Trueflow::Processor.new\n    rendered = processor.process([0, 1, 2])\n\n    raise \"unexpected output\" unless rendered == [0, 2, 4]\n  end\nend\n";
+        let result = split_result(content, Language::Ruby);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
+        assert!(
+            blocks.iter().any(|block| {
+                block.kind == BlockKind::Method && block.tags.iter().any(|tag| tag == "test")
+            }),
+            "expected at least one Ruby method to be tagged as a test"
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Paragraph))
+        );
+        assert!(blocks.iter().all(|block| block.complexity.is_none()));
     }
 
     #[test]

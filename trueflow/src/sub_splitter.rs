@@ -45,6 +45,8 @@ enum SplitPlan {
     KotlinFunctionReviewUnits,
     KotlinTypeReviewUnits,
     PythonFunctionReviewUnits,
+    RubyMethodReviewUnits,
+    RubyScopeReviewUnits,
     JsFunctionReviewUnits,
     JavaFunctionReviewUnits,
     JavaTypeReviewUnits,
@@ -68,6 +70,8 @@ impl SplitPlan {
             | Self::KotlinFunctionReviewUnits
             | Self::KotlinTypeReviewUnits
             | Self::PythonFunctionReviewUnits
+            | Self::RubyMethodReviewUnits
+            | Self::RubyScopeReviewUnits
             | Self::JsFunctionReviewUnits
             | Self::JavaFunctionReviewUnits
             | Self::JavaTypeReviewUnits
@@ -117,6 +121,8 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         SplitPlan::KotlinFunctionReviewUnits => split_kotlin_function(block)?,
         SplitPlan::KotlinTypeReviewUnits => split_kotlin_type(block)?,
         SplitPlan::PythonFunctionReviewUnits => split_python_function(block)?,
+        SplitPlan::RubyMethodReviewUnits => split_ruby_method(block)?,
+        SplitPlan::RubyScopeReviewUnits => split_ruby_scope(block)?,
         SplitPlan::JsFunctionReviewUnits => split_js_function(block, lang)?,
         SplitPlan::JavaFunctionReviewUnits => split_java_function(block)?,
         SplitPlan::JavaTypeReviewUnits => split_java_type(block)?,
@@ -195,6 +201,10 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
         }
         Language::Python if matches!(kind, BlockKind::Function | BlockKind::Method) => {
             SplitPlan::PythonFunctionReviewUnits
+        }
+        Language::Ruby if matches!(kind, BlockKind::Method) => SplitPlan::RubyMethodReviewUnits,
+        Language::Ruby if matches!(kind, BlockKind::Module | BlockKind::Class) => {
+            SplitPlan::RubyScopeReviewUnits
         }
         Language::JavaScript | Language::TypeScript
             if matches!(
@@ -371,7 +381,7 @@ struct FunctionSplitConfig<'a> {
     body_statement_kind: Option<&'a str>,
     signature_end: fn(&str, usize) -> usize,
     comment_kinds: &'a [&'a str],
-    trim_closing_brace: bool,
+    trailing_delimiters: &'a [&'a str],
 }
 
 fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
@@ -384,7 +394,7 @@ fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["line_comment", "block_comment"],
-            trim_closing_brace: true,
+            trailing_delimiters: &["}"],
         },
     )
 }
@@ -551,7 +561,22 @@ fn split_python_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_before_body,
             comment_kinds: &["comment", "line_comment", "block_comment"],
-            trim_closing_brace: false,
+            trailing_delimiters: &[],
+        },
+    )
+}
+
+fn split_ruby_method(block: &Block) -> Result<Vec<Block>> {
+    split_function_with_parser(
+        block,
+        &FunctionSplitConfig {
+            language: tree_sitter_ruby::LANGUAGE.into(),
+            function_kinds: &["method", "singleton_method"],
+            body_kind: "body_statement",
+            body_statement_kind: None,
+            signature_end: signature_end_before_body,
+            comment_kinds: &["comment"],
+            trailing_delimiters: &["end"],
         },
     )
 }
@@ -570,7 +595,7 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["comment", "line_comment", "block_comment"],
-            trim_closing_brace: true,
+            trailing_delimiters: &["}"],
         },
     )
 }
@@ -585,7 +610,7 @@ fn split_swift_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: Some("statements"),
             signature_end: signature_end_offset,
             comment_kinds: &["comment", "multiline_comment"],
-            trim_closing_brace: true,
+            trailing_delimiters: &["}"],
         },
     )
 }
@@ -671,7 +696,7 @@ fn split_java_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["line_comment", "block_comment"],
-            trim_closing_brace: true,
+            trailing_delimiters: &["}"],
         },
     )
 }
@@ -832,6 +857,27 @@ fn split_csharp_type(block: &Block) -> Result<Vec<Block>> {
     }
 }
 
+fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_ruby::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse ruby scope")?;
+    let root = tree.root_node();
+    let scope_node = find_named_descendant_any(root, &["module", "class"]);
+    let Some(scope_node) = scope_node else {
+        return split_code(block);
+    };
+
+    let items = collect_ruby_scope_items(block, scope_node);
+    if items.is_empty() {
+        split_code(block)
+    } else {
+        Ok(items)
+    }
+}
+
 fn split_function_with_parser(
     block: &Block,
     config: &FunctionSplitConfig<'_>,
@@ -893,9 +939,11 @@ fn split_function_with_parser(
         let leading_start = last_end + gap_prefix_len;
 
         let mut end = node.end_byte();
-        if config.trim_closing_brace
-            && idx == nodes.len().saturating_sub(1)
-            && content[end..].trim() == "}"
+        if idx == nodes.len().saturating_sub(1)
+            && config
+                .trailing_delimiters
+                .iter()
+                .any(|delimiter| content[end..].trim() == *delimiter)
         {
             end = content.len();
         }
@@ -1251,6 +1299,75 @@ fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
     None
 }
 
+fn collect_ruby_scope_items(parent: &Block, scope_node: tree_sitter::Node<'_>) -> Vec<Block> {
+    let Some(body) = scope_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut blocks = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        let kind = match child.kind() {
+            "class" => BlockKind::Class,
+            "module" => BlockKind::Module,
+            "method" | "singleton_method" => BlockKind::Method,
+            "assignment" if ruby_assignment_targets_constant(child) => BlockKind::Const,
+            "call" if ruby_call_is_import(child, &parent.content) => BlockKind::Import,
+            _ => continue,
+        };
+
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            &parent.content[child.start_byte()..child.end_byte()],
+            child.start_byte(),
+            child.end_byte(),
+            kind,
+        ));
+
+        if matches!(child.kind(), "class" | "module") {
+            blocks.extend(collect_ruby_scope_items(parent, child));
+        }
+    }
+
+    blocks
+}
+
+fn ruby_assignment_targets_constant(node: tree_sitter::Node<'_>) -> bool {
+    let Some(left) = node.child_by_field_name("left") else {
+        return false;
+    };
+
+    ruby_lhs_targets_constant(left)
+}
+
+fn ruby_lhs_targets_constant(node: tree_sitter::Node<'_>) -> bool {
+    match node.kind() {
+        "constant" => true,
+        "scope_resolution" => node
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() == "constant"),
+        "left_assignment_list" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .all(ruby_lhs_targets_constant)
+        }
+        _ => false,
+    }
+}
+
+fn ruby_call_is_import(node: tree_sitter::Node<'_>, content: &str) -> bool {
+    matches!(
+        ruby_call_method_name(node, content).as_deref(),
+        Some("require") | Some("require_relative")
+    )
+}
+
+fn ruby_call_method_name(node: tree_sitter::Node<'_>, content: &str) -> Option<String> {
+    node.child_by_field_name("method")
+        .and_then(|method| method.utf8_text(content.as_bytes()).ok())
+        .map(str::to_string)
+}
+
 fn gap_prefix_length(gap: &str) -> usize {
     if gap.is_empty() {
         return 0;
@@ -1538,6 +1655,43 @@ mod tests {
             ]
         );
         assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_ruby_method_into_review_units() {
+        let content = "def process(values)\n  output = []\n\n  # Preserve only meaningful slices.\n  values.each do |value|\n    output << value * SCALE\n  end\n\n  Formatting.render(output)\nend\n";
+        let block = make_large_block(content, BlockKind::Method);
+        let chunks = split(&block, Language::Ruby).unwrap();
+        let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::FunctionSignature,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::Comment,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::CodeParagraph,
+            ]
+        );
+        assert_eq!(merge_blocks(chunks.clone()), content);
+        assert!(chunks.iter().all(|chunk| chunk.complexity.is_none()));
+    }
+
+    #[test]
+    fn test_split_ruby_module_into_members() {
+        let content = "module Trueflow\n  DEFAULT_LIMIT = 4\n\n  module Formatting\n    def self.render(values)\n      values.join(\",\")\n    end\n  end\n\n  class Processor\n    SCALE = 2\n\n    def process(values)\n      values.map { |value| value * SCALE }\n    end\n  end\nend\n";
+        let block = make_large_block(content, BlockKind::Module);
+        let chunks = split(&block, Language::Ruby).unwrap();
+        assert!(chunks.iter().any(|block| block.kind == BlockKind::Const));
+        assert!(chunks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(chunks.iter().any(|block| block.kind == BlockKind::Class));
+        assert!(
+            !chunks
+                .iter()
+                .any(|block| block.kind == BlockKind::Module && block.content == content)
+        );
     }
 
     #[test]
