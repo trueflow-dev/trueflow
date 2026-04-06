@@ -95,6 +95,16 @@ fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
     );
     assert_contains(
         &flake,
+        "commonNativeBuildInputs = [ pkgs.pkg-config ];",
+        "flake package native build tools",
+    );
+    assert_contains(
+        &flake,
+        "buildInputs = [ ];",
+        "flake package build inputs are empty",
+    );
+    assert_contains(
+        &flake,
         "\"--remap-path-prefix=$NIX_BUILD_TOP=/build\"",
         "flake nix build root remap flag",
     );
@@ -109,7 +119,6 @@ fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
         "export RUSTFLAGS=\"''${RUSTFLAGS:+$RUSTFLAGS }${rustPathRemapFlagsString}\"",
         "flake rustflags export with remap prefixes",
     );
-
     Ok(())
 }
 

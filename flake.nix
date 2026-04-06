@@ -29,9 +29,7 @@
           rustc = rustToolchain;
         };
 
-        commonBuildInputs = with pkgs;
-          [ pkg-config ]
-          ++ lib.optionals stdenv.isDarwin [ apple-sdk libiconv ];
+        commonNativeBuildInputs = [ pkgs.pkg-config ];
 
         rustPathRemapFlags = [
           "--remap-path-prefix=$NIX_BUILD_TOP=/build"
@@ -50,9 +48,9 @@
             src = ./trueflow;
             cargoLock = { lockFile = ./trueflow/Cargo.lock; };
 
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = commonNativeBuildInputs;
             nativeCheckInputs = [ pkgs.gitMinimal ];
-            buildInputs = commonBuildInputs;
+            buildInputs = [ ];
             preConfigure = ''
               export RUSTFLAGS="''${RUSTFLAGS:+$RUSTFLAGS }${rustPathRemapFlagsString}"
             '';
@@ -122,7 +120,7 @@
               gnupg
               trash-cli
               beads.packages.${system}.default
-            ] ++ commonBuildInputs;
+            ] ++ commonNativeBuildInputs;
 
           shellHook = ''
             # Tells rust-analyzer where the stdlib sources are
