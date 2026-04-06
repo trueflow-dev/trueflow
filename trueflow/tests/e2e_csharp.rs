@@ -149,7 +149,7 @@ fn test_csharp_sub_block_review_splitting_for_type_and_method() -> Result<()> {
     );
     assert_eq!(method_kinds.first().copied(), Some("FunctionSignature"));
     assert!(
-        method_kinds.iter().any(|kind| *kind == "CodeParagraph"),
+        method_kinds.contains(&"CodeParagraph"),
         "expected code paragraphs in method split: {method_kinds:?}"
     );
 

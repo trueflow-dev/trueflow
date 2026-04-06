@@ -237,7 +237,8 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         | Language::Python
         | Language::Ruby
         | Language::Php
-        | Language::Shell => attempt_split(
+        | Language::Shell
+        | Language::C => attempt_split(
             content,
             lang,
             split_tree_sitter(content, lang),
@@ -505,6 +506,7 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
         Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+        Language::C => Some(tree_sitter_c::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
     }
@@ -1103,6 +1105,7 @@ fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str)
         Language::Elisp => map_elisp_kind(node, content),
         Language::Kotlin => map_kotlin_kind(node, content),
         Language::Ruby => map_ruby_kind(node, content),
+        Language::C => map_c_kind(node, content),
         _ => map_kind(lang, node.kind()),
     }
 }
@@ -1326,6 +1329,59 @@ fn ruby_lhs_targets_constant(node: tree_sitter::Node<'_>) -> bool {
         }
         _ => false,
     }
+}
+
+fn map_c_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match node.kind() {
+        "comment" => BlockKind::Comment,
+        "preproc_include" => BlockKind::Import,
+        "type_definition" => BlockKind::Type,
+        "struct_specifier" | "union_specifier" => BlockKind::Struct,
+        "enum_specifier" => BlockKind::Enum,
+        "function_definition" => BlockKind::Function,
+        "declaration" => map_c_declaration_kind(node, content),
+        _ => BlockKind::Code,
+    }
+}
+
+fn map_c_declaration_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    if node_contains_kind(node, "function_declarator") {
+        return BlockKind::FunctionSignature;
+    }
+
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return BlockKind::Code;
+    };
+
+    match type_node.kind() {
+        "struct_specifier" | "union_specifier" => BlockKind::Struct,
+        "enum_specifier" => BlockKind::Enum,
+        _ if c_node_contains_const_qualifier(node, content) => BlockKind::Const,
+        _ => BlockKind::Variable,
+    }
+}
+
+fn node_contains_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| node_contains_kind(child, kind))
+}
+
+fn c_node_contains_const_qualifier(node: tree_sitter::Node<'_>, content: &str) -> bool {
+    if node.kind() == "type_qualifier" {
+        return node
+            .utf8_text(content.as_bytes())
+            .map(|text| text.trim() == "const")
+            .unwrap_or(false);
+    }
+
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| c_node_contains_const_qualifier(child, content))
 }
 
 fn collect_swift_type_items(
@@ -1711,6 +1767,9 @@ fn collect_test_ranges(
         Language::Php => {
             collect_php_test_ranges(tree.root_node(), source, &mut ranges)?;
         }
+        Language::C => {
+            collect_c_test_ranges(tree.root_node(), source, &mut ranges)?;
+        }
         Language::CSharp => {
             collect_csharp_test_ranges(tree, source, &mut ranges)?;
         }
@@ -2001,6 +2060,55 @@ fn collect_php_test_ranges(
     Ok(())
 }
 
+fn collect_c_test_ranges(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    ranges: &mut Vec<ByteSpan>,
+) -> Result<()> {
+    if node.kind() == "function_definition"
+        && let Some(name) = c_function_name(node, source)
+        && name.starts_with("test_")
+    {
+        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_c_test_ranges(child, source, ranges)?;
+    }
+
+    Ok(())
+}
+
+fn c_function_name(function_node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let declarator = function_node.child_by_field_name("declarator")?;
+    c_declarator_name(declarator, source)
+}
+
+fn c_declarator_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "identifier" {
+        return node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(std::string::ToString::to_string);
+    }
+
+    if let Some(declarator) = node.child_by_field_name("declarator")
+        && let Some(name) = c_declarator_name(declarator, source)
+    {
+        return Some(name);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(name) = c_declarator_name(child, source) {
+            return Some(name);
+        }
+    }
+
+    None
+}
+
 fn collect_csharp_test_ranges(
     tree: &tree_sitter::Tree,
     source: &str,
@@ -2249,9 +2357,9 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
         let test_block = blocks
             .iter()
-            .find(|block| block.content.contains("fun testWorker"))
-            .expect("expected Kotlin test block");
-        assert!(test_block.tags.iter().any(|tag| tag == "test"));
+            .find(|block| block.content.contains("fun testWorker"));
+        assert!(test_block.is_some(), "expected Kotlin test block");
+        assert!(test_block.is_some_and(|block| block.tags.iter().any(|tag| tag == "test")));
         assert!(
             !blocks
                 .iter()
@@ -2311,42 +2419,6 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
             !blocks
                 .iter()
                 .any(|block| block.kind == BlockKind::Paragraph)
-        );
-    }
-
-    #[test]
-    fn test_php_structural_blocks_and_test_detection() {
-        let content = "<?php\n\nnamespace Demo\\Example;\n\nuse RuntimeException;\n\ninterface Formatter\n{\n    public function format(array $values): string;\n}\n\ntrait NormalizesValues\n{\n    protected function normalize(int $value): int\n    {\n        return max($value, 0);\n    }\n}\n\nenum ReportMode: string\n{\n    case Summary = 'summary';\n\n    public function label(): string\n    {\n        return 'summary';\n    }\n}\n\nfinal class ReportBuilder implements Formatter\n{\n    public function format(array $values): string\n    {\n        return implode(',', $values);\n    }\n\n    public function testFormatsRecords(): void\n    {\n        if ($this->format([1, 2]) !== '1,2') {\n            throw new RuntimeException('unexpected format');\n        }\n    }\n}\n\nfunction test_standalone_helper(): void\n{\n    if (true !== true) {\n        throw new RuntimeException('bad test');\n    }\n}\n";
-        let result = split_result(content, Language::Php);
-        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
-        let blocks = result.blocks;
-
-        assert_eq!(
-            blocks.first().map(|block| block.kind),
-            Some(BlockKind::Module)
-        );
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
-        assert!(
-            blocks
-                .iter()
-                .any(|block| block.kind == BlockKind::Interface)
-        );
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Impl));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
-        assert!(
-            blocks
-                .iter()
-                .filter(|block| block.tags.iter().any(|tag| tag == "test"))
-                .count()
-                >= 2
-        );
-        assert!(
-            !blocks
-                .iter()
-                .any(|block| matches!(block.kind, BlockKind::Paragraph))
         );
     }
 

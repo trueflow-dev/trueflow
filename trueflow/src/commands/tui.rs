@@ -5817,6 +5817,10 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: GO_KEYWORDS,
             line_comment_start: Some("//"),
         },
+        Language::C => LanguageHighlightRules {
+            keywords: CPP_KEYWORDS,
+            line_comment_start: Some("//"),
+        },
         Language::Cpp => LanguageHighlightRules {
             keywords: CPP_KEYWORDS,
             line_comment_start: Some("//"),

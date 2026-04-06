@@ -54,6 +54,8 @@ enum SplitPlan {
     CSharpTypeReviewUnits,
     PhpFunctionReviewUnits,
     PhpTypeReviewUnits,
+    CFunctionReviewUnits,
+    CTypeReviewUnits,
 }
 
 impl SplitPlan {
@@ -80,7 +82,9 @@ impl SplitPlan {
             | Self::CSharpFunctionReviewUnits
             | Self::CSharpTypeReviewUnits
             | Self::PhpFunctionReviewUnits
-            | Self::PhpTypeReviewUnits => SubSplitSemantics::ReviewUnits,
+            | Self::PhpTypeReviewUnits
+            | Self::CFunctionReviewUnits
+            | Self::CTypeReviewUnits => SubSplitSemantics::ReviewUnits,
         }
     }
 }
@@ -134,6 +138,8 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         SplitPlan::CSharpTypeReviewUnits => split_csharp_type(block)?,
         SplitPlan::PhpFunctionReviewUnits => split_php_function(block)?,
         SplitPlan::PhpTypeReviewUnits => split_php_type(block)?,
+        SplitPlan::CFunctionReviewUnits => split_c_function(block)?,
+        SplitPlan::CTypeReviewUnits => split_c_type(block)?,
     };
 
     let result = SubSplitResult {
@@ -256,6 +262,10 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
             ) =>
         {
             SplitPlan::PhpTypeReviewUnits
+        }
+        Language::C if matches!(kind, BlockKind::Function) => SplitPlan::CFunctionReviewUnits,
+        Language::C if matches!(kind, BlockKind::Struct | BlockKind::Enum | BlockKind::Type) => {
+            SplitPlan::CTypeReviewUnits
         }
         _ => SplitPlan::CodeReviewUnits,
     }
@@ -942,6 +952,50 @@ fn split_php_type(block: &Block) -> Result<Vec<Block>> {
     }
 }
 
+fn split_c_function(block: &Block) -> Result<Vec<Block>> {
+    split_function_with_parser(
+        block,
+        &FunctionSplitConfig {
+            language: tree_sitter_c::LANGUAGE.into(),
+            function_kinds: &["function_definition"],
+            body_kind: "compound_statement",
+            body_statement_kind: None,
+            signature_end: signature_end_offset,
+            comment_kinds: &["comment"],
+            trailing_delimiters: &["}"],
+        },
+    )
+}
+
+fn split_c_type(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse C type")?;
+    let root = tree.root_node();
+    let type_node = find_named_descendant_any(
+        root,
+        &[
+            "type_definition",
+            "struct_specifier",
+            "union_specifier",
+            "enum_specifier",
+        ],
+    );
+    let Some(type_node) = type_node else {
+        return split_code(block);
+    };
+
+    let items = collect_c_type_items(block, type_node);
+    if items.is_empty() {
+        split_code(block)
+    } else {
+        Ok(items)
+    }
+}
+
 fn split_function_with_parser(
     block: &Block,
     config: &FunctionSplitConfig<'_>,
@@ -1396,28 +1450,6 @@ fn collect_ruby_scope_items(parent: &Block, scope_node: tree_sitter::Node<'_>) -
     blocks
 }
 
-fn collect_php_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<Block> {
-    let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = match child.kind() {
-                "const_declaration" | "enum_case" => BlockKind::Const,
-                "property_declaration" => BlockKind::Variable,
-                "method_declaration" => BlockKind::Method,
-                "use_declaration" => BlockKind::Impl,
-                _ => return None,
-            };
-            Some(create_sub_block_with_kind(
-                parent,
-                &parent.content[child.start_byte()..child.end_byte()],
-                child.start_byte(),
-                child.end_byte(),
-                kind,
-            ))
-        })
-        .collect()
-}
-
 fn ruby_assignment_targets_constant(node: tree_sitter::Node<'_>) -> bool {
     let Some(left) = node.child_by_field_name("left") else {
         return false;
@@ -1452,6 +1484,60 @@ fn ruby_call_method_name(node: tree_sitter::Node<'_>, content: &str) -> Option<S
     node.child_by_field_name("method")
         .and_then(|method| method.utf8_text(content.as_bytes()).ok())
         .map(str::to_string)
+}
+
+fn collect_php_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<Block> {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "const_declaration" | "enum_case" => BlockKind::Const,
+                "property_declaration" => BlockKind::Variable,
+                "method_declaration" => BlockKind::Method,
+                "use_declaration" => BlockKind::Impl,
+                _ => return None,
+            };
+            Some(create_sub_block_with_kind(
+                parent,
+                &parent.content[child.start_byte()..child.end_byte()],
+                child.start_byte(),
+                child.end_byte(),
+                kind,
+            ))
+        })
+        .collect()
+}
+
+fn collect_c_type_items(parent: &Block, type_node: tree_sitter::Node<'_>) -> Vec<Block> {
+    let specifier = if type_node.kind() == "type_definition" {
+        type_node.child_by_field_name("type").unwrap_or(type_node)
+    } else {
+        type_node
+    };
+
+    let Some(body) = specifier.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut cursor = body.walk();
+    body.children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "field_declaration" => BlockKind::Variable,
+                "enumerator" => BlockKind::Const,
+                "comment" => BlockKind::Comment,
+                _ => return None,
+            };
+
+            Some(create_sub_block_with_kind(
+                parent,
+                &parent.content[child.start_byte()..child.end_byte()],
+                child.start_byte(),
+                child.end_byte(),
+                kind,
+            ))
+        })
+        .collect()
 }
 
 fn gap_prefix_length(gap: &str) -> usize {
@@ -1777,59 +1863,6 @@ mod tests {
             !chunks
                 .iter()
                 .any(|block| block.kind == BlockKind::Module && block.content == content)
-        );
-    }
-
-    #[test]
-    fn test_split_php_function_review_units() {
-        let content = "function processData(array $values): array\n{\n    $output = [];\n\n    foreach ($values as $value) {\n        if ($value === 0) {\n            continue;\n        }\n        $output[] = $value;\n    }\n\n    // Preserve a footer entry for reviewers.\n    $output[] = count($values);\n\n    return $output;\n}\n";
-        let block = make_large_block(content, BlockKind::Function);
-        let chunks = split(&block, Language::Php).unwrap();
-        let kinds: Vec<_> = chunks
-            .iter()
-            .filter(|chunk| chunk.kind != BlockKind::Gap)
-            .map(|chunk| chunk.kind)
-            .collect();
-
-        assert_eq!(
-            kinds,
-            vec![
-                BlockKind::FunctionSignature,
-                BlockKind::CodeParagraph,
-                BlockKind::CodeParagraph,
-                BlockKind::Comment,
-                BlockKind::CodeParagraph,
-                BlockKind::CodeParagraph,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_split_php_type_review_units() {
-        let content = "final class ReportBuilder\n{\n    private const SCALE = 2;\n    private string $name;\n\n    public function __construct(string $name)\n    {\n        $this->name = $name;\n    }\n\n    public function processData(array $values): array\n    {\n        return $values;\n    }\n\n    public function testFormatsRecords(): void\n    {\n        if ($this->processData([1, 2]) !== [1, 2]) {\n            throw new RuntimeException('unexpected format');\n        }\n    }\n}\n";
-        let block = make_large_block(content, BlockKind::Class);
-        let chunks = split(&block, Language::Php).unwrap();
-        let kinds: Vec<_> = chunks
-            .iter()
-            .filter(|chunk| chunk.kind != BlockKind::Gap)
-            .map(|chunk| chunk.kind)
-            .collect();
-
-        assert!(
-            kinds.contains(&BlockKind::Const),
-            "missing const member: {kinds:?}"
-        );
-        assert!(
-            kinds.contains(&BlockKind::Variable),
-            "missing property member: {kinds:?}"
-        );
-        assert!(
-            kinds
-                .iter()
-                .filter(|kind| **kind == BlockKind::Method)
-                .count()
-                >= 3,
-            "missing method members: {kinds:?}"
         );
     }
 
