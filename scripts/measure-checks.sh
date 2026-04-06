@@ -51,8 +51,12 @@ coverage-check
 nix-check
 nix-check-native
 nix-check-default
+nix-check-static
+nix-check-release
 nix-check-native-with-tests
 nix-check-default-with-tests
+nix-check-static-with-tests
+nix-check-release-with-tests
 EOF
 }
 
@@ -89,7 +93,7 @@ stage_command() {
       printf '%s\n' 'cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80'
       ;;
     nix-check)
-      printf '%s\n' 'nix build --no-link .#native .#default'
+      printf '%s\n' 'nix build --no-link .#default'
       ;;
     nix-check-native)
       printf '%s\n' 'nix build --no-link .#native'
@@ -97,11 +101,23 @@ stage_command() {
     nix-check-default)
       printf '%s\n' 'nix build --no-link .#default'
       ;;
+    nix-check-static)
+      printf '%s\n' 'nix build --no-link .#static'
+      ;;
+    nix-check-release)
+      printf '%s\n' 'nix build --no-link .#release'
+      ;;
     nix-check-native-with-tests)
       printf '%s\n' 'nix build --no-link .#native-with-tests'
       ;;
     nix-check-default-with-tests)
       printf '%s\n' 'nix build --no-link .#default-with-tests'
+      ;;
+    nix-check-static-with-tests)
+      printf '%s\n' 'nix build --no-link .#static-with-tests'
+      ;;
+    nix-check-release-with-tests)
+      printf '%s\n' 'nix build --no-link .#release-with-tests'
       ;;
     *)
       echo "unknown stage: $1" >&2

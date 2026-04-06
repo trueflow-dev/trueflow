@@ -36,12 +36,37 @@ fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
     assert_contains(
         &flake,
         "trueflowMusl = mkTrueflowPackage {\n          rustPlatform = pkgs.pkgsStatic.rustPlatform;\n          cargoBuildTarget = \"${pkgs.pkgsStatic.stdenv.hostPlatform.config}\";\n          doCheck = false;\n        };",
-        "flake default package build policy",
+        "flake static package build policy",
     );
     assert_contains(
         &flake,
         "trueflowMuslWithTests = mkTrueflowPackage {\n          rustPlatform = pkgs.pkgsStatic.rustPlatform;\n          cargoBuildTarget = \"${pkgs.pkgsStatic.stdenv.hostPlatform.config}\";\n          doCheck = true;\n        };",
-        "flake default package with tests policy",
+        "flake static package with tests policy",
+    );
+    assert_contains(
+        &flake,
+        "defaultPackage = if pkgs.stdenv.isDarwin then trueflow else trueflowMusl;",
+        "flake conditional default package alias",
+    );
+    assert_contains(
+        &flake,
+        "defaultPackageWithTests = if pkgs.stdenv.isDarwin then trueflowWithTests else trueflowMuslWithTests;",
+        "flake conditional default package-with-tests alias",
+    );
+    assert_contains(
+        &flake,
+        "packages.default = defaultPackage;",
+        "flake default package output",
+    );
+    assert_contains(
+        &flake,
+        "packages.static = trueflowMusl;",
+        "flake explicit static package output",
+    );
+    assert_contains(
+        &flake,
+        "packages.release = trueflowMusl;",
+        "flake explicit release package output",
     );
     assert_contains(
         &flake,
@@ -50,8 +75,23 @@ fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
     );
     assert_contains(
         &flake,
-        "packages.\"default-with-tests\" = trueflowMuslWithTests;",
+        "packages.\"default-with-tests\" = defaultPackageWithTests;",
         "flake explicit default package-with-tests output",
+    );
+    assert_contains(
+        &flake,
+        "packages.\"static-with-tests\" = trueflowMuslWithTests;",
+        "flake explicit static package-with-tests output",
+    );
+    assert_contains(
+        &flake,
+        "packages.\"release-with-tests\" = trueflowMuslWithTests;",
+        "flake explicit release package-with-tests output",
+    );
+    assert_contains(
+        &flake,
+        "apps.default = flake-utils.lib.mkApp { drv = defaultPackage; };",
+        "flake default app follows default package",
     );
     assert_contains(
         &flake,
@@ -128,12 +168,22 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "nix-check:\n    nix build --no-link .#native .#default\n",
+        "nix-check:\n    nix build --no-link .#default\n",
         "Justfile nix-check recipe",
     );
     assert_contains(
         &justfile,
-        "nix-check-with-tests:\n    nix build --no-link .#native-with-tests .#default-with-tests\n",
+        "nix-check-static:\n    nix build --no-link .#static\n",
+        "Justfile nix-check-static recipe",
+    );
+    assert_contains(
+        &justfile,
+        "nix-check-release:\n    nix build --no-link .#release\n",
+        "Justfile nix-check-release recipe",
+    );
+    assert_contains(
+        &justfile,
+        "nix-check-with-tests:\n    nix build --no-link .#default-with-tests\n",
         "Justfile nix-check-with-tests recipe",
     );
     assert_contains(
@@ -145,6 +195,16 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
         &justfile,
         "nix-check-default-with-tests:\n    nix build --no-link .#default-with-tests\n",
         "Justfile nix-check-default-with-tests recipe",
+    );
+    assert_contains(
+        &justfile,
+        "nix-check-static-with-tests:\n    nix build --no-link .#static-with-tests\n",
+        "Justfile nix-check-static-with-tests recipe",
+    );
+    assert_contains(
+        &justfile,
+        "nix-check-release-with-tests:\n    nix build --no-link .#release-with-tests\n",
+        "Justfile nix-check-release-with-tests recipe",
     );
 
     Ok(())
@@ -170,7 +230,7 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "nix-check\nnix-check-native\nnix-check-default\nnix-check-native-with-tests\nnix-check-default-with-tests",
+        "nix-check\nnix-check-native\nnix-check-default\nnix-check-static\nnix-check-release\nnix-check-native-with-tests\nnix-check-default-with-tests\nnix-check-static-with-tests\nnix-check-release-with-tests",
         "measure-check nix stage list",
     );
     assert_contains(
@@ -210,8 +270,18 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    nix-check)\n      printf '%s\\n' 'nix build --no-link .#native .#default'",
+        "    nix-check)\n      printf '%s\\n' 'nix build --no-link .#default'",
         "measure-check nix-check stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    nix-check-static)\n      printf '%s\\n' 'nix build --no-link .#static'",
+        "measure-check nix-check-static stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    nix-check-release)\n      printf '%s\\n' 'nix build --no-link .#release'",
+        "measure-check nix-check-release stage",
     );
     assert_contains(
         &measure_script,
@@ -222,6 +292,16 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
         &measure_script,
         "    nix-check-default-with-tests)\n      printf '%s\\n' 'nix build --no-link .#default-with-tests'",
         "measure-check nix-check-default-with-tests stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    nix-check-static-with-tests)\n      printf '%s\\n' 'nix build --no-link .#static-with-tests'",
+        "measure-check nix-check-static-with-tests stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    nix-check-release-with-tests)\n      printf '%s\\n' 'nix build --no-link .#release-with-tests'",
+        "measure-check nix-check-release-with-tests stage",
     );
     assert_contains(
         &measure_script,

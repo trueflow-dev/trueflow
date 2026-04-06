@@ -190,6 +190,12 @@ nix develop -c just check-fast
 # Full local verification path
 nix develop -c just check-full
 
+# Verify the host-default flake package
+nix develop -c just nix-check
+
+# Optional: verify the explicit release/static flake package
+nix develop -c just nix-check-release
+
 # Optional: rerun buildRustPackage's package-level test phase explicitly
 nix develop -c just nix-check-with-tests
 
@@ -205,7 +211,9 @@ nix develop -c just coverage
 `just check` is the default local gate: tests, lint, and format checks.
 `just check-fast` keeps the faster compile-only path for cases where you want a quicker no-test loop.
 The heavier non-inner-loop work lives behind `just check-full`.
-`just nix-check-with-tests` is the explicit opt-in path for rerunning crate tests inside the Nix package builds themselves.
+`just nix-check` validates the host-default flake package (`native` on Darwin, release/static on Linux).
+`just nix-check-release` is the explicit release/static package build.
+`just nix-check-with-tests` is the explicit opt-in path for rerunning crate tests inside the host-default Nix package build.
 Timing artifacts are written under `.trueflow/measurements/`.
 
     The coverage report is written to `trueflow/target/llvm-cov/html/index.html`.

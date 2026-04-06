@@ -85,9 +85,9 @@ doc:
 coverage-check:
     cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
 
-# Verify both flake packages build in one Nix invocation
+# Verify the default flake package builds for this host
 nix-check:
-    nix build --no-link .#native .#default
+    nix build --no-link .#default
 
 # Verify only the native flake package builds
 nix-check-native:
@@ -97,9 +97,17 @@ nix-check-native:
 nix-check-default:
     nix build --no-link .#default
 
-# Explicitly rerun package-build tests for both flake package variants
+# Verify only the static flake package builds
+nix-check-static:
+    nix build --no-link .#static
+
+# Verify the release flake package builds
+nix-check-release:
+    nix build --no-link .#release
+
+# Explicitly rerun package-build tests for the default flake package
 nix-check-with-tests:
-    nix build --no-link .#native-with-tests .#default-with-tests
+    nix build --no-link .#default-with-tests
 
 # Explicitly rerun package-build tests for the native flake package
 nix-check-native-with-tests:
@@ -108,6 +116,14 @@ nix-check-native-with-tests:
 # Explicitly rerun package-build tests for the default flake package
 nix-check-default-with-tests:
     nix build --no-link .#default-with-tests
+
+# Explicitly rerun package-build tests for the static flake package
+nix-check-static-with-tests:
+    nix build --no-link .#static-with-tests
+
+# Explicitly rerun package-build tests for the release flake package
+nix-check-release-with-tests:
+    nix build --no-link .#release-with-tests
 
 # Fix clippy issues
 fix-clippy:

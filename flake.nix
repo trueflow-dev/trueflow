@@ -86,14 +86,21 @@
           cargoBuildTarget = "${pkgs.pkgsStatic.stdenv.hostPlatform.config}";
           doCheck = true;
         };
+
+        defaultPackage = if pkgs.stdenv.isDarwin then trueflow else trueflowMusl;
+        defaultPackageWithTests = if pkgs.stdenv.isDarwin then trueflowWithTests else trueflowMuslWithTests;
       in {
-        packages.default = trueflowMusl;
+        packages.default = defaultPackage;
         packages.native = trueflow;
         packages.musl = trueflowMusl;
+        packages.static = trueflowMusl;
+        packages.release = trueflowMusl;
         packages."native-with-tests" = trueflowWithTests;
-        packages."default-with-tests" = trueflowMuslWithTests;
+        packages."default-with-tests" = defaultPackageWithTests;
         packages."musl-with-tests" = trueflowMuslWithTests;
-        apps.default = flake-utils.lib.mkApp { drv = trueflowMusl; };
+        packages."static-with-tests" = trueflowMuslWithTests;
+        packages."release-with-tests" = trueflowMuslWithTests;
+        apps.default = flake-utils.lib.mkApp { drv = defaultPackage; };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs;
