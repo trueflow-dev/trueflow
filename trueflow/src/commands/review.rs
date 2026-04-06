@@ -12,7 +12,7 @@ use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
 use crate::tree;
 use crate::vcs;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
@@ -232,8 +232,82 @@ pub struct CollectedReview {
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
 }
 
-pub fn parse_review_request(all: bool, values: &[ReviewTarget]) -> Result<ReviewRequest> {
-    Ok(CliSemanticReviewScope::from_cli(all, values)?.review_request())
+pub fn parse_review_request(
+    all: bool,
+    values: &[ReviewTarget],
+    since: Option<&str>,
+) -> Result<ReviewRequest> {
+    Ok(resolve_cli_review_scope(all, values, since)?.review_request())
+}
+
+pub fn resolve_cli_review_scope(
+    all: bool,
+    values: &[ReviewTarget],
+    since: Option<&str>,
+) -> Result<CliSemanticReviewScope> {
+    resolve_cli_review_scope_with(all, values, since, validate_revision_exists_str)
+}
+
+pub fn expand_cli_review_targets(
+    values: &[ReviewTarget],
+    since: Option<&str>,
+) -> Result<Vec<ReviewTarget>> {
+    expand_cli_review_targets_with(values, since, &validate_revision_exists_str)
+}
+
+pub(crate) fn resolve_cli_review_scope_with<F>(
+    all: bool,
+    values: &[ReviewTarget],
+    since: Option<&str>,
+    validate_revision: F,
+) -> Result<CliSemanticReviewScope>
+where
+    F: Fn(&str) -> Result<()>,
+{
+    let targets = expand_cli_review_targets_with(values, since, &validate_revision)?;
+    CliSemanticReviewScope::from_cli(all, &targets)
+}
+
+pub(crate) fn expand_cli_review_targets_with<F>(
+    values: &[ReviewTarget],
+    since: Option<&str>,
+    validate_revision: &F,
+) -> Result<Vec<ReviewTarget>>
+where
+    F: Fn(&str) -> Result<()>,
+{
+    let Some(since) = since else {
+        return Ok(values.to_vec());
+    };
+    if !values.is_empty() {
+        return Err(anyhow!("--since cannot be combined with --target"));
+    }
+
+    Ok(vec![since_review_target_with(since, validate_revision)?])
+}
+
+pub fn since_review_target(since: &str) -> Result<ReviewTarget> {
+    since_review_target_with(since, &validate_revision_exists_str)
+}
+
+fn since_review_target_with<F>(since: &str, validate_revision: &F) -> Result<ReviewTarget>
+where
+    F: Fn(&str) -> Result<()>,
+{
+    let start = RevisionSpec::new(since)?;
+    validate_revision(start.as_str())?;
+    validate_revision("HEAD")?;
+    Ok(ReviewTarget::RevisionRange(RevisionRangeSpec::new(
+        start.as_str(),
+        "HEAD",
+    )?))
+}
+
+fn validate_revision_exists_str(revision: &str) -> Result<()> {
+    let repo = vcs::repo_from_workdir().context("git repository required for revision targets")?;
+    repo.rev_parse_single(revision)
+        .with_context(|| format!("revision `{revision}` could not be resolved"))?;
+    Ok(())
 }
 
 pub fn resolve_review_request(
@@ -655,13 +729,14 @@ pub fn run(
     json: bool,
     all: bool,
     target: &[ReviewTarget],
+    since: Option<&str>,
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<()> {
     info!(
-        "review start (json={json}, all={all}, target={target:?}, only={only:?}, exclude={exclude:?})"
+        "review start (json={json}, all={all}, target={target:?}, since={since:?}, only={only:?}, exclude={exclude:?})"
     );
-    let request = parse_review_request(all, target)?;
+    let request = parse_review_request(all, target, since)?;
     run_request(json, request, only, exclude)
 }
 
@@ -781,6 +856,7 @@ mod tests {
         let err = parse_review_request(
             true,
             &[ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap())],
+            None,
         )
         .unwrap_err();
         assert!(
@@ -791,7 +867,7 @@ mod tests {
 
     #[test]
     fn parse_review_request_defaults_to_dirty_worktree() {
-        let request = parse_review_request(false, &[])
+        let request = parse_review_request(false, &[], None)
             .unwrap_or_else(|error| panic!("expected default request: {error}"));
         assert_eq!(
             request,
@@ -807,6 +883,7 @@ mod tests {
                 ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
                 ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "def5678").unwrap()),
             ],
+            None,
         )
         .unwrap_or_else(|error| panic!("expected typed targets: {error}"));
 
@@ -829,6 +906,40 @@ mod tests {
             ReviewTarget::from_str("main").unwrap(),
             ReviewTarget::MainDiff
         );
+    }
+
+    #[test]
+    fn parse_review_request_expands_since_to_head_range() {
+        let scope = resolve_cli_review_scope_with(false, &[], Some("HEAD"), |_| Ok(()))
+            .unwrap_or_else(|error| panic!("expected since scope: {error}"));
+        let request = scope.review_request();
+
+        assert_eq!(
+            request,
+            ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
+                RevisionRangeSpec::new("HEAD", "HEAD").unwrap()
+            )])
+        );
+    }
+
+    #[test]
+    fn expand_cli_review_targets_rejects_since_with_explicit_targets() {
+        let err =
+            expand_cli_review_targets_with(&[ReviewTarget::MainDiff], Some("abc1234"), &|_| Ok(()))
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--since cannot be combined with --target")
+        );
+    }
+
+    #[test]
+    fn since_review_target_rejects_unknown_revision_early() {
+        let err = since_review_target_with("definitely-not-a-real-revision", &|revision| {
+            Err(anyhow!("revision `{revision}` could not be resolved"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("could not be resolved"));
     }
 
     #[test]

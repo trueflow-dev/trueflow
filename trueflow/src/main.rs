@@ -45,9 +45,18 @@ fn main() -> Result<()> {
             json,
             all,
             target,
+            since,
             only,
             exclude,
-        } => commands::review::run(&context, *json, *all, target, only, exclude),
+        } => commands::review::run(
+            &context,
+            *json,
+            *all,
+            target,
+            since.as_deref(),
+            only,
+            exclude,
+        ),
         Commands::Feedback {
             format,
             since,
@@ -71,8 +80,9 @@ fn main() -> Result<()> {
         Commands::Tui {
             all,
             target,
+            since,
             only,
             exclude,
-        } => commands::tui::run(&context, *all, target, only, exclude),
+        } => commands::tui::run(&context, *all, target, since.as_deref(), only, exclude),
     }
 }

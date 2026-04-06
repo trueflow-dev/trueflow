@@ -24,6 +24,12 @@ fn checkout_branch(repo: &TestRepo, branch: &str) -> Result<()> {
     repo.git(&["checkout", "-b", branch])
 }
 
+fn head_revision(repo: &TestRepo) -> Result<String> {
+    Ok(run_git_output(&repo.path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string())
+}
+
 #[test]
 fn test_main_review_json_uses_semantic_review_shape() -> Result<()> {
     let repo = TestRepo::new("initial_state")?;
@@ -216,6 +222,38 @@ fn test_main_review_ignores_untracked_files() -> Result<()> {
 
     let changes = get_main_review_json(&repo)?;
     assert!(changes.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn test_review_since_matches_revision_range_target() -> Result<()> {
+    let repo = TestRepo::new("review_since_range")?;
+    repo.write("src/lib.rs", "pub fn one() {}\n")?;
+    repo.commit_all("Initial")?;
+    let base = head_revision(&repo)?;
+
+    repo.write("src/lib.rs", "pub fn one() {}\npub fn two() {}\n")?;
+    repo.commit_all("Add two")?;
+
+    let since_output = repo.run(&["review", "--since", &base, "--json"])?;
+    let range_output = repo.run(&["review", "--target", &format!("rev:{base}..HEAD"), "--json"])?;
+
+    assert_eq!(json(&since_output)?, json(&range_output)?);
+    Ok(())
+}
+
+#[test]
+fn test_review_since_rejects_unknown_revision() -> Result<()> {
+    let repo = TestRepo::new("review_since_invalid")?;
+    repo.write("src/lib.rs", "pub fn one() {}\n")?;
+    repo.commit_all("Initial")?;
+
+    let stderr = repo.run_err(&["review", "--since", "definitely-not-a-real-revision"])?;
+    assert!(
+        stderr.contains("could not be resolved"),
+        "unexpected stderr: {stderr}"
+    );
 
     Ok(())
 }

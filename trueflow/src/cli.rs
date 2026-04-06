@@ -83,8 +83,12 @@ pub enum Commands {
         all: bool,
 
         /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, or `rev:abc1234..def5678`
-        #[arg(long, value_name = "TARGET")]
+        #[arg(long, value_name = "TARGET", conflicts_with = "since")]
         target: Vec<ReviewTarget>,
+
+        /// Review committed changes since this commit (equivalent to `rev:COMMIT..HEAD`)
+        #[arg(long, value_name = "COMMIT", conflicts_with = "all")]
+        since: Option<String>,
 
         /// Only include block types (e.g. "function", "struct")
         #[arg(long)]
@@ -148,8 +152,12 @@ pub enum Commands {
         all: bool,
 
         /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, or `rev:abc1234..def5678`
-        #[arg(long, value_name = "TARGET")]
+        #[arg(long, value_name = "TARGET", conflicts_with = "since")]
         target: Vec<ReviewTarget>,
+
+        /// Review committed changes since this commit (equivalent to `rev:COMMIT..HEAD`)
+        #[arg(long, value_name = "COMMIT", conflicts_with = "all")]
+        since: Option<String>,
 
         /// Only include block types (e.g. "function", "struct")
         #[arg(long)]
@@ -248,6 +256,7 @@ mod tests {
             Commands::Tui {
                 all,
                 target,
+                since,
                 only,
                 exclude,
             } => {
@@ -259,6 +268,7 @@ mod tests {
                         ReviewTarget::Revision(RevisionSpec::new("abc1234").unwrap()),
                     ]
                 );
+                assert!(since.is_none());
                 assert_eq!(only, vec![BlockKind::Function]);
                 assert_eq!(exclude, vec![BlockKind::Comment]);
             }
@@ -274,11 +284,13 @@ mod tests {
             Commands::Tui {
                 all,
                 target,
+                since,
                 only,
                 exclude,
             } => {
                 assert!(!all);
                 assert!(target.is_empty());
+                assert!(since.is_none());
                 assert!(only.is_empty());
                 assert!(exclude.is_empty());
             }
@@ -319,6 +331,7 @@ mod tests {
         match cli.command {
             Commands::Review {
                 target,
+                since,
                 only,
                 exclude,
                 ..
@@ -327,11 +340,72 @@ mod tests {
                     target,
                     vec![ReviewTarget::DirtyWorktree, ReviewTarget::MainDiff]
                 );
+                assert!(since.is_none());
                 assert!(only.is_empty());
                 assert!(exclude.is_empty());
             }
             _ => panic!("expected review command"),
         }
+    }
+
+    #[test]
+    fn review_command_parses_since_commit() {
+        let cli = Cli::parse_from(["trueflow", "review", "--since", "abc1234"]);
+
+        match cli.command {
+            Commands::Review {
+                all,
+                target,
+                since,
+                only,
+                exclude,
+                ..
+            } => {
+                assert!(!all);
+                assert!(target.is_empty());
+                assert_eq!(since.as_deref(), Some("abc1234"));
+                assert!(only.is_empty());
+                assert!(exclude.is_empty());
+            }
+            _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
+    fn tui_command_parses_since_commit() {
+        let cli = Cli::parse_from(["trueflow", "tui", "--since", "abc1234"]);
+
+        match cli.command {
+            Commands::Tui {
+                all,
+                target,
+                since,
+                only,
+                exclude,
+            } => {
+                assert!(!all);
+                assert!(target.is_empty());
+                assert_eq!(since.as_deref(), Some("abc1234"));
+                assert!(only.is_empty());
+                assert!(exclude.is_empty());
+            }
+            _ => panic!("expected tui command"),
+        }
+    }
+
+    #[test]
+    fn review_command_rejects_since_with_target() {
+        let err = match Cli::try_parse_from([
+            "trueflow", "review", "--since", "abc1234", "--target", "main",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --since with --target"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--since") && rendered.contains("--target"),
+            "unexpected clap error: {rendered}"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    CollectedReview, ReviewTarget, collect_review, resolve_review_request,
+    CollectedReview, ReviewTarget, collect_review, resolve_cli_review_scope, resolve_review_request,
 };
 use crate::config::{
     BlockFilters, TuiConfig, TuiDiffFocusMode, TuiKeybindsConfig, TuiSpeedReadConfig,
@@ -349,6 +349,7 @@ pub fn run(
     context: &TrueflowContext,
     all: bool,
     target: &[ReviewTarget],
+    since: Option<&str>,
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<()> {
@@ -356,7 +357,7 @@ pub fn run(
     let config = load_config()?;
     let run_result = (|| {
         let scan_options = config.scan.resolve_options()?;
-        let launch = if let Some(request) = cli_review_request(all, target, only, exclude)? {
+        let launch = if let Some(request) = cli_review_request(all, target, since, only, exclude)? {
             let filters = config.review.resolve_filters(only, exclude);
             let review = {
                 let query = resolve_review_request(
@@ -415,15 +416,31 @@ pub fn run(
 fn cli_review_request(
     all: bool,
     target: &[ReviewTarget],
+    since: Option<&str>,
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<Option<CliReviewRequest>> {
-    let has_cli_overrides = all || !target.is_empty() || !only.is_empty() || !exclude.is_empty();
+    cli_review_request_with(all, target, since, only, exclude, resolve_cli_review_scope)
+}
+
+fn cli_review_request_with<F>(
+    all: bool,
+    target: &[ReviewTarget],
+    since: Option<&str>,
+    only: &[BlockKind],
+    exclude: &[BlockKind],
+    scope_resolver: F,
+) -> Result<Option<CliReviewRequest>>
+where
+    F: Fn(bool, &[ReviewTarget], Option<&str>) -> Result<CliSemanticReviewScope>,
+{
+    let has_cli_overrides =
+        all || !target.is_empty() || since.is_some() || !only.is_empty() || !exclude.is_empty();
     if !has_cli_overrides {
         return Ok(None);
     }
 
-    let review_scope = CliSemanticReviewScope::from_cli(all, target)?;
+    let review_scope = scope_resolver(all, target, since)?;
     Ok(Some(CliReviewRequest { review_scope }))
 }
 
@@ -3837,14 +3854,14 @@ mod diff_scope_tests {
 
     #[test]
     fn cli_review_request_returns_none_without_cli_overrides() {
-        let request = cli_review_request(false, &[], &[], &[])
+        let request = cli_review_request(false, &[], None, &[], &[])
             .unwrap_or_else(|error| panic!("expected no parse error: {error}"));
         assert!(request.is_none());
     }
     #[test]
     fn cli_review_request_file_target_uses_main_diff_scope() {
         let targets = vec![ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap())];
-        let request = cli_review_request(false, &targets, &[], &[])
+        let request = cli_review_request(false, &targets, None, &[], &[])
             .unwrap_or_else(|error| panic!("expected file target request: {error}"));
         let Some(request) = request else {
             panic!("expected cli request");
@@ -3861,7 +3878,7 @@ mod diff_scope_tests {
         let targets = vec![ReviewTarget::RevisionRange(
             crate::commands::review::RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
         )];
-        let request = cli_review_request(false, &targets, &[], &[])
+        let request = cli_review_request(false, &targets, None, &[], &[])
             .unwrap_or_else(|error| panic!("expected revision range request: {error}"));
         let Some(request) = request else {
             panic!("expected cli request");
@@ -3879,7 +3896,7 @@ mod diff_scope_tests {
     fn cli_review_request_only_exclude_without_targets_is_supported() {
         let only = vec![BlockKind::Function];
         let exclude = vec![BlockKind::Comment];
-        let request = cli_review_request(false, &[], &only, &exclude)
+        let request = cli_review_request(false, &[], None, &only, &exclude)
             .unwrap_or_else(|error| panic!("expected filter-only request: {error}"));
         let Some(request) = request else {
             panic!("expected cli request");
@@ -3890,8 +3907,29 @@ mod diff_scope_tests {
     #[test]
     fn cli_review_request_errors_when_all_is_combined_with_targets() {
         let targets = vec![ReviewTarget::DirtyWorktree];
-        let request = cli_review_request(true, &targets, &[], &[]);
+        let request = cli_review_request(true, &targets, None, &[], &[]);
         assert!(request.is_err());
+    }
+
+    #[test]
+    fn cli_review_request_since_uses_revision_range_scope() {
+        let request =
+            cli_review_request_with(false, &[], Some("HEAD"), &[], &[], |all, target, since| {
+                crate::commands::review::resolve_cli_review_scope_with(all, target, since, |_| {
+                    Ok(())
+                })
+            })
+            .unwrap_or_else(|error| panic!("expected since request: {error}"));
+        let Some(request) = request else {
+            panic!("expected cli request");
+        };
+
+        assert_eq!(
+            request.review_scope,
+            CliSemanticReviewScope::RevisionRange(
+                crate::commands::review::RevisionRangeSpec::new("HEAD", "HEAD").unwrap(),
+            )
+        );
     }
 
     #[test]
