@@ -1998,10 +1998,16 @@ fn build_action_lines(
     keybinds: &TuiKeybindsConfig,
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
+    let approve_action = format_key_action(keybinds.approve, "approve");
+    let note_action = format_key_action(keybinds.note, note_action_label(keybinds.note));
+    let mode_action = format_key_action(keybinds.toggle_view, "mode");
+    let speed_read_action = format_key_action(keybinds.speed_read, "speed-read");
+    let root_action = format_key_action(keybinds.root, "root");
+    let quit_action = format_key_action(keybinds.quit, "quit");
     let lines = match context {
         ActionLineContext::Root => vec![
             format!(
-                "[{}/{}/\u{2193}/\u{2191}]move [{}/{}/\u{2192}/Enter]open [{}/{}/\u{2190}]back",
+                "[{}/{}]move [{}/{}/Enter]open [{}/{}]back",
                 keybinds.scroll_down,
                 keybinds.scroll_up,
                 keybinds.next,
@@ -2009,28 +2015,25 @@ fn build_action_lines(
                 keybinds.prev,
                 keybinds.parent,
             ),
-            format!(
-                "[{}]approve [{}]note [{}]root [{}]quit",
-                keybinds.approve, keybinds.note, keybinds.root, keybinds.quit
-            ),
+            format!("{approve_action} {note_action} {root_action} {quit_action}"),
         ],
         ActionLineContext::Review => vec![
             format!(
-                "[{}/{}/\u{2193}/\u{2191}]line-scroll [PgUp/PgDn/Space/Home/End]page-scroll",
+                "[{}/{}]line-scroll [PgUp/PgDn/Space/Home/End]page-scroll",
                 keybinds.scroll_down, keybinds.scroll_up,
             ),
             format!(
-                "[{}/{}/\u{2190}/\u{2192}]prev/next [{}/{}]parent/child [{}]approve [{}]note [{}]view [{}]speed-read [{}]root [{}]quit",
+                "[{}/{}]prev/next [{}/{}]parent/child {} {} {} {} {} {}",
                 keybinds.prev,
                 keybinds.next,
                 keybinds.parent,
                 keybinds.child,
-                keybinds.approve,
-                keybinds.note,
-                keybinds.toggle_view,
-                keybinds.speed_read,
-                keybinds.root,
-                keybinds.quit,
+                approve_action,
+                note_action,
+                mode_action,
+                speed_read_action,
+                root_action,
+                quit_action,
             ),
         ],
     };
@@ -2047,6 +2050,26 @@ fn build_action_lines(
             ))
         })
         .collect()
+}
+
+fn note_action_label(key: char) -> &'static str {
+    if key.eq_ignore_ascii_case(&'c') {
+        "comment"
+    } else {
+        "note"
+    }
+}
+
+fn format_key_action(key: char, label: &str) -> String {
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return format!("[{key}]");
+    };
+    if first.eq_ignore_ascii_case(&key) {
+        format!("[{key}]{}", chars.as_str())
+    } else {
+        format!("[{key}]{label}")
+    }
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -3687,9 +3710,13 @@ mod diff_scope_tests {
         let joined = rendered.join(" ");
 
         assert_eq!(lines.len(), 2);
-        assert!(joined.contains("[m/i/↓/↑]move"));
-        assert!(joined.contains("[l/o/→/Enter]open"));
-        assert!(joined.contains("[j/u/←]back"));
+        assert!(joined.contains("[m/i]move"));
+        assert!(joined.contains("[l/o/Enter]open"));
+        assert!(joined.contains("[j/u]back"));
+        assert!(!joined.contains('↓'));
+        assert!(!joined.contains('↑'));
+        assert!(!joined.contains('←'));
+        assert!(!joined.contains('→'));
         assert!(joined.contains("[y]approve"));
         assert!(joined.contains("[e]note"));
         assert!(joined.contains("[x]quit"));
@@ -3698,35 +3725,46 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn build_action_lines_for_review_nodes_advertise_line_and_page_scroll() {
-        let keybinds = crate::config::TuiKeybindsConfig {
-            scroll_up: 'i',
-            scroll_down: 'm',
-            prev: 'j',
-            next: 'l',
-            parent: 'u',
-            child: 'o',
-            approve: 'y',
-            note: 'e',
-            toggle_view: 'v',
-            speed_read: 's',
-            root: 'z',
-            quit: 'x',
-        };
+    fn build_action_lines_for_review_nodes_use_mode_label_and_configured_keys() {
+        let keybinds = crate::config::TuiKeybindsConfig::default();
         let palette = UiPalette::default();
         let lines = build_action_lines(80, ActionLineContext::Review, &keybinds, &palette);
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
         assert_eq!(lines.len(), 2);
-        assert!(joined.contains("[m/i/↓/↑]line-scroll"));
+        assert!(joined.contains("[j/k]line-scroll"));
         assert!(joined.contains("[PgUp/PgDn/Space/Home/End]page-scroll"));
-        assert!(joined.contains("[j/l/←/→]prev/next"));
-        assert!(joined.contains("[u/o]parent/child"));
-        assert!(joined.contains("[v]view"));
-        assert!(joined.contains("[s]speed-read"));
-        assert!(joined.contains("[z]root"));
-        assert!(joined.contains("[x]quit"));
+        assert!(joined.contains("[h/l]prev/next"));
+        assert!(joined.contains("[p/c]parent/child"));
+        assert!(joined.contains("[a]pprove"));
+        assert!(joined.contains("[n]ote"));
+        assert!(joined.contains("[m]ode"));
+        assert!(joined.contains("[r]speed-read"));
+        assert!(joined.contains("[g]root"));
+        assert!(joined.contains("[q]uit"));
+        assert!(!joined.contains('↓'));
+        assert!(!joined.contains('↑'));
+        assert!(!joined.contains('←'));
+        assert!(!joined.contains('→'));
+        assert!(!joined.contains("view"));
+        assert!(!joined.contains("[n]note"));
+        assert!(!joined.contains("[q]quit"));
+    }
+
+    #[test]
+    fn build_action_lines_use_comment_label_when_note_key_is_c() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            note: 'c',
+            ..crate::config::TuiKeybindsConfig::default()
+        };
+        let palette = UiPalette::default();
+        let lines = build_action_lines(80, ActionLineContext::Review, &keybinds, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let joined = rendered.join(" ");
+
+        assert!(joined.contains("[c]omment"));
+        assert!(!joined.contains("[c]comment"));
     }
 
     #[test]
