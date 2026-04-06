@@ -25,13 +25,13 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
 
     assert_contains(
         &justfile,
-        "check: compile-check lint fmt-check",
-        "Justfile fast check recipe",
+        "check: test lint fmt-check",
+        "Justfile default check recipe",
     );
     assert_contains(
         &justfile,
-        "check-dev: test lint fmt-check",
-        "Justfile check-dev recipe",
+        "check-fast: compile-check lint fmt-check",
+        "Justfile check-fast recipe",
     );
     assert_contains(
         &justfile,
@@ -82,7 +82,7 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
 
     assert_contains(
         &measure_script,
-        "check\ncheck-dev\ncheck-heavy\ncheck-full\ncurrent-check\nlocal-minimum\nlocal-dev",
+        "check\ncheck-fast\ncheck-heavy\ncheck-full\ncurrent-check\nlocal-minimum\nlocal-dev",
         "measure-check profile list",
     );
     assert_contains(
@@ -117,13 +117,13 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    check|local-minimum)\n      printf '%s\\n' compile-check lint fmt-check",
-        "measure-check fast check profile",
+        "    check|local-dev)\n      printf '%s\\n' test lint fmt-check",
+        "measure-check default check profile",
     );
     assert_contains(
         &measure_script,
-        "    check-dev|local-dev)\n      printf '%s\\n' test lint fmt-check",
-        "measure-check check-dev profile",
+        "    check-fast|local-minimum)\n      printf '%s\\n' compile-check lint fmt-check",
+        "measure-check check-fast profile",
     );
     assert_contains(
         &measure_script,

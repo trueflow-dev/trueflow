@@ -9,25 +9,25 @@ Usage:
   scripts/measure-checks.sh --list-stages
 
 Profiles:
-  check           Fast default local gate (compile, lint, fmt)
-  check-dev       Fast local developer loop (tests, lint, fmt)
+  check           Default local gate (tests, lint, fmt)
+  check-fast      Faster no-test local gate (compile, lint, fmt)
   check-heavy     Heavyweight non-inner-loop checks (audit, doc, coverage, nix builds)
   check-full      Full local verification path
   current-check   Legacy alias for check-full
-  local-minimum   Legacy alias for check
-  local-dev       Legacy alias for check-dev
+  local-minimum   Legacy alias for check-fast
+  local-dev       Legacy alias for check
 
 Examples:
   scripts/measure-checks.sh --profile check
+  scripts/measure-checks.sh --profile check-fast
   scripts/measure-checks.sh --profile check-full
-  scripts/measure-checks.sh lint test
 EOF
 }
 
 list_profiles() {
   cat <<'EOF'
 check
-check-dev
+check-fast
 check-heavy
 check-full
 current-check
@@ -100,11 +100,11 @@ stage_command() {
 
 profile_stages() {
   case "$1" in
-    check|local-minimum)
-      printf '%s\n' compile-check lint fmt-check
-      ;;
-    check-dev|local-dev)
+    check|local-dev)
       printf '%s\n' test lint fmt-check
+      ;;
+    check-fast|local-minimum)
+      printf '%s\n' compile-check lint fmt-check
       ;;
     check-heavy)
       printf '%s\n' audit doc coverage-check nix-check-native nix-check-default

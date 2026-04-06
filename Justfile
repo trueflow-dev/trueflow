@@ -2,11 +2,11 @@
 default:
     @just --list
 
-# Run the fast default local gate (compile, lint, fmt)
-check: compile-check lint fmt-check
+# Run the default local gate (tests, lint, fmt)
+check: test lint fmt-check
 
-# Run the fast local developer loop (tests, lint, fmt)
-check-dev: test lint fmt-check
+# Run the faster no-test local gate (compile, lint, fmt)
+check-fast: compile-check lint fmt-check
 
 # Run heavyweight checks that are useful before CI / release work
 check-heavy: audit doc coverage-check nix-check
@@ -18,9 +18,9 @@ check-full: test-full lint-all-targets fmt-check audit doc coverage-check nix-ch
 measure-check profile="check":
     ./scripts/measure-checks.sh --profile "{{profile}}"
 
-# Measure the fast local developer loop
-measure-check-dev:
-    ./scripts/measure-checks.sh --profile check-dev
+# Measure the faster no-test local gate
+measure-check-fast:
+    ./scripts/measure-checks.sh --profile check-fast
 
 # Measure the heavyweight local gate
 measure-check-heavy:
