@@ -442,10 +442,17 @@ fn build_review_state(
     let remaining_blocks = reviewable_nodes.len();
 
     let root_children = review.tree.node(review.tree.root()).children.clone();
-    let root_cursor = root_children.first().copied();
-
     let review_order = ReviewOrder::from_tree(&review.tree, &review.unreviewed_block_nodes);
-    let navigator = ReviewNavigator::new(review.tree, review.unreviewed_block_nodes)?;
+    let mut navigator = ReviewNavigator::new(review.tree, review.unreviewed_block_nodes)?;
+    let mut root_cursor = root_children.first().copied();
+    let mut focus_block = None;
+    let mut pending_focus_scroll = false;
+    if let Some(initial_block) = review_order.first_reviewable_block() {
+        navigator.set_current(initial_block);
+        root_cursor = root_child_for_node(&navigator.tree, initial_block).or(root_cursor);
+        focus_block = Some(initial_block);
+        pending_focus_scroll = true;
+    }
 
     Ok(AppState {
         review_scope,
@@ -464,8 +471,8 @@ fn build_review_state(
         workdir_prefix: options.workdir_prefix,
         file_cache: HashMap::new(),
         root_cursor,
-        focus_block: None,
-        pending_focus_scroll: false,
+        focus_block,
+        pending_focus_scroll,
         scroll_offset: 0,
         content_height: 0,
         viewport_height: 0,
@@ -481,6 +488,18 @@ fn build_review_state(
             options.speed_read_config_path,
         ),
     })
+}
+
+fn root_child_for_node(tree: &Tree, node_id: TreeNodeId) -> Option<TreeNodeId> {
+    let root = tree.root();
+    let mut current = node_id;
+    while let Some(parent) = tree.parent(current) {
+        if parent == root {
+            return Some(current);
+        }
+        current = parent;
+    }
+    None
 }
 
 fn block_diff_focus_mode_from_config(config: &TuiConfig) -> vcs::BlockDiffFocusMode {
@@ -3123,8 +3142,15 @@ mod diff_scope_tests {
     use super::*;
     use crate::analysis::Language;
     use crate::block::{Block, BlockKind};
+    use crate::cli::Cli;
+    use crate::commands::review::{
+        CollectedReview, ReviewDiagnostic, ReviewSummary, UnreviewedFile,
+    };
+    use crate::context::TrueflowContext;
+    use crate::repo_path::RepoPath;
     use crate::store::ReviewTargetKind;
     use crate::tree::TreeBuilder;
+    use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -3866,6 +3892,68 @@ mod diff_scope_tests {
         let targets = vec![ReviewTarget::DirtyWorktree];
         let request = cli_review_request(true, &targets, &[], &[]);
         assert!(request.is_err());
+    }
+
+    #[test]
+    fn build_review_state_starts_direct_launch_on_first_reviewable_block() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let block = Block::new("fn helper() {}\n".to_string(), BlockKind::Function, 3, 4);
+        let block_id = builder.add_block(
+            file,
+            "helper".to_string(),
+            "src/lib.rs".to_string(),
+            block.clone(),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let review = CollectedReview {
+            summary: ReviewSummary {
+                files: vec![UnreviewedFile {
+                    path: RepoPath::new("src/lib.rs").unwrap(),
+                    language: Language::Rust,
+                    blocks: vec![block],
+                }],
+                total_blocks: 1,
+                diagnostics: Vec::<ReviewDiagnostic>::new(),
+            },
+            tree,
+            unreviewed_block_nodes: HashSet::from([block_id]),
+        };
+        let context = TrueflowContext::new(Cli::parse_from(["trueflow", "tui"]));
+
+        let state = build_review_state(
+            &context,
+            review,
+            ReviewScope::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "HEAD".to_string(),
+            },
+            ReviewStateBuildOptions {
+                confirm_batch: false,
+                block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+                keybinds: TuiKeybindsConfig::default(),
+                scope_label: "rev:abc1234..HEAD".to_string(),
+                workdir_prefix: None,
+                speed_read_config: TuiSpeedReadConfig::default(),
+                speed_read_config_path: PathBuf::from("trueflow.toml"),
+            },
+        )
+        .unwrap_or_else(|error| panic!("expected review state: {error}"));
+
+        assert_eq!(state.navigator.current_id(), block_id);
+        assert_eq!(state.focus_block, Some(block_id));
+        assert!(state.pending_focus_scroll);
+        assert_eq!(state.root_cursor, Some(src));
+        assert_ne!(state.navigator.current_id(), state.navigator.tree.root());
     }
 
     #[test]
