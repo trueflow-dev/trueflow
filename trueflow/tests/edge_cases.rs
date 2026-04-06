@@ -106,11 +106,11 @@ fn test_empty_file() -> Result<()> {
 }
 
 #[test]
-fn test_scan_surfaces_unsupported_code_fallback_diagnostic() -> Result<()> {
-    let repo = TestRepo::new("unsupported_code_fallback")?;
+fn test_scan_reports_structured_elisp_blocks_without_fallback_diagnostic() -> Result<()> {
+    let repo = TestRepo::new("structured_elisp")?;
     repo.write(
         "main.el",
-        "(message \"hello\")\n\n(defun greet ()\n  (message \"hi\"))\n",
+        "(require 'cl-lib)\n\n(defun greet ()\n  (message \"hi\"))\n",
     )?;
 
     let output = repo.run(&["scan", "--json"])?;
@@ -121,14 +121,9 @@ fn test_scan_surfaces_unsupported_code_fallback_diagnostic() -> Result<()> {
         .find(|file| file.path.as_str() == "main.el")
         .context("missing scan output for main.el")?;
 
+    assert_eq!(file_state.language, trueflow::analysis::Language::Elisp);
     assert!(!file_state.blocks.is_empty());
-    assert!(
-        file_state
-            .blocks
-            .iter()
-            .any(|block| block.kind == trueflow::block::BlockKind::CodeParagraph)
-    );
-    assert!(scan_result.diagnostics.iter().any(|diagnostic| {
+    assert!(!scan_result.diagnostics.iter().any(|diagnostic| {
         diagnostic.path.as_ref().map(|path| path.as_str()) == Some("main.el")
             && diagnostic.reason.contains("unsupported language")
     }));

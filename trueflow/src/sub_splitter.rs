@@ -38,6 +38,7 @@ enum SplitPlan {
     SentenceReviewUnits,
     CodeReviewUnits,
     RustFunctionReviewUnits,
+    ElispFunctionReviewUnits,
     RustImplReviewUnits,
     SwiftFunctionReviewUnits,
     SwiftTypeReviewUnits,
@@ -56,6 +57,7 @@ impl SplitPlan {
             | Self::SentenceReviewUnits
             | Self::CodeReviewUnits
             | Self::RustFunctionReviewUnits
+            | Self::ElispFunctionReviewUnits
             | Self::RustImplReviewUnits
             | Self::SwiftFunctionReviewUnits
             | Self::SwiftTypeReviewUnits
@@ -100,6 +102,7 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         SplitPlan::SentenceReviewUnits => split_sentences(block)?,
         SplitPlan::CodeReviewUnits => split_code(block)?,
         SplitPlan::RustFunctionReviewUnits => split_rust_function(block)?,
+        SplitPlan::ElispFunctionReviewUnits => split_elisp_function(block)?,
         SplitPlan::RustImplReviewUnits => split_rust_impl(block)?,
         SplitPlan::SwiftFunctionReviewUnits => split_swift_function(block)?,
         SplitPlan::SwiftTypeReviewUnits => split_swift_type(block)?,
@@ -143,6 +146,9 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
         Language::Markdown => SplitPlan::MarkdownChildren,
         Language::Text => SplitPlan::SentenceReviewUnits,
         Language::Toml | Language::Nix | Language::Just => SplitPlan::CodeReviewUnits,
+        Language::Elisp if matches!(kind, BlockKind::Function | BlockKind::Macro) => {
+            SplitPlan::ElispFunctionReviewUnits
+        }
         Language::Rust if matches!(kind, BlockKind::Function | BlockKind::Method) => {
             SplitPlan::RustFunctionReviewUnits
         }
@@ -368,6 +374,122 @@ fn split_rust_impl(block: &Block) -> Result<Vec<Block>> {
     }
 
     split_code(block)
+}
+
+fn split_elisp_function(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_elisp::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse elisp function")?;
+    let root = tree.root_node();
+    let Some(form_node) =
+        find_named_descendant_any(root, &["function_definition", "macro_definition", "list"])
+    else {
+        return split_code(block);
+    };
+
+    let signature_end = match form_node.kind() {
+        "function_definition" | "macro_definition" => elisp_definition_signature_end(form_node),
+        "list" => elisp_ert_test_signature_end(form_node, content),
+        _ => None,
+    };
+    let Some(signature_end) = signature_end else {
+        return split_code(block);
+    };
+    if signature_end >= content.len() {
+        return split_code(block);
+    }
+
+    let mut blocks = vec![create_sub_block_with_kind(
+        block,
+        &content[..signature_end],
+        0,
+        signature_end,
+        BlockKind::FunctionSignature,
+    )];
+    blocks.extend(split_by_paragraph_breaks(
+        &content[signature_end..],
+        |chunk, start, end, is_gap| {
+            let kind = if is_gap {
+                BlockKind::Gap
+            } else {
+                classify_code_chunk(chunk)
+            };
+            create_sub_block_with_kind(
+                block,
+                chunk,
+                signature_end + start,
+                signature_end + end,
+                kind,
+            )
+        },
+    ));
+
+    Ok(blocks)
+}
+
+fn elisp_definition_signature_end(node: tree_sitter::Node<'_>) -> Option<usize> {
+    let name = node.child_by_field_name("name")?;
+    let parameters = node.child_by_field_name("parameters");
+    let docstring = node.child_by_field_name("docstring");
+    collect_elisp_form_items(node, |child| {
+        same_tree_sitter_node(child, name)
+            || parameters.is_some_and(|parameters| same_tree_sitter_node(child, parameters))
+            || docstring.is_some_and(|docstring| same_tree_sitter_node(child, docstring))
+    })
+    .first()
+    .map(|node| node.start_byte())
+}
+
+fn elisp_ert_test_signature_end(node: tree_sitter::Node<'_>, content: &str) -> Option<usize> {
+    if !matches!(elisp_list_head_symbol(node, content), Some("ert-deftest")) {
+        return None;
+    }
+
+    let head = node.named_child(0)?;
+    let name = node.named_child(1)?;
+    let parameters = node.named_child(2)?;
+    let docstring = node.named_child(3).filter(|node| node.kind() == "string");
+    collect_elisp_form_items(node, |child| {
+        same_tree_sitter_node(child, head)
+            || same_tree_sitter_node(child, name)
+            || same_tree_sitter_node(child, parameters)
+            || docstring.is_some_and(|docstring| same_tree_sitter_node(child, docstring))
+    })
+    .first()
+    .map(|node| node.start_byte())
+}
+
+fn collect_elisp_form_items<'a, F>(
+    node: tree_sitter::Node<'a>,
+    mut should_skip: F,
+) -> Vec<tree_sitter::Node<'a>>
+where
+    F: FnMut(tree_sitter::Node<'a>) -> bool,
+{
+    let mut items = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if (child.is_named() || child.kind() == "comment") && !should_skip(child) {
+            items.push(child);
+        }
+    }
+    items
+}
+
+fn same_tree_sitter_node(left: tree_sitter::Node<'_>, right: tree_sitter::Node<'_>) -> bool {
+    left.kind() == right.kind()
+        && left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
+}
+
+fn elisp_list_head_symbol<'a>(node: tree_sitter::Node<'a>, content: &'a str) -> Option<&'a str> {
+    let head = node.named_child(0)?;
+    (head.kind() == "symbol")
+        .then(|| head.utf8_text(content.as_bytes()).ok())
+        .flatten()
 }
 
 fn collect_rust_impl_items(parent: &Block, impl_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
@@ -1060,6 +1182,26 @@ mod tests {
         assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
         assert_eq!(chunks[1].kind, BlockKind::Gap);
         assert_eq!(chunks[2].kind, BlockKind::CodeParagraph);
+        assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn test_split_elisp_function_into_review_units() {
+        let content = "(defun elisp-support-run (items)\n  \"Normalize ITEMS and report the active entries.\"\n  (let ((normalized (seq-filter #'identity items))\n        (results nil))\n    ;; keep only truthy values\n    (dolist (item normalized)\n      (push (string-trim item) results))\n\n    (when elisp-support-enabled\n      (message \"%s\" elisp-support-mode-name))\n\n    (nreverse results)))\n";
+        let block = make_large_block(content, BlockKind::Function);
+        let chunks = split(&block, Language::Elisp).unwrap();
+        let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::FunctionSignature,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::CodeParagraph,
+            ]
+        );
         assert_eq!(merge_blocks(chunks), content);
     }
 

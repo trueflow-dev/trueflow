@@ -214,6 +214,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         ),
         Language::Rust
         | Language::Swift
+        | Language::Elisp
         | Language::JavaScript
         | Language::TypeScript
         | Language::Java
@@ -434,6 +435,7 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
     match lang {
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
         Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
+        Language::Elisp => Some(tree_sitter_elisp::LANGUAGE.into()),
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
@@ -1025,7 +1027,53 @@ fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8>
 fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
     match lang {
         Language::Swift => swift::map_kind(node, content),
+        Language::Elisp => map_elisp_kind(node, content),
         _ => map_kind(lang, node.kind()),
+    }
+}
+
+fn map_elisp_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match node.kind() {
+        "function_definition" => BlockKind::Function,
+        "macro_definition" => BlockKind::Macro,
+        "special_form" => match elisp_special_form_head(node) {
+            Some("defconst") => BlockKind::Const,
+            Some("defvar") => BlockKind::Variable,
+            _ => BlockKind::Code,
+        },
+        "list" => match elisp_list_head_symbol(node, content) {
+            Some("require") | Some("use-package") => BlockKind::Import,
+            Some("provide") => BlockKind::Module,
+            Some("defcustom") => BlockKind::Variable,
+            Some("ert-deftest") => BlockKind::Function,
+            _ => BlockKind::Code,
+        },
+        "comment" => BlockKind::Comment,
+        _ => BlockKind::Code,
+    }
+}
+
+fn elisp_special_form_head(node: tree_sitter::Node<'_>) -> Option<&str> {
+    Some(node.child(1)?.kind())
+}
+
+fn elisp_list_head_symbol<'a>(node: tree_sitter::Node<'a>, content: &'a str) -> Option<&'a str> {
+    let head = node.named_child(0)?;
+    (head.kind() == "symbol")
+        .then(|| head.utf8_text(content.as_bytes()).ok())
+        .flatten()
+}
+
+fn elisp_form_name<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "function_definition" | "macro_definition" => node
+            .child_by_field_name("name")?
+            .utf8_text(source.as_bytes())
+            .ok(),
+        "list" if matches!(elisp_list_head_symbol(node, source), Some("ert-deftest")) => {
+            node.named_child(1)?.utf8_text(source.as_bytes()).ok()
+        }
+        _ => None,
     }
 }
 
@@ -1263,6 +1311,7 @@ fn collect_test_ranges(
             collect_python_test_ranges(&PYTHON_DECORATED_TEST_QUERY, tree, source, &mut ranges)?;
             collect_python_test_ranges(&PYTHON_FUNCTION_TEST_QUERY, tree, source, &mut ranges)?;
         }
+        Language::Elisp => collect_elisp_test_ranges(tree.root_node(), source, &mut ranges)?,
         Language::JavaScript => {
             collect_js_test_ranges(&JAVASCRIPT_ARROW_TEST_QUERY, tree, source, &mut ranges)?;
             collect_js_test_ranges(&JAVASCRIPT_MEMBER_TEST_QUERY, tree, source, &mut ranges)?;
@@ -1409,6 +1458,35 @@ fn collect_python_test_ranges(
             ranges.push(ByteSpan::new(range.0, range.1));
         }
     }
+    Ok(())
+}
+
+fn collect_elisp_test_ranges(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    ranges: &mut Vec<ByteSpan>,
+) -> Result<()> {
+    match node.kind() {
+        "function_definition" | "macro_definition" => {
+            if let Some(name) = elisp_form_name(node, source)
+                && name.starts_with("test-")
+            {
+                ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+            }
+        }
+        "list" => {
+            if matches!(elisp_list_head_symbol(node, source), Some("ert-deftest")) {
+                ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_elisp_test_ranges(child, source, ranges)?;
+    }
+
     Ok(())
 }
 
@@ -1811,22 +1889,33 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
     }
 
     #[test]
-    fn test_split_unsupported_code_language_falls_back_to_code_blocks() {
-        let content = "(message \"hello\")\n\n(defun greet ()\n  (message \"hi\"))\n";
+    fn test_split_elisp_structural_blocks_and_test_detection() {
+        let content = "(require 'cl-lib)\n\n(use-package seq\n  :ensure t)\n\n(defconst elisp-support-limit 3\n  \"Retry count.\")\n\n(defvar elisp-support-name \"trueflow\"\n  \"Display name.\")\n\n(defcustom elisp-support-enabled t\n  \"Whether support is enabled.\"\n  :type 'boolean)\n\n(defmacro elisp-support-with-message (label &rest body)\n  `(progn\n     (message \"running %s\" ,label)\n     ,@body))\n\n(defun elisp-support-run ()\n  (message \"ok\"))\n\n(ert-deftest elisp-support-run-test ()\n  (should t))\n\n(provide 'elisp-support)\n";
         let result = split_result(content, Language::Elisp);
-        assert_eq!(result.strategy, BlockSplitStrategy::UnsupportedCode);
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.reason.contains("unsupported language"))
-        );
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
         let blocks = result.blocks;
-        assert!(!blocks.is_empty());
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Variable));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Macro));
         assert!(
             blocks
                 .iter()
-                .any(|block| block.kind == BlockKind::CodeParagraph)
+                .filter(|block| block.kind == BlockKind::Function)
+                .count()
+                >= 2
+        );
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.content.contains("ert-deftest") && block.has_tag("test"))
+        );
+        assert!(blocks.iter().all(|block| block.complexity.is_none()));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Paragraph))
         );
     }
 
