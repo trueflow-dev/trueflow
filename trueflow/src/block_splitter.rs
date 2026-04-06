@@ -218,6 +218,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         | Language::JavaScript
         | Language::TypeScript
         | Language::Java
+        | Language::Kotlin
         | Language::Python
         | Language::Shell => attempt_split(
             content,
@@ -393,6 +394,11 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         {
             blocks.extend(collect_java_type_items(child, content, lang));
         }
+        if matches!(lang, Language::Kotlin)
+            && matches!(ts_kind, "class_declaration" | "object_declaration")
+        {
+            blocks.extend(collect_kotlin_type_items(child, content, lang));
+        }
 
         last_end_byte = end_byte;
         pending_start = None;
@@ -439,6 +445,7 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
+        Language::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -1028,6 +1035,7 @@ fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str)
     match lang {
         Language::Swift => swift::map_kind(node, content),
         Language::Elisp => map_elisp_kind(node, content),
+        Language::Kotlin => map_kotlin_kind(node, content),
         _ => map_kind(lang, node.kind()),
     }
 }
@@ -1134,6 +1142,44 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
     }
 }
 
+fn map_kotlin_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match node.kind() {
+        "package_header" => BlockKind::Module,
+        "import" => BlockKind::Import,
+        "function_declaration" => BlockKind::Function,
+        "property_declaration" => {
+            classify_kotlin_property_kind(&content[node.start_byte()..node.end_byte()])
+        }
+        "class_declaration" => classify_kotlin_class_kind(node, content),
+        "object_declaration" => BlockKind::Class,
+        _ => BlockKind::Code,
+    }
+}
+
+fn classify_kotlin_class_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    let name_start = node
+        .child_by_field_name("name")
+        .map(|name| name.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let header = &content[node.start_byte()..name_start.min(node.end_byte())];
+
+    if header.contains("interface") {
+        BlockKind::Interface
+    } else if header.contains("enum") {
+        BlockKind::Enum
+    } else {
+        BlockKind::Class
+    }
+}
+
+fn classify_kotlin_property_kind(text: &str) -> BlockKind {
+    if text.contains("var ") {
+        BlockKind::Variable
+    } else {
+        BlockKind::Const
+    }
+}
+
 fn collect_swift_type_items(
     type_node: tree_sitter::Node<'_>,
     content: &str,
@@ -1207,6 +1253,74 @@ fn collect_java_type_items(
             })
         })
         .collect()
+}
+
+fn collect_kotlin_type_items(
+    type_node: tree_sitter::Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let Some(body) = kotlin_type_body(type_node) else {
+        return Vec::new();
+    };
+
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = map_kotlin_type_member_kind(child, content);
+            (!matches!(kind, BlockKind::Code)).then(|| {
+                create_block(
+                    &content[child.start_byte()..child.end_byte()],
+                    kind,
+                    content,
+                    child.start_byte(),
+                    child.end_byte(),
+                    lang,
+                )
+            })
+        })
+        .collect()
+}
+
+fn kotlin_type_body(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    first_child_of_kind(node, "class_body").or_else(|| first_child_of_kind(node, "enum_class_body"))
+}
+
+fn map_kotlin_type_member_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    match node.kind() {
+        "function_declaration" => {
+            if find_named_descendant_of_kind(node, "function_body").is_some() {
+                BlockKind::Method
+            } else {
+                BlockKind::FunctionSignature
+            }
+        }
+        "property_declaration" => {
+            classify_kotlin_property_kind(&content[node.start_byte()..node.end_byte()])
+        }
+        "class_declaration" => classify_kotlin_class_kind(node, content),
+        "object_declaration" | "companion_object" => BlockKind::Class,
+        "secondary_constructor" => BlockKind::Method,
+        _ => BlockKind::Code,
+    }
+}
+
+fn find_named_descendant_of_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = find_named_descendant_of_kind(child, kind) {
+            return Some(found);
+        }
+    }
+
+    None
 }
 
 fn create_block(
@@ -1312,6 +1426,9 @@ fn collect_test_ranges(
             collect_python_test_ranges(&PYTHON_FUNCTION_TEST_QUERY, tree, source, &mut ranges)?;
         }
         Language::Elisp => collect_elisp_test_ranges(tree.root_node(), source, &mut ranges)?,
+        Language::Kotlin => {
+            collect_kotlin_test_ranges(tree.root_node(), source, &mut ranges)?;
+        }
         Language::JavaScript => {
             collect_js_test_ranges(&JAVASCRIPT_ARROW_TEST_QUERY, tree, source, &mut ranges)?;
             collect_js_test_ranges(&JAVASCRIPT_MEMBER_TEST_QUERY, tree, source, &mut ranges)?;
@@ -1418,6 +1535,34 @@ fn collect_swift_xctest_ranges(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_swift_xctest_ranges(child, source, ranges)?;
+    }
+
+    Ok(())
+}
+
+fn collect_kotlin_test_ranges(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    ranges: &mut Vec<ByteSpan>,
+) -> Result<()> {
+    if node.kind() == "function_declaration" {
+        let name_is_test = node
+            .child_by_field_name("name")
+            .map(|name| name.utf8_text(source.as_bytes()))
+            .transpose()?
+            .is_some_and(|name| name.starts_with("test"));
+        let has_test_annotation = first_child_of_kind(node, "modifiers")
+            .map(|modifiers| &source[modifiers.start_byte()..modifiers.end_byte()])
+            .is_some_and(|modifiers| modifiers.contains("Test"));
+
+        if name_is_test || has_test_annotation {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_kotlin_test_ranges(child, source, ranges)?;
     }
 
     Ok(())
@@ -1664,6 +1809,41 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
             !blocks
                 .iter()
                 .any(|block| block.kind == BlockKind::Paragraph)
+        );
+    }
+
+    #[test]
+    fn test_kotlin_structural_blocks_and_test_detection() {
+        let content = "package demo.kotlin\n\nimport kotlin.test.Test\n\nconst val defaultScale = 2\nvar globalCounter = 0\n\ninterface WorkerPort {\n    fun load(id: String): Worker\n}\n\nclass Worker {\n    val name = \"worker\"\n    var enabled = true\n\n    fun process(values: List<Int>): Int {\n        return values.sum()\n    }\n}\n\nobject Registry {\n    val defaultWorker = Worker()\n}\n\nenum class Mode {\n    FAST,\n    SAFE,\n}\n\n@Test\nfun testWorker() {\n    check(true)\n}\n";
+        let result = split_result(content, Language::Kotlin);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Variable));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Interface)
+        );
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Class)
+                .count()
+                >= 2
+        );
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Enum));
+        let test_block = blocks
+            .iter()
+            .find(|block| block.content.contains("fun testWorker"));
+        assert!(test_block.is_some(), "expected Kotlin test block");
+        assert!(test_block.is_some_and(|block| block.tags.iter().any(|tag| tag == "test")));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Paragraph))
         );
     }
 

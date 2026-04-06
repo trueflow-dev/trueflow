@@ -42,6 +42,8 @@ enum SplitPlan {
     RustImplReviewUnits,
     SwiftFunctionReviewUnits,
     SwiftTypeReviewUnits,
+    KotlinFunctionReviewUnits,
+    KotlinTypeReviewUnits,
     PythonFunctionReviewUnits,
     JsFunctionReviewUnits,
     JavaFunctionReviewUnits,
@@ -61,6 +63,8 @@ impl SplitPlan {
             | Self::RustImplReviewUnits
             | Self::SwiftFunctionReviewUnits
             | Self::SwiftTypeReviewUnits
+            | Self::KotlinFunctionReviewUnits
+            | Self::KotlinTypeReviewUnits
             | Self::PythonFunctionReviewUnits
             | Self::JsFunctionReviewUnits
             | Self::JavaFunctionReviewUnits
@@ -106,6 +110,8 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         SplitPlan::RustImplReviewUnits => split_rust_impl(block)?,
         SplitPlan::SwiftFunctionReviewUnits => split_swift_function(block)?,
         SplitPlan::SwiftTypeReviewUnits => split_swift_type(block)?,
+        SplitPlan::KotlinFunctionReviewUnits => split_kotlin_function(block)?,
+        SplitPlan::KotlinTypeReviewUnits => split_kotlin_type(block)?,
         SplitPlan::PythonFunctionReviewUnits => split_python_function(block)?,
         SplitPlan::JsFunctionReviewUnits => split_js_function(block, lang)?,
         SplitPlan::JavaFunctionReviewUnits => split_java_function(block)?,
@@ -169,6 +175,17 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
             ) =>
         {
             SplitPlan::SwiftTypeReviewUnits
+        }
+        Language::Kotlin if matches!(kind, BlockKind::Function | BlockKind::Method) => {
+            SplitPlan::KotlinFunctionReviewUnits
+        }
+        Language::Kotlin
+            if matches!(
+                kind,
+                BlockKind::Class | BlockKind::Interface | BlockKind::Enum
+            ) =>
+        {
+            SplitPlan::KotlinTypeReviewUnits
         }
         Language::Python if matches!(kind, BlockKind::Function | BlockKind::Method) => {
             SplitPlan::PythonFunctionReviewUnits
@@ -584,6 +601,45 @@ fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
     }
 }
 
+fn split_kotlin_function(block: &Block) -> Result<Vec<Block>> {
+    split_function_with_parser(
+        block,
+        &FunctionSplitConfig {
+            language: tree_sitter_kotlin_ng::LANGUAGE.into(),
+            function_kinds: &["function_declaration"],
+            body_kind: "function_body",
+            body_statement_kind: Some("block"),
+            signature_end: signature_end_offset,
+            comment_kinds: &["line_comment", "block_comment"],
+            trim_closing_brace: true,
+        },
+    )
+}
+
+fn split_kotlin_type(block: &Block) -> Result<Vec<Block>> {
+    let content = block.content.as_str();
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())?;
+    let tree = parser
+        .parse(content, None)
+        .context("Failed to parse kotlin type")?;
+    let root = tree.root_node();
+    let type_node = find_named_descendant_any(root, &["class_declaration", "object_declaration"]);
+    let Some(type_node) = type_node else {
+        return split_code(block);
+    };
+    let Some(body) = kotlin_type_body(type_node) else {
+        return split_code(block);
+    };
+
+    let items = collect_kotlin_type_items(block, body, content);
+    if items.is_empty() {
+        split_code(block)
+    } else {
+        Ok(items)
+    }
+}
+
 fn split_java_function(block: &Block) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
@@ -935,6 +991,78 @@ fn collect_java_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<B
         .collect()
 }
 
+fn kotlin_type_body(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    first_child_of_kind(node, "class_body").or_else(|| first_child_of_kind(node, "enum_class_body"))
+}
+
+fn first_child_of_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn collect_kotlin_type_items(
+    parent: &Block,
+    body: tree_sitter::Node<'_>,
+    content: &str,
+) -> Vec<Block> {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "function_declaration" => {
+                    if find_named_descendant(child, "function_body").is_some() {
+                        BlockKind::Method
+                    } else {
+                        BlockKind::FunctionSignature
+                    }
+                }
+                "property_declaration" => {
+                    classify_kotlin_property_kind(&content[child.start_byte()..child.end_byte()])
+                }
+                "class_declaration" => classify_kotlin_class_kind(child, content),
+                "object_declaration" | "companion_object" => BlockKind::Class,
+                "secondary_constructor" => BlockKind::Method,
+                _ => return None,
+            };
+            Some(create_sub_block_with_kind(
+                parent,
+                &parent.content[child.start_byte()..child.end_byte()],
+                child.start_byte(),
+                child.end_byte(),
+                kind,
+            ))
+        })
+        .collect()
+}
+
+fn classify_kotlin_class_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    let name_start = node
+        .child_by_field_name("name")
+        .map(|name| name.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let header = &content[node.start_byte()..name_start.min(node.end_byte())];
+
+    if header.contains("interface") {
+        BlockKind::Interface
+    } else if header.contains("enum") {
+        BlockKind::Enum
+    } else {
+        BlockKind::Class
+    }
+}
+
+fn classify_kotlin_property_kind(text: &str) -> BlockKind {
+    if text.contains("var ") {
+        BlockKind::Variable
+    } else {
+        BlockKind::Const
+    }
+}
+
 fn gap_prefix_length(gap: &str) -> usize {
     if gap.is_empty() {
         return 0;
@@ -1138,6 +1266,38 @@ mod tests {
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Variable));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Class));
+    }
+
+    #[test]
+    fn test_split_kotlin_class_into_members() {
+        let content = "class Worker {\n    val name = \"worker\"\n    var enabled = true\n\n    fun load(id: String): Worker {\n        return this\n    }\n\n    fun reset() {\n        enabled = true\n    }\n}\n";
+        let block = make_large_block(content, BlockKind::Class);
+        let chunks = split(&block, Language::Kotlin).unwrap();
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Const));
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Variable));
+        assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
+        assert!(!chunks.iter().any(|b| b.kind == BlockKind::Class));
+    }
+
+    #[test]
+    fn test_split_kotlin_function_into_review_units() {
+        let content = "fun process(values: List<Int>): Int {\n    var total = 0\n\n    // accumulate positive values\n    for (value in values) {\n        if (value > 0) {\n            total += value\n        }\n    }\n\n    return total\n}\n";
+        let block = make_large_block(content, BlockKind::Function);
+        let chunks = split(&block, Language::Kotlin).unwrap();
+        let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::FunctionSignature,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::Comment,
+                BlockKind::CodeParagraph,
+                BlockKind::Gap,
+                BlockKind::CodeParagraph,
+            ]
+        );
+        assert_eq!(merge_blocks(chunks), content);
     }
 
     #[test]

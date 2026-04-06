@@ -9,6 +9,7 @@ pub enum Language {
     JavaScript,
     TypeScript,
     Java,
+    Kotlin,
     Python,
     Go,
     Cpp,
@@ -42,6 +43,7 @@ impl Language {
             "js" => Some(Language::JavaScript),
             "ts" => Some(Language::TypeScript),
             "java" => Some(Language::Java),
+            "kt" | "kts" => Some(Language::Kotlin),
             "py" => Some(Language::Python),
             "go" => Some(Language::Go),
             "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" => Some(Language::Cpp),
@@ -196,6 +198,8 @@ mod tests {
         assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("java"), Some(Language::Java));
+        assert_eq!(Language::from_extension("kt"), Some(Language::Kotlin));
+        assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
@@ -258,6 +262,30 @@ mod tests {
             analyze_file(file.path()),
             FileType::Code(CodeFile {
                 language: Language::Java
+            })
+        ));
+    }
+
+    #[test]
+    fn analyze_file_detects_kotlin_by_extension() {
+        let file = write_temp_file("Main.kt", b"class Main\n");
+
+        assert!(matches!(
+            analyze_file(file.path()),
+            FileType::Code(CodeFile {
+                language: Language::Kotlin
+            })
+        ));
+    }
+
+    #[test]
+    fn analyze_file_detects_kotlin_script_by_extension() {
+        let file = write_temp_file("build.main.kts", b"val answer = 42\n");
+
+        assert!(matches!(
+            analyze_file(file.path()),
+            FileType::Code(CodeFile {
+                language: Language::Kotlin
             })
         ));
     }
