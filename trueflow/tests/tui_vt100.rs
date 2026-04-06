@@ -292,9 +292,10 @@ fn failed_note_submit_keeps_editor_open_and_preserves_note() -> Result<()> {
     app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))?;
     press_text(&mut app, "beta")?;
 
-    let error = app
-        .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .expect_err("expected injected mark failure to bubble out");
+    let result = app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let Err(error) = result else {
+        panic!("expected injected mark failure to bubble out");
+    };
     assert!(error.to_string().contains("injected mark failure"));
     assert!(
         app.is_editing(),
@@ -345,6 +346,38 @@ fn multiline_note_submit_persists_to_review_store_and_feedback_output() -> Resul
 
     let feedback = repo.run(&["feedback", "--format", "xml", "--since", "all"])?;
     assert!(feedback.contains("<comment>alpha\nbeta</comment>"));
+
+    Ok(())
+}
+
+#[test]
+fn source_view_expands_tabs_before_rendering_code_lines() -> Result<()> {
+    let file_content = "xx\tfoo\nxx\tfoo界界\nxx\tfoo\n";
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(40, 20),
+        "src/lib.rs",
+        file_content,
+        "xx\tfoo界界\n",
+        1,
+        2,
+    )?;
+
+    app.render()?;
+    let rows = app
+        .backend()
+        .rows()
+        .into_iter()
+        .map(|row| row.replace(' ', "."))
+        .collect::<Vec<_>>();
+
+    assert!(
+        rows.iter().any(|row| row.contains(".......xx......foo")),
+        "expected context rows to preserve tab width with the gutter: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("xx......foo界界")),
+        "expected focus rows to preserve tab width before wide characters: {rows:#?}"
+    );
 
     Ok(())
 }

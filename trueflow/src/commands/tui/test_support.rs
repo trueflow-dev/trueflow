@@ -354,7 +354,7 @@ where
             }
             EditingKeyAction::InsertChar(c) => {
                 clear_editing_validation(&mut self.state);
-                self.state.input_buffer.push(c)
+                self.state.input_buffer.push(c);
             }
             EditingKeyAction::Ignore => {}
         }

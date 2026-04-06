@@ -45,6 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 #[cfg(any(test, feature = "tui-test-support"))]
 #[doc(hidden)]
@@ -213,6 +214,7 @@ struct AppState {
 }
 
 const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
+const DISPLAY_TAB_WIDTH: usize = 8;
 
 struct ReviewStateBuildOptions {
     confirm_batch: bool,
@@ -2920,7 +2922,8 @@ fn format_diff_overlay_row(line: &vcs::DiffLine) -> String {
         vcs::DiffLineKind::Added => '+',
         vcs::DiffLineKind::Removed => '-',
     };
-    format!("{old_col} {new_col} {marker} {}", line.text)
+    let text = expand_tabs_for_display(&line.text);
+    format!("{old_col} {new_col} {marker} {text}")
 }
 
 fn format_diff_line_number(line: Option<u32>) -> String {
@@ -4311,6 +4314,29 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn format_diff_overlay_row_expands_tabs_before_rendering() {
+        let line = vcs::DiffLine {
+            kind: vcs::DiffLineKind::Context,
+            old_line: Some(7),
+            new_line: Some(9),
+            text: "xx\tfoo".to_string(),
+            is_focus: true,
+        };
+        assert_eq!(
+            format_diff_overlay_row(&line),
+            "    7     9   xx      foo".to_string()
+        );
+    }
+
+    #[test]
+    fn expand_tabs_for_display_accounts_for_wide_characters_before_tab() {
+        assert_eq!(
+            expand_tabs_for_display("界\tfoo"),
+            "界      foo".to_string()
+        );
+    }
+
+    #[test]
     fn key_code_for_press_event_extracts_key_code() {
         let event = Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Char('j'),
@@ -4872,10 +4898,12 @@ mod diff_scope_tests {
         };
         state.input_buffer = "keep me".to_string();
 
-        let error = handle_editing_submit_with(&mut state, |_action, _state| {
+        let result = handle_editing_submit_with(&mut state, |_action, _state| {
             Err(anyhow::anyhow!("mark failed"))
-        })
-        .expect_err("expected submit failure to preserve editor state");
+        });
+        let Err(error) = result else {
+            panic!("expected submit failure to preserve editor state");
+        };
 
         assert!(error.to_string().contains("mark failed"));
         assert!(matches!(state.input_mode, InputMode::Editing { .. }));
@@ -6073,6 +6101,27 @@ fn plain_text_tokens(line: &str) -> Vec<HighlightToken> {
     }
 }
 
+fn expand_tabs_for_display(line: &str) -> String {
+    let mut expanded = String::with_capacity(line.len());
+    let mut column = 0usize;
+
+    for ch in line.chars() {
+        if ch == '\t' {
+            let spaces = DISPLAY_TAB_WIDTH - (column % DISPLAY_TAB_WIDTH);
+            for _ in 0..spaces {
+                expanded.push(' ');
+            }
+            column = column.saturating_add(spaces);
+            continue;
+        }
+
+        expanded.push(ch);
+        column = column.saturating_add(ch.width().unwrap_or(0));
+    }
+
+    expanded
+}
+
 fn consume_string_literal(rest: &str) -> Option<usize> {
     let mut chars = rest.char_indices();
     let (_, first) = chars.next()?;
@@ -6392,15 +6441,16 @@ fn highlighted_tokens_for_line(
     line: &str,
     language: Option<&Language>,
 ) -> Vec<HighlightToken> {
+    let display_line = expand_tabs_for_display(line);
     let key = HighlightLineCacheKey {
-        line: line.to_string(),
+        line: display_line.clone(),
         language: language.copied(),
     };
     if let Some(tokens) = cache.get(&key) {
         return tokens.clone();
     }
 
-    let tokens = highlight_line(line, language);
+    let tokens = highlight_line(&display_line, language);
     cache.insert(key, tokens.clone());
     tokens
 }
