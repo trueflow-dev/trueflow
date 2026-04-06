@@ -16,6 +16,7 @@ This note captures the measured state after splitting the local check gates, res
 - `5aa67c4` — `nix: drop unnecessary darwin package inputs`
 - `3b2fa46` — `build: narrow doc and coverage heavy checks`
 - `e5bc770` — `build: isolate benches from normal test paths`
+- `deede96` — `build: split packaging from heavy code checks`
 
 ## Original baseline
 
@@ -277,6 +278,43 @@ Verification:
 
 This means bench-only dependencies and targets are now structurally outside the normal developer verification path, instead of merely being omitted by recipe shape.
 
+## Packaging split follow-up
+
+The next gate-shape change moved host-default Nix packaging verification out of the normal heavy code iteration path.
+
+That was changed in:
+
+- `deede96` — `build: split packaging from heavy code checks`
+
+New gate shape:
+
+- `check-heavy` -> `audit doc coverage-check`
+- `check-full` -> `test-full lint-all-targets fmt-check audit doc coverage-check`
+- `check-packaging` -> `nix-check`
+
+This keeps packaging validation available, but no longer pays for it on every heavy code-oriented local run.
+
+Fresh clean-tree profile measurements after `deede96`:
+
+- `check-heavy`: **1m17s**
+  - `audit`: `3s`
+  - `doc`: `15s`
+  - `coverage-check`: `59s`
+- `check-full`: **1m25s**
+  - `test-full`: `30s`
+  - `lint-all-targets`: `7s`
+  - `fmt-check`: `0s`
+  - `audit`: `3s`
+  - `doc`: `2s`
+  - `coverage-check`: `43s`
+- `check-packaging`: **54s**
+  - `nix-check`: `54s`
+
+Measurement outputs:
+- `.trueflow/measurements/packaging-split-check-heavy/`
+- `.trueflow/measurements/packaging-split-check-full/`
+- `.trueflow/measurements/packaging-split-check-packaging/`
+
 ## Net effect on the heavyweight path
 
 Compared to the pre-Nix-optimization clean-tree heavyweight baseline:
@@ -288,18 +326,23 @@ Compared to the pre-Nix-optimization clean-tree heavyweight baseline:
   - `.#default` forced rebuild: **50s**
   - `.#release` forced rebuild: **55s**
 - after narrowing docs and coverage, the cold heavy path in the clean green worktree dropped from **11m29s** to **2m33s**
-- the main remaining local heavy costs are now:
-  - `nix-check` on cold clean worktrees
+- after splitting packaging out, the cold code-only heavy path dropped again to:
+  - `check-heavy`: **1m17s**
+  - `check-full`: **1m25s**
+- packaging still exists as a separate explicit cost:
+  - `check-packaging`: **54s**
+- the main remaining local heavy code costs are now:
   - `coverage-check`
   - `test-full`
-  - explicit package-build-with-tests reruns when intentionally requested
+  - `doc` on cold worktrees
+  - explicit package-build and package-build-with-tests reruns when intentionally requested
 
 ## Next optimization target
 
 The next likely high-value directions are now:
-1. decide whether host-default `nix-check` still belongs inside `check-heavy` / `check-full`, or should become an explicit opt-in / CI-oriented stage
-2. investigate whether `test-full` still needs `--all-targets`, or whether benches/examples can move out of the heavyweight local path
-3. investigate whether coverage can be made cheaper still without weakening the intended signal
+1. investigate whether `test-full` still needs examples, or whether examples should move out of the heavyweight local code path too
+2. investigate whether coverage can be made cheaper still without weakening the intended signal
+3. decide whether package-build-with-tests should also be grouped under an explicit packaging-full gate for pre-release / CI-oriented work
 
 Related investigation note:
 - `plans/nix-build-time-investigation-candidate-plan-2026-04-06.md`
