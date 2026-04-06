@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/measure-checks.sh [--profile PROFILE] [--output-dir DIR] [--run-name NAME] [stage ...]
+  scripts/measure-checks.sh --list-profiles
+  scripts/measure-checks.sh --list-stages
+
+Profiles:
+  current-check   Current heavyweight local gate (test, lint, fmt, audit, doc, coverage, nix builds)
+  local-minimum   Minimum fast local correctness gate (compile, lint, fmt)
+  local-dev       Faster local developer loop (compile, test, lint, fmt)
+
+Examples:
+  scripts/measure-checks.sh --profile current-check
+  scripts/measure-checks.sh --profile local-minimum
+  scripts/measure-checks.sh lint test
+EOF
+}
+
+list_profiles() {
+  cat <<'EOF'
+current-check
+local-minimum
+local-dev
+EOF
+}
+
+list_stages() {
+  cat <<'EOF'
+compile-check
+test
+lint
+fmt-check
+audit
+doc
+coverage-check
+nix-check-native
+nix-check-default
+EOF
+}
+
+stage_command() {
+  case "$1" in
+    compile-check)
+      printf '%s\n' 'cd trueflow && cargo check --all-features --all-targets'
+      ;;
+    test)
+      printf '%s\n' 'cd trueflow && cargo nextest run --all-features --all-targets'
+      ;;
+    lint)
+      printf '%s\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'
+      ;;
+    fmt-check)
+      printf '%s\n' 'cd trueflow && cargo fmt --check --all'
+      ;;
+    audit)
+      printf '%s\n' 'cd trueflow && cargo audit'
+      ;;
+    doc)
+      printf '%s\n' 'cd trueflow && cargo doc --all-features'
+      ;;
+    coverage-check)
+      printf '%s\n' 'cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80'
+      ;;
+    nix-check-native)
+      printf '%s\n' 'nix build .#native'
+      ;;
+    nix-check-default)
+      printf '%s\n' 'nix build .#default'
+      ;;
+    *)
+      echo "unknown stage: $1" >&2
+      exit 2
+      ;;
+  esac
+}
+
+profile_stages() {
+  case "$1" in
+    current-check)
+      printf '%s\n' test lint fmt-check audit doc coverage-check nix-check-native nix-check-default
+      ;;
+    local-minimum)
+      printf '%s\n' compile-check lint fmt-check
+      ;;
+    local-dev)
+      printf '%s\n' compile-check test lint fmt-check
+      ;;
+    *)
+      echo "unknown profile: $1" >&2
+      exit 2
+      ;;
+  esac
+}
+
+format_duration() {
+  local seconds="$1"
+  local hours=$((seconds / 3600))
+  local minutes=$(((seconds % 3600) / 60))
+  local remainder=$((seconds % 60))
+
+  if [ "$hours" -gt 0 ]; then
+    printf '%dh %dm %ds' "$hours" "$minutes" "$remainder"
+  elif [ "$minutes" -gt 0 ]; then
+    printf '%dm %ds' "$minutes" "$remainder"
+  else
+    printf '%ds' "$remainder"
+  fi
+}
+
+profile="current-check"
+output_dir=""
+run_name=""
+custom_stages=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --profile)
+      profile="$2"
+      shift 2
+      ;;
+    --output-dir)
+      output_dir="$2"
+      shift 2
+      ;;
+    --run-name)
+      run_name="$2"
+      shift 2
+      ;;
+    --list-profiles)
+      list_profiles
+      exit 0
+      ;;
+    --list-stages)
+      list_stages
+      exit 0
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [ "$#" -gt 0 ]; do
+        custom_stages+=("$1")
+        shift
+      done
+      ;;
+    *)
+      custom_stages+=("$1")
+      shift
+      ;;
+  esac
+done
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd "$script_dir/.." && pwd)
+cd "$repo_root"
+
+if [ -z "$output_dir" ]; then
+  output_dir="$repo_root/.trueflow/measurements"
+fi
+mkdir -p "$output_dir"
+
+timestamp=$(date -u +"%Y%m%dT%H%M%SZ")
+if [ -z "$run_name" ]; then
+  run_name="${profile}-${timestamp}"
+fi
+run_dir="$output_dir/$run_name"
+stages_dir="$run_dir/stages"
+mkdir -p "$stages_dir"
+
+stages=()
+if [ "${#custom_stages[@]}" -gt 0 ]; then
+  stages=("${custom_stages[@]}")
+else
+  while IFS= read -r stage; do
+    [ -n "$stage" ] && stages+=("$stage")
+  done < <(profile_stages "$profile")
+fi
+
+summary_tsv="$run_dir/summary.tsv"
+summary_md="$run_dir/summary.md"
+env_txt="$run_dir/env.txt"
+
+head_commit=$(git rev-parse HEAD)
+if git diff --quiet && git diff --cached --quiet; then
+  dirty_state="clean"
+else
+  dirty_state="dirty"
+fi
+
+{
+  printf 'timestamp_utc=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  printf 'profile=%s\n' "$profile"
+  printf 'run_name=%s\n' "$run_name"
+  printf 'head_commit=%s\n' "$head_commit"
+  printf 'git_state=%s\n' "$dirty_state"
+  printf 'uname=%s\n' "$(uname -a)"
+  if command -v rustc >/dev/null 2>&1; then
+    printf 'rustc=%s\n' "$(rustc --version)"
+  fi
+  if command -v cargo >/dev/null 2>&1; then
+    printf 'cargo=%s\n' "$(cargo --version)"
+  fi
+  if command -v nix >/dev/null 2>&1; then
+    printf 'nix=%s\n' "$(nix --version 2>/dev/null || true)"
+  fi
+} > "$env_txt"
+
+printf 'stage\tstatus\tduration_seconds\tstart_utc\tend_utc\tcommand\n' > "$summary_tsv"
+
+recorded_stages=()
+recorded_statuses=()
+recorded_durations=()
+recorded_commands=()
+
+failed=0
+total_duration=0
+
+for stage in "${stages[@]}"; do
+  command_text=$(stage_command "$stage")
+  stage_dir="$stages_dir/$stage"
+  mkdir -p "$stage_dir"
+  printf '%s\n' "$command_text" > "$stage_dir/command.txt"
+
+  start_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  SECONDS=0
+  set +e
+  bash -lc "cd '$repo_root' && set -euo pipefail && $command_text" \
+    > "$stage_dir/stdout.log" \
+    2> "$stage_dir/stderr.log"
+  status=$?
+  set -e
+  duration=$SECONDS
+  end_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  total_duration=$((total_duration + duration))
+  if [ "$status" -ne 0 ]; then
+    failed=1
+  fi
+
+  recorded_stages+=("$stage")
+  recorded_statuses+=("$status")
+  recorded_durations+=("$duration")
+  recorded_commands+=("$command_text")
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$stage" "$status" "$duration" "$start_utc" "$end_utc" "$command_text" \
+    >> "$summary_tsv"
+
+done
+
+{
+  printf '# Check timing run\n\n'
+  printf -- '- profile: `%s`\n' "$profile"
+  printf -- '- run name: `%s`\n' "$run_name"
+  printf -- '- head commit: `%s`\n' "$head_commit"
+  printf -- '- git state: `%s`\n' "$dirty_state"
+  printf -- '- total duration: `%s`\n' "$(format_duration "$total_duration")"
+  printf -- '- output dir: `%s`\n\n' "$run_dir"
+  printf '| Stage | Exit | Duration |
+'
+  printf '|---|---:|---:|
+'
+  for i in "${!recorded_stages[@]}"; do
+    printf '| `%s` | `%s` | `%s` |\n' \
+      "${recorded_stages[$i]}" \
+      "${recorded_statuses[$i]}" \
+      "$(format_duration "${recorded_durations[$i]}")"
+  done
+  printf '\nArtifacts for each stage are under `stages/<stage>/`.\n'
+} > "$summary_md"
+
+cat "$summary_md"
+
+if [ "$failed" -ne 0 ]; then
+  echo
+  echo "One or more stages failed. See $summary_tsv and per-stage logs under $stages_dir." >&2
+  exit 1
+fi

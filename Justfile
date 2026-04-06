@@ -5,6 +5,18 @@ default:
 # Run all checks (test, lint, fmt, audit, doc, coverage, flake builds)
 check: test lint fmt-check audit doc coverage-check nix-check
 
+# Measure check pipeline timings (writes under .trueflow/measurements/)
+measure-check profile="current-check":
+    ./scripts/measure-checks.sh --profile "{{profile}}"
+
+# Measure a smaller local developer loop
+measure-local-dev:
+    ./scripts/measure-checks.sh --profile local-dev
+
+# Measure the minimum local correctness gate
+measure-local-minimum:
+    ./scripts/measure-checks.sh --profile local-minimum
+
 # Fix all auto-fixable issues
 fix: fix-clippy fix-fmt fix-audit fix-cargo
 
