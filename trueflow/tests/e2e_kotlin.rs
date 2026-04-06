@@ -74,10 +74,11 @@ fn test_kotlin_detection_and_structural_blocks() -> Result<()> {
         "tags={test_tags:?}"
     );
 
-    assert!(
-        blocks.iter().all(|block| block.get("complexity").is_none()),
-        "expected Kotlin block complexity to remain unset"
-    );
+    let run_scenario = find_block(blocks, "fun runScenario")?;
+    assert_eq!(run_scenario["complexity"].as_u64(), Some(7));
+
+    let worker_class = find_block(blocks, "class Worker(private val scale: Int)")?;
+    assert_eq!(worker_class["complexity"].as_u64(), Some(4));
 
     Ok(())
 }

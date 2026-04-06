@@ -17,6 +17,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Language::Java => Some(tree_sitter_java::LANGUAGE.into()),
+        Language::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -82,6 +83,15 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
                 | "catch_clause"
                 | "ternary_expression"
         ),
+        Language::Kotlin => matches!(
+            kind,
+            "if_expression"
+                | "when_expression"
+                | "for_statement"
+                | "while_statement"
+                | "do_while_statement"
+                | "catch_block"
+        ),
         Language::Python => matches!(
             kind,
             "if_statement"
@@ -108,6 +118,7 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         }
         Language::JavaScript | Language::TypeScript => matches!(kind, "&&" | "||" | "??"),
         Language::Java => matches!(kind, "&&" | "||"),
+        Language::Kotlin => matches!(kind, "&&" | "||" | "?:"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
@@ -230,6 +241,26 @@ func run(_ values: [Int]) -> Int {
 }";
         let score = calculate(code, Language::Swift);
         assert_eq!(score, Some(3));
+    }
+
+    #[test]
+    fn test_calculate_complexity_kotlin() {
+        let code = "
+fun run(values: List<Int>): Int {
+    for (value in values) {
+        if (value > 0 && value < 10) {
+            return value
+        }
+    }
+    return 0
+}
+";
+        // for: +1
+        // if inside for: +1 + nesting 1 = 2
+        // &&: +1
+        // Total: 4
+        let score = calculate(code, Language::Kotlin);
+        assert_eq!(score, Some(4));
     }
 
     #[test]
