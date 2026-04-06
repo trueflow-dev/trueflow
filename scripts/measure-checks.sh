@@ -87,10 +87,10 @@ stage_command() {
       printf '%s\n' 'cd trueflow && cargo audit'
       ;;
     doc)
-      printf '%s\n' 'cd trueflow && cargo doc --all-features'
+      printf '%s\n' 'cd trueflow && cargo doc --all-features --no-deps'
       ;;
     coverage-check)
-      printf '%s\n' 'cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80'
+      printf '%s\n' 'cd trueflow && cargo llvm-cov --all-features --lib --bins --tests --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80'
       ;;
     nix-check)
       printf '%s\n' 'nix build --no-link .#default'

@@ -167,6 +167,11 @@ fn justfile_fast_and_full_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
+        "doc:\n    cd trueflow && cargo doc --all-features --no-deps\n",
+        "Justfile doc recipe",
+    );
+    assert_contains(
+        &justfile,
         "lint:\n    cd trueflow && cargo clippy --all-features --lib --bins --tests -- -D warnings\n",
         "Justfile lint recipe",
     );
@@ -259,8 +264,18 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
+        "    doc)\n      printf '%s\\n' 'cd trueflow && cargo doc --all-features --no-deps'",
+        "measure-check doc stage",
+    );
+    assert_contains(
+        &measure_script,
         "    lint)\n      printf '%s\\n' 'cd trueflow && cargo clippy --all-features --lib --bins --tests -- -D warnings'",
         "measure-check lint stage",
+    );
+    assert_contains(
+        &measure_script,
+        "    coverage-check)\n      printf '%s\\n' 'cd trueflow && cargo llvm-cov --all-features --lib --bins --tests --summary-only --ignore-filename-regex \"src/commands/tui.rs\" --fail-under-lines 80'",
+        "measure-check coverage-check stage",
     );
     assert_contains(
         &measure_script,

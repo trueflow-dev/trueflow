@@ -81,13 +81,14 @@ fmt-check:
 audit:
     cd trueflow && cargo audit
 
-# Build documentation
+# Build this crate's documentation without dependency docs
+# to keep the heavyweight local path focused and fast.
 doc:
-    cd trueflow && cargo doc --all-features
+    cd trueflow && cargo doc --all-features --no-deps
 
-# Enforce minimum test coverage (line coverage)
+# Enforce minimum test coverage (line coverage) for the main crate target set.
 coverage-check:
-    cd trueflow && cargo llvm-cov --all-features --all-targets --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
+    cd trueflow && cargo llvm-cov --all-features --lib --bins --tests --summary-only --ignore-filename-regex "src/commands/tui.rs" --fail-under-lines 80
 
 # Verify the default flake package builds for this host
 nix-check:
