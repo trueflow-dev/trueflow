@@ -174,6 +174,7 @@ mod tests {
     use super::{Cli, Commands};
     use crate::block::BlockKind;
     use crate::build_info;
+    use crate::build_metadata::UNKNOWN_BUILD_TIMESTAMP;
     use crate::commands::review::{ReviewTarget, RevisionSpec};
     use crate::repo_path::RepoPath;
     use chrono::DateTime;
@@ -206,8 +207,13 @@ mod tests {
     }
 
     #[test]
-    fn build_timestamp_is_rfc3339() {
-        DateTime::parse_from_rfc3339(env!("TRUEFLOW_BUILD_TIMESTAMP"))
+    fn build_timestamp_is_unknown_or_rfc3339() {
+        let build_timestamp = env!("TRUEFLOW_BUILD_TIMESTAMP");
+        if build_timestamp == UNKNOWN_BUILD_TIMESTAMP {
+            return;
+        }
+
+        DateTime::parse_from_rfc3339(build_timestamp)
             .unwrap_or_else(|error| panic!("build timestamp was not RFC3339: {error}"));
     }
 

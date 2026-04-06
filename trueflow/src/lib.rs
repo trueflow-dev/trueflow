@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod block;
 pub mod block_splitter;
 pub mod build_info;
+pub(crate) mod build_metadata;
 pub mod cli;
 pub mod code_comments;
 pub mod commands;

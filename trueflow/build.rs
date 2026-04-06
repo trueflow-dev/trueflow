@@ -1,3 +1,6 @@
+#[path = "src/build_metadata.rs"]
+mod build_metadata;
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -6,9 +9,11 @@ use std::process::Command;
 fn main() {
     emit_git_rerun_hints();
     println!("cargo:rustc-env=TRUEFLOW_GIT_COMMIT={}", git_commit_hash());
+
+    let source_date_epoch = env::var("SOURCE_DATE_EPOCH").ok();
     println!(
         "cargo:rustc-env=TRUEFLOW_BUILD_TIMESTAMP={}",
-        build_timestamp()
+        build_metadata::build_timestamp_from_source_date_epoch(source_date_epoch.as_deref())
     );
 }
 
@@ -41,11 +46,6 @@ fn emit_git_rerun_hints() {
 
 fn git_commit_hash() -> String {
     run_command("git", &["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into())
-}
-
-fn build_timestamp() -> String {
-    run_command("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
 }
 
 fn run_command(program: &str, args: &[&str]) -> Option<String> {
