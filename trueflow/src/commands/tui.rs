@@ -3553,11 +3553,12 @@ fn editing_submit_decision(
     // comment action. Lower layers still model notes as optional so non-TUI
     // callers can pass `None`, but the overlay UX treats blank submit as
     // validation failure instead of as an empty comment.
-    let note = input_buffer.trim().to_string();
-    if note.is_empty() {
+    if input_buffer.trim().is_empty() {
         return Some(EditingSubmitDecision::Empty);
     }
-    Some(EditingSubmitDecision::Ready(action.with_note(note)))
+    Some(EditingSubmitDecision::Ready(
+        action.with_note(input_buffer.to_string()),
+    ))
 }
 
 fn clear_editing_validation(state: &mut AppState) {

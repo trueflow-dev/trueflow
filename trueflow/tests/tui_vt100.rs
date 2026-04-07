@@ -351,6 +351,49 @@ fn multiline_note_submit_persists_to_review_store_and_feedback_output() -> Resul
 }
 
 #[test]
+fn multiline_note_submit_preserves_exact_whitespace() -> Result<()> {
+    let repo = TestRepo::new("tui_vt100_comment_whitespace")?;
+    let file_content = "fn demo() {\n    work();\n}\n";
+    repo.write("src/lib.rs", file_content)?;
+
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(120, 20),
+        "src/lib.rs",
+        file_content,
+        file_content,
+        0,
+        3,
+    )?;
+    app.install_mark_action_runner(
+        trueflow::commands::tui::test_support::CliMarkActionRunner::new(
+            env!("CARGO_BIN_EXE_trueflow"),
+            &repo.path,
+        ),
+    );
+
+    app.open_note_overlay()?;
+    press_text(&mut app, "  alpha")?;
+    app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))?;
+    press_text(&mut app, "beta  ")?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+    assert!(
+        !app.is_editing(),
+        "expected successful submit to close the editor"
+    );
+
+    let records = read_review_records(&repo.path.join(".trueflow").join("reviews.jsonl"))?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].verdict.as_str(), "comment");
+    assert_eq!(records[0].note.as_deref(), Some("  alpha\nbeta  "));
+
+    let feedback = repo.run(&["feedback", "--format", "xml", "--since", "all"])?;
+    assert!(feedback.contains("<comment>  alpha\nbeta  </comment>"));
+
+    Ok(())
+}
+
+#[test]
 fn source_view_expands_tabs_before_rendering_code_lines() -> Result<()> {
     let file_content = "xx\tfoo\nxx\tfoo界界\nxx\tfoo\n";
     let mut app = ScriptedTui::with_single_rust_block_file(
