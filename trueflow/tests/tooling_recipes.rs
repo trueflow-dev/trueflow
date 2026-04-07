@@ -305,11 +305,7 @@ fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
         "lint-all-targets:",
         "Justfile legacy lint-all-targets recipe",
     );
-    assert_not_contains(
-        &justfile,
-        "test-full:",
-        "Justfile legacy test-full recipe",
-    );
+    assert_not_contains(&justfile, "test-full:", "Justfile legacy test-full recipe");
 
     Ok(())
 }
