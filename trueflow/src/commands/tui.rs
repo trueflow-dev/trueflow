@@ -2050,8 +2050,7 @@ fn build_render_content(
     code_height: u16,
     code_width: u16,
 ) -> BuiltContent {
-    if let Some((lines, total_lines)) =
-        build_speed_read_lines(state, node.id, palette, code_width)
+    if let Some((lines, total_lines)) = build_speed_read_lines(state, node.id, palette, code_width)
     {
         BuiltContent {
             lines,
@@ -2072,7 +2071,11 @@ fn display_metrics_for_content(
     if matches!(state.view_mode, ViewMode::Source)
         && matches!(node.kind, TreeNodeKind::File | TreeNodeKind::Block)
     {
-        wrapped_display_metrics_for_lines(&content.lines, content.focus_row_range.as_ref(), code_width)
+        wrapped_display_metrics_for_lines(
+            &content.lines,
+            content.focus_row_range.as_ref(),
+            code_width,
+        )
     } else {
         (content.total_lines, content.focus_row_range.clone())
     }
