@@ -320,12 +320,12 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
 
     assert_contains(
         &measure_script,
-        "check\ncheck-fast\ncheck-heavy\ncheck-code\ncheck-packaging\nlocal-minimum\nlocal-dev",
+        "check\ncheck-fast\ncheck-heavy\ncheck-code\ncheck-packaging\ncurrent-check\ncheck-full\nlocal-minimum\nlocal-dev",
         "measure-check profile list",
     );
     assert_contains(
         &measure_script,
-        "compile-check-code\ntest\ntest-code\nlint\nlint-code",
+        "compile-check\ncompile-check-code\ncompile-check-all-targets\ntest\ntest-code\ntest-full\nlint\nlint-code\nlint-all-targets",
         "measure-check stage list",
     );
     assert_contains(

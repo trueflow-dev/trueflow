@@ -33,6 +33,8 @@ check-fast
 check-heavy
 check-code
 check-packaging
+current-check
+check-full
 local-minimum
 local-dev
 EOF
@@ -42,10 +44,13 @@ list_stages() {
   cat <<'EOF'
 compile-check
 compile-check-code
+compile-check-all-targets
 test
 test-code
+test-full
 lint
 lint-code
+lint-all-targets
 fmt-check
 audit
 doc
