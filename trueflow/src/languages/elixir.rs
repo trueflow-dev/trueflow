@@ -18,6 +18,7 @@ pub(crate) fn registration() -> LanguageRegistration {
             is_attribute_node,
             collect_nested_blocks,
             collect_test_ranges,
+            custom_splitter: None,
         },
         sub_split: sub_split_registration,
     }
