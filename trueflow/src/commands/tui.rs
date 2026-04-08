@@ -11,8 +11,8 @@ use crate::commands::review::{
     CollectedReview, ReviewTarget, collect_review, resolve_cli_review_scope, resolve_review_request,
 };
 use crate::config::{
-    BlockFilters, TuiConfig, TuiDiffFocusMode, TuiKeybindsConfig, TuiSpeedReadConfig,
-    load as load_config,
+    BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers, TuiKeybindsConfig,
+    TuiSpeedReadConfig, load as load_config,
 };
 use crate::context::TrueflowContext;
 use crate::path_utils;
@@ -206,6 +206,7 @@ struct AppState {
     code_rect: Rect,
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
+    diff_line_numbers: TuiDiffLineNumbers,
     keybinds: TuiKeybindsConfig,
     file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
@@ -219,6 +220,7 @@ const DISPLAY_TAB_WIDTH: usize = 8;
 struct ReviewStateBuildOptions {
     confirm_batch: bool,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
+    diff_line_numbers: TuiDiffLineNumbers,
     keybinds: TuiKeybindsConfig,
     scope_label: String,
     workdir_prefix: Option<String>,
@@ -417,6 +419,7 @@ pub fn run(
             ReviewStateBuildOptions {
                 confirm_batch: config.tui.confirm_batch,
                 block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
+                diff_line_numbers: config.tui.diff_line_numbers,
                 keybinds: config.tui.keybinds,
                 scope_label: launch.scope_label,
                 workdir_prefix: workdir_prefix_from_git_root(),
@@ -521,6 +524,7 @@ fn build_review_state(
         code_rect: Rect::default(),
         view_mode: ViewMode::Diff,
         block_diff_focus_mode: options.block_diff_focus_mode,
+        diff_line_numbers: options.diff_line_numbers,
         keybinds: options.keybinds,
         file_diff_cache: HashMap::new(),
         content_frame_cache: HashMap::new(),
@@ -2912,13 +2916,14 @@ fn render_contextual_diff_lines(
     focus_line_span: Option<&std::ops::Range<usize>>,
     palette: &UiPalette,
     code_width: u16,
+    line_numbers: TuiDiffLineNumbers,
 ) -> RenderedContextualDiffLines {
     let mut lines = Vec::new();
     let mut row_ranges = Vec::with_capacity(rows.len());
 
     for row in rows {
         let style = style_for_contextual_diff_row(row, focus_line_span, palette);
-        let row_lines = wrap_contextual_diff_row(row, style, code_width);
+        let row_lines = wrap_contextual_diff_row(row, style, code_width, line_numbers);
         let start = lines.len();
         lines.extend(row_lines);
         row_ranges.push(start..lines.len());
@@ -2931,6 +2936,7 @@ fn wrap_contextual_diff_row(
     row: &ContextualDiffRow,
     style: Style,
     code_width: u16,
+    line_numbers: TuiDiffLineNumbers,
 ) -> Vec<Line<'static>> {
     let diff_line = vcs::DiffLine {
         kind: row.kind,
@@ -2940,16 +2946,17 @@ fn wrap_contextual_diff_row(
         is_focus: false,
     };
 
-    wrap_diff_overlay_row(&diff_line, style, code_width)
+    wrap_diff_overlay_row(&diff_line, style, code_width, line_numbers)
 }
 
 fn wrap_diff_overlay_row(
     line: &vcs::DiffLine,
     style: Style,
     code_width: u16,
+    line_numbers: TuiDiffLineNumbers,
 ) -> Vec<Line<'static>> {
     let available_width = usize::from(code_width.max(1));
-    let format = diff_overlay_format_for_width(code_width);
+    let format = diff_overlay_format_for_width(code_width, line_numbers);
     let prefix = diff_overlay_prefix(line, format, available_width);
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
     let text = expand_tabs_for_display(&line.text);
@@ -2987,11 +2994,16 @@ fn wrap_diff_overlay_row(
     lines
 }
 
-fn diff_overlay_format_for_width(code_width: u16) -> DiffOverlayFormat {
-    if usize::from(code_width) <= FULL_DIFF_OVERLAY_GUTTER_WIDTH {
-        DiffOverlayFormat::Compact
-    } else {
-        DiffOverlayFormat::Full
+fn diff_overlay_format_for_width(
+    code_width: u16,
+    line_numbers: TuiDiffLineNumbers,
+) -> DiffOverlayFormat {
+    match line_numbers {
+        TuiDiffLineNumbers::Disabled => DiffOverlayFormat::Compact,
+        TuiDiffLineNumbers::OldNew if usize::from(code_width) <= FULL_DIFF_OVERLAY_GUTTER_WIDTH => {
+            DiffOverlayFormat::Compact
+        }
+        TuiDiffLineNumbers::OldNew => DiffOverlayFormat::Full,
     }
 }
 
@@ -3135,7 +3147,13 @@ fn build_diff_context_content(
                 TreeNodeKind::Block => block_line_span.as_ref(),
                 _ => display_line_span.as_ref(),
             };
-            let rendered = render_contextual_diff_lines(&rows, highlight_span, palette, code_width);
+            let rendered = render_contextual_diff_lines(
+                &rows,
+                highlight_span,
+                palette,
+                code_width,
+                state.diff_line_numbers,
+            );
             let focus_row_range = focus_row_range.as_ref().and_then(|focus| {
                 focus_row_range_for_wrapped_contextual_diff_rows(&rendered.row_ranges, focus)
             });
@@ -3179,12 +3197,17 @@ fn build_block_lines(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn format_diff_overlay_row(line: &vcs::DiffLine) -> String {
-    let old_col = format_diff_line_number(line.old_line);
-    let new_col = format_diff_line_number(line.new_line);
+fn format_diff_overlay_row(line: &vcs::DiffLine, line_numbers: TuiDiffLineNumbers) -> String {
     let marker = diff_overlay_marker(line.kind);
     let text = expand_tabs_for_display(&line.text);
-    format!("{old_col} {new_col} {marker} {text}")
+    match line_numbers {
+        TuiDiffLineNumbers::Disabled => format!("{marker} {text}"),
+        TuiDiffLineNumbers::OldNew => {
+            let old_col = format_diff_line_number(line.old_line);
+            let new_col = format_diff_line_number(line.new_line);
+            format!("{old_col} {new_col} {marker} {text}")
+        }
+    }
 }
 
 fn format_diff_line_number(line: Option<u32>) -> String {
@@ -3791,6 +3814,7 @@ mod diff_scope_tests {
             code_rect: Rect::default(),
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            diff_line_numbers: TuiDiffLineNumbers::Disabled,
             keybinds: TuiKeybindsConfig::default(),
             file_diff_cache,
             content_frame_cache: HashMap::new(),
@@ -3854,6 +3878,7 @@ mod diff_scope_tests {
             code_rect: Rect::default(),
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            diff_line_numbers: TuiDiffLineNumbers::Disabled,
             keybinds: TuiKeybindsConfig::default(),
             file_diff_cache: HashMap::new(),
             content_frame_cache: HashMap::new(),
@@ -3931,6 +3956,7 @@ mod diff_scope_tests {
             code_rect: Rect::default(),
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            diff_line_numbers: TuiDiffLineNumbers::Disabled,
             keybinds: TuiKeybindsConfig::default(),
             file_diff_cache: HashMap::new(),
             content_frame_cache: HashMap::new(),
@@ -4027,6 +4053,7 @@ mod diff_scope_tests {
             code_rect: Rect::default(),
             view_mode: ViewMode::Source,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            diff_line_numbers: TuiDiffLineNumbers::Disabled,
             keybinds: TuiKeybindsConfig::default(),
             file_diff_cache: HashMap::new(),
             content_frame_cache: HashMap::new(),
@@ -4171,6 +4198,7 @@ mod diff_scope_tests {
             confirm_batch: true,
             diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
             diff_focus_context_lines: 7,
+            diff_line_numbers: TuiDiffLineNumbers::Disabled,
             keybinds: crate::config::TuiKeybindsConfig::default(),
             speed_read: crate::config::TuiSpeedReadConfig::default(),
         };
@@ -4545,6 +4573,7 @@ mod diff_scope_tests {
             ReviewStateBuildOptions {
                 confirm_batch: false,
                 block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+                diff_line_numbers: TuiDiffLineNumbers::Disabled,
                 keybinds: TuiKeybindsConfig::default(),
                 scope_label: "rev:abc1234..HEAD".to_string(),
                 workdir_prefix: None,
@@ -4562,7 +4591,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn format_diff_overlay_row_renders_old_new_gutter() {
+    fn format_diff_overlay_row_renders_disabled_line_numbers() {
         let line = vcs::DiffLine {
             kind: vcs::DiffLineKind::Added,
             old_line: None,
@@ -4571,7 +4600,22 @@ mod diff_scope_tests {
             is_focus: true,
         };
         assert_eq!(
-            format_diff_overlay_row(&line),
+            format_diff_overlay_row(&line, TuiDiffLineNumbers::Disabled),
+            "+ let x = 1;".to_string()
+        );
+    }
+
+    #[test]
+    fn format_diff_overlay_row_renders_old_new_gutter_when_enabled() {
+        let line = vcs::DiffLine {
+            kind: vcs::DiffLineKind::Added,
+            old_line: None,
+            new_line: Some(42),
+            text: "let x = 1;".to_string(),
+            is_focus: true,
+        };
+        assert_eq!(
+            format_diff_overlay_row(&line, TuiDiffLineNumbers::OldNew),
             "         42 + let x = 1;".to_string()
         );
     }
@@ -4586,8 +4630,8 @@ mod diff_scope_tests {
             is_focus: true,
         };
         assert_eq!(
-            format_diff_overlay_row(&line),
-            "    7     9   xx      foo".to_string()
+            format_diff_overlay_row(&line, TuiDiffLineNumbers::Disabled),
+            "  xx      foo".to_string()
         );
     }
 
@@ -5437,27 +5481,113 @@ mod diff_scope_tests {
         assert_eq!(
             rendered,
             vec![
-                format_diff_overlay_row(&vcs::DiffLine {
-                    kind: vcs::DiffLineKind::Removed,
-                    old_line: Some(1),
-                    new_line: None,
-                    text: "line1".to_string(),
-                    is_focus: true,
-                }),
-                format_diff_overlay_row(&vcs::DiffLine {
-                    kind: vcs::DiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(1),
-                    text: "line1 changed".to_string(),
-                    is_focus: true,
-                }),
-                format_diff_overlay_row(&vcs::DiffLine {
-                    kind: vcs::DiffLineKind::Context,
-                    old_line: Some(2),
-                    new_line: Some(2),
-                    text: "line2".to_string(),
-                    is_focus: false,
-                }),
+                format_diff_overlay_row(
+                    &vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                        text: "line1".to_string(),
+                        is_focus: true,
+                    },
+                    TuiDiffLineNumbers::Disabled,
+                ),
+                format_diff_overlay_row(
+                    &vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        text: "line1 changed".to_string(),
+                        is_focus: true,
+                    },
+                    TuiDiffLineNumbers::Disabled,
+                ),
+                format_diff_overlay_row(
+                    &vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Context,
+                        old_line: Some(2),
+                        new_line: Some(2),
+                        text: "line2".to_string(),
+                        is_focus: false,
+                    },
+                    TuiDiffLineNumbers::Disabled,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_file_lines_diff_mode_can_render_old_new_line_numbers() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_file_diff_mode_old_new")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\nline2\n";
+        let block_content = "line1\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        state.view_mode = ViewMode::Diff;
+        state.diff_line_numbers = TuiDiffLineNumbers::OldNew;
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::removed("line1\n"),
+                        vcs::DiffHunkLine::added("line1 changed\n"),
+                        vcs::DiffHunkLine::context("line2\n"),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3, 80);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                format_diff_overlay_row(
+                    &vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                        text: "line1".to_string(),
+                        is_focus: true,
+                    },
+                    TuiDiffLineNumbers::OldNew,
+                ),
+                format_diff_overlay_row(
+                    &vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        text: "line1 changed".to_string(),
+                        is_focus: true,
+                    },
+                    TuiDiffLineNumbers::OldNew,
+                ),
+                format_diff_overlay_row(
+                    &vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Context,
+                        old_line: Some(2),
+                        new_line: Some(2),
+                        text: "line2".to_string(),
+                        is_focus: false,
+                    },
+                    TuiDiffLineNumbers::OldNew,
+                ),
             ]
         );
     }

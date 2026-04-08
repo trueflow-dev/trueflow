@@ -28,6 +28,8 @@ ignore_globs = []
 [tui]
 # Require confirmation modal before batch actions.
 confirm_batch = true
+# Diff-mode line numbers: disabled|old_new. Default keeps diffs focused on +/- content.
+diff_line_numbers = "disabled"
 
 [tui.keybinds]
 # Keybind defaults. Arrow keys mirror prev/next and up/down.

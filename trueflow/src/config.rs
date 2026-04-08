@@ -31,6 +31,8 @@ pub struct TuiConfig {
     pub diff_focus_mode: TuiDiffFocusMode,
     #[serde(default = "default_diff_focus_context_lines")]
     pub diff_focus_context_lines: usize,
+    #[serde(default = "default_tui_diff_line_numbers")]
+    pub diff_line_numbers: TuiDiffLineNumbers,
     #[serde(default)]
     pub keybinds: TuiKeybindsConfig,
     #[serde(default)]
@@ -134,6 +136,13 @@ pub enum TuiDiffFocusMode {
     ChangedWithContext,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiDiffLineNumbers {
+    Disabled,
+    OldNew,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiSpeedReadPunctuationDwell {
@@ -175,6 +184,7 @@ impl Default for TuiConfig {
             confirm_batch: true,
             diff_focus_mode: default_tui_diff_focus_mode(),
             diff_focus_context_lines: default_diff_focus_context_lines(),
+            diff_line_numbers: default_tui_diff_line_numbers(),
             keybinds: TuiKeybindsConfig::default(),
             speed_read: TuiSpeedReadConfig::default(),
         }
@@ -252,6 +262,10 @@ fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {
 
 fn default_diff_focus_context_lines() -> usize {
     3
+}
+
+fn default_tui_diff_line_numbers() -> TuiDiffLineNumbers {
+    TuiDiffLineNumbers::Disabled
 }
 
 fn default_tui_keybind_scroll_up() -> char {
@@ -617,6 +631,7 @@ mod tests {
         assert!(cfg.tui.confirm_batch);
         assert_eq!(cfg.tui.diff_focus_mode, TuiDiffFocusMode::WholeBlock);
         assert_eq!(cfg.tui.diff_focus_context_lines, 3);
+        assert_eq!(cfg.tui.diff_line_numbers, TuiDiffLineNumbers::Disabled);
         assert_eq!(cfg.tui.keybinds.scroll_up, 'k');
         assert_eq!(cfg.tui.keybinds.scroll_down, 'j');
         assert_eq!(cfg.tui.keybinds.prev, 'h');
@@ -644,6 +659,15 @@ mod tests {
             TuiDiffFocusMode::ChangedWithContext
         );
         assert_eq!(cfg.tui.diff_focus_context_lines, 5);
+    }
+
+    #[test]
+    fn tui_config_parses_old_new_diff_line_numbers() {
+        let cfg: TrueflowConfig = match toml::from_str("[tui]\ndiff_line_numbers = \"old_new\"\n") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert_eq!(cfg.tui.diff_line_numbers, TuiDiffLineNumbers::OldNew);
     }
 
     #[test]

@@ -101,6 +101,11 @@ exclude = ["gap", "comment"]
 [feedback]
 exclude = ["gap"]
 
+[tui]
+# disabled|old_new
+# default: disabled
+# diff_line_numbers = "old_new"
+
 [tui.keybinds]
 scroll_up = "k"
 scroll_down = "j"
@@ -138,6 +143,7 @@ Main review actions:
 - `a` approve
 - `n` add a note (`Enter` submits, `Ctrl+J` inserts a newline, and the TUI requires note text before submit)
 - `m` toggle diff/source
+  - diff-mode line numbers are disabled by default; set `[tui] diff_line_numbers = "old_new"` to restore the old/new gutter
 - `r` toggle speed-reading
 - `g` jump to root
 - `q` quit
