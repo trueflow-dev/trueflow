@@ -27,7 +27,7 @@ pub fn block_breadcrumb(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
                 let Some(block) = ancestor.block.as_ref() else {
                     continue;
                 };
-                let label = block_signature(block);
+                let label = block_breadcrumb_label(block);
                 if label.is_empty() {
                     continue;
                 }
@@ -119,33 +119,92 @@ pub fn parent_kind_label(kind: BlockKind) -> &'static str {
     }
 }
 
-fn block_signature(block: &crate::block::Block) -> String {
+fn block_breadcrumb_label(block: &crate::block::Block) -> String {
+    let kind_label = humanize_block_kind(block.kind);
+    match block_identifier(block) {
+        Some(identifier) => format!("{kind_label} ({identifier})"),
+        None => kind_label,
+    }
+}
+
+fn block_identifier(block: &crate::block::Block) -> Option<String> {
+    let line = first_meaningful_line(block)?;
+    match block.kind {
+        BlockKind::Function | BlockKind::Method | BlockKind::FunctionSignature => {
+            extract_callable_name(line)
+        }
+        BlockKind::Struct => extract_named_declaration(line, &["struct"]),
+        BlockKind::Enum => extract_named_declaration(line, &["enum"]),
+        BlockKind::Class => extract_named_declaration(line, &["class"]),
+        BlockKind::Interface => extract_named_declaration(line, &["interface", "protocol"]),
+        BlockKind::Type => extract_named_declaration(line, &["type", "typealias"]),
+        BlockKind::Module => extract_named_declaration(line, &["module", "mod", "namespace"]),
+        BlockKind::Const => extract_named_declaration(line, &["const"]),
+        BlockKind::Static => extract_named_declaration(line, &["static"]),
+        BlockKind::Variable => extract_named_declaration(line, &["let", "var", "val", "const"]),
+        BlockKind::Macro => extract_macro_name(line),
+        BlockKind::Impl => extract_impl_target(line),
+        _ => None,
+    }
+}
+
+fn first_meaningful_line(block: &crate::block::Block) -> Option<&str> {
     let mut non_empty_lines = block
         .content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty());
-    let line = if should_skip_attribute_lines(block.kind) {
+    if should_skip_attribute_lines(block.kind) {
         non_empty_lines
             .find(|line| !line.starts_with("#["))
             .or_else(|| non_empty_lines.next())
     } else {
         non_empty_lines.next()
-    };
-    let Some(line) = line else {
-        return block.kind.as_str().to_string();
-    };
-    let mut text = line.trim_end_matches('{').trim().to_string();
+    }
+}
 
-    if matches!(
-        block.kind,
-        BlockKind::Function | BlockKind::Method | BlockKind::FunctionSignature
-    ) && let Some(idx) = find_argument_list_start(&text)
-    {
-        text.truncate(idx);
+fn humanize_block_kind(kind: BlockKind) -> String {
+    let raw = kind.as_str();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+
+    for ch in raw.chars() {
+        if matches!(ch, '_' | '-' | ' ') {
+            if !current.is_empty() {
+                words.push(current);
+                current = String::new();
+            }
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+
+        if ch.is_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
+            words.push(current);
+            current = String::new();
+        }
+
+        current.push(ch);
+        previous_was_lower_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
     }
 
-    truncate_text(text.trim(), 72)
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+        .into_iter()
+        .map(|word| {
+            let mut chars = word.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut label = first.to_uppercase().collect::<String>();
+            label.push_str(&chars.as_str().to_ascii_lowercase());
+            label
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn should_skip_attribute_lines(kind: BlockKind) -> bool {
@@ -165,6 +224,154 @@ fn should_skip_attribute_lines(kind: BlockKind) -> bool {
     )
 }
 
+fn extract_callable_name(text: &str) -> Option<String> {
+    let before_arguments = &text[..find_argument_list_start(text)?];
+    trailing_identifier(before_arguments)
+}
+
+fn extract_named_declaration(text: &str, keywords: &[&str]) -> Option<String> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if keywords
+            .iter()
+            .any(|keyword| token.eq_ignore_ascii_case(keyword))
+        {
+            let next = tokens.get(index + 1)?;
+            if let Some(identifier) = leading_identifier(next) {
+                return Some(identifier);
+            }
+        }
+    }
+    None
+}
+
+fn extract_macro_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("macro_rules!") {
+        return leading_identifier(rest);
+    }
+    extract_named_declaration(trimmed, &["macro"])
+}
+
+fn extract_impl_target(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let impl_index = trimmed.find("impl")?;
+    let mut rest = trimmed[impl_index + "impl".len()..].trim_start();
+    rest = strip_leading_generic_group(rest);
+    if let Some((_, after_for)) = rest.rsplit_once(" for ") {
+        rest = after_for.trim();
+    }
+    let target = rest.split(" where ").next().unwrap_or(rest).trim();
+    trailing_identifier(target)
+}
+
+fn strip_leading_generic_group(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('<') {
+        return trimmed;
+    }
+    let Some(end) = balanced_group_end(trimmed, '<', '>') else {
+        return trimmed;
+    };
+    trimmed[end + 1..].trim_start()
+}
+
+fn balanced_group_end(text: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn leading_identifier(text: &str) -> Option<String> {
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        if is_identifier_start(ch) {
+            start = Some(index);
+            break;
+        }
+    }
+    let start = start?;
+    let mut end = text.len();
+    for (offset, ch) in text[start..].char_indices() {
+        if !is_identifier_char(ch) {
+            end = start + offset;
+            break;
+        }
+    }
+    Some(text[start..end].to_string())
+}
+
+fn trailing_identifier(text: &str) -> Option<String> {
+    let trimmed = strip_trailing_generic_groups(text.trim_end_matches('{').trim());
+    let mut end = None;
+
+    for (index, ch) in trimmed.char_indices().rev() {
+        if end.is_none() {
+            if is_identifier_char(ch) {
+                end = Some(index + ch.len_utf8());
+            }
+            continue;
+        }
+
+        if !is_identifier_char(ch) {
+            let start = index + ch.len_utf8();
+            let candidate = &trimmed[start..end?];
+            return is_identifier_start(candidate.chars().next()?).then(|| candidate.to_string());
+        }
+    }
+
+    let end = end?;
+    let candidate = &trimmed[..end];
+    is_identifier_start(candidate.chars().next()?).then(|| candidate.to_string())
+}
+
+fn strip_trailing_generic_groups(text: &str) -> &str {
+    let mut trimmed = text.trim_end();
+    loop {
+        if !trimmed.ends_with('>') {
+            return trimmed;
+        }
+        let Some(start) = trailing_balanced_group_start(trimmed, '<', '>') else {
+            return trimmed;
+        };
+        trimmed = trimmed[..start].trim_end();
+    }
+}
+
+fn trailing_balanced_group_start(text: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut saw_close = false;
+    for (index, ch) in text.char_indices().rev() {
+        if ch == close {
+            depth += 1;
+            saw_close = true;
+        } else if ch == open {
+            depth = depth.saturating_sub(1);
+            if saw_close && depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    is_identifier_start(ch) || ch.is_ascii_digit()
+}
+
 fn find_argument_list_start(text: &str) -> Option<usize> {
     let mut depth = 0;
     for (index, c) in text.char_indices() {
@@ -180,26 +387,6 @@ fn find_argument_list_start(text: &str) -> Option<usize> {
         }
     }
     None
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    if max_chars == 0 || trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let cutoff = max_chars.saturating_sub(3).max(1);
-    let mut out = String::new();
-    for (idx, ch) in trimmed.chars().enumerate() {
-        if idx >= cutoff {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
 }
 
 #[cfg(test)]
@@ -245,7 +432,7 @@ mod tests {
         let breadcrumb = block_breadcrumb(&tree, method);
         assert_eq!(
             breadcrumb,
-            Some("File (src/lib.rs) -> impl Foo -> fn bar".to_string())
+            Some("File (src/lib.rs) -> Impl (Foo) -> Method (bar)".to_string())
         );
     }
 
@@ -273,7 +460,7 @@ mod tests {
         let breadcrumb = block_breadcrumb(&tree, impl_block);
         assert_eq!(
             breadcrumb,
-            Some("File (src/lib.rs) -> impl Foo".to_string())
+            Some("File (src/lib.rs) -> Impl (Foo)".to_string())
         );
     }
 
@@ -306,7 +493,80 @@ mod tests {
         let breadcrumb = block_breadcrumb(&tree, struct_block);
         assert_eq!(
             breadcrumb,
-            Some("File (src/lib.rs) -> struct Config".to_string())
+            Some("File (src/lib.rs) -> Struct (Config)".to_string())
+        );
+    }
+
+    #[test]
+    fn breadcrumb_uses_fixed_semantic_label_for_comment_children() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let function = builder.add_block(
+            file,
+            "function".to_string(),
+            "src/lib.rs".to_string(),
+            block("fn build_state() {", BlockKind::Function, 1, 20),
+            Language::Rust,
+        );
+        let comment = builder.add_block(
+            function,
+            "comment".to_string(),
+            "src/lib.rs".to_string(),
+            block(
+                "// this breadcrumb should not include comment text",
+                BlockKind::Comment,
+                2,
+                3,
+            ),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+
+        let breadcrumb = block_breadcrumb(&tree, comment);
+        assert_eq!(
+            breadcrumb,
+            Some("File (src/lib.rs) -> Function (build_state) -> Comment".to_string())
+        );
+    }
+
+    #[test]
+    fn breadcrumb_uses_fixed_semantic_label_for_paragraph_blocks() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let docs = builder.add_dir(root, "docs".to_string(), "docs".to_string());
+        let file = builder.add_file(
+            docs,
+            "guide.md".to_string(),
+            "docs/guide.md".to_string(),
+            "file-hash".to_string(),
+            Language::Markdown,
+        );
+        let paragraph = builder.add_block(
+            file,
+            "paragraph".to_string(),
+            "docs/guide.md".to_string(),
+            block(
+                "This paragraph should not be copied into breadcrumbs.",
+                BlockKind::Paragraph,
+                1,
+                3,
+            ),
+            Language::Markdown,
+        );
+        let tree = builder.finalize();
+
+        let breadcrumb = block_breadcrumb(&tree, paragraph);
+        assert_eq!(
+            breadcrumb,
+            Some("File (docs/guide.md) -> Paragraph".to_string())
         );
     }
 
