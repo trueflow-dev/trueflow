@@ -323,12 +323,20 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         .parse(content, None)
         .context("Failed to parse source with tree-sitter")?;
     let root = tree.root_node();
+    let test_spans = collect_test_line_spans(lang, &tree, content)?;
+
+    if let Some(registration) = registration
+        && let Some(custom_splitter) = registration.top_level.custom_splitter
+    {
+        let mut blocks = custom_splitter(root, content, lang)?;
+        apply_test_tags(&mut blocks, &test_spans);
+        return Ok(blocks);
+    }
+
     let mut blocks = Vec::new();
 
     let mut cursor = root.walk();
     let mut last_end_byte = 0;
-
-    let test_spans = collect_test_line_spans(lang, &tree, content)?;
 
     let mut pending_start: Option<usize> = None;
     let mut pending_end: usize = 0;

@@ -1,10 +1,844 @@
-use super::{LanguageRegistration, generic_tree_sitter_registration};
-use tree_sitter::Language as TsLanguage;
+use super::{
+    LanguageRegistration, LanguageSubSplitSemantics, SubSplitRegistration, TopLevelRegistration,
+    default_code_sub_split, default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
+};
+use crate::analysis::Language;
+use crate::block::{Block, BlockKind};
+use crate::code_comments;
+use crate::complexity;
+use crate::hashing::TreeHash;
+use crate::text_split::split_by_paragraph_breaks;
+use anyhow::{Context, Result};
+use tree_sitter::{Language as TsLanguage, Node, Parser};
+
+#[derive(Debug, Clone)]
+struct SemanticSpan {
+    start_byte: usize,
+    end_byte: usize,
+    kind: BlockKind,
+    tags: Vec<String>,
+}
 
 pub(crate) fn registration() -> LanguageRegistration {
-    generic_tree_sitter_registration(parser_language)
+    LanguageRegistration {
+        top_level: TopLevelRegistration {
+            parser_language,
+            map_kind: default_map_kind,
+            is_attribute_node: no_attribute_nodes,
+            collect_nested_blocks: no_nested_blocks,
+            collect_test_ranges: no_test_ranges,
+            custom_splitter: Some(split_top_level),
+        },
+        sub_split: sub_split_registration,
+    }
 }
 
 fn parser_language(_content: &str) -> TsLanguage {
     tree_sitter_dart::LANGUAGE.into()
+}
+
+fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
+    let mut blocks = Vec::new();
+    let mut cursor = root.walk();
+    let children: Vec<_> = root.children(&mut cursor).collect();
+
+    let mut pending_start: Option<usize> = None;
+    let mut pending_end = 0usize;
+    let mut last_end = 0usize;
+    let mut index = 0usize;
+
+    while index < children.len() {
+        let child = children[index];
+        let kind = child.kind();
+
+        if !child.is_named() || is_top_level_fragment_node(kind) {
+            index += 1;
+            continue;
+        }
+
+        if is_leading_node(kind) {
+            if pending_start.is_none() {
+                pending_start = Some(child.start_byte());
+            }
+            pending_end = child.end_byte();
+            index += 1;
+            continue;
+        }
+
+        if matches!(
+            kind,
+            "function_signature" | "getter_signature" | "setter_signature"
+        ) && let Some(next) = children.get(index + 1).copied()
+            && next.kind() == "function_body"
+        {
+            let start = pending_start.unwrap_or(child.start_byte());
+            push_non_empty_gap(&mut blocks, content, last_end, start, lang);
+
+            let end = next.end_byte();
+            blocks.push(create_file_block(
+                &content[start..end],
+                BlockKind::Function,
+                function_like_tags(child, content),
+                content,
+                start,
+                end,
+                lang,
+            ));
+            blocks.extend(collect_test_invocation_blocks(next, content, lang));
+
+            last_end = end;
+            pending_start = None;
+            pending_end = 0;
+            index += 2;
+            continue;
+        }
+
+        let span = match kind {
+            "script_tag" => Some(SemanticSpan {
+                start_byte: pending_start.unwrap_or(child.start_byte()),
+                end_byte: child.end_byte(),
+                kind: BlockKind::Module,
+                tags: Vec::new(),
+            }),
+            "library_name" | "part_of_directive" => Some(SemanticSpan {
+                start_byte: pending_start.unwrap_or(child.start_byte()),
+                end_byte: child.end_byte(),
+                kind: BlockKind::Module,
+                tags: Vec::new(),
+            }),
+            "import_or_export" | "part_directive" => Some(SemanticSpan {
+                start_byte: pending_start.unwrap_or(child.start_byte()),
+                end_byte: child.end_byte(),
+                kind: BlockKind::Import,
+                tags: Vec::new(),
+            }),
+            "function_signature" | "getter_signature" | "setter_signature" => {
+                let start = pending_start
+                    .unwrap_or_else(|| declaration_start(content, last_end, child.start_byte()));
+                Some(SemanticSpan {
+                    start_byte: start,
+                    end_byte: extend_to_semicolon(content, child.end_byte()),
+                    kind: BlockKind::FunctionSignature,
+                    tags: function_like_tags(child, content),
+                })
+            }
+            "static_final_declaration_list" | "initialized_identifier_list" | "identifier_list" => {
+                let start = pending_start
+                    .unwrap_or_else(|| declaration_start(content, last_end, child.start_byte()));
+                let end = extend_to_semicolon(content, child.end_byte());
+                let text = &content[start..end.min(content.len())];
+                Some(SemanticSpan {
+                    start_byte: start,
+                    end_byte: end,
+                    kind: classify_variable_kind(text),
+                    tags: Vec::new(),
+                })
+            }
+            "class_declaration"
+            | "mixin_declaration"
+            | "extension_declaration"
+            | "extension_type_declaration"
+            | "enum_declaration"
+            | "type_alias" => Some(SemanticSpan {
+                start_byte: pending_start.unwrap_or(child.start_byte()),
+                end_byte: child.end_byte(),
+                kind: map_type_declaration_kind(child),
+                tags: Vec::new(),
+            }),
+            _ => Some(SemanticSpan {
+                start_byte: pending_start.unwrap_or(child.start_byte()),
+                end_byte: child.end_byte().max(pending_end),
+                kind: BlockKind::Code,
+                tags: Vec::new(),
+            }),
+        };
+
+        if let Some(span) = span {
+            push_non_empty_gap(&mut blocks, content, last_end, span.start_byte, lang);
+            blocks.push(create_file_block(
+                &content[span.start_byte..span.end_byte],
+                span.kind,
+                span.tags,
+                content,
+                span.start_byte,
+                span.end_byte,
+                lang,
+            ));
+
+            if matches!(
+                kind,
+                "class_declaration"
+                    | "mixin_declaration"
+                    | "extension_declaration"
+                    | "extension_type_declaration"
+                    | "enum_declaration"
+            ) {
+                blocks.extend(collect_type_member_blocks(child, content, lang));
+            }
+
+            last_end = span.end_byte;
+        }
+
+        pending_start = None;
+        pending_end = 0;
+        index += 1;
+    }
+
+    if let Some(start) = pending_start {
+        let end = pending_end.max(start);
+        if end > start {
+            push_non_empty_gap(&mut blocks, content, last_end, start, lang);
+            blocks.push(create_file_block(
+                &content[start..end],
+                BlockKind::Comment,
+                Vec::new(),
+                content,
+                start,
+                end,
+                lang,
+            ));
+            last_end = end;
+        }
+    }
+
+    push_non_empty_gap(&mut blocks, content, last_end, content.len(), lang);
+
+    Ok(blocks)
+}
+
+fn collect_type_member_blocks(type_node: Node<'_>, content: &str, lang: Language) -> Vec<Block> {
+    collect_type_member_spans(type_node, content)
+        .into_iter()
+        .map(|span| {
+            create_file_block(
+                &content[span.start_byte..span.end_byte],
+                span.kind,
+                span.tags,
+                content,
+                span.start_byte,
+                span.end_byte,
+                lang,
+            )
+        })
+        .collect()
+}
+
+fn collect_type_member_spans(type_node: Node<'_>, content: &str) -> Vec<SemanticSpan> {
+    let Some(body) = type_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut spans = Vec::new();
+    let mut cursor = body.walk();
+    let mut pending_start: Option<usize> = None;
+    let mut pending_end = 0usize;
+
+    for child in body.children(&mut cursor) {
+        let kind = child.kind();
+        if matches!(kind, "{" | "}" | "," | ";") {
+            continue;
+        }
+
+        if is_leading_node(kind) {
+            if pending_start.is_none() {
+                pending_start = Some(child.start_byte());
+            }
+            pending_end = child.end_byte();
+            continue;
+        }
+
+        let Some(member_kind) = map_type_member_kind(child, content) else {
+            continue;
+        };
+
+        spans.push(SemanticSpan {
+            start_byte: pending_start.unwrap_or(child.start_byte()),
+            end_byte: child.end_byte(),
+            kind: member_kind,
+            tags: member_tags(child, content),
+        });
+        pending_start = None;
+        pending_end = 0;
+    }
+
+    if let Some(start) = pending_start {
+        let end = pending_end.max(start);
+        if end > start {
+            spans.push(SemanticSpan {
+                start_byte: start,
+                end_byte: end,
+                kind: BlockKind::Comment,
+                tags: Vec::new(),
+            });
+        }
+    }
+
+    spans
+}
+
+fn collect_test_invocation_blocks(
+    function_body: Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Vec<Block> {
+    let mut spans = Vec::new();
+    collect_test_invocation_spans(function_body, content, &mut spans);
+    spans
+        .into_iter()
+        .map(|span| {
+            create_file_block(
+                &content[span.start_byte..span.end_byte],
+                span.kind,
+                span.tags,
+                content,
+                span.start_byte,
+                span.end_byte,
+                lang,
+            )
+        })
+        .collect()
+}
+
+fn collect_test_invocation_spans(node: Node<'_>, content: &str, spans: &mut Vec<SemanticSpan>) {
+    if node.kind() == "expression_statement"
+        && let Some(name) = leading_invocation_name(node, content)
+        && is_stable_test_invocation(name)
+    {
+        spans.push(SemanticSpan {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            kind: BlockKind::Function,
+            tags: vec!["test".to_string()],
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_test_invocation_spans(child, content, spans);
+    }
+}
+
+fn leading_invocation_name<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find_map(|child| {
+        (child.kind() == "identifier")
+            .then(|| child.utf8_text(content.as_bytes()).ok())
+            .flatten()
+    })
+}
+
+fn is_stable_test_invocation(name: &str) -> bool {
+    matches!(
+        name,
+        "group" | "test" | "testWidgets" | "setUp" | "tearDown" | "setUpAll" | "tearDownAll"
+    )
+}
+
+fn is_leading_node(kind: &str) -> bool {
+    matches!(kind, "annotation" | "comment")
+}
+
+fn is_top_level_fragment_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "type_identifier" | "void_type" | "function_type" | "record_type" | "type_arguments"
+    )
+}
+
+fn declaration_start(content: &str, last_end: usize, node_start: usize) -> usize {
+    if node_start <= last_end {
+        return node_start;
+    }
+
+    content[last_end..node_start]
+        .char_indices()
+        .find_map(|(offset, ch)| (!ch.is_whitespace()).then_some(last_end + offset))
+        .unwrap_or(node_start)
+}
+
+fn extend_to_semicolon(content: &str, from: usize) -> usize {
+    if from >= content.len() {
+        return content.len();
+    }
+
+    content[from..]
+        .find(';')
+        .map(|offset| from + offset + 1)
+        .unwrap_or(content.len())
+}
+
+fn push_non_empty_gap(
+    blocks: &mut Vec<Block>,
+    content: &str,
+    start: usize,
+    end: usize,
+    lang: Language,
+) {
+    if end <= start {
+        return;
+    }
+
+    let gap = &content[start..end];
+    if gap.trim().is_empty() {
+        return;
+    }
+
+    blocks.push(create_file_block(
+        gap,
+        BlockKind::Gap,
+        Vec::new(),
+        content,
+        start,
+        end,
+        lang,
+    ));
+}
+
+fn map_type_declaration_kind(node: Node<'_>) -> BlockKind {
+    match node.kind() {
+        "class_declaration" => BlockKind::Class,
+        "mixin_declaration" | "extension_declaration" => BlockKind::Impl,
+        "extension_type_declaration" | "type_alias" => BlockKind::Type,
+        "enum_declaration" => BlockKind::Enum,
+        _ => BlockKind::Code,
+    }
+}
+
+fn map_type_member_kind(node: Node<'_>, content: &str) -> Option<BlockKind> {
+    match node.kind() {
+        "comment" | "annotation" => None,
+        "enum_constant" => Some(BlockKind::Const),
+        "class_member" => classify_class_member_kind(node, content),
+        _ => None,
+    }
+}
+
+fn classify_class_member_kind(node: Node<'_>, content: &str) -> Option<BlockKind> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "annotation" => continue,
+            "method_signature" => return Some(BlockKind::Method),
+            "declaration" => return classify_member_declaration_kind(node, child, content),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn classify_member_declaration_kind(
+    member_node: Node<'_>,
+    declaration_node: Node<'_>,
+    content: &str,
+) -> Option<BlockKind> {
+    if contains_named_descendant_any(
+        declaration_node,
+        &[
+            "constructor_signature",
+            "constant_constructor_signature",
+            "factory_constructor_signature",
+            "redirecting_factory_constructor_signature",
+        ],
+    ) {
+        return Some(BlockKind::Method);
+    }
+
+    if contains_named_descendant_any(
+        declaration_node,
+        &[
+            "function_signature",
+            "getter_signature",
+            "setter_signature",
+            "operator_signature",
+        ],
+    ) {
+        return Some(BlockKind::FunctionSignature);
+    }
+
+    if contains_named_descendant_any(
+        declaration_node,
+        &[
+            "static_final_declaration_list",
+            "initialized_identifier_list",
+            "identifier_list",
+        ],
+    ) {
+        return Some(classify_variable_kind(
+            &content[member_node.start_byte()..member_node.end_byte()],
+        ));
+    }
+
+    None
+}
+
+fn contains_named_descendant_any(node: Node<'_>, kinds: &[&str]) -> bool {
+    if kinds.iter().any(|kind| *kind == node.kind()) {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| contains_named_descendant_any(child, kinds))
+}
+
+fn classify_variable_kind(text: &str) -> BlockKind {
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("const ") || lowered.contains("final ") {
+        BlockKind::Const
+    } else {
+        BlockKind::Variable
+    }
+}
+
+fn function_like_tags(node: Node<'_>, content: &str) -> Vec<String> {
+    declaration_name(node, content)
+        .filter(|name| is_test_like_name(name))
+        .map(|_| vec!["test".to_string()])
+        .unwrap_or_default()
+}
+
+fn member_tags(node: Node<'_>, content: &str) -> Vec<String> {
+    declaration_name(node, content)
+        .filter(|name| is_test_like_name(name))
+        .map(|_| vec!["test".to_string()])
+        .unwrap_or_default()
+}
+
+fn declaration_name<'a>(node: Node<'a>, content: &'a str) -> Option<String> {
+    if let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+    {
+        return Some(name.to_string());
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "annotation" {
+            continue;
+        }
+        if let Some(name) = declaration_name(child, content) {
+            return Some(name);
+        }
+    }
+
+    None
+}
+
+fn is_test_like_name(name: &str) -> bool {
+    name.strip_prefix("test").is_some_and(|suffix| {
+        suffix.is_empty() || !suffix.chars().next().is_some_and(char::is_lowercase)
+    }) || name.starts_with("test_")
+}
+
+fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
+    match kind {
+        BlockKind::Function | BlockKind::Method => SubSplitRegistration {
+            semantics: LanguageSubSplitSemantics::ReviewUnits,
+            splitter: split_function_like_review_units,
+        },
+        BlockKind::Class | BlockKind::Impl | BlockKind::Enum | BlockKind::Type => {
+            SubSplitRegistration {
+                semantics: LanguageSubSplitSemantics::ReviewUnits,
+                splitter: split_type_like_review_units,
+            }
+        }
+        _ => default_code_sub_split(kind),
+    }
+}
+
+fn split_function_like_review_units(block: &Block) -> Result<Vec<Block>> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
+
+    let tree = parser
+        .parse(&block.content, None)
+        .context("Failed to parse dart function-like block")?;
+    let root = tree.root_node();
+    let Some(body_node) = find_named_descendant(root, "function_body") else {
+        return crate::sub_splitter::split_code_review_units(block);
+    };
+
+    let signature_end = signature_end_for_function_body(&block.content, body_node.start_byte());
+    if signature_end == 0 || signature_end > block.content.len() {
+        return crate::sub_splitter::split_code_review_units(block);
+    }
+
+    let mut blocks = vec![create_sub_block(
+        block,
+        &block.content[..signature_end],
+        0,
+        signature_end,
+        BlockKind::FunctionSignature,
+        Vec::new(),
+    )];
+
+    let body = &block.content[signature_end..];
+    let mut tail_blocks = split_by_paragraph_breaks(body, |chunk, start, end, is_gap| {
+        let kind = if is_gap {
+            BlockKind::Gap
+        } else {
+            classify_review_chunk(chunk)
+        };
+        create_sub_block(
+            block,
+            chunk,
+            signature_end + start,
+            signature_end + end,
+            kind,
+            Vec::new(),
+        )
+    });
+    blocks.append(&mut tail_blocks);
+
+    Ok(blocks)
+}
+
+fn signature_end_for_function_body(content: &str, body_start: usize) -> usize {
+    if body_start >= content.len() {
+        return content.len();
+    }
+
+    let tail = &content[body_start..];
+    let arrow = tail.find("=>");
+    let brace = tail.find('{');
+
+    match (arrow, brace) {
+        (Some(arrow_pos), Some(brace_pos)) if arrow_pos < brace_pos => {
+            advance_past_trivia(content, body_start + arrow_pos + 2)
+        }
+        (_, Some(brace_pos)) => advance_past_brace(content, body_start + brace_pos),
+        (Some(arrow_pos), None) => advance_past_trivia(content, body_start + arrow_pos + 2),
+        (None, None) => body_start,
+    }
+}
+
+fn advance_past_brace(content: &str, brace_index: usize) -> usize {
+    let mut end = brace_index.saturating_add(1);
+    let bytes = content.as_bytes();
+    if bytes.get(end) == Some(&b'\r') && bytes.get(end + 1) == Some(&b'\n') {
+        end += 2;
+    } else if bytes.get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    end.min(content.len())
+}
+
+fn advance_past_trivia(content: &str, mut index: usize) -> usize {
+    let bytes = content.as_bytes();
+    while let Some(byte) = bytes.get(index) {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        index += 1;
+    }
+    index.min(content.len())
+}
+
+fn classify_review_chunk(chunk: &str) -> BlockKind {
+    let trimmed = chunk.trim();
+    if trimmed.is_empty() {
+        return BlockKind::Gap;
+    }
+    if trimmed.chars().all(|ch| matches!(ch, '}' | ';')) {
+        return BlockKind::Gap;
+    }
+    if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+        BlockKind::Comment
+    } else {
+        BlockKind::CodeParagraph
+    }
+}
+
+fn split_type_like_review_units(block: &Block) -> Result<Vec<Block>> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
+
+    let tree = parser
+        .parse(&block.content, None)
+        .context("Failed to parse dart type-like block")?;
+    let root = tree.root_node();
+
+    if find_named_descendant(root, "type_alias").is_some() {
+        return Ok(vec![block.clone()]);
+    }
+
+    let Some(type_node) = find_named_descendant_any(
+        root,
+        &[
+            "class_declaration",
+            "mixin_declaration",
+            "extension_declaration",
+            "extension_type_declaration",
+            "enum_declaration",
+        ],
+    ) else {
+        return crate::sub_splitter::split_code_review_units(block);
+    };
+
+    let spans = collect_type_member_spans(type_node, &block.content);
+    if spans.is_empty() {
+        return crate::sub_splitter::split_code_review_units(block);
+    }
+
+    Ok(spans
+        .into_iter()
+        .map(|span| {
+            create_sub_block(
+                block,
+                &block.content[span.start_byte..span.end_byte],
+                span.start_byte,
+                span.end_byte,
+                span.kind,
+                span.tags,
+            )
+        })
+        .collect())
+}
+
+fn find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    find_named_descendant_any(node, &[kind])
+}
+
+fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    if kinds.iter().any(|kind| *kind == node.kind()) {
+        return Some(node);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = find_named_descendant_any(child, kinds) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn create_file_block(
+    text: &str,
+    kind: BlockKind,
+    tags: Vec<String>,
+    full_source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    lang: Language,
+) -> Block {
+    let (start_line, end_line) = byte_range_to_lines(full_source, start_byte, end_byte);
+    Block {
+        hash: TreeHash::from_content(text),
+        content: text.to_string(),
+        kind,
+        tags,
+        complexity: complexity::calculate(text, lang),
+        start_line,
+        end_line,
+    }
+}
+
+fn create_sub_block(
+    parent: &Block,
+    text: &str,
+    start_offset: usize,
+    _end_offset: usize,
+    kind: BlockKind,
+    tags: Vec<String>,
+) -> Block {
+    let pre_chunk = &parent.content[..start_offset];
+    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
+    let chunk_newlines = text.chars().filter(|&ch| ch == '\n').count();
+
+    let start_line = parent.start_line + offset_newlines;
+    let end_line = start_line + chunk_newlines + if text.ends_with('\n') { 0 } else { 1 };
+
+    let mut combined_tags = parent.tags.clone();
+    for tag in tags {
+        if !combined_tags.iter().any(|existing| existing == &tag) {
+            combined_tags.push(tag);
+        }
+    }
+
+    Block {
+        hash: TreeHash::from_content(text),
+        content: text.to_string(),
+        kind,
+        tags: combined_tags,
+        complexity: None,
+        start_line,
+        end_line,
+    }
+}
+
+fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
+    let pre = &source[..start];
+    let start_line = pre.lines().count();
+    let start_line = if start > 0 && pre.ends_with('\n') {
+        start_line
+    } else {
+        start_line.saturating_sub(1)
+    };
+
+    let mid = &source[start..end];
+    let new_lines = mid.chars().filter(|&ch| ch == '\n').count();
+    let end_line = start_line + new_lines + if mid.ends_with('\n') { 0 } else { 1 };
+
+    (start_line, end_line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_top_level_keeps_real_dart_kinds() {
+        let source = "import 'dart:math';\n\nconst answer = 42;\n\nString greet(String name) {\n  return 'hi $name';\n}\n\nmixin Counter {\n  int hits = 0;\n}\n\nclass Worker {\n  final String name;\n  Worker(this.name);\n\n  void run() {}\n}\n";
+        let tree = parse_tree(source);
+        let root = tree.root_node();
+
+        let blocks = split_top_level(root, source, Language::Dart).unwrap();
+        let kinds = blocks.iter().map(|block| block.kind).collect::<Vec<_>>();
+
+        assert!(kinds.contains(&BlockKind::Import));
+        assert!(kinds.contains(&BlockKind::Const));
+        assert!(kinds.contains(&BlockKind::Function));
+        assert!(kinds.contains(&BlockKind::Impl));
+        assert!(kinds.contains(&BlockKind::Class));
+        assert!(kinds.contains(&BlockKind::Method));
+    }
+
+    #[test]
+    fn split_top_level_collects_nested_group_and_test_calls() {
+        let source = "void main() {\n  group('suite', () {\n    test('works', () {\n      expect(true, isTrue);\n    });\n  });\n}\n";
+        let tree = parse_tree(source);
+        let root = tree.root_node();
+
+        let blocks = split_top_level(root, source, Language::Dart).unwrap();
+        let tagged = blocks
+            .iter()
+            .filter(|block| block.tags.iter().any(|tag| tag == "test"))
+            .map(|block| block.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            tagged
+                .iter()
+                .any(|content| content.contains("group('suite'"))
+        );
+        assert!(
+            tagged
+                .iter()
+                .any(|content| content.contains("test('works'"))
+        );
+    }
+
+    fn parse_tree(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_dart::LANGUAGE.into())
+            .unwrap_or_else(|error| panic!("load dart grammar: {error}"));
+        parser
+            .parse(source, None)
+            .unwrap_or_else(|| panic!("parse dart"))
+    }
 }

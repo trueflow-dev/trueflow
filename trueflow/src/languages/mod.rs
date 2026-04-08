@@ -37,6 +37,7 @@ pub(crate) type AttributeNodeDetector = fn(&str) -> bool;
 pub(crate) type NestedBlockCollector =
     for<'tree> fn(Node<'tree>, &str, Language) -> Vec<NestedBlock>;
 pub(crate) type TestRangeCollector = fn(&Tree, &str) -> Result<Vec<ByteSpan>>;
+pub(crate) type TopLevelSplitter = for<'tree> fn(Node<'tree>, &str, Language) -> Result<Vec<Block>>;
 pub(crate) type SubSplitter = fn(&Block) -> Result<Vec<Block>>;
 pub(crate) type SubSplitRegistrationFn = fn(BlockKind) -> SubSplitRegistration;
 
@@ -47,6 +48,7 @@ pub(crate) struct TopLevelRegistration {
     pub(crate) is_attribute_node: AttributeNodeDetector,
     pub(crate) collect_nested_blocks: NestedBlockCollector,
     pub(crate) collect_test_ranges: TestRangeCollector,
+    pub(crate) custom_splitter: Option<TopLevelSplitter>,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +114,7 @@ pub(crate) fn generic_tree_sitter_registration(
             is_attribute_node: no_attribute_nodes,
             collect_nested_blocks: no_nested_blocks,
             collect_test_ranges: no_test_ranges,
+            custom_splitter: None,
         },
         sub_split: default_code_sub_split,
     }
