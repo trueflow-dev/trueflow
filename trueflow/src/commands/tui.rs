@@ -5197,7 +5197,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn editing_submit_decision_returns_ready_with_trimmed_note() {
+    fn editing_submit_decision_returns_ready_with_original_note_whitespace() {
         let action = PendingAction::Single {
             node_id: TreeBuilder::new().root(),
             verdict: Verdict::Comment,
@@ -5209,7 +5209,7 @@ mod diff_scope_tests {
         else {
             panic!("expected ready single action");
         };
-        assert_eq!(note.as_deref(), Some("keep this note"));
+        assert_eq!(note.as_deref(), Some("  keep this note  "));
     }
 
     #[test]
