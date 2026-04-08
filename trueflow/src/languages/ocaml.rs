@@ -691,9 +691,9 @@ fn consume_ocaml_comment(source: &str, start: usize) -> Option<usize> {
 }
 
 fn parse_best_tree(source: &str) -> Result<Tree> {
-    let implementation = parse_with_language(source, tree_sitter_ocaml::LANGUAGE_OCAML.into())
+    let implementation = parse_with_language(source, &tree_sitter_ocaml::LANGUAGE_OCAML.into())
         .context("Failed to parse with OCaml implementation grammar")?;
-    let interface = parse_with_language(source, tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
+    let interface = parse_with_language(source, &tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
         .context("Failed to parse with OCaml interface grammar")?;
 
     let implementation_score = syntax_error_score(implementation.root_node());
@@ -706,9 +706,9 @@ fn parse_best_tree(source: &str) -> Result<Tree> {
     }
 }
 
-fn parse_with_language(source: &str, language: TsLanguage) -> Result<Tree> {
+fn parse_with_language(source: &str, language: &TsLanguage) -> Result<Tree> {
     let mut parser = Parser::new();
-    parser.set_language(&language)?;
+    parser.set_language(language)?;
     parser
         .parse(source, None)
         .context("tree-sitter parse failed")
