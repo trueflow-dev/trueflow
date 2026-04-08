@@ -442,10 +442,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing non-gap block for {language:?}"));
             let sub_split = crate::sub_splitter::split_result(first_block, language)
                 .unwrap_or_else(|error| panic!("sub-split {language:?}: {error}"));
+            let expected_semantics = match language {
+                Language::Scala => crate::sub_splitter::SubSplitSemantics::StructuralChildren,
+                _ => crate::sub_splitter::SubSplitSemantics::ReviewUnits,
+            };
             assert_eq!(
-                sub_split.semantics,
-                crate::sub_splitter::SubSplitSemantics::ReviewUnits,
-                "expected default review-unit sub-split registration for {language:?}"
+                sub_split.semantics, expected_semantics,
+                "unexpected sub-split semantics for {language:?}"
             );
             assert!(
                 !sub_split.blocks.is_empty(),
