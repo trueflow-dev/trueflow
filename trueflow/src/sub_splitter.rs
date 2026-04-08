@@ -4,7 +4,7 @@ use crate::code_comments;
 use crate::hashing::TreeHash;
 use crate::review_units::{MAX_REVIEW_UNIT_SPAN_LINES, block_line_span};
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
-use crate::{rust, swift};
+use crate::{languages, rust, swift};
 use anyhow::{Context, Result};
 use tracing::info;
 use tree_sitter::Parser;
@@ -101,6 +101,45 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         block.content.len(),
         block.hash
     );
+
+    if let Some(language_registration) = languages::registration(lang) {
+        let registration = (language_registration.sub_split)(block.kind);
+        if matches!(
+            registration.semantics,
+            languages::LanguageSubSplitSemantics::ReviewUnits
+        ) && block_line_span(block) <= MAX_REVIEW_UNIT_SPAN_LINES
+        {
+            let result = SubSplitResult {
+                blocks: vec![block.clone()],
+                semantics: SubSplitSemantics::ReviewUnits,
+            };
+            info!(
+                "sub_splitter kept parent review unit (lines={}, max_lines={})",
+                block_line_span(block),
+                MAX_REVIEW_UNIT_SPAN_LINES
+            );
+            return Ok(result);
+        }
+
+        let result = SubSplitResult {
+            blocks: (registration.splitter)(block)?,
+            semantics: match registration.semantics {
+                languages::LanguageSubSplitSemantics::ReviewUnits => {
+                    SubSplitSemantics::ReviewUnits
+                }
+                languages::LanguageSubSplitSemantics::StructuralChildren => {
+                    SubSplitSemantics::StructuralChildren
+                }
+            },
+        };
+
+        info!(
+            "sub_splitter done (blocks={}, semantics={:?})",
+            result.blocks.len(),
+            result.semantics
+        );
+        return Ok(result);
+    }
 
     let plan = determine_split_plan(block.kind, lang);
     if should_keep_parent_review_unit(plan, block) {
@@ -271,7 +310,7 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
     }
 }
 
-fn split_code(block: &Block) -> Result<Vec<Block>> {
+pub(crate) fn split_code_review_units(block: &Block) -> Result<Vec<Block>> {
     let content = &block.content;
     let blocks = split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
         let block_kind = if is_gap {
@@ -282,6 +321,10 @@ fn split_code(block: &Block) -> Result<Vec<Block>> {
         create_sub_block_with_kind(block, chunk, start, end, block_kind)
     });
     Ok(blocks)
+}
+
+fn split_code(block: &Block) -> Result<Vec<Block>> {
+    split_code_review_units(block)
 }
 
 fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {

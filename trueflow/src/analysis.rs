@@ -17,6 +17,19 @@ pub enum Language {
     Go,
     C,
     Cpp,
+    Zig,
+    Lua,
+    Dart,
+    Scala,
+    Haskell,
+    OCaml,
+    Elixir,
+    Clojure,
+    Sql,
+    Yaml,
+    Json,
+    Html,
+    Css,
     Shell,
     Markdown,
     Toml,
@@ -55,6 +68,19 @@ impl Language {
             "go" => Some(Language::Go),
             "c" => Some(Language::C),
             "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" => Some(Language::Cpp),
+            "zig" => Some(Language::Zig),
+            "lua" => Some(Language::Lua),
+            "dart" => Some(Language::Dart),
+            "scala" | "sc" => Some(Language::Scala),
+            "hs" | "lhs" => Some(Language::Haskell),
+            "ml" | "mli" => Some(Language::OCaml),
+            "ex" | "exs" => Some(Language::Elixir),
+            "clj" | "cljs" | "cljc" => Some(Language::Clojure),
+            "sql" => Some(Language::Sql),
+            "yaml" | "yml" => Some(Language::Yaml),
+            "json" => Some(Language::Json),
+            "html" | "htm" => Some(Language::Html),
+            "css" => Some(Language::Css),
             "sh" => Some(Language::Shell),
             "md" | "markdown" => Some(Language::Markdown),
             "toml" => Some(Language::Toml),
@@ -215,6 +241,27 @@ mod tests {
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("c"), Some(Language::C));
         assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("zig"), Some(Language::Zig));
+        assert_eq!(Language::from_extension("lua"), Some(Language::Lua));
+        assert_eq!(Language::from_extension("dart"), Some(Language::Dart));
+        assert_eq!(Language::from_extension("scala"), Some(Language::Scala));
+        assert_eq!(Language::from_extension("sc"), Some(Language::Scala));
+        assert_eq!(Language::from_extension("hs"), Some(Language::Haskell));
+        assert_eq!(Language::from_extension("lhs"), Some(Language::Haskell));
+        assert_eq!(Language::from_extension("ml"), Some(Language::OCaml));
+        assert_eq!(Language::from_extension("mli"), Some(Language::OCaml));
+        assert_eq!(Language::from_extension("ex"), Some(Language::Elixir));
+        assert_eq!(Language::from_extension("exs"), Some(Language::Elixir));
+        assert_eq!(Language::from_extension("clj"), Some(Language::Clojure));
+        assert_eq!(Language::from_extension("cljs"), Some(Language::Clojure));
+        assert_eq!(Language::from_extension("cljc"), Some(Language::Clojure));
+        assert_eq!(Language::from_extension("sql"), Some(Language::Sql));
+        assert_eq!(Language::from_extension("yaml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("yml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("json"), Some(Language::Json));
+        assert_eq!(Language::from_extension("html"), Some(Language::Html));
+        assert_eq!(Language::from_extension("htm"), Some(Language::Html));
+        assert_eq!(Language::from_extension("css"), Some(Language::Css));
         assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("cc"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("hpp"), Some(Language::Cpp));
@@ -348,5 +395,59 @@ mod tests {
                 language: Language::C
             })
         ));
+    }
+
+    #[test]
+    fn wave2_language_registrations_smoke() {
+        let cases = [
+            (Language::Zig, "const value: i32 = 1;\n"),
+            (Language::Lua, "local value = 1\n"),
+            (Language::Dart, "int value = 1;\n"),
+            (Language::Scala, "object Main {}\n"),
+            (Language::Haskell, "module Main where\nmain = putStrLn \"hi\"\n"),
+            (Language::OCaml, "let value = 1\n"),
+            (Language::Elixir, "defmodule Demo do\nend\n"),
+            (Language::Clojure, "(ns demo)\n(def answer 42)\n"),
+            (Language::Sql, "select 1;\n"),
+            (Language::Yaml, "name: demo\n"),
+            (Language::Json, "{\"name\":\"demo\"}\n"),
+            (Language::Html, "<div>demo</div>\n"),
+            (Language::Css, "body { color: red; }\n"),
+        ];
+
+        for (language, sample) in cases {
+            assert!(crate::languages::registered_languages().contains(&language));
+            assert!(crate::languages::registration(language).is_some());
+
+            let split = crate::block_splitter::split(sample, language);
+            assert_ne!(
+                split.strategy,
+                crate::block_splitter::BlockSplitStrategy::UnsupportedCode,
+                "expected registered top-level splitter for {language:?}"
+            );
+            assert!(
+                split.blocks.iter().any(|block| {
+                    !matches!(block.kind, crate::block::BlockKind::Gap) && !block.content.is_empty()
+                }),
+                "expected at least one non-gap block for {language:?}"
+            );
+
+            let first_block = split
+                .blocks
+                .iter()
+                .find(|block| !matches!(block.kind, crate::block::BlockKind::Gap))
+                .unwrap_or_else(|| panic!("missing non-gap block for {language:?}"));
+            let sub_split = crate::sub_splitter::split_result(first_block, language)
+                .unwrap_or_else(|error| panic!("sub-split {language:?}: {error}"));
+            assert_eq!(
+                sub_split.semantics,
+                crate::sub_splitter::SubSplitSemantics::ReviewUnits,
+                "expected default review-unit sub-split registration for {language:?}"
+            );
+            assert!(
+                !sub_split.blocks.is_empty(),
+                "expected non-empty sub-split blocks for {language:?}"
+            );
+        }
     }
 }

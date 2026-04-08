@@ -49,6 +49,19 @@ tree-sitter-ruby = "0.23.1"
 tree-sitter-php = "0.24.2"
 tree-sitter-c = "0.24.1"
 tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-zig = "1.1.2"
+tree-sitter-lua = "0.5.0"
+tree-sitter-dart = "0.1.0"
+tree-sitter-scala = "0.25.0"
+tree-sitter-haskell = "0.23.1"
+tree-sitter-ocaml = "0.24.2"
+tree-sitter-elixir = "0.3.5"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-json = "0.24.8"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25.0"
+tree-sitter-clojure = { version = "0.2.5", package = "tree-sitter-clojure-orchard" }
+tree-sitter-sql = { version = "0.3.11", package = "tree-sitter-sequel" }
 
 # [dependencies]
 # dioxus = "0.4.3"

@@ -5,7 +5,7 @@ use crate::complexity;
 use crate::hashing::TreeHash;
 use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
-use crate::{rust, swift};
+use crate::{languages, rust, swift};
 use anyhow::{Context, Result};
 use std::sync::LazyLock;
 use tracing::info;
@@ -221,6 +221,9 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
             Vec::new(),
         ),
         Language::Nix => attempt_split(content, lang, split_nix(content), FallbackMode::Code),
+        _ if languages::registration(lang).is_some() => {
+            attempt_split(content, lang, split_tree_sitter(content, lang), FallbackMode::Code)
+        }
         _ if lang.uses_text_fallback() || matches!(lang, Language::Unknown) => complete_split(
             split_paragraphs(content, lang),
             BlockSplitStrategy::Textual,
@@ -307,12 +310,10 @@ fn complete_split(
 }
 
 fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
+    let registration = languages::registration(lang);
     let mut parser = Parser::new();
-    let language = match lang {
-        Language::Php => php_tree_sitter_language(content),
-        _ => tree_sitter_language_for(lang)
-            .ok_or_else(|| anyhow::anyhow!("No tree-sitter grammar configured for {lang:?}"))?,
-    };
+    let language = tree_sitter_language_for(lang, content)
+        .ok_or_else(|| anyhow::anyhow!("No tree-sitter grammar configured for {lang:?}"))?;
     parser.set_language(&language)?;
 
     let tree = parser
@@ -334,17 +335,21 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         let end_byte = child.end_byte();
         let ts_kind = child.kind();
 
-        let is_attribute = match lang {
-            Language::Rust => {
-                ts_kind == "attribute_item"
-                    || ts_kind == "line_comment"
-                    || ts_kind == "block_comment"
+        let is_attribute = if let Some(registration) = registration {
+            (registration.top_level.is_attribute_node)(ts_kind)
+        } else {
+            match lang {
+                Language::Rust => {
+                    ts_kind == "attribute_item"
+                        || ts_kind == "line_comment"
+                        || ts_kind == "block_comment"
+                }
+                Language::Python => ts_kind == "decorator",
+                Language::Swift => swift::is_attribute_node(ts_kind),
+                Language::CSharp => ts_kind == "attribute_list",
+                Language::Php => ts_kind == "php_tag",
+                _ => false,
             }
-            Language::Python => ts_kind == "decorator",
-            Language::Swift => swift::is_attribute_node(ts_kind),
-            Language::CSharp => ts_kind == "attribute_list",
-            Language::Php => ts_kind == "php_tag",
-            _ => false,
         };
 
         if is_attribute {
@@ -397,64 +402,81 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
             lang,
         ));
 
-        if matches!(lang, Language::Rust) && matches!(ts_kind, "impl_item" | "trait_item") {
-            blocks.extend(collect_rust_impl_items(child, content, lang));
-        }
-        if matches!(lang, Language::Swift)
-            && matches!(ts_kind, "class_declaration" | "protocol_declaration")
-        {
-            blocks.extend(collect_swift_type_items(child, content, lang));
-        }
-        if matches!(lang, Language::Java)
-            && matches!(
-                ts_kind,
-                "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "annotation_type_declaration"
-            )
-        {
-            blocks.extend(collect_java_type_items(child, content, lang));
-        }
-        if matches!(lang, Language::Kotlin)
-            && matches!(ts_kind, "class_declaration" | "object_declaration")
-        {
-            blocks.extend(collect_kotlin_type_items(child, content, lang));
-        }
-        if matches!(lang, Language::CSharp)
-            && matches!(
-                ts_kind,
-                "namespace_declaration" | "file_scoped_namespace_declaration"
-            )
-        {
-            blocks.extend(collect_csharp_namespace_items(child, content, lang));
-        }
-        if matches!(lang, Language::CSharp)
-            && matches!(
-                ts_kind,
-                "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "struct_declaration"
-            )
-        {
-            blocks.extend(collect_csharp_type_items(child, content, lang));
-        }
-        if matches!(lang, Language::Ruby) && matches!(ts_kind, "class" | "module") {
-            blocks.extend(collect_ruby_scope_items(child, content, lang));
-        }
-        if matches!(lang, Language::Php)
-            && matches!(
-                ts_kind,
-                "class_declaration"
-                    | "interface_declaration"
-                    | "trait_declaration"
-                    | "enum_declaration"
-            )
-        {
-            blocks.extend(collect_php_type_items(child, content, lang));
+        if let Some(registration) = registration {
+            blocks.extend(
+                (registration.top_level.collect_nested_blocks)(child, content, lang)
+                    .into_iter()
+                    .map(|nested| {
+                        create_block(
+                            &content[nested.start_byte..nested.end_byte],
+                            nested.kind,
+                            content,
+                            nested.start_byte,
+                            nested.end_byte,
+                            lang,
+                        )
+                    }),
+            );
+        } else {
+            if matches!(lang, Language::Rust) && matches!(ts_kind, "impl_item" | "trait_item") {
+                blocks.extend(collect_rust_impl_items(child, content, lang));
+            }
+            if matches!(lang, Language::Swift)
+                && matches!(ts_kind, "class_declaration" | "protocol_declaration")
+            {
+                blocks.extend(collect_swift_type_items(child, content, lang));
+            }
+            if matches!(lang, Language::Java)
+                && matches!(
+                    ts_kind,
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "record_declaration"
+                        | "annotation_type_declaration"
+                )
+            {
+                blocks.extend(collect_java_type_items(child, content, lang));
+            }
+            if matches!(lang, Language::Kotlin)
+                && matches!(ts_kind, "class_declaration" | "object_declaration")
+            {
+                blocks.extend(collect_kotlin_type_items(child, content, lang));
+            }
+            if matches!(lang, Language::CSharp)
+                && matches!(
+                    ts_kind,
+                    "namespace_declaration" | "file_scoped_namespace_declaration"
+                )
+            {
+                blocks.extend(collect_csharp_namespace_items(child, content, lang));
+            }
+            if matches!(lang, Language::CSharp)
+                && matches!(
+                    ts_kind,
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "record_declaration"
+                        | "struct_declaration"
+                )
+            {
+                blocks.extend(collect_csharp_type_items(child, content, lang));
+            }
+            if matches!(lang, Language::Ruby) && matches!(ts_kind, "class" | "module") {
+                blocks.extend(collect_ruby_scope_items(child, content, lang));
+            }
+            if matches!(lang, Language::Php)
+                && matches!(
+                    ts_kind,
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "trait_declaration"
+                        | "enum_declaration"
+                )
+            {
+                blocks.extend(collect_php_type_items(child, content, lang));
+            }
         }
 
         last_end_byte = end_byte;
@@ -494,7 +516,11 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
+fn tree_sitter_language_for(lang: Language, content: &str) -> Option<TsLanguage> {
+    if let Some(registration) = languages::registration(lang) {
+        return Some((registration.top_level.parser_language)(content));
+    }
+
     match lang {
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
         Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
@@ -506,6 +532,7 @@ fn tree_sitter_language_for(lang: Language) -> Option<TsLanguage> {
         Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+        Language::Php => Some(php_tree_sitter_language(content)),
         Language::C => Some(tree_sitter_c::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -1100,6 +1127,10 @@ fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8>
 }
 
 fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
+    if let Some(registration) = languages::registration(lang) {
+        return (registration.top_level.map_kind)(node, content);
+    }
+
     match lang {
         Language::Swift => swift::map_kind(node, content),
         Language::Elisp => map_elisp_kind(node, content),
@@ -1689,6 +1720,10 @@ fn collect_test_ranges(
     tree: &tree_sitter::Tree,
     source: &str,
 ) -> Result<Vec<ByteSpan>> {
+    if let Some(registration) = languages::registration(lang) {
+        return (registration.top_level.collect_test_ranges)(tree, source);
+    }
+
     let mut ranges: Vec<ByteSpan> = Vec::new();
     match lang {
         Language::Rust => {

@@ -6786,7 +6786,7 @@ fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> 
             keywords: JUST_KEYWORDS,
             line_comment_start: Some("#"),
         },
-        Language::Markdown | Language::Toml | Language::Text | Language::Unknown => return None,
+        _ => return None,
     };
 
     Some(LineHighlighter { rules })
