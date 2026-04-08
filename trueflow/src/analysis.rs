@@ -404,7 +404,10 @@ mod tests {
             (Language::Lua, "local value = 1\n"),
             (Language::Dart, "int value = 1;\n"),
             (Language::Scala, "object Main {}\n"),
-            (Language::Haskell, "module Main where\nmain = putStrLn \"hi\"\n"),
+            (
+                Language::Haskell,
+                "module Main where\nmain = putStrLn \"hi\"\n",
+            ),
             (Language::OCaml, "let value = 1\n"),
             (Language::Elixir, "defmodule Demo do\nend\n"),
             (Language::Clojure, "(ns demo)\n(def answer 42)\n"),

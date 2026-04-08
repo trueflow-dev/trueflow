@@ -221,9 +221,12 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
             Vec::new(),
         ),
         Language::Nix => attempt_split(content, lang, split_nix(content), FallbackMode::Code),
-        _ if languages::registration(lang).is_some() => {
-            attempt_split(content, lang, split_tree_sitter(content, lang), FallbackMode::Code)
-        }
+        _ if languages::registration(lang).is_some() => attempt_split(
+            content,
+            lang,
+            split_tree_sitter(content, lang),
+            FallbackMode::Code,
+        ),
         _ if lang.uses_text_fallback() || matches!(lang, Language::Unknown) => complete_split(
             split_paragraphs(content, lang),
             BlockSplitStrategy::Textual,

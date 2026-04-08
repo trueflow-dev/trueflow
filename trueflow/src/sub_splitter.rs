@@ -124,9 +124,7 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
         let result = SubSplitResult {
             blocks: (registration.splitter)(block)?,
             semantics: match registration.semantics {
-                languages::LanguageSubSplitSemantics::ReviewUnits => {
-                    SubSplitSemantics::ReviewUnits
-                }
+                languages::LanguageSubSplitSemantics::ReviewUnits => SubSplitSemantics::ReviewUnits,
                 languages::LanguageSubSplitSemantics::StructuralChildren => {
                     SubSplitSemantics::StructuralChildren
                 }

@@ -102,7 +102,9 @@ pub(crate) fn registration(lang: Language) -> Option<LanguageRegistration> {
     }
 }
 
-pub(crate) fn generic_tree_sitter_registration(parser_language: ParserLanguageFn) -> LanguageRegistration {
+pub(crate) fn generic_tree_sitter_registration(
+    parser_language: ParserLanguageFn,
+) -> LanguageRegistration {
     LanguageRegistration {
         top_level: TopLevelRegistration {
             parser_language,
