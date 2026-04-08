@@ -167,6 +167,30 @@ where
         Ok(())
     }
 
+    pub fn show_diff(&mut self) {
+        self.state.view_mode = ViewMode::Diff;
+        let preferred_focus = self.state.focus_block;
+        set_focus_for_current_node(&mut self.state, preferred_focus);
+        self.state.content_frame_cache.clear();
+    }
+
+    pub fn preload_text_diff(
+        &mut self,
+        repo_path: impl Into<String>,
+        hunks: Vec<vcs::DiffHunk>,
+    ) -> Result<()> {
+        let repo_path = repo_path.into();
+        self.state.file_diff_cache.insert(
+            PathBuf::from(&repo_path),
+            vcs::FileDiff::Text {
+                path: crate::repo_path::RepoPath::new(&repo_path)?,
+                hunks,
+            },
+        );
+        self.state.content_frame_cache.clear();
+        Ok(())
+    }
+
     pub fn send_key(&mut self, key_event: KeyEvent) -> Result<()> {
         let event = Event::Key(key_event);
         self.apply_event(&event)

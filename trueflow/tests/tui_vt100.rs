@@ -5,6 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use trueflow::commands::tui::test_support::{
     MarkActionRunner, ScriptedMarkAction, ScriptedSessionRecap, ScriptedTui,
 };
+use trueflow::repo_path::RepoPath;
+use trueflow::vcs;
 
 mod common;
 use common::vt100_backend::VT100Backend;
@@ -85,6 +87,61 @@ fn root_selection_stays_visible_when_scrolling_past_viewport_height() -> Result<
             .any(|row| row.contains("file-10.rs")),
         "expected selected root entry to remain visible on screen:\n{}",
         app.backend().screen_contents()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn diff_view_initial_render_scrolls_to_changed_rows_for_long_block() -> Result<()> {
+    let mut file_content = String::new();
+    let mut diff_lines = Vec::new();
+    for line_number in 1..=24 {
+        if line_number == 22 {
+            file_content.push_str("line22 changed\n");
+            diff_lines.push(vcs::DiffHunkLine::removed("line22\n"));
+            diff_lines.push(vcs::DiffHunkLine::added("line22 changed\n"));
+            continue;
+        }
+
+        let text = format!("line{line_number}\n");
+        file_content.push_str(&text);
+        diff_lines.push(vcs::DiffHunkLine::context(text));
+    }
+
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(80, 18),
+        "src/lib.rs",
+        &file_content,
+        &file_content,
+        0,
+        24,
+    )?;
+    app.preload_text_diff(
+        "src/lib.rs",
+        vec![vcs::DiffHunk {
+            file_path: RepoPath::new("src/lib.rs")?,
+            old_start: 1,
+            new_start: 1,
+            lines: diff_lines,
+        }],
+    )?;
+    app.show_diff();
+
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        app.scroll_offset() > 0,
+        "expected diff view to auto-scroll to changed rows"
+    );
+    assert!(
+        screen.contains("- line22"),
+        "expected initial diff render to show removed line:\n{screen}"
+    );
+    assert!(
+        screen.contains("+ line22 changed"),
+        "expected initial diff render to show added line:\n{screen}"
     );
 
     Ok(())
