@@ -2322,16 +2322,6 @@ fn build_header_lines(
         false,
     ));
 
-    if state.view_mode == ViewMode::Diff
-        && matches!(node.kind, TreeNodeKind::File | TreeNodeKind::Block)
-    {
-        lines.push(format_header_row(
-            "Columns: old new ± content",
-            palette,
-            false,
-        ));
-    }
-
     if matches!(node.kind, TreeNodeKind::Block)
         && let Some(breadcrumb) = review_metadata::block_breadcrumb(&state.navigator.tree, node.id)
     {
@@ -5839,12 +5829,6 @@ mod diff_scope_tests {
             .map(Line::to_string)
             .collect::<Vec<_>>();
         assert!(diff_header.iter().any(|line| line == "Mode: Diff"));
-        assert!(
-            diff_header
-                .iter()
-                .any(|line| line == "Columns: old new ± content"),
-            "expected diff header to explain the old/new gutter columns: {diff_header:?}"
-        );
 
         state.view_mode = ViewMode::Source;
         let source_header = build_header_lines(file_node, &state, &palette)
@@ -5852,12 +5836,6 @@ mod diff_scope_tests {
             .map(Line::to_string)
             .collect::<Vec<_>>();
         assert!(source_header.iter().any(|line| line == "Mode: Source"));
-        assert!(
-            source_header
-                .iter()
-                .all(|line| line != "Columns: old new ± content"),
-            "did not expect source mode to show diff gutter copy: {source_header:?}"
-        );
     }
 
     #[test]
