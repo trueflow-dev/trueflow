@@ -2384,7 +2384,7 @@ enum ActionLineContext {
 }
 
 fn build_action_lines(
-    _width: u16,
+    width: u16,
     context: ActionLineContext,
     keybinds: &TuiKeybindsConfig,
     palette: &UiPalette,
@@ -2392,44 +2392,32 @@ fn build_action_lines(
     let approve_action = format_key_action(keybinds.approve, "approve");
     let note_action = format_key_action(keybinds.note, note_action_label(keybinds.note));
     let mode_action = format_key_action(keybinds.toggle_view, "mode");
-    let speed_read_action = format_key_action(keybinds.speed_read, "speed-read");
-    let root_action = format_key_action(keybinds.root, "root");
     let quit_action = format_key_action(keybinds.quit, "quit");
-    let lines = match context {
+    let phrases = match context {
         ActionLineContext::Root => vec![
-            format!(
-                "[{}/{}]move [{}/{}/Enter]open [{}/{}]back",
-                keybinds.scroll_down,
-                keybinds.scroll_up,
-                keybinds.next,
-                keybinds.child,
-                keybinds.prev,
-                keybinds.parent,
-            ),
-            format!("{approve_action} {note_action} {root_action} {quit_action}"),
+            format!("[{}/{}]move", keybinds.scroll_down, keybinds.scroll_up),
+            format!("[{}/{}/Enter]open", keybinds.next, keybinds.child),
+            format!("[{}/{}]back", keybinds.prev, keybinds.parent),
+            approve_action,
+            note_action,
+            quit_action,
         ],
         ActionLineContext::Review => vec![
-            format!(
-                "[{}/{}]line-scroll [PgUp/PgDn/Space/Home/End]page-scroll",
-                keybinds.scroll_down, keybinds.scroll_up,
-            ),
-            format!(
-                "[{}/{}]prev/next [{}/{}]parent/child {} {} {} {} {} {}",
-                keybinds.prev,
-                keybinds.next,
-                keybinds.parent,
-                keybinds.child,
-                approve_action,
-                note_action,
-                mode_action,
-                speed_read_action,
-                root_action,
-                quit_action,
-            ),
+            "[PgUp/PgDown]".to_string(),
+            format_key_action(keybinds.prev, "prev"),
+            format_key_action(keybinds.next, "next"),
+            format_key_action(keybinds.scroll_down, "down"),
+            format_key_action(keybinds.scroll_up, "up"),
+            format_key_action(keybinds.parent, "parent"),
+            format_key_action(keybinds.child, "child"),
+            approve_action,
+            note_action,
+            mode_action,
+            quit_action,
         ],
     };
 
-    lines
+    pack_action_phrases(width, &phrases)
         .into_iter()
         .map(|line| {
             Line::from(Span::styled(
@@ -2441,6 +2429,37 @@ fn build_action_lines(
             ))
         })
         .collect()
+}
+
+fn pack_action_phrases(width: u16, phrases: &[String]) -> Vec<String> {
+    let max_width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for phrase in phrases {
+        if current.is_empty() {
+            current.push_str(phrase);
+            continue;
+        }
+
+        let candidate = format!("{current} {phrase}");
+        if UnicodeWidthStr::width(candidate.as_str()) <= max_width {
+            current = candidate;
+        } else {
+            lines.push(current);
+            current = phrase.clone();
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
 }
 
 fn note_action_label(key: char) -> &'static str {
@@ -4325,7 +4344,7 @@ mod diff_scope_tests {
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 1);
         assert!(joined.contains("[m/i]move"));
         assert!(joined.contains("[l/o/Enter]open"));
         assert!(joined.contains("[j/u]back"));
@@ -4338,34 +4357,49 @@ mod diff_scope_tests {
         assert!(joined.contains("[x]quit"));
         assert!(!joined.contains("prev/next"));
         assert!(!joined.contains("line-scroll"));
+        assert!(!joined.contains("speed-read"));
+        assert!(!joined.contains("root"));
     }
 
     #[test]
     fn build_action_lines_for_review_nodes_use_mode_label_and_configured_keys() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         let palette = UiPalette::default();
-        let lines = build_action_lines(80, ActionLineContext::Review, &keybinds, &palette);
+        let lines = build_action_lines(120, ActionLineContext::Review, &keybinds, &palette);
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
-        assert_eq!(lines.len(), 2);
-        assert!(joined.contains("[j/k]line-scroll"));
-        assert!(joined.contains("[PgUp/PgDn/Space/Home/End]page-scroll"));
-        assert!(joined.contains("[h/l]prev/next"));
-        assert!(joined.contains("[p/c]parent/child"));
+        assert_eq!(lines.len(), 1);
+        assert!(joined.contains("[PgUp/PgDown]"));
+        assert!(joined.contains("[h]prev"));
+        assert!(joined.contains("[l]next"));
+        assert!(joined.contains("[j]down"));
+        assert!(joined.contains("[k]up"));
+        assert!(joined.contains("[p]arent"));
+        assert!(joined.contains("[c]hild"));
         assert!(joined.contains("[a]pprove"));
         assert!(joined.contains("[n]ote"));
         assert!(joined.contains("[m]ode"));
-        assert!(joined.contains("[r]speed-read"));
-        assert!(joined.contains("[g]root"));
         assert!(joined.contains("[q]uit"));
         assert!(!joined.contains('↓'));
         assert!(!joined.contains('↑'));
         assert!(!joined.contains('←'));
         assert!(!joined.contains('→'));
-        assert!(!joined.contains("view"));
+        assert!(!joined.contains("line-scroll"));
+        assert!(!joined.contains("page-scroll"));
+        assert!(!joined.contains("speed-read"));
+        assert!(!joined.contains("root"));
         assert!(!joined.contains("[n]note"));
         assert!(!joined.contains("[q]quit"));
+    }
+
+    #[test]
+    fn build_action_lines_wrap_when_width_is_narrow() {
+        let keybinds = crate::config::TuiKeybindsConfig::default();
+        let palette = UiPalette::default();
+        let lines = build_action_lines(60, ActionLineContext::Review, &keybinds, &palette);
+
+        assert!(lines.len() > 1, "expected narrow action area to wrap");
     }
 
     #[test]
