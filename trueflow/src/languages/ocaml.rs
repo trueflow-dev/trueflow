@@ -693,8 +693,9 @@ fn consume_ocaml_comment(source: &str, start: usize) -> Option<usize> {
 fn parse_best_tree(source: &str) -> Result<Tree> {
     let implementation = parse_with_language(source, &tree_sitter_ocaml::LANGUAGE_OCAML.into())
         .context("Failed to parse with OCaml implementation grammar")?;
-    let interface = parse_with_language(source, &tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
-        .context("Failed to parse with OCaml interface grammar")?;
+    let interface =
+        parse_with_language(source, &tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
+            .context("Failed to parse with OCaml interface grammar")?;
 
     let implementation_score = syntax_error_score(implementation.root_node());
     let interface_score = syntax_error_score(interface.root_node());
