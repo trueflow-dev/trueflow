@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Trueflow HTML Fixture</title>
+    <style>
+      .hero { color: rebeccapurple; }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <h1>Dashboard</h1>
+      <nav aria-label="Primary">
+        <ul>
+          <li><a href="#overview">Overview</a></li>
+          <li><a href="#activity">Activity</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="overview">
+      <section class="hero">
+        <h2>Overview</h2>
+        <p>Important status and rollout notes live here.</p>
+        <div class="actions">
+          <button type="button">Refresh</button>
+          <button type="button">Export</button>
+        </div>
+      </section>
+
+      <article id="activity">
+        <header>
+          <h2>Recent activity</h2>
+        </header>
+        <ul class="activity-list">
+          <li>Build completed.</li>
+          <li>Tests passed.</li>
+        </ul>
+      </article>
+    </main>
+
+    <footer>
+      <small>Updated hourly.</small>
+    </footer>
+  </body>
+</html>

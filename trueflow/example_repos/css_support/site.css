@@ -1,0 +1,60 @@
+@charset "utf-8";
+@import url("./print.css");
+@namespace svg url("http://www.w3.org/2000/svg");
+
+:root {
+  --accent: #4f46e5;
+  --spacing: 1rem;
+
+  color-scheme: light dark;
+}
+
+body,
+main.dashboard {
+  margin: 0;
+  color: var(--accent);
+
+  background: white;
+}
+
+/* Cards adapt to the current viewport width. */
+.card,
+.panel {
+  padding: var(--spacing);
+  border: 1px solid #d4d4d8;
+}
+
+@media screen and (min-width: 48rem) {
+  .dashboard {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+  }
+
+  .card {
+    padding: calc(var(--spacing) * 2);
+  }
+}
+
+@supports (display: grid) {
+  .dashboard {
+    gap: var(--spacing);
+  }
+}
+
+@keyframes pulse {
+  from {
+    opacity: 0.5;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@layer components {
+  .badge {
+    font-weight: 600;
+  }
+}
+
+@tailwind utilities;
