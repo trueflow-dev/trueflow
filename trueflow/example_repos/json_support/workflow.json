@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "metadata": {
+    "owner": "platform",
+    "labels": {
+      "tier": "backend",
+      "oncall": "billing"
+    }
+  },
+  "pipelines": [
+    {
+      "name": "ingest",
+      "steps": [
+        { "kind": "fetch", "retries": 3 },
+        { "kind": "decode", "format": "csv" }
+      ]
+    },
+    {
+      "name": "publish",
+      "steps": [
+        { "kind": "store", "table": "events" }
+      ]
+    }
+  ],
+  "alerts": [
+    "pagerduty",
+    "slack"
+  ]
+}

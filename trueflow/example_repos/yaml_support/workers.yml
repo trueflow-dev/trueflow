@@ -1,0 +1,10 @@
+- name: api
+  replicas: 3
+  labels:
+    tier: backend
+    critical: true
+- name: worker
+  replicas: 2
+  labels:
+    tier: async
+    critical: false
