@@ -104,22 +104,6 @@ pub(crate) fn registration(lang: Language) -> Option<LanguageRegistration> {
     }
 }
 
-pub(crate) fn generic_tree_sitter_registration(
-    parser_language: ParserLanguageFn,
-) -> LanguageRegistration {
-    LanguageRegistration {
-        top_level: TopLevelRegistration {
-            parser_language,
-            map_kind: default_map_kind,
-            is_attribute_node: no_attribute_nodes,
-            collect_nested_blocks: no_nested_blocks,
-            collect_test_ranges: no_test_ranges,
-            custom_splitter: None,
-        },
-        sub_split: default_code_sub_split,
-    }
-}
-
 pub(crate) fn default_map_kind(_node: Node<'_>, _content: &str) -> BlockKind {
     BlockKind::Code
 }
