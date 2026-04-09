@@ -434,7 +434,7 @@ fn split_function_like_review_units(block: &Block) -> Result<Vec<Block>> {
         &block.content[..signature_end],
         0,
         header_kind,
-        Vec::new(),
+        &[],
     )];
     blocks.extend(split_review_tail(block, signature_end));
     Ok(blocks)
@@ -462,7 +462,7 @@ fn split_declaration_group_children(block: &Block) -> Result<Vec<Block>> {
                 &block.content[span.start_byte..span.end_byte],
                 span.start_byte,
                 span.kind,
-                span.tags,
+                &span.tags,
             )
         })
         .collect())
@@ -514,7 +514,7 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
             &rest[gap.start()..gap.end()],
             start_offset + gap.start(),
             BlockKind::Gap,
-            Vec::new(),
+            &[],
         ));
         start = gap.end();
     }
@@ -547,7 +547,7 @@ fn push_review_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<
             comment,
             start,
             BlockKind::Comment,
-            Vec::new(),
+            &[],
         ));
 
         let remainder = &chunk[comment_end..];
@@ -557,7 +557,7 @@ fn push_review_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<
                 remainder,
                 start + comment_end,
                 BlockKind::CodeParagraph,
-                Vec::new(),
+                &[],
             ));
         }
         return;
@@ -568,7 +568,7 @@ fn push_review_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<
         return;
     }
 
-    blocks.push(create_sub_block(parent, chunk, start, kind, Vec::new()));
+    blocks.push(create_sub_block(parent, chunk, start, kind, &[]));
 }
 
 fn classify_review_chunk(chunk: &str) -> BlockKind {
@@ -844,7 +844,7 @@ fn create_sub_block(
     text: &str,
     start_offset: usize,
     kind: BlockKind,
-    tags: Vec<String>,
+    tags: &[String],
 ) -> Block {
     let pre_chunk = &parent.content[..start_offset];
     let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
@@ -854,7 +854,7 @@ fn create_sub_block(
     let end_line = start_line + chunk_newlines + usize::from(!text.ends_with('\n'));
 
     let mut combined_tags = parent.tags.clone();
-    extend_tags(&mut combined_tags, &tags);
+    extend_tags(&mut combined_tags, tags);
 
     Block {
         hash: TreeHash::from_content(text),
