@@ -31,6 +31,17 @@ fn file_block_contents<'a>(file: &'a Value) -> Result<Vec<&'a str>> {
         .collect()
 }
 
+fn first_file_block_hash(file: &Value) -> Result<String> {
+    file["blocks"]
+        .as_array()
+        .context("blocks")?
+        .first()
+        .context("expected block")?["hash"]
+        .as_str()
+        .context("hash")
+        .map(ToString::to_string)
+}
+
 const LIB_ADD: &str = include_str!("fixtures/diff_lib_add.rs");
 const LIB_ADD_SUB: &str = include_str!("fixtures/diff_lib_add_sub.rs");
 const RENAME_NEW: &str = include_str!("fixtures/diff_rename_new.rs");
@@ -343,6 +354,50 @@ fn test_main_review_json_keeps_deleted_whole_file_semantic_blocks() -> Result<()
             .any(|content| content.contains("removed_helper")
                 && content.contains("base only marker")),
         "expected deleted file review to reconstruct base-side content: {contents:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_deleted_block_approval_round_trip_unblocks_check() -> Result<()> {
+    // GIVEN: a feature branch deletes a reviewable semantic block from main
+    let repo = TestRepo::new("diff_deleted_block_round_trip")?;
+    repo.write(
+        "src/legacy.rs",
+        "pub fn legacy_path() {\n    println!(\"delete me\");\n}\n",
+    )?;
+    repo.commit_all("Add legacy path")?;
+
+    checkout_branch(&repo, "feature/remove-legacy")?;
+    fs::remove_file(repo.path.join("src/legacy.rs"))?;
+    repo.commit_all("Delete legacy path")?;
+
+    // WHEN: we approve the deleted block that review exposes
+    let before_check = repo.run_raw(&["check"])?;
+    let review_before = get_main_review_json(&repo)?;
+    let deleted_file = review_file_by_path(&review_before, "src/legacy.rs")?;
+    let deleted_hash = first_file_block_hash(deleted_file)?;
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &deleted_hash,
+        "--verdict",
+        "approved",
+        "--quiet",
+    ])?;
+
+    // THEN: check succeeds and the deleted block disappears from review output
+    assert!(
+        !before_check.status.success(),
+        "expected check to fail before approving deleted block"
+    );
+    assert!(get_main_review_json(&repo)?.is_empty());
+
+    let after_check = repo.run(&["check"])?;
+    assert!(
+        after_check.trim().is_empty(),
+        "expected check to stay silent after approving deleted block"
     );
 
     Ok(())
