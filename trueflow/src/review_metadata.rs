@@ -148,6 +148,10 @@ fn block_identifier(block: &crate::block::Block) -> Option<String> {
     }
 }
 
+pub(crate) fn semantic_block_identifier(block: &crate::block::Block) -> Option<String> {
+    block_identifier(block)
+}
+
 fn first_meaningful_line(block: &crate::block::Block) -> Option<&str> {
     let mut non_empty_lines = block
         .content

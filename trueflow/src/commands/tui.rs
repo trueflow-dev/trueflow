@@ -4618,6 +4618,7 @@ mod diff_scope_tests {
             },
             tree,
             unreviewed_block_nodes: HashSet::from([block_id]),
+            diff_block_sides: HashMap::new(),
         };
         let context = TrueflowContext::new(Cli::parse_from(["trueflow", "tui"]));
 

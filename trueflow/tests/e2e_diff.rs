@@ -15,6 +15,22 @@ fn first_main_review_block_hash(repo: &TestRepo) -> Result<String> {
     first_block_hash(&output)
 }
 
+fn review_file_by_path<'a>(files: &'a [Value], path: &str) -> Result<&'a Value> {
+    files
+        .iter()
+        .find(|file| file["path"].as_str() == Some(path))
+        .with_context(|| format!("expected review output for path {path}"))
+}
+
+fn file_block_contents<'a>(file: &'a Value) -> Result<Vec<&'a str>> {
+    file["blocks"]
+        .as_array()
+        .context("blocks")?
+        .iter()
+        .map(|block| block["content"].as_str().context("block content"))
+        .collect()
+}
+
 const LIB_ADD: &str = include_str!("fixtures/diff_lib_add.rs");
 const LIB_ADD_SUB: &str = include_str!("fixtures/diff_lib_add_sub.rs");
 const RENAME_NEW: &str = include_str!("fixtures/diff_rename_new.rs");
@@ -296,6 +312,38 @@ fn test_main_review_skips_binary_changes() -> Result<()> {
 
     let changes = get_main_review_json(&repo)?;
     assert!(changes.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn test_main_review_json_keeps_deleted_whole_file_semantic_blocks() -> Result<()> {
+    // GIVEN: a file exists on main and the feature branch deletes that whole file
+    let repo = TestRepo::new("diff_deleted_whole_file")?;
+    repo.write(
+        "src/obsolete.rs",
+        "pub fn removed_helper() {\n    println!(\"base only marker\");\n}\n",
+    )?;
+    repo.commit_all("Add obsolete helper")?;
+
+    checkout_branch(&repo, "feature/delete-obsolete")?;
+    fs::remove_file(repo.path.join("src/obsolete.rs"))?;
+    repo.commit_all("Delete obsolete helper")?;
+
+    // WHEN: diff-scoped review is collected against main
+    let files = get_main_review_json(&repo)?;
+    let deleted_file = review_file_by_path(&files, "src/obsolete.rs")?;
+    let contents = file_block_contents(deleted_file)?;
+
+    // THEN: the deleted file still appears with its base-side semantic block content
+    assert_eq!(files.len(), 1);
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("removed_helper")
+                && content.contains("base only marker")),
+        "expected deleted file review to reconstruct base-side content: {contents:?}"
+    );
 
     Ok(())
 }

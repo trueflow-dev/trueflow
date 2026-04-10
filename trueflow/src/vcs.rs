@@ -125,6 +125,12 @@ pub(crate) enum BlockDiffChangeKind {
     ReviewableChanges,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffBlockSide {
+    Base,
+    Head,
+}
+
 pub struct GitConfig {
     pub email: String,
     pub signing_key: Option<String>,
@@ -295,6 +301,49 @@ pub fn file_states_for_paths_in_revision(
     file_states_for_paths_in_tree(&tree, paths, workdir_prefix)
 }
 
+pub(crate) fn file_state_for_path_in_main_base(
+    repo: &gix::Repository,
+    repo_relative_path: &RepoPath,
+    output_path: &RepoPath,
+) -> Result<Option<FileState>> {
+    let (base_tree, _) = main_and_head_trees(repo)?;
+    file_state_for_path_in_tree(&base_tree, repo_relative_path.as_str(), output_path)
+}
+
+pub(crate) fn file_state_for_path_in_revision(
+    repo: &gix::Repository,
+    revision: &str,
+    repo_relative_path: &RepoPath,
+    output_path: &RepoPath,
+) -> Result<Option<FileState>> {
+    let object = repo.rev_parse_single(revision)?;
+    let commit = object
+        .object()?
+        .peel_to_commit()
+        .context("revision must resolve to a commit")?;
+    let tree = commit.tree()?;
+    file_state_for_path_in_tree(&tree, repo_relative_path.as_str(), output_path)
+}
+
+pub(crate) fn file_state_for_path_in_revision_base(
+    repo: &gix::Repository,
+    revision: &str,
+    repo_relative_path: &RepoPath,
+    output_path: &RepoPath,
+) -> Result<Option<FileState>> {
+    let object = repo.rev_parse_single(revision)?;
+    let commit = object
+        .object()?
+        .peel_to_commit()
+        .context("revision must resolve to a commit")?;
+    let base_tree = if let Some(parent_id) = commit.parent_ids().next() {
+        repo.find_commit(parent_id)?.tree()?
+    } else {
+        repo.empty_tree()
+    };
+    file_state_for_path_in_tree(&base_tree, repo_relative_path.as_str(), output_path)
+}
+
 fn file_states_for_paths_in_tree(
     tree: &gix::Tree<'_>,
     paths: &HashSet<RepoPath>,
@@ -463,10 +512,22 @@ pub(crate) fn block_has_changed_lines_in_diff(
     block: &Block,
     hunks: &[DiffHunk],
 ) -> BlockDiffChangeKind {
-    analyze_block_diff_hunks(block, hunks)
+    analyze_block_diff_hunks_for_side(block, hunks, DiffBlockSide::Head)
 }
 
-fn analyze_block_diff_hunks(block: &Block, hunks: &[DiffHunk]) -> BlockDiffChangeKind {
+pub(crate) fn block_has_changed_lines_in_diff_for_side(
+    block: &Block,
+    hunks: &[DiffHunk],
+    side: DiffBlockSide,
+) -> BlockDiffChangeKind {
+    analyze_block_diff_hunks_for_side(block, hunks, side)
+}
+
+fn analyze_block_diff_hunks_for_side(
+    block: &Block,
+    hunks: &[DiffHunk],
+    side: DiffBlockSide,
+) -> BlockDiffChangeKind {
     let start = usize_to_u32_saturating(block.start_line).saturating_add(1); // 1-based for diff
     let end_exclusive = usize_to_u32_saturating(block.end_line).saturating_add(1);
 
@@ -474,9 +535,15 @@ fn analyze_block_diff_hunks(block: &Block, hunks: &[DiffHunk]) -> BlockDiffChang
         .iter()
         .flat_map(positioned_hunk_lines)
         .filter(|line| {
-            line.anchor_new_line >= start
-                && line.anchor_new_line < end_exclusive
-                && line.kind != DiffLineKind::Context
+            let anchor_line = match side {
+                DiffBlockSide::Base => line.old_line,
+                DiffBlockSide::Head => Some(line.new_line.unwrap_or(line.anchor_new_line)),
+            };
+            anchor_line.is_some_and(|line_number| {
+                line_number >= start
+                    && line_number < end_exclusive
+                    && line.kind != DiffLineKind::Context
+            })
         })
         .map(|line| DiffLine {
             kind: line.kind,

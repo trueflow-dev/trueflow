@@ -6,6 +6,7 @@ use crate::coverage::{CoverageBuildOptions, CoverageIndex};
 use crate::path_utils;
 use crate::policy::{should_skip_container_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
+use crate::review_metadata;
 use crate::review_scope::CliSemanticReviewScope;
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
@@ -14,7 +15,7 @@ use crate::tree;
 use crate::vcs;
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use tracing::info;
@@ -230,6 +231,45 @@ pub struct CollectedReview {
     pub summary: ReviewSummary,
     pub tree: tree::Tree,
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
+    pub diff_block_sides: HashMap<tree::TreeNodeId, DiffBlockSides>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffBlockSides {
+    pub base: Option<Block>,
+    pub head: Option<Block>,
+}
+
+impl DiffBlockSides {
+    fn display_block(&self) -> &Block {
+        self.head
+            .as_ref()
+            .or(self.base.as_ref())
+            .unwrap_or_else(|| panic!("diff block sides must include at least one side"))
+    }
+
+    pub(crate) fn is_base_only(&self) -> bool {
+        self.base.is_some() && self.head.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiffReviewBlock {
+    sides: DiffBlockSides,
+}
+
+impl DiffReviewBlock {
+    fn display_block(&self) -> &Block {
+        self.sides.display_block()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiffReviewFile {
+    path: RepoPath,
+    language: Language,
+    file_hash: crate::hashing::TreeHash,
+    blocks: Vec<DiffReviewBlock>,
 }
 
 pub fn parse_review_request(
@@ -396,6 +436,20 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
     };
     info!("scanned {} files", files.len());
+    if let (Some(repo), Some(diff_targets)) = (review_repo.as_ref(), query.diff_selection.targets())
+    {
+        return collect_diff_scoped_review(
+            query,
+            repo,
+            &database,
+            files,
+            diagnostics,
+            diff_targets,
+            workdir_prefix,
+            &review_check,
+        );
+    }
+
     let tree = tree::build_tree_from_files(&files);
     let coverage = CoverageIndex::build(
         &tree,
@@ -524,7 +578,343 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         },
         tree,
         unreviewed_block_nodes,
+        diff_block_sides: HashMap::new(),
     })
+}
+
+fn collect_diff_scoped_review(
+    query: &ResolvedReviewQuery,
+    repo: &gix::Repository,
+    database: &crate::store::ReviewDatabase,
+    files: Vec<crate::block::FileState>,
+    diagnostics: Vec<ReviewDiagnostic>,
+    diff_targets: &[ReviewDiffTarget],
+    workdir_prefix: Option<String>,
+    review_check: &ReviewCheck,
+) -> Result<CollectedReview> {
+    let review_files =
+        collect_diff_review_files(query, repo, files, diff_targets, workdir_prefix.as_deref())?;
+    let (tree, diff_block_sides) = build_tree_from_diff_review_files(&review_files)?;
+    let coverage = CoverageIndex::build(
+        &tree,
+        database,
+        &CoverageBuildOptions {
+            workdir_prefix: workdir_prefix.clone(),
+        },
+    )?;
+
+    let mut unreviewed_files = Vec::new();
+    let mut total_blocks = 0usize;
+    let mut unreviewed_block_nodes = HashSet::new();
+
+    for file in review_files {
+        let Some(file_node_id) = tree.find_by_path(file.path.as_str()) else {
+            continue;
+        };
+        if coverage
+            .node(file_node_id)
+            .effective_latest_verdict_for(review_check)
+            == Some(&Verdict::Approved)
+        {
+            continue;
+        }
+
+        let mut unreviewed_blocks = Vec::new();
+        for review_block in file.blocks {
+            let display_block = review_block.display_block().clone();
+            let Some(node_id) = tree.find_block_node(&file.path, &display_block) else {
+                continue;
+            };
+            if should_skip_container_by_default(
+                tree.is_container_block(node_id),
+                &display_block,
+                &query.filters,
+            ) {
+                continue;
+            }
+            total_blocks += 1;
+            let block_coverage = coverage.block(&file.path, &display_block);
+            if block_coverage.effective_latest_verdict_for(review_check) == Some(&Verdict::Approved)
+            {
+                continue;
+            }
+
+            if block_coverage
+                .direct_latest_verdict_for(review_check)
+                .is_none()
+                && is_subblock_covered(
+                    &display_block,
+                    file.language,
+                    query,
+                    &coverage,
+                    review_check,
+                    &file.path,
+                )
+            {
+                continue;
+            }
+
+            unreviewed_block_nodes.insert(node_id);
+            unreviewed_blocks.push(display_block);
+        }
+
+        if !unreviewed_blocks.is_empty() {
+            unreviewed_files.push(UnreviewedFile {
+                path: file.path,
+                language: file.language,
+                blocks: unreviewed_blocks,
+            });
+        }
+    }
+
+    for file in &mut unreviewed_files {
+        file.blocks
+            .sort_by_key(|block| (kind_rank(block), block.start_line));
+    }
+
+    unreviewed_files.sort_by(|a, b| {
+        let rank_fn = |file: &UnreviewedFile| file.blocks.first().map_or(100, kind_rank);
+        (rank_fn(a), &a.path).cmp(&(rank_fn(b), &b.path))
+    });
+
+    Ok(CollectedReview {
+        summary: ReviewSummary {
+            files: unreviewed_files,
+            total_blocks,
+            diagnostics,
+        },
+        tree,
+        unreviewed_block_nodes,
+        diff_block_sides,
+    })
+}
+
+fn collect_diff_review_files(
+    query: &ResolvedReviewQuery,
+    repo: &gix::Repository,
+    files: Vec<crate::block::FileState>,
+    diff_targets: &[ReviewDiffTarget],
+    workdir_prefix: Option<&str>,
+) -> Result<Vec<DiffReviewFile>> {
+    let mut head_files_by_path = files
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    let mut selected_paths = selected_review_paths(&query.path_selection, &head_files_by_path);
+    selected_paths.sort();
+
+    let mut review_files = Vec::new();
+    for path in selected_paths {
+        let display_path = display_path_for_workdir_prefix(&path, workdir_prefix)?;
+        let repo_relative_path = repo_relative_path_for_diff(&display_path, workdir_prefix)?;
+        let head_file = head_files_by_path.remove(&display_path);
+        let base_files = base_file_states_for_diff_targets(
+            repo,
+            diff_targets,
+            &display_path,
+            &repo_relative_path,
+        )?;
+        let hunks = diff_hunks_for_file_targets(repo, diff_targets, &display_path, workdir_prefix)?;
+
+        let mut base_blocks = dedupe_blocks(
+            base_files
+                .iter()
+                .flat_map(|file| file.blocks.clone())
+                .collect::<Vec<_>>(),
+        );
+        let mut head_blocks = head_file
+            .as_ref()
+            .map(|file| file.blocks.clone())
+            .unwrap_or_default();
+        base_blocks.sort_by_key(|block| (block.start_line, block.end_line, block.kind.as_str()));
+        head_blocks.sort_by_key(|block| (block.start_line, block.end_line, block.kind.as_str()));
+
+        let blocks = collect_diff_review_blocks_for_file(&base_blocks, &head_blocks, &hunks)
+            .into_iter()
+            .filter(|review_block| {
+                let display_block = review_block.display_block();
+                query.filters.allows_block(display_block.kind)
+                    && !should_skip_imports_by_default(
+                        display_path.as_str(),
+                        display_block,
+                        &query.filters,
+                    )
+            })
+            .collect::<Vec<_>>();
+        if blocks.is_empty() {
+            continue;
+        }
+
+        let language = head_file
+            .as_ref()
+            .map(|file| file.language)
+            .or_else(|| base_files.first().map(|file| file.language))
+            .unwrap_or(Language::Unknown);
+        let file_hash = head_file
+            .as_ref()
+            .map(|file| file.tree_hash.clone())
+            .or_else(|| base_files.first().map(|file| file.tree_hash.clone()))
+            .unwrap_or_default();
+
+        review_files.push(DiffReviewFile {
+            path: display_path,
+            language,
+            file_hash,
+            blocks,
+        });
+    }
+
+    Ok(review_files)
+}
+
+fn selected_review_paths(
+    path_selection: &ReviewPathSelection,
+    head_files_by_path: &HashMap<RepoPath, crate::block::FileState>,
+) -> Vec<RepoPath> {
+    match path_selection {
+        ReviewPathSelection::All => head_files_by_path.keys().cloned().collect(),
+        ReviewPathSelection::Specific(paths) => paths.iter().cloned().collect(),
+    }
+}
+
+fn display_path_for_workdir_prefix(
+    path: &RepoPath,
+    workdir_prefix: Option<&str>,
+) -> Result<RepoPath> {
+    let Some(prefix) = workdir_prefix
+        .map(path_utils::normalize_path_str)
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return Ok(path.clone());
+    };
+
+    let normalized = path_utils::normalize_path_str(path.as_str());
+    let prefixed_root = format!("{prefix}/");
+    if let Some(stripped) = normalized.strip_prefix(&prefixed_root) {
+        return RepoPath::new(stripped);
+    }
+    if normalized == prefix {
+        return RepoPath::new(path.as_str());
+    }
+    RepoPath::new(path.as_str())
+}
+
+fn base_file_states_for_diff_targets(
+    repo: &gix::Repository,
+    diff_targets: &[ReviewDiffTarget],
+    display_path: &RepoPath,
+    repo_relative_path: &RepoPath,
+) -> Result<Vec<crate::block::FileState>> {
+    let mut files = Vec::new();
+    for target in diff_targets {
+        let file = match target {
+            ReviewDiffTarget::MainDiff => {
+                vcs::file_state_for_path_in_main_base(repo, repo_relative_path, display_path)?
+            }
+            ReviewDiffTarget::Revision(revision) => vcs::file_state_for_path_in_revision_base(
+                repo,
+                revision.as_str(),
+                repo_relative_path,
+                display_path,
+            )?,
+            ReviewDiffTarget::RevisionRange(range) => vcs::file_state_for_path_in_revision(
+                repo,
+                range.start.as_str(),
+                repo_relative_path,
+                display_path,
+            )?,
+        };
+        if let Some(file) = file {
+            files.push(file);
+        }
+    }
+    Ok(files)
+}
+
+fn dedupe_blocks(blocks: Vec<Block>) -> Vec<Block> {
+    let mut unique = HashMap::new();
+    for block in blocks {
+        unique
+            .entry((block.hash.clone(), block.start_line, block.end_line))
+            .or_insert(block);
+    }
+    unique.into_values().collect()
+}
+
+fn build_tree_from_diff_review_files(
+    files: &[DiffReviewFile],
+) -> Result<(tree::Tree, HashMap<tree::TreeNodeId, DiffBlockSides>)> {
+    let mut builder = tree::TreeBuilder::new();
+    let root = builder.root();
+    let mut directories = HashMap::from([(RepoPath::root(), root)]);
+    let mut diff_block_sides = HashMap::new();
+
+    for file in files {
+        let parts = file.path.as_str().split('/').collect::<Vec<_>>();
+        let mut current_path = RepoPath::root();
+        let mut parent = root;
+
+        for (index, part) in parts.iter().enumerate() {
+            let is_file = index == parts.len().saturating_sub(1);
+            let next_path = current_path.join(part)?;
+            if is_file {
+                let file_id = builder.add_file(
+                    parent,
+                    (*part).to_string(),
+                    next_path.clone(),
+                    file.file_hash.clone(),
+                    file.language,
+                );
+                let mut container_stack: Vec<(tree::TreeNodeId, usize, usize)> = Vec::new();
+                for review_block in &file.blocks {
+                    let display_block = review_block.display_block().clone();
+                    while let Some((_, _, end_line)) = container_stack.last() {
+                        if display_block.start_line > *end_line {
+                            container_stack.pop();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let parent = container_stack
+                        .iter()
+                        .rev()
+                        .find(|(_, start, end)| {
+                            display_block.start_line >= *start && display_block.end_line <= *end
+                        })
+                        .map(|(id, _, _)| *id)
+                        .unwrap_or(file_id);
+                    let start_line = display_block.start_line;
+                    let end_line = display_block.end_line;
+                    let node_id = builder.add_block(
+                        parent,
+                        diff_block_label(&display_block),
+                        next_path.clone(),
+                        display_block.clone(),
+                        file.language,
+                    );
+                    diff_block_sides.insert(node_id, review_block.sides.clone());
+                    if display_block.kind.can_contain_review_children() {
+                        container_stack.push((node_id, start_line, end_line));
+                    }
+                }
+            } else {
+                let dir_id = *directories.entry(next_path.clone()).or_insert_with(|| {
+                    builder.add_dir(parent, (*part).to_string(), next_path.clone())
+                });
+                parent = dir_id;
+                current_path = next_path;
+            }
+        }
+    }
+
+    Ok((builder.finalize(), diff_block_sides))
+}
+
+fn diff_block_label(block: &Block) -> String {
+    let start = block.start_line + 1;
+    let end = block.end_line.max(start);
+    format!("{}:L{}-L{}", block.kind.as_str(), start, end)
 }
 
 pub fn collect_review_summary(query: &ResolvedReviewQuery) -> Result<ReviewSummary> {
@@ -801,10 +1191,229 @@ fn is_subblock_covered(
     }
 }
 
+fn collect_diff_review_blocks_for_file(
+    base_blocks: &[Block],
+    head_blocks: &[Block],
+    hunks: &[vcs::DiffHunk],
+) -> Vec<DiffReviewBlock> {
+    let changed_base_blocks = base_blocks
+        .iter()
+        .filter(|block| {
+            vcs::block_has_changed_lines_in_diff_for_side(block, hunks, vcs::DiffBlockSide::Base)
+                == vcs::BlockDiffChangeKind::ReviewableChanges
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed_head_blocks = head_blocks
+        .iter()
+        .filter(|block| {
+            vcs::block_has_changed_lines_in_diff_for_side(block, hunks, vcs::DiffBlockSide::Head)
+                == vcs::BlockDiffChangeKind::ReviewableChanges
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut unmatched_head_blocks = changed_head_blocks
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    let mut diff_blocks = Vec::new();
+
+    for base_block in changed_base_blocks {
+        if let Some(head_index) =
+            find_matching_head_block(&base_block, &unmatched_head_blocks, hunks)
+        {
+            let head_block = unmatched_head_blocks[head_index]
+                .take()
+                .unwrap_or_else(|| panic!("matched head block should still be present"));
+            diff_blocks.push(DiffReviewBlock {
+                sides: DiffBlockSides {
+                    base: Some(base_block),
+                    head: Some(head_block),
+                },
+            });
+        } else {
+            diff_blocks.push(DiffReviewBlock {
+                sides: DiffBlockSides {
+                    base: Some(base_block),
+                    head: None,
+                },
+            });
+        }
+    }
+
+    diff_blocks.extend(
+        unmatched_head_blocks
+            .into_iter()
+            .flatten()
+            .map(|head_block| DiffReviewBlock {
+                sides: DiffBlockSides {
+                    base: None,
+                    head: Some(head_block),
+                },
+            }),
+    );
+
+    diff_blocks.sort_by_key(|block| {
+        let display = block.display_block();
+        (
+            display.start_line,
+            display.end_line,
+            display.kind.default_review_priority(),
+        )
+    });
+    diff_blocks
+}
+
+fn find_matching_head_block(
+    base_block: &Block,
+    head_blocks: &[Option<Block>],
+    hunks: &[vcs::DiffHunk],
+) -> Option<usize> {
+    let base_identifier = review_metadata::semantic_block_identifier(base_block);
+    if let Some(identifier) = base_identifier.as_deref() {
+        let identifier_matches = head_blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, head_block)| {
+                let head_block = head_block.as_ref()?;
+                if head_block.kind != base_block.kind {
+                    return None;
+                }
+                (review_metadata::semantic_block_identifier(head_block).as_deref()
+                    == Some(identifier))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if identifier_matches.len() == 1 {
+            return identifier_matches.into_iter().next();
+        }
+    }
+
+    let mapped_base_range = mapped_head_range_for_base_block(base_block, hunks);
+    head_blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, head_block)| {
+            let head_block = head_block.as_ref()?;
+            if head_block.kind != base_block.kind {
+                return None;
+            }
+            let head_range = head_block_line_range(head_block);
+            let overlap = line_range_overlap(&mapped_base_range, &head_range);
+            (overlap > 0).then_some((index, overlap))
+        })
+        .max_by_key(|(_, overlap)| *overlap)
+        .map(|(index, _)| index)
+}
+
+fn mapped_head_range_for_base_block(
+    base_block: &Block,
+    hunks: &[vcs::DiffHunk],
+) -> std::ops::Range<u32> {
+    let start = map_base_line_to_head_anchor(
+        u32::try_from(base_block.start_line.saturating_add(1)).unwrap_or(u32::MAX),
+        hunks,
+    );
+    let end_inclusive = u32::try_from(base_block.end_line).unwrap_or(u32::MAX);
+    let end_anchor = map_base_line_to_head_anchor(end_inclusive.max(start), hunks);
+    start..end_anchor.saturating_add(1)
+}
+
+fn map_base_line_to_head_anchor(old_line: u32, hunks: &[vcs::DiffHunk]) -> u32 {
+    let mut old_cursor = 1u32;
+    let mut new_cursor = 1u32;
+
+    for hunk in hunks {
+        while old_cursor < hunk.old_start {
+            if old_line == old_cursor {
+                return new_cursor;
+            }
+            old_cursor = old_cursor.saturating_add(1);
+            new_cursor = new_cursor.saturating_add(1);
+        }
+
+        for line in &hunk.lines {
+            match line.kind {
+                vcs::DiffLineKind::Context => {
+                    if old_line == old_cursor {
+                        return new_cursor;
+                    }
+                    old_cursor = old_cursor.saturating_add(1);
+                    new_cursor = new_cursor.saturating_add(1);
+                }
+                vcs::DiffLineKind::Removed => {
+                    if old_line == old_cursor {
+                        return new_cursor;
+                    }
+                    old_cursor = old_cursor.saturating_add(1);
+                }
+                vcs::DiffLineKind::Added => {
+                    new_cursor = new_cursor.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    let delta = i64::from(new_cursor) - i64::from(old_cursor);
+    let mapped = i64::from(old_line) + delta;
+    mapped.max(1).min(i64::from(u32::MAX)) as u32
+}
+
+fn head_block_line_range(block: &Block) -> std::ops::Range<u32> {
+    let start = u32::try_from(block.start_line.saturating_add(1)).unwrap_or(u32::MAX);
+    let end = u32::try_from(block.end_line.saturating_add(1)).unwrap_or(u32::MAX);
+    start..end
+}
+
+fn line_range_overlap(a: &std::ops::Range<u32>, b: &std::ops::Range<u32>) -> u32 {
+    let start = a.start.max(b.start);
+    let end = a.end.min(b.end);
+    end.saturating_sub(start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hashing::TreeHash;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use uuid::Uuid;
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl CurrentDirGuard {
+        fn push(path: &Path) -> Self {
+            let current = std::env::current_dir()
+                .unwrap_or_else(|error| panic!("failed to read current directory: {error}"));
+            std::env::set_current_dir(path)
+                .unwrap_or_else(|error| panic!("failed to enter test directory {path:?}: {error}"));
+            Self(current)
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0)
+                .unwrap_or_else(|error| panic!("failed to restore current directory: {error}"));
+        }
+    }
+
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to execute git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn make_block(kind: BlockKind, tags: &[&str]) -> Block {
         Block {
@@ -976,5 +1585,223 @@ mod tests {
             ReviewContentSource::Revision(RevisionSpec::new("def5678").unwrap())
         );
         assert!(matches!(diff_selection, ReviewDiffSelection::Targets(_)));
+    }
+
+    fn make_diff_block(
+        hash: &str,
+        kind: BlockKind,
+        start_line: usize,
+        end_line: usize,
+        content: &str,
+    ) -> Block {
+        Block {
+            hash: TreeHash::new(hash),
+            content: content.to_string(),
+            kind,
+            tags: Vec::new(),
+            complexity: None,
+            start_line,
+            end_line,
+        }
+    }
+
+    fn diff_review_blocks<'a>(blocks: &'a [DiffReviewBlock]) -> Vec<&'a DiffBlockSides> {
+        blocks.iter().map(|block| &block.sides).collect()
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_includes_deleted_single_line_module() {
+        let base_module = make_diff_block("base-module", BlockKind::Module, 0, 1, "mod common;\n");
+        let blocks = collect_diff_review_blocks_for_file(
+            std::slice::from_ref(&base_module),
+            &[],
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![vcs::DiffHunkLine::removed("mod common;\n")],
+            }],
+        );
+
+        let sides = diff_review_blocks(&blocks);
+        assert_eq!(sides.len(), 1, "expected deleted module review unit");
+        assert_eq!(
+            sides[0].base.as_ref().map(|block| block.hash.as_str()),
+            Some(base_module.hash.as_str())
+        );
+        assert!(sides[0].head.is_none());
+        assert!(sides[0].is_base_only());
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_includes_deleted_function() {
+        let base_function = make_diff_block(
+            "base-function",
+            BlockKind::Function,
+            0,
+            3,
+            "fn removed() {\n    old_body();\n}\n",
+        );
+        let blocks = collect_diff_review_blocks_for_file(
+            std::slice::from_ref(&base_function),
+            &[],
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("fn removed() {\n"),
+                    vcs::DiffHunkLine::removed("    old_body();\n"),
+                    vcs::DiffHunkLine::removed("}\n"),
+                ],
+            }],
+        );
+
+        let sides = diff_review_blocks(&blocks);
+        assert_eq!(sides.len(), 1, "expected deleted function review unit");
+        assert_eq!(
+            sides[0].base.as_ref().map(|block| block.hash.as_str()),
+            Some(base_function.hash.as_str())
+        );
+        assert!(sides[0].head.is_none());
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_keeps_modified_function_and_deleted_code_paragraph() {
+        let base_function = make_diff_block(
+            "base-function",
+            BlockKind::Function,
+            0,
+            4,
+            "fn keep() {\n    first();\n    second();\n}\n",
+        );
+        let deleted_paragraph = make_diff_block(
+            "deleted-paragraph",
+            BlockKind::CodeParagraph,
+            2,
+            3,
+            "    second();\n",
+        );
+        let head_function = make_diff_block(
+            "head-function",
+            BlockKind::Function,
+            0,
+            3,
+            "fn keep() {\n    first();\n}\n",
+        );
+
+        let blocks = collect_diff_review_blocks_for_file(
+            &[base_function.clone(), deleted_paragraph.clone()],
+            std::slice::from_ref(&head_function),
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::context("fn keep() {\n"),
+                    vcs::DiffHunkLine::context("    first();\n"),
+                    vcs::DiffHunkLine::removed("    second();\n"),
+                    vcs::DiffHunkLine::context("}\n"),
+                ],
+            }],
+        );
+
+        let sides = diff_review_blocks(&blocks);
+        assert_eq!(
+            sides.len(),
+            2,
+            "expected one modified function review unit and one deleted paragraph"
+        );
+        assert!(
+            sides.iter().any(|side| {
+                side.base.as_ref().map(|block| block.hash.as_str())
+                    == Some(base_function.hash.as_str())
+                    && side.head.as_ref().map(|block| block.hash.as_str())
+                        == Some(head_function.hash.as_str())
+            }),
+            "expected paired function review unit: {sides:?}"
+        );
+        assert!(
+            sides.iter().any(|side| {
+                side.base.as_ref().map(|block| block.hash.as_str())
+                    == Some(deleted_paragraph.hash.as_str())
+                    && side.head.is_none()
+            }),
+            "expected deleted code paragraph review unit: {sides:?}"
+        );
+    }
+
+    #[test]
+    fn collect_review_main_diff_includes_deleted_base_only_module_block() {
+        let repo_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("review_deleted_module_collect")
+            .join(Uuid::new_v4().to_string());
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
+        fs::write(
+            &file_path,
+            concat!(
+                "mod common;\n",
+                "\n",
+                "fn kept() {\n",
+                "    body();\n",
+                "}\n"
+            ),
+        )
+        .unwrap_or_else(|error| panic!("failed to write initial fixture file: {error}"));
+
+        run_git(&repo_root, &["init", "-q"]);
+        run_git(&repo_root, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_root, &["config", "user.name", "Test User"]);
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        run_git(&repo_root, &["switch", "-c", "feature"]);
+
+        fs::write(&file_path, concat!("fn kept() {\n", "    body();\n", "}\n"))
+            .unwrap_or_else(|error| panic!("failed to write updated fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Delete module"]);
+
+        let _guard = CurrentDirGuard::push(&repo_root);
+        let query = resolve_review_request(
+            ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
+            BlockFilters::default(),
+            ScanOptions::default(),
+        )
+        .unwrap_or_else(|error| panic!("expected main diff query: {error}"));
+        let collected = collect_review(&query)
+            .unwrap_or_else(|error| panic!("expected collected review: {error}"));
+
+        let deleted_block = collected
+            .summary
+            .files
+            .iter()
+            .flat_map(|file| file.blocks.iter())
+            .find(|block| block.content.contains("mod common;"))
+            .unwrap_or_else(|| panic!("expected deleted module block in summary"));
+        assert!(
+            !deleted_block.content.trim().is_empty(),
+            "expected deleted block to keep original content"
+        );
+
+        let node_id = collected
+            .tree
+            .find_block_node("src/lib.rs", deleted_block)
+            .unwrap_or_else(|| panic!("expected deleted module node in tree"));
+        let sides = collected
+            .diff_block_sides
+            .get(&node_id)
+            .unwrap_or_else(|| panic!("expected diff sides for deleted module node"));
+        assert!(sides.is_base_only());
+        assert!(
+            sides
+                .base
+                .as_ref()
+                .is_some_and(|block| block.content.contains("mod common;"))
+        );
+        assert!(sides.head.is_none());
     }
 }
