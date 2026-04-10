@@ -715,6 +715,77 @@ fn test_review_historical_revision_range_from_subdir_uses_end_revision_content()
 }
 
 #[test]
+fn test_review_historical_deletion_target_and_range_preserve_deleted_base_content() -> Result<()> {
+    // GIVEN: a historical target deletes a file and later HEAD reintroduces that path with different content
+    let repo = TestRepo::new("review_historical_deleted_content")?;
+    repo.write(
+        "src/history.rs",
+        "pub fn removed_in_target() {\n    println!(\"deleted base marker\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+    let start_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let start_revision = start_revision.trim().to_string();
+
+    repo.git(&["checkout", "-b", "feature/history-delete"])?;
+    fs::remove_file(repo.path.join("src/history.rs"))?;
+    repo.commit_all("Delete historical file")?;
+    let delete_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let delete_revision = delete_revision.trim().to_string();
+
+    repo.write(
+        "src/history.rs",
+        "pub fn later_head_version() {\n    println!(\"later head marker\");\n}\n",
+    )?;
+    repo.commit_all("Re-add different file")?;
+
+    // WHEN: we review the deletion commit directly and as a revision range endpoint
+    let target_output = repo.run(&[
+        "review",
+        "--json",
+        "--target",
+        &format!("rev:{delete_revision}"),
+    ])?;
+    let range_output = repo.run(&[
+        "review",
+        "--json",
+        "--target",
+        &format!("rev:{start_revision}..{delete_revision}"),
+    ])?;
+    let target_files = json_array(&target_output)?;
+    let range_files = json_array(&range_output)?;
+
+    // THEN: both historical views show the deleted base content and never leak the later HEAD content
+    for files in [&target_files, &range_files] {
+        let file = files
+            .iter()
+            .find(|entry| entry["path"].as_str() == Some("src/history.rs"))
+            .context("expected deleted historical file in review output")?;
+        let contents = file["blocks"]
+            .as_array()
+            .context("blocks")?
+            .iter()
+            .filter_map(|block| block["content"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("removed_in_target")
+                    && content.contains("deleted base marker")),
+            "historical deletion review did not preserve deleted base content: {contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("later head marker")),
+            "historical deletion review leaked later HEAD content: {contents:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_review_rejects_mixed_historical_targets_with_different_content_revisions() -> Result<()> {
     let repo = TestRepo::new("review_mixed_historical_targets")?;
     repo.write(
