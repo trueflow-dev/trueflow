@@ -272,6 +272,14 @@ struct DiffReviewFile {
     blocks: Vec<DiffReviewBlock>,
 }
 
+struct DiffReviewContext<'a> {
+    repo: &'a gix::Repository,
+    database: &'a crate::store::ReviewDatabase,
+    diff_targets: &'a [ReviewDiffTarget],
+    workdir_prefix: Option<&'a str>,
+    review_check: &'a ReviewCheck,
+}
+
 pub fn parse_review_request(
     all: bool,
     values: &[ReviewTarget],
@@ -438,16 +446,14 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     info!("scanned {} files", files.len());
     if let (Some(repo), Some(diff_targets)) = (review_repo.as_ref(), query.diff_selection.targets())
     {
-        return collect_diff_scoped_review(
-            query,
+        let diff_context = DiffReviewContext {
             repo,
-            &database,
-            files,
-            diagnostics,
+            database: &database,
             diff_targets,
-            workdir_prefix,
-            &review_check,
-        );
+            workdir_prefix: workdir_prefix.as_deref(),
+            review_check: &review_check,
+        };
+        return collect_diff_scoped_review(query, &diff_context, files, diagnostics);
     }
 
     let tree = tree::build_tree_from_files(&files);
@@ -584,22 +590,23 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
 
 fn collect_diff_scoped_review(
     query: &ResolvedReviewQuery,
-    repo: &gix::Repository,
-    database: &crate::store::ReviewDatabase,
+    diff_context: &DiffReviewContext<'_>,
     files: Vec<crate::block::FileState>,
     diagnostics: Vec<ReviewDiagnostic>,
-    diff_targets: &[ReviewDiffTarget],
-    workdir_prefix: Option<String>,
-    review_check: &ReviewCheck,
 ) -> Result<CollectedReview> {
-    let review_files =
-        collect_diff_review_files(query, repo, files, diff_targets, workdir_prefix.as_deref())?;
+    let review_files = collect_diff_review_files(
+        query,
+        diff_context.repo,
+        files,
+        diff_context.diff_targets,
+        diff_context.workdir_prefix,
+    )?;
     let (tree, diff_block_sides) = build_tree_from_diff_review_files(&review_files)?;
     let coverage = CoverageIndex::build(
         &tree,
-        database,
+        diff_context.database,
         &CoverageBuildOptions {
-            workdir_prefix: workdir_prefix.clone(),
+            workdir_prefix: diff_context.workdir_prefix.map(ToOwned::to_owned),
         },
     )?;
 
@@ -613,7 +620,7 @@ fn collect_diff_scoped_review(
         };
         if coverage
             .node(file_node_id)
-            .effective_latest_verdict_for(review_check)
+            .effective_latest_verdict_for(diff_context.review_check)
             == Some(&Verdict::Approved)
         {
             continue;
@@ -634,20 +641,21 @@ fn collect_diff_scoped_review(
             }
             total_blocks += 1;
             let block_coverage = coverage.block(&file.path, &display_block);
-            if block_coverage.effective_latest_verdict_for(review_check) == Some(&Verdict::Approved)
+            if block_coverage.effective_latest_verdict_for(diff_context.review_check)
+                == Some(&Verdict::Approved)
             {
                 continue;
             }
 
             if block_coverage
-                .direct_latest_verdict_for(review_check)
+                .direct_latest_verdict_for(diff_context.review_check)
                 .is_none()
                 && is_subblock_covered(
                     &display_block,
                     file.language,
                     query,
                     &coverage,
-                    review_check,
+                    diff_context.review_check,
                     &file.path,
                 )
             {
@@ -707,7 +715,9 @@ fn collect_diff_review_files(
     for path in selected_paths {
         let display_path = display_path_for_workdir_prefix(&path, workdir_prefix)?;
         let repo_relative_path = repo_relative_path_for_diff(&display_path, workdir_prefix)?;
-        let head_file = head_files_by_path.remove(&display_path);
+        let head_file = head_files_by_path
+            .remove(&path)
+            .or_else(|| head_files_by_path.remove(&display_path));
         let base_files = base_file_states_for_diff_targets(
             repo,
             diff_targets,
@@ -1357,7 +1367,7 @@ fn map_base_line_to_head_anchor(old_line: u32, hunks: &[vcs::DiffHunk]) -> u32 {
 
     let delta = i64::from(new_cursor) - i64::from(old_cursor);
     let mapped = i64::from(old_line) + delta;
-    mapped.max(1).min(i64::from(u32::MAX)) as u32
+    u32::try_from(mapped.max(1).min(i64::from(u32::MAX))).unwrap_or(u32::MAX)
 }
 
 fn head_block_line_range(block: &Block) -> std::ops::Range<u32> {
@@ -1605,7 +1615,7 @@ mod tests {
         }
     }
 
-    fn diff_review_blocks<'a>(blocks: &'a [DiffReviewBlock]) -> Vec<&'a DiffBlockSides> {
+    fn diff_review_blocks(blocks: &[DiffReviewBlock]) -> Vec<&DiffBlockSides> {
         blocks.iter().map(|block| &block.sides).collect()
     }
 

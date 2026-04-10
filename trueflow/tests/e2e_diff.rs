@@ -22,7 +22,7 @@ fn review_file_by_path<'a>(files: &'a [Value], path: &str) -> Result<&'a Value> 
         .with_context(|| format!("expected review output for path {path}"))
 }
 
-fn file_block_contents<'a>(file: &'a Value) -> Result<Vec<&'a str>> {
+fn file_block_contents(file: &Value) -> Result<Vec<&str>> {
     file["blocks"]
         .as_array()
         .context("blocks")?
