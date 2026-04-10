@@ -8,7 +8,8 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    CollectedReview, ReviewTarget, collect_review, resolve_cli_review_scope, resolve_review_request,
+    CollectedReview, DiffBlockSides, ReviewTarget, collect_review, resolve_cli_review_scope,
+    resolve_review_request,
 };
 use crate::config::{
     BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers, TuiKeybindsConfig,
@@ -188,6 +189,7 @@ struct AppState {
     initial_remaining_blocks: usize,
     remaining_blocks: usize,
     reviewable_nodes: HashSet<TreeNodeId>,
+    diff_block_sides: HashMap<TreeNodeId, DiffBlockSides>,
     session_recap: SessionRecap,
     scope_label: String,
     input_mode: InputMode,
@@ -477,17 +479,22 @@ fn build_review_state(
     review_scope: ReviewScope,
     options: ReviewStateBuildOptions,
 ) -> Result<AppState> {
-    let reviewable_nodes: HashSet<TreeNodeId> = review
-        .unreviewed_block_nodes
+    let CollectedReview {
+        summary,
+        tree,
+        unreviewed_block_nodes,
+        diff_block_sides,
+    } = review;
+    let reviewable_nodes: HashSet<TreeNodeId> = unreviewed_block_nodes
         .iter()
         .copied()
-        .filter(|&id| matches!(review.tree.node(id).kind, TreeNodeKind::Block))
+        .filter(|&id| matches!(tree.node(id).kind, TreeNodeKind::Block))
         .collect();
     let remaining_blocks = reviewable_nodes.len();
 
-    let root_children = review.tree.node(review.tree.root()).children.clone();
-    let review_order = ReviewOrder::from_tree(&review.tree, &review.unreviewed_block_nodes);
-    let mut navigator = ReviewNavigator::new(review.tree, review.unreviewed_block_nodes)?;
+    let root_children = tree.node(tree.root()).children.clone();
+    let review_order = ReviewOrder::from_tree(&tree, &unreviewed_block_nodes);
+    let mut navigator = ReviewNavigator::new(tree, unreviewed_block_nodes)?;
     let mut root_cursor = root_children.first().copied();
     let mut focus_block = None;
     let mut pending_focus_scroll = false;
@@ -502,10 +509,11 @@ fn build_review_state(
         review_scope,
         navigator,
         review_order,
-        total_blocks: review.summary.total_blocks,
+        total_blocks: summary.total_blocks,
         initial_remaining_blocks: remaining_blocks,
         remaining_blocks,
         reviewable_nodes,
+        diff_block_sides,
         session_recap: SessionRecap::default(),
         scope_label: options.scope_label,
         input_mode: InputMode::Normal,
@@ -2665,6 +2673,14 @@ fn focus_block_for_content_node(
     }
 }
 
+fn is_base_only_diff_node(state: &AppState, node: &ContentNodeSnapshot) -> bool {
+    matches!(node.kind, TreeNodeKind::Block)
+        && state
+            .diff_block_sides
+            .get(&node.id)
+            .is_some_and(DiffBlockSides::is_base_only)
+}
+
 fn focus_line_span_for_node(
     state: &AppState,
     node: &ContentNodeSnapshot,
@@ -2714,6 +2730,29 @@ fn build_source_context_content(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
 ) -> BuiltContent {
+    if is_base_only_diff_node(state, node)
+        && let Some(block) = node.block.as_ref()
+    {
+        let lines = block
+            .content
+            .lines()
+            .map(|line| {
+                format_code_line(
+                    &mut state.highlighted_line_cache,
+                    line,
+                    palette,
+                    node.language.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total_lines = lines.len();
+        return BuiltContent {
+            lines,
+            total_lines,
+            focus_row_range: Some(0..total_lines),
+        };
+    }
+
     let language = node.language;
     let focus_line_span = load_file_lines(state, &node.path)
         .as_ref()
@@ -3154,6 +3193,12 @@ fn build_diff_context_content(
     palette: &UiPalette,
     code_width: u16,
 ) -> BuiltContent {
+    if is_base_only_diff_node(state, node)
+        && let Some(block) = node.block.as_ref()
+    {
+        return build_deleted_block_diff_content(state, block, palette, code_width);
+    }
+
     let Some(file_lines) = load_file_lines(state, &node.path) else {
         return content_message("(File missing)", None, palette);
     };
@@ -3223,6 +3268,42 @@ fn build_diff_context_content(
             None,
             palette,
         ),
+    }
+}
+
+fn build_deleted_block_diff_content(
+    state: &AppState,
+    block: &crate::block::Block,
+    palette: &UiPalette,
+    code_width: u16,
+) -> BuiltContent {
+    let style = Style::default()
+        .fg(palette.del)
+        .bg(palette.code_bg)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+
+    for (offset, line) in block.content.lines().enumerate() {
+        let diff_line = vcs::DiffLine {
+            kind: vcs::DiffLineKind::Removed,
+            old_line: Some(u32::try_from(block.start_line + offset + 1).unwrap_or(u32::MAX)),
+            new_line: None,
+            text: line.to_string(),
+            is_focus: true,
+        };
+        lines.extend(wrap_diff_overlay_row(
+            &diff_line,
+            style,
+            code_width,
+            state.diff_line_numbers,
+        ));
+    }
+
+    let total_lines = lines.len();
+    BuiltContent {
+        total_lines,
+        lines,
+        focus_row_range: Some(0..total_lines),
     }
 }
 
@@ -3839,6 +3920,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 0,
             remaining_blocks: 0,
             reviewable_nodes: HashSet::new(),
+            diff_block_sides: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: String::new(),
             input_mode: InputMode::Normal,
@@ -3903,6 +3985,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 1,
             remaining_blocks: 1,
             reviewable_nodes: visible,
+            diff_block_sides: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
@@ -3981,6 +4064,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 2,
             remaining_blocks: 2,
             reviewable_nodes: visible,
+            diff_block_sides: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
@@ -4069,6 +4153,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 1,
             remaining_blocks: 1,
             reviewable_nodes: visible,
+            diff_block_sides: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
@@ -6004,6 +6089,132 @@ mod diff_scope_tests {
         assert!(
             rendered.iter().any(|line| line.contains("new_body();")),
             "expected block diff to include the current function change: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn build_block_lines_diff_mode_for_deleted_block_excludes_following_function_rows() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_deleted_block_diff_scoped")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = concat!("fn kept() {\n", "    body();\n", "}\n");
+        let deleted_block_content = "fn removed() {\n    old_body();\n}\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, deleted_block_content, 0, 3);
+        state.view_mode = ViewMode::Diff;
+        let deleted_block = state
+            .navigator
+            .tree
+            .node(block_id)
+            .block
+            .clone()
+            .unwrap_or_else(|| panic!("expected deleted block fixture"));
+        state.diff_block_sides.insert(
+            block_id,
+            DiffBlockSides {
+                base: Some(deleted_block),
+                head: None,
+            },
+        );
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::removed("fn removed() {\n"),
+                        vcs::DiffHunkLine::removed("    old_body();\n"),
+                        vcs::DiffHunkLine::removed("}\n"),
+                        vcs::DiffHunkLine::context("fn kept() {\n"),
+                        vcs::DiffHunkLine::context("    body();\n"),
+                        vcs::DiffHunkLine::context("}\n"),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_block_lines(&mut state, &snapshot, &palette, 6, 80);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("fn removed()")),
+            "expected deleted block diff to include removed function: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("old_body();")),
+            "expected deleted block diff to include removed body: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|line| !line.contains("fn kept()")),
+            "deleted block diff should not include following function rows: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn build_block_lines_source_mode_for_deleted_block_uses_base_content_only() {
+        // GIVEN: a deleted base-only block exists at a path whose current file content is different
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_deleted_block_source_scoped")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = concat!("fn kept() {\n", "    body();\n", "}\n");
+        let deleted_block_content = "fn removed() {\n    old_body();\n}\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, deleted_block_content, 0, 3);
+        state.view_mode = ViewMode::Source;
+        let deleted_block = state
+            .navigator
+            .tree
+            .node(block_id)
+            .block
+            .clone()
+            .unwrap_or_else(|| panic!("expected deleted block fixture"));
+        state.diff_block_sides.insert(
+            block_id,
+            DiffBlockSides {
+                base: Some(deleted_block),
+                head: None,
+            },
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        // WHEN: source mode renders that deleted block
+        let content = build_block_lines(&mut state, &snapshot, &palette, 6, 80);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        // THEN: source mode shows only the deleted base-side block content
+        assert_eq!(content.total_lines, 3);
+        assert_eq!(content.focus_row_range, Some(0..3));
+        assert!(
+            rendered.iter().any(|line| line.contains("fn removed()")),
+            "expected deleted block source to include removed function: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("old_body();")),
+            "expected deleted block source to include removed body: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|line| !line.contains("fn kept()")),
+            "deleted block source should not include current file rows: {rendered:?}"
         );
     }
 
