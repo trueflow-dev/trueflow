@@ -97,6 +97,11 @@ pub struct TuiKeybindsConfig {
     )]
     pub root: char,
     #[serde(
+        default = "default_tui_keybind_recap_done",
+        deserialize_with = "deserialize_single_char"
+    )]
+    pub recap_done: char,
+    #[serde(
         default = "default_tui_keybind_quit",
         deserialize_with = "deserialize_single_char"
     )]
@@ -205,6 +210,7 @@ impl Default for TuiKeybindsConfig {
             toggle_view: default_tui_keybind_toggle_view(),
             speed_read: default_tui_keybind_speed_read(),
             root: default_tui_keybind_root(),
+            recap_done: default_tui_keybind_recap_done(),
             quit: default_tui_keybind_quit(),
         }
     }
@@ -310,6 +316,10 @@ fn default_tui_keybind_speed_read() -> char {
 
 fn default_tui_keybind_root() -> char {
     'g'
+}
+
+fn default_tui_keybind_recap_done() -> char {
+    'd'
 }
 
 fn default_tui_keybind_quit() -> char {
@@ -643,6 +653,7 @@ mod tests {
         assert_eq!(cfg.tui.keybinds.toggle_view, 'm');
         assert_eq!(cfg.tui.keybinds.speed_read, 'r');
         assert_eq!(cfg.tui.keybinds.root, 'g');
+        assert_eq!(cfg.tui.keybinds.recap_done, 'd');
         assert_eq!(cfg.tui.keybinds.quit, 'q');
     }
 
@@ -686,6 +697,7 @@ note = "e"
 toggle_view = "v"
 speed_read = "s"
 root = "z"
+recap_done = "w"
 quit = "x"
 "#,
         ) {
@@ -703,6 +715,7 @@ quit = "x"
         assert_eq!(cfg.tui.keybinds.toggle_view, 'v');
         assert_eq!(cfg.tui.keybinds.speed_read, 's');
         assert_eq!(cfg.tui.keybinds.root, 'z');
+        assert_eq!(cfg.tui.keybinds.recap_done, 'w');
         assert_eq!(cfg.tui.keybinds.quit, 'x');
     }
 

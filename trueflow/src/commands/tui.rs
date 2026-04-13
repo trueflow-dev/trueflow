@@ -1217,10 +1217,17 @@ fn is_recap_mode(state: &AppState) -> bool {
     matches!(state.input_mode, InputMode::Normal) && state.remaining_blocks == 0
 }
 
-const RECAP_DONE_KEY: char = 'd';
+fn recap_done_key(keybinds: &TuiKeybindsConfig) -> char {
+    keybinds.recap_done
+}
+
+fn recap_done_action_text(keybinds: &TuiKeybindsConfig) -> String {
+    format!("[{}]done", recap_done_key(keybinds))
+}
 
 fn recap_key_should_exit(keybinds: &TuiKeybindsConfig, key_code: KeyCode) -> bool {
-    matches!(key_code, KeyCode::Esc | KeyCode::Char(RECAP_DONE_KEY))
+    matches!(key_code, KeyCode::Esc)
+        || matches!(key_code, KeyCode::Char(ch) if ch == recap_done_key(keybinds))
         || matches!(
             keybind_action_for_key_code(keybinds, key_code),
             Some(KeybindAction::Quit)
@@ -2369,6 +2376,8 @@ fn build_header_lines(
     lines
 }
 
+/// UI mode precedence matters here: recap overrides everything, then speed read
+/// for the current block, then root navigation, then diff/source review.
 fn current_ui_mode(state: &AppState) -> UiMode {
     if is_recap_mode(state) {
         UiMode::Recap
@@ -2460,10 +2469,7 @@ fn build_action_lines(
             "[0]reset".to_string(),
             format!("[{}/Esc]exit", keybinds.speed_read),
         ],
-        UiMode::Recap => vec![
-            format!("[{}]done", RECAP_DONE_KEY),
-            quit_action,
-        ],
+        UiMode::Recap => vec![recap_done_action_text(keybinds), quit_action],
     };
 
     pack_action_phrases(width, &phrases)
@@ -2584,8 +2590,9 @@ fn render_recap_view(frame: &mut Frame, state: &AppState, area: Rect, palette: &
 
 fn recap_footer_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     format!(
-        "Press [{}] done or [{}] quit",
-        RECAP_DONE_KEY, keybinds.quit
+        "Press [{}] done or [{}/Esc] exit",
+        recap_done_key(keybinds),
+        keybinds.quit
     )
 }
 
@@ -4507,6 +4514,7 @@ mod diff_scope_tests {
             toggle_view: 'v',
             speed_read: 's',
             root: 'z',
+            recap_done: 'd',
             quit: 'x',
         };
         assert_eq!(
@@ -4545,6 +4553,7 @@ mod diff_scope_tests {
             toggle_view: 'v',
             speed_read: 's',
             root: 'z',
+            recap_done: 'd',
             quit: 'x',
         };
         assert_eq!(
@@ -4567,6 +4576,7 @@ mod diff_scope_tests {
             toggle_view: 'v',
             speed_read: 's',
             root: 'z',
+            recap_done: 'd',
             quit: 'x',
         };
         let palette = UiPalette::default();
@@ -4624,6 +4634,18 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn build_action_lines_for_source_review_use_diff_toggle_label() {
+        let keybinds = crate::config::TuiKeybindsConfig::default();
+        let palette = UiPalette::default();
+        let lines = build_action_lines(120, UiMode::SourceReview, &keybinds, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let joined = rendered.join(" ");
+
+        assert!(joined.contains("[m]diff"));
+        assert!(!joined.contains("[m]source"));
+    }
+
+    #[test]
     fn build_action_lines_for_speed_read_mode_use_speed_read_controls() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         let palette = UiPalette::default();
@@ -4638,6 +4660,43 @@ mod diff_scope_tests {
         assert!(joined.contains("[[/]]words"));
         assert!(joined.contains("[0]reset"));
         assert!(joined.contains("[r/Esc]exit"));
+    }
+
+    #[test]
+    fn build_action_lines_for_speed_read_mode_use_configured_exit_key() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            speed_read: 's',
+            ..crate::config::TuiKeybindsConfig::default()
+        };
+        let palette = UiPalette::default();
+        let lines = build_action_lines(120, UiMode::SpeedRead, &keybinds, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let joined = rendered.join(" ");
+
+        assert!(joined.contains("[s/Esc]exit"));
+        assert!(!joined.contains("[r/Esc]exit"));
+    }
+
+    #[test]
+    fn build_action_lines_for_recap_mode_only_show_recap_actions() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            recap_done: 'f',
+            quit: 'x',
+            ..crate::config::TuiKeybindsConfig::default()
+        };
+        let palette = UiPalette::default();
+        let lines = build_action_lines(80, UiMode::Recap, &keybinds, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let joined = rendered.join(" ");
+
+        assert!(joined.contains("[f]done"));
+        assert!(joined.contains("[x]quit"));
+        assert!(!joined.contains("approve"));
+        assert!(!joined.contains("note"));
+        assert!(!joined.contains("speed"));
+        assert!(!joined.contains("source"));
+        assert!(!joined.contains("diff"));
+        assert!(!joined.contains("Esc"));
     }
 
     #[test]
@@ -6525,7 +6584,11 @@ mod diff_scope_tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert!(source_header.iter().any(|line| line == "Mode: Source Review"));
+        assert!(
+            source_header
+                .iter()
+                .any(|line| line == "Mode: Source Review")
+        );
     }
 
     #[test]
@@ -7026,11 +7089,16 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn recap_key_handler_exits_on_done_and_quit_only() {
-        let keybinds = crate::config::TuiKeybindsConfig::default();
-        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('q')));
-        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('d')));
+    fn recap_key_handler_uses_configured_done_quit_and_escape_keys() {
+        let keybinds = crate::config::TuiKeybindsConfig {
+            recap_done: 'f',
+            quit: 'x',
+            ..crate::config::TuiKeybindsConfig::default()
+        };
+        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('f')));
+        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('x')));
         assert!(recap_key_should_exit(&keybinds, KeyCode::Esc));
+        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('d')));
         assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('m')));
     }
 
@@ -7039,7 +7107,7 @@ mod diff_scope_tests {
         let default_keybinds = crate::config::TuiKeybindsConfig::default();
         assert_eq!(
             recap_footer_hint_text(&default_keybinds),
-            "Press [d] done or [q] quit"
+            "Press [d] done or [q/Esc] exit"
         );
 
         let custom_keybinds = crate::config::TuiKeybindsConfig {
@@ -7054,11 +7122,12 @@ mod diff_scope_tests {
             toggle_view: 'v',
             speed_read: 's',
             root: 'z',
+            recap_done: 'f',
             quit: 'x',
         };
         assert_eq!(
             recap_footer_hint_text(&custom_keybinds),
-            "Press [d] done or [x] quit"
+            "Press [f] done or [x/Esc] exit"
         );
     }
 
@@ -7079,7 +7148,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn toggle_speed_read_mode_starts_autoplay_on_block_node() {
+    fn toggle_speed_read_mode_starts_paused_on_block_node() {
         let (mut state, block_id) = build_state_with_single_block("alpha beta gamma");
         assert!(state.speed_read.is_none());
 
@@ -7089,8 +7158,8 @@ mod diff_scope_tests {
             panic!("expected speed read mode to activate");
         };
         assert_eq!(mode.node_id, block_id);
-        assert_eq!(mode.model.playback, PlaybackState::Playing);
-        assert!(mode.next_tick_at.is_some());
+        assert_eq!(mode.model.playback, PlaybackState::Paused);
+        assert!(mode.next_tick_at.is_none());
     }
 
     #[test]
@@ -7104,7 +7173,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn speed_read_space_toggles_playback_after_autoplay_starts() {
+    fn speed_read_space_starts_playback_when_mode_is_paused() {
         let (mut state, _) = build_state_with_single_block("alpha beta gamma delta");
         toggle_speed_read_mode(&mut state);
 
@@ -7116,6 +7185,20 @@ mod diff_scope_tests {
         let Some(mode) = state.speed_read.as_ref() else {
             panic!("expected speed read mode to remain active");
         };
+        assert_eq!(mode.model.playback, PlaybackState::Playing);
+        assert!(mode.next_tick_at.is_some());
+    }
+
+    #[test]
+    fn toggle_speed_read_mode_with_whitespace_only_content_stays_paused_without_next_tick() {
+        let (mut state, _) = build_state_with_single_block("  \n\t  ");
+
+        toggle_speed_read_mode(&mut state);
+
+        let Some(mode) = state.speed_read.as_ref() else {
+            panic!("expected speed read mode to activate");
+        };
+        assert!(mode.model.phrases.is_empty());
         assert_eq!(mode.model.playback, PlaybackState::Paused);
         assert!(mode.next_tick_at.is_none());
     }
@@ -7124,6 +7207,10 @@ mod diff_scope_tests {
     fn speed_read_autoplay_timeout_exits_to_normal_view_at_end() {
         let (mut state, _) = build_state_with_single_block("alpha beta");
         toggle_speed_read_mode(&mut state);
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char(' ')
+        ));
 
         if let Some(mode) = state.speed_read.as_mut() {
             mode.next_tick_at = Some(Instant::now());

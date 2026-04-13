@@ -152,14 +152,13 @@ impl SpeedReadController {
             .persisted_defaults
             .default_chunk_words
             .clamp(self.config.min_chunk_words, self.config.max_chunk_words);
-        let mut model = build_speed_read_model(&block.content, default_wpm, default_chunk_words);
+        let model = build_speed_read_model(&block.content, default_wpm, default_chunk_words);
         let show_prose_optimization_hint =
             self.config.show_prose_optimization_hint && is_code_heavy_text(&block.content);
 
-        if !model.phrases.is_empty() {
-            model.playback = PlaybackState::Playing;
-        }
-
+        // Enter speed read paused. Playback and tick scheduling only start after
+        // the user explicitly presses Space, which keeps activation predictable
+        // and avoids autoplay for empty phrase lists.
         let mut active = SpeedReadUiState {
             node_id: current_node_id,
             model,
