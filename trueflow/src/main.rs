@@ -40,7 +40,10 @@ fn main() -> Result<()> {
             },
         ),
         Commands::Check => commands::check::run(&context),
-        Commands::Scan { json, tree } => commands::scan::run(&context, *json, *tree),
+        Commands::Scan { json, tree } => commands::scan::run(
+            &context,
+            commands::scan::ScanOutputMode::from_flags(*json, *tree)?,
+        ),
         Commands::Review {
             json,
             all,
