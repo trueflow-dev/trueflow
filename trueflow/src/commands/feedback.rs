@@ -16,6 +16,18 @@ use std::path::Path;
 const FEEDBACK_CURSOR_FILE: &str = "feedback.cursor";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackFormat {
+    Xml,
+    Json,
+}
+
+impl FeedbackFormat {
+    pub fn from_arg(raw: &str) -> Self {
+        if raw == "json" { Self::Json } else { Self::Xml }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeedbackSince {
     All,
     Timestamp(i64),
@@ -32,7 +44,7 @@ struct FeedbackEntry {
 
 pub fn run(
     _context: &TrueflowContext,
-    format: &str,
+    format: FeedbackFormat,
     since: Option<&str>,
     include_approved: bool,
     only: &[BlockKind],
@@ -66,40 +78,43 @@ pub fn run(
         workdir_prefix.as_deref(),
     )?;
 
-    if format == "json" {
-        let export_list = entries
-            .into_iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "file": entry.file_path,
-                    "block": entry.block,
-                    "reviews": entry.reviews,
-                    "latest_verdict": entry.latest_verdict,
+    match format {
+        FeedbackFormat::Json => {
+            let export_list = entries
+                .into_iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "file": entry.file_path,
+                        "block": entry.block,
+                        "reviews": entry.reviews,
+                        "latest_verdict": entry.latest_verdict,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        println!("{}", serde_json::to_string_pretty(&export_list)?);
-    } else {
-        println!("<trueflow_feedback>");
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&export_list)?);
+        }
+        FeedbackFormat::Xml => {
+            println!("<trueflow_feedback>");
 
-        let mut current_file_path: Option<String> = None;
-        for entry in entries {
-            if current_file_path.as_deref() != Some(entry.file_path.as_str()) {
-                if current_file_path.is_some() {
-                    println!("  </file>");
+            let mut current_file_path: Option<String> = None;
+            for entry in entries {
+                if current_file_path.as_deref() != Some(entry.file_path.as_str()) {
+                    if current_file_path.is_some() {
+                        println!("  </file>");
+                    }
+                    println!("  <file path=\"{}\">", escape_xml(&entry.file_path));
+                    current_file_path = Some(entry.file_path.clone());
                 }
-                println!("  <file path=\"{}\">", escape_xml(&entry.file_path));
-                current_file_path = Some(entry.file_path.clone());
+
+                print_block_xml(&entry.block, &entry.reviews);
             }
 
-            print_block_xml(&entry.block, &entry.reviews);
-        }
+            if current_file_path.is_some() {
+                println!("  </file>");
+            }
 
-        if current_file_path.is_some() {
-            println!("  </file>");
+            println!("</trueflow_feedback>");
         }
-
-        println!("</trueflow_feedback>");
     }
 
     if matches!(since_mode, FeedbackSince::Last)
@@ -294,4 +309,21 @@ fn write_feedback_cursor(path: &Path, timestamp: i64) -> Result<()> {
 fn workdir_prefix_from_git_root() -> Option<String> {
     let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
     path_utils::current_workdir_prefix_for_repo_root(&repo_root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feedback_format_uses_json_for_json_arg() {
+        assert_eq!(FeedbackFormat::from_arg("json"), FeedbackFormat::Json);
+    }
+
+    #[test]
+    fn feedback_format_preserves_xml_default_behavior_for_non_json_args() {
+        assert_eq!(FeedbackFormat::from_arg("xml"), FeedbackFormat::Xml);
+        assert_eq!(FeedbackFormat::from_arg("yaml"), FeedbackFormat::Xml);
+        assert_eq!(FeedbackFormat::from_arg(""), FeedbackFormat::Xml);
+    }
 }

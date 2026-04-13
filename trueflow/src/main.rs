@@ -68,7 +68,7 @@ fn main() -> Result<()> {
             exclude,
         } => commands::feedback::run(
             &context,
-            format,
+            commands::feedback::FeedbackFormat::from_arg(format),
             since.as_deref(),
             *include_approved,
             only,
