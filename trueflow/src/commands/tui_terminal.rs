@@ -113,12 +113,88 @@ fn ensure_tty_preflight() -> Result<()> {
     validate_tty_preflight(stdin.is_tty(), stdout.is_tty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalPhase {
+    Active,
+    Suspended,
+    Restored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalModeState {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSessionStatus {
+    phase: TerminalPhase,
+    raw_mode: TerminalModeState,
+    tui_mode: TerminalModeState,
+}
+
+impl TerminalSessionStatus {
+    fn active() -> Self {
+        Self {
+            phase: TerminalPhase::Active,
+            raw_mode: TerminalModeState::Enabled,
+            tui_mode: TerminalModeState::Enabled,
+        }
+    }
+
+    fn is_restored(self) -> bool {
+        matches!(self.phase, TerminalPhase::Restored)
+    }
+
+    fn raw_mode_enabled(self) -> bool {
+        matches!(self.raw_mode, TerminalModeState::Enabled)
+    }
+
+    fn tui_mode_enabled(self) -> bool {
+        matches!(self.tui_mode, TerminalModeState::Enabled)
+    }
+
+    fn mark_raw_mode_disabled(&mut self) {
+        self.raw_mode = TerminalModeState::Disabled;
+        if self.tui_mode_enabled() {
+            return;
+        }
+        if !self.is_restored() {
+            self.phase = TerminalPhase::Suspended;
+        }
+    }
+
+    fn mark_tui_mode_disabled(&mut self) {
+        self.tui_mode = TerminalModeState::Disabled;
+        if self.raw_mode_enabled() {
+            return;
+        }
+        if !self.is_restored() {
+            self.phase = TerminalPhase::Suspended;
+        }
+    }
+
+    fn mark_raw_mode_enabled(&mut self) {
+        self.raw_mode = TerminalModeState::Enabled;
+        self.phase = TerminalPhase::Active;
+    }
+
+    fn mark_tui_mode_enabled(&mut self) {
+        self.tui_mode = TerminalModeState::Enabled;
+        self.phase = TerminalPhase::Active;
+    }
+
+    fn mark_restored(&mut self) {
+        self.phase = TerminalPhase::Restored;
+        self.raw_mode = TerminalModeState::Disabled;
+        self.tui_mode = TerminalModeState::Disabled;
+    }
+}
+
 pub(crate) struct TerminalSession {
     terminal: TuiTerminal,
     capabilities: TerminalCapabilities,
-    raw_mode_enabled: bool,
-    tui_mode_enabled: bool,
-    restored: bool,
+    status: TerminalSessionStatus,
 }
 
 impl TerminalSession {
@@ -137,9 +213,7 @@ impl TerminalSession {
             Ok(terminal) => Ok(Self {
                 terminal,
                 capabilities,
-                raw_mode_enabled: true,
-                tui_mode_enabled: true,
-                restored: false,
+                status: TerminalSessionStatus::active(),
             }),
             Err(error) => {
                 let mut stdout = io::stdout();
@@ -173,25 +247,25 @@ impl TerminalSession {
     }
 
     pub(crate) fn restore(&mut self) -> Result<()> {
-        if self.restored {
+        if self.status.is_restored() {
             return Ok(());
         }
 
         let mut first_error = None;
 
-        if self.raw_mode_enabled {
+        if self.status.raw_mode_enabled() {
             if let Err(error) = disable_raw_mode() {
                 first_error.get_or_insert_with(|| error.into());
             } else {
-                self.raw_mode_enabled = false;
+                self.status.mark_raw_mode_disabled();
             }
         }
 
-        if self.tui_mode_enabled {
+        if self.status.tui_mode_enabled() {
             if let Err(error) = leave_tui_mode(self.terminal.backend_mut(), self.capabilities) {
                 first_error.get_or_insert(error);
             } else {
-                self.tui_mode_enabled = false;
+                self.status.mark_tui_mode_disabled();
             }
         }
 
@@ -202,31 +276,31 @@ impl TerminalSession {
         if let Some(error) = first_error {
             Err(error)
         } else {
-            self.restored = true;
+            self.status.mark_restored();
             Ok(())
         }
     }
 
     fn deactivate(&mut self) -> Result<()> {
-        if self.raw_mode_enabled {
+        if self.status.raw_mode_enabled() {
             disable_raw_mode()?;
-            self.raw_mode_enabled = false;
+            self.status.mark_raw_mode_disabled();
         }
-        if self.tui_mode_enabled {
+        if self.status.tui_mode_enabled() {
             leave_tui_mode(self.terminal.backend_mut(), self.capabilities)?;
-            self.tui_mode_enabled = false;
+            self.status.mark_tui_mode_disabled();
         }
         Ok(())
     }
 
     fn reactivate(&mut self) -> Result<()> {
-        if !self.tui_mode_enabled {
+        if !self.status.tui_mode_enabled() {
             enter_tui_mode(self.terminal.backend_mut(), self.capabilities)?;
-            self.tui_mode_enabled = true;
+            self.status.mark_tui_mode_enabled();
         }
-        if !self.raw_mode_enabled {
+        if !self.status.raw_mode_enabled() {
             enable_raw_mode()?;
-            self.raw_mode_enabled = true;
+            self.status.mark_raw_mode_enabled();
         }
         self.terminal.clear()?;
         Ok(())
@@ -235,7 +309,7 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        if !self.restored {
+        if !self.status.is_restored() {
             let _ = self.restore();
         }
     }
@@ -327,6 +401,43 @@ mod tests {
             String::from_utf8(output).unwrap_or_else(|error| panic!("invalid ansi bytes: {error}"));
         assert!(rendered.contains("\u{1b}[?2004l"));
         assert!(!rendered.contains("\u{1b}[<1u"));
+    }
+
+    #[test]
+    fn terminal_session_status_starts_active_with_both_modes_enabled() {
+        let status = TerminalSessionStatus::active();
+
+        assert_eq!(status.phase, TerminalPhase::Active);
+        assert!(status.raw_mode_enabled());
+        assert!(status.tui_mode_enabled());
+        assert!(!status.is_restored());
+    }
+
+    #[test]
+    fn terminal_session_status_becomes_suspended_once_both_modes_are_disabled() {
+        let mut status = TerminalSessionStatus::active();
+
+        status.mark_raw_mode_disabled();
+        assert_eq!(status.phase, TerminalPhase::Active);
+        status.mark_tui_mode_disabled();
+
+        assert_eq!(status.phase, TerminalPhase::Suspended);
+        assert!(!status.raw_mode_enabled());
+        assert!(!status.tui_mode_enabled());
+    }
+
+    #[test]
+    fn terminal_session_status_marks_restored_explicitly() {
+        let mut status = TerminalSessionStatus::active();
+
+        status.mark_raw_mode_disabled();
+        status.mark_tui_mode_disabled();
+        status.mark_restored();
+
+        assert_eq!(status.phase, TerminalPhase::Restored);
+        assert!(status.is_restored());
+        assert!(!status.raw_mode_enabled());
+        assert!(!status.tui_mode_enabled());
     }
 
     #[test]
