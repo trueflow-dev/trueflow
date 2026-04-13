@@ -3021,9 +3021,15 @@ fn style_for_contextual_diff_row(
             .add_modifier(Modifier::BOLD),
         vcs::DiffLineKind::Context => {
             if focus_line_span.is_some_and(|focus| focus.contains(&row.anchor_index)) {
-                Style::default().fg(palette.fg).bg(palette.code_bg)
+                Style::default()
+                    .fg(palette.fg)
+                    .bg(palette.code_bg)
+                    .add_modifier(Modifier::DIM)
             } else {
-                Style::default().fg(palette.context).bg(palette.code_bg)
+                Style::default()
+                    .fg(palette.context)
+                    .bg(palette.code_bg)
+                    .add_modifier(Modifier::DIM)
             }
         }
     }
@@ -4847,6 +4853,38 @@ mod diff_scope_tests {
             format_diff_overlay_row(&line, TuiDiffLineNumbers::Disabled),
             "  xx      foo".to_string()
         );
+    }
+
+    #[test]
+    fn diff_mode_context_rows_are_dimmed_outside_focus_span() {
+        let row = ContextualDiffRow {
+            kind: vcs::DiffLineKind::Context,
+            old_line: Some(7),
+            new_line: Some(9),
+            anchor_index: 12,
+            text: "let stable = true;".to_string(),
+        };
+        let palette = UiPalette::default();
+
+        let style = style_for_contextual_diff_row(&row, Some(&(20..25)), &palette);
+
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn diff_mode_context_rows_are_dimmed_inside_focus_span() {
+        let row = ContextualDiffRow {
+            kind: vcs::DiffLineKind::Context,
+            old_line: Some(7),
+            new_line: Some(9),
+            anchor_index: 12,
+            text: "let stable = true;".to_string(),
+        };
+        let palette = UiPalette::default();
+
+        let style = style_for_contextual_diff_row(&row, Some(&(10..15)), &palette);
+
+        assert!(style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
