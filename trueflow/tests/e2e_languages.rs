@@ -194,3 +194,101 @@ fn test_all_languages_test_blocks() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_all_languages_review_block_generation_smoke() -> Result<()> {
+    let repo = TestRepo::fixture("all_languages")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let files = json_array(&output)?;
+
+    let mut blocks_by_path = std::collections::HashMap::new();
+    let mut total_blocks = 0usize;
+    for file in files {
+        let path = file["path"]
+            .as_str()
+            .context("path should be string")?
+            .replace("./", "");
+        let blocks = file["blocks"]
+            .as_array()
+            .context("blocks should be array")?
+            .clone();
+        total_blocks += blocks.len();
+        blocks_by_path.insert(path, blocks);
+    }
+
+    assert!(
+        blocks_by_path.len() >= 15,
+        "expected broad multi-language review coverage, got {} files",
+        blocks_by_path.len()
+    );
+    assert!(
+        total_blocks >= 80,
+        "expected nontrivial review block generation, got {total_blocks} blocks"
+    );
+
+    for path in [
+        "main.rs",
+        "main.java",
+        "main.nix",
+        "main.swift",
+        "main.toml",
+        "main.txt",
+    ] {
+        let blocks = blocks_by_path
+            .get(path)
+            .with_context(|| format!("missing review output for {path}"))?;
+        assert!(
+            !blocks.is_empty(),
+            "expected at least one review block in {path}"
+        );
+    }
+
+    let rust_kinds = blocks_by_path["main.rs"]
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        rust_kinds.contains(&"struct") && rust_kinds.contains(&"function"),
+        "expected struct + function review blocks in main.rs (kinds={rust_kinds:?})"
+    );
+
+    let java_kinds = blocks_by_path["main.java"]
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        java_kinds.iter().filter(|kind| **kind == "method").count() >= 2
+            && java_kinds.contains(&"variable"),
+        "expected method + variable review blocks in main.java (kinds={java_kinds:?})"
+    );
+
+    let js_kinds = blocks_by_path["main.js"]
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        js_kinds.contains(&"class") && js_kinds.contains(&"function"),
+        "expected class + function review blocks in main.js (kinds={js_kinds:?})"
+    );
+
+    let nix_kinds = blocks_by_path["main.nix"]
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        nix_kinds.contains(&"FunctionSignature"),
+        "expected FunctionSignature review block in main.nix (kinds={nix_kinds:?})"
+    );
+
+    let text_kinds = blocks_by_path["main.txt"]
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        text_kinds.contains(&"Paragraph"),
+        "expected Paragraph fallback block in main.txt (kinds={text_kinds:?})"
+    );
+
+    Ok(())
+}
