@@ -2778,6 +2778,57 @@ fn focus_block_line_span_for_node(
     (start < end).then_some(start..end)
 }
 
+fn changed_focus_line_span_for_source_node(
+    state: &mut AppState,
+    node: &ContentNodeSnapshot,
+    file_line_count: usize,
+) -> Option<std::ops::Range<usize>> {
+    let focus_block_line_span = focus_block_line_span_for_node(state, node, file_line_count)?;
+    let vcs::FileDiff::Text { hunks, .. } = cached_file_diff_for_node(state, node)? else {
+        return None;
+    };
+
+    changed_line_span_for_block(hunks, &focus_block_line_span)
+}
+
+fn changed_line_span_for_block(
+    hunks: &[vcs::DiffHunk],
+    block_line_span: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let mut first = None;
+    let mut last = None;
+
+    for hunk in hunks {
+        let mut new_line = hunk.new_start;
+        for line in &hunk.lines {
+            match line.kind {
+                vcs::DiffLineKind::Context => {
+                    new_line = new_line.saturating_add(1);
+                }
+                vcs::DiffLineKind::Added => {
+                    let anchor_index =
+                        usize::try_from(new_line.saturating_sub(1)).unwrap_or(usize::MAX);
+                    if block_line_span.contains(&anchor_index) {
+                        first.get_or_insert(anchor_index);
+                        last = Some(anchor_index.saturating_add(1));
+                    }
+                    new_line = new_line.saturating_add(1);
+                }
+                vcs::DiffLineKind::Removed => {
+                    let anchor_index =
+                        usize::try_from(new_line.saturating_sub(1)).unwrap_or(usize::MAX);
+                    if block_line_span.contains(&anchor_index) {
+                        first.get_or_insert(anchor_index);
+                        last = Some(anchor_index.saturating_add(1));
+                    }
+                }
+            }
+        }
+    }
+
+    first.zip(last).map(|(start, end)| start..end)
+}
+
 fn build_source_context_content(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
@@ -2807,9 +2858,6 @@ fn build_source_context_content(
     }
 
     let language = node.language;
-    let focus_line_span = load_file_lines(state, &node.path)
-        .as_ref()
-        .and_then(|lines| focus_line_span_for_node(state, node, lines.len()));
 
     let Some(file_lines) = load_file_lines(state, &node.path) else {
         if let Some(block) = &node.block {
@@ -2842,9 +2890,13 @@ fn build_source_context_content(
         };
     };
 
+    let highlight_line_span = focus_line_span_for_node(state, node, file_lines.len());
+    let focus_row_range = changed_focus_line_span_for_source_node(state, node, file_lines.len())
+        .or_else(|| highlight_line_span.clone());
+
     let mut lines = Vec::with_capacity(file_lines.len());
     for (index, line) in file_lines.iter().enumerate() {
-        if focus_line_span
+        if highlight_line_span
             .as_ref()
             .is_some_and(|focus| focus.contains(&index))
         {
@@ -2854,7 +2906,7 @@ fn build_source_context_content(
                 palette,
                 language.as_ref(),
             ));
-        } else if focus_line_span.is_some() {
+        } else if highlight_line_span.is_some() {
             lines.push(format_context_line(
                 &mut state.highlighted_line_cache,
                 line,
@@ -2874,7 +2926,7 @@ fn build_source_context_content(
     BuiltContent {
         total_lines: lines.len(),
         lines,
-        focus_row_range: focus_line_span,
+        focus_row_range,
     }
 }
 
@@ -5662,6 +5714,127 @@ mod diff_scope_tests {
         assert_eq!(rendered[1], "line2");
         assert!(rendered[2].contains("line3"));
         assert_eq!(content.focus_row_range, Some(1..2));
+    }
+
+    #[test]
+    fn build_file_lines_source_mode_focuses_changed_rows_within_selected_block() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_file_source_focuses_changed_rows")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = concat!(
+            "line1
+",
+            "line2
+",
+            "line3
+",
+            "line4
+",
+            "line5
+",
+            "line6
+",
+            "line7
+",
+            "line8 changed
+",
+            "line9
+",
+            "line10
+"
+        );
+        let block_content = concat!(
+            "line5
+",
+            "line6
+",
+            "line7
+",
+            "line8 changed
+",
+            "line9
+"
+        );
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 4, 9);
+        state.view_mode = ViewMode::Source;
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::context(
+                            "line1
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line2
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line3
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line4
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line5
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line6
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line7
+",
+                        ),
+                        vcs::DiffHunkLine::removed(
+                            "line8
+",
+                        ),
+                        vcs::DiffHunkLine::added(
+                            "line8 changed
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line9
+",
+                        ),
+                        vcs::DiffHunkLine::context(
+                            "line10
+",
+                        ),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_file_lines(&mut state, &snapshot, &palette, 5, 80);
+
+        assert_eq!(content.focus_row_range, Some(7..8));
+        assert_eq!(
+            scroll_offset_for_focus_range(
+                content
+                    .focus_row_range
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("expected source focus row range")),
+                5,
+                content.total_lines,
+            ),
+            5
+        );
     }
 
     #[test]
