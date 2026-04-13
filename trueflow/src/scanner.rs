@@ -18,10 +18,36 @@ const DEFAULT_IGNORE_NAMES: &[&str] =
     &[".git", ".trueflow", "target", "node_modules", "mutants.out"];
 const SCAN_CACHE_FORMAT_VERSION: u32 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCacheMode {
+    Disabled,
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl ScanCacheMode {
+    pub fn from_flags(use_cache: bool, write_cache: bool) -> Self {
+        match (use_cache, write_cache) {
+            (false, false) => Self::Disabled,
+            (true, false) => Self::ReadOnly,
+            (false, true) => Self::WriteOnly,
+            (true, true) => Self::ReadWrite,
+        }
+    }
+
+    fn reads_enabled(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    fn writes_enabled(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOptions {
-    pub use_cache: bool,
-    pub write_cache: bool,
+    pub cache_mode: ScanCacheMode,
     pub cache_dir: Option<PathBuf>,
     pub ignore_names: Vec<String>,
     pub ignore_globs: Vec<String>,
@@ -31,8 +57,7 @@ pub struct ScanOptions {
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
-            use_cache: true,
-            write_cache: true,
+            cache_mode: ScanCacheMode::ReadWrite,
             cache_dir: None,
             ignore_names: DEFAULT_IGNORE_NAMES
                 .iter()
@@ -109,7 +134,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         rescanned_files: 0,
     };
 
-    let cached_entry = if options.use_cache {
+    let cached_entry = if options.cache_mode.reads_enabled() {
         match load_cache_entry(root, options) {
             Ok(Some(entry)) => {
                 cache.read = ScanCacheReadStatus::Hit;
@@ -162,7 +187,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 
-    if options.write_cache {
+    if options.cache_mode.writes_enabled() {
         match write_cache(root, options, cache_files) {
             Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
             Err(err) => {
@@ -667,6 +692,26 @@ mod tests {
             &RepoPath::new("src/generate.rs").unwrap(),
             &prefix,
         ));
+    }
+
+    #[test]
+    fn scan_cache_mode_maps_bool_pairs_to_explicit_modes() {
+        assert_eq!(
+            ScanCacheMode::from_flags(false, false),
+            ScanCacheMode::Disabled
+        );
+        assert_eq!(
+            ScanCacheMode::from_flags(true, false),
+            ScanCacheMode::ReadOnly
+        );
+        assert_eq!(
+            ScanCacheMode::from_flags(false, true),
+            ScanCacheMode::WriteOnly
+        );
+        assert_eq!(
+            ScanCacheMode::from_flags(true, true),
+            ScanCacheMode::ReadWrite
+        );
     }
 
     #[test]

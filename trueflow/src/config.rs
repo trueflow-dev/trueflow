@@ -7,7 +7,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::block::BlockKind;
 use crate::repo_path::RepoPath;
-use crate::scanner::ScanOptions;
+use crate::scanner::{ScanCacheMode, ScanOptions};
 
 const CONFIG_FILE_NAME: &str = "trueflow.toml";
 
@@ -439,8 +439,7 @@ impl ScanConfig {
         validate_ignore_globs(&self.ignore_globs)?;
 
         let mut options = ScanOptions {
-            use_cache: self.use_cache,
-            write_cache: self.write_cache,
+            cache_mode: ScanCacheMode::from_flags(self.use_cache, self.write_cache),
             cache_dir: self.cache_dir.clone(),
             ..ScanOptions::default()
         };
@@ -864,8 +863,7 @@ ignore_path_prefixes = ["vendor", "generated"]
             .scan
             .resolve_options()
             .unwrap_or_else(|err| panic!("resolve scan options: {err}"));
-        assert!(!options.use_cache);
-        assert!(options.write_cache);
+        assert_eq!(options.cache_mode, ScanCacheMode::WriteOnly);
         assert_eq!(options.cache_dir, Some(PathBuf::from("custom-cache")));
         assert!(options.ignore_names.iter().any(|name| name == ".git"));
         assert!(options.ignore_names.iter().any(|name| name == "dist"));
