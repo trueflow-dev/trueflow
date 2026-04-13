@@ -6,6 +6,7 @@ use trueflow::commands::tui::test_support::{
     MarkActionRunner, ScriptedMarkAction, ScriptedSessionRecap, ScriptedTui,
 };
 use trueflow::repo_path::RepoPath;
+use trueflow::review_speedread::PlaybackState;
 use trueflow::vcs;
 
 mod common;
@@ -477,6 +478,54 @@ fn source_view_expands_tabs_before_rendering_code_lines() -> Result<()> {
     assert!(
         rows.iter().any(|row| row.contains("xx......foo界界")),
         "expected focus rows to preserve tab width before wide characters: {rows:#?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn speed_read_space_only_dispatches_while_current_mode_is_speed_read() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(80, 18),
+        "src/lib.rs",
+        "alpha beta gamma delta\n",
+        "alpha beta gamma delta\n",
+        0,
+        1,
+    )?;
+
+    app.send_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))?;
+    app.render()?;
+    assert!(
+        app.is_speed_read_active(),
+        "expected speed read mode after activation"
+    );
+    assert_eq!(app.speed_read_playback(), Some(PlaybackState::Paused));
+
+    app.send_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))?;
+    app.render()?;
+    assert!(
+        app.is_speed_read_active(),
+        "expected to remain in speed read mode after play"
+    );
+    assert_eq!(app.speed_read_playback(), Some(PlaybackState::Playing));
+
+    app.send_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))?;
+    app.render()?;
+    assert!(
+        !app.is_speed_read_active(),
+        "did not expect stale speed read mode at root"
+    );
+    assert!(
+        app.is_at_root(),
+        "expected root navigation after leaving the block"
+    );
+
+    app.send_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))?;
+    app.render()?;
+    assert!(
+        !app.is_speed_read_active(),
+        "did not expect space to revive speed read off the active block"
     );
 
     Ok(())

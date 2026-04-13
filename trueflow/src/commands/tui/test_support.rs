@@ -4,13 +4,13 @@ use super::{
     TuiSpeedReadConfig, UiMode, ViewMode, clear_editing_validation, clear_focus_scroll,
     clear_speed_read_if_not_on_current_node, current_ui_mode, editing_key_action_for_event,
     execute_action_with, handle_child, handle_confirm_cancel, handle_editing_cancel,
-    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action,
-    handle_parent, handle_paste_event, handle_prev, handle_scroll_line_down,
-    handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
-    handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
-    key_event_for_press_event, key_event_for_press_or_repeat_event,
-    keybind_action_accepts_repeat, keybind_action_for_key_code, set_focus_for_current_node,
-    should_rerender_on_event, toggle_speed_read_mode, ui, vcs,
+    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
+    handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
+    handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding,
+    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
+    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
+    keybind_action_for_key_code, set_focus_for_current_node, should_rerender_on_event,
+    toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
@@ -241,6 +241,21 @@ where
     pub fn root_cursor_label(&self) -> Option<String> {
         let id = self.state.root_cursor?;
         Some(self.state.navigator.tree.node(id).name.clone())
+    }
+
+    pub fn is_at_root(&self) -> bool {
+        self.state.navigator.current_id() == self.state.navigator.tree.root()
+    }
+
+    pub fn is_speed_read_active(&self) -> bool {
+        matches!(current_ui_mode(&self.state), UiMode::SpeedRead)
+    }
+
+    pub fn speed_read_playback(&self) -> Option<crate::review_speedread::PlaybackState> {
+        self.state
+            .speed_read
+            .active_for(self.state.navigator.current_id())
+            .map(|mode| mode.model.playback)
     }
 
     fn apply_event(&mut self, event: &Event) -> Result<()> {
