@@ -14,8 +14,9 @@ fn bench_full_review(c: &mut Criterion) {
     group.bench_function("review_bench_workspace_cold", |b| {
         b.iter_batched(
             || {
-                ReviewBenchRepo::fixture("review_bench_workspace")
-                    .unwrap_or_else(|error| panic!("failed to prepare cold bench fixture: {error}"))
+                ReviewBenchRepo::fixture("review_bench_workspace").unwrap_or_else(|error| {
+                    panic!("failed to prepare cold benchmark fixture: {error}")
+                })
             },
             |repo| {
                 let summary = repo
@@ -32,7 +33,7 @@ fn bench_full_review(c: &mut Criterion) {
             || {
                 let repo =
                     ReviewBenchRepo::fixture("review_bench_workspace").unwrap_or_else(|error| {
-                        panic!("failed to prepare warm bench fixture: {error}")
+                        panic!("failed to prepare warm benchmark fixture: {error}")
                     });
                 repo.full_review_summary()
                     .unwrap_or_else(|error| panic!("failed to warm benchmark fixture: {error}"));
