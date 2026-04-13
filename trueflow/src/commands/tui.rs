@@ -298,6 +298,15 @@ enum ViewMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UiMode {
+    Navigation,
+    DiffReview,
+    SourceReview,
+    SpeedRead,
+    Recap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ContentFrameCacheKey {
     node_id: TreeNodeId,
     focus_block: Option<TreeNodeId>,
@@ -861,8 +870,9 @@ fn run_app(
                     continue;
                 };
                 let key_code = key_event.code;
+                let ui_mode = current_ui_mode(&state);
 
-                if is_recap_mode(&state) {
+                if matches!(ui_mode, UiMode::Recap) {
                     if key_event.kind == KeyEventKind::Press
                         && recap_key_should_exit(&state.keybinds, key_code)
                     {
@@ -872,7 +882,8 @@ fn run_app(
                     continue;
                 }
 
-                if key_event.kind == KeyEventKind::Press
+                if matches!(ui_mode, UiMode::SpeedRead)
+                    && key_event.kind == KeyEventKind::Press
                     && handle_speed_read_key_binding(&mut state, key_code)
                 {
                     needs_render = true;
@@ -1940,14 +1951,10 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let header_lines = build_header_lines(node, state, palette);
 
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
-    let actions_context = if matches!(node.kind, TreeNodeKind::Root) {
-        ActionLineContext::Root
-    } else {
-        ActionLineContext::Review
-    };
+    let ui_mode = current_ui_mode(state);
     let actions_lines = build_action_lines(
         focus_layout.actions.width,
-        actions_context,
+        ui_mode,
         &state.keybinds,
         palette,
     );
@@ -2304,6 +2311,7 @@ fn build_header_lines(
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let ui_mode = current_ui_mode(state);
 
     let header_text = match node.kind {
         TreeNodeKind::Root => format!("Repository (Root node) @ {}", state.repo_name),
@@ -2327,7 +2335,7 @@ fn build_header_lines(
 
     lines.push(format_header_row(&header_text, palette, true));
     lines.push(format_header_row(
-        &format!("Mode: {}", view_mode_label(state.view_mode)),
+        &format!("Mode: {}", ui_mode_label(ui_mode)),
         palette,
         false,
     ));
@@ -2361,10 +2369,28 @@ fn build_header_lines(
     lines
 }
 
-fn view_mode_label(view_mode: ViewMode) -> &'static str {
-    match view_mode {
-        ViewMode::Diff => "Diff",
-        ViewMode::Source => "Source",
+fn current_ui_mode(state: &AppState) -> UiMode {
+    if is_recap_mode(state) {
+        UiMode::Recap
+    } else if state.speed_read.is_active_for(state.navigator.current_id()) {
+        UiMode::SpeedRead
+    } else if state.navigator.current_id() == state.navigator.tree.root() {
+        UiMode::Navigation
+    } else {
+        match state.view_mode {
+            ViewMode::Diff => UiMode::DiffReview,
+            ViewMode::Source => UiMode::SourceReview,
+        }
+    }
+}
+
+fn ui_mode_label(mode: UiMode) -> &'static str {
+    match mode {
+        UiMode::Navigation => "Navigation",
+        UiMode::DiffReview => "Diff Review",
+        UiMode::SourceReview => "Source Review",
+        UiMode::SpeedRead => "Speed Read",
+        UiMode::Recap => "Recap",
     }
 }
 
@@ -2387,24 +2413,23 @@ fn scope_selector_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActionLineContext {
-    Root,
-    Review,
-}
-
 fn build_action_lines(
     width: u16,
-    context: ActionLineContext,
+    mode: UiMode,
     keybinds: &TuiKeybindsConfig,
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
     let approve_action = format_key_action(keybinds.approve, "approve");
     let note_action = format_key_action(keybinds.note, note_action_label(keybinds.note));
-    let mode_action = format_key_action(keybinds.toggle_view, "mode");
+    let mode_action = match mode {
+        UiMode::DiffReview => format_key_action(keybinds.toggle_view, "source"),
+        UiMode::SourceReview => format_key_action(keybinds.toggle_view, "diff"),
+        _ => format_key_action(keybinds.toggle_view, "mode"),
+    };
+    let speed_read_action = format_key_action(keybinds.speed_read, "speed");
     let quit_action = format_key_action(keybinds.quit, "quit");
-    let phrases = match context {
-        ActionLineContext::Root => vec![
+    let phrases = match mode {
+        UiMode::Navigation => vec![
             format!("[{}/{}]move", keybinds.scroll_down, keybinds.scroll_up),
             format!("[{}/{}/Enter]open", keybinds.next, keybinds.child),
             format!("[{}/{}]back", keybinds.prev, keybinds.parent),
@@ -2412,7 +2437,7 @@ fn build_action_lines(
             note_action,
             quit_action,
         ],
-        ActionLineContext::Review => vec![
+        UiMode::DiffReview | UiMode::SourceReview => vec![
             "[PgUp/PgDown]".to_string(),
             format_key_action(keybinds.prev, "prev"),
             format_key_action(keybinds.next, "next"),
@@ -2422,7 +2447,21 @@ fn build_action_lines(
             format_key_action(keybinds.child, "child"),
             approve_action,
             note_action,
+            speed_read_action,
             mode_action,
+            quit_action,
+        ],
+        UiMode::SpeedRead => vec![
+            "[Space]play/pause".to_string(),
+            "[j]prev".to_string(),
+            "[l]next".to_string(),
+            "[-/=]wpm".to_string(),
+            "[[/]]words".to_string(),
+            "[0]reset".to_string(),
+            format!("[{}/Esc]exit", keybinds.speed_read),
+        ],
+        UiMode::Recap => vec![
+            format!("[{}]done", RECAP_DONE_KEY),
             quit_action,
         ],
     };
@@ -4473,7 +4512,7 @@ mod diff_scope_tests {
             quit: 'x',
         };
         let palette = UiPalette::default();
-        let lines = build_action_lines(80, ActionLineContext::Root, &keybinds, &palette);
+        let lines = build_action_lines(80, UiMode::Navigation, &keybinds, &palette);
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
@@ -4490,7 +4529,6 @@ mod diff_scope_tests {
         assert!(joined.contains("[x]quit"));
         assert!(!joined.contains("prev/next"));
         assert!(!joined.contains("line-scroll"));
-        assert!(!joined.contains("speed-read"));
         assert!(!joined.contains("root"));
     }
 
@@ -4498,12 +4536,13 @@ mod diff_scope_tests {
     fn build_action_lines_for_review_nodes_use_mode_label_and_configured_keys() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         let palette = UiPalette::default();
-        let lines = build_action_lines(120, ActionLineContext::Review, &keybinds, &palette);
+        let lines = build_action_lines(120, UiMode::DiffReview, &keybinds, &palette);
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
         assert_eq!(lines.len(), 1);
         assert!(joined.contains("[PgUp/PgDown]"));
+        assert!(joined.contains("[r]speed"));
         assert!(joined.contains("[h]prev"));
         assert!(joined.contains("[l]next"));
         assert!(joined.contains("[j]down"));
@@ -4512,7 +4551,7 @@ mod diff_scope_tests {
         assert!(joined.contains("[c]hild"));
         assert!(joined.contains("[a]pprove"));
         assert!(joined.contains("[n]ote"));
-        assert!(joined.contains("[m]ode"));
+        assert!(joined.contains("[m]source"));
         assert!(joined.contains("[q]uit"));
         assert!(!joined.contains('↓'));
         assert!(!joined.contains('↑'));
@@ -4527,10 +4566,27 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn build_action_lines_for_speed_read_mode_use_speed_read_controls() {
+        let keybinds = crate::config::TuiKeybindsConfig::default();
+        let palette = UiPalette::default();
+        let lines = build_action_lines(120, UiMode::SpeedRead, &keybinds, &palette);
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let joined = rendered.join(" ");
+
+        assert!(joined.contains("[Space]play/pause"));
+        assert!(joined.contains("[j]prev"));
+        assert!(joined.contains("[l]next"));
+        assert!(joined.contains("[-/=]wpm"));
+        assert!(joined.contains("[[/]]words"));
+        assert!(joined.contains("[0]reset"));
+        assert!(joined.contains("[r/Esc]exit"));
+    }
+
+    #[test]
     fn build_action_lines_wrap_when_width_is_narrow() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         let palette = UiPalette::default();
-        let lines = build_action_lines(60, ActionLineContext::Review, &keybinds, &palette);
+        let lines = build_action_lines(60, UiMode::DiffReview, &keybinds, &palette);
 
         assert!(lines.len() > 1, "expected narrow action area to wrap");
     }
@@ -4542,7 +4598,7 @@ mod diff_scope_tests {
             ..crate::config::TuiKeybindsConfig::default()
         };
         let palette = UiPalette::default();
-        let lines = build_action_lines(80, ActionLineContext::Review, &keybinds, &palette);
+        let lines = build_action_lines(80, UiMode::DiffReview, &keybinds, &palette);
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
@@ -6251,14 +6307,48 @@ mod diff_scope_tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert!(diff_header.iter().any(|line| line == "Mode: Diff"));
+        assert!(diff_header.iter().any(|line| line == "Mode: Diff Review"));
 
         state.view_mode = ViewMode::Source;
         let source_header = build_header_lines(file_node, &state, &palette)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert!(source_header.iter().any(|line| line == "Mode: Source"));
+        assert!(source_header.iter().any(|line| line == "Mode: Source Review"));
+    }
+
+    #[test]
+    fn build_header_lines_show_navigation_mode_for_root_nodes() {
+        let mut state = build_test_state(ReviewScope::All, None, HashMap::new());
+        state.total_blocks = 1;
+        state.initial_remaining_blocks = 1;
+        state.remaining_blocks = 1;
+        state.navigator.jump_root();
+        let palette = UiPalette::default();
+        let root_node = state.navigator.tree.node(state.navigator.tree.root());
+
+        let header = build_header_lines(root_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(header.iter().any(|line| line == "Mode: Navigation"));
+    }
+
+    #[test]
+    fn build_header_lines_show_speed_read_mode_when_active() {
+        let (mut state, block_id) = build_state_with_single_block("alpha beta gamma delta");
+        let palette = UiPalette::default();
+
+        toggle_speed_read_mode(&mut state);
+
+        let block_node = state.navigator.tree.node(block_id);
+        let header = build_header_lines(block_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(header.iter().any(|line| line == "Mode: Speed Read"));
     }
 
     #[test]
@@ -6778,7 +6868,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn toggle_speed_read_mode_activates_on_block_node() {
+    fn toggle_speed_read_mode_starts_autoplay_on_block_node() {
         let (mut state, block_id) = build_state_with_single_block("alpha beta gamma");
         assert!(state.speed_read.is_none());
 
@@ -6788,7 +6878,8 @@ mod diff_scope_tests {
             panic!("expected speed read mode to activate");
         };
         assert_eq!(mode.node_id, block_id);
-        assert_eq!(mode.model.playback, PlaybackState::Paused);
+        assert_eq!(mode.model.playback, PlaybackState::Playing);
+        assert!(mode.next_tick_at.is_some());
     }
 
     #[test]
@@ -6802,7 +6893,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn speed_read_space_toggles_playback_and_sets_next_tick() {
+    fn speed_read_space_toggles_playback_after_autoplay_starts() {
         let (mut state, _) = build_state_with_single_block("alpha beta gamma delta");
         toggle_speed_read_mode(&mut state);
 
@@ -6814,18 +6905,14 @@ mod diff_scope_tests {
         let Some(mode) = state.speed_read.as_ref() else {
             panic!("expected speed read mode to remain active");
         };
-        assert_eq!(mode.model.playback, PlaybackState::Playing);
-        assert!(mode.next_tick_at.is_some());
+        assert_eq!(mode.model.playback, PlaybackState::Paused);
+        assert!(mode.next_tick_at.is_none());
     }
 
     #[test]
     fn speed_read_autoplay_timeout_exits_to_normal_view_at_end() {
         let (mut state, _) = build_state_with_single_block("alpha beta");
         toggle_speed_read_mode(&mut state);
-        assert!(handle_speed_read_key_binding(
-            &mut state,
-            KeyCode::Char(' ')
-        ));
 
         if let Some(mode) = state.speed_read.as_mut() {
             mode.next_tick_at = Some(Instant::now());

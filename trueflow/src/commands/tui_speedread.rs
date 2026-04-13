@@ -152,16 +152,27 @@ impl SpeedReadController {
             .persisted_defaults
             .default_chunk_words
             .clamp(self.config.min_chunk_words, self.config.max_chunk_words);
-        let model = build_speed_read_model(&block.content, default_wpm, default_chunk_words);
+        let mut model = build_speed_read_model(&block.content, default_wpm, default_chunk_words);
         let show_prose_optimization_hint =
             self.config.show_prose_optimization_hint && is_code_heavy_text(&block.content);
 
-        self.active = Some(SpeedReadUiState {
+        if !model.phrases.is_empty() {
+            model.playback = PlaybackState::Playing;
+        }
+
+        let mut active = SpeedReadUiState {
             node_id: current_node_id,
             model,
             next_tick_at: None,
             show_prose_optimization_hint,
-        });
+        };
+        update_next_tick(
+            &mut active,
+            self.config.punctuation_dwell,
+            self.config.punctuation_dwell_multiplier,
+        );
+
+        self.active = Some(active);
         true
     }
 

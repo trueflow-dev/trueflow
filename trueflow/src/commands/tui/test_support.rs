@@ -1,16 +1,16 @@
 use super::{
     AppState, EditingKeyAction, Event, InputMode, KeyCode, KeyEvent, KeyEventKind, KeybindAction,
     Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers, TuiKeybindsConfig,
-    TuiSpeedReadConfig, ViewMode, clear_editing_validation, clear_focus_scroll,
-    clear_speed_read_if_not_on_current_node, editing_key_action_for_event, execute_action_with,
-    handle_child, handle_confirm_cancel, handle_editing_cancel, handle_editing_submit_with,
-    handle_mouse_event, handle_next, handle_note_action, handle_parent, handle_paste_event,
-    handle_prev, handle_scroll_line_down, handle_scroll_line_up, handle_scroll_page_down,
-    handle_scroll_page_up, handle_speed_read_key_binding, is_recap_mode,
-    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
-    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
-    keybind_action_for_key_code, set_focus_for_current_node, should_rerender_on_event,
-    toggle_speed_read_mode, ui, vcs,
+    TuiSpeedReadConfig, UiMode, ViewMode, clear_editing_validation, clear_focus_scroll,
+    clear_speed_read_if_not_on_current_node, current_ui_mode, editing_key_action_for_event,
+    execute_action_with, handle_child, handle_confirm_cancel, handle_editing_cancel,
+    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action,
+    handle_parent, handle_paste_event, handle_prev, handle_scroll_line_down,
+    handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
+    handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
+    key_event_for_press_event, key_event_for_press_or_repeat_event,
+    keybind_action_accepts_repeat, keybind_action_for_key_code, set_focus_for_current_node,
+    should_rerender_on_event, toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
@@ -276,12 +276,14 @@ where
             return Ok(());
         };
         let key_code = key_event.code;
+        let ui_mode = current_ui_mode(&self.state);
 
-        if is_recap_mode(&self.state) {
+        if matches!(ui_mode, UiMode::Recap) {
             return Ok(());
         }
 
-        if key_event.kind == KeyEventKind::Press
+        if matches!(ui_mode, UiMode::SpeedRead)
+            && key_event.kind == KeyEventKind::Press
             && handle_speed_read_key_binding(&mut self.state, key_code)
         {
             return Ok(());
