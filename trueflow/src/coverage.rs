@@ -29,12 +29,24 @@ pub enum CoverageDiagnostic {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageScope {
+    Direct,
+    Effective,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictRequirement {
+    Any,
+    ApprovedOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct CoveragePolicy {
     pub required_checks: Vec<ReviewCheck>,
     pub min_distinct_identities: usize,
-    pub require_approved: bool,
-    pub count_inherited: bool,
+    pub verdict_requirement: VerdictRequirement,
+    pub scope: CoverageScope,
 }
 
 impl CoveragePolicy {
@@ -42,8 +54,8 @@ impl CoveragePolicy {
         Self {
             required_checks: vec![ReviewCheck::review()],
             min_distinct_identities: 1,
-            require_approved: true,
-            count_inherited: false,
+            verdict_requirement: VerdictRequirement::ApprovedOnly,
+            scope: CoverageScope::Direct,
         }
     }
 
@@ -51,8 +63,20 @@ impl CoveragePolicy {
         Self {
             required_checks: vec![ReviewCheck::review()],
             min_distinct_identities: 2,
-            require_approved: true,
-            count_inherited: false,
+            verdict_requirement: VerdictRequirement::ApprovedOnly,
+            scope: CoverageScope::Direct,
+        }
+    }
+
+    pub fn with_scope(mut self, scope: CoverageScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    fn allows_verdict(&self, verdict: Option<&Verdict>) -> bool {
+        match self.verdict_requirement {
+            VerdictRequirement::Any => true,
+            VerdictRequirement::ApprovedOnly => verdict == Some(&Verdict::Approved),
         }
     }
 }
@@ -336,19 +360,18 @@ impl<'a> NodeCoverage<'a> {
 
     pub fn is_well_reviewed(&self, policy: &CoveragePolicy) -> bool {
         policy.required_checks.iter().all(|check| {
-            let verdict = if policy.count_inherited {
-                self.effective_latest_verdict_for(check)
-            } else {
-                self.direct_latest_verdict_for(check)
-            };
-            let identity_count = if policy.count_inherited {
-                self.effective_distinct_identity_count(check)
-            } else {
-                self.direct_distinct_identity_count(check)
+            let (verdict, identity_count) = match policy.scope {
+                CoverageScope::Direct => (
+                    self.direct_latest_verdict_for(check),
+                    self.direct_distinct_identity_count(check),
+                ),
+                CoverageScope::Effective => (
+                    self.effective_latest_verdict_for(check),
+                    self.effective_distinct_identity_count(check),
+                ),
             };
 
-            (!policy.require_approved || verdict == Some(&Verdict::Approved))
-                && identity_count >= policy.min_distinct_identities
+            policy.allows_verdict(verdict) && identity_count >= policy.min_distinct_identities
         })
     }
 
@@ -466,19 +489,18 @@ impl<'a> BlockCoverage<'a> {
 
     pub fn is_well_reviewed(&self, policy: &CoveragePolicy) -> bool {
         policy.required_checks.iter().all(|check| {
-            let verdict = if policy.count_inherited {
-                self.effective_latest_verdict_for(check)
-            } else {
-                self.direct_latest_verdict_for(check)
-            };
-            let identity_count = if policy.count_inherited {
-                self.effective_distinct_identity_count(check)
-            } else {
-                self.direct_distinct_identity_count(check)
+            let (verdict, identity_count) = match policy.scope {
+                CoverageScope::Direct => (
+                    self.direct_latest_verdict_for(check),
+                    self.direct_distinct_identity_count(check),
+                ),
+                CoverageScope::Effective => (
+                    self.effective_latest_verdict_for(check),
+                    self.effective_distinct_identity_count(check),
+                ),
             };
 
-            (!policy.require_approved || verdict == Some(&Verdict::Approved))
-                && identity_count >= policy.min_distinct_identities
+            policy.allows_verdict(verdict) && identity_count >= policy.min_distinct_identities
         })
     }
 }
@@ -977,6 +999,41 @@ mod tests {
                 .direct_latest_verdict_for(&security),
             Some(&Verdict::Approved)
         );
+    }
+
+    #[test]
+    fn single_review_policy_defaults_to_direct_approved_scope() {
+        let policy = CoveragePolicy::single_review();
+
+        assert_eq!(policy.scope, CoverageScope::Direct);
+        assert_eq!(policy.verdict_requirement, VerdictRequirement::ApprovedOnly);
+        assert_eq!(policy.min_distinct_identities, 1);
+    }
+
+    #[test]
+    fn effective_scope_policy_counts_inherited_reviews() {
+        let (tree, file_id, function_id, _, _) = build_function_tree();
+        let file_hash = tree.node(file_id).hash.clone();
+        let records = vec![file_record(
+            "1",
+            file_hash,
+            "review",
+            Verdict::Approved,
+            "alice@example.com",
+            1,
+        )];
+        let database = ReviewDatabase::from_records(records);
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+
+        assert!(
+            !coverage
+                .node(function_id)
+                .is_well_reviewed(&CoveragePolicy::single_review())
+        );
+        assert!(coverage.node(function_id).is_well_reviewed(
+            &CoveragePolicy::single_review().with_scope(CoverageScope::Effective)
+        ));
     }
 
     #[test]

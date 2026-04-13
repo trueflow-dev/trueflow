@@ -2,6 +2,7 @@ use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::coverage::{
     BindingRelation, CoverageBuildOptions, CoverageDiagnostic, CoverageIndex, CoveragePolicy,
+    CoverageScope,
 };
 use crate::path_utils;
 use crate::repo_path::RepoPath;
@@ -209,11 +210,9 @@ fn build_coverage_summary(
     }
 
     let single_direct = CoveragePolicy::single_review();
-    let mut single_effective = CoveragePolicy::single_review();
-    single_effective.count_inherited = true;
+    let single_effective = CoveragePolicy::single_review().with_scope(CoverageScope::Effective);
     let two_direct = CoveragePolicy::two_person_review();
-    let mut two_effective = CoveragePolicy::two_person_review();
-    two_effective.count_inherited = true;
+    let two_effective = CoveragePolicy::two_person_review().with_scope(CoverageScope::Effective);
 
     let related_record_ids = linked_reviews
         .iter()
