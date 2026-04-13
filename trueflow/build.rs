@@ -1,5 +1,7 @@
 #[path = "src/build_metadata.rs"]
 mod build_metadata;
+#[path = "src/build_script_support.rs"]
+mod build_script_support;
 
 use std::env;
 use std::fs;
@@ -18,30 +20,19 @@ fn main() {
 }
 
 fn emit_git_rerun_hints() {
-    let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
-        return;
-    };
-    let Some(repo_root) = manifest_dir.parent() else {
-        return;
-    };
-    let git_dir = repo_root.join(".git");
-    let head_path = git_dir.join("HEAD");
-    println!("cargo:rerun-if-changed={}", head_path.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        git_dir.join("packed-refs").display()
-    );
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let head_contents = manifest_dir
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|repo_root| repo_root.join(".git").join("HEAD"))
+        .and_then(|head_path| fs::read_to_string(head_path).ok());
 
-    let Ok(head_contents) = fs::read_to_string(&head_path) else {
-        return;
-    };
-    let Some(reference) = head_contents.strip_prefix("ref: ").map(str::trim) else {
-        return;
-    };
-    println!(
-        "cargo:rerun-if-changed={}",
-        git_dir.join(reference).display()
-    );
+    for path in build_script_support::git_rerun_hint_paths(
+        manifest_dir.as_deref(),
+        head_contents.as_deref(),
+    ) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 fn git_commit_hash() -> String {
@@ -50,15 +41,5 @@ fn git_commit_hash() -> String {
 
 fn run_command(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let value = String::from_utf8(output.stdout).ok()?;
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    build_script_support::normalized_command_stdout(output.status.success(), &output.stdout)
 }
