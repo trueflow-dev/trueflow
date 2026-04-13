@@ -1206,11 +1206,13 @@ fn is_recap_mode(state: &AppState) -> bool {
     matches!(state.input_mode, InputMode::Normal) && state.remaining_blocks == 0
 }
 
+const RECAP_DONE_KEY: char = 'd';
+
 fn recap_key_should_exit(keybinds: &TuiKeybindsConfig, key_code: KeyCode) -> bool {
-    matches!(key_code, KeyCode::Esc)
+    matches!(key_code, KeyCode::Esc | KeyCode::Char(RECAP_DONE_KEY))
         || matches!(
             keybind_action_for_key_code(keybinds, key_code),
-            Some(KeybindAction::Quit | KeybindAction::ToggleView)
+            Some(KeybindAction::Quit)
         )
 }
 
@@ -1917,7 +1919,7 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
 
     if is_recap_mode(state) {
         render_recap_view(frame, state, content_area, &palette);
-        render_recap_footer(frame, footer_area, &palette);
+        render_recap_footer(frame, footer_area, &palette, &state.keybinds);
     } else {
         render_active_node(frame, state, content_area, &palette);
         render_footer(frame, state, footer_area, &palette);
@@ -2541,10 +2543,22 @@ fn render_recap_view(frame: &mut Frame, state: &AppState, area: Rect, palette: &
     );
 }
 
-fn render_recap_footer(frame: &mut Frame, area: Rect, palette: &UiPalette) {
+fn recap_footer_hint_text(keybinds: &TuiKeybindsConfig) -> String {
+    format!(
+        "Press [{}] done or [{}] quit",
+        RECAP_DONE_KEY, keybinds.quit
+    )
+}
+
+fn render_recap_footer(
+    frame: &mut Frame,
+    area: Rect,
+    palette: &UiPalette,
+    keybinds: &TuiKeybindsConfig,
+) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "Press [d] done or [q] quit",
+            recap_footer_hint_text(keybinds),
             Style::default()
                 .fg(palette.fg)
                 .bg(palette.bg)
@@ -6711,12 +6725,40 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn recap_key_handler_exits_on_q_and_mode() {
+    fn recap_key_handler_exits_on_done_and_quit_only() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         assert!(recap_key_should_exit(&keybinds, KeyCode::Char('q')));
-        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('m')));
+        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('d')));
         assert!(recap_key_should_exit(&keybinds, KeyCode::Esc));
-        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('d')));
+        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('m')));
+    }
+
+    #[test]
+    fn recap_footer_hint_text_uses_configured_keybinds() {
+        let default_keybinds = crate::config::TuiKeybindsConfig::default();
+        assert_eq!(
+            recap_footer_hint_text(&default_keybinds),
+            "Press [d] done or [q] quit"
+        );
+
+        let custom_keybinds = crate::config::TuiKeybindsConfig {
+            scroll_up: 'i',
+            scroll_down: 'k',
+            prev: 'j',
+            next: 'l',
+            parent: 'u',
+            child: 'o',
+            approve: 'y',
+            note: 'e',
+            toggle_view: 'v',
+            speed_read: 's',
+            root: 'z',
+            quit: 'x',
+        };
+        assert_eq!(
+            recap_footer_hint_text(&custom_keybinds),
+            "Press [d] done or [x] quit"
+        );
     }
 
     #[test]
