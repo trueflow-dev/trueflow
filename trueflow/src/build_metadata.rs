@@ -81,4 +81,20 @@ mod tests {
             UNKNOWN_BUILD_TIMESTAMP
         );
     }
+
+    #[test]
+    fn trims_surrounding_whitespace_from_epoch_input() {
+        assert_eq!(
+            build_timestamp_from_source_date_epoch(Some(" 1709210096\n")),
+            "2024-02-29T12:34:56Z"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_unknown_when_epoch_overflows_u64() {
+        assert_eq!(
+            build_timestamp_from_source_date_epoch(Some("18446744073709551616")),
+            UNKNOWN_BUILD_TIMESTAMP
+        );
+    }
 }
