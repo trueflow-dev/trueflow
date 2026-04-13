@@ -79,7 +79,9 @@ fn main() -> Result<()> {
             split,
             coverage,
         } => commands::inspect::run(&context, fingerprint, *split, *coverage),
-        Commands::Verify { all, id } => commands::verify::run(*all, id.as_deref()),
+        Commands::Verify { all, id } => commands::verify::run(
+            commands::verify::VerifySelection::from_args(*all, id.as_deref())?,
+        ),
         Commands::Tui {
             all,
             target,

@@ -70,11 +70,28 @@ impl Drop for Verifier {
     }
 }
 
-pub fn run(all: bool, id: Option<&str>) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifySelection<'a> {
+    All,
+    Id(&'a str),
+}
+
+impl<'a> VerifySelection<'a> {
+    pub fn from_args(all: bool, id: Option<&'a str>) -> Result<Self> {
+        match (all, id) {
+            (true, None) => Ok(Self::All),
+            (false, Some(id)) => Ok(Self::Id(id)),
+            (true, Some(_)) => anyhow::bail!("Use --all or --id, not both"),
+            (false, None) => anyhow::bail!("Provide --all or --id"),
+        }
+    }
+}
+
+pub fn run(selection: VerifySelection<'_>) -> Result<()> {
     let store = FileStore::new()?;
     let records = store.read_history()?;
 
-    let filtered = filter_records(records, all, id)?;
+    let filtered = filter_records(records, selection);
 
     let mut attested = 0;
     let mut unattested = 0;
@@ -151,21 +168,89 @@ pub fn run(all: bool, id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn filter_records(records: Vec<Record>, all: bool, id: Option<&str>) -> Result<Vec<Record>> {
-    if all && id.is_some() {
-        anyhow::bail!("Use --all or --id, not both");
-    }
-
-    if !all && id.is_none() {
-        anyhow::bail!("Provide --all or --id");
-    }
-
-    if let Some(target) = id {
-        return Ok(records
+fn filter_records(records: Vec<Record>, selection: VerifySelection<'_>) -> Vec<Record> {
+    match selection {
+        VerifySelection::All => records,
+        VerifySelection::Id(target) => records
             .into_iter()
             .filter(|record| record.id == target)
-            .collect());
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hashing::TreeHash;
+    use crate::store::{
+        BlockState, Identity, RepoRef, RepoRevision, ReviewCheck, ReviewTargetRef, VcsSystem,
+        Verdict,
+    };
+
+    fn record(id: &str) -> Record {
+        Record {
+            id: id.to_string(),
+            version: 1,
+            target: ReviewTargetRef::Block {
+                hash: TreeHash::parse(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            },
+            check: ReviewCheck::review(),
+            verdict: Verdict::Approved,
+            identity: Identity::Email {
+                email: "test@example.com".to_string(),
+            },
+            repo_ref: RepoRef::Vcs {
+                system: VcsSystem::Git,
+                revision: RepoRevision::new("0123456789abcdef").unwrap(),
+            },
+            block_state: BlockState::Committed,
+            timestamp: 1,
+            path_hint: None,
+            line_hint: None,
+            note: None,
+            tags: None,
+            attestations: None,
+        }
     }
 
-    Ok(records)
+    #[test]
+    fn verify_selection_accepts_all_without_id() {
+        assert_eq!(
+            VerifySelection::from_args(true, None).unwrap(),
+            VerifySelection::All
+        );
+    }
+
+    #[test]
+    fn verify_selection_accepts_single_id_without_all() {
+        assert_eq!(
+            VerifySelection::from_args(false, Some("abc")).unwrap(),
+            VerifySelection::Id("abc")
+        );
+    }
+
+    #[test]
+    fn verify_selection_rejects_all_and_id_together() {
+        let error = VerifySelection::from_args(true, Some("abc")).unwrap_err();
+        assert!(error.to_string().contains("Use --all or --id, not both"));
+    }
+
+    #[test]
+    fn verify_selection_requires_all_or_id() {
+        let error = VerifySelection::from_args(false, None).unwrap_err();
+        assert!(error.to_string().contains("Provide --all or --id"));
+    }
+
+    #[test]
+    fn filter_records_uses_explicit_selection() {
+        let records = vec![record("one"), record("two")];
+
+        let filtered = filter_records(records, VerifySelection::Id("two"));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "two");
+    }
 }
