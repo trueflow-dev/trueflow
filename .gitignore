@@ -10,6 +10,7 @@ trueflow/mutants.out/
 trueflow/mutants.out.old/
 result
 infra/terraform/.terraform/
+infra/terraform/backend.hcl
 *.tfstate
 *.tfstate.*
 crash.log

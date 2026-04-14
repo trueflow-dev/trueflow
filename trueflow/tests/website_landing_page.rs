@@ -210,6 +210,7 @@ fn website_styles_define_install_command_and_skip_link_patterns() -> Result<()> 
 
 #[test]
 fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
+    let backend = read_repo_file("infra/terraform/backend.tf")?;
     let versions = read_repo_file("infra/terraform/versions.tf")?;
     let main = read_repo_file("infra/terraform/main.tf")?;
     let variables = read_repo_file("infra/terraform/variables.tf")?;
@@ -222,6 +223,11 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
     let deploy_downloads = read_repo_file("scripts/deploy-downloads.sh")?;
     let gitignore = read_repo_file(".gitignore")?;
 
+    assert_contains(&backend, "backend \"s3\"", "terraform s3 backend block");
+    assert_contains(&backend, "jm-deploy-state-bucket", "terraform backend bucket");
+    assert_contains(&backend, "trueflow/site/terraform.tfstate", "terraform backend key");
+    assert_contains(&backend, "us-west-2", "terraform backend region");
+    assert_contains(&backend, "encrypt = true", "terraform backend encryption");
     assert_contains(&versions, "required_providers", "terraform provider declaration");
     assert_contains(&versions, "source  = \"hashicorp/aws\"", "aws provider source");
     assert_contains(&main, "data \"aws_route53_zone\" \"site\"", "route53 zone lookup");

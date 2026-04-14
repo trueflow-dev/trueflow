@@ -111,5 +111,28 @@ To upload a different artifact directory later:
 
 ## State
 
-The default workflow uses local state for now. If you later want a remote S3
-backend and locking, add that explicitly rather than assuming it exists.
+This repo now commits its S3 backend config directly in `backend.tf`.
+
+Backend:
+
+- bucket: `jm-deploy-state-bucket`
+- key: `trueflow/site/terraform.tfstate`
+- region: `us-west-2`
+- encryption: enabled
+
+So on fresh machine, no extra backend config file needed. Run:
+
+```sh
+nix develop
+tofu -chdir=infra/terraform init
+```
+
+If you already had local state and need to migrate it into S3, run:
+
+```sh
+nix develop
+tofu -chdir=infra/terraform init -migrate-state -force-copy
+```
+
+AWS provider for website infra still targets `us-east-1`; backend region is
+region of S3 state bucket.
