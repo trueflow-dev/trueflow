@@ -205,7 +205,7 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
         Duration::from_secs(10),
         &mut *child,
     )?;
-    send_and_flush(&mut *writer, b"n")?;
+    send_and_flush(&mut *writer, b"c")?;
     wait_for_output(&output, "Type a note", Duration::from_secs(5), &mut *child)?;
     send_and_flush(&mut *writer, b"a")?;
     send_and_flush(&mut *writer, b"\n")?;

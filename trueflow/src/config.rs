@@ -291,11 +291,11 @@ fn default_tui_keybind_next() -> char {
 }
 
 fn default_tui_keybind_parent() -> char {
-    'p'
+    'P'
 }
 
 fn default_tui_keybind_child() -> char {
-    'c'
+    'C'
 }
 
 fn default_tui_keybind_approve() -> char {
@@ -303,7 +303,7 @@ fn default_tui_keybind_approve() -> char {
 }
 
 fn default_tui_keybind_note() -> char {
-    'n'
+    'c'
 }
 
 fn default_tui_keybind_toggle_view() -> char {
@@ -645,10 +645,10 @@ mod tests {
         assert_eq!(cfg.tui.keybinds.scroll_down, 'j');
         assert_eq!(cfg.tui.keybinds.prev, 'h');
         assert_eq!(cfg.tui.keybinds.next, 'l');
-        assert_eq!(cfg.tui.keybinds.parent, 'p');
-        assert_eq!(cfg.tui.keybinds.child, 'c');
+        assert_eq!(cfg.tui.keybinds.parent, 'P');
+        assert_eq!(cfg.tui.keybinds.child, 'C');
         assert_eq!(cfg.tui.keybinds.approve, 'a');
-        assert_eq!(cfg.tui.keybinds.note, 'n');
+        assert_eq!(cfg.tui.keybinds.note, 'c');
         assert_eq!(cfg.tui.keybinds.toggle_view, 'm');
         assert_eq!(cfg.tui.keybinds.speed_read, 'r');
         assert_eq!(cfg.tui.keybinds.root, 'g');
