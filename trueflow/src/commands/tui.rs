@@ -2503,11 +2503,7 @@ fn build_action_lines(
 ) -> Vec<Line<'static>> {
     let approve_action = format_key_action(keybinds.approve, "approve");
     let note_action = format_key_action(keybinds.note, note_action_label(keybinds.note));
-    let mode_action = match mode {
-        UiMode::DiffReview => format_key_action(keybinds.toggle_view, "source"),
-        UiMode::SourceReview => format_key_action(keybinds.toggle_view, "diff"),
-        _ => format_key_action(keybinds.toggle_view, "mode"),
-    };
+    let mode_action = format_key_action(keybinds.toggle_view, "mode");
     let quit_action = format_key_action(keybinds.quit, "quit");
     let phrases = match mode {
         UiMode::Navigation => vec![
@@ -4724,7 +4720,9 @@ mod diff_scope_tests {
         assert!(joined.contains("[C]hild"));
         assert!(joined.contains("[a]pprove"));
         assert!(joined.contains("[c]omment"));
-        assert!(joined.contains("[m]source"));
+        assert!(joined.contains("[m]ode"));
+        assert!(!joined.contains("[m]source"));
+        assert!(!joined.contains("[m]diff"));
         assert!(joined.contains("[q]uit"));
         assert!(!joined.contains('↓'));
         assert!(!joined.contains('↑'));
@@ -4739,14 +4737,15 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn build_action_lines_for_source_review_use_diff_toggle_label() {
+    fn build_action_lines_for_source_review_use_mode_toggle_label() {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         let palette = UiPalette::default();
         let lines = build_action_lines(120, UiMode::SourceReview, &keybinds, &palette);
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
-        assert!(joined.contains("[m]diff"));
+        assert!(joined.contains("[m]ode"));
+        assert!(!joined.contains("[m]diff"));
         assert!(!joined.contains("[m]source"));
     }
 
