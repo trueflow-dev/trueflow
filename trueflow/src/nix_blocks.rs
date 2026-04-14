@@ -19,13 +19,15 @@ pub(crate) fn split_structural_children(
     source: &str,
     block_kind: BlockKind,
 ) -> Result<Option<Vec<NixSpan>>> {
-    match block_kind {
-        BlockKind::Variable => split_binding_children(source),
+    let spans = match block_kind {
+        BlockKind::Variable => split_binding_children(source)?,
         BlockKind::Section | BlockKind::List | BlockKind::Code | BlockKind::Function => {
-            split_expression_children(source)
+            split_expression_children(source)?
         }
-        _ => Ok(None),
-    }
+        _ => None,
+    };
+
+    Ok(spans.map(normalize_spans))
 }
 
 fn split_binding_children(source: &str) -> Result<Option<Vec<NixSpan>>> {
@@ -49,7 +51,7 @@ fn split_binding_children(source: &str) -> Result<Option<Vec<NixSpan>>> {
     };
 
     Ok(match item.kind() {
-        "binding" => split_binding_node(item, &wrapped, 1),
+        "binding" => split_binding_node(item, source, 1),
         _ => None,
     })
 }
@@ -433,6 +435,21 @@ fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         .find(|child| child.kind() == kind)
 }
 
+fn normalize_spans(spans: Vec<NixSpan>) -> Vec<NixSpan> {
+    let mut normalized: Vec<NixSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(previous) = normalized.last_mut()
+            && previous.kind == span.kind
+            && previous.end == span.start
+        {
+            previous.end = span.end;
+        } else {
+            normalized.push(span);
+        }
+    }
+    normalized
+}
+
 fn push_range(spans: &mut Vec<NixSpan>, start: usize, end: usize, kind: BlockKind) {
     if end > start {
         spans.push(NixSpan::new(start, end, kind));
@@ -550,6 +567,41 @@ mod tests {
             .unwrap()
             .expect("expected structural split");
         assert!(spans.iter().any(|span| span.kind == BlockKind::Section));
+        assert_eq!(merge_spans(source, &spans), source);
+    }
+
+    #[test]
+    fn split_binding_children_keeps_whitespace_between_list_items_as_gap() {
+        let source = "packages = [\n  pkgs.git\n  { name = \"helper\"; }\n];";
+        let spans = split_structural_children(source, BlockKind::Variable)
+            .unwrap()
+            .expect("expected structural split");
+        let preambles = spans
+            .iter()
+            .filter(|span| span.kind == BlockKind::Preamble)
+            .collect::<Vec<_>>();
+        assert_eq!(preambles.len(), 1, "unexpected preambles: {spans:#?}");
+        assert_eq!(&source[preambles[0].start..preambles[0].end], "packages = ");
+        assert_eq!(merge_spans(source, &spans), source);
+    }
+
+    #[test]
+    fn split_binding_children_merges_adjacent_preamble_segments() {
+        let source =
+            "selected = if enabled then { system = \"linux\"; } else { system = \"other\"; };";
+        let spans = split_structural_children(source, BlockKind::Variable)
+            .unwrap()
+            .expect("expected structural split");
+        let preambles = spans
+            .iter()
+            .filter(|span| span.kind == BlockKind::Preamble)
+            .collect::<Vec<_>>();
+        assert_eq!(preambles.len(), 2, "unexpected preambles: {spans:#?}");
+        assert_eq!(
+            &source[preambles[0].start..preambles[0].end],
+            "selected = if enabled then "
+        );
+        assert_eq!(&source[preambles[1].start..preambles[1].end], " else ");
         assert_eq!(merge_spans(source, &spans), source);
     }
 }
