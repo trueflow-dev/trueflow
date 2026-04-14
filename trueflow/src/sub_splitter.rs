@@ -1867,8 +1867,106 @@ mod tests {
         assert!(!kinds.contains(&BlockKind::Preamble));
         assert!(kinds.contains(&BlockKind::List));
         assert!(kinds.contains(&BlockKind::Section));
-        assert!(chunks.iter().any(|block| block.content.contains("ports = [8001, 8002]")));
-        assert!(chunks.iter().any(|block| block.content.contains("targets = { primary = \"cache\"")));
+        assert!(
+            chunks
+                .iter()
+                .any(|block| block.content.contains("ports = [8001, 8002]"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|block| block.content.contains("targets = { primary = \"cache\""))
+        );
+    }
+
+    #[test]
+    fn test_small_toml_table_still_splits_structurally_under_threshold() {
+        let content = "[owner]\nname = \"sample\"\nactive = true\n";
+        let block = make_block(content, BlockKind::Section);
+        let result = split_result(&block, Language::Toml).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+        let kinds: Vec<_> = result.blocks.iter().map(|block| block.kind).collect();
+        assert_eq!(kinds, vec![BlockKind::Content, BlockKind::Content]);
+    }
+
+    #[test]
+    fn test_small_toml_list_still_splits_structurally_under_threshold() {
+        let content = "keywords = [\"blue\", \"green\"]";
+        let block = make_block(content, BlockKind::List);
+        let result = split_result(&block, Language::Toml).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+        let kinds: Vec<_> = result.blocks.iter().map(|block| block.kind).collect();
+        assert_eq!(kinds, vec![BlockKind::Content, BlockKind::Content]);
+        assert!(
+            result
+                .blocks
+                .iter()
+                .any(|block| block.content == "\"blue\"")
+        );
+        assert!(
+            result
+                .blocks
+                .iter()
+                .any(|block| block.content == "\"green\"")
+        );
+    }
+
+    #[test]
+    fn test_small_nix_variable_still_splits_structurally_under_threshold() {
+        let content =
+            "selected = if enabled then { system = \"linux\"; } else { system = \"other\"; };";
+        let block = make_block(content, BlockKind::Variable);
+        let result = split_result(&block, Language::Nix).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+        let kinds: Vec<_> = result
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.kind)
+            .collect();
+        assert!(kinds.contains(&BlockKind::Preamble));
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == BlockKind::Section)
+                .count(),
+            2
+        );
+        assert_eq!(merge_blocks(result.blocks), content);
+    }
+
+    #[test]
+    fn test_small_nix_attrset_still_splits_structurally_under_threshold() {
+        let content = "{ inherit name; meta = { role = \"worker\"; }; }";
+        let block = make_block(content, BlockKind::Section);
+        let result = split_result(&block, Language::Nix).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+        let kinds: Vec<_> = result
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.kind)
+            .collect();
+        assert!(kinds.contains(&BlockKind::Import));
+        assert!(kinds.contains(&BlockKind::Variable));
+        assert_eq!(merge_blocks(result.blocks), content);
+    }
+
+    #[test]
+    fn test_small_nix_list_still_splits_structurally_under_threshold() {
+        let content = "[ pkgs.git { name = \"helper\"; enabled = true; } ]";
+        let block = make_block(content, BlockKind::List);
+        let result = split_result(&block, Language::Nix).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+        let kinds: Vec<_> = result
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.kind)
+            .collect();
+        assert!(kinds.contains(&BlockKind::Content));
+        assert!(kinds.contains(&BlockKind::Section));
+        assert_eq!(merge_blocks(result.blocks), content);
     }
 
     #[test]

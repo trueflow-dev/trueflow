@@ -318,6 +318,14 @@ fn test_all_languages_review_block_generation_smoke() -> Result<()> {
         nix_kinds.contains(&"FunctionSignature"),
         "expected FunctionSignature review block in main.nix (kinds={nix_kinds:?})"
     );
+    assert!(
+        nix_kinds.iter().filter(|kind| **kind == "variable").count() >= 3,
+        "expected multiple variable review blocks in main.nix (kinds={nix_kinds:?})"
+    );
+    assert!(
+        !nix_kinds.contains(&"Paragraph") && !nix_kinds.contains(&"CodeParagraph"),
+        "did not expect fallback review blocks in main.nix (kinds={nix_kinds:?})"
+    );
 
     let toml_kinds = blocks_by_path["main.toml"]
         .iter()
