@@ -140,6 +140,14 @@ nix-check-static-with-tests:
 nix-check-release-with-tests:
     nix build --no-link .#release-with-tests
 
+# Package the native Linux x86_64 musl release artifact on Linux x86_64
+package-linux-release:
+    ./scripts/package-linux-release.sh
+
+# Smoke-test a packaged release artifact
+smoke-test-release artifact:
+    ./scripts/smoke-test-release.sh "{{artifact}}"
+
 # Fix clippy issues without pulling benches into the normal fix path
 fix-clippy:
     cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples --fix --allow-dirty

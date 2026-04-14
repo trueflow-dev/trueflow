@@ -1,26 +1,26 @@
 #!/bin/sh
 set -eu
 
-TARGET="aarch64-apple-darwin"
+TARGET="x86_64-unknown-linux-musl"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-CRATE_DIR="$REPO_ROOT/trueflow"
 DEFAULT_OUTPUT_BASE="$REPO_ROOT/.trueflow/release-artifacts"
-SKIP_BUILD=0
 OUTPUT_BASE=$DEFAULT_OUTPUT_BASE
 VERSION=""
+BINARY_SOURCE=""
 
 usage() {
   cat <<'EOF'
-Usage: package-macos-release.sh [--version vX.Y.Z] [--output-dir DIR] [--skip-build]
+Usage: package-linux-release.sh [--version vX.Y.Z] [--output-dir DIR] [--binary PATH]
 
-Build and package the Apple Silicon macOS trueflow binary into the versioned
-artifact format expected by https://trueflow.dev/install.sh.
+Build and package the Linux x86_64 musl trueflow binary on native Linux x86_64.
+By default this script builds via `nix build .#release` and then packages the
+result into the artifact format used under https://trueflow.dev/download/.
 
 Options:
   --version VERSION   Override the version label (default: read from Cargo.toml).
   --output-dir DIR    Base directory for versioned artifacts (default: .trueflow/release-artifacts).
-  --skip-build        Reuse the existing release binary without rebuilding.
+  --binary PATH       Package an already-built binary instead of running nix build.
   -h, --help          Show this help text.
 EOF
 }
@@ -28,6 +28,10 @@ EOF
 die() {
   printf 'error: %s\n' "$1" >&2
   exit 1
+}
+
+have_command() {
+  command -v "$1" >/dev/null 2>&1
 }
 
 while [ $# -gt 0 ]; do
@@ -42,8 +46,10 @@ while [ $# -gt 0 ]; do
       [ $# -gt 0 ] || die "--output-dir requires a value"
       OUTPUT_BASE=$1
       ;;
-    --skip-build)
-      SKIP_BUILD=1
+    --binary)
+      shift
+      [ $# -gt 0 ] || die "--binary requires a value"
+      BINARY_SOURCE=$1
       ;;
     -h|--help)
       usage
@@ -57,26 +63,22 @@ while [ $# -gt 0 ]; do
 done
 
 case "$(uname -s):$(uname -m)" in
-  Darwin:arm64|Darwin:aarch64)
+  Linux:x86_64|Linux:amd64)
     ;;
   *)
-    die "this script packages the local Apple Silicon macOS binary; run it on Apple Silicon macOS"
+    die "this script packages the native Linux x86_64 musl release; run it on Linux x86_64"
     ;;
 esac
 
-BINARY_SOURCE="$CRATE_DIR/target/release/trueflow"
-
-if [ "$SKIP_BUILD" -eq 0 ]; then
-  printf '==> building trueflow release binary\n'
-  (
-    cd "$CRATE_DIR"
-    cargo build --release --locked
-  )
+if [ -z "$BINARY_SOURCE" ]; then
+  have_command nix || die "nix is required unless --binary is provided"
+  printf '==> building trueflow Linux x86_64 musl release with nix\n'
+  BUILD_OUTPUT=$(cd "$REPO_ROOT" && nix build --no-link --print-out-paths .#release)
+  [ -n "$BUILD_OUTPUT" ] || die "nix build did not print an output path"
+  BINARY_SOURCE="$BUILD_OUTPUT/bin/trueflow"
 else
-  printf '==> skipping build and reusing existing release binary\n'
+  printf '==> packaging prebuilt binary %s\n' "$BINARY_SOURCE"
 fi
-
-[ -f "$BINARY_SOURCE" ] || die "expected release binary at $BINARY_SOURCE"
 
 set -- \
   --target "$TARGET" \

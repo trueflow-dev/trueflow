@@ -143,6 +143,17 @@ To package and upload the current Apple Silicon macOS binary separately:
 ./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.0
 ```
 
+To package and smoke-test a native Linux x86_64 musl release on Linux x86_64:
+
+```sh
+./scripts/package-linux-release.sh
+./scripts/smoke-test-release.sh .trueflow/release-artifacts/v0.1.0/trueflow-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+```
+
+That Linux release flow uses `nix build .#release` as the build source of truth.
+Website installer and install-page wiring for Linux is a follow-up; for now this
+produces local release artifacts that can also be uploaded under `/download/`.
+
 To upload a different artifact directory later:
 
 ```sh
