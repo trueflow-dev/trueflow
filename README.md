@@ -36,7 +36,7 @@ stores review state in an append-only flat file database, e.g.
     the highest-priority material first according to the tool's review-order
     heuristics.
 - Runtime config lives in `trueflow.toml`.
-- Current website-distributed binary support is Apple Silicon macOS.
+- Current website-distributed binary support is Apple Silicon macOS and Linux x86_64.
 
 Still some rough edges.
 
@@ -50,7 +50,7 @@ For current install instructions and release downloads, see:
 
 - <https://trueflow.dev/install/>
 
-Current website-distributed binary support: Apple Silicon macOS.
+Current website-distributed binary support: Apple Silicon macOS and Linux x86_64.
 
 ### Alternative install paths
 
@@ -71,6 +71,75 @@ cargo install --path trueflow --locked
 
 `cargo install` usually puts the `trueflow` binary in `~/.cargo/bin`, so make
 sure that directory is on your `PATH`.
+
+## Official language support
+
+Trueflow always falls back to semi-smart text processing when official
+semantic/AST blocking is not available yet. That fallback still gives you
+usable review units via paragraphs, sentences, code chunks, comments, and the
+usual review-priority heuristics.
+
+In the matrix below:
+
+- `✅` = official semantic/structured blocking today
+- `🚧` = detection/fallback works today, but official semantic/AST blocking is
+  still coming soon
+- `Subblock split` means language-specific `inspect --split` behavior, not only
+  generic code fallback
+
+Review priority heuristics apply across all review targets, including fallback
+modes.
+
+### Official semantic / structured blocking today
+
+| Language | Semantic / AST blocks | Subblock split | Complexity scoring | TUI highlight |
+| --- | --- | --- | --- | --- |
+| Rust | ✅ | ✅ | ✅ | ✅ |
+| Swift | ✅ | ✅ | ✅ | ✅ |
+| Emacs Lisp | ✅ | ✅ | ✅ | ✅ |
+| JavaScript | ✅ | ✅ | ✅ | ✅ |
+| TypeScript | ✅ | ✅ | ✅ | ✅ |
+| Java | ✅ | ✅ | ✅ | ✅ |
+| Kotlin | ✅ | ✅ | ✅ | ✅ |
+| C# | ✅ | ✅ | ✅ | ✅ |
+| Python | ✅ | ✅ | ✅ | ✅ |
+| Ruby | ✅ | ✅ | ✅ | ✅ |
+| PHP | ✅ | ✅ | ✅ | ✅ |
+| Shell | ✅ | — | ✅ | ✅ |
+| C | ✅ | ✅ | ✅ | ✅ |
+| Zig | ✅ | ✅ | — | — |
+| Lua | ✅ | ✅ | — | — |
+| Dart | ✅ | ✅ | — | — |
+| Scala | ✅ | ✅ | — | — |
+| Haskell | ✅ | ✅ | — | — |
+| OCaml | ✅ | ✅ | — | — |
+| Elixir | ✅ | ✅ | — | — |
+| Clojure | ✅ | ✅ | — | — |
+| SQL | ✅ | — | — | — |
+| YAML | ✅ | ✅ | — | — |
+| JSON | ✅ | ✅ | — | — |
+| HTML | ✅ | ✅ | — | — |
+| CSS | ✅ | ✅ | — | — |
+| Markdown | ✅ | ✅ | — | — |
+| TOML | ✅ | ✅ | — | — |
+| Nix | ✅ | ✅ | — | ✅ |
+
+### Fallback / heuristic support today, official semantic / AST blocking coming soon
+
+| Language | Semantic / AST blocks | Subblock split | Complexity scoring | TUI highlight |
+| --- | --- | --- | --- | --- |
+| Go | 🚧 | — | — | ✅ |
+| C++ | 🚧 | — | — | ✅ |
+| Just | 🚧 | — | — | ✅ |
+| Text / Org | 🚧 | ✅ | — | — |
+
+Notes:
+
+- Most `✅` code languages use tree-sitter-backed structural blocking.
+- Markdown, TOML, and some config/data formats use custom structured splitting
+  instead of a full AST.
+- `🚧` languages still work today through heuristic or text-oriented fallback,
+  but they are not yet at the same official semantic/AST support level.
 
 ## Website infra (`trueflow.dev`)
 
@@ -222,10 +291,10 @@ scroll_up = "k"
 scroll_down = "j"
 prev = "h"
 next = "l"
-parent = "p"
-child = "c"
+parent = "P"
+child = "C"
 approve = "a"
-note = "n"
+note = "c"
 toggle_view = "m"
 speed_read = "r"
 root = "g"

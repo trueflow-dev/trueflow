@@ -59,7 +59,7 @@ fn website_landing_page_has_install_command_above_the_fold() -> Result<()> {
     );
     assert_contains(
         &html,
-        "Current binary support: Apple Silicon macOS.",
+        "Current binary support: Apple Silicon macOS and Linux x86_64.",
         "landing page supported platform note",
     );
     assert_contains(
@@ -79,6 +79,11 @@ fn website_landing_page_has_install_command_above_the_fold() -> Result<()> {
     );
     assert_contains(
         &html,
+        "README.md#official-language-support",
+        "landing page language support matrix link",
+    );
+    assert_contains(
+        &html,
         "Review the semantic units that matter",
         "benefit section content",
     );
@@ -91,6 +96,39 @@ fn website_landing_page_has_install_command_above_the_fold() -> Result<()> {
         &html,
         "Keep review state attached to content",
         "benefit section content",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn readme_language_support_matrix_explains_official_vs_fallback_support() -> Result<()> {
+    let readme = read_repo_file("README.md")?;
+
+    assert_contains(
+        &readme,
+        "## Official language support",
+        "readme language support section",
+    );
+    assert_contains(
+        &readme,
+        "semi-smart text processing",
+        "readme fallback explanation",
+    );
+    assert_contains(
+        &readme,
+        "| Rust | ✅ | ✅ | ✅ | ✅ |",
+        "readme rust support row",
+    );
+    assert_contains(
+        &readme,
+        "| Go | 🚧 | — | — | ✅ |",
+        "readme go fallback row",
+    );
+    assert_contains(
+        &readme,
+        "| Text / Org | 🚧 | ✅ | — | — |",
+        "readme text fallback row",
     );
 
     Ok(())
@@ -114,7 +152,12 @@ fn website_install_page_explains_script_and_manual_downloads() -> Result<()> {
     assert_contains(
         &html,
         "/download/trueflow-v0.1.0-aarch64-apple-darwin.tar.gz",
-        "install page artifact link",
+        "install page macos artifact link",
+    );
+    assert_contains(
+        &html,
+        "/download/trueflow-v0.1.0-x86_64-unknown-linux-musl.tar.gz",
+        "install page linux artifact link",
     );
     assert_contains(
         &html,
@@ -214,7 +257,12 @@ fn website_install_script_targets_same_domain_and_macos_arm64() -> Result<()> {
     assert_contains(
         &script,
         "aarch64-apple-darwin",
-        "installer supported target",
+        "installer macos supported target",
+    );
+    assert_contains(
+        &script,
+        "x86_64-unknown-linux-musl",
+        "installer linux supported target",
     );
     assert_contains(
         &script,
@@ -232,6 +280,11 @@ fn website_install_script_targets_same_domain_and_macos_arm64() -> Result<()> {
         &script,
         "current draft support is Apple Silicon macOS only",
         "installer stale draft support message",
+    );
+    assert_not_contains(
+        &script,
+        "current support is Apple Silicon macOS only",
+        "installer stale single-platform support message",
     );
 
     Ok(())
@@ -260,7 +313,9 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
     let variables = read_repo_file("infra/terraform/variables.tf")?;
     let outputs = read_repo_file("infra/terraform/outputs.tf")?;
     let readme = read_repo_file("infra/terraform/README.md")?;
+    let package_built_release = read_repo_file("scripts/package-built-release.sh")?;
     let package_macos_release = read_repo_file("scripts/package-macos-release.sh")?;
+    let package_linux_release = read_repo_file("scripts/package-linux-release.sh")?;
     let deploy_public_site = read_repo_file("scripts/deploy-public-site.sh")?;
     let deploy_public_site_fast = read_repo_file("scripts/deploy-public-site-fast.sh")?;
     let deploy_website = read_repo_file("scripts/deploy-website.sh")?;
@@ -287,11 +342,14 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
     assert_contains(&outputs, "output \"site_distribution_id\"", "terraform distribution output");
     assert_contains(&readme, "No secrets are stored in this directory", "infra public safety note");
     assert_contains(&readme, "Tofu and Terraform both understand this HCL", "terraform compatibility note");
+    assert_contains(&package_built_release, "trueflow-${VERSION}-${TARGET}.tar.gz", "shared packaging artifact name");
+    assert_contains(&package_built_release, "trueflow-${VERSION}-SHA256SUMS.txt", "shared packaging checksum name");
+    assert_contains(&package_built_release, ".trueflow/release-artifacts", "shared packaging output root");
     assert_contains(&package_macos_release, "TARGET=\"aarch64-apple-darwin\"", "macos packaging target");
     assert_contains(&package_macos_release, "cargo build --release --locked", "macos packaging build command");
-    assert_contains(&package_macos_release, "trueflow-${VERSION}-${TARGET}.tar.gz", "macos packaging artifact name");
-    assert_contains(&package_macos_release, "trueflow-${VERSION}-SHA256SUMS.txt", "macos packaging checksum name");
-    assert_contains(&package_macos_release, ".trueflow/release-artifacts", "macos packaging output root");
+    assert_contains(&package_macos_release, "package-built-release.sh", "macos packaging shared packager handoff");
+    assert_contains(&package_linux_release, "TARGET=\"x86_64-unknown-linux-musl\"", "linux packaging target");
+    assert_contains(&package_linux_release, "nix build --no-link --print-out-paths .#release", "linux packaging nix build command");
     assert_contains(&deploy_public_site, "tofu init", "one-shot deploy tofu init step");
     assert_contains(&deploy_public_site, "tofu fmt -check", "one-shot deploy tofu fmt step");
     assert_contains(&deploy_public_site, "tofu validate", "one-shot deploy tofu validate step");
