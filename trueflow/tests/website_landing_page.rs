@@ -14,6 +14,11 @@ fn read_repo_file(relative_path: &str) -> Result<String> {
         .with_context(|| format!("failed to read {}", path.display()))
 }
 
+fn read_repo_bytes(relative_path: &str) -> Result<Vec<u8>> {
+    let path = repo_root()?.join(relative_path);
+    fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
+}
+
 fn assert_contains(haystack: &str, needle: &str, context: &str) {
     assert!(
         haystack.contains(needle),
@@ -149,6 +154,20 @@ fn website_about_page_mentions_jordan_mcqueen_and_personal_site() -> Result<()> 
     assert_contains(&install_html, "href=\"/about/\"", "install page about link");
     assert_contains(&edge_router, "request.uri === \"/about\"", "about clean path rewrite");
     assert_contains(&edge_router, "request.uri = \"/about/index.html\"", "about index rewrite");
+
+    Ok(())
+}
+
+#[test]
+fn website_screenshot_asset_matches_repo_screenshot() -> Result<()> {
+    let repo_screenshot = read_repo_bytes("tui.png")?;
+    let website_screenshot = read_repo_bytes("website/assets/tui.png")?;
+
+    assert_eq!(
+        website_screenshot,
+        repo_screenshot,
+        "expected website/assets/tui.png to match repo-root tui.png",
+    );
 
     Ok(())
 }
