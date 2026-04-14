@@ -4,10 +4,12 @@
 
 ![trueflow TUI screenshot](./tui.png)
 
-Trueflow is an experimental semantic code review tool.
+Trueflow is a semantic local code review tool.
 
-It turns files or diffs into reviewable **blocks**, lets you review those blocks
-in a CLI/TUI/Emacs workflow, and stores review state in an append-only flat file
+Website: <https://trueflow.dev>
+
+It lets you review repository content and diffs as semantic **blocks** in a
+CLI/TUI/Emacs workflow, and stores review state in an append-only flat file
 database, e.g. `.trueflow/reviews.jsonl`.
 
 ## What it does
@@ -33,6 +35,14 @@ Still some rough edges.
 
 ## Install
 
+For current install instructions and release downloads, see:
+
+- <https://trueflow.dev/install/>
+
+Current website-distributed binary support: Apple Silicon macOS.
+
+### Alternative install paths
+
 With Nix:
 
 ```sh
@@ -50,6 +60,85 @@ cargo install --path trueflow --locked
 
 `cargo install` usually puts the `trueflow` binary in `~/.cargo/bin`, so make
 sure that directory is on your `PATH`.
+
+## Website infra (`trueflow.dev`)
+
+The repo also contains Terraform-compatible OpenTofu configuration for the
+static website and download host at `trueflow.dev`.
+
+What it stands up:
+
+- one **private S3 bucket** for site and download artifacts
+- one **CloudFront distribution** in front of that bucket, using OAC
+- one **ACM certificate** for `trueflow.dev` and `www.trueflow.dev`
+- **Route53 alias records** for apex + `www`
+- a small **CloudFront Function** to redirect `www` to the apex host and rewrite
+  clean paths like `/install/`
+
+What it does **not** stand up:
+
+- no new Route53 hosted zone
+- no EC2 / containers / Lambda app backend
+- no public S3 website hosting
+- no databases or other stateful services
+
+It reuses the existing public Route53 hosted zone for `trueflow.dev`.
+
+From the repo root:
+
+```sh
+nix develop
+./scripts/deploy-public-site.sh
+```
+
+That one command will:
+
+- run `tofu init`, `tofu fmt -check`, `tofu validate`, and `tofu apply`
+- upload `website/`
+- package the Apple Silicon macOS binary artifact
+- upload `/download/` artifacts
+
+For the common fast path after infra is already up:
+
+```sh
+./scripts/deploy-public-site-fast.sh
+```
+
+That keeps the safety checks (`tofu init`, `fmt`, `validate`) but skips
+`tofu apply` before uploading website + download artifacts.
+
+If you want to run the steps manually instead:
+
+```sh
+cd infra/terraform
+tofu init
+tofu fmt -check
+tofu plan
+# inspect the plan carefully
+# when ready:
+tofu apply
+cd ../..
+./scripts/deploy-website.sh
+```
+
+Note: on local Darwin right now, the flake-pinned Nix `aws` binary hangs
+during startup, so the dev shell intentionally relies on your existing ambient
+`aws` instead of shadowing it.
+
+To package and upload the current Apple Silicon macOS binary separately:
+
+```sh
+./scripts/package-macos-release.sh
+./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.0
+```
+
+To upload a different artifact directory later:
+
+```sh
+./scripts/deploy-downloads.sh path/to/release-artifacts
+```
+
+For more detail, see `infra/terraform/README.md`.
 
 ## Quick start
 

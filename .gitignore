@@ -9,3 +9,11 @@ target/
 trueflow/mutants.out/
 trueflow/mutants.out.old/
 result
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

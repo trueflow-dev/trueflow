@@ -117,10 +117,19 @@
               cargo-pgo
               cargo-udeps
               cargo-watch
+
+              # Website / infrastructure tooling
+              # NOTE: on local Darwin here, the flake-pinned nix AWS CLI hangs
+              # during startup, so keep using the ambient aws there instead of
+              # shadowing it from the dev shell.
+              opentofu
+              python3
+
               gnupg
               trash-cli
               beads.packages.${system}.default
-            ] ++ commonNativeBuildInputs;
+            ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [ awscli2 ]
+              ++ commonNativeBuildInputs;
 
           shellHook = ''
             # Tells rust-analyzer where the stdlib sources are

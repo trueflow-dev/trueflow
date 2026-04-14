@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Install trueflow</title>
+    <meta
+      name="description"
+      content="Install trueflow with a one-line shell command, or download the current Apple Silicon macOS binary and checksum directly from trueflow.dev."
+    >
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Source+Serif+4:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    >
+    <link rel="stylesheet" href="/site.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="/" aria-label="Trueflow home">
+          <img src="/assets/trueflow.jpg" alt="Trueflow logo mark">
+          <span>Trueflow</span>
+        </a>
+
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/install/">Install</a>
+          <a href="/about/">About</a>
+          <a href="https://github.com/trueflow-dev/trueflow/blob/main/README.md">Docs</a>
+          <a href="https://github.com/trueflow-dev/trueflow">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="page-intro shell narrow">
+        <p class="eyebrow">Install</p>
+        <h1>Install trueflow</h1>
+        <p class="hero-body">
+          Use the one-line installer to detect the supported build, verify its
+          checksum, and place <span class="inline-code">trueflow</span> in
+          <span class="inline-code">~/.local/bin</span> by default.
+        </p>
+        <p class="hero-body subtle">
+          Current binary support: Apple Silicon macOS. More targets can be added
+          once the initial packaging and release flow is stable.
+        </p>
+      </section>
+
+      <section class="install-sections shell" aria-label="Install options">
+        <article class="install-panel">
+          <h2>Quick install</h2>
+          <p>
+            The installer script auto-detects the supported platform and fetches
+            the matching versioned artifact from <span class="inline-code">/download/</span>.
+          </p>
+          <p class="command-label">Latest release</p>
+          <pre class="command-line"><code>curl -fsSL https://trueflow.dev/install.sh | sh</code></pre>
+          <p class="command-label">Pinned version</p>
+          <pre class="command-line"><code>curl -fsSL https://trueflow.dev/install.sh | sh -s -- --version v0.1.0</code></pre>
+          <p class="install-note">
+            The script currently supports Apple Silicon macOS and verifies the
+            downloaded checksum before installing.
+          </p>
+        </article>
+
+        <article class="install-panel">
+          <h2>Manual download</h2>
+          <p>
+            If you prefer not to use the installer script, download the archive
+            and checksum directly.
+          </p>
+          <ul class="download-list">
+            <li>
+              <a href="/download/trueflow-v0.1.0-aarch64-apple-darwin.tar.gz">trueflow-v0.1.0-aarch64-apple-darwin.tar.gz</a>
+            </li>
+            <li>
+              <a href="/download/trueflow-v0.1.0-SHA256SUMS.txt">trueflow-v0.1.0-SHA256SUMS.txt</a>
+            </li>
+          </ul>
+          <pre class="command-line"><code>curl -fsSLO https://trueflow.dev/download/trueflow-v0.1.0-aarch64-apple-darwin.tar.gz
+curl -fsSLO https://trueflow.dev/download/trueflow-v0.1.0-SHA256SUMS.txt
+shasum -a 256 -c trueflow-v0.1.0-SHA256SUMS.txt
+tar -xzf trueflow-v0.1.0-aarch64-apple-darwin.tar.gz
+install -m 0755 trueflow ~/.local/bin/trueflow</code></pre>
+          <p class="install-note">
+            These URLs go live when the first signed-off binary release is published.
+          </p>
+        </article>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <p>Semantic code review built around content, not just patches.</p>
+        <div class="footer-links">
+          <a href="/">Home</a>
+          <a href="/about/">About</a>
+          <a href="https://github.com/trueflow-dev/trueflow/blob/main/README.md">Docs</a>
+          <a href="https://github.com/trueflow-dev/trueflow">GitHub</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

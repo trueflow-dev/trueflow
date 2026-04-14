@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trueflow — Semantic code review that keeps you in flow.</title>
+    <meta
+      name="description"
+      content="Trueflow turns existing code, repositories, and diffs into semantic review blocks for content-based review and diff review with less hunk noise."
+    >
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Source+Serif+4:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    >
+    <link rel="stylesheet" href="/site.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="/" aria-label="Trueflow home">
+          <img src="/assets/trueflow.jpg" alt="Trueflow logo mark">
+          <span>Trueflow</span>
+        </a>
+
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/install/">Install</a>
+          <a href="/about/">About</a>
+          <a href="https://github.com/trueflow-dev/trueflow/blob/main/README.md">Docs</a>
+          <a href="https://github.com/trueflow-dev/trueflow">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero shell">
+        <div class="hero-copy">
+          <p class="eyebrow">Semantic code review for the agent era</p>
+          <h1>Trueflow is a semantic local code review tool</h1>
+          <p class="hero-body">
+            Review repository content and diffs as semantic blocks instead of raw diff hunks.
+          </p>
+          <p class="hero-body subtle">Use it for content review of existing code or diff review of pull requests and local changes.</p>
+          <p class="hero-body subtle">
+            Review in a focused TUI or use the CLI / automation layer while
+            keeping review records attached to content instead of transient
+            patches.
+          </p>
+
+          <div class="install-card" aria-labelledby="quick-install-title">
+            <p class="command-label" id="quick-install-title">Quick install</p>
+            <pre class="command-line"><code>curl -fsSL https://trueflow.dev/install.sh | sh</code></pre>
+            <p class="install-note">
+              Current binary support: Apple Silicon macOS. The installer detects
+              the supported platform and installs the matching build.
+            </p>
+          </div>
+
+          <div class="hero-actions">
+            <a class="button button-primary" href="/install/">Install details</a>
+            <a class="button button-secondary" href="https://github.com/trueflow-dev/trueflow/blob/main/README.md">Read the docs</a>
+          </div>
+
+          <ul class="hero-notes" aria-label="Key product points">
+            <li>Content-based review for existing code and whole repos</li>
+            <li>Diff review for pull requests and local changes</li>
+            <li>Review records that survive refactors and file motion</li>
+          </ul>
+        </div>
+
+        <div class="hero-panel">
+          <div class="hero-panel-bar" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <img
+            src="/assets/tui.png"
+            alt="Trueflow TUI showing semantic code review blocks and a focused diff workflow"
+          >
+        </div>
+      </section>
+
+      <section class="benefits shell" aria-labelledby="benefits-title">
+        <div class="section-heading">
+          <p class="eyebrow">Why it feels better</p>
+          <h2 id="benefits-title">A quieter, more exact review loop.</h2>
+        </div>
+
+        <div class="benefit-grid">
+          <article class="benefit-card">
+            <h3>Review the semantic units that matter</h3>
+            <p>
+              Split code into functions, structs, paragraphs, and other meaningful
+              blocks so review focus follows structure instead of arbitrary hunk
+              boundaries.
+            </p>
+          </article>
+
+          <article class="benefit-card">
+            <h3>Use the workflow that fits your loop</h3>
+            <p>
+              Move through a calm TUI or use the CLI / automation layer with
+              machine-readable output.
+            </p>
+          </article>
+
+          <article class="benefit-card">
+            <h3>Keep review state attached to content</h3>
+            <p>
+              Store approvals, rejections, and notes as append-only review
+              records so useful context survives refactors and file motion.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="how-it-works shell" aria-labelledby="how-it-works-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">How it works</p>
+          <h2 id="how-it-works-title">Fast to learn. Precise to use.</h2>
+        </div>
+
+        <ol class="steps">
+          <li>
+            <strong>Scan structure.</strong>
+            Turn a working tree or revision range into semantic review blocks.
+          </li>
+          <li>
+            <strong>Review in flow.</strong>
+            Move through a focused TUI or export machine-readable review output.
+          </li>
+          <li>
+            <strong>Keep context.</strong>
+            Store review records in append-only state outside the patch itself.
+          </li>
+        </ol>
+      </section>
+
+      <section class="ecosystem-note shell narrow" aria-labelledby="emacs-title">
+        <div class="integration-note">
+          <p class="eyebrow">Editors</p>
+          <h2 id="emacs-title">Emacs support is there if you want it.</h2>
+          <p>
+            Trueflow also includes an Emacs workflow for people who want review
+            controls inside their editor, without making that the center of the
+            main product story.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <p>Semantic code review built around content, not just patches.</p>
+        <div class="footer-links">
+          <a href="/install/">Install</a>
+          <a href="/about/">About</a>
+          <a href="https://github.com/trueflow-dev/trueflow/blob/main/README.md">Docs</a>
+          <a href="https://github.com/trueflow-dev/trueflow">GitHub</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -10,9 +10,14 @@
 - Gwern-adjacent editorial restraint (long-form legibility).
 
 ## Information Architecture
-- Single page only.
-- Header: logo + minimal nav (Docs, GitHub, Blog optional).
-- Hero: short headline, 2-3 line blurb, single primary CTA, hero video/gif.
+- Primary surfaces:
+  - `/` landing page
+  - `/about/` about page
+  - `/install/` install page
+  - `/install.sh` one-line installer
+  - `/download/<artifact_name>` raw release artifacts
+- Header: logo + minimal nav (Install, About, Docs, GitHub).
+- Hero: short headline, 2-3 line blurb, install command above the fold, hero screenshot.
 - Optional below-fold: 3 short benefits and a small "how it works" row.
 - Footer: legal + links.
 
@@ -48,9 +53,10 @@
 
 ## Content Draft
 - Headline: "Code review that keeps you in flow."
-- Blurb: "Trueflow gives you a calm, precise review workspace-fast diffs, low friction, and zero noise."
-- Primary CTA: "Get started"
-- Secondary CTA: "Read the docs"
+- Blurb: "Trueflow turns files and diffs into semantic review blocks so you can move faster and spend less time fighting noisy hunks."
+- Primary hero action: show `curl -fsSL https://trueflow.dev/install.sh | sh`
+- Secondary CTAs: "Install details" and "Read the docs"
+- Current support note: Apple Silicon macOS first; other targets later.
 
 ## Hero Media
 - Placeholder: static frame or low-framerate loop (replace later).
@@ -59,20 +65,24 @@
 - Fallback: poster image; prefers-reduced-motion static.
 
 ## Technical Direction
-- Axum SSR HTML, streamed response (head -> hero -> footer).
-- Templates: Askama (preferred) or Maud.
+- Static HTML served from object storage + CDN.
+- Markup: plain HTML; no framework for v1.
 - CSS: custom; small reset; no framework.
-- JS: none for v1; consider htmx only if needed later.
+- JS: none for v1.
+- Hosting target: S3 + CloudFront, with Route53 DNS.
+- Public-safe infra source in repo: Terraform-compatible OpenTofu definitions with no committed credentials or account-specific secrets.
 
 ## Repository Layout
-- Website root: `www/trueflow-web-server/`.
-- Static assets: `www/trueflow-web-server/static/`.
-- Templates: `www/trueflow-web-server/templates/`.
+- Website root: `website/`.
+- Static assets: `website/assets/`.
+- Main files: `website/index.html`, `website/about/index.html`, `website/install/index.html`, `website/install.sh`, `website/site.css`.
+- Infra source: `infra/terraform/`.
+- Deploy helpers: `scripts/deploy-website.sh`, `scripts/deploy-downloads.sh`.
 
-## TOML Data (to add)
-- `website` section for hero copy, CTA labels, and nav links.
-- `color_palette_light` tokens (semantic names).
-- `media` fields for hero video/poster paths.
+## TOML Data (optional follow-up)
+- `website` section for hero copy, CTA labels, and nav links if we later want templated generation.
+- `color_palette_light` tokens (semantic names) if we want metadata-driven theming.
+- `media` fields for hero video/poster paths if hero media becomes more dynamic.
 
 ## Accessibility & Performance
 - WCAG AA contrast, visible focus, skip link.
@@ -80,6 +90,6 @@
 - Lazy load hero media; preload critical fonts.
 
 ## Project Management
-- Status: planning complete, awaiting implementation.
-- Completed: initial design brief, layout and palette guidance, repo layout decision.
-- Next: add `trueflow.metadata.toml` website data, scaffold Axum crate, implement SSR templates + CSS.
+- Status: static v1 implementation underway.
+- Completed: initial design brief, layout and palette guidance, static repo layout decision, initial same-domain install/download contract.
+- Next: plan/review the OpenTofu stack locally, wire deployment, and publish the first Apple Silicon macOS binary artifact set.

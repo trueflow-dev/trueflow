@@ -1,0 +1,77 @@
+function queryStringSuffix(querystring) {
+  var keys = Object.keys(querystring || {});
+  if (keys.length === 0) {
+    return "";
+  }
+
+  var parts = [];
+  for (var index = 0; index < keys.length; index += 1) {
+    var key = keys[index];
+    var entry = querystring[key];
+
+    if (entry && entry.multiValue && entry.multiValue.length > 0) {
+      for (var valueIndex = 0; valueIndex < entry.multiValue.length; valueIndex += 1) {
+        var valueEntry = entry.multiValue[valueIndex];
+        if (valueEntry.value === "") {
+          parts.push(encodeURIComponent(key));
+        } else {
+          parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(valueEntry.value));
+        }
+      }
+      continue;
+    }
+
+    if (!entry || entry.value === "") {
+      parts.push(encodeURIComponent(key));
+      continue;
+    }
+
+    parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(entry.value));
+  }
+
+  return parts.length > 0 ? "?" + parts.join("&") : "";
+}
+
+function redirectToApex(request) {
+  return {
+    statusCode: 301,
+    statusDescription: "Moved Permanently",
+    headers: {
+      location: {
+        value: "https://${apex_host}" + request.uri + queryStringSuffix(request.querystring)
+      }
+    }
+  };
+}
+
+function handler(event) {
+  var request = event.request;
+  var hostHeader = request.headers.host;
+  var host = hostHeader ? hostHeader.value : "";
+  var redirectHosts = ${redirect_hosts_json};
+
+  if (redirectHosts.indexOf(host) !== -1) {
+    return redirectToApex(request);
+  }
+
+  if (request.uri === "" || request.uri === "/") {
+    request.uri = "/index.html";
+    return request;
+  }
+
+  if (request.uri === "/install" || request.uri === "/install/") {
+    request.uri = "/install/index.html";
+    return request;
+  }
+
+  if (request.uri === "/about" || request.uri === "/about/") {
+    request.uri = "/about/index.html";
+    return request;
+  }
+
+  if (request.uri.charAt(request.uri.length - 1) === "/") {
+    request.uri = request.uri + "index.html";
+  }
+
+  return request;
+}
