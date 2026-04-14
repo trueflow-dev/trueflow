@@ -68,6 +68,44 @@ fn test_all_languages_detection() -> Result<()> {
 }
 
 #[test]
+fn test_all_languages_toml_blocks_are_structural() -> Result<()> {
+    let repo = TestRepo::fixture("all_languages")?;
+
+    let output = repo.run(&["scan", "--json"])?;
+    let files = json_array(&output)?;
+
+    let toml_file = files
+        .iter()
+        .find(|file| {
+            file["path"].as_str().map(|path| path.replace("./", ""))
+                == Some("main.toml".to_string())
+        })
+        .context("missing scan output for main.toml")?;
+    let blocks = toml_file["blocks"]
+        .as_array()
+        .context("blocks should be array")?;
+    let kinds = blocks
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+
+    assert!(
+        kinds.contains(&"Content"),
+        "expected a scalar content block in main.toml (kinds={kinds:?})"
+    );
+    assert!(
+        kinds.contains(&"Section"),
+        "expected a table section block in main.toml (kinds={kinds:?})"
+    );
+    assert!(
+        !kinds.contains(&"Paragraph"),
+        "did not expect paragraph fallback blocks in main.toml (kinds={kinds:?})"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_all_languages_nix_blocks_are_structural() -> Result<()> {
     let repo = TestRepo::fixture("all_languages")?;
 
@@ -279,6 +317,19 @@ fn test_all_languages_review_block_generation_smoke() -> Result<()> {
     assert!(
         nix_kinds.contains(&"FunctionSignature"),
         "expected FunctionSignature review block in main.nix (kinds={nix_kinds:?})"
+    );
+
+    let toml_kinds = blocks_by_path["main.toml"]
+        .iter()
+        .filter_map(|block| block.get("kind").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        toml_kinds.contains(&"Content") && toml_kinds.contains(&"Section"),
+        "expected structural TOML review blocks in main.toml (kinds={toml_kinds:?})"
+    );
+    assert!(
+        !toml_kinds.contains(&"Paragraph"),
+        "did not expect paragraph fallback blocks in main.toml (kinds={toml_kinds:?})"
     );
 
     let text_kinds = blocks_by_path["main.txt"]

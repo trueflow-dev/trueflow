@@ -5,7 +5,7 @@ use crate::complexity;
 use crate::hashing::TreeHash;
 use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
-use crate::{languages, rust, swift};
+use crate::{languages, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
 use std::sync::LazyLock;
 use tracing::info;
@@ -220,6 +220,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
             BlockSplitStrategy::Heuristic,
             Vec::new(),
         ),
+        Language::Toml => attempt_split(content, lang, split_toml(content), FallbackMode::Code),
         Language::Nix => attempt_split(content, lang, split_nix(content), FallbackMode::Code),
         _ if languages::registration(lang).is_some() => attempt_split(
             content,
@@ -721,6 +722,54 @@ fn split_cpp(content: &str) -> Vec<Block> {
         };
         create_block(chunk, kind, content, start, end, Language::Cpp)
     })
+}
+
+fn split_toml(content: &str) -> Result<Vec<Block>> {
+    let spans = toml_blocks::split_document(content)?;
+    let mut blocks = Vec::new();
+    let mut last_end = 0usize;
+
+    for span in spans {
+        push_non_empty_toml_gap(&mut blocks, content, last_end, span.start);
+        blocks.push(create_block(
+            &content[span.start..span.end],
+            span.kind,
+            content,
+            span.start,
+            span.end,
+            Language::Toml,
+        ));
+        last_end = span.end;
+    }
+
+    push_non_empty_toml_gap(&mut blocks, content, last_end, content.len());
+    Ok(blocks)
+}
+
+fn push_non_empty_toml_gap(blocks: &mut Vec<Block>, content: &str, start: usize, end: usize) {
+    if end <= start {
+        return;
+    }
+
+    let chunk = &content[start..end];
+    if chunk.is_empty() || chunk.trim().is_empty() {
+        return;
+    }
+
+    let kind = if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+        BlockKind::Comment
+    } else {
+        BlockKind::Gap
+    };
+
+    blocks.push(create_block(
+        chunk,
+        kind,
+        content,
+        start,
+        end,
+        Language::Toml,
+    ));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2534,8 +2583,30 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
     }
 
     #[test]
-    fn test_split_toml_paragraphs() {
-        assert_paragraph_split(Language::Toml);
+    fn test_split_toml_uses_structural_blocks() {
+        let content = "title = \"deploy\"\nkeywords = [\"blue\", \"green\"]\n\n[owner]\nname = \"platform\"\n\n[database]\nports = [8001, 8002]\n";
+        let result = split_result(content, Language::Toml);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.blocks;
+        let kinds: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Content,
+                BlockKind::List,
+                BlockKind::Section,
+                BlockKind::Section,
+            ]
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Paragraph)
+        );
     }
 
     #[test]

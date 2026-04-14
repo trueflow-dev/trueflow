@@ -1,0 +1,19 @@
+title = "deploy"
+enabled = true
+keywords = ["blue", "green"]
+
+[owner]
+name = "platform"
+active = true
+
+[database]
+ports = [8001, 8002, 8003]
+targets = { primary = "cache", secondary = "backup" }
+
+[[workers]]
+name = "api"
+retries = 3
+
+[[workers]]
+name = "async"
+retries = 2

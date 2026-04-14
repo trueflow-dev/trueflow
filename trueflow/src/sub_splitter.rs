@@ -4,7 +4,7 @@ use crate::code_comments;
 use crate::hashing::TreeHash;
 use crate::review_units::{MAX_REVIEW_UNIT_SPAN_LINES, block_line_span};
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
-use crate::{languages, rust, swift};
+use crate::{languages, nix_blocks, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
 use tracing::info;
 use tree_sitter::Parser;
@@ -131,6 +131,48 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
             },
         };
 
+        info!(
+            "sub_splitter done (blocks={}, semantics={:?})",
+            result.blocks.len(),
+            result.semantics
+        );
+        return Ok(result);
+    }
+
+    if matches!(lang, Language::Toml) && matches!(block.kind, BlockKind::Section | BlockKind::List)
+    {
+        let blocks = match block.kind {
+            BlockKind::Section => split_toml_structural_children(block, block.kind)?,
+            BlockKind::List => split_toml_structural_children(block, block.kind)?,
+            _ => unreachable!("guarded above"),
+        };
+        let result = SubSplitResult {
+            blocks,
+            semantics: SubSplitSemantics::StructuralChildren,
+        };
+        info!(
+            "sub_splitter done (blocks={}, semantics={:?})",
+            result.blocks.len(),
+            result.semantics
+        );
+        return Ok(result);
+    }
+
+    if matches!(lang, Language::Nix)
+        && matches!(
+            block.kind,
+            BlockKind::Variable
+                | BlockKind::Section
+                | BlockKind::List
+                | BlockKind::Code
+                | BlockKind::Function
+        )
+        && let Some(blocks) = split_nix_structural_children(block)?
+    {
+        let result = SubSplitResult {
+            blocks,
+            semantics: SubSplitSemantics::StructuralChildren,
+        };
         info!(
             "sub_splitter done (blocks={}, semantics={:?})",
             result.blocks.len(),
@@ -323,6 +365,75 @@ pub(crate) fn split_code_review_units(block: &Block) -> Result<Vec<Block>> {
 
 fn split_code(block: &Block) -> Result<Vec<Block>> {
     split_code_review_units(block)
+}
+
+fn split_toml_structural_children(block: &Block, kind: BlockKind) -> Result<Vec<Block>> {
+    let spans = match kind {
+        BlockKind::Section => toml_blocks::split_section_children(&block.content)?,
+        BlockKind::List => toml_blocks::split_list_children(&block.content)?,
+        _ => Vec::new(),
+    };
+
+    Ok(spans_to_sub_blocks(block, &spans))
+}
+
+fn split_nix_structural_children(block: &Block) -> Result<Option<Vec<Block>>> {
+    let Some(spans) = nix_blocks::split_structural_children(&block.content, block.kind)? else {
+        return Ok(None);
+    };
+    Ok(Some(spans_to_sub_blocks(block, &spans)))
+}
+
+fn spans_to_sub_blocks<T>(block: &Block, spans: &[T]) -> Vec<Block>
+where
+    T: StructuralSpan,
+{
+    spans
+        .iter()
+        .map(|span| {
+            create_sub_block_with_kind(
+                block,
+                &block.content[span.start()..span.end()],
+                span.start(),
+                span.end(),
+                span.kind(),
+            )
+        })
+        .collect()
+}
+
+trait StructuralSpan {
+    fn start(&self) -> usize;
+    fn end(&self) -> usize;
+    fn kind(&self) -> BlockKind;
+}
+
+impl StructuralSpan for toml_blocks::TomlSpan {
+    fn start(&self) -> usize {
+        self.start
+    }
+
+    fn end(&self) -> usize {
+        self.end
+    }
+
+    fn kind(&self) -> BlockKind {
+        self.kind
+    }
+}
+
+impl StructuralSpan for nix_blocks::NixSpan {
+    fn start(&self) -> usize {
+        self.start
+    }
+
+    fn end(&self) -> usize {
+        self.end
+    }
+
+    fn kind(&self) -> BlockKind {
+        self.kind
+    }
 }
 
 fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
@@ -1746,15 +1857,18 @@ mod tests {
     }
 
     #[test]
-    fn test_split_toml_paragraphs_preserve_content() {
-        let content = "key = \"value\"\n\nother = \"value\"";
-        let block = make_large_block(content, BlockKind::Code);
-        let chunks = split(&block, Language::Toml).unwrap();
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
-        assert_eq!(chunks[1].kind, BlockKind::Gap);
-        assert_eq!(chunks[2].kind, BlockKind::CodeParagraph);
-        assert_eq!(merge_blocks(chunks), content);
+    fn test_split_toml_table_into_structural_children() {
+        let content = "[database]\nports = [8001, 8002]\ntargets = { primary = \"cache\", secondary = \"backup\" }\n";
+        let block = make_block(content, BlockKind::Section);
+        let result = split_result(&block, Language::Toml).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+        let chunks = result.blocks;
+        let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
+        assert!(!kinds.contains(&BlockKind::Preamble));
+        assert!(kinds.contains(&BlockKind::List));
+        assert!(kinds.contains(&BlockKind::Section));
+        assert!(chunks.iter().any(|block| block.content.contains("ports = [8001, 8002]")));
+        assert!(chunks.iter().any(|block| block.content.contains("targets = { primary = \"cache\"")));
     }
 
     #[test]
