@@ -82,6 +82,9 @@ detect_target() {
     Darwin:arm64|Darwin:aarch64)
       printf '%s\n' 'aarch64-apple-darwin'
       ;;
+    Linux:x86_64|Linux:amd64)
+      printf '%s\n' 'x86_64-unknown-linux-musl'
+      ;;
     *)
       return 1
       ;;
@@ -111,7 +114,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-TARGET=$(detect_target) || die "unsupported platform; current support is Apple Silicon macOS only. See ${BASE_URL}/install/"
+TARGET=$(detect_target) || die "unsupported platform; current support is Apple Silicon macOS and Linux x86_64. See ${BASE_URL}/install/"
 ARCHIVE_NAME="trueflow-${VERSION}-${TARGET}.tar.gz"
 CHECKSUM_NAME="trueflow-${VERSION}-SHA256SUMS.txt"
 ARCHIVE_URL="${BASE_URL}/download/${ARCHIVE_NAME}"

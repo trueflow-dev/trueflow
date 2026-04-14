@@ -31,7 +31,7 @@ The site and release flow use one domain:
 - `/install.sh` — shell installer
 - `/download/<artifact_name>` — raw release artifacts and checksums
 
-Current binary scope is Apple Silicon macOS only.
+Current binary scope is Apple Silicon macOS and Linux x86_64.
 
 ## Deployment shape
 
