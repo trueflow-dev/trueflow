@@ -8,24 +8,35 @@ Trueflow is a semantic local code review tool.
 
 Website: <https://trueflow.dev>
 
-It lets you review repository content and diffs as semantic **blocks** in a
-CLI/TUI/Emacs workflow, and stores review state in an append-only flat file
-database, e.g. `.trueflow/reviews.jsonl`.
+It lets you review existing repository content and diffs as semantic **blocks**
+instead of raw diff hunks. It is built for local CLI/TUI/Emacs workflows and
+stores review state in an append-only flat file database, e.g.
+`.trueflow/reviews.jsonl`.
 
 ## What it does
 
+- reviews existing code and whole repositories, not just diffs
 - scans a working tree or revision range into semantic review `blocks` (a
   `block` is some semantic unit of content, e.g. `Method`, `Struct`,
   `CodeParagraph`)
+- presents review targets in a stable priority order so higher-priority
+  material appears first
 - lets you approve, reject, or comment on `blocks`
 - stores review records in `.trueflow/reviews.jsonl`
-- exports review feedback for an agent or other automation
-- TODO: auto-integration with agents as you review
+- exports review feedback for agents and other automation
 
-## Current model
+## Current model and status
 
 - The canonical review unit is a **block**, not a textual diff hunk.
+- Review targets are presented in a stable priority order.
+  - Today that includes heuristics like tests before library code before main
+    entrypoints, and higher-priority block kinds before lower-priority ones
+    within a file.
+  - The goal is a practical review invariant: if you stop early, you have seen
+    the highest-priority material first according to the tool's review-order
+    heuristics.
 - Runtime config lives in `trueflow.toml`.
+- Current website-distributed binary support is Apple Silicon macOS.
 
 Still some rough edges.
 
@@ -73,7 +84,7 @@ What it stands up:
 - one **ACM certificate** for `trueflow.dev` and `www.trueflow.dev`
 - **Route53 alias records** for apex + `www`
 - a small **CloudFront Function** to redirect `www` to the apex host and rewrite
-  clean paths like `/install/`
+  clean paths like `/about/` and `/install/`
 
 What it does **not** stand up:
 
