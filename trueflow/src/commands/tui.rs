@@ -8,8 +8,8 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    CollectedReview, DiffBlockSides, ReviewTarget, collect_review, resolve_cli_review_scope,
-    resolve_review_request,
+    BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewTarget, collect_review,
+    resolve_cli_review_scope, resolve_review_request,
 };
 use crate::config::{
     BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers, TuiKeybindsConfig,
@@ -190,6 +190,8 @@ struct AppState {
     remaining_blocks: usize,
     reviewable_nodes: HashSet<TreeNodeId>,
     diff_block_sides: HashMap<TreeNodeId, DiffBlockSides>,
+    file_change_kinds: HashMap<TreeNodeId, FileChangeKind>,
+    block_change_kinds: HashMap<TreeNodeId, BlockChangeKind>,
     session_recap: SessionRecap,
     scope_label: String,
     input_mode: InputMode,
@@ -304,6 +306,27 @@ enum UiMode {
     SourceReview,
     SpeedRead,
     Recap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderChangeKind {
+    File(FileChangeKind),
+    Block(BlockChangeKind),
+    Unknown,
+}
+
+impl HeaderChangeKind {
+    fn label(self) -> &'static str {
+        match self {
+            HeaderChangeKind::File(FileChangeKind::Added) => "File Added",
+            HeaderChangeKind::File(FileChangeKind::Deleted) => "File Deleted",
+            HeaderChangeKind::File(FileChangeKind::Changed) => "File Changed",
+            HeaderChangeKind::Block(BlockChangeKind::Added) => "Block Added",
+            HeaderChangeKind::Block(BlockChangeKind::Deleted) => "Block Deleted",
+            HeaderChangeKind::Block(BlockChangeKind::Changed) => "Block Changed",
+            HeaderChangeKind::Unknown => "Unknown Change",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -493,6 +516,8 @@ fn build_review_state(
         tree,
         unreviewed_block_nodes,
         diff_block_sides,
+        file_change_kinds,
+        block_change_kinds,
     } = review;
     let reviewable_nodes: HashSet<TreeNodeId> = unreviewed_block_nodes
         .iter()
@@ -523,6 +548,8 @@ fn build_review_state(
         remaining_blocks,
         reviewable_nodes,
         diff_block_sides,
+        file_change_kinds,
+        block_change_kinds,
         session_recap: SessionRecap::default(),
         scope_label: options.scope_label,
         input_mode: InputMode::Normal,
@@ -1956,6 +1983,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let node = state.navigator.tree.node(state.navigator.current_id());
 
     let header_lines = build_header_lines(node, state, palette);
+    let mode_banner_line = build_mode_banner_line(state, palette);
 
     let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
     let ui_mode = current_ui_mode(state);
@@ -2022,6 +2050,11 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(Style::default().fg(palette.meta_border).bg(palette.meta_bg))
         .style(Style::default().bg(palette.meta_bg).fg(palette.fg));
+
+    frame.render_widget(
+        Paragraph::new(mode_banner_line).alignment(Alignment::Center),
+        focus_layout.mode,
+    );
 
     frame.render_widget(
         Paragraph::new(header_lines)
@@ -2318,7 +2351,6 @@ fn build_header_lines(
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let ui_mode = current_ui_mode(state);
 
     let header_text = match node.kind {
         TreeNodeKind::Root => format!("Repository (Root node) @ {}", state.repo_name),
@@ -2341,11 +2373,9 @@ fn build_header_lines(
     };
 
     lines.push(format_header_row(&header_text, palette, true));
-    lines.push(format_header_row(
-        &format!("Mode: {}", ui_mode_label(ui_mode)),
-        palette,
-        false,
-    ));
+    if let Some(change_kind) = header_change_kind_for_node(node, state) {
+        lines.push(format_header_row(change_kind.label(), palette, false));
+    }
 
     if matches!(node.kind, TreeNodeKind::Block)
         && let Some(breadcrumb) = review_metadata::block_breadcrumb(&state.navigator.tree, node.id)
@@ -2376,6 +2406,49 @@ fn build_header_lines(
     lines
 }
 
+fn build_mode_banner_line(state: &AppState, palette: &UiPalette) -> Line<'static> {
+    Line::from(Span::styled(
+        mode_banner_label(current_ui_mode(state)).to_string(),
+        Style::default()
+            .fg(palette.fg)
+            .bg(palette.bg)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn should_show_change_metadata(state: &AppState) -> bool {
+    !matches!(state.review_scope, ReviewScope::All)
+}
+
+fn header_change_kind_for_node(
+    node: &crate::tree::TreeNode,
+    state: &AppState,
+) -> Option<HeaderChangeKind> {
+    if !should_show_change_metadata(state) {
+        return None;
+    }
+
+    match node.kind {
+        TreeNodeKind::File => Some(
+            state
+                .file_change_kinds
+                .get(&node.id)
+                .copied()
+                .map(HeaderChangeKind::File)
+                .unwrap_or(HeaderChangeKind::Unknown),
+        ),
+        TreeNodeKind::Block => Some(
+            state
+                .block_change_kinds
+                .get(&node.id)
+                .copied()
+                .map(HeaderChangeKind::Block)
+                .unwrap_or(HeaderChangeKind::Unknown),
+        ),
+        TreeNodeKind::Root | TreeNodeKind::Directory => None,
+    }
+}
+
 /// UI mode precedence matters here: recap overrides everything, then speed read
 /// for the current block, then root navigation, then diff/source review.
 fn current_ui_mode(state: &AppState) -> UiMode {
@@ -2393,13 +2466,13 @@ fn current_ui_mode(state: &AppState) -> UiMode {
     }
 }
 
-fn ui_mode_label(mode: UiMode) -> &'static str {
+fn mode_banner_label(mode: UiMode) -> &'static str {
     match mode {
-        UiMode::Navigation => "Navigation",
-        UiMode::DiffReview => "Diff Review",
-        UiMode::SourceReview => "Source Review",
-        UiMode::SpeedRead => "Speed Read",
-        UiMode::Recap => "Recap",
+        UiMode::Navigation => "Navigation Mode",
+        UiMode::DiffReview => "Diff Mode",
+        UiMode::SourceReview => "Source Mode",
+        UiMode::SpeedRead => "Speed Read Mode",
+        UiMode::Recap => "Recap Mode",
     }
 }
 
@@ -3857,12 +3930,14 @@ fn centered_rect(r: Rect, percent_x: u16, percent_y: u16) -> Rect {
 }
 
 struct FocusLayout {
+    mode: Rect,
     meta: Rect,
     code: Rect,
     actions: Rect,
 }
 
 const ACTIONS_HEIGHT: u16 = 2;
+const MODE_BANNER_HEIGHT: u16 = 1;
 
 fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let code_width = area.width.min(120);
@@ -3870,40 +3945,50 @@ fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let padding = u16::try_from((u32::from(area.height) * 5 + 50) / 100).unwrap_or(u16::MAX);
 
     let available_height = area.height.saturating_sub(padding * 2).max(1);
-    let actions_height = ACTIONS_HEIGHT.min(available_height.saturating_sub(2));
-    let available_for_header_and_code = available_height.saturating_sub(actions_height);
+    let mode_height = MODE_BANNER_HEIGHT.min(available_height);
+    let available_after_mode = available_height.saturating_sub(mode_height);
+    let actions_height = ACTIONS_HEIGHT.min(available_after_mode.saturating_sub(2));
+    let available_for_header_and_code = available_after_mode.saturating_sub(actions_height);
     let min_header_height = 3.min(available_for_header_and_code);
     let desired_header_height = header_lines.saturating_add(2).max(min_header_height);
     let header_height = desired_header_height.min(available_for_header_and_code.saturating_sub(1));
     let code_height =
         desired_code_height.min(available_for_header_and_code.saturating_sub(header_height));
-    let total_height = header_height + code_height + actions_height;
+    let total_height = mode_height + header_height + code_height + actions_height;
 
     let content_top = area.y + (area.height.saturating_sub(total_height)) / 2;
     let content_left = area.x + (area.width.saturating_sub(code_width)) / 2;
 
-    let meta = Rect {
+    let mode = Rect {
         x: content_left,
         y: content_top,
+        width: code_width,
+        height: mode_height,
+    };
+
+    let meta = Rect {
+        x: content_left,
+        y: content_top + mode_height,
         width: code_width,
         height: header_height,
     };
 
     let code = Rect {
         x: content_left,
-        y: content_top + header_height,
+        y: content_top + mode_height + header_height,
         width: code_width,
         height: code_height,
     };
 
     let actions = Rect {
         x: content_left,
-        y: content_top + header_height + code_height,
+        y: content_top + mode_height + header_height + code_height,
         width: code_width,
         height: actions_height,
     };
 
     FocusLayout {
+        mode,
         meta,
         code,
         actions,
@@ -3943,6 +4028,19 @@ mod focus_layout_tests {
     }
 
     #[test]
+    fn focus_layout_reserves_mode_banner_row_above_header_box() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = compute_focus_layout(area, 3);
+        assert_eq!(layout.mode.height, 1);
+        assert_eq!(layout.meta.y, layout.mode.y + layout.mode.height);
+    }
+
+    #[test]
     fn focus_layout_reserves_header_border_space() {
         let area = Rect {
             x: 0,
@@ -3977,7 +4075,8 @@ mod diff_scope_tests {
     use crate::block::{Block, BlockKind};
     use crate::cli::Cli;
     use crate::commands::review::{
-        CollectedReview, ReviewDiagnostic, ReviewSummary, UnreviewedFile,
+        BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewSummary,
+        UnreviewedFile,
     };
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
@@ -4039,6 +4138,8 @@ mod diff_scope_tests {
             remaining_blocks: 0,
             reviewable_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: String::new(),
             input_mode: InputMode::Normal,
@@ -4104,6 +4205,8 @@ mod diff_scope_tests {
             remaining_blocks: 1,
             reviewable_nodes: visible,
             diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
@@ -4183,6 +4286,8 @@ mod diff_scope_tests {
             remaining_blocks: 2,
             reviewable_nodes: visible,
             diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
@@ -4272,6 +4377,8 @@ mod diff_scope_tests {
             remaining_blocks: 1,
             reviewable_nodes: visible,
             diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
             session_recap: SessionRecap::default(),
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
@@ -4891,6 +4998,8 @@ mod diff_scope_tests {
             tree,
             unreviewed_block_nodes: HashSet::from([block_id]),
             diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
         };
         let context = TrueflowContext::new(Cli::parse_from(["trueflow", "tui"]));
 
@@ -6559,70 +6668,144 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn build_header_lines_include_current_view_mode_for_file_nodes() {
+    fn build_mode_banner_line_shows_diff_mode() {
         let temp_root = std::env::temp_dir()
             .join("trueflow_tests")
-            .join("tui_header_mode_label")
+            .join("tui_mode_banner_label")
             .join(Uuid::new_v4().to_string());
         let file_path = temp_root.join("src/lib.rs");
         let file_content = "line1\n";
         let block_content = "line1\n";
-        let (mut state, file_id, _block_id) =
+        let (mut state, _file_id, _block_id) =
             build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
         state.view_mode = ViewMode::Diff;
         let palette = UiPalette::default();
-        let file_node = state.navigator.tree.node(file_id);
 
-        let diff_header = build_header_lines(file_node, &state, &palette)
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        assert!(diff_header.iter().any(|line| line == "Mode: Diff Review"));
+        assert_eq!(
+            build_mode_banner_line(&state, &palette).to_string(),
+            "Diff Mode"
+        );
 
         state.view_mode = ViewMode::Source;
-        let source_header = build_header_lines(file_node, &state, &palette)
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        assert!(
-            source_header
-                .iter()
-                .any(|line| line == "Mode: Source Review")
+        assert_eq!(
+            build_mode_banner_line(&state, &palette).to_string(),
+            "Source Mode"
         );
     }
 
     #[test]
-    fn build_header_lines_show_navigation_mode_for_root_nodes() {
+    fn build_mode_banner_line_shows_navigation_mode() {
         let mut state = build_test_state(ReviewScope::All, None, HashMap::new());
         state.total_blocks = 1;
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 1;
         state.navigator.jump_root();
         let palette = UiPalette::default();
-        let root_node = state.navigator.tree.node(state.navigator.tree.root());
 
-        let header = build_header_lines(root_node, &state, &palette)
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-
-        assert!(header.iter().any(|line| line == "Mode: Navigation"));
+        assert_eq!(
+            build_mode_banner_line(&state, &palette).to_string(),
+            "Navigation Mode"
+        );
     }
 
     #[test]
-    fn build_header_lines_show_speed_read_mode_when_active() {
-        let (mut state, block_id) = build_state_with_single_block("alpha beta gamma delta");
+    fn build_mode_banner_line_shows_speed_read_mode() {
+        let (mut state, _block_id) = build_state_with_single_block("alpha beta gamma delta");
         let palette = UiPalette::default();
 
         toggle_speed_read_mode(&mut state);
 
+        assert_eq!(
+            build_mode_banner_line(&state, &palette).to_string(),
+            "Speed Read Mode"
+        );
+    }
+
+    #[test]
+    fn build_header_lines_show_file_change_metadata_without_mode_row() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_header_change_label")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\n";
+        let block_content = "line1\n";
+        let (state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        let mut state = state;
+        state.review_scope = ReviewScope::MainDiff;
+        state
+            .file_change_kinds
+            .insert(file_id, FileChangeKind::Deleted);
+        let palette = UiPalette::default();
+        let file_node = state.navigator.tree.node(file_id);
+
+        let header = build_header_lines(file_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert!(header.iter().any(|line| line == "File Deleted"));
+        assert!(header.iter().all(|line| !line.starts_with("Mode: ")));
+
+        state.view_mode = ViewMode::Source;
+        let source_header = build_header_lines(file_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert!(source_header.iter().any(|line| line == "File Deleted"));
+    }
+
+    #[test]
+    fn build_header_lines_show_block_change_metadata_independent_from_file_metadata() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_header_block_change_label")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "fn demo() {\n    old();\n}\n";
+        let block_content = file_content;
+        let (state, file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 3);
+        let mut state = state;
+        state.review_scope = ReviewScope::MainDiff;
+        state
+            .file_change_kinds
+            .insert(file_id, FileChangeKind::Changed);
+        state
+            .block_change_kinds
+            .insert(block_id, BlockChangeKind::Added);
+        let palette = UiPalette::default();
         let block_node = state.navigator.tree.node(block_id);
+
         let header = build_header_lines(block_node, &state, &palette)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
+        assert!(header.iter().any(|line| line == "Block Added"));
+        assert!(header.iter().all(|line| line != "File Changed"));
+    }
 
-        assert!(header.iter().any(|line| line == "Mode: Speed Read"));
+    #[test]
+    fn build_header_lines_show_unknown_change_when_diff_metadata_missing() {
+        let temp_root = std::env::temp_dir()
+            .join("trueflow_tests")
+            .join("tui_header_unknown_change_label")
+            .join(Uuid::new_v4().to_string());
+        let file_path = temp_root.join("src/lib.rs");
+        let file_content = "line1\n";
+        let block_content = "line1\n";
+        let (state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
+        let mut state = state;
+        state.review_scope = ReviewScope::MainDiff;
+        let palette = UiPalette::default();
+        let block_node = state.navigator.tree.node(block_id);
+
+        let header = build_header_lines(block_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert!(header.iter().any(|line| line == "Unknown Change"));
     }
 
     #[test]

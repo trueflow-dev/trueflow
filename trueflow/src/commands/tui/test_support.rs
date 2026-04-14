@@ -15,11 +15,12 @@ use super::{
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::commands::mark;
+use crate::commands::review::{BlockChangeKind, FileChangeKind};
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::ReviewScope;
 use crate::store::Verdict;
-use crate::tree::TreeBuilder;
+use crate::tree::{TreeBuilder, TreeNodeId, TreeNodeKind};
 use anyhow::{Result, bail};
 use ratatui::{Terminal, backend::Backend};
 use std::collections::{HashMap, HashSet};
@@ -172,6 +173,27 @@ where
         let preferred_focus = self.state.focus_block;
         set_focus_for_current_node(&mut self.state, preferred_focus);
         self.state.content_frame_cache.clear();
+    }
+
+    pub fn set_review_scope(&mut self, review_scope: ReviewScope) {
+        self.state.review_scope = review_scope;
+    }
+
+    pub fn set_current_block_change_kind(&mut self, change_kind: BlockChangeKind) {
+        let current = self.state.navigator.current_id();
+        self.state.block_change_kinds.insert(current, change_kind);
+    }
+
+    pub fn set_current_file_change_kind(&mut self, change_kind: FileChangeKind) {
+        if let Some(file_id) =
+            current_or_ancestor_file_id(&self.state, self.state.navigator.current_id())
+        {
+            self.state.file_change_kinds.insert(file_id, change_kind);
+        }
+    }
+
+    pub fn go_parent(&mut self) {
+        handle_parent(&mut self.state);
     }
 
     pub fn preload_text_diff(
@@ -427,6 +449,18 @@ enum TestInputMode {
     ConfirmBatch,
 }
 
+fn current_or_ancestor_file_id(state: &AppState, start: TreeNodeId) -> Option<TreeNodeId> {
+    let mut current = Some(start);
+    while let Some(node_id) = current {
+        let node = state.navigator.tree.node(node_id);
+        if matches!(node.kind, TreeNodeKind::File) {
+            return Some(node_id);
+        }
+        current = node.parent;
+    }
+    None
+}
+
 fn build_root_state<I, S>(file_names: I) -> Result<AppState>
 where
     I: IntoIterator<Item = S>,
@@ -471,6 +505,8 @@ where
         remaining_blocks: visible.len(),
         reviewable_nodes: visible,
         diff_block_sides: HashMap::new(),
+        file_change_kinds: HashMap::new(),
+        block_change_kinds: HashMap::new(),
         session_recap: SessionRecap::default(),
         scope_label: "All".to_string(),
         input_mode: InputMode::Normal,
@@ -552,6 +588,8 @@ fn build_state_with_single_rust_block_file(
         remaining_blocks: 1,
         reviewable_nodes: visible,
         diff_block_sides: HashMap::new(),
+        file_change_kinds: HashMap::new(),
+        block_change_kinds: HashMap::new(),
         session_recap: SessionRecap::default(),
         scope_label: "All".to_string(),
         input_mode: InputMode::Normal,

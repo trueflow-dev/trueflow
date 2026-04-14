@@ -113,7 +113,7 @@ fn pty_smoke_diff_mode_keeps_wrapped_rows_readable_in_narrow_terminal() -> Resul
         }
     });
 
-    wait_for_output(&output, "Mode: Diff", Duration::from_secs(5), &mut *child)?;
+    wait_for_output(&output, "Diff Mode", Duration::from_secs(5), &mut *child)?;
     let screen = parsed_screen_contents(&output, rows, cols);
     assert!(
         screen.lines().any(|row| row.starts_with('-')),

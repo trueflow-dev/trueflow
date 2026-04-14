@@ -2,10 +2,12 @@
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use trueflow::commands::review::{BlockChangeKind, FileChangeKind};
 use trueflow::commands::tui::test_support::{
     MarkActionRunner, ScriptedMarkAction, ScriptedSessionRecap, ScriptedTui,
 };
 use trueflow::repo_path::RepoPath;
+use trueflow::review_scope::ReviewScope;
 use trueflow::review_speedread::PlaybackState;
 use trueflow::vcs;
 
@@ -143,6 +145,74 @@ fn diff_view_initial_render_scrolls_to_changed_rows_for_long_block() -> Result<(
     assert!(
         screen.contains("+ line22 changed"),
         "expected initial diff render to show added line:\n{screen}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn diff_view_renders_file_deleted_banner_and_header_metadata() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(100, 20),
+        "src/lib.rs",
+        "fn removed() {\n    old_body();\n}\n",
+        "fn removed() {\n    old_body();\n}\n",
+        0,
+        3,
+    )?;
+    app.set_review_scope(ReviewScope::MainDiff);
+    app.set_current_file_change_kind(FileChangeKind::Deleted);
+    app.show_diff();
+    app.go_parent();
+
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        screen.contains("Diff Mode"),
+        "expected diff mode banner:\n{screen}"
+    );
+    assert!(
+        screen.contains("File Deleted"),
+        "expected deleted-file header metadata:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Mode: Diff"),
+        "did not expect legacy mode row copy:\n{screen}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn diff_view_renders_block_change_metadata_independent_from_file_change_metadata() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(100, 20),
+        "src/lib.rs",
+        "fn demo() {\n    work();\n}\n",
+        "fn demo() {\n    work();\n}\n",
+        0,
+        3,
+    )?;
+    app.set_review_scope(ReviewScope::MainDiff);
+    app.set_current_file_change_kind(FileChangeKind::Changed);
+    app.set_current_block_change_kind(BlockChangeKind::Added);
+    app.show_diff();
+
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        screen.contains("Diff Mode"),
+        "expected diff mode banner:\n{screen}"
+    );
+    assert!(
+        screen.contains("Block Added"),
+        "expected block-local change metadata:\n{screen}"
+    );
+    assert!(
+        !screen.contains("File Changed"),
+        "did not expect parent file label on block header:\n{screen}"
     );
 
     Ok(())

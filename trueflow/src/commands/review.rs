@@ -227,11 +227,27 @@ pub struct ReviewSummary {
     pub diagnostics: Vec<ReviewDiagnostic>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChangeKind {
+    Added,
+    Deleted,
+    Changed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockChangeKind {
+    Added,
+    Deleted,
+    Changed,
+}
+
 pub struct CollectedReview {
     pub summary: ReviewSummary,
     pub tree: tree::Tree,
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
     pub diff_block_sides: HashMap<tree::TreeNodeId, DiffBlockSides>,
+    pub file_change_kinds: HashMap<tree::TreeNodeId, FileChangeKind>,
+    pub block_change_kinds: HashMap<tree::TreeNodeId, BlockChangeKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +272,7 @@ impl DiffBlockSides {
 #[derive(Debug, Clone)]
 struct DiffReviewBlock {
     sides: DiffBlockSides,
+    change_kind: BlockChangeKind,
 }
 
 impl DiffReviewBlock {
@@ -269,6 +286,7 @@ struct DiffReviewFile {
     path: RepoPath,
     language: Language,
     file_hash: crate::hashing::TreeHash,
+    change_kind: FileChangeKind,
     blocks: Vec<DiffReviewBlock>,
 }
 
@@ -585,6 +603,8 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         tree,
         unreviewed_block_nodes,
         diff_block_sides: HashMap::new(),
+        file_change_kinds: HashMap::new(),
+        block_change_kinds: HashMap::new(),
     })
 }
 
@@ -601,7 +621,8 @@ fn collect_diff_scoped_review(
         diff_context.diff_targets,
         diff_context.workdir_prefix,
     )?;
-    let (tree, diff_block_sides) = build_tree_from_diff_review_files(&review_files)?;
+    let (tree, diff_block_sides, file_change_kinds, block_change_kinds) =
+        build_tree_from_diff_review_files(&review_files)?;
     let coverage = CoverageIndex::build(
         &tree,
         diff_context.database,
@@ -694,6 +715,8 @@ fn collect_diff_scoped_review(
         tree,
         unreviewed_block_nodes,
         diff_block_sides,
+        file_change_kinds,
+        block_change_kinds,
     })
 }
 
@@ -766,10 +789,17 @@ fn collect_diff_review_files(
             .or_else(|| base_files.first().map(|file| file.tree_hash.clone()))
             .unwrap_or_default();
 
+        let Some(change_kind) =
+            classify_file_change_kind(!base_files.is_empty(), head_file.is_some())
+        else {
+            continue;
+        };
+
         review_files.push(DiffReviewFile {
             path: display_path,
             language,
             file_hash,
+            change_kind,
             blocks,
         });
     }
@@ -851,13 +881,38 @@ fn dedupe_blocks(blocks: Vec<Block>) -> Vec<Block> {
     unique.into_values().collect()
 }
 
-fn build_tree_from_diff_review_files(
-    files: &[DiffReviewFile],
-) -> Result<(tree::Tree, HashMap<tree::TreeNodeId, DiffBlockSides>)> {
+fn classify_file_change_kind(has_base: bool, has_head: bool) -> Option<FileChangeKind> {
+    match (has_base, has_head) {
+        (true, true) => Some(FileChangeKind::Changed),
+        (true, false) => Some(FileChangeKind::Deleted),
+        (false, true) => Some(FileChangeKind::Added),
+        (false, false) => None,
+    }
+}
+
+fn classify_block_change_kind(sides: &DiffBlockSides) -> Option<BlockChangeKind> {
+    match (&sides.base, &sides.head) {
+        (Some(_), Some(_)) => Some(BlockChangeKind::Changed),
+        (Some(_), None) => Some(BlockChangeKind::Deleted),
+        (None, Some(_)) => Some(BlockChangeKind::Added),
+        (None, None) => None,
+    }
+}
+
+type DiffReviewTreeBuild = (
+    tree::Tree,
+    HashMap<tree::TreeNodeId, DiffBlockSides>,
+    HashMap<tree::TreeNodeId, FileChangeKind>,
+    HashMap<tree::TreeNodeId, BlockChangeKind>,
+);
+
+fn build_tree_from_diff_review_files(files: &[DiffReviewFile]) -> Result<DiffReviewTreeBuild> {
     let mut builder = tree::TreeBuilder::new();
     let root = builder.root();
     let mut directories = HashMap::from([(RepoPath::root(), root)]);
     let mut diff_block_sides = HashMap::new();
+    let mut file_change_kinds = HashMap::new();
+    let mut block_change_kinds = HashMap::new();
 
     for file in files {
         let parts = file.path.as_str().split('/').collect::<Vec<_>>();
@@ -875,6 +930,7 @@ fn build_tree_from_diff_review_files(
                     file.file_hash.clone(),
                     file.language,
                 );
+                file_change_kinds.insert(file_id, file.change_kind);
                 let mut container_stack: Vec<(tree::TreeNodeId, usize, usize)> = Vec::new();
                 for review_block in &file.blocks {
                     let display_block = review_block.display_block().clone();
@@ -904,6 +960,7 @@ fn build_tree_from_diff_review_files(
                         file.language,
                     );
                     diff_block_sides.insert(node_id, review_block.sides.clone());
+                    block_change_kinds.insert(node_id, review_block.change_kind);
                     if display_block.kind.can_contain_review_children() {
                         container_stack.push((node_id, start_line, end_line));
                     }
@@ -918,7 +975,12 @@ fn build_tree_from_diff_review_files(
         }
     }
 
-    Ok((builder.finalize(), diff_block_sides))
+    Ok((
+        builder.finalize(),
+        diff_block_sides,
+        file_change_kinds,
+        block_change_kinds,
+    ))
 }
 
 fn diff_block_label(block: &Block) -> String {
@@ -1236,18 +1298,24 @@ fn collect_diff_review_blocks_for_file(
             let head_block = unmatched_head_blocks[head_index]
                 .take()
                 .unwrap_or_else(|| panic!("matched head block should still be present"));
+            let sides = DiffBlockSides {
+                base: Some(base_block),
+                head: Some(head_block),
+            };
             diff_blocks.push(DiffReviewBlock {
-                sides: DiffBlockSides {
-                    base: Some(base_block),
-                    head: Some(head_block),
-                },
+                change_kind: classify_block_change_kind(&sides)
+                    .unwrap_or_else(|| panic!("paired diff block should have a change kind")),
+                sides,
             });
         } else {
+            let sides = DiffBlockSides {
+                base: Some(base_block),
+                head: None,
+            };
             diff_blocks.push(DiffReviewBlock {
-                sides: DiffBlockSides {
-                    base: Some(base_block),
-                    head: None,
-                },
+                change_kind: classify_block_change_kind(&sides)
+                    .unwrap_or_else(|| panic!("base-only diff block should have a change kind")),
+                sides,
             });
         }
     }
@@ -1256,11 +1324,17 @@ fn collect_diff_review_blocks_for_file(
         unmatched_head_blocks
             .into_iter()
             .flatten()
-            .map(|head_block| DiffReviewBlock {
-                sides: DiffBlockSides {
+            .map(|head_block| {
+                let sides = DiffBlockSides {
                     base: None,
                     head: Some(head_block),
-                },
+                };
+                DiffReviewBlock {
+                    change_kind: classify_block_change_kind(&sides).unwrap_or_else(|| {
+                        panic!("head-only diff block should have a change kind")
+                    }),
+                    sides,
+                }
             }),
     );
 
@@ -1617,6 +1691,95 @@ mod tests {
 
     fn diff_review_blocks(blocks: &[DiffReviewBlock]) -> Vec<&DiffBlockSides> {
         blocks.iter().map(|block| &block.sides).collect()
+    }
+
+    #[test]
+    fn classify_file_change_kind_marks_head_and_base_as_changed() {
+        assert_eq!(
+            classify_file_change_kind(true, true),
+            Some(FileChangeKind::Changed)
+        );
+    }
+
+    #[test]
+    fn classify_file_change_kind_marks_base_only_as_deleted() {
+        assert_eq!(
+            classify_file_change_kind(true, false),
+            Some(FileChangeKind::Deleted)
+        );
+    }
+
+    #[test]
+    fn classify_file_change_kind_marks_head_only_as_added() {
+        assert_eq!(
+            classify_file_change_kind(false, true),
+            Some(FileChangeKind::Added)
+        );
+    }
+
+    #[test]
+    fn classify_file_change_kind_returns_none_when_neither_side_exists() {
+        assert_eq!(classify_file_change_kind(false, false), None);
+    }
+
+    #[test]
+    fn classify_block_change_kind_marks_head_only_as_added() {
+        let head_block = make_diff_block("head-only", BlockKind::Function, 0, 1, "fn add() {}\n");
+        assert_eq!(
+            classify_block_change_kind(&DiffBlockSides {
+                base: None,
+                head: Some(head_block),
+            }),
+            Some(BlockChangeKind::Added)
+        );
+    }
+
+    #[test]
+    fn classify_block_change_kind_marks_base_only_as_deleted() {
+        let base_block = make_diff_block("base-only", BlockKind::Function, 0, 1, "fn gone() {}\n");
+        assert_eq!(
+            classify_block_change_kind(&DiffBlockSides {
+                base: Some(base_block),
+                head: None,
+            }),
+            Some(BlockChangeKind::Deleted)
+        );
+    }
+
+    #[test]
+    fn classify_block_change_kind_marks_paired_block_as_changed() {
+        let base_block = make_diff_block(
+            "base",
+            BlockKind::Function,
+            0,
+            2,
+            "fn demo() {\n    old();\n}\n",
+        );
+        let head_block = make_diff_block(
+            "head",
+            BlockKind::Function,
+            0,
+            2,
+            "fn demo() {\n    new();\n}\n",
+        );
+        assert_eq!(
+            classify_block_change_kind(&DiffBlockSides {
+                base: Some(base_block),
+                head: Some(head_block),
+            }),
+            Some(BlockChangeKind::Changed)
+        );
+    }
+
+    #[test]
+    fn classify_block_change_kind_returns_none_when_neither_side_exists() {
+        assert_eq!(
+            classify_block_change_kind(&DiffBlockSides {
+                base: None,
+                head: None,
+            }),
+            None
+        );
     }
 
     #[test]
