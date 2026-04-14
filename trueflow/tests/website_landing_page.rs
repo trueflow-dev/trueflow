@@ -121,6 +121,31 @@ fn website_install_page_explains_script_and_manual_downloads() -> Result<()> {
         "/download/trueflow-v0.1.0-SHA256SUMS.txt",
         "install page checksum link",
     );
+    assert_contains(
+        &html,
+        "nix run github:trueflow-dev/trueflow",
+        "install page nix run command",
+    );
+    assert_contains(
+        &html,
+        "nix profile install github:trueflow-dev/trueflow",
+        "install page nix profile install command",
+    );
+    assert_contains(
+        &html,
+        "inputs.trueflow.url = \"github:trueflow-dev/trueflow\";",
+        "install page nix flake input example",
+    );
+    assert_contains(
+        &html,
+        "trueflow.packages.${pkgs.system}.default",
+        "install page nix package reference",
+    );
+    assert_contains(
+        &html,
+        "path:/path/to/trueflow",
+        "install page local nix path example",
+    );
     assert_not_contains(
         &html,
         "These URLs go live when the first signed-off binary release is published.",

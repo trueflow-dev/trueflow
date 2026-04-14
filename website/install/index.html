@@ -87,6 +87,27 @@ install -m 0755 trueflow ~/.local/bin/trueflow</code></pre>
             The latest published artifacts and checksums live under <span class="inline-code">/download/</span>.
           </p>
         </article>
+
+        <article class="install-panel">
+          <h2>Nix</h2>
+          <p>
+            If you already use Nix, install trueflow directly from the flake
+            instead of using the website-distributed binary.
+          </p>
+          <p class="command-label">Run without installing</p>
+          <pre class="command-line"><code>nix run github:trueflow-dev/trueflow</code></pre>
+          <p class="command-label">Install into your profile</p>
+          <pre class="command-line"><code>nix profile install github:trueflow-dev/trueflow</code></pre>
+          <p class="command-label">Use from your own flake</p>
+          <pre class="command-line"><code>inputs.trueflow.url = "github:trueflow-dev/trueflow";
+
+# later, in home-manager / nix-darwin / NixOS package lists
+trueflow.packages.${pkgs.system}.default</code></pre>
+          <p class="install-note">
+            For a local checkout, replace the GitHub URL with a path input such
+            as <span class="inline-code">path:/path/to/trueflow</span>.
+          </p>
+        </article>
       </section>
     </main>
 
