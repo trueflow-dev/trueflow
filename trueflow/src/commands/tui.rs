@@ -2508,7 +2508,6 @@ fn build_action_lines(
         UiMode::SourceReview => format_key_action(keybinds.toggle_view, "diff"),
         _ => format_key_action(keybinds.toggle_view, "mode"),
     };
-    let speed_read_action = format_key_action(keybinds.speed_read, "speed");
     let quit_action = format_key_action(keybinds.quit, "quit");
     let phrases = match mode {
         UiMode::Navigation => vec![
@@ -2529,7 +2528,6 @@ fn build_action_lines(
             format_key_action(keybinds.child, "child"),
             approve_action,
             note_action,
-            speed_read_action,
             mode_action,
             quit_action,
         ],
@@ -4582,15 +4580,15 @@ mod diff_scope_tests {
             Some(KeybindAction::Next)
         );
         assert_eq!(
-            keybind_action_for_key_code(&keybinds, KeyCode::Char('p')),
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('P')),
             Some(KeybindAction::Parent)
         );
         assert_eq!(
-            keybind_action_for_key_code(&keybinds, KeyCode::Char('c')),
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('C')),
             Some(KeybindAction::Child)
         );
         assert_eq!(
-            keybind_action_for_key_code(&keybinds, KeyCode::Char('n')),
+            keybind_action_for_key_code(&keybinds, KeyCode::Char('c')),
             Some(KeybindAction::Note)
         );
         assert_eq!(
@@ -4717,15 +4715,15 @@ mod diff_scope_tests {
 
         assert_eq!(lines.len(), 1);
         assert!(joined.contains("[PgUp/PgDown]"));
-        assert!(joined.contains("[r]speed"));
+        assert!(!joined.contains("[r]speed"));
         assert!(joined.contains("[h]prev"));
         assert!(joined.contains("[l]next"));
         assert!(joined.contains("[j]down"));
         assert!(joined.contains("[k]up"));
-        assert!(joined.contains("[p]arent"));
-        assert!(joined.contains("[c]hild"));
+        assert!(joined.contains("[P]arent"));
+        assert!(joined.contains("[C]hild"));
         assert!(joined.contains("[a]pprove"));
-        assert!(joined.contains("[n]ote"));
+        assert!(joined.contains("[c]omment"));
         assert!(joined.contains("[m]source"));
         assert!(joined.contains("[q]uit"));
         assert!(!joined.contains('↓'));
@@ -4736,7 +4734,7 @@ mod diff_scope_tests {
         assert!(!joined.contains("page-scroll"));
         assert!(!joined.contains("speed-read"));
         assert!(!joined.contains("root"));
-        assert!(!joined.contains("[n]note"));
+        assert!(!joined.contains("[c]comment"));
         assert!(!joined.contains("[q]quit"));
     }
 
