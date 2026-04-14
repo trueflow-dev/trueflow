@@ -111,7 +111,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-TARGET=$(detect_target) || die "unsupported platform; current draft support is Apple Silicon macOS only. See ${BASE_URL}/install/"
+TARGET=$(detect_target) || die "unsupported platform; current support is Apple Silicon macOS only. See ${BASE_URL}/install/"
 ARCHIVE_NAME="trueflow-${VERSION}-${TARGET}.tar.gz"
 CHECKSUM_NAME="trueflow-${VERSION}-SHA256SUMS.txt"
 ARCHIVE_URL="${BASE_URL}/download/${ARCHIVE_NAME}"

@@ -21,6 +21,13 @@ fn assert_contains(haystack: &str, needle: &str, context: &str) {
     );
 }
 
+fn assert_not_contains(haystack: &str, needle: &str, context: &str) {
+    assert!(
+        !haystack.contains(needle),
+        "expected {context} to not contain {needle:?}"
+    );
+}
+
 #[test]
 fn website_landing_page_has_install_command_above_the_fold() -> Result<()> {
     let html = read_repo_file("website/index.html")?;
@@ -109,10 +116,15 @@ fn website_install_page_explains_script_and_manual_downloads() -> Result<()> {
         "/download/trueflow-v0.1.0-SHA256SUMS.txt",
         "install page checksum link",
     );
-    assert_contains(
+    assert_not_contains(
         &html,
         "These URLs go live when the first signed-off binary release is published.",
-        "install page draft release note",
+        "install page stale release note",
+    );
+    assert_not_contains(
+        &html,
+        "More targets can be added once the initial packaging and release flow is stable.",
+        "install page stale packaging note",
     );
 
     Ok(())
@@ -172,6 +184,11 @@ fn website_install_script_targets_same_domain_and_macos_arm64() -> Result<()> {
     );
     assert_contains(&script, "--version", "installer pinned version flag");
     assert_contains(&script, "--to", "installer custom install dir flag");
+    assert_not_contains(
+        &script,
+        "current draft support is Apple Silicon macOS only",
+        "installer stale draft support message",
+    );
 
     Ok(())
 }

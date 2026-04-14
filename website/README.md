@@ -23,7 +23,7 @@ Then open <http://localhost:8080>.
 
 ## URL contract
 
-The draft site and release flow use one domain:
+The site and release flow use one domain:
 
 - `/` — landing page
 - `/about/` — about page
@@ -31,7 +31,7 @@ The draft site and release flow use one domain:
 - `/install.sh` — shell installer
 - `/download/<artifact_name>` — raw release artifacts and checksums
 
-Current draft binary scope is Apple Silicon macOS only.
+Current binary scope is Apple Silicon macOS only.
 
 ## Deployment shape
 
