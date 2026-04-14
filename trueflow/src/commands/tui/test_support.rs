@@ -1,16 +1,17 @@
 use super::{
-    AppState, EditingKeyAction, Event, InputMode, KeyCode, KeyEvent, KeyEventKind, KeybindAction,
-    RecapAction, Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers, TuiKeybindsConfig,
-    TuiSpeedReadConfig, UiMode, ViewMode, clear_editing_validation, clear_focus_scroll,
+    AppState, EditingActionResult, Event, InputCursor, InputMode, KeyCode, KeyEvent, KeyEventKind,
+    KeybindAction, RecapAction, Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers,
+    TuiKeybindsConfig, TuiSpeedReadConfig, UiMode, ViewMode, clear_focus_scroll,
     current_ui_mode, editing_key_action_for_event, execute_action_with,
-    handle_advance_review_target, handle_child, handle_confirm_cancel, handle_editing_cancel,
-    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
-    handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
-    handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding,
-    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
-    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
-    keybind_action_for_key_code, recap_action_for_key_code, set_focus_for_current_node,
-    should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
+    handle_advance_review_target, handle_child, handle_confirm_cancel, handle_editing_key_action,
+    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action,
+    handle_parent, handle_paste_event, handle_prev, handle_scroll_line_down,
+    handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
+    handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
+    key_event_for_press_event, key_event_for_press_or_repeat_event,
+    keybind_action_accepts_repeat, keybind_action_for_key_code, recap_action_for_key_code,
+    set_focus_for_current_node, should_rerender_on_event, sync_speed_read_focus,
+    toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
@@ -439,8 +440,8 @@ where
             return Ok(());
         };
 
-        match editing_key_action_for_event(&key_event) {
-            EditingKeyAction::Submit => {
+        match handle_editing_key_action(&mut self.state, editing_key_action_for_event(&key_event)) {
+            EditingActionResult::Submit => {
                 let runner = &mut self.mark_action_runner;
                 handle_editing_submit_with(&mut self.state, |action, state| {
                     let Some(runner) = runner.as_mut() else {
@@ -452,20 +453,7 @@ where
                     })
                 })?;
             }
-            EditingKeyAction::InsertNewline => {
-                clear_editing_validation(&mut self.state);
-                self.state.input_buffer.push('\n');
-            }
-            EditingKeyAction::Cancel => handle_editing_cancel(&mut self.state),
-            EditingKeyAction::Backspace => {
-                clear_editing_validation(&mut self.state);
-                self.state.input_buffer.pop();
-            }
-            EditingKeyAction::InsertChar(c) => {
-                clear_editing_validation(&mut self.state);
-                self.state.input_buffer.push(c);
-            }
-            EditingKeyAction::Ignore => {}
+            EditingActionResult::Handled | EditingActionResult::Noop => {}
         }
 
         Ok(())
@@ -556,6 +544,7 @@ where
         scope_label: "All".to_string(),
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
+        input_cursor: InputCursor::default(),
         editing_validation: None,
         confirm_batch: crate::config::BatchConfirmPolicy::Never,
         repo_name: "repo".to_string(),
@@ -638,6 +627,7 @@ fn build_state_with_single_rust_block_file(
         scope_label: "All".to_string(),
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
+        input_cursor: InputCursor::default(),
         editing_validation: None,
         confirm_batch: crate::config::BatchConfirmPolicy::Never,
         repo_name: "repo".to_string(),

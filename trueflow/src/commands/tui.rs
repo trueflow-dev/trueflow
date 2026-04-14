@@ -37,7 +37,7 @@ use crossterm::event::{
 };
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -544,6 +544,30 @@ enum InputMode {
     },
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct InputCursor {
+    offset: usize,
+    goal_column: Option<usize>,
+}
+
+impl InputCursor {
+    fn clamped_to_buffer(self, content: &str) -> Self {
+        Self {
+            offset: clamp_cursor_offset_to_char_boundary(content, self.offset),
+            goal_column: self.goal_column,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.offset = 0;
+        self.goal_column = None;
+    }
+
+    fn clear_goal_column(&mut self) {
+        self.goal_column = None;
+    }
+}
+
 struct AppState {
     review_scope: ScopePreset,
     navigator: ReviewNavigator,
@@ -559,6 +583,7 @@ struct AppState {
     scope_label: String,
     input_mode: InputMode,
     input_buffer: String,
+    input_cursor: InputCursor,
     editing_validation: Option<EditingValidation>,
     confirm_batch: BatchConfirmPolicy,
     repo_name: String,
@@ -976,6 +1001,7 @@ fn build_review_state(
         scope_label: options.scope_label,
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
+        input_cursor: InputCursor::default(),
         editing_validation: None,
         confirm_batch: options.confirm_batch,
         repo_name: detect_repo_name(context),
@@ -1487,31 +1513,18 @@ fn run_app(
                     continue;
                 };
 
-                match editing_key_action_for_event(&key_event) {
-                    EditingKeyAction::Submit => {
+                match handle_editing_key_action(
+                    &mut state,
+                    editing_key_action_for_event(&key_event),
+                ) {
+                    EditingActionResult::Submit => {
                         handle_editing_submit(session, context, &mut state)?;
                         needs_render = true;
                     }
-                    EditingKeyAction::InsertNewline => {
-                        clear_editing_validation(&mut state);
-                        state.input_buffer.push('\n');
+                    EditingActionResult::Handled => {
                         needs_render = true;
                     }
-                    EditingKeyAction::Cancel => {
-                        handle_editing_cancel(&mut state);
-                        needs_render = true;
-                    }
-                    EditingKeyAction::Backspace => {
-                        clear_editing_validation(&mut state);
-                        state.input_buffer.pop();
-                        needs_render = true;
-                    }
-                    EditingKeyAction::InsertChar(c) => {
-                        clear_editing_validation(&mut state);
-                        state.input_buffer.push(c);
-                        needs_render = true;
-                    }
-                    EditingKeyAction::Ignore => {}
+                    EditingActionResult::Noop => {}
                 }
             }
             InputMode::ConfirmBatch { .. } => {
@@ -1589,8 +1602,22 @@ enum EditingKeyAction {
     InsertNewline,
     Cancel,
     Backspace,
+    Delete,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    MoveHome,
+    MoveEnd,
     InsertChar(char),
     Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditingActionResult {
+    Noop,
+    Handled,
+    Submit,
 }
 
 fn editing_key_action_for_event(key_event: &KeyEvent) -> EditingKeyAction {
@@ -1598,6 +1625,13 @@ fn editing_key_action_for_event(key_event: &KeyEvent) -> EditingKeyAction {
         KeyEventKind::Release => return EditingKeyAction::Ignore,
         KeyEventKind::Repeat => match key_event.code {
             KeyCode::Backspace => return EditingKeyAction::Backspace,
+            KeyCode::Delete => return EditingKeyAction::Delete,
+            KeyCode::Left => return EditingKeyAction::MoveLeft,
+            KeyCode::Right => return EditingKeyAction::MoveRight,
+            KeyCode::Up => return EditingKeyAction::MoveUp,
+            KeyCode::Down => return EditingKeyAction::MoveDown,
+            KeyCode::Home => return EditingKeyAction::MoveHome,
+            KeyCode::End => return EditingKeyAction::MoveEnd,
             KeyCode::Char(c) => {
                 if key_event
                     .modifiers
@@ -1619,6 +1653,13 @@ fn editing_key_action_for_event(key_event: &KeyEvent) -> EditingKeyAction {
         KeyCode::Enter => EditingKeyAction::Submit,
         KeyCode::Esc => EditingKeyAction::Cancel,
         KeyCode::Backspace => EditingKeyAction::Backspace,
+        KeyCode::Delete => EditingKeyAction::Delete,
+        KeyCode::Left => EditingKeyAction::MoveLeft,
+        KeyCode::Right => EditingKeyAction::MoveRight,
+        KeyCode::Up => EditingKeyAction::MoveUp,
+        KeyCode::Down => EditingKeyAction::MoveDown,
+        KeyCode::Home => EditingKeyAction::MoveHome,
+        KeyCode::End => EditingKeyAction::MoveEnd,
         KeyCode::Char('j')
             if key_event.modifiers.contains(KeyModifiers::CONTROL)
                 && !key_event
@@ -1639,6 +1680,303 @@ fn editing_key_action_for_event(key_event: &KeyEvent) -> EditingKeyAction {
         }
         _ => EditingKeyAction::Ignore,
     }
+}
+
+fn handle_editing_key_action(
+    state: &mut AppState,
+    action: EditingKeyAction,
+) -> EditingActionResult {
+    match action {
+        EditingKeyAction::Submit => EditingActionResult::Submit,
+        EditingKeyAction::InsertNewline => {
+            if insert_text_at_input_cursor(state, "\n") {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::Cancel => {
+            handle_editing_cancel(state);
+            EditingActionResult::Handled
+        }
+        EditingKeyAction::Backspace => {
+            let cleared_validation = state.editing_validation.is_some();
+            if cleared_validation {
+                clear_editing_validation(state);
+            }
+            if delete_before_input_cursor(state) || cleared_validation {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::Delete => {
+            let cleared_validation = state.editing_validation.is_some();
+            if cleared_validation {
+                clear_editing_validation(state);
+            }
+            if delete_after_input_cursor(state) || cleared_validation {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::MoveLeft => {
+            if move_input_cursor_left(state) {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::MoveRight => {
+            if move_input_cursor_right(state) {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::MoveUp => {
+            if move_input_cursor_vertically(state, -1) {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::MoveDown => {
+            if move_input_cursor_vertically(state, 1) {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::MoveHome => {
+            if move_input_cursor_to_comment_start(state) {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::MoveEnd => {
+            if move_input_cursor_to_comment_end(state) {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::InsertChar(c) => {
+            let mut utf8 = [0u8; 4];
+            if insert_text_at_input_cursor(state, c.encode_utf8(&mut utf8)) {
+                EditingActionResult::Handled
+            } else {
+                EditingActionResult::Noop
+            }
+        }
+        EditingKeyAction::Ignore => EditingActionResult::Noop,
+    }
+}
+
+fn clamp_cursor_offset_to_char_boundary(content: &str, offset: usize) -> usize {
+    let mut clamped = offset.min(content.len());
+    while clamped > 0 && !content.is_char_boundary(clamped) {
+        clamped = clamped.saturating_sub(1);
+    }
+    clamped
+}
+
+fn previous_char_boundary(content: &str, offset: usize) -> usize {
+    let offset = clamp_cursor_offset_to_char_boundary(content, offset);
+    if offset == 0 {
+        return 0;
+    }
+    content[..offset]
+        .char_indices()
+        .last()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_char_boundary(content: &str, offset: usize) -> usize {
+    let offset = clamp_cursor_offset_to_char_boundary(content, offset);
+    if offset >= content.len() {
+        return content.len();
+    }
+    let next_char_len = content[offset..].chars().next().map_or(0, char::len_utf8);
+    offset.saturating_add(next_char_len)
+}
+
+fn line_start_for_cursor(content: &str, offset: usize) -> usize {
+    let offset = clamp_cursor_offset_to_char_boundary(content, offset);
+    content[..offset].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn line_end_for_start(content: &str, line_start: usize) -> usize {
+    content[line_start..]
+        .find('\n')
+        .map_or(content.len(), |index| line_start + index)
+}
+
+fn char_column_for_offset(content: &str, line_start: usize, offset: usize) -> usize {
+    let offset = clamp_cursor_offset_to_char_boundary(content, offset);
+    content[line_start..offset].chars().count()
+}
+
+fn byte_offset_for_char_column(content: &str, column: usize) -> usize {
+    let mut byte_offset = 0usize;
+    let mut chars_seen = 0usize;
+    for ch in content.chars() {
+        if chars_seen == column {
+            break;
+        }
+        byte_offset = byte_offset.saturating_add(ch.len_utf8());
+        chars_seen = chars_seen.saturating_add(1);
+    }
+    byte_offset
+}
+
+fn previous_line_start(content: &str, current_line_start: usize) -> Option<usize> {
+    if current_line_start == 0 {
+        return None;
+    }
+
+    let search_end = current_line_start.saturating_sub(1);
+    Some(
+        content[..search_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1),
+    )
+}
+
+fn next_line_start(content: &str, current_line_end: usize) -> Option<usize> {
+    (current_line_end < content.len()).then_some(current_line_end + 1)
+}
+
+fn insert_text_at_input_cursor(state: &mut AppState, inserted: &str) -> bool {
+    if inserted.is_empty() {
+        return false;
+    }
+
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    clear_editing_validation(state);
+    state
+        .input_buffer
+        .insert_str(state.input_cursor.offset, inserted);
+    state.input_cursor.offset = state.input_cursor.offset.saturating_add(inserted.len());
+    state.input_cursor.clear_goal_column();
+    true
+}
+
+fn delete_before_input_cursor(state: &mut AppState) -> bool {
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    if state.input_cursor.offset == 0 {
+        return false;
+    }
+
+    let previous = previous_char_boundary(&state.input_buffer, state.input_cursor.offset);
+    clear_editing_validation(state);
+    state
+        .input_buffer
+        .replace_range(previous..state.input_cursor.offset, "");
+    state.input_cursor.offset = previous;
+    state.input_cursor.clear_goal_column();
+    true
+}
+
+fn delete_after_input_cursor(state: &mut AppState) -> bool {
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    if state.input_cursor.offset >= state.input_buffer.len() {
+        return false;
+    }
+
+    let next = next_char_boundary(&state.input_buffer, state.input_cursor.offset);
+    clear_editing_validation(state);
+    state
+        .input_buffer
+        .replace_range(state.input_cursor.offset..next, "");
+    state.input_cursor.clear_goal_column();
+    true
+}
+
+fn move_input_cursor_left(state: &mut AppState) -> bool {
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    if state.input_cursor.offset == 0 {
+        return false;
+    }
+
+    state.input_cursor.offset =
+        previous_char_boundary(&state.input_buffer, state.input_cursor.offset);
+    state.input_cursor.clear_goal_column();
+    true
+}
+
+fn move_input_cursor_right(state: &mut AppState) -> bool {
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    if state.input_cursor.offset >= state.input_buffer.len() {
+        return false;
+    }
+
+    state.input_cursor.offset = next_char_boundary(&state.input_buffer, state.input_cursor.offset);
+    state.input_cursor.clear_goal_column();
+    true
+}
+
+fn move_input_cursor_to_comment_start(state: &mut AppState) -> bool {
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    if state.input_cursor.offset == 0 {
+        state.input_cursor.clear_goal_column();
+        return false;
+    }
+
+    state.input_cursor.offset = 0;
+    state.input_cursor.clear_goal_column();
+    true
+}
+
+fn move_input_cursor_to_comment_end(state: &mut AppState) -> bool {
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    let end = state.input_buffer.len();
+    if state.input_cursor.offset == end {
+        state.input_cursor.clear_goal_column();
+        return false;
+    }
+
+    state.input_cursor.offset = end;
+    state.input_cursor.clear_goal_column();
+    true
+}
+
+fn move_input_cursor_vertically(state: &mut AppState, direction: isize) -> bool {
+    state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
+    if state.input_buffer.is_empty() {
+        return false;
+    }
+
+    let line_start = line_start_for_cursor(&state.input_buffer, state.input_cursor.offset);
+    let line_end = line_end_for_start(&state.input_buffer, line_start);
+    let current_column =
+        char_column_for_offset(&state.input_buffer, line_start, state.input_cursor.offset);
+    let goal_column = state.input_cursor.goal_column.unwrap_or(current_column);
+
+    let target_start = if direction.is_negative() {
+        previous_line_start(&state.input_buffer, line_start)
+    } else {
+        next_line_start(&state.input_buffer, line_end)
+    };
+    let Some(target_start) = target_start else {
+        return false;
+    };
+
+    let target_end = line_end_for_start(&state.input_buffer, target_start);
+    let target_line = &state.input_buffer[target_start..target_end];
+    let target_column = goal_column.min(target_line.chars().count());
+    let target_offset = target_start + byte_offset_for_char_column(target_line, target_column);
+
+    if state.input_cursor.offset == target_offset {
+        state.input_cursor.goal_column = Some(goal_column);
+        return false;
+    }
+
+    state.input_cursor.offset = target_offset;
+    state.input_cursor.goal_column = Some(goal_column);
+    true
 }
 
 fn key_event_for_press_event(event: &Event) -> Option<KeyEvent> {
@@ -1695,9 +2033,7 @@ fn handle_paste_event(state: &mut AppState, pasted: &str) -> bool {
         return false;
     }
 
-    clear_editing_validation(state);
-    state.input_buffer.push_str(pasted);
-    true
+    insert_text_at_input_cursor(state, pasted)
 }
 
 fn handle_mouse_event(state: &mut AppState, mouse_event: MouseEvent) -> bool {
@@ -2173,6 +2509,7 @@ fn handle_note_action(state: &mut AppState) -> Result<()> {
     );
     state.input_mode = InputMode::Editing { action };
     state.input_buffer.clear();
+    state.input_cursor.reset();
     clear_editing_validation(state);
     Ok(())
 }
@@ -2203,11 +2540,13 @@ where
             clear_editing_validation(state);
             if let Some(count) = batch_confirmation_count_for_action(state, &action) {
                 state.input_buffer.clear();
+                state.input_cursor.reset();
                 state.input_mode = InputMode::ConfirmBatch { action, count };
             } else {
                 on_action(action, state)?;
                 state.input_mode = InputMode::Normal;
                 state.input_buffer.clear();
+                state.input_cursor.reset();
             }
         }
     }
@@ -2218,8 +2557,10 @@ fn handle_editing_cancel(state: &mut AppState) {
     clear_editing_validation(state);
     if state.input_buffer.is_empty() {
         state.input_mode = InputMode::Normal;
+        state.input_cursor.reset();
     } else {
         state.input_buffer.clear();
+        state.input_cursor.reset();
     }
 }
 
@@ -4426,7 +4767,7 @@ fn format_context_line(
 }
 
 fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
-    let (overlay_kind, title, hints, content) = match &state.input_mode {
+    let (overlay_kind, title, hints, content, cursor) = match &state.input_mode {
         InputMode::Editing { .. } => {
             let content = state.input_buffer.clone();
             let input_lines = editing_input_lines(&content, input_overlay_width(area.width));
@@ -4435,6 +4776,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
                 " Note ",
                 editing_overlay_hint(&content, state.editing_validation),
                 content,
+                Some(state.input_cursor.clamped_to_buffer(&state.input_buffer)),
             )
         }
         InputMode::ConfirmBatch { count, action } => {
@@ -4449,6 +4791,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
                 " Batch Action ",
                 "Enter to confirm • Esc to cancel",
                 content,
+                None,
             )
         }
         InputMode::Normal => return,
@@ -4460,7 +4803,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
         .title(title)
         .borders(ratatui::widgets::Borders::ALL)
         .style(Style::default().bg(palette.bg).fg(palette.fg));
-
+    let inner_area = block.inner(popup_area);
     let lines = input_overlay_lines(&content, hints, palette);
 
     frame.render_widget(
@@ -4469,6 +4812,10 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             .wrap(Wrap { trim: false }),
         popup_area,
     );
+
+    if let Some(cursor) = cursor {
+        frame.set_cursor_position(editing_cursor_position(&content, cursor, inner_area));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4489,10 +4836,97 @@ fn editing_input_lines(content: &str, overlay_width: u16) -> u16 {
     let inner_width = usize::from(overlay_width.saturating_sub(2).max(1));
     let wrapped_lines = content
         .split('\n')
-        .map(|line| line.chars().count().max(1).div_ceil(inner_width))
+        .map(|line| soft_wrapped_editor_line_count(line, inner_width))
         .sum::<usize>()
         .max(1);
     usize_to_u16_saturating(wrapped_lines)
+}
+
+fn soft_wrapped_editor_line_count(line: &str, wrap_width: usize) -> usize {
+    editor_display_width(line)
+        .max(1)
+        .div_ceil(wrap_width.max(1))
+}
+
+fn editor_display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn editor_char_display_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn editing_cursor_position(content: &str, cursor: InputCursor, inner_area: Rect) -> Position {
+    if inner_area.width == 0 || inner_area.height == 0 {
+        return Position {
+            x: inner_area.x,
+            y: inner_area.y,
+        };
+    }
+
+    let (column, row) = editing_cursor_visual_offset(content, cursor.offset, inner_area.width);
+    let max_row = inner_area.height.saturating_sub(3);
+    Position {
+        x: inner_area.x + column.min(inner_area.width.saturating_sub(1)),
+        y: inner_area.y + row.min(max_row),
+    }
+}
+
+fn editing_cursor_visual_offset(
+    content: &str,
+    cursor_offset: usize,
+    wrap_width: u16,
+) -> (u16, u16) {
+    if wrap_width == 0 {
+        return (0, 0);
+    }
+
+    let wrap_width = usize::from(wrap_width.max(1));
+    let cursor_offset = clamp_cursor_offset_to_char_boundary(content, cursor_offset);
+    let mut row = 0usize;
+    let mut column = 0usize;
+
+    for ch in content[..cursor_offset].chars() {
+        if ch == '\n' {
+            row = row.saturating_add(1);
+            column = 0;
+            continue;
+        }
+
+        let char_width = editor_char_display_width(ch);
+        if char_width == 0 {
+            continue;
+        }
+
+        if column == wrap_width || (column > 0 && column.saturating_add(char_width) > wrap_width) {
+            row = row.saturating_add(1);
+            column = 0;
+        }
+
+        column = column.saturating_add(char_width);
+
+        if column > wrap_width {
+            let overflow = column.saturating_sub(1);
+            row = row.saturating_add(overflow / wrap_width);
+            column = overflow % wrap_width + 1;
+        }
+    }
+
+    if column == wrap_width && cursor_offset < content.len() {
+        row = row.saturating_add(1);
+        column = 0;
+    }
+
+    let display_column = if column == wrap_width {
+        wrap_width.saturating_sub(1)
+    } else {
+        column
+    };
+
+    (
+        usize_to_u16_saturating(display_column),
+        usize_to_u16_saturating(row),
+    )
 }
 
 fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
@@ -4743,6 +5177,7 @@ mod diff_scope_tests {
     use crate::test_git::{run_git, run_git_stdout, temp_git_repo, temp_test_dir};
     use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
+    use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
@@ -4770,6 +5205,7 @@ mod diff_scope_tests {
             scope_label: String::new(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            input_cursor: InputCursor::default(),
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -4836,6 +5272,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            input_cursor: InputCursor::default(),
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -4932,6 +5369,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            input_cursor: InputCursor::default(),
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -5022,6 +5460,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            input_cursor: InputCursor::default(),
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -5108,6 +5547,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            input_cursor: InputCursor::default(),
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Threshold(2),
             repo_name: "repo".to_string(),
@@ -5175,6 +5615,7 @@ mod diff_scope_tests {
             scope_label: "All".to_string(),
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            input_cursor: InputCursor::default(),
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -6471,6 +6912,17 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn editing_input_lines_counts_display_width_for_wide_characters() {
+        assert_eq!(editing_input_lines("界界界", 4), 3);
+    }
+
+    #[test]
+    fn editing_cursor_visual_offset_counts_display_width_for_wide_characters() {
+        assert_eq!(editing_cursor_visual_offset("界a", "界".len(), 4), (2, 0));
+        assert_eq!(editing_cursor_visual_offset("界a", "界a".len(), 4), (3, 0));
+    }
+
+    #[test]
     fn input_overlay_rect_grows_for_soft_wrapped_editing_content() {
         let area = Rect {
             x: 0,
@@ -6602,6 +7054,239 @@ mod diff_scope_tests {
             KeyEventKind::Repeat,
         );
         assert_eq!(editing_key_action_for_event(&key), EditingKeyAction::Ignore);
+    }
+
+    #[test]
+    fn editing_key_action_arrow_keys_home_end_and_delete_map_to_editor_actions() {
+        assert_eq!(
+            editing_key_action_for_event(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            EditingKeyAction::MoveLeft
+        );
+        assert_eq!(
+            editing_key_action_for_event(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            EditingKeyAction::MoveRight
+        );
+        assert_eq!(
+            editing_key_action_for_event(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            EditingKeyAction::MoveUp
+        );
+        assert_eq!(
+            editing_key_action_for_event(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            EditingKeyAction::MoveDown
+        );
+        assert_eq!(
+            editing_key_action_for_event(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            EditingKeyAction::MoveHome
+        );
+        assert_eq!(
+            editing_key_action_for_event(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            EditingKeyAction::MoveEnd
+        );
+        assert_eq!(
+            editing_key_action_for_event(&KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            EditingKeyAction::Delete
+        );
+    }
+
+    #[test]
+    fn handle_editing_key_action_inserts_and_deletes_at_cursor() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = "ab".to_string();
+        state.input_cursor = InputCursor {
+            offset: 1,
+            goal_column: None,
+        };
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::InsertChar('x')),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_buffer, "axb");
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 2,
+                goal_column: None,
+            }
+        );
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::Backspace),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_buffer, "ab");
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 1,
+                goal_column: None,
+            }
+        );
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::Delete),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_buffer, "a");
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 1,
+                goal_column: None,
+            }
+        );
+    }
+
+    #[test]
+    fn handle_editing_key_action_moves_cursor_horizontally_and_to_comment_bounds() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = "abcd".to_string();
+        state.input_cursor = InputCursor {
+            offset: 2,
+            goal_column: None,
+        };
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveLeft),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_cursor.offset, 1);
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveRight),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_cursor.offset, 2);
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveHome),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_cursor.offset, 0);
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveEnd),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_cursor.offset, 4);
+    }
+
+    #[test]
+    fn handle_editing_key_action_moves_cursor_vertically_across_multiline_comments() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = "abcd\nx\nwxyz".to_string();
+        state.input_cursor = InputCursor {
+            offset: 3,
+            goal_column: None,
+        };
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveDown),
+            EditingActionResult::Handled
+        );
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 6,
+                goal_column: Some(3),
+            }
+        );
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveDown),
+            EditingActionResult::Handled
+        );
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 10,
+                goal_column: Some(3),
+            }
+        );
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveUp),
+            EditingActionResult::Handled
+        );
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 6,
+                goal_column: Some(3),
+            }
+        );
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveHome),
+            EditingActionResult::Handled
+        );
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 0,
+                goal_column: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ui_renders_real_cursor_inside_editing_overlay() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = "hello".to_string();
+        state.input_cursor = InputCursor {
+            offset: 2,
+            goal_column: None,
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| ui(frame, &mut state))
+            .unwrap_or_else(|error| panic!("failed to render editing overlay: {error}"));
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 12,
+        };
+        let popup_area = input_overlay_rect(area, InputOverlayKind::Editing { input_lines: 1 });
+        let inner = UiBlock::default()
+            .title(" Note ")
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(popup_area);
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position((inner.x + 2, inner.y));
     }
 
     #[test]
@@ -6819,7 +7504,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn handle_paste_event_appends_single_line_text_while_editing() {
+    fn handle_paste_event_inserts_single_line_text_at_cursor_while_editing() {
         let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
@@ -6829,17 +7514,28 @@ mod diff_scope_tests {
             },
         };
         state.input_buffer = "note".to_string();
+        state.input_cursor = InputCursor {
+            offset: 2,
+            goal_column: None,
+        };
         state.editing_validation = Some(EditingValidation::NoteRequired);
 
         let rerender = handle_paste_event(&mut state, " plus");
 
         assert!(rerender);
-        assert_eq!(state.input_buffer, "note plus");
+        assert_eq!(state.input_buffer, "no pluste");
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 7,
+                goal_column: None,
+            }
+        );
         assert_eq!(state.editing_validation, None);
     }
 
     #[test]
-    fn handle_paste_event_preserves_multiline_text_while_editing() {
+    fn handle_paste_event_preserves_multiline_text_and_inserts_at_cursor_while_editing() {
         let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
@@ -6848,11 +7544,23 @@ mod diff_scope_tests {
                 note: None,
             },
         };
+        state.input_buffer = "ab".to_string();
+        state.input_cursor = InputCursor {
+            offset: 1,
+            goal_column: None,
+        };
 
-        let rerender = handle_paste_event(&mut state, "first line\nsecond line");
+        let rerender = handle_paste_event(&mut state, "x\ny");
 
         assert!(rerender);
-        assert_eq!(state.input_buffer, "first line\nsecond line");
+        assert_eq!(state.input_buffer, "ax\nyb");
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: 4,
+                goal_column: None,
+            }
+        );
     }
 
     #[test]

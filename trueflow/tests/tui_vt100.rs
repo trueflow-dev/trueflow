@@ -315,6 +315,33 @@ fn note_validation_clears_after_character_input() -> Result<()> {
 }
 
 #[test]
+fn left_arrow_inserts_text_in_the_middle_of_a_note() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(120, 20),
+        "src/lib.rs",
+        "fn demo() {\n    work();\n}\n",
+        "fn demo() {\n    work();\n}\n",
+        0,
+        3,
+    )?;
+
+    app.open_note_overlay()?;
+    press_text(&mut app, "ab")?;
+    app.send_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))?;
+    app.send_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))?;
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert_eq!(app.input_buffer(), "axb");
+    assert!(
+        screen.contains("axb"),
+        "expected rendered note buffer to show middle insertion:\n{screen}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn note_validation_clears_after_backspace() -> Result<()> {
     let mut app = app_with_validation_message()?;
 
