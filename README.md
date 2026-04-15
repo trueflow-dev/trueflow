@@ -229,13 +229,13 @@ See `trueflow.example.toml` for the default settings.
 Main review actions:
 
 - In the root view, `j`/`k` and Up/Down move the selection through the visible file/dir list
-- In the root view, `l`, Right, Enter, and `c` open the selected item; `h`, Left, and `p` are back/leftward actions and are a no-op at the repository root
+- In the root view, `l`, Right, Enter, and `C` open the selected item; `h`, Left, and `P` are back/leftward actions and are a no-op at the repository root
 - Outside the root view, `j`/`k` and Up/Down scroll code line-by-line
 - `PageUp`, `PageDown`, `Space`, `Home`, and `End` scroll by page or jump to the top/bottom of the current code view
 - Outside the root view, `h`/`l` and Left/Right move to the previous/next semantic sibling
-- `p`/`c` move to the semantic parent/child
+- `P`/`C` move to the semantic parent/child
 - `a` approve
-- `n` add a note (`Enter` submits, `Ctrl+J` inserts a newline, and the TUI requires note text before submit)
+- `c` add a comment (`Enter` submits, `Ctrl+J` inserts a newline, and the TUI requires comment text before submit)
 - `m` toggle diff/source
   - diff-mode line numbers are disabled by default; set `[tui] diff_line_numbers = "old_new"` to restore the old/new gutter
 - `r` toggle speed-reading

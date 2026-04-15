@@ -164,6 +164,34 @@ fn readme_separates_public_docs_from_operator_infra_docs() -> Result<()> {
 }
 
 #[test]
+fn readme_tui_controls_match_current_default_keybinds() -> Result<()> {
+    let readme = read_repo_file("README.md")?;
+
+    assert_contains(
+        &readme,
+        "`l`, Right, Enter, and `C` open the selected item",
+        "readme root open controls",
+    );
+    assert_contains(
+        &readme,
+        "`h`, Left, and `P` are back/leftward actions",
+        "readme root back controls",
+    );
+    assert_contains(
+        &readme,
+        "`P`/`C` move to the semantic parent/child",
+        "readme parent child controls",
+    );
+    assert_contains(
+        &readme,
+        "`c` add a comment",
+        "readme comment control",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn website_install_page_explains_script_and_manual_downloads() -> Result<()> {
     let html = read_repo_file("website/install/index.html")?;
 
