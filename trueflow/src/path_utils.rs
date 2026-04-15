@@ -69,7 +69,7 @@ pub fn tree_path_candidates_for_repo_path(
     candidates
 }
 
-pub fn candidate_repo_paths_for_hint(
+pub fn repo_path_candidates(
     path_hint: &str,
     workdir_prefix: Option<&str>,
     repo_workdir: Option<&Path>,
@@ -151,9 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn candidate_repo_paths_for_hint_expands_subdir_input() {
+    fn repo_path_candidates_expands_subdir_input() {
         assert_eq!(
-            candidate_repo_paths_for_hint("src/lib.rs", Some("pkg"), None),
+            repo_path_candidates("src/lib.rs", Some("pkg"), None),
             vec!["src/lib.rs".to_string(), "pkg/src/lib.rs".to_string()]
         );
     }

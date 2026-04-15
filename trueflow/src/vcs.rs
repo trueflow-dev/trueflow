@@ -213,7 +213,7 @@ pub fn block_state_for_path(
         .workdir()
         .and_then(path_utils::current_workdir_prefix_for_repo_root);
     let candidate_paths =
-        path_utils::candidate_repo_paths_for_hint(path, workdir_prefix.as_deref(), repo.workdir());
+        path_utils::repo_path_candidates(path, workdir_prefix.as_deref(), repo.workdir());
     tracing::debug!(
         path_hint = %path,
         ?candidate_paths,

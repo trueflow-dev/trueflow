@@ -801,7 +801,7 @@ fn collect_path_candidates(path_hint: &RepoPath, workdir_prefix: Option<&str>) -
 
     let mut candidates = Vec::new();
     for candidate in
-        path_utils::candidate_repo_paths_for_hint(path_hint.as_str(), workdir_prefix, None)
+        path_utils::repo_path_candidates(path_hint.as_str(), workdir_prefix, None)
             .into_iter()
             .chain(path_utils::tree_path_candidates_for_repo_path(
                 path_hint.as_str(),

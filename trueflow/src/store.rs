@@ -571,7 +571,7 @@ fn update_latest_verdict<K: Eq + std::hash::Hash>(
 
 fn block_path_candidates(path: &RepoPath, workdir_prefix: Option<&str>) -> Vec<RepoPath> {
     let mut candidates = Vec::new();
-    for candidate in path_utils::candidate_repo_paths_for_hint(path.as_str(), workdir_prefix, None)
+    for candidate in path_utils::repo_path_candidates(path.as_str(), workdir_prefix, None)
     {
         let Ok(candidate) = RepoPath::new(candidate) else {
             continue;
