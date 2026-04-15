@@ -82,7 +82,7 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, or `rev:abc1234..def5678`
+        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
         #[arg(long, value_name = "TARGET", conflicts_with = "since")]
         target: Vec<ReviewTarget>,
 
@@ -104,9 +104,13 @@ pub enum Commands {
         #[arg(long, default_value = "xml")]
         format: String,
 
-        /// Only include records since this point ("all", "last", unix ts, or RFC3339)
+        /// Only include records since this point ("all", "last", relative durations like "1h", unix ts, or RFC3339)
         #[arg(long)]
         since: Option<String>,
+
+        /// Feedback targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
+        #[arg(long, value_name = "TARGET")]
+        target: Vec<ReviewTarget>,
 
         /// Include approved blocks (for few-shot examples)
         #[arg(long)]
@@ -151,7 +155,7 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, or `rev:abc1234..def5678`
+        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
         #[arg(long, value_name = "TARGET", conflicts_with = "since")]
         target: Vec<ReviewTarget>,
 
@@ -314,15 +318,45 @@ mod tests {
             Commands::Feedback {
                 format,
                 since,
+                target,
                 include_approved,
                 only,
                 exclude,
             } => {
                 assert_eq!(format, "json");
                 assert_eq!(since.as_deref(), Some("last"));
+                assert!(target.is_empty());
                 assert!(!include_approved);
                 assert!(only.is_empty());
                 assert!(exclude.is_empty());
+            }
+            _ => panic!("expected feedback command"),
+        }
+    }
+
+    #[test]
+    fn feedback_command_parses_explicit_targets() {
+        let cli = Cli::parse_from([
+            "trueflow",
+            "feedback",
+            "--target",
+            "file:src/lib.rs",
+            "--target",
+            "dir:src",
+            "--target",
+            "rev:abc1234",
+        ]);
+
+        match cli.command {
+            Commands::Feedback { target, .. } => {
+                assert_eq!(
+                    target,
+                    vec![
+                        ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
+                        ReviewTarget::Dir(RepoPath::new("src").unwrap()),
+                        ReviewTarget::Revision(RevisionSpec::new("abc1234").unwrap()),
+                    ]
+                );
             }
             _ => panic!("expected feedback command"),
         }

@@ -63,6 +63,7 @@ fn main() -> Result<()> {
         Commands::Feedback {
             format,
             since,
+            target,
             include_approved,
             only,
             exclude,
@@ -70,6 +71,7 @@ fn main() -> Result<()> {
             &context,
             commands::feedback::FeedbackFormat::from_arg(format),
             since.as_deref(),
+            target,
             *include_approved,
             only,
             exclude,

@@ -537,9 +537,11 @@ mod tests {
     #[test]
     fn split_binding_children_exposes_attrset_members() {
         let source = "defaults = {\n  retries = 3;\n};";
-        let spans = split_binding_children(source)
-            .unwrap()
-            .expect("expected structural split");
+        let spans = match split_binding_children(source) {
+            Ok(Some(spans)) => spans,
+            Ok(None) => panic!("expected structural split"),
+            Err(error) => panic!("split binding children failed: {error}"),
+        };
         assert!(spans.iter().any(|span| {
             span.kind == BlockKind::Preamble && &source[span.start..span.end] == "defaults = "
         }));
@@ -553,9 +555,11 @@ mod tests {
     #[test]
     fn split_expression_children_exposes_attrset_bindings() {
         let source = "{\n  retries = 3;\n  labels = { tier = \"backend\"; };\n}";
-        let spans = split_expression_children(source)
-            .unwrap()
-            .expect("expected structural split");
+        let spans = match split_expression_children(source) {
+            Ok(Some(spans)) => spans,
+            Ok(None) => panic!("expected structural split"),
+            Err(error) => panic!("split expression children failed: {error}"),
+        };
         assert!(spans.iter().any(|span| span.kind == BlockKind::Variable));
         assert_eq!(merge_spans(source, &spans), source);
     }
@@ -563,9 +567,11 @@ mod tests {
     #[test]
     fn split_expression_children_exposes_if_branches_when_structural() {
         let source = "if enabled then { system = \"linux\"; } else { system = \"other\"; }";
-        let spans = split_expression_children(source)
-            .unwrap()
-            .expect("expected structural split");
+        let spans = match split_expression_children(source) {
+            Ok(Some(spans)) => spans,
+            Ok(None) => panic!("expected structural split"),
+            Err(error) => panic!("split expression children failed: {error}"),
+        };
         assert!(spans.iter().any(|span| span.kind == BlockKind::Section));
         assert_eq!(merge_spans(source, &spans), source);
     }
@@ -573,9 +579,11 @@ mod tests {
     #[test]
     fn split_binding_children_keeps_whitespace_between_list_items_as_gap() {
         let source = "packages = [\n  pkgs.git\n  { name = \"helper\"; }\n];";
-        let spans = split_structural_children(source, BlockKind::Variable)
-            .unwrap()
-            .expect("expected structural split");
+        let spans = match split_structural_children(source, BlockKind::Variable) {
+            Ok(Some(spans)) => spans,
+            Ok(None) => panic!("expected structural split"),
+            Err(error) => panic!("split structural children failed: {error}"),
+        };
         let preambles = spans
             .iter()
             .filter(|span| span.kind == BlockKind::Preamble)
@@ -589,9 +597,11 @@ mod tests {
     fn split_binding_children_merges_adjacent_preamble_segments() {
         let source =
             "selected = if enabled then { system = \"linux\"; } else { system = \"other\"; };";
-        let spans = split_structural_children(source, BlockKind::Variable)
-            .unwrap()
-            .expect("expected structural split");
+        let spans = match split_structural_children(source, BlockKind::Variable) {
+            Ok(Some(spans)) => spans,
+            Ok(None) => panic!("expected structural split"),
+            Err(error) => panic!("split structural children failed: {error}"),
+        };
         let preambles = spans
             .iter()
             .filter(|span| span.kind == BlockKind::Preamble)

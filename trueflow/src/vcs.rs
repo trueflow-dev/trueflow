@@ -291,14 +291,20 @@ pub fn file_states_for_paths_in_revision(
     paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
 ) -> Result<Vec<FileState>> {
-    let object = repo.rev_parse_single(revision)?;
-    let commit = object
-        .object()?
-        .peel_to_commit()
-        .context("revision must resolve to a commit")?;
-    let tree = commit.tree()?;
-
+    let tree = tree_for_revision(repo, revision)?;
     file_states_for_paths_in_tree(&tree, paths, workdir_prefix)
+}
+
+pub fn file_states_in_revision(
+    repo: &gix::Repository,
+    revision: &str,
+    workdir_prefix: Option<&str>,
+) -> Result<Vec<FileState>> {
+    let tree = tree_for_revision(repo, revision)?;
+    let mut files = Vec::new();
+    collect_file_states_in_tree(&tree, "", workdir_prefix, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
 }
 
 pub(crate) fn file_state_for_path_in_main_base(
@@ -316,12 +322,7 @@ pub(crate) fn file_state_for_path_in_revision(
     repo_relative_path: &RepoPath,
     output_path: &RepoPath,
 ) -> Result<Option<FileState>> {
-    let object = repo.rev_parse_single(revision)?;
-    let commit = object
-        .object()?
-        .peel_to_commit()
-        .context("revision must resolve to a commit")?;
-    let tree = commit.tree()?;
+    let tree = tree_for_revision(repo, revision)?;
     file_state_for_path_in_tree(&tree, repo_relative_path.as_str(), output_path)
 }
 
@@ -342,6 +343,18 @@ pub(crate) fn file_state_for_path_in_revision_base(
         repo.empty_tree()
     };
     file_state_for_path_in_tree(&base_tree, repo_relative_path.as_str(), output_path)
+}
+
+fn tree_for_revision<'repo>(
+    repo: &'repo gix::Repository,
+    revision: &str,
+) -> Result<gix::Tree<'repo>> {
+    let object = repo.rev_parse_single(revision)?;
+    let commit = object
+        .object()?
+        .peel_to_commit()
+        .context("revision must resolve to a commit")?;
+    commit.tree().map_err(Into::into)
 }
 
 fn file_states_for_paths_in_tree(
@@ -383,14 +396,75 @@ fn file_state_for_path_in_tree(
     }
 
     let blob = entry.object()?.try_into_blob()?;
+    Ok(Some(file_state_from_blob(
+        blob,
+        tree_path,
+        output_path.clone(),
+    )))
+}
+
+fn collect_file_states_in_tree(
+    tree: &gix::Tree<'_>,
+    prefix: &str,
+    workdir_prefix: Option<&str>,
+    files: &mut Vec<FileState>,
+) -> Result<()> {
+    for entry in tree.iter() {
+        let entry = entry?;
+        let file_name = entry.filename().to_str_lossy();
+        let full_path = if prefix.is_empty() {
+            file_name.to_string()
+        } else {
+            format!("{prefix}/{file_name}")
+        };
+
+        match entry.kind() {
+            EntryKind::Tree => {
+                let child_tree = entry.object()?.try_into_tree()?;
+                collect_file_states_in_tree(&child_tree, &full_path, workdir_prefix, files)?;
+            }
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                if let Some(prefix) = workdir_prefix
+                    && !path_utils::path_matches_workdir_prefix(&full_path, prefix)
+                {
+                    continue;
+                }
+
+                let output_path = display_path_for_tree_entry(&full_path, workdir_prefix)?;
+                let blob = entry.object()?.try_into_blob()?;
+                files.push(file_state_from_blob(
+                    blob,
+                    Path::new(&full_path),
+                    output_path,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn display_path_for_tree_entry(path: &str, workdir_prefix: Option<&str>) -> Result<RepoPath> {
+    let normalized_path = path_utils::normalize_path_str(path);
+    let Some(prefix) = workdir_prefix
+        .map(path_utils::normalize_path_str)
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return RepoPath::new(normalized_path);
+    };
+
+    let prefixed_root = format!("{prefix}/");
+    if let Some(stripped) = normalized_path.strip_prefix(&prefixed_root) {
+        return RepoPath::new(stripped);
+    }
+
+    RepoPath::new(normalized_path)
+}
+
+fn file_state_from_blob(blob: gix::Blob<'_>, tree_path: &Path, output_path: RepoPath) -> FileState {
     let content = match std::str::from_utf8(&blob.data) {
         Ok(content) => content,
-        Err(_) => {
-            return Ok(Some(FileState::from_binary(
-                output_path.clone(),
-                &blob.data,
-            )));
-        }
+        Err(_) => return FileState::from_binary(output_path, &blob.data),
     };
 
     let language = tree_path
@@ -400,12 +474,7 @@ fn file_state_for_path_in_tree(
         .unwrap_or(Language::Unknown);
     let blocks = split_blocks(content, language);
 
-    Ok(Some(FileState::from_text(
-        output_path.clone(),
-        language,
-        &blob.data,
-        blocks,
-    )))
+    FileState::from_text(output_path, language, &blob.data, blocks)
 }
 
 pub fn diff_hunks_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<DiffHunk>> {

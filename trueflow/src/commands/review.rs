@@ -100,7 +100,7 @@ impl ReviewTarget {
         Err(anyhow!("Unknown review target: {raw}"))
     }
 
-    fn historical_content_revision(&self) -> Option<&RevisionSpec> {
+    pub(crate) fn historical_content_revision(&self) -> Option<&RevisionSpec> {
         match self {
             Self::Revision(revision) => Some(revision),
             Self::RevisionRange(range) => Some(&range.end),
@@ -108,7 +108,7 @@ impl ReviewTarget {
         }
     }
 
-    fn is_worktree_content_target(&self) -> bool {
+    pub(crate) fn is_worktree_content_target(&self) -> bool {
         matches!(self, Self::DirtyWorktree | Self::MainDiff)
     }
 
@@ -147,9 +147,7 @@ pub enum ReviewPathSelection {
     All,
     Specific(HashSet<RepoPath>),
     /// Explicit files plus one or more directory prefixes. A file matches
-    /// if it's in `files` or lives under any entry in `dirs`. Only used
-    /// for workdir-content targets — historical content paths must be
-    /// fully enumerated.
+    /// if it's in `files` or lives under any entry in `dirs`.
     Scoped {
         files: HashSet<RepoPath>,
         dirs: Vec<RepoPath>,
@@ -157,7 +155,11 @@ pub enum ReviewPathSelection {
 }
 
 impl ReviewPathSelection {
-    fn includes(&self, file_path: &RepoPath, workdir_prefix: Option<&str>) -> Result<bool> {
+    pub(crate) fn includes(
+        &self,
+        file_path: &RepoPath,
+        workdir_prefix: Option<&str>,
+    ) -> Result<bool> {
         match self {
             Self::All => Ok(true),
             Self::Specific(targets) => {
@@ -175,34 +177,32 @@ impl ReviewPathSelection {
                     return Ok(true);
                 }
                 if let Some(prefix) = workdir_prefix {
-                    let with_prefix = RepoPath::new(format!("{prefix}/{file_path}"))?;
-                    if files.contains(&with_prefix) {
+                    let repo_path = RepoPath::new(format!("{prefix}/{file_path}"))?;
+                    if files.contains(&repo_path) {
                         return Ok(true);
                     }
-                    if dirs.iter().any(|d| path_under_dir(&with_prefix, d)) {
+                    if dirs.iter().any(|dir| path_under_dir(&repo_path, dir)) {
                         return Ok(true);
                     }
                 }
-                Ok(dirs.iter().any(|d| path_under_dir(file_path, d)))
+                Ok(dirs.iter().any(|dir| path_under_dir(file_path, dir)))
             }
         }
     }
 }
 
 /// True if `file` equals `dir` or lives under `dir` as a subtree.
-/// Root directory (empty string) matches every path.
+/// Root directory matches every path.
 fn path_under_dir(file: &RepoPath, dir: &RepoPath) -> bool {
-    let dir_str = dir.as_str();
-    if dir_str.is_empty() {
+    if dir.is_root() {
         return true;
     }
-    let file_str = file.as_str();
-    if file_str == dir_str {
-        return true;
-    }
-    file_str
-        .strip_prefix(dir_str)
-        .is_some_and(|rest| rest.starts_with('/'))
+
+    file == dir
+        || file
+            .as_str()
+            .strip_prefix(dir.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,27 +487,8 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             let Some(repo) = review_repo.as_ref() else {
                 return Err(anyhow!("review repo unavailable for revision target"));
             };
-            let paths = match &query.path_selection {
-                ReviewPathSelection::Specific(paths) => paths,
-                ReviewPathSelection::All => {
-                    return Err(anyhow!(
-                        "historical review targets must resolve to explicit paths"
-                    ));
-                }
-                ReviewPathSelection::Scoped { .. } => {
-                    return Err(anyhow!(
-                        "dir: review targets are only supported for workdir content, \
-                         not historical revisions"
-                    ));
-                }
-            };
             (
-                vcs::file_states_for_paths_in_revision(
-                    repo,
-                    revision.as_str(),
-                    paths,
-                    workdir_prefix.as_deref(),
-                )?,
+                vcs::file_states_in_revision(repo, revision.as_str(), workdir_prefix.as_deref())?,
                 Vec::new(),
             )
         }
@@ -867,7 +848,9 @@ fn selected_review_paths(
         ReviewPathSelection::Specific(paths) => paths.iter().cloned().collect(),
         ReviewPathSelection::Scoped { files, dirs } => head_files_by_path
             .keys()
-            .filter(|p| files.contains(*p) || dirs.iter().any(|d| path_under_dir(p, d)))
+            .filter(|path| {
+                files.contains(*path) || dirs.iter().any(|dir| path_under_dir(path, dir))
+            })
             .cloned()
             .collect(),
     }
