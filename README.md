@@ -174,6 +174,10 @@ trueflow feedback --exclude gap --exclude comment
 # Launch the TUI scoped to one file
 trueflow tui --target file:src/lib.rs
 
+# Scope the review to an entire directory subtree
+trueflow review --target dir:website --json
+trueflow tui --target dir:trueflow/src
+
 # Scope the TUI to a revision range with additional filtering
 trueflow tui --target rev:abc1234..def5678 --only function --exclude comment
 ```
