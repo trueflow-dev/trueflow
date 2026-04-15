@@ -77,6 +77,7 @@ impl ReviewOrder {
                 review_band_rank(a_band),
                 a_cursor.kind_rank,
                 a_cursor.start_line,
+                a_cursor.node_id,
             )
                 .cmp(&(
                     review_group_rank(b_group),
@@ -84,6 +85,7 @@ impl ReviewOrder {
                     review_band_rank(b_band),
                     b_cursor.kind_rank,
                     b_cursor.start_line,
+                    b_cursor.node_id,
                 ))
         });
 

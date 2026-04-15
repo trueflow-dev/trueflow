@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TreeNodeId(usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -150,6 +150,78 @@ impl Tree {
 
     pub fn is_container_block(&self, id: TreeNodeId) -> bool {
         matches!(self.node(id).kind, TreeNodeKind::Block) && self.block_has_child_blocks(id)
+    }
+
+    pub fn insert_block_children(
+        &mut self,
+        parent: TreeNodeId,
+        blocks: Vec<Block>,
+    ) -> Vec<TreeNodeId> {
+        if blocks.is_empty() {
+            return Vec::new();
+        }
+
+        let parent_node = self.node(parent).clone();
+        assert!(
+            matches!(parent_node.kind, TreeNodeKind::File | TreeNodeKind::Block),
+            "tree node kind {:?} cannot receive dynamic block children",
+            parent_node.kind
+        );
+        let language = parent_node.language.unwrap_or(Language::Unknown);
+        let path = parent_node.path;
+
+        blocks
+            .into_iter()
+            .map(|block| self.insert_block_child(parent, &path, language, block))
+            .collect()
+    }
+
+    fn insert_block_child(
+        &mut self,
+        parent: TreeNodeId,
+        path: &RepoPath,
+        language: Language,
+        block: Block,
+    ) -> TreeNodeId {
+        let parent_kind = self
+            .nodes
+            .get(parent.0)
+            .unwrap_or_else(|| panic!("tree parent id {parent:?} must exist"))
+            .kind;
+        assert!(
+            parent_kind.can_contain(TreeNodeKind::Block),
+            "tree node kind {parent_kind:?} cannot receive block children"
+        );
+
+        let hash = block.hash.clone();
+        let start_line = block.start_line;
+        let id = TreeNodeId(self.nodes.len());
+        self.nodes.push(TreeNode {
+            id,
+            parent: Some(parent),
+            kind: TreeNodeKind::Block,
+            name: block_label(&block),
+            path: path.clone(),
+            hash: hash.clone(),
+            children: Vec::new(),
+            block: Some(block),
+            language: Some(language),
+        });
+        self.nodes[parent.0].children.push(id);
+
+        let previous = self
+            .block_nodes_by_path_hash_start
+            .entry(path.clone())
+            .or_default()
+            .entry(hash)
+            .or_default()
+            .insert(start_line, id);
+        assert!(
+            previous.is_none(),
+            "duplicate block lookup key: path={path}, start_line={start_line}"
+        );
+
+        id
     }
 
     pub fn is_node_covered(

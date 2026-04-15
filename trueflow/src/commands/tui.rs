@@ -27,6 +27,7 @@ use crate::review_scope::{
 use crate::review_session;
 use crate::review_speedread::PlaybackState;
 use crate::store::{ReviewTargetKind, Verdict};
+use crate::sub_splitter;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
 use anyhow::Result;
@@ -1297,11 +1298,83 @@ fn handle_child(state: &mut AppState) {
             clear_speed_read_if_not_on_current_node(state);
         }
     } else {
+        let current = state.navigator.current_id();
+        if state.navigator.first_visible_child(current).is_none()
+            && state.navigator.tree.node(current).children.is_empty()
+        {
+            let _ = expand_current_node_children(state, current);
+        }
         state.navigator.descend();
         state.scroll_offset = 0;
         set_focus_for_current_node(state, None);
         clear_speed_read_if_not_on_current_node(state);
     }
+}
+
+fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bool {
+    let node = state.navigator.tree.node(node_id);
+    let Some(block) = node.block.clone() else {
+        return false;
+    };
+    let Some(language) = node.language else {
+        return false;
+    };
+
+    let Ok(sub_split) = sub_splitter::split_result_for_child_navigation(&block, language) else {
+        return false;
+    };
+
+    let child_blocks = sub_split
+        .blocks
+        .into_iter()
+        .filter(|child| child.kind != BlockKind::Gap)
+        .filter(|child| !is_identity_subblock(&block, child))
+        .collect::<Vec<_>>();
+    if child_blocks.is_empty() {
+        return false;
+    }
+
+    let previous_remaining = state.reviewable_nodes.len();
+    state.reviewable_nodes.remove(&node_id);
+
+    let inserted_ids = state
+        .navigator
+        .tree
+        .insert_block_children(node_id, child_blocks);
+    if inserted_ids.is_empty() {
+        return false;
+    }
+
+    for child_id in &inserted_ids {
+        state.reviewable_nodes.insert(*child_id);
+    }
+    state.navigator.reveal_blocks(inserted_ids.iter().copied());
+    refresh_review_state_after_refinement(state, previous_remaining);
+    state.content_frame_cache.clear();
+
+    true
+}
+
+fn is_identity_subblock(parent: &crate::block::Block, child: &crate::block::Block) -> bool {
+    child.kind == parent.kind
+        && child.start_line == parent.start_line
+        && child.end_line == parent.end_line
+        && child.hash == parent.hash
+}
+
+fn refresh_review_state_after_refinement(state: &mut AppState, previous_remaining: usize) {
+    let next_remaining = state.reviewable_nodes.len();
+    if next_remaining >= previous_remaining {
+        let delta = next_remaining - previous_remaining;
+        state.total_blocks = state.total_blocks.saturating_add(delta);
+        state.initial_remaining_blocks = state.initial_remaining_blocks.saturating_add(delta);
+    } else {
+        let delta = previous_remaining - next_remaining;
+        state.total_blocks = state.total_blocks.saturating_sub(delta);
+        state.initial_remaining_blocks = state.initial_remaining_blocks.saturating_sub(delta);
+    }
+    state.remaining_blocks = next_remaining;
+    state.review_order = ReviewOrder::from_tree(&state.navigator.tree, &state.reviewable_nodes);
 }
 
 fn handle_scroll_line_up(state: &mut AppState) {
@@ -4066,7 +4139,8 @@ mod focus_layout_tests {
 mod diff_scope_tests {
     use super::*;
     use crate::analysis::Language;
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, FileState};
+    use crate::block_splitter;
     use crate::cli::Cli;
     use crate::commands::review::{
         BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewSummary,
@@ -4075,7 +4149,7 @@ mod diff_scope_tests {
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
     use crate::store::ReviewTargetKind;
-    use crate::tree::TreeBuilder;
+    use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4412,6 +4486,84 @@ mod diff_scope_tests {
         };
 
         (state, file, block_id)
+    }
+
+    fn build_state_with_markdown_file(
+        repo_path: &str,
+        file_content: &str,
+    ) -> (AppState, TreeNodeId, TreeNodeId) {
+        let file_state = FileState::from_text(
+            RepoPath::new(repo_path)
+                .unwrap_or_else(|error| panic!("invalid repo path {repo_path}: {error}")),
+            Language::Markdown,
+            file_content.as_bytes(),
+            block_splitter::split(file_content, Language::Markdown).blocks,
+        );
+        let tree = build_tree_from_files(&[file_state]);
+        let file_id = tree
+            .find_by_path(repo_path)
+            .unwrap_or_else(|| panic!("expected file node for {repo_path}"));
+        let top_level_blocks = tree.node(file_id).children.clone();
+        let top_section = *top_level_blocks
+            .first()
+            .unwrap_or_else(|| panic!("expected at least one markdown review block"));
+        let visible = top_level_blocks.into_iter().collect::<HashSet<_>>();
+        let review_order = ReviewOrder::from_tree(&tree, &visible);
+        let mut navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        navigator.set_current(file_id);
+
+        let mut state = AppState {
+            review_scope: ReviewScope::All,
+            navigator,
+            review_order,
+            total_blocks: visible.len(),
+            initial_remaining_blocks: visible.len(),
+            remaining_blocks: visible.len(),
+            reviewable_nodes: visible,
+            diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
+            session_recap: SessionRecap::default(),
+            scope_label: "All".to_string(),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            editing_validation: None,
+            confirm_batch: false,
+            repo_name: "repo".to_string(),
+            workdir_prefix: None,
+            file_cache: HashMap::from([(
+                PathBuf::from(repo_path),
+                Arc::from(
+                    file_content
+                        .lines()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+            )]),
+            root_cursor: None,
+            focus_block: None,
+            pending_focus_scroll: false,
+            scroll_offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            code_rect: Rect::default(),
+            view_mode: ViewMode::Source,
+            block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            diff_line_numbers: TuiDiffLineNumbers::Disabled,
+            keybinds: TuiKeybindsConfig::default(),
+            file_diff_cache: HashMap::new(),
+            content_frame_cache: HashMap::new(),
+            highlighted_line_cache: HashMap::new(),
+            speed_read: SpeedReadController::new(
+                TuiSpeedReadConfig::default(),
+                PathBuf::from("trueflow.toml"),
+            ),
+        };
+        set_focus_for_current_node(&mut state, None);
+
+        (state, file_id, top_section)
     }
 
     #[test]
@@ -6915,6 +7067,155 @@ mod diff_scope_tests {
     fn scroll_offset_for_focus_range_top_aligns_tall_focus_span() {
         let offset = scroll_offset_for_focus_range(&(10..20), 5, 40);
         assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn handle_child_lazily_expands_small_markdown_section_into_header_paragraph_and_nested_section()
+    {
+        let content =
+            "# Root\nIntro paragraph.\n\n## Coding\nDetails live here.\n\n### Dev Guide\nSteps.\n";
+        let (mut state, file_id, root_section) =
+            build_state_with_markdown_file("docs/guide.md", content);
+
+        assert_eq!(state.navigator.current_id(), file_id);
+        assert_eq!(state.reviewable_nodes.len(), 1);
+
+        handle_child(&mut state);
+        assert_eq!(state.navigator.current_id(), root_section);
+
+        handle_child(&mut state);
+        let current = state.navigator.tree.node(state.navigator.current_id());
+        assert_eq!(
+            current.block.as_ref().map(|block| block.kind),
+            Some(BlockKind::Header)
+        );
+
+        let child_kinds: Vec<_> = state
+            .navigator
+            .tree
+            .node(root_section)
+            .children
+            .iter()
+            .map(|child| {
+                state
+                    .navigator
+                    .tree
+                    .node(*child)
+                    .block
+                    .as_ref()
+                    .map(|block| block.kind)
+            })
+            .collect();
+        assert_eq!(
+            child_kinds,
+            vec![
+                Some(BlockKind::Header),
+                Some(BlockKind::Paragraph),
+                Some(BlockKind::Section)
+            ]
+        );
+        assert!(!state.reviewable_nodes.contains(&root_section));
+        assert_eq!(state.reviewable_nodes.len(), 3);
+
+        handle_next(&mut state);
+        handle_next(&mut state);
+        let nested_section = state.navigator.current_id();
+        assert_eq!(
+            state
+                .navigator
+                .tree
+                .node(nested_section)
+                .block
+                .as_ref()
+                .map(|block| block.kind),
+            Some(BlockKind::Section)
+        );
+
+        handle_child(&mut state);
+        let nested_current = state.navigator.tree.node(state.navigator.current_id());
+        assert_eq!(
+            nested_current.block.as_ref().map(|block| block.kind),
+            Some(BlockKind::Header)
+        );
+
+        let nested_child_kinds: Vec<_> = state
+            .navigator
+            .tree
+            .node(nested_section)
+            .children
+            .iter()
+            .map(|child| {
+                state
+                    .navigator
+                    .tree
+                    .node(*child)
+                    .block
+                    .as_ref()
+                    .map(|block| block.kind)
+            })
+            .collect();
+        assert_eq!(
+            nested_child_kinds,
+            vec![
+                Some(BlockKind::Header),
+                Some(BlockKind::Paragraph),
+                Some(BlockKind::Section)
+            ]
+        );
+    }
+
+    #[test]
+    fn handle_child_lazily_expands_small_markdown_paragraph_into_sentences() {
+        let content = "# Root\nSentence one. Sentence two?\n";
+        let (mut state, _file_id, _root_section) =
+            build_state_with_markdown_file("docs/guide.md", content);
+
+        handle_child(&mut state);
+        handle_child(&mut state);
+        handle_next(&mut state);
+
+        let paragraph_id = state.navigator.current_id();
+        assert_eq!(
+            state
+                .navigator
+                .tree
+                .node(paragraph_id)
+                .block
+                .as_ref()
+                .map(|block| block.kind),
+            Some(BlockKind::Paragraph)
+        );
+
+        handle_child(&mut state);
+        let first_sentence_id = state.navigator.current_id();
+        let sentence = state.navigator.tree.node(first_sentence_id);
+        assert_eq!(
+            sentence.block.as_ref().map(|block| block.kind),
+            Some(BlockKind::Sentence)
+        );
+        assert!(!state.reviewable_nodes.contains(&paragraph_id));
+
+        let sentence_children = state.navigator.tree.node(paragraph_id).children.clone();
+        let sentence_kinds: Vec<_> = sentence_children
+            .iter()
+            .map(|child| {
+                state
+                    .navigator
+                    .tree
+                    .node(*child)
+                    .block
+                    .as_ref()
+                    .map(|block| block.kind)
+            })
+            .collect();
+        assert_eq!(
+            sentence_kinds,
+            vec![Some(BlockKind::Sentence), Some(BlockKind::Sentence)]
+        );
+        assert_eq!(
+            compute_next_review_target(&state, first_sentence_id),
+            sentence_children.get(1).copied()
+        );
     }
 
     #[test]

@@ -79,6 +79,19 @@ impl ReviewNavigator {
         self.visible_nodes.remove(&id)
     }
 
+    pub fn reveal_blocks<I>(&mut self, block_ids: I)
+    where
+        I: IntoIterator<Item = TreeNodeId>,
+    {
+        for block_id in block_ids {
+            self.visible_nodes.insert(block_id);
+            for ancestor in self.tree.ancestors(block_id) {
+                self.visible_nodes.insert(ancestor);
+            }
+        }
+        self.visible_nodes.insert(self.tree.root());
+    }
+
     pub fn prune_visible_to_block_ancestors(&mut self) {
         self.visible_nodes = visible_block_ancestors(&self.tree, &self.visible_nodes);
         if !self.is_visible(self.current) {

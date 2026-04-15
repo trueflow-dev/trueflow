@@ -89,25 +89,51 @@ impl SplitPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SplitOptions {
+    pub force_expand_children: bool,
+}
+
 pub fn split(block: &Block, lang: Language) -> Result<Vec<Block>> {
     split_result(block, lang).map(|result| result.blocks)
 }
 
 pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
+    split_result_with_options(block, lang, SplitOptions::default())
+}
+
+pub fn split_result_for_child_navigation(block: &Block, lang: Language) -> Result<SubSplitResult> {
+    split_result_with_options(
+        block,
+        lang,
+        SplitOptions {
+            force_expand_children: true,
+        },
+    )
+}
+
+fn split_result_with_options(
+    block: &Block,
+    lang: Language,
+    options: SplitOptions,
+) -> Result<SubSplitResult> {
     info!(
-        "sub_splitter start (lang={:?}, kind={}, bytes={}, hash={})",
+        "sub_splitter start (lang={:?}, kind={}, bytes={}, hash={}, force_expand_children={})",
         lang,
         block.kind.as_str(),
         block.content.len(),
-        block.hash
+        block.hash,
+        options.force_expand_children
     );
 
     if let Some(language_registration) = languages::registration(lang) {
         let registration = (language_registration.sub_split)(block.kind);
-        if matches!(
-            registration.semantics,
-            languages::LanguageSubSplitSemantics::ReviewUnits
-        ) && block_line_span(block) <= MAX_REVIEW_UNIT_SPAN_LINES
+        if !options.force_expand_children
+            && matches!(
+                registration.semantics,
+                languages::LanguageSubSplitSemantics::ReviewUnits
+            )
+            && block_line_span(block) <= MAX_REVIEW_UNIT_SPAN_LINES
         {
             let result = SubSplitResult {
                 blocks: vec![block.clone()],
@@ -141,11 +167,7 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
 
     if matches!(lang, Language::Toml) && matches!(block.kind, BlockKind::Section | BlockKind::List)
     {
-        let blocks = match block.kind {
-            BlockKind::Section => split_toml_structural_children(block, block.kind)?,
-            BlockKind::List => split_toml_structural_children(block, block.kind)?,
-            _ => unreachable!("guarded above"),
-        };
+        let blocks = split_toml_structural_children(block, block.kind)?;
         let result = SubSplitResult {
             blocks,
             semantics: SubSplitSemantics::StructuralChildren,
@@ -182,7 +204,7 @@ pub fn split_result(block: &Block, lang: Language) -> Result<SubSplitResult> {
     }
 
     let plan = determine_split_plan(block.kind, lang);
-    if should_keep_parent_review_unit(plan, block) {
+    if !options.force_expand_children && should_keep_parent_review_unit(plan, block) {
         let result = SubSplitResult {
             blocks: vec![block.clone()],
             semantics: SubSplitSemantics::ReviewUnits,
@@ -448,6 +470,85 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
         .context("Failed to parse markdown")?;
     let root = tree.root_node();
 
+    let mut headings = Vec::new();
+    collect_markdown_heading_spans(root, content, &mut headings);
+    headings.sort_by_key(|heading| heading.start);
+
+    let Some(root_heading) = headings
+        .first()
+        .copied()
+        .filter(|heading| heading.start == 0)
+    else {
+        return split_markdown_flat_range(block, 0, content.len());
+    };
+
+    let mut blocks = vec![create_sub_block_with_kind(
+        block,
+        &content[root_heading.start..root_heading.end],
+        root_heading.start,
+        root_heading.end,
+        BlockKind::Header,
+    )];
+
+    let child_sections =
+        immediate_markdown_child_sections(&headings, root_heading.level, content.len());
+    let content_end = child_sections
+        .first()
+        .map(|section| section.start)
+        .unwrap_or(content.len());
+    blocks.extend(split_markdown_flat_range(
+        block,
+        root_heading.end,
+        content_end,
+    )?);
+
+    for section in child_sections {
+        blocks.push(create_sub_block_with_kind(
+            block,
+            &content[section.start..section.end],
+            section.start,
+            section.end,
+            BlockKind::Section,
+        ));
+    }
+
+    if blocks.is_empty() {
+        return split_code(block);
+    }
+
+    Ok(blocks)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkdownHeadingSpan {
+    start: usize,
+    end: usize,
+    level: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkdownSectionSpan {
+    start: usize,
+    end: usize,
+}
+
+fn split_markdown_flat_range(block: &Block, start: usize, end: usize) -> Result<Vec<Block>> {
+    if start >= end {
+        return Ok(Vec::new());
+    }
+
+    let content = block.content.as_str();
+    let slice = &content[start..end];
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_md::LANGUAGE.into())
+        .context("Failed to load markdown grammar")?;
+
+    let tree = parser
+        .parse(slice, None)
+        .context("Failed to parse markdown")?;
+    let root = tree.root_node();
+
     let mut spans = Vec::new();
     collect_markdown_spans(root, &mut spans);
     spans.sort_by_key(|span| span.start);
@@ -456,43 +557,101 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
     let mut last_end = 0;
     for span in spans {
         if span.start > last_end {
-            let gap = &content[last_end..span.start];
+            let gap = &slice[last_end..span.start];
             if !gap.is_empty() {
                 blocks.push(create_sub_block_with_kind(
                     block,
                     gap,
-                    last_end,
-                    span.start,
+                    start + last_end,
+                    start + span.start,
                     BlockKind::Gap,
                 ));
             }
         }
 
-        let chunk = &content[span.start..span.end];
+        let chunk = &slice[span.start..span.end];
         blocks.push(create_sub_block_with_kind(
-            block, chunk, span.start, span.end, span.kind,
+            block,
+            chunk,
+            start + span.start,
+            start + span.end,
+            span.kind,
         ));
         last_end = span.end;
     }
 
-    if last_end < content.len() {
-        let tail = &content[last_end..];
+    if last_end < slice.len() {
+        let tail = &slice[last_end..];
         if !tail.is_empty() {
+            let kind = if tail.trim().is_empty() {
+                BlockKind::Gap
+            } else {
+                BlockKind::Paragraph
+            };
             blocks.push(create_sub_block_with_kind(
                 block,
                 tail,
-                last_end,
-                content.len(),
-                BlockKind::Gap,
+                start + last_end,
+                end,
+                kind,
             ));
         }
     }
 
-    if blocks.is_empty() {
-        return split_code(block);
+    Ok(blocks)
+}
+
+fn collect_markdown_heading_spans(
+    node: tree_sitter::Node<'_>,
+    content: &str,
+    headings: &mut Vec<MarkdownHeadingSpan>,
+) {
+    if let Some(level) = markdown_heading_level(node.kind(), node.start_byte(), content) {
+        headings.push(MarkdownHeadingSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+            level,
+        });
+        return;
     }
 
-    Ok(blocks)
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_markdown_heading_spans(child, content, headings);
+    }
+}
+
+fn immediate_markdown_child_sections(
+    headings: &[MarkdownHeadingSpan],
+    root_level: u8,
+    content_len: usize,
+) -> Vec<MarkdownSectionSpan> {
+    let mut sections: Vec<MarkdownSectionSpan> = Vec::new();
+    let mut level_stack = vec![root_level];
+
+    for heading in headings.iter().skip(1) {
+        while level_stack
+            .last()
+            .is_some_and(|level| *level >= heading.level)
+        {
+            level_stack.pop();
+        }
+
+        let parent_level = level_stack.last().copied().unwrap_or(root_level);
+        if parent_level == root_level {
+            if let Some(previous) = sections.last_mut() {
+                previous.end = heading.start;
+            }
+            sections.push(MarkdownSectionSpan {
+                start: heading.start,
+                end: content_len,
+            });
+        }
+
+        level_stack.push(heading.level);
+    }
+
+    sections
 }
 
 fn split_markdown_sentences(block: &Block) -> Result<Vec<Block>> {
@@ -1323,6 +1482,31 @@ fn collect_markdown_spans(node: tree_sitter::Node<'_>, spans: &mut Vec<MarkdownS
     }
 }
 
+fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8> {
+    match kind {
+        "atx_heading" => {
+            let line = content.get(start..)?.lines().next()?;
+            let level = line.chars().take_while(|ch| *ch == '#').count();
+            if level > 0 {
+                u8::try_from(level.min(6)).ok()
+            } else {
+                None
+            }
+        }
+        "setext_heading" => {
+            let line = content.get(start..)?.lines().next()?;
+            if line.chars().all(|ch| ch == '=') {
+                Some(1)
+            } else if line.chars().all(|ch| ch == '-') {
+                Some(2)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn markdown_kind(kind: &str) -> Option<BlockKind> {
     match kind {
         "atx_heading" | "setext_heading" => Some(BlockKind::Header),
@@ -1854,6 +2038,56 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].kind, BlockKind::Sentence);
         assert_eq!(merge_blocks(chunks), content);
+    }
+
+    #[test]
+    fn forced_markdown_section_split_creates_header_and_nested_section_children_under_threshold() {
+        let content =
+            "# Root\nIntro paragraph.\n\n## Coding\nDetails live here.\n\n### Dev Guide\nSteps.\n";
+        let block = make_block(content, BlockKind::Section);
+        let result = split_result_for_child_navigation(&block, Language::Markdown).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+
+        let kinds: Vec<_> = result
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![BlockKind::Header, BlockKind::Paragraph, BlockKind::Section]
+        );
+        assert_eq!(merge_blocks(result.blocks.clone()), content);
+
+        let coding_section = result
+            .blocks
+            .into_iter()
+            .find(|block| block.kind == BlockKind::Section)
+            .unwrap_or_else(|| panic!("expected nested section child"));
+        let nested =
+            split_result_for_child_navigation(&coding_section, Language::Markdown).unwrap();
+        let nested_kinds: Vec<_> = nested
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.kind)
+            .collect();
+        assert_eq!(
+            nested_kinds,
+            vec![BlockKind::Header, BlockKind::Paragraph, BlockKind::Section]
+        );
+    }
+
+    #[test]
+    fn forced_markdown_paragraph_split_creates_sentence_children_under_threshold() {
+        let content = "Sentence one. Sentence two?";
+        let block = make_block(content, BlockKind::Paragraph);
+        let result = split_result_for_child_navigation(&block, Language::Markdown).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
+        let kinds: Vec<_> = result.blocks.iter().map(|block| block.kind).collect();
+        assert_eq!(kinds, vec![BlockKind::Sentence, BlockKind::Sentence]);
+        assert_eq!(merge_blocks(result.blocks), content);
     }
 
     #[test]
