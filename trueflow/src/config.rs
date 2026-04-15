@@ -26,7 +26,7 @@ pub struct TrueflowConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TuiConfig {
     #[serde(default = "default_confirm_batch_sub_blocks")]
-    pub confirm_batch_sub_blocks: TuiConfirmBatchSubBlocks,
+    pub confirm_batch_sub_blocks: BatchConfirmPolicy,
     #[serde(default = "default_tui_diff_focus_mode")]
     pub diff_focus_mode: TuiDiffFocusMode,
     #[serde(default = "default_diff_focus_context_lines")]
@@ -135,18 +135,18 @@ pub struct FeedbackConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TuiConfirmBatchSubBlocks {
+pub enum BatchConfirmPolicy {
     Never,
     Threshold(usize),
 }
 
-impl Default for TuiConfirmBatchSubBlocks {
+impl Default for BatchConfirmPolicy {
     fn default() -> Self {
         Self::Threshold(2)
     }
 }
 
-impl<'de> Deserialize<'de> for TuiConfirmBatchSubBlocks {
+impl<'de> Deserialize<'de> for BatchConfirmPolicy {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -160,7 +160,7 @@ impl<'de> Deserialize<'de> for TuiConfirmBatchSubBlocks {
 
         match Repr::deserialize(deserializer)? {
             Repr::Keyword(keyword) => match keyword.as_str() {
-                "never" => Ok(TuiConfirmBatchSubBlocks::Never),
+                "never" => Ok(BatchConfirmPolicy::Never),
                 _ => Err(serde::de::Error::custom(
                     "confirm_batch_sub_blocks must be \"never\" or an integer threshold >= 1",
                 )),
@@ -168,16 +168,16 @@ impl<'de> Deserialize<'de> for TuiConfirmBatchSubBlocks {
             Repr::Threshold(0) => Err(serde::de::Error::custom(
                 "confirm_batch_sub_blocks threshold must be at least 1",
             )),
-            Repr::Threshold(threshold) => Ok(TuiConfirmBatchSubBlocks::Threshold(threshold)),
+            Repr::Threshold(threshold) => Ok(BatchConfirmPolicy::Threshold(threshold)),
         }
     }
 }
 
-impl TuiConfirmBatchSubBlocks {
+impl BatchConfirmPolicy {
     pub fn should_confirm(self, count: usize) -> bool {
         match self {
-            TuiConfirmBatchSubBlocks::Never => false,
-            TuiConfirmBatchSubBlocks::Threshold(threshold) => count >= threshold,
+            BatchConfirmPolicy::Never => false,
+            BatchConfirmPolicy::Threshold(threshold) => count >= threshold,
         }
     }
 }
@@ -306,8 +306,8 @@ impl Default for FeedbackConfig {
     }
 }
 
-fn default_confirm_batch_sub_blocks() -> TuiConfirmBatchSubBlocks {
-    TuiConfirmBatchSubBlocks::default()
+fn default_confirm_batch_sub_blocks() -> BatchConfirmPolicy {
+    BatchConfirmPolicy::default()
 }
 
 fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {
@@ -687,7 +687,7 @@ mod tests {
         };
         assert_eq!(
             cfg.tui.confirm_batch_sub_blocks,
-            TuiConfirmBatchSubBlocks::Threshold(2)
+            BatchConfirmPolicy::Threshold(2)
         );
         assert_eq!(cfg.tui.diff_focus_mode, TuiDiffFocusMode::WholeBlock);
         assert_eq!(cfg.tui.diff_focus_context_lines, 3);
@@ -728,7 +728,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("parse threshold config: {err}"));
         assert_eq!(
             threshold_cfg.tui.confirm_batch_sub_blocks,
-            TuiConfirmBatchSubBlocks::Threshold(1)
+            BatchConfirmPolicy::Threshold(1)
         );
 
         let never_cfg: TrueflowConfig =
@@ -736,7 +736,7 @@ mod tests {
                 .unwrap_or_else(|err| panic!("parse never config: {err}"));
         assert_eq!(
             never_cfg.tui.confirm_batch_sub_blocks,
-            TuiConfirmBatchSubBlocks::Never
+            BatchConfirmPolicy::Never
         );
     }
 

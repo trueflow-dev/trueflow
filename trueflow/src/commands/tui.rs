@@ -12,7 +12,7 @@ use crate::commands::review::{
     resolve_cli_review_scope, resolve_review_request,
 };
 use crate::config::{
-    BlockFilters, TuiConfig, TuiConfirmBatchSubBlocks, TuiDiffFocusMode, TuiDiffLineNumbers,
+    BlockFilters, TuiConfig, BatchConfirmPolicy, TuiDiffFocusMode, TuiDiffLineNumbers,
     TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
 use crate::context::TrueflowContext;
@@ -198,7 +198,7 @@ struct AppState {
     input_mode: InputMode,
     input_buffer: String,
     editing_validation: Option<EditingValidation>,
-    confirm_batch: TuiConfirmBatchSubBlocks,
+    confirm_batch: BatchConfirmPolicy,
     repo_name: String,
     workdir_prefix: Option<String>,
     file_cache: HashMap<PathBuf, Arc<[String]>>,
@@ -223,7 +223,7 @@ const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
 const DISPLAY_TAB_WIDTH: usize = 8;
 
 struct ReviewStateBuildOptions {
-    confirm_batch: TuiConfirmBatchSubBlocks,
+    confirm_batch: BatchConfirmPolicy,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     diff_line_numbers: TuiDiffLineNumbers,
     keybinds: TuiKeybindsConfig,
@@ -4145,7 +4145,7 @@ mod diff_scope_tests {
         BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewSummary,
         UnreviewedFile,
     };
-    use crate::config::TuiConfirmBatchSubBlocks;
+    use crate::config::BatchConfirmPolicy;
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
     use crate::store::ReviewTargetKind;
@@ -4213,7 +4213,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: TuiConfirmBatchSubBlocks::Never,
+            confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             workdir_prefix,
             file_cache: HashMap::new(),
@@ -4280,7 +4280,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: TuiConfirmBatchSubBlocks::Never,
+            confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::new(),
@@ -4361,7 +4361,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: TuiConfirmBatchSubBlocks::Never,
+            confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::new(),
@@ -4452,7 +4452,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: TuiConfirmBatchSubBlocks::Never,
+            confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::from([(
@@ -4539,7 +4539,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: TuiConfirmBatchSubBlocks::Threshold(2),
+            confirm_batch: BatchConfirmPolicy::Threshold(2),
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::new(),
@@ -4607,7 +4607,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: TuiConfirmBatchSubBlocks::Never,
+            confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::from([(
@@ -4772,7 +4772,7 @@ mod diff_scope_tests {
     #[test]
     fn block_diff_focus_mode_uses_configured_context() {
         let config = TuiConfig {
-            confirm_batch_sub_blocks: TuiConfirmBatchSubBlocks::Threshold(2),
+            confirm_batch_sub_blocks: BatchConfirmPolicy::Threshold(2),
             diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
             diff_focus_context_lines: 7,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -5238,7 +5238,7 @@ mod diff_scope_tests {
                 end: "HEAD".to_string(),
             },
             ReviewStateBuildOptions {
-                confirm_batch: TuiConfirmBatchSubBlocks::Never,
+                confirm_batch: BatchConfirmPolicy::Never,
                 block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
                 diff_line_numbers: TuiDiffLineNumbers::Disabled,
                 keybinds: TuiKeybindsConfig::default(),
@@ -7307,7 +7307,7 @@ mod diff_scope_tests {
     #[test]
     fn batch_confirmation_threshold_can_confirm_single_sub_block_batch_actions() {
         let (mut state, file_id, _block_ids) = build_state_with_file_block_count(1);
-        state.confirm_batch = TuiConfirmBatchSubBlocks::Threshold(1);
+        state.confirm_batch = BatchConfirmPolicy::Threshold(1);
         let action = PendingAction::from_node(&state.navigator.tree, file_id, Verdict::Approved);
 
         assert_eq!(
@@ -7319,7 +7319,7 @@ mod diff_scope_tests {
     #[test]
     fn batch_confirmation_threshold_never_disables_batch_confirmation() {
         let (mut state, file_id, _block_ids) = build_state_with_file_block_count(3);
-        state.confirm_batch = TuiConfirmBatchSubBlocks::Never;
+        state.confirm_batch = BatchConfirmPolicy::Never;
         let action = PendingAction::from_node(&state.navigator.tree, file_id, Verdict::Approved);
 
         assert_eq!(batch_confirmation_count_for_action(&state, &action), None);
