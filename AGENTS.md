@@ -30,3 +30,4 @@
   to improve tests, maintainability, correctness.
 - Be extremely picky about dependencies. When choosing dependencies, offer
   options and make a point to confirm before choosing.
+- This is a beta version that has no compatibility requirements. We don't need backwards compatibility and we do not need aliases or migration plans. We can and should routinely break things without bridges or migrations or backwards compat.
