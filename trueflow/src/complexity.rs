@@ -25,6 +25,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         } else {
             tree_sitter_php::LANGUAGE_PHP_ONLY.into()
         }),
+        Language::Go => Some(tree_sitter_go::LANGUAGE.into()),
         Language::C => Some(tree_sitter_c::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
@@ -139,6 +140,14 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
                 | "catch_clause"
                 | "conditional_expression"
         ),
+        Language::Go => matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "select_statement"
+        ),
         Language::C => matches!(
             kind,
             "if_statement"
@@ -182,6 +191,7 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         Language::CSharp => matches!(kind, "&&" | "||" | "??"),
         Language::Ruby => matches!(kind, "&&" | "||" | "and" | "or"),
         Language::Php => matches!(kind, "&&" | "||" | "??"),
+        Language::Go => matches!(kind, "&&" | "||"),
         Language::C => matches!(kind, "&&" | "||"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
@@ -433,4 +443,25 @@ int run(int flag, int ready) {
         let score = calculate(code, Language::C);
         assert_eq!(score, Some(4));
     }
+
+    #[test]
+    fn test_calculate_complexity_go() {
+        let code = "
+func process(values []int, ready bool) int {
+    for _, value := range values {
+        if ready && value > 0 {
+            return value
+        }
+    }
+    return 0
+}
+";
+        // for: +1
+        // if inside for: +1 + nesting 1 = 2
+        // &&: +1
+        // Total: 4
+        let score = calculate(code, Language::Go);
+        assert_eq!(score, Some(4));
+    }
+
 }

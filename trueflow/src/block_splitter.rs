@@ -212,9 +212,6 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
             BlockSplitStrategy::Heuristic,
             Vec::new(),
         ),
-        Language::Go => {
-            complete_split(split_go(content), BlockSplitStrategy::Heuristic, Vec::new())
-        }
         Language::Cpp => complete_split(
             split_cpp(content),
             BlockSplitStrategy::Heuristic,
@@ -702,17 +699,6 @@ fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
     })
 }
 
-fn split_go(content: &str) -> Vec<Block> {
-    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
-        let kind = if is_gap {
-            BlockKind::Gap
-        } else {
-            classify_go_chunk(chunk)
-        };
-        create_block(chunk, kind, content, start, end, Language::Go)
-    })
-}
-
 fn split_cpp(content: &str) -> Vec<Block> {
     split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
         let kind = if is_gap {
@@ -1005,58 +991,6 @@ fn classify_nix_node_kind(kind: &str) -> BlockKind {
 fn is_nix_comment_chunk(chunk: &str) -> bool {
     let trimmed = chunk.trim_start();
     trimmed.starts_with('#') || trimmed.starts_with("/*")
-}
-
-fn classify_go_chunk(chunk: &str) -> BlockKind {
-    let mut saw_non_empty = false;
-    let mut first_code_line = None;
-    for line in chunk.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        saw_non_empty = true;
-        if is_comment_line(trimmed) {
-            continue;
-        }
-        first_code_line = Some(trimmed);
-        break;
-    }
-
-    if !saw_non_empty {
-        return BlockKind::Gap;
-    }
-
-    let Some(line) = first_code_line else {
-        return BlockKind::Comment;
-    };
-
-    if line.starts_with("package ") {
-        return BlockKind::Module;
-    }
-    if line.starts_with("import ") {
-        return BlockKind::Import;
-    }
-    if line.starts_with("type ") {
-        if line.contains("interface") {
-            return BlockKind::Interface;
-        }
-        return BlockKind::Struct;
-    }
-    if let Some(rest) = line.strip_prefix("func ") {
-        if rest.trim_start().starts_with('(') {
-            return BlockKind::Method;
-        }
-        return BlockKind::Function;
-    }
-    if line.starts_with("const ") {
-        return BlockKind::Const;
-    }
-    if line.starts_with("var ") {
-        return BlockKind::Variable;
-    }
-
-    BlockKind::Code
 }
 
 fn classify_cpp_chunk(chunk: &str) -> BlockKind {
@@ -2709,7 +2643,7 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
             "package main\n\nimport \"fmt\"\n\ntype Worker struct{}\n\nfunc run() {\n    fmt.Println(\"ok\")\n}\n",
             Language::Go,
         );
-        assert_eq!(result.strategy, BlockSplitStrategy::Heuristic);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
         let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Struct));

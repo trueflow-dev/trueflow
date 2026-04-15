@@ -62,6 +62,7 @@ tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
 tree-sitter-clojure = { version = "0.2.5", package = "tree-sitter-clojure-orchard" }
 tree-sitter-sql = { version = "0.3.11", package = "tree-sitter-sequel" }
+tree-sitter-go = "0.25.0"
 
 # [dependencies]
 # dioxus = "0.4.3"

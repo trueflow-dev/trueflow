@@ -400,6 +400,7 @@ mod tests {
     #[test]
     fn wave2_language_registrations_smoke() {
         let cases = [
+            (Language::Go, "package demo\n\nfunc main() {}\n"),
             (Language::Zig, "const value: i32 = 1;\n"),
             (Language::Lua, "local value = 1\n"),
             (Language::Dart, "int value = 1;\n"),
