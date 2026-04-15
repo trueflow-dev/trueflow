@@ -27,6 +27,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         }),
         Language::Go => Some(tree_sitter_go::LANGUAGE.into()),
         Language::C => Some(tree_sitter_c::LANGUAGE.into()),
+        Language::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
@@ -161,6 +162,20 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
                 | "preproc_elif"
                 | "preproc_else"
         ),
+        Language::Cpp => matches!(
+            kind,
+            "if_statement"
+                | "switch_statement"
+                | "for_statement"
+                | "for_range_loop"
+                | "while_statement"
+                | "do_statement"
+                | "conditional_expression"
+                | "preproc_if"
+                | "preproc_ifdef"
+                | "preproc_elif"
+                | "preproc_else"
+        ),
         Language::Python => matches!(
             kind,
             "if_statement"
@@ -193,6 +208,7 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         Language::Php => matches!(kind, "&&" | "||" | "??"),
         Language::Go => matches!(kind, "&&" | "||"),
         Language::C => matches!(kind, "&&" | "||"),
+        Language::Cpp => matches!(kind, "&&" | "||"),
         Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
@@ -464,4 +480,23 @@ func process(values []int, ready bool) int {
         assert_eq!(score, Some(4));
     }
 
+    #[test]
+    fn test_calculate_complexity_cpp() {
+        let code = "
+int process(const std::vector<int>& values, bool ready) {
+    for (int value : values) {
+        if (ready && value > 0) {
+            return value;
+        }
+    }
+    return 0;
+}
+";
+        // range-for: +1
+        // if inside range-for: +1 + nesting 1 = 2
+        // &&: +1
+        // Total: 4
+        let score = calculate(code, Language::Cpp);
+        assert_eq!(score, Some(4));
+    }
 }

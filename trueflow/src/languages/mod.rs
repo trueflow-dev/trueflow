@@ -4,6 +4,7 @@ use anyhow::Result;
 use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 mod clojure;
+mod cpp;
 mod css;
 mod dart;
 mod elixir;
@@ -67,6 +68,7 @@ pub(crate) struct LanguageRegistration {
 #[cfg(test)]
 const REGISTERED_LANGUAGES: &[Language] = &[
     Language::Go,
+    Language::Cpp,
     Language::Zig,
     Language::Lua,
     Language::Dart,
@@ -90,6 +92,7 @@ pub(crate) fn registered_languages() -> &'static [Language] {
 pub(crate) fn registration(lang: Language) -> Option<LanguageRegistration> {
     match lang {
         Language::Go => Some(go::registration()),
+        Language::Cpp => Some(cpp::registration()),
         Language::Zig => Some(zig::registration()),
         Language::Lua => Some(lua::registration()),
         Language::Dart => Some(dart::registration()),

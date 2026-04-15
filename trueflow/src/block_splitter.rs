@@ -212,11 +212,6 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
             BlockSplitStrategy::Heuristic,
             Vec::new(),
         ),
-        Language::Cpp => complete_split(
-            split_cpp(content),
-            BlockSplitStrategy::Heuristic,
-            Vec::new(),
-        ),
         Language::Toml => attempt_split(content, lang, split_toml(content), FallbackMode::Code),
         Language::Nix => attempt_split(content, lang, split_nix(content), FallbackMode::Code),
         _ if languages::registration(lang).is_some() => attempt_split(
@@ -699,17 +694,6 @@ fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
     })
 }
 
-fn split_cpp(content: &str) -> Vec<Block> {
-    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
-        let kind = if is_gap {
-            BlockKind::Gap
-        } else {
-            classify_cpp_chunk(chunk)
-        };
-        create_block(chunk, kind, content, start, end, Language::Cpp)
-    })
-}
-
 fn split_toml(content: &str) -> Result<Vec<Block>> {
     let spans = toml_blocks::split_document(content)?;
     let mut blocks = Vec::new();
@@ -991,83 +975,6 @@ fn classify_nix_node_kind(kind: &str) -> BlockKind {
 fn is_nix_comment_chunk(chunk: &str) -> bool {
     let trimmed = chunk.trim_start();
     trimmed.starts_with('#') || trimmed.starts_with("/*")
-}
-
-fn classify_cpp_chunk(chunk: &str) -> BlockKind {
-    let mut saw_non_empty = false;
-    let mut first_code_line = None;
-    for line in chunk.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        saw_non_empty = true;
-        if is_comment_line(trimmed) {
-            continue;
-        }
-        first_code_line = Some(trimmed);
-        break;
-    }
-
-    if !saw_non_empty {
-        return BlockKind::Gap;
-    }
-
-    let Some(line) = first_code_line else {
-        return BlockKind::Comment;
-    };
-
-    if line.starts_with("#include ") || line.starts_with("import ") {
-        return BlockKind::Import;
-    }
-    if line.starts_with("namespace ") {
-        return BlockKind::Module;
-    }
-    if line.starts_with("class ") {
-        return BlockKind::Class;
-    }
-    if line.starts_with("struct ") {
-        return BlockKind::Struct;
-    }
-    if line.starts_with("enum ") {
-        return BlockKind::Enum;
-    }
-    if line.starts_with("constexpr ") || line.starts_with("const ") {
-        return BlockKind::Const;
-    }
-    if looks_like_cpp_function(chunk, line) {
-        return BlockKind::Function;
-    }
-
-    BlockKind::Code
-}
-
-fn looks_like_cpp_function(chunk: &str, signature_line: &str) -> bool {
-    if !signature_line.contains('(') || !signature_line.contains(')') {
-        return false;
-    }
-
-    let disallowed = [
-        "if ",
-        "for ",
-        "while ",
-        "switch ",
-        "return ",
-        "catch ",
-        "static_assert",
-    ];
-    if disallowed
-        .iter()
-        .any(|prefix| signature_line.starts_with(prefix))
-    {
-        return false;
-    }
-
-    chunk.contains('{')
-}
-
-fn is_comment_line(trimmed_line: &str) -> bool {
-    code_comments::line_is_c_style_comment(trimmed_line)
 }
 
 #[derive(Debug, Clone)]
@@ -2656,7 +2563,7 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
             "#include <vector>\n\nclass Worker {\npublic:\n    int value = 1;\n};\n\nint run() {\n    return 1;\n}\n",
             Language::Cpp,
         );
-        assert_eq!(result.strategy, BlockSplitStrategy::Heuristic);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
         let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));

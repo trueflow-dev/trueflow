@@ -67,7 +67,9 @@ impl Language {
             "php" => Some(Language::Php),
             "go" => Some(Language::Go),
             "c" => Some(Language::C),
-            "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" => Some(Language::Cpp),
+            "cpp" | "cxx" | "cc" | "hpp" | "hh" | "hxx" | "h++" | "ipp" | "tpp" | "inl" => {
+                Some(Language::Cpp)
+            }
             "zig" => Some(Language::Zig),
             "lua" => Some(Language::Lua),
             "dart" => Some(Language::Dart),
@@ -268,6 +270,9 @@ mod tests {
         assert_eq!(Language::from_extension("hh"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("hxx"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("h++"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("ipp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("tpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("inl"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("sh"), Some(Language::Shell));
         assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
         assert_eq!(
@@ -401,6 +406,10 @@ mod tests {
     fn wave2_language_registrations_smoke() {
         let cases = [
             (Language::Go, "package demo\n\nfunc main() {}\n"),
+            (
+                Language::Cpp,
+                "#include <vector>\n\nint main() { return 0; }\n",
+            ),
             (Language::Zig, "const value: i32 = 1;\n"),
             (Language::Lua, "local value = 1\n"),
             (Language::Dart, "int value = 1;\n"),
