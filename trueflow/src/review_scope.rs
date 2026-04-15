@@ -15,6 +15,7 @@ pub enum CliSemanticReviewScope {
     DirtyWorktree,
     MainDiff,
     File(RepoPath),
+    Dir(RepoPath),
     Revision(RevisionSpec),
     RevisionRange(RevisionRangeSpec),
     MultiTarget(Vec<ReviewTarget>),
@@ -73,6 +74,7 @@ impl CliSemanticReviewScope {
             [ReviewTarget::DirtyWorktree] => Self::DirtyWorktree,
             [ReviewTarget::MainDiff] => Self::MainDiff,
             [ReviewTarget::File(path)] => Self::File(path.clone()),
+            [ReviewTarget::Dir(path)] => Self::Dir(path.clone()),
             [ReviewTarget::Revision(revision)] => Self::Revision(revision.clone()),
             [ReviewTarget::RevisionRange(range)] => Self::RevisionRange(range.clone()),
             _ => Self::MultiTarget(targets.to_vec()),
@@ -85,6 +87,7 @@ impl CliSemanticReviewScope {
             Self::DirtyWorktree => ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree]),
             Self::MainDiff => ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
             Self::File(path) => ReviewRequest::Targets(vec![ReviewTarget::File(path.clone())]),
+            Self::Dir(path) => ReviewRequest::Targets(vec![ReviewTarget::Dir(path.clone())]),
             Self::Revision(revision) => {
                 ReviewRequest::Targets(vec![ReviewTarget::Revision(revision.clone())])
             }
@@ -101,6 +104,7 @@ impl CliSemanticReviewScope {
             Self::DirtyWorktree => "dirty worktree".to_string(),
             Self::MainDiff => "diff vs main".to_string(),
             Self::File(path) => format!("file {path}"),
+            Self::Dir(path) => format!("dir {path}"),
             Self::Revision(revision) => format!("revision {revision}"),
             Self::RevisionRange(range) => {
                 format!("revisions {}..{}", range.start, range.end)
@@ -120,9 +124,11 @@ impl CliSemanticReviewScope {
                 start: range.start.as_str().to_string(),
                 end: range.end.as_str().to_string(),
             },
-            Self::DirtyWorktree | Self::MainDiff | Self::File(_) | Self::MultiTarget(_) => {
-                ReviewScope::MainDiff
-            }
+            Self::DirtyWorktree
+            | Self::MainDiff
+            | Self::File(_)
+            | Self::Dir(_)
+            | Self::MultiTarget(_) => ReviewScope::MainDiff,
         }
     }
 }

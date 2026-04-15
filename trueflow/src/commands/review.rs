@@ -71,6 +71,9 @@ pub enum ReviewTarget {
     DirtyWorktree,
     MainDiff,
     File(RepoPath),
+    /// Scope the review to every reviewable file under `path` (inclusive).
+    /// Uses the workdir as the content source, same as `File`.
+    Dir(RepoPath),
     Revision(RevisionSpec),
     RevisionRange(RevisionRangeSpec),
 }
@@ -85,6 +88,9 @@ impl ReviewTarget {
         if let Some(rest) = raw.strip_prefix("file:") {
             return Ok(Self::File(RepoPath::new(rest)?));
         }
+        if let Some(rest) = raw.strip_prefix("dir:") {
+            return Ok(Self::Dir(RepoPath::new(rest)?));
+        }
         if let Some(rest) = raw.strip_prefix("rev:") {
             if let Some((start, end)) = rest.split_once("..") {
                 return Ok(Self::RevisionRange(RevisionRangeSpec::new(start, end)?));
@@ -98,7 +104,7 @@ impl ReviewTarget {
         match self {
             Self::Revision(revision) => Some(revision),
             Self::RevisionRange(range) => Some(&range.end),
-            Self::DirtyWorktree | Self::MainDiff | Self::File(_) => None,
+            Self::DirtyWorktree | Self::MainDiff | Self::File(_) | Self::Dir(_) => None,
         }
     }
 
@@ -111,7 +117,7 @@ impl ReviewTarget {
             Self::MainDiff => Some(ReviewDiffTarget::MainDiff),
             Self::Revision(revision) => Some(ReviewDiffTarget::Revision(revision.clone())),
             Self::RevisionRange(range) => Some(ReviewDiffTarget::RevisionRange(range.clone())),
-            Self::DirtyWorktree | Self::File(_) => None,
+            Self::DirtyWorktree | Self::File(_) | Self::Dir(_) => None,
         }
     }
 }
@@ -140,6 +146,14 @@ pub enum ReviewContentSource {
 pub enum ReviewPathSelection {
     All,
     Specific(HashSet<RepoPath>),
+    /// Explicit files plus one or more directory prefixes. A file matches
+    /// if it's in `files` or lives under any entry in `dirs`. Only used
+    /// for workdir-content targets — historical content paths must be
+    /// fully enumerated.
+    Scoped {
+        files: HashSet<RepoPath>,
+        dirs: Vec<RepoPath>,
+    },
 }
 
 impl ReviewPathSelection {
@@ -156,8 +170,39 @@ impl ReviewPathSelection {
                 }
                 Ok(false)
             }
+            Self::Scoped { files, dirs } => {
+                if files.contains(file_path) {
+                    return Ok(true);
+                }
+                if let Some(prefix) = workdir_prefix {
+                    let with_prefix = RepoPath::new(format!("{prefix}/{file_path}"))?;
+                    if files.contains(&with_prefix) {
+                        return Ok(true);
+                    }
+                    if dirs.iter().any(|d| path_under_dir(&with_prefix, d)) {
+                        return Ok(true);
+                    }
+                }
+                Ok(dirs.iter().any(|d| path_under_dir(file_path, d)))
+            }
         }
     }
+}
+
+/// True if `file` equals `dir` or lives under `dir` as a subtree.
+/// Root directory (empty string) matches every path.
+fn path_under_dir(file: &RepoPath, dir: &RepoPath) -> bool {
+    let dir_str = dir.as_str();
+    if dir_str.is_empty() {
+        return true;
+    }
+    let file_str = file.as_str();
+    if file_str == dir_str {
+        return true;
+    }
+    file_str
+        .strip_prefix(dir_str)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +492,12 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                 ReviewPathSelection::All => {
                     return Err(anyhow!(
                         "historical review targets must resolve to explicit paths"
+                    ));
+                }
+                ReviewPathSelection::Scoped { .. } => {
+                    return Err(anyhow!(
+                        "dir: review targets are only supported for workdir content, \
+                         not historical revisions"
                     ));
                 }
             };
@@ -814,6 +865,11 @@ fn selected_review_paths(
     match path_selection {
         ReviewPathSelection::All => head_files_by_path.keys().cloned().collect(),
         ReviewPathSelection::Specific(paths) => paths.iter().cloned().collect(),
+        ReviewPathSelection::Scoped { files, dirs } => head_files_by_path
+            .keys()
+            .filter(|p| files.contains(*p) || dirs.iter().any(|d| path_under_dir(p, d)))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -1037,6 +1093,7 @@ fn resolve_review_content_source(targets: &[ReviewTarget]) -> Result<ReviewConte
 
 fn resolve_review_path_selection(targets: &[ReviewTarget]) -> Result<ReviewPathSelection> {
     let mut paths = HashSet::new();
+    let mut dirs: Vec<RepoPath> = Vec::new();
 
     for target in targets {
         match target {
@@ -1051,6 +1108,11 @@ fn resolve_review_path_selection(targets: &[ReviewTarget]) -> Result<ReviewPathS
             ReviewTarget::File(path) => {
                 paths.insert(path.clone());
             }
+            ReviewTarget::Dir(path) => {
+                if !dirs.contains(path) {
+                    dirs.push(path.clone());
+                }
+            }
             ReviewTarget::Revision(revision) => {
                 paths.extend(vcs::files_changed_in_revision(revision.as_str())?);
             }
@@ -1063,7 +1125,11 @@ fn resolve_review_path_selection(targets: &[ReviewTarget]) -> Result<ReviewPathS
         }
     }
 
-    Ok(ReviewPathSelection::Specific(paths))
+    if dirs.is_empty() {
+        Ok(ReviewPathSelection::Specific(paths))
+    } else {
+        Ok(ReviewPathSelection::Scoped { files: paths, dirs })
+    }
 }
 
 fn resolve_review_diff_selection(targets: &[ReviewTarget]) -> ReviewDiffSelection {
@@ -1509,6 +1575,162 @@ mod tests {
             start_line: 0,
             end_line: 1,
         }
+    }
+
+    #[test]
+    fn dir_target_parses() {
+        let target = ReviewTarget::from_cli("dir:website").expect("dir target should parse");
+        assert_eq!(
+            target,
+            ReviewTarget::Dir(RepoPath::new("website").expect("valid repo path"))
+        );
+    }
+
+    #[test]
+    fn dir_target_parses_nested_path() {
+        let target =
+            ReviewTarget::from_cli("dir:trueflow/src/commands").expect("nested dir target");
+        assert_eq!(
+            target,
+            ReviewTarget::Dir(RepoPath::new("trueflow/src/commands").expect("valid repo path"))
+        );
+    }
+
+    #[test]
+    fn dir_target_rejects_absolute_path() {
+        assert!(ReviewTarget::from_cli("dir:/tmp/absolute").is_err());
+    }
+
+    #[test]
+    fn dir_target_is_workdir_content() {
+        let target = ReviewTarget::Dir(RepoPath::new("website").unwrap());
+        assert!(target.historical_content_revision().is_none());
+        assert!(target.diff_target().is_none());
+    }
+
+    #[test]
+    fn dir_target_resolves_to_scoped_selection() {
+        let target = ReviewTarget::Dir(RepoPath::new("website").unwrap());
+        let selection = resolve_review_path_selection(std::slice::from_ref(&target))
+            .expect("resolve should succeed for dir target");
+        match selection {
+            ReviewPathSelection::Scoped { files, dirs } => {
+                assert!(files.is_empty());
+                assert_eq!(dirs, vec![RepoPath::new("website").unwrap()]);
+            }
+            other => panic!("expected Scoped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_target_combines_with_file_target() {
+        let file_path = RepoPath::new("docs/intro.md").unwrap();
+        let dir_path = RepoPath::new("website").unwrap();
+        let targets = vec![
+            ReviewTarget::File(file_path.clone()),
+            ReviewTarget::Dir(dir_path.clone()),
+        ];
+        match resolve_review_path_selection(&targets).expect("resolve succeeds") {
+            ReviewPathSelection::Scoped { files, dirs } => {
+                assert!(files.contains(&file_path));
+                assert_eq!(dirs, vec![dir_path]);
+            }
+            other => panic!("expected Scoped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_target_deduplicates_repeated_dirs() {
+        let dir = RepoPath::new("website").unwrap();
+        let targets = vec![
+            ReviewTarget::Dir(dir.clone()),
+            ReviewTarget::Dir(dir.clone()),
+        ];
+        match resolve_review_path_selection(&targets).expect("resolve succeeds") {
+            ReviewPathSelection::Scoped { dirs, .. } => {
+                assert_eq!(dirs, vec![dir]);
+            }
+            other => panic!("expected Scoped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_selection_includes_files_under_dir() {
+        let selection = ReviewPathSelection::Scoped {
+            files: HashSet::new(),
+            dirs: vec![RepoPath::new("website").unwrap()],
+        };
+        assert!(
+            selection
+                .includes(&RepoPath::new("website/index.html").unwrap(), None)
+                .unwrap()
+        );
+        assert!(
+            selection
+                .includes(&RepoPath::new("website/a/b/c.js").unwrap(), None)
+                .unwrap()
+        );
+        // Exact-match dir itself (rare — treated as a direct hit)
+        assert!(
+            selection
+                .includes(&RepoPath::new("website").unwrap(), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_selection_excludes_files_outside_dir() {
+        let selection = ReviewPathSelection::Scoped {
+            files: HashSet::new(),
+            dirs: vec![RepoPath::new("website").unwrap()],
+        };
+        assert!(
+            !selection
+                .includes(&RepoPath::new("docs/intro.md").unwrap(), None)
+                .unwrap()
+        );
+        // Prefix match on string but NOT a subtree (e.g. `website-next/`)
+        assert!(
+            !selection
+                .includes(&RepoPath::new("website-next/index.html").unwrap(), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_selection_still_checks_explicit_files() {
+        let mut files = HashSet::new();
+        let explicit = RepoPath::new("README.md").unwrap();
+        files.insert(explicit.clone());
+        let selection = ReviewPathSelection::Scoped {
+            files,
+            dirs: vec![RepoPath::new("website").unwrap()],
+        };
+        assert!(selection.includes(&explicit, None).unwrap());
+    }
+
+    #[test]
+    fn path_under_dir_matches_exact_and_subtree() {
+        let dir = RepoPath::new("website").unwrap();
+        assert!(path_under_dir(&RepoPath::new("website").unwrap(), &dir));
+        assert!(path_under_dir(
+            &RepoPath::new("website/index.html").unwrap(),
+            &dir
+        ));
+        assert!(!path_under_dir(
+            &RepoPath::new("website-next/index.html").unwrap(),
+            &dir
+        ));
+        assert!(!path_under_dir(&RepoPath::new("docs/x.md").unwrap(), &dir));
+    }
+
+    #[test]
+    fn path_under_dir_root_matches_everything() {
+        let root = RepoPath::root();
+        assert!(path_under_dir(
+            &RepoPath::new("anything.rs").unwrap(),
+            &root
+        ));
     }
 
     #[test]
