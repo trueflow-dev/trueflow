@@ -2,7 +2,7 @@ use super::{
     AppState, EditingKeyAction, Event, InputMode, KeyCode, KeyEvent, KeyEventKind, KeybindAction,
     Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers, TuiKeybindsConfig,
     TuiSpeedReadConfig, UiMode, ViewMode, clear_editing_validation, clear_focus_scroll,
-    clear_speed_read_if_not_on_current_node, current_ui_mode, editing_key_action_for_event,
+    sync_speed_read_focus, current_ui_mode, editing_key_action_for_event,
     execute_action_with, handle_child, handle_confirm_cancel, handle_editing_cancel,
     handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
     handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
@@ -354,7 +354,7 @@ where
                 KeybindAction::Root => {
                     self.state.navigator.jump_root();
                     clear_focus_scroll(&mut self.state);
-                    clear_speed_read_if_not_on_current_node(&mut self.state);
+                    sync_speed_read_focus(&mut self.state);
                 }
                 KeybindAction::Quit => {}
             }

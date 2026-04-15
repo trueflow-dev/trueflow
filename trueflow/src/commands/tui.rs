@@ -950,7 +950,7 @@ fn run_app(
                         KeybindAction::Root => {
                             state.navigator.jump_root();
                             clear_focus_scroll(&mut state);
-                            clear_speed_read_if_not_on_current_node(&mut state);
+                            sync_speed_read_focus(&mut state);
                         }
                         KeybindAction::Quit => {
                             flush_pending_speed_read_defaults(&mut state)?;
@@ -1063,7 +1063,7 @@ fn next_app_deadline(state: &AppState) -> Option<Instant> {
     state.speed_read.next_deadline(state.navigator.current_id())
 }
 
-fn clear_speed_read_if_not_on_current_node(state: &mut AppState) {
+fn sync_speed_read_focus(state: &mut AppState) {
     state
         .speed_read
         .clear_if_not_on_current_node(state.navigator.current_id());
@@ -1280,7 +1280,7 @@ fn handle_parent(state: &mut AppState) {
     state.navigator.ascend();
     state.scroll_offset = 0;
     set_focus_for_current_node(state, Some(previous_current));
-    clear_speed_read_if_not_on_current_node(state);
+    sync_speed_read_focus(state);
 }
 
 fn handle_child(state: &mut AppState) {
@@ -1295,7 +1295,7 @@ fn handle_child(state: &mut AppState) {
             state.navigator.set_current(target);
             state.scroll_offset = 0;
             set_focus_for_current_node(state, None);
-            clear_speed_read_if_not_on_current_node(state);
+            sync_speed_read_focus(state);
         }
     } else {
         let current = state.navigator.current_id();
@@ -1307,7 +1307,7 @@ fn handle_child(state: &mut AppState) {
         state.navigator.descend();
         state.scroll_offset = 0;
         set_focus_for_current_node(state, None);
-        clear_speed_read_if_not_on_current_node(state);
+        sync_speed_read_focus(state);
     }
 }
 
@@ -1401,7 +1401,7 @@ fn handle_prev(state: &mut AppState) {
     state.navigator.move_prev();
     state.scroll_offset = 0;
     set_focus_for_current_node(state, None);
-    clear_speed_read_if_not_on_current_node(state);
+    sync_speed_read_focus(state);
 }
 
 fn handle_next(state: &mut AppState) {
@@ -1413,7 +1413,7 @@ fn handle_next(state: &mut AppState) {
     state.navigator.move_next();
     state.scroll_offset = 0;
     set_focus_for_current_node(state, None);
-    clear_speed_read_if_not_on_current_node(state);
+    sync_speed_read_focus(state);
 }
 
 fn handle_scroll_page_up(state: &mut AppState) {
@@ -1877,7 +1877,7 @@ fn apply_action_locally(
         state.scroll_offset = 0;
         clear_focus_scroll(state);
     }
-    clear_speed_read_if_not_on_current_node(state);
+    sync_speed_read_focus(state);
 
     ActionImpact {
         affected_blocks,
