@@ -135,6 +135,35 @@ fn readme_language_support_matrix_explains_official_vs_fallback_support() -> Res
 }
 
 #[test]
+fn readme_separates_public_docs_from_operator_infra_docs() -> Result<()> {
+    let readme = read_repo_file("README.md")?;
+    let infra_readme = read_repo_file("infra/README.md")?;
+
+    assert_contains(
+        &readme,
+        "infra/README.md",
+        "top-level readme operator docs pointer",
+    );
+    assert_not_contains(
+        &readme,
+        "## Website infra (`trueflow.dev`)",
+        "top-level readme website infra section",
+    );
+    assert_contains(
+        &infra_readme,
+        "./scripts/deploy-public-site.sh",
+        "infra readme one-shot deploy flow",
+    );
+    assert_contains(
+        &infra_readme,
+        "terraform/README.md",
+        "infra readme terraform handoff",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn website_install_page_explains_script_and_manual_downloads() -> Result<()> {
     let html = read_repo_file("website/install/index.html")?;
 
