@@ -1894,7 +1894,7 @@ fn classify_code_chunk(chunk: &str) -> BlockKind {
         return BlockKind::Gap;
     }
 
-    if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+    if code_comments::chunk_is_comment_only(chunk) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph

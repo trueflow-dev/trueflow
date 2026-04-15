@@ -305,7 +305,7 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
             return;
         }
 
-        let kind = if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+        let kind = if code_comments::chunk_is_comment_only(chunk) {
             BlockKind::Comment
         } else {
             BlockKind::CodeParagraph
@@ -367,7 +367,7 @@ fn push_non_child_chunk(parent: &Block, start: usize, end: usize, blocks: &mut V
     let chunk = &parent.content[start..end];
     let kind = if chunk.trim().is_empty() {
         BlockKind::Gap
-    } else if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+    } else if code_comments::chunk_is_comment_only(chunk) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph

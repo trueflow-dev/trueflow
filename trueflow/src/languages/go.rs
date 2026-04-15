@@ -381,7 +381,7 @@ fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
 fn classify_code_chunk(chunk: &str) -> BlockKind {
     if chunk.trim().is_empty() {
         BlockKind::Gap
-    } else if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+    } else if code_comments::chunk_is_comment_only(chunk) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph

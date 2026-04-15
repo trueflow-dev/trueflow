@@ -656,7 +656,7 @@ fn classify_code_paragraph(chunk: &str) -> BlockKind {
         return BlockKind::Gap;
     }
 
-    if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+    if code_comments::chunk_is_comment_only(chunk) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph
@@ -726,7 +726,7 @@ fn push_non_empty_toml_gap(blocks: &mut Vec<Block>, content: &str, start: usize,
         return;
     }
 
-    let kind = if code_comments::chunk_is_hash_or_c_style_comment_only(chunk) {
+    let kind = if code_comments::chunk_is_comment_only(chunk) {
         BlockKind::Comment
     } else {
         BlockKind::Gap
