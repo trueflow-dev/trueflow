@@ -344,7 +344,7 @@ fn load_cache_entry(root: &Path, options: &ScanOptions) -> Result<Option<CacheEn
     if entry.root_hash != cache_root_hash(root) {
         return Ok(None);
     }
-    if entry.options_fingerprint != cache_options_fingerprint(options) {
+    if entry.options_fingerprint != scan_options_fingerprint(options) {
         return Ok(None);
     }
 
@@ -370,7 +370,7 @@ fn write_cache(root: &Path, options: &ScanOptions, files: Vec<CachedFileEntry>) 
     let entry = CacheEntry {
         format_version: SCAN_CACHE_FORMAT_VERSION,
         root_hash: cache_root_hash(root),
-        options_fingerprint: cache_options_fingerprint(options),
+        options_fingerprint: scan_options_fingerprint(options),
         files,
     };
 
@@ -379,7 +379,7 @@ fn write_cache(root: &Path, options: &ScanOptions, files: Vec<CachedFileEntry>) 
     Ok(())
 }
 
-fn cache_options_fingerprint(options: &ScanOptions) -> String {
+fn scan_options_fingerprint(options: &ScanOptions) -> String {
     #[derive(Serialize)]
     struct CacheOptionsFingerprint<'a> {
         ignore_names: &'a [String],
@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_options_fingerprint_ignores_order_and_duplicates() {
+    fn scan_options_fingerprint_ignores_order_and_duplicates() {
         let mut a = ScanOptions::default();
         a.ignore_names
             .extend(["dist".to_string(), "dist".to_string()]);
@@ -736,6 +736,6 @@ mod tests {
             RepoPath::new("vendor").unwrap(),
         ]);
 
-        assert_eq!(cache_options_fingerprint(&a), cache_options_fingerprint(&b));
+        assert_eq!(scan_options_fingerprint(&a), scan_options_fingerprint(&b));
     }
 }
