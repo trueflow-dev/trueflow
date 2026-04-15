@@ -148,7 +148,7 @@ img {
 
 .hero {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(420px, 560px);
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 560px);
   align-items: center;
   gap: 3rem;
   padding: 5.5rem 0 4rem;
@@ -156,6 +156,16 @@ img {
 
 .hero-copy {
   max-width: var(--copy-width);
+}
+
+.hero-copy,
+.hero-panel,
+.install-card,
+.install-panel,
+.integration-note,
+.benefit-card,
+.steps {
+  min-width: 0;
 }
 
 .page-intro {
@@ -247,6 +257,7 @@ h3 {
 
 .command-line {
   margin: 0.75rem 0 0;
+  max-width: 100%;
   padding: 1rem 1.1rem;
   overflow-x: auto;
   border-radius: 14px;
@@ -490,7 +501,7 @@ h3 {
   }
 
   .shell {
-    width: min(calc(100% - 1.25rem), var(--content-width));
+    width: min(calc(100% - 2rem), var(--content-width));
   }
 
   .button {

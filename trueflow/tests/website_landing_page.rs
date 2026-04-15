@@ -10,8 +10,7 @@ fn repo_root() -> Result<&'static Path> {
 
 fn read_repo_file(relative_path: &str) -> Result<String> {
     let path = repo_root()?.join(relative_path);
-    fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))
+    fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
 }
 
 fn read_repo_bytes(relative_path: &str) -> Result<Vec<u8>> {
@@ -187,11 +186,7 @@ fn readme_tui_controls_match_current_default_keybinds() -> Result<()> {
         "`P`/`C` move to the semantic parent/child",
         "readme parent child controls",
     );
-    assert_contains(
-        &readme,
-        "`c` add a comment",
-        "readme comment control",
-    );
+    assert_contains(&readme, "`c` add a comment", "readme comment control");
 
     Ok(())
 }
@@ -306,18 +301,34 @@ fn website_about_page_mentions_jordan_mcqueen_and_personal_site() -> Result<()> 
     let install_html = read_repo_file("website/install/index.html")?;
     let edge_router = read_repo_file("infra/terraform/edge-router.js.tftpl")?;
 
-    assert_contains(&about_html, "<title>About Trueflow</title>", "about page title");
+    assert_contains(
+        &about_html,
+        "<title>About Trueflow</title>",
+        "about page title",
+    );
     assert_contains(&about_html, "Jordan McQueen", "about page developer name");
     assert_contains(
         &about_html,
         "software engineer based in Tokyo",
         "about page developer bio",
     );
-    assert_contains(&about_html, "href=\"https://jm.dev\"", "about page personal site link");
+    assert_contains(
+        &about_html,
+        "href=\"https://jm.dev\"",
+        "about page personal site link",
+    );
     assert_contains(&landing_html, "href=\"/about/\"", "landing page about link");
     assert_contains(&install_html, "href=\"/about/\"", "install page about link");
-    assert_contains(&edge_router, "request.uri === \"/about\"", "about clean path rewrite");
-    assert_contains(&edge_router, "request.uri = \"/about/index.html\"", "about index rewrite");
+    assert_contains(
+        &edge_router,
+        "request.uri === \"/about\"",
+        "about clean path rewrite",
+    );
+    assert_contains(
+        &edge_router,
+        "request.uri = \"/about/index.html\"",
+        "about index rewrite",
+    );
 
     Ok(())
 }
@@ -328,8 +339,7 @@ fn website_screenshot_asset_matches_repo_screenshot() -> Result<()> {
     let website_screenshot = read_repo_bytes("website/assets/tui.png")?;
 
     assert_eq!(
-        website_screenshot,
-        repo_screenshot,
+        website_screenshot, repo_screenshot,
         "expected website/assets/tui.png to match repo-root tui.png",
     );
 
@@ -396,7 +406,39 @@ fn website_styles_define_install_command_and_skip_link_patterns() -> Result<()> 
     assert_contains(&css, ".command-line", "command block styles");
     assert_contains(&css, "left: -9999px;", "skip link hidden offscreen");
     assert_contains(&css, ".skip-link:focus", "skip link focus reveal styles");
-    assert_contains(&css, "@media (max-width: 900px)", "website responsive breakpoint");
+    assert_contains(
+        &css,
+        "@media (max-width: 900px)",
+        "website responsive breakpoint",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn website_styles_keep_mobile_content_inset_and_hero_layout_safe() -> Result<()> {
+    let css = read_repo_file("website/site.css")?;
+
+    assert_contains(
+        &css,
+        "grid-template-columns: minmax(0, 1fr) minmax(320px, 560px);",
+        "website hero desktop column sizing",
+    );
+    assert_contains(
+        &css,
+        "@media (max-width: 640px)",
+        "website mobile breakpoint",
+    );
+    assert_contains(
+        &css,
+        ".shell {\n    width: min(calc(100% - 2rem), var(--content-width));\n  }",
+        "website mobile shell gutter",
+    );
+    assert_contains(
+        &css,
+        ".hero-copy,\n.hero-panel,\n.install-card,\n.install-panel,\n.integration-note,\n.benefit-card,\n.steps {\n  min-width: 0;\n}",
+        "website overflow-resistant content containers",
+    );
 
     Ok(())
 }
@@ -419,46 +461,194 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
     let gitignore = read_repo_file(".gitignore")?;
 
     assert_contains(&backend, "backend \"s3\"", "terraform s3 backend block");
-    assert_contains(&backend, "jm-deploy-state-bucket", "terraform backend bucket");
-    assert_contains(&backend, "trueflow/site/terraform.tfstate", "terraform backend key");
+    assert_contains(
+        &backend,
+        "jm-deploy-state-bucket",
+        "terraform backend bucket",
+    );
+    assert_contains(
+        &backend,
+        "trueflow/site/terraform.tfstate",
+        "terraform backend key",
+    );
     assert_contains(&backend, "us-west-2", "terraform backend region");
     assert_contains(&backend, "encrypt = true", "terraform backend encryption");
-    assert_contains(&versions, "required_providers", "terraform provider declaration");
-    assert_contains(&versions, "source  = \"hashicorp/aws\"", "aws provider source");
-    assert_contains(&main, "data \"aws_route53_zone\" \"site\"", "route53 zone lookup");
+    assert_contains(
+        &versions,
+        "required_providers",
+        "terraform provider declaration",
+    );
+    assert_contains(
+        &versions,
+        "source  = \"hashicorp/aws\"",
+        "aws provider source",
+    );
+    assert_contains(
+        &main,
+        "data \"aws_route53_zone\" \"site\"",
+        "route53 zone lookup",
+    );
     assert_contains(&main, "private_zone = false", "public hosted zone lookup");
-    assert_contains(&main, "resource \"aws_s3_bucket\" \"site\"", "site bucket resource");
-    assert_contains(&main, "resource \"aws_cloudfront_distribution\" \"site\"", "cloudfront distribution resource");
-    assert_contains(&main, "resource \"aws_acm_certificate\" \"site\"", "certificate resource");
-    assert_contains(&main, "resource \"aws_cloudfront_origin_access_control\" \"site\"", "oac resource");
-    assert_contains(&variables, "default     = \"trueflow.dev\"", "terraform apex domain default");
-    assert_contains(&variables, "default     = \"www.trueflow.dev\"", "terraform www domain default");
-    assert_contains(&variables, "default     = \"us-east-1\"", "terraform region default");
-    assert_contains(&outputs, "output \"site_bucket_name\"", "terraform bucket output");
-    assert_contains(&outputs, "output \"site_distribution_id\"", "terraform distribution output");
-    assert_contains(&readme, "No secrets are stored in this directory", "infra public safety note");
-    assert_contains(&readme, "Tofu and Terraform both understand this HCL", "terraform compatibility note");
-    assert_contains(&package_built_release, "trueflow-${VERSION}-${TARGET}.tar.gz", "shared packaging artifact name");
-    assert_contains(&package_built_release, "trueflow-${VERSION}-SHA256SUMS.txt", "shared packaging checksum name");
-    assert_contains(&package_built_release, ".trueflow/release-artifacts", "shared packaging output root");
-    assert_contains(&package_macos_release, "TARGET=\"aarch64-apple-darwin\"", "macos packaging target");
-    assert_contains(&package_macos_release, "cargo build --release --locked", "macos packaging build command");
-    assert_contains(&package_macos_release, "package-built-release.sh", "macos packaging shared packager handoff");
-    assert_contains(&package_linux_release, "TARGET=\"x86_64-unknown-linux-musl\"", "linux packaging target");
-    assert_contains(&package_linux_release, "nix build --no-link --print-out-paths .#release", "linux packaging nix build command");
-    assert_contains(&deploy_public_site, "tofu init", "one-shot deploy tofu init step");
-    assert_contains(&deploy_public_site, "tofu fmt -check", "one-shot deploy tofu fmt step");
-    assert_contains(&deploy_public_site, "tofu validate", "one-shot deploy tofu validate step");
-    assert_contains(&deploy_public_site, "tofu apply", "one-shot deploy tofu apply step");
-    assert_contains(&deploy_public_site, "scripts/deploy-website.sh", "one-shot deploy website step");
-    assert_contains(&deploy_public_site, "scripts/package-macos-release.sh", "one-shot deploy package step");
-    assert_contains(&deploy_public_site, "scripts/deploy-downloads.sh", "one-shot deploy downloads step");
-    assert_contains(&deploy_public_site, "--auto-approve", "one-shot deploy auto approve flag");
-    assert_contains(&deploy_public_site_fast, "--skip-infra-apply", "fast deploy skips infra apply");
-    assert_contains(&deploy_public_site_fast, "deploy-public-site.sh", "fast deploy wrapper target");
-    assert_contains(&deploy_website, "TRUEFLOW_INFRA_CLI", "deploy website infra cli override");
-    assert_contains(&deploy_downloads, "TRUEFLOW_INFRA_CLI", "deploy downloads infra cli override");
-    assert_contains(&gitignore, "infra/terraform/.terraform/", "terraform plugin dir ignore rule");
+    assert_contains(
+        &main,
+        "resource \"aws_s3_bucket\" \"site\"",
+        "site bucket resource",
+    );
+    assert_contains(
+        &main,
+        "resource \"aws_cloudfront_distribution\" \"site\"",
+        "cloudfront distribution resource",
+    );
+    assert_contains(
+        &main,
+        "resource \"aws_acm_certificate\" \"site\"",
+        "certificate resource",
+    );
+    assert_contains(
+        &main,
+        "resource \"aws_cloudfront_origin_access_control\" \"site\"",
+        "oac resource",
+    );
+    assert_contains(
+        &variables,
+        "default     = \"trueflow.dev\"",
+        "terraform apex domain default",
+    );
+    assert_contains(
+        &variables,
+        "default     = \"www.trueflow.dev\"",
+        "terraform www domain default",
+    );
+    assert_contains(
+        &variables,
+        "default     = \"us-east-1\"",
+        "terraform region default",
+    );
+    assert_contains(
+        &outputs,
+        "output \"site_bucket_name\"",
+        "terraform bucket output",
+    );
+    assert_contains(
+        &outputs,
+        "output \"site_distribution_id\"",
+        "terraform distribution output",
+    );
+    assert_contains(
+        &readme,
+        "No secrets are stored in this directory",
+        "infra public safety note",
+    );
+    assert_contains(
+        &readme,
+        "Tofu and Terraform both understand this HCL",
+        "terraform compatibility note",
+    );
+    assert_contains(
+        &package_built_release,
+        "trueflow-${VERSION}-${TARGET}.tar.gz",
+        "shared packaging artifact name",
+    );
+    assert_contains(
+        &package_built_release,
+        "trueflow-${VERSION}-SHA256SUMS.txt",
+        "shared packaging checksum name",
+    );
+    assert_contains(
+        &package_built_release,
+        ".trueflow/release-artifacts",
+        "shared packaging output root",
+    );
+    assert_contains(
+        &package_macos_release,
+        "TARGET=\"aarch64-apple-darwin\"",
+        "macos packaging target",
+    );
+    assert_contains(
+        &package_macos_release,
+        "cargo build --release --locked",
+        "macos packaging build command",
+    );
+    assert_contains(
+        &package_macos_release,
+        "package-built-release.sh",
+        "macos packaging shared packager handoff",
+    );
+    assert_contains(
+        &package_linux_release,
+        "TARGET=\"x86_64-unknown-linux-musl\"",
+        "linux packaging target",
+    );
+    assert_contains(
+        &package_linux_release,
+        "nix build --no-link --print-out-paths .#release",
+        "linux packaging nix build command",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "tofu init",
+        "one-shot deploy tofu init step",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "tofu fmt -check",
+        "one-shot deploy tofu fmt step",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "tofu validate",
+        "one-shot deploy tofu validate step",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "tofu apply",
+        "one-shot deploy tofu apply step",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "scripts/deploy-website.sh",
+        "one-shot deploy website step",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "scripts/package-macos-release.sh",
+        "one-shot deploy package step",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "scripts/deploy-downloads.sh",
+        "one-shot deploy downloads step",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "--auto-approve",
+        "one-shot deploy auto approve flag",
+    );
+    assert_contains(
+        &deploy_public_site_fast,
+        "--skip-infra-apply",
+        "fast deploy skips infra apply",
+    );
+    assert_contains(
+        &deploy_public_site_fast,
+        "deploy-public-site.sh",
+        "fast deploy wrapper target",
+    );
+    assert_contains(
+        &deploy_website,
+        "TRUEFLOW_INFRA_CLI",
+        "deploy website infra cli override",
+    );
+    assert_contains(
+        &deploy_downloads,
+        "TRUEFLOW_INFRA_CLI",
+        "deploy downloads infra cli override",
+    );
+    assert_contains(
+        &gitignore,
+        "infra/terraform/.terraform/",
+        "terraform plugin dir ignore rule",
+    );
     assert_contains(&gitignore, "*.tfstate", "terraform state ignore rule");
 
     Ok(())
