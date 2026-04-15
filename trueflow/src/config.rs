@@ -25,8 +25,8 @@ pub struct TrueflowConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TuiConfig {
-    #[serde(default = "default_confirm_batch")]
-    pub confirm_batch: bool,
+    #[serde(default = "default_confirm_batch_sub_blocks")]
+    pub confirm_batch_sub_blocks: TuiConfirmBatchSubBlocks,
     #[serde(default = "default_tui_diff_focus_mode")]
     pub diff_focus_mode: TuiDiffFocusMode,
     #[serde(default = "default_diff_focus_context_lines")]
@@ -134,6 +134,54 @@ pub struct FeedbackConfig {
     pub default_since: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiConfirmBatchSubBlocks {
+    Never,
+    Threshold(usize),
+}
+
+impl Default for TuiConfirmBatchSubBlocks {
+    fn default() -> Self {
+        Self::Threshold(2)
+    }
+}
+
+impl<'de> Deserialize<'de> for TuiConfirmBatchSubBlocks {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Keyword(String),
+            Threshold(usize),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Keyword(keyword) => match keyword.as_str() {
+                "never" => Ok(TuiConfirmBatchSubBlocks::Never),
+                _ => Err(serde::de::Error::custom(
+                    "confirm_batch_sub_blocks must be \"never\" or an integer threshold >= 1",
+                )),
+            },
+            Repr::Threshold(0) => Err(serde::de::Error::custom(
+                "confirm_batch_sub_blocks threshold must be at least 1",
+            )),
+            Repr::Threshold(threshold) => Ok(TuiConfirmBatchSubBlocks::Threshold(threshold)),
+        }
+    }
+}
+
+impl TuiConfirmBatchSubBlocks {
+    pub fn should_confirm(self, count: usize) -> bool {
+        match self {
+            TuiConfirmBatchSubBlocks::Never => false,
+            TuiConfirmBatchSubBlocks::Threshold(threshold) => count >= threshold,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiDiffFocusMode {
@@ -186,7 +234,7 @@ pub struct TuiSpeedReadConfig {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            confirm_batch: true,
+            confirm_batch_sub_blocks: default_confirm_batch_sub_blocks(),
             diff_focus_mode: default_tui_diff_focus_mode(),
             diff_focus_context_lines: default_diff_focus_context_lines(),
             diff_line_numbers: default_tui_diff_line_numbers(),
@@ -258,8 +306,8 @@ impl Default for FeedbackConfig {
     }
 }
 
-fn default_confirm_batch() -> bool {
-    true
+fn default_confirm_batch_sub_blocks() -> TuiConfirmBatchSubBlocks {
+    TuiConfirmBatchSubBlocks::default()
 }
 
 fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {
@@ -637,7 +685,10 @@ mod tests {
             Ok(config) => config,
             Err(err) => panic!("parse config: {err}"),
         };
-        assert!(cfg.tui.confirm_batch);
+        assert_eq!(
+            cfg.tui.confirm_batch_sub_blocks,
+            TuiConfirmBatchSubBlocks::Threshold(2)
+        );
         assert_eq!(cfg.tui.diff_focus_mode, TuiDiffFocusMode::WholeBlock);
         assert_eq!(cfg.tui.diff_focus_context_lines, 3);
         assert_eq!(cfg.tui.diff_line_numbers, TuiDiffLineNumbers::Disabled);
@@ -669,6 +720,35 @@ mod tests {
             TuiDiffFocusMode::ChangedWithContext
         );
         assert_eq!(cfg.tui.diff_focus_context_lines, 5);
+    }
+
+    #[test]
+    fn tui_config_parses_confirm_batch_sub_blocks_threshold_and_never() {
+        let threshold_cfg: TrueflowConfig = toml::from_str("[tui]\nconfirm_batch_sub_blocks = 1\n")
+            .unwrap_or_else(|err| panic!("parse threshold config: {err}"));
+        assert_eq!(
+            threshold_cfg.tui.confirm_batch_sub_blocks,
+            TuiConfirmBatchSubBlocks::Threshold(1)
+        );
+
+        let never_cfg: TrueflowConfig =
+            toml::from_str("[tui]\nconfirm_batch_sub_blocks = \"never\"\n")
+                .unwrap_or_else(|err| panic!("parse never config: {err}"));
+        assert_eq!(
+            never_cfg.tui.confirm_batch_sub_blocks,
+            TuiConfirmBatchSubBlocks::Never
+        );
+    }
+
+    #[test]
+    fn tui_config_rejects_zero_confirm_batch_sub_blocks_threshold() {
+        let err =
+            toml::from_str::<TrueflowConfig>("[tui]\nconfirm_batch_sub_blocks = 0\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("confirm_batch_sub_blocks threshold must be at least 1"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]
@@ -917,7 +997,7 @@ exclude = ["gap"]
 
 [tui]
 # important note
-confirm_batch = true
+confirm_batch_sub_blocks = 2
 "#;
         std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
             .unwrap_or_else(|err| panic!("create temp dir: {err}"));
@@ -933,7 +1013,7 @@ confirm_batch = true
             "expected comment to survive edit: {content}"
         );
         assert!(
-            content.contains("confirm_batch"),
+            content.contains("confirm_batch_sub_blocks"),
             "expected existing key to survive edit: {content}"
         );
 

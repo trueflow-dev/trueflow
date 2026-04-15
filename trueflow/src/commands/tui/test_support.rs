@@ -512,7 +512,7 @@ where
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
         editing_validation: None,
-        confirm_batch: false,
+        confirm_batch: crate::config::TuiConfirmBatchSubBlocks::Never,
         repo_name: "repo".to_string(),
         workdir_prefix: None,
         file_cache: HashMap::new(),
@@ -595,7 +595,7 @@ fn build_state_with_single_rust_block_file(
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
         editing_validation: None,
-        confirm_batch: false,
+        confirm_batch: crate::config::TuiConfirmBatchSubBlocks::Never,
         repo_name: "repo".to_string(),
         workdir_prefix: None,
         file_cache: HashMap::from([(

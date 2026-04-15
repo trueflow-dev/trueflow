@@ -12,8 +12,8 @@ use crate::commands::review::{
     resolve_cli_review_scope, resolve_review_request,
 };
 use crate::config::{
-    BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers, TuiKeybindsConfig,
-    TuiSpeedReadConfig, load as load_config,
+    BlockFilters, TuiConfig, TuiConfirmBatchSubBlocks, TuiDiffFocusMode, TuiDiffLineNumbers,
+    TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
 use crate::context::TrueflowContext;
 use crate::path_utils;
@@ -198,7 +198,7 @@ struct AppState {
     input_mode: InputMode,
     input_buffer: String,
     editing_validation: Option<EditingValidation>,
-    confirm_batch: bool,
+    confirm_batch: TuiConfirmBatchSubBlocks,
     repo_name: String,
     workdir_prefix: Option<String>,
     file_cache: HashMap<PathBuf, Arc<[String]>>,
@@ -223,7 +223,7 @@ const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
 const DISPLAY_TAB_WIDTH: usize = 8;
 
 struct ReviewStateBuildOptions {
-    confirm_batch: bool,
+    confirm_batch: TuiConfirmBatchSubBlocks,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     diff_line_numbers: TuiDiffLineNumbers,
     keybinds: TuiKeybindsConfig,
@@ -452,7 +452,7 @@ pub fn run(
             launch.review,
             launch.scope,
             ReviewStateBuildOptions {
-                confirm_batch: config.tui.confirm_batch,
+                confirm_batch: config.tui.confirm_batch_sub_blocks,
                 block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
                 diff_line_numbers: config.tui.diff_line_numbers,
                 keybinds: config.tui.keybinds,
@@ -1658,15 +1658,20 @@ fn handle_action(
     let action =
         PendingAction::from_node(&state.navigator.tree, state.navigator.current_id(), verdict);
 
-    if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
-        let count = state
-            .navigator
-            .count_visible_descendant_blocks(state.navigator.current_id());
+    if let Some(count) = batch_confirmation_count_for_action(state, &action) {
         state.input_mode = InputMode::ConfirmBatch { action, count };
     } else {
         execute_action(session, context, state, action)?;
     }
     Ok(())
+}
+
+fn batch_confirmation_count_for_action(state: &AppState, action: &PendingAction) -> Option<usize> {
+    let PendingAction::Batch { node_id, .. } = action else {
+        return None;
+    };
+    let count = state.navigator.count_visible_descendant_blocks(*node_id);
+    state.confirm_batch.should_confirm(count).then_some(count)
 }
 
 fn handle_note_action(state: &mut AppState) -> Result<()> {
@@ -1705,13 +1710,7 @@ where
         }
         EditingSubmitDecision::Ready(action) => {
             clear_editing_validation(state);
-            if matches!(action, PendingAction::Batch { .. }) && state.confirm_batch {
-                let count = state
-                    .navigator
-                    .count_visible_descendant_blocks(match &action {
-                        PendingAction::Single { node_id, .. }
-                        | PendingAction::Batch { node_id, .. } => *node_id,
-                    });
+            if let Some(count) = batch_confirmation_count_for_action(state, &action) {
                 state.input_buffer.clear();
                 state.input_mode = InputMode::ConfirmBatch { action, count };
             } else {
@@ -4146,6 +4145,7 @@ mod diff_scope_tests {
         BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewSummary,
         UnreviewedFile,
     };
+    use crate::config::TuiConfirmBatchSubBlocks;
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
     use crate::store::ReviewTargetKind;
@@ -4213,7 +4213,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: false,
+            confirm_batch: TuiConfirmBatchSubBlocks::Never,
             repo_name: "repo".to_string(),
             workdir_prefix,
             file_cache: HashMap::new(),
@@ -4280,7 +4280,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: false,
+            confirm_batch: TuiConfirmBatchSubBlocks::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::new(),
@@ -4361,7 +4361,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: false,
+            confirm_batch: TuiConfirmBatchSubBlocks::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::new(),
@@ -4452,7 +4452,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: false,
+            confirm_batch: TuiConfirmBatchSubBlocks::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::from([(
@@ -4486,6 +4486,84 @@ mod diff_scope_tests {
         };
 
         (state, file, block_id)
+    }
+
+    fn build_state_with_file_block_count(
+        block_count: usize,
+    ) -> (AppState, TreeNodeId, Vec<TreeNodeId>) {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let mut block_ids = Vec::new();
+        for index in 0..block_count {
+            let block_id = builder.add_block(
+                file,
+                format!("function-{index}"),
+                "src/lib.rs".to_string(),
+                Block::new(
+                    format!("fn block_{}() {{}}\n", index),
+                    BlockKind::Function,
+                    index,
+                    index + 1,
+                ),
+                Language::Rust,
+            );
+            block_ids.push(block_id);
+        }
+        let tree = builder.finalize();
+        let visible = block_ids.iter().copied().collect::<HashSet<_>>();
+        let review_order = ReviewOrder::from_tree(&tree, &visible);
+        let mut navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        navigator.set_current(file);
+
+        let state = AppState {
+            review_scope: ReviewScope::All,
+            navigator,
+            review_order,
+            total_blocks: visible.len(),
+            initial_remaining_blocks: visible.len(),
+            remaining_blocks: visible.len(),
+            reviewable_nodes: visible,
+            diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
+            session_recap: SessionRecap::default(),
+            scope_label: "All".to_string(),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            editing_validation: None,
+            confirm_batch: TuiConfirmBatchSubBlocks::Threshold(2),
+            repo_name: "repo".to_string(),
+            workdir_prefix: None,
+            file_cache: HashMap::new(),
+            root_cursor: Some(file),
+            focus_block: None,
+            pending_focus_scroll: false,
+            scroll_offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            code_rect: Rect::default(),
+            view_mode: ViewMode::Diff,
+            block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+            diff_line_numbers: TuiDiffLineNumbers::Disabled,
+            keybinds: TuiKeybindsConfig::default(),
+            file_diff_cache: HashMap::new(),
+            content_frame_cache: HashMap::new(),
+            highlighted_line_cache: HashMap::new(),
+            speed_read: SpeedReadController::new(
+                TuiSpeedReadConfig::default(),
+                PathBuf::from("trueflow.toml"),
+            ),
+        };
+
+        (state, file, block_ids)
     }
 
     fn build_state_with_markdown_file(
@@ -4529,7 +4607,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             editing_validation: None,
-            confirm_batch: false,
+            confirm_batch: TuiConfirmBatchSubBlocks::Never,
             repo_name: "repo".to_string(),
             workdir_prefix: None,
             file_cache: HashMap::from([(
@@ -4694,7 +4772,7 @@ mod diff_scope_tests {
     #[test]
     fn block_diff_focus_mode_uses_configured_context() {
         let config = TuiConfig {
-            confirm_batch: true,
+            confirm_batch_sub_blocks: TuiConfirmBatchSubBlocks::Threshold(2),
             diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
             diff_focus_context_lines: 7,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -5160,7 +5238,7 @@ mod diff_scope_tests {
                 end: "HEAD".to_string(),
             },
             ReviewStateBuildOptions {
-                confirm_batch: false,
+                confirm_batch: TuiConfirmBatchSubBlocks::Never,
                 block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
                 diff_line_numbers: TuiDiffLineNumbers::Disabled,
                 keybinds: TuiKeybindsConfig::default(),
@@ -7216,6 +7294,35 @@ mod diff_scope_tests {
             compute_next_review_target(&state, first_sentence_id),
             sentence_children.get(1).copied()
         );
+    }
+
+    #[test]
+    fn batch_confirmation_threshold_defaults_to_skipping_single_sub_block_batch_actions() {
+        let (state, file_id, _block_ids) = build_state_with_file_block_count(1);
+        let action = PendingAction::from_node(&state.navigator.tree, file_id, Verdict::Approved);
+
+        assert_eq!(batch_confirmation_count_for_action(&state, &action), None);
+    }
+
+    #[test]
+    fn batch_confirmation_threshold_can_confirm_single_sub_block_batch_actions() {
+        let (mut state, file_id, _block_ids) = build_state_with_file_block_count(1);
+        state.confirm_batch = TuiConfirmBatchSubBlocks::Threshold(1);
+        let action = PendingAction::from_node(&state.navigator.tree, file_id, Verdict::Approved);
+
+        assert_eq!(
+            batch_confirmation_count_for_action(&state, &action),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn batch_confirmation_threshold_never_disables_batch_confirmation() {
+        let (mut state, file_id, _block_ids) = build_state_with_file_block_count(3);
+        state.confirm_batch = TuiConfirmBatchSubBlocks::Never;
+        let action = PendingAction::from_node(&state.navigator.tree, file_id, Verdict::Approved);
+
+        assert_eq!(batch_confirmation_count_for_action(&state, &action), None);
     }
 
     #[test]
