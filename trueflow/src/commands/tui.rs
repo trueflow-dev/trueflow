@@ -7722,7 +7722,7 @@ mod diff_scope_tests {
     #[test]
     fn mark_terminal_suspend_requirement_without_signing_key_is_not_required() {
         assert_eq!(
-            mark::terminal_suspend_requirement_for_signing_key(None),
+            mark::suspend_policy_for_signing_key(None),
             mark::TerminalSuspendRequirement::NotRequired
         );
     }
@@ -7730,7 +7730,7 @@ mod diff_scope_tests {
     #[test]
     fn mark_terminal_suspend_requirement_with_signing_key_is_required() {
         assert_eq!(
-            mark::terminal_suspend_requirement_for_signing_key(Some("ABC123")),
+            mark::suspend_policy_for_signing_key(Some("ABC123")),
             mark::TerminalSuspendRequirement::Required
         );
     }

@@ -89,7 +89,7 @@ fn runtime_config_from_git_config(config: Option<vcs::GitConfig>) -> RuntimeConf
     match config {
         Some(config) => {
             let terminal_suspend_requirement =
-                terminal_suspend_requirement_for_signing_key(config.signing_key.as_deref());
+                suspend_policy_for_signing_key(config.signing_key.as_deref());
             RuntimeConfig {
                 email: config.email,
                 signing_key: config.signing_key,
@@ -104,7 +104,7 @@ fn runtime_config_from_git_config(config: Option<vcs::GitConfig>) -> RuntimeConf
     }
 }
 
-pub(crate) fn terminal_suspend_requirement_for_signing_key(
+pub(crate) fn suspend_policy_for_signing_key(
     signing_key: Option<&str>,
 ) -> TerminalSuspendRequirement {
     match signing_key {
