@@ -122,8 +122,13 @@ fn readme_language_support_matrix_explains_official_vs_fallback_support() -> Res
     );
     assert_contains(
         &readme,
-        "| Go | 🚧 | — | — | ✅ |",
-        "readme go fallback row",
+        "| Go | ✅ | ✅ | ✅ | ✅ |",
+        "readme go support row",
+    );
+    assert_contains(
+        &readme,
+        "| C++ | ✅ | ✅ | ✅ | ✅ |",
+        "readme cpp support row",
     );
     assert_contains(
         &readme,
@@ -186,6 +191,40 @@ fn readme_tui_controls_match_current_default_keybinds() -> Result<()> {
         &readme,
         "`c` add a comment",
         "readme comment control",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn readme_moves_internal_development_workflow_to_contributing_doc() -> Result<()> {
+    let readme = read_repo_file("README.md")?;
+    let contributing = read_repo_file("CONTRIBUTING.md")?;
+
+    assert_contains(
+        &readme,
+        "CONTRIBUTING.md",
+        "top-level readme contributing docs pointer",
+    );
+    assert_not_contains(
+        &readme,
+        "nix develop -c just check",
+        "top-level readme internal development command block",
+    );
+    assert_contains(
+        &contributing,
+        "nix develop -c just check",
+        "contributing local gate command",
+    );
+    assert_contains(
+        &contributing,
+        "nix develop -c just nix-check-release",
+        "contributing release packaging check",
+    );
+    assert_contains(
+        &contributing,
+        "The coverage report is written to `trueflow/target/llvm-cov/html/index.html`.",
+        "contributing coverage output note",
     );
 
     Ok(())
