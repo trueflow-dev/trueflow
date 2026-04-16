@@ -397,7 +397,11 @@ fn build_explicit_selection(
     dirs: Vec<crate::repo_path::RepoPath>,
 ) -> Option<ReviewPathSelection> {
     if !dirs.is_empty() {
-        Some(ReviewPathSelection::Scoped { files, dirs })
+        Some(ReviewPathSelection::Scoped {
+            files,
+            dirs,
+            changed: None,
+        })
     } else if files.is_empty() {
         None
     } else {
