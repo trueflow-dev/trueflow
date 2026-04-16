@@ -158,6 +158,17 @@ enum ScopeSelection {
     Selected(ReviewScope),
 }
 
+enum AppExit {
+    Quit,
+    ReviewSomethingElse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecapAction {
+    Exit,
+    ReviewSomethingElse,
+}
+
 struct LaunchSelection {
     scope: ReviewScope,
     review: CollectedReview,
@@ -474,55 +485,64 @@ pub fn run(
     let config = load_config()?;
     let run_result = (|| {
         let scan_options = config.scan.resolve_options()?;
-        let launch = if let Some(request) = cli_review_request(all, target, since, only, exclude)? {
-            let filters = config.review.resolve_filters(only, exclude);
-            let review = {
-                let query = resolve_review_request(
-                    request.review_scope.review_request(),
-                    filters,
-                    scan_options,
-                )?;
-                collect_review(&query)?
-            };
-            LaunchSelection {
-                scope: request.review_scope.tui_scope(),
-                review,
-                scope_label: request.review_scope.label(),
-            }
-        } else {
-            let filters = config.review.resolve_filters(&[], &[]);
-            let selector = load_scope_selector(&filters, &scan_options)?;
-            let selection =
-                run_scope_selector(session.terminal_mut(), selector, &config.tui.keybinds)?;
-            match selection {
-                ScopeSelection::Quit => return Ok(()),
-                ScopeSelection::Selected(scope) => {
-                    let review = load_review_state(&scope, &filters, &scan_options)?;
-                    LaunchSelection {
-                        scope_label: scope.label(),
-                        scope,
-                        review,
+        let filters = config.review.resolve_filters(only, exclude);
+        let mut pending_cli_request = cli_review_request(all, target, since, only, exclude)?;
+
+        loop {
+            let launch = if let Some(request) = pending_cli_request.take() {
+                let review = {
+                    let query = resolve_review_request(
+                        request.review_scope.review_request(),
+                        filters.clone(),
+                        scan_options.clone(),
+                    )?;
+                    collect_review(&query)?
+                };
+                LaunchSelection {
+                    scope: request.review_scope.tui_scope(),
+                    review,
+                    scope_label: request.review_scope.label(),
+                }
+            } else {
+                let selector = load_scope_selector(&filters, &scan_options)?;
+                let selection =
+                    run_scope_selector(session.terminal_mut(), selector, &config.tui.keybinds)?;
+                match selection {
+                    ScopeSelection::Quit => return Ok(()),
+                    ScopeSelection::Selected(scope) => {
+                        let review = load_review_state(&scope, &filters, &scan_options)?;
+                        LaunchSelection {
+                            scope_label: scope.label(),
+                            scope,
+                            review,
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        let state = build_review_state(
-            context,
-            launch.review,
-            launch.scope,
-            ReviewStateBuildOptions {
-                confirm_batch: config.tui.confirm_batch_sub_blocks,
-                block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
-                diff_line_numbers: config.tui.diff_line_numbers,
-                keybinds: config.tui.keybinds,
-                scope_label: launch.scope_label,
-                workdir_prefix: workdir_prefix_from_git_root(),
-                speed_read_config: config.tui.speed_read.clone(),
-                speed_read_config_path: speed_read_config_path_for_repo_root(),
-            },
-        )?;
-        run_app(context, &mut session, state)
+            let state = build_review_state(
+                context,
+                launch.review,
+                launch.scope,
+                ReviewStateBuildOptions {
+                    confirm_batch: config.tui.confirm_batch_sub_blocks,
+                    block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
+                    diff_line_numbers: config.tui.diff_line_numbers,
+                    keybinds: config.tui.keybinds,
+                    scope_label: launch.scope_label,
+                    workdir_prefix: workdir_prefix_from_git_root(),
+                    speed_read_config: config.tui.speed_read.clone(),
+                    speed_read_config_path: speed_read_config_path_for_repo_root(),
+                },
+            )?;
+
+            match run_app(context, &mut session, state)? {
+                AppExit::Quit => return Ok(()),
+                AppExit::ReviewSomethingElse => {
+                    pending_cli_request = None;
+                }
+            }
+        }
     })();
     let restore_result = session.restore();
     match (run_result, restore_result) {
@@ -917,7 +937,7 @@ fn run_app(
     context: &TrueflowContext,
     session: &mut TerminalSession,
     mut state: AppState,
-) -> Result<()> {
+) -> Result<AppExit> {
     let mut needs_render = true;
     let mut event_pump = EventPump::default();
 
@@ -975,10 +995,13 @@ fn run_app(
 
                 if matches!(ui_mode, UiMode::Recap) {
                     if key_event.kind == KeyEventKind::Press
-                        && recap_key_should_exit(&state.keybinds, key_code)
+                        && let Some(action) = recap_action_for_key_code(&state.keybinds, key_code)
                     {
                         flush_pending_speed_read_defaults(&mut state)?;
-                        return Ok(());
+                        return Ok(match action {
+                            RecapAction::Exit => AppExit::Quit,
+                            RecapAction::ReviewSomethingElse => AppExit::ReviewSomethingElse,
+                        });
                     }
                     continue;
                 }
@@ -1027,7 +1050,7 @@ fn run_app(
                         }
                         KeybindAction::Quit => {
                             flush_pending_speed_read_defaults(&mut state)?;
-                            return Ok(());
+                            return Ok(AppExit::Quit);
                         }
                     }
                     needs_render = true;
@@ -1323,16 +1346,24 @@ fn recap_done_key(keybinds: &TuiKeybindsConfig) -> char {
 }
 
 fn recap_done_action_text(keybinds: &TuiKeybindsConfig) -> String {
-    format!("[{}]done", recap_done_key(keybinds))
+    format_key_action(recap_done_key(keybinds), "choose scope")
 }
 
-fn recap_key_should_exit(keybinds: &TuiKeybindsConfig, key_code: KeyCode) -> bool {
-    matches!(key_code, KeyCode::Esc)
-        || matches!(key_code, KeyCode::Char(ch) if ch == recap_done_key(keybinds))
+fn recap_action_for_key_code(
+    keybinds: &TuiKeybindsConfig,
+    key_code: KeyCode,
+) -> Option<RecapAction> {
+    if matches!(key_code, KeyCode::Esc)
         || matches!(
             keybind_action_for_key_code(keybinds, key_code),
             Some(KeybindAction::Quit)
         )
+    {
+        return Some(RecapAction::Exit);
+    }
+
+    matches!(key_code, KeyCode::Char(ch) if ch == recap_done_key(keybinds))
+        .then_some(RecapAction::ReviewSomethingElse)
 }
 
 // ... helper functions for actions ...
@@ -2869,7 +2900,7 @@ fn render_recap_view(frame: &mut Frame, state: &AppState, area: Rect, palette: &
 
 fn recap_footer_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     format!(
-        "Press [{}] done or [{}/Esc] exit",
+        "Press [{}] review something else or [{}/Esc] exit",
         recap_done_key(keybinds),
         keybinds.quit
     )
@@ -5258,7 +5289,7 @@ mod diff_scope_tests {
         let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = rendered.join(" ");
 
-        assert!(joined.contains("[f]done"));
+        assert!(joined.contains("[f]choose scope"));
         assert!(joined.contains("[x]quit"));
         assert!(!joined.contains("approve"));
         assert!(!joined.contains("note"));
@@ -7866,11 +7897,26 @@ mod diff_scope_tests {
             quit: 'x',
             ..crate::config::TuiKeybindsConfig::default()
         };
-        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('f')));
-        assert!(recap_key_should_exit(&keybinds, KeyCode::Char('x')));
-        assert!(recap_key_should_exit(&keybinds, KeyCode::Esc));
-        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('d')));
-        assert!(!recap_key_should_exit(&keybinds, KeyCode::Char('m')));
+        assert_eq!(
+            recap_action_for_key_code(&keybinds, KeyCode::Char('f')),
+            Some(RecapAction::ReviewSomethingElse)
+        );
+        assert_eq!(
+            recap_action_for_key_code(&keybinds, KeyCode::Char('x')),
+            Some(RecapAction::Exit)
+        );
+        assert_eq!(
+            recap_action_for_key_code(&keybinds, KeyCode::Esc),
+            Some(RecapAction::Exit)
+        );
+        assert_eq!(
+            recap_action_for_key_code(&keybinds, KeyCode::Char('d')),
+            None
+        );
+        assert_eq!(
+            recap_action_for_key_code(&keybinds, KeyCode::Char('m')),
+            None
+        );
     }
 
     #[test]
@@ -7878,7 +7924,7 @@ mod diff_scope_tests {
         let default_keybinds = crate::config::TuiKeybindsConfig::default();
         assert_eq!(
             recap_footer_hint_text(&default_keybinds),
-            "Press [d] done or [q/Esc] exit"
+            "Press [d] review something else or [q/Esc] exit"
         );
 
         let custom_keybinds = crate::config::TuiKeybindsConfig {
@@ -7898,7 +7944,7 @@ mod diff_scope_tests {
         };
         assert_eq!(
             recap_footer_hint_text(&custom_keybinds),
-            "Press [f] done or [x/Esc] exit"
+            "Press [f] review something else or [x/Esc] exit"
         );
     }
 

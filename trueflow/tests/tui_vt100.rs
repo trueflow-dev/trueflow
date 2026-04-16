@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use trueflow::commands::review::{BlockChangeKind, FileChangeKind};
 use trueflow::commands::tui::test_support::{
-    MarkActionRunner, ScriptedMarkAction, ScriptedSessionRecap, ScriptedTui,
+    MarkActionRunner, ScriptedMarkAction, ScriptedSessionAction, ScriptedSessionRecap, ScriptedTui,
 };
 use trueflow::repo_path::RepoPath;
 use trueflow::review_scope::ReviewScope;
@@ -548,6 +548,54 @@ fn source_view_expands_tabs_before_rendering_code_lines() -> Result<()> {
         rows.iter().any(|row| row.contains("xx......foo界界")),
         "expected focus rows to preserve tab width before wide characters: {rows:#?}"
     );
+
+    Ok(())
+}
+
+#[test]
+fn recap_done_requests_review_something_else_instead_of_exit() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(100, 20),
+        "src/lib.rs",
+        "fn demo() {\n    work();\n}\n",
+        "fn demo() {\n    work();\n}\n",
+        0,
+        3,
+    )?;
+    app.show_recap();
+
+    app.render()?;
+    let screen = app.backend().screen_contents();
+    assert!(
+        screen.contains("Press [d] review something else or [q/Esc] exit"),
+        "expected recap footer to advertise the continue-review flow:\n{screen}"
+    );
+
+    app.send_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))?;
+
+    assert_eq!(
+        app.take_session_action(),
+        Some(ScriptedSessionAction::ReviewSomethingElse)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn recap_quit_still_requests_exit() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(100, 20),
+        "src/lib.rs",
+        "fn demo() {\n    work();\n}\n",
+        "fn demo() {\n    work();\n}\n",
+        0,
+        3,
+    )?;
+    app.show_recap();
+
+    app.send_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))?;
+
+    assert_eq!(app.take_session_action(), Some(ScriptedSessionAction::Exit));
 
     Ok(())
 }

@@ -1,16 +1,15 @@
 use super::{
     AppState, EditingKeyAction, Event, InputMode, KeyCode, KeyEvent, KeyEventKind, KeybindAction,
-    Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers, TuiKeybindsConfig,
+    RecapAction, Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers, TuiKeybindsConfig,
     TuiSpeedReadConfig, UiMode, ViewMode, clear_editing_validation, clear_focus_scroll,
-    sync_speed_read_focus, current_ui_mode, editing_key_action_for_event,
-    execute_action_with, handle_child, handle_confirm_cancel, handle_editing_cancel,
-    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
-    handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
-    handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding,
-    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
-    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
-    keybind_action_for_key_code, set_focus_for_current_node, should_rerender_on_event,
-    toggle_speed_read_mode, ui, vcs,
+    current_ui_mode, editing_key_action_for_event, execute_action_with, handle_child,
+    handle_confirm_cancel, handle_editing_cancel, handle_editing_submit_with, handle_mouse_event,
+    handle_next, handle_note_action, handle_parent, handle_paste_event, handle_prev,
+    handle_scroll_line_down, handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
+    handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
+    key_event_for_press_event, key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
+    keybind_action_for_key_code, recap_action_for_key_code, set_focus_for_current_node,
+    should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
@@ -113,12 +112,28 @@ where
     terminal: Terminal<B>,
     state: AppState,
     mark_action_runner: Option<Box<dyn MarkActionRunner>>,
+    pending_session_action: Option<ScriptedSessionAction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScriptedSessionRecap {
     pub comments: usize,
     pub blocks_touched: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptedSessionAction {
+    Exit,
+    ReviewSomethingElse,
+}
+
+impl From<RecapAction> for ScriptedSessionAction {
+    fn from(action: RecapAction) -> Self {
+        match action {
+            RecapAction::Exit => Self::Exit,
+            RecapAction::ReviewSomethingElse => Self::ReviewSomethingElse,
+        }
+    }
 }
 
 impl<B> ScriptedTui<B>
@@ -136,6 +151,7 @@ where
             terminal,
             state,
             mark_action_runner: None,
+            pending_session_action: None,
         })
     }
 
@@ -160,6 +176,7 @@ where
             terminal,
             state,
             mark_action_runner: None,
+            pending_session_action: None,
         })
     }
 
@@ -177,6 +194,11 @@ where
 
     pub fn set_review_scope(&mut self, review_scope: ReviewScope) {
         self.state.review_scope = review_scope;
+    }
+
+    pub fn show_recap(&mut self) {
+        self.state.remaining_blocks = 0;
+        self.state.input_mode = InputMode::Normal;
     }
 
     pub fn set_current_block_change_kind(&mut self, change_kind: BlockChangeKind) {
@@ -260,6 +282,10 @@ where
         }
     }
 
+    pub fn take_session_action(&mut self) -> Option<ScriptedSessionAction> {
+        self.pending_session_action.take()
+    }
+
     pub fn root_cursor_label(&self) -> Option<String> {
         let id = self.state.root_cursor?;
         Some(self.state.navigator.tree.node(id).name.clone())
@@ -316,6 +342,11 @@ where
         let ui_mode = current_ui_mode(&self.state);
 
         if matches!(ui_mode, UiMode::Recap) {
+            if key_event.kind == KeyEventKind::Press {
+                self.pending_session_action =
+                    recap_action_for_key_code(&self.state.keybinds, key_code)
+                        .map(ScriptedSessionAction::from);
+            }
             return Ok(());
         }
 
