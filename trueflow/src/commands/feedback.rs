@@ -1,7 +1,5 @@
 use crate::block::{Block, BlockKind};
-use crate::commands::review::{
-    ReviewContentSource, ReviewPathSelection, ReviewTarget,
-};
+use crate::commands::review::{ReviewContentSource, ReviewPathSelection, ReviewTarget};
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::coverage::{CoverageBuildOptions, CoverageIndex};
@@ -53,6 +51,13 @@ struct FeedbackTargetQuery {
     changed_selection: Option<ReviewPathSelection>,
 }
 
+struct FeedbackCollectionOptions<'a> {
+    filters: &'a crate::config::BlockFilters,
+    target_query: &'a FeedbackTargetQuery,
+    include_approved: bool,
+    workdir_prefix: Option<&'a str>,
+}
+
 pub fn run(
     _context: &TrueflowContext,
     format: FeedbackFormat,
@@ -91,10 +96,12 @@ pub fn run(
         &tree,
         &database,
         since_threshold,
-        &filters,
-        &target_query,
-        include_approved,
-        workdir_prefix.as_deref(),
+        &FeedbackCollectionOptions {
+            filters: &filters,
+            target_query: &target_query,
+            include_approved,
+            workdir_prefix: workdir_prefix.as_deref(),
+        },
     )?;
 
     match format {
@@ -191,11 +198,14 @@ fn collect_feedback_entries(
     tree: &tree::Tree,
     database: &crate::store::ReviewDatabase,
     since_threshold: Option<i64>,
-    filters: &crate::config::BlockFilters,
-    target_query: &FeedbackTargetQuery,
-    include_approved: bool,
-    workdir_prefix: Option<&str>,
+    options: &FeedbackCollectionOptions<'_>,
 ) -> Result<Vec<FeedbackEntry>> {
+    let FeedbackCollectionOptions {
+        filters,
+        target_query,
+        include_approved,
+        workdir_prefix,
+    } = *options;
     let build_options = CoverageBuildOptions {
         workdir_prefix: workdir_prefix.map(str::to_string),
     };
@@ -519,9 +529,9 @@ mod tests {
         let now = Utc
             .timestamp_opt(10_000, 0)
             .single()
-            .expect("valid timestamp");
-        let parsed =
-            parse_feedback_since_with_now(Some("1h"), now).expect("relative duration should parse");
+            .unwrap_or_else(|| panic!("valid timestamp"));
+        let parsed = parse_feedback_since_with_now(Some("1h"), now)
+            .unwrap_or_else(|error| panic!("relative duration should parse: {error}"));
         assert_eq!(parsed, FeedbackSince::Timestamp(6_400));
     }
 
@@ -530,9 +540,9 @@ mod tests {
         let now = Utc
             .timestamp_opt(200_000, 0)
             .single()
-            .expect("valid timestamp");
+            .unwrap_or_else(|| panic!("valid timestamp"));
         let parsed = parse_feedback_since_with_now(Some("2d ago"), now)
-            .expect("relative duration with ago should parse");
+            .unwrap_or_else(|error| panic!("relative duration with ago should parse: {error}"));
         assert_eq!(parsed, FeedbackSince::Timestamp(27_200));
     }
 }

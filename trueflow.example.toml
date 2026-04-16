@@ -12,6 +12,9 @@ exclude = []
 only = []
 # Exclude block kinds from feedback output.
 exclude = []
+# Default feedback history window. Supports all|last, relative durations like
+# "1h", unix timestamps, and RFC3339 values.
+# default_since = "all"
 
 [scan]
 # Read/write the scan cache under ~/.trueflow/cache by default.

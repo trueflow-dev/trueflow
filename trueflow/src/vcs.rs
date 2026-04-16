@@ -397,7 +397,7 @@ fn file_state_for_path_in_tree(
 
     let blob = entry.object()?.try_into_blob()?;
     Ok(Some(file_state_from_blob(
-        blob,
+        &blob,
         tree_path,
         output_path.clone(),
     )))
@@ -433,7 +433,7 @@ fn collect_file_states_in_tree(
                 let output_path = display_path_for_tree_entry(&full_path, workdir_prefix)?;
                 let blob = entry.object()?.try_into_blob()?;
                 files.push(file_state_from_blob(
-                    blob,
+                    &blob,
                     Path::new(&full_path),
                     output_path,
                 ));
@@ -461,7 +461,11 @@ fn display_path_for_tree_entry(path: &str, workdir_prefix: Option<&str>) -> Resu
     RepoPath::new(normalized_path)
 }
 
-fn file_state_from_blob(blob: gix::Blob<'_>, tree_path: &Path, output_path: RepoPath) -> FileState {
+fn file_state_from_blob(
+    blob: &gix::Blob<'_>,
+    tree_path: &Path,
+    output_path: RepoPath,
+) -> FileState {
     let content = match std::str::from_utf8(&blob.data) {
         Ok(content) => content,
         Err(_) => return FileState::from_binary(output_path, &blob.data),

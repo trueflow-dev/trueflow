@@ -160,6 +160,9 @@ trueflow inspect --fingerprint <fp> --split
 
 # Export review feedback
 trueflow feedback --format xml
+
+# Export recent feedback for one subtree
+trueflow feedback --format json --since 1h --target dir:trueflow/src
 ```
 
 ## Filter and scope review
@@ -273,7 +276,10 @@ Key actions include approve/reject/comment/split/refresh/review-start.
 ## Feedback and metadata
 
 `trueflow feedback` exports review history for reuse by an agent or another
-consumer.
+consumer. It supports time filtering with `--since` (`all`, `last`, relative
+durations like `1h` / `2d`, unix timestamps, or RFC3339) and the same target
+syntax as review commands (for example `file:src/lib.rs`, `dir:trueflow/src`,
+and `rev:abc1234..def5678`).
 
 The current public CLI/API field name for a review target is still
 `fingerprint`. That currently coexists with separate diff fingerprints, so the
