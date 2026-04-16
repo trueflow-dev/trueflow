@@ -3,14 +3,17 @@ mod fs_support;
 #[path = "vt100_backend.rs"]
 pub mod vt100_backend;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
 use trueflow::store::{Record, ReviewTargetRef};
 use uuid::Uuid;
+
+static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub struct TestRepo {
     pub path: PathBuf,
@@ -20,26 +23,18 @@ impl TestRepo {
     pub fn new(name: &str) -> Result<Self> {
         let path = temp_dir("trueflow_tests", name);
         fs::create_dir_all(&path)?;
-        init_git(&path)?;
+        init_git_with_identity(&path, "test@example.com", "Test User")?;
         Ok(Self { path })
     }
 
     pub fn fixture(name: &str) -> Result<Self> {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("example_repos")
-            .join(name);
-        if !src.is_dir() {
-            anyhow::bail!("test fixture not found: {}", src.display());
-        }
-
-        let path = temp_dir("trueflow_e2e", name);
-        if path.exists() {
-            fs::remove_dir_all(&path)?;
-        }
-
-        fs_support::copy_dir_all(&src, &path)?;
-        init_git(&path)?;
+        let path = prepare_fixture_repo(
+            name,
+            "trueflow_e2e",
+            "test@example.com",
+            "Test User",
+            "test fixture",
+        )?;
         Ok(Self { path })
     }
 
@@ -94,6 +89,33 @@ impl TestRepo {
     }
 }
 
+pub struct ReviewBenchRepo {
+    pub path: PathBuf,
+}
+
+impl ReviewBenchRepo {
+    pub fn fixture(name: &str) -> Result<Self> {
+        let path = prepare_fixture_repo(
+            name,
+            "trueflow_review_bench",
+            "bench@example.com",
+            "Bench User",
+            "benchmark fixture",
+        )?;
+        Ok(Self { path })
+    }
+
+    pub fn full_review_summary(&self) -> Result<trueflow::commands::review::ReviewSummary> {
+        run_full_review(&self.path)
+    }
+}
+
+impl Drop for ReviewBenchRepo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn temp_dir(base: &str, name: &str) -> PathBuf {
     std::env::temp_dir()
         .join(base)
@@ -101,10 +123,39 @@ fn temp_dir(base: &str, name: &str) -> PathBuf {
         .join(Uuid::new_v4().to_string())
 }
 
-fn init_git(path: &Path) -> Result<()> {
+fn fixture_source_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("example_repos")
+        .join(name)
+}
+
+fn prepare_fixture_repo(
+    name: &str,
+    temp_base: &str,
+    email: &str,
+    user_name: &str,
+    missing_label: &str,
+) -> Result<PathBuf> {
+    let src = fixture_source_dir(name);
+    if !src.is_dir() {
+        return Err(anyhow!("{missing_label} not found: {}", src.display()));
+    }
+
+    let path = temp_dir(temp_base, name);
+    if path.exists() {
+        fs::remove_dir_all(&path)?;
+    }
+
+    fs_support::copy_dir_all(&src, &path)?;
+    init_git_with_identity(&path, email, user_name)?;
+    Ok(path)
+}
+
+fn init_git_with_identity(path: &Path, email: &str, user_name: &str) -> Result<()> {
     run_git(path, &["init", "-q"])?;
-    run_git(path, &["config", "user.email", "test@example.com"])?;
-    run_git(path, &["config", "user.name", "Test User"])?;
+    run_git(path, &["config", "user.email", email])?;
+    run_git(path, &["config", "user.name", user_name])?;
     Ok(())
 }
 
@@ -387,4 +438,38 @@ pub fn write_reviews_jsonl(dir: &Path, records: &[Value]) -> Result<()> {
         writer.write_all(b"\n")?;
     }
     Ok(())
+}
+
+pub fn run_full_review(path: &Path) -> Result<trueflow::commands::review::ReviewSummary> {
+    with_current_dir(path, || {
+        let query = trueflow::commands::review::resolve_review_request(
+            trueflow::commands::review::ReviewRequest::AllFiles,
+            trueflow::config::BlockFilters::default(),
+            trueflow::scanner::ScanOptions::default(),
+        )?;
+
+        trueflow::commands::review::collect_review_summary(&query)
+    })
+}
+
+fn with_current_dir<T>(path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = CWD_LOCK
+        .lock()
+        .map_err(|error| anyhow!("current-directory lock poisoned: {error}"))?;
+    let original = std::env::current_dir().context("failed to capture original cwd")?;
+    std::env::set_current_dir(path)
+        .with_context(|| format!("failed to switch cwd to {}", path.display()))?;
+
+    let result = action();
+    let restore_result = std::env::set_current_dir(&original)
+        .with_context(|| format!("failed to restore cwd to {}", original.display()));
+
+    match (result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(error), Err(restore_error)) => {
+            Err(error.context(format!("also failed to restore cwd: {restore_error}")))
+        }
+    }
 }

@@ -28,6 +28,7 @@ use crate::review_session;
 use crate::review_speedread::PlaybackState;
 use crate::store::{ReviewTargetKind, Verdict};
 use crate::sub_splitter;
+use crate::targets::workdir_prefix_from_git_root;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
 use anyhow::Result;
@@ -667,18 +668,12 @@ where
         .collect()
 }
 
-fn workdir_prefix_from_git_root() -> Option<String> {
-    let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
-    path_utils::current_workdir_prefix_for_repo_root(&repo_root)
-}
-
 fn speed_read_config_path_for_repo_root() -> PathBuf {
     match vcs::git_root_from_workdir() {
         Ok(Some(root)) => root.join("trueflow.toml"),
         Ok(None) | Err(_) => PathBuf::from("trueflow.toml"),
     }
 }
-
 
 #[derive(Default)]
 struct EventPump {
@@ -4707,7 +4702,9 @@ mod diff_scope_tests {
             "trueflow/src/lib.rs",
             "trueflow"
         ));
-        assert!(path_utils::path_matches_workdir_prefix("trueflow", "trueflow"));
+        assert!(path_utils::path_matches_workdir_prefix(
+            "trueflow", "trueflow"
+        ));
         assert!(!path_utils::path_matches_workdir_prefix(
             "other/src/lib.rs",
             "trueflow"

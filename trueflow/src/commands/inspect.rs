@@ -4,13 +4,12 @@ use crate::coverage::{
     BindingRelation, CoverageBuildOptions, CoverageDiagnostic, CoverageIndex, CoveragePolicy,
     CoverageScope,
 };
-use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::scanner;
 use crate::store::{FileStore, Record, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
+use crate::targets::workdir_prefix_from_git_root;
 use crate::tree;
-use crate::vcs;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -286,9 +285,4 @@ fn diagnostic_record_id(diagnostic: &CoverageDiagnostic) -> Option<&String> {
         CoverageDiagnostic::AmbiguousRecord { record_id, .. }
         | CoverageDiagnostic::UnresolvedRecord { record_id } => Some(record_id),
     }
-}
-
-fn workdir_prefix_from_git_root() -> Option<String> {
-    let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
-    path_utils::current_workdir_prefix_for_repo_root(&repo_root)
 }

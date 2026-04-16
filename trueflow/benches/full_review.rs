@@ -1,10 +1,7 @@
-#[path = "../tests/common/review_bench_support.rs"]
-mod review_bench_support;
-
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use review_bench_support::ReviewBenchRepo;
 use std::hint::black_box;
 use std::time::Duration;
+use trueflow_test_support::ReviewBenchRepo;
 
 fn bench_full_review(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_review");

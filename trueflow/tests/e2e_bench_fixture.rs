@@ -1,10 +1,7 @@
 #![cfg(feature = "bench")]
 
-#[path = "common/review_bench_support.rs"]
-mod review_bench_support;
-
 use anyhow::Result;
-use review_bench_support::ReviewBenchRepo;
+use trueflow_test_support::ReviewBenchRepo;
 
 #[test]
 fn test_full_review_bench_fixture_smoke() -> Result<()> {
