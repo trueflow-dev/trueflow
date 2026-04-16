@@ -28,7 +28,7 @@ impl TerminalCapabilities {
 
     fn from_keyboard_enhancement_support_result(result: io::Result<bool>) -> Self {
         Self {
-            keyboard_enhancement_supported: result.unwrap_or(false),
+            keyboard_enhancement_supported: should_request_keyboard_enhancement(result),
         }
     }
 
@@ -315,6 +315,18 @@ impl Drop for TerminalSession {
     }
 }
 
+// On Unix, requesting kitty keyboard enhancement is cheap and terminals that
+// do not support it generally ignore the escape sequence. The probe itself is
+// the flaky part, so we request it optimistically there.
+fn should_request_keyboard_enhancement(result: io::Result<bool>) -> bool {
+    if cfg!(windows) {
+        result.unwrap_or(false)
+    } else {
+        let _ = result;
+        true
+    }
+}
+
 fn merge_primary_and_restore_error(
     primary: &anyhow::Error,
     restore: &anyhow::Error,
@@ -333,18 +345,19 @@ mod tests {
     }
 
     #[test]
-    fn terminal_capabilities_disable_keyboard_enhancement_when_probe_is_unsupported() {
-        let capabilities =
-            TerminalCapabilities::from_keyboard_enhancement_support_result(Ok(false));
-        assert!(!capabilities.keyboard_enhancement_supported());
-    }
-
-    #[test]
-    fn terminal_capabilities_disable_keyboard_enhancement_when_probe_errors() {
-        let capabilities = TerminalCapabilities::from_keyboard_enhancement_support_result(Err(
+    fn terminal_capabilities_follow_platform_keyboard_enhancement_fallback_policy() {
+        let unsupported = TerminalCapabilities::from_keyboard_enhancement_support_result(Ok(false));
+        let error = TerminalCapabilities::from_keyboard_enhancement_support_result(Err(
             io::Error::new(io::ErrorKind::Unsupported, "no keyboard enhancement"),
         ));
-        assert!(!capabilities.keyboard_enhancement_supported());
+
+        if cfg!(windows) {
+            assert!(!unsupported.keyboard_enhancement_supported());
+            assert!(!error.keyboard_enhancement_supported());
+        } else {
+            assert!(unsupported.keyboard_enhancement_supported());
+            assert!(error.keyboard_enhancement_supported());
+        }
     }
 
     #[test]
