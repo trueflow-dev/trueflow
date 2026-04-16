@@ -1,17 +1,18 @@
 use crate::block::{Block, BlockKind};
-use crate::commands::review::{ReviewContentSource, ReviewPathSelection, ReviewTarget};
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::coverage::{CoverageBuildOptions, CoverageIndex};
-use crate::path_utils;
 use crate::policy::should_skip_imports_by_default;
 use crate::scanner;
 use crate::store::{FileStore, Identity, Record, ReviewStore};
+use crate::targets::{
+    ResolvedTargets, ReviewContentSource, ReviewTarget, resolve_targets,
+    workdir_prefix_from_git_root,
+};
 use crate::tree;
 use crate::vcs;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -44,16 +45,9 @@ struct FeedbackEntry {
     latest_verdict: String,
 }
 
-#[derive(Debug, Clone)]
-struct FeedbackTargetQuery {
-    content_source: ReviewContentSource,
-    explicit_selection: Option<ReviewPathSelection>,
-    changed_selection: Option<ReviewPathSelection>,
-}
-
 struct FeedbackCollectionOptions<'a> {
     filters: &'a crate::config::BlockFilters,
-    target_query: &'a FeedbackTargetQuery,
+    targets: &'a ResolvedTargets,
     include_approved: bool,
     workdir_prefix: Option<&'a str>,
 }
@@ -71,11 +65,11 @@ pub fn run(
     let filters = config.feedback.resolve_filters(only, exclude);
     let scan_options = config.scan.resolve_options()?;
     let effective_since = since.or(Some(config.feedback.default_since.as_str()));
-    let target_query = resolve_feedback_target_query(targets)?;
+    let resolved_targets = resolve_targets(targets)?;
 
     // 1. Scan current or historical directory state.
     let workdir_prefix = workdir_prefix_from_git_root();
-    let files = match &target_query.content_source {
+    let files = match &resolved_targets.content_source {
         ReviewContentSource::Workdir => scanner::scan_directory(".", &scan_options)?.files,
         ReviewContentSource::Revision(revision) => {
             let repo = vcs::repo_from_workdir()?;
@@ -98,7 +92,7 @@ pub fn run(
         since_threshold,
         &FeedbackCollectionOptions {
             filters: &filters,
-            target_query: &target_query,
+            targets: &resolved_targets,
             include_approved,
             workdir_prefix: workdir_prefix.as_deref(),
         },
@@ -202,10 +196,12 @@ fn collect_feedback_entries(
 ) -> Result<Vec<FeedbackEntry>> {
     let FeedbackCollectionOptions {
         filters,
-        target_query,
+        targets,
         include_approved,
         workdir_prefix,
     } = *options;
+    let explicit_selection = targets.explicit_selection();
+    let changed_selection = targets.changed_selection();
     let build_options = CoverageBuildOptions {
         workdir_prefix: workdir_prefix.map(str::to_string),
     };
@@ -222,12 +218,12 @@ fn collect_feedback_entries(
 
     let mut entries = Vec::new();
     for file in files {
-        if let Some(selection) = &target_query.explicit_selection
+        if let Some(selection) = &explicit_selection
             && !selection.includes(&file.path, workdir_prefix)?
         {
             continue;
         }
-        if let Some(selection) = &target_query.changed_selection
+        if let Some(selection) = &changed_selection
             && !selection.includes(&file.path, workdir_prefix)?
         {
             continue;
@@ -355,111 +351,6 @@ fn parse_relative_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<Optio
     Ok(Some(threshold))
 }
 
-fn resolve_feedback_target_query(targets: &[ReviewTarget]) -> Result<FeedbackTargetQuery> {
-    let content_source = resolve_feedback_content_source(targets)?;
-    let mut explicit_files = HashSet::new();
-    let mut explicit_dirs = Vec::new();
-    let mut changed_paths = HashSet::new();
-
-    for target in targets {
-        match target {
-            ReviewTarget::DirtyWorktree => {
-                if let Ok(dirty) = vcs::dirty_files_from_workdir() {
-                    changed_paths.extend(dirty);
-                }
-            }
-            ReviewTarget::MainDiff => {
-                changed_paths.extend(vcs::files_changed_main_to_head()?);
-            }
-            ReviewTarget::File(path) => {
-                explicit_files.insert(path.clone());
-            }
-            ReviewTarget::Dir(path) => {
-                if !explicit_dirs.contains(path) {
-                    explicit_dirs.push(path.clone());
-                }
-            }
-            ReviewTarget::Revision(revision) => {
-                changed_paths.extend(vcs::files_changed_in_revision(revision.as_str())?);
-            }
-            ReviewTarget::RevisionRange(range) => {
-                changed_paths.extend(vcs::files_changed_in_range(
-                    range.start.as_str(),
-                    range.end.as_str(),
-                )?);
-            }
-        }
-    }
-
-    Ok(FeedbackTargetQuery {
-        content_source,
-        explicit_selection: build_explicit_selection(explicit_files, explicit_dirs),
-        changed_selection: if changed_paths.is_empty() {
-            None
-        } else {
-            Some(ReviewPathSelection::Specific(changed_paths))
-        },
-    })
-}
-
-fn build_explicit_selection(
-    files: HashSet<crate::repo_path::RepoPath>,
-    dirs: Vec<crate::repo_path::RepoPath>,
-) -> Option<ReviewPathSelection> {
-    if !dirs.is_empty() {
-        Some(ReviewPathSelection::Scoped {
-            files,
-            dirs,
-            changed: None,
-        })
-    } else if files.is_empty() {
-        None
-    } else {
-        Some(ReviewPathSelection::Specific(files))
-    }
-}
-
-fn resolve_feedback_content_source(targets: &[ReviewTarget]) -> Result<ReviewContentSource> {
-    let mut revision = None;
-    let mut saw_worktree_target = false;
-
-    for target in targets {
-        if target.is_worktree_content_target() {
-            if revision.is_some() {
-                return Err(anyhow!(
-                    "Historical targets cannot be mixed with worktree-based targets"
-                ));
-            }
-            saw_worktree_target = true;
-            continue;
-        }
-
-        let Some(candidate) = target.historical_content_revision() else {
-            continue;
-        };
-
-        if saw_worktree_target {
-            return Err(anyhow!(
-                "Historical targets cannot be mixed with worktree-based targets"
-            ));
-        }
-
-        match &revision {
-            Some(existing) if existing != candidate => {
-                return Err(anyhow!(
-                    "Multiple historical targets with different content revisions are not supported"
-                ));
-            }
-            Some(_) => {}
-            None => revision = Some(candidate.clone()),
-        }
-    }
-
-    Ok(revision
-        .map(ReviewContentSource::Revision)
-        .unwrap_or(ReviewContentSource::Workdir))
-}
-
 fn resolve_since_threshold(store: &FileStore, since: FeedbackSince) -> Result<Option<i64>> {
     let threshold = match since {
         FeedbackSince::All => None,
@@ -500,11 +391,6 @@ fn write_feedback_cursor(path: &Path, timestamp: i64) -> Result<()> {
     }
     fs::write(path, format!("{timestamp}\n"))?;
     Ok(())
-}
-
-fn workdir_prefix_from_git_root() -> Option<String> {
-    let repo_root = vcs::git_root_from_workdir().ok().flatten()?;
-    path_utils::current_workdir_prefix_for_repo_root(&repo_root)
 }
 
 #[cfg(test)]

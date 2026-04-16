@@ -34,6 +34,7 @@ pub mod scanner;
 pub mod store;
 pub mod sub_splitter;
 pub(crate) mod swift;
+pub mod targets;
 pub mod text_split;
 pub(crate) mod toml_blocks;
 pub mod tree;

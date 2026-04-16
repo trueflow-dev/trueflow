@@ -306,7 +306,10 @@ impl LineSpan {
     pub fn overlaps(&self, other: &LineSpan) -> bool {
         self.start_line < other.end_line && self.end_line > other.start_line
     }
+}
 
+#[cfg(test)]
+impl LineSpan {
     pub fn contains(&self, other: &LineSpan) -> bool {
         self.start_line <= other.start_line && self.end_line >= other.end_line
     }
