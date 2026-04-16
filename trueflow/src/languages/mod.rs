@@ -26,7 +26,6 @@ pub(crate) struct NestedBlock {
     pub(crate) kind: BlockKind,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LanguageSubSplitSemantics {
     ReviewUnits,

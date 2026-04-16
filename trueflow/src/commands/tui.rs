@@ -3585,7 +3585,7 @@ fn build_block_lines(
     build_source_context_content(state, node, palette)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn format_diff_overlay_row(line: &vcs::DiffLine, line_numbers: TuiDiffLineNumbers) -> String {
     let marker = diff_overlay_marker(line.kind);
     let text = expand_tabs_for_display(&line.text);

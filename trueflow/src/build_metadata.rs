@@ -1,9 +1,9 @@
-pub const UNKNOWN_BUILD_TIMESTAMP: &str = "unknown";
+pub(crate) const UNKNOWN_BUILD_TIMESTAMP: &str = "unknown";
 const SECONDS_PER_DAY: u64 = 86_400;
 const SECONDS_PER_HOUR: u64 = 3_600;
 const SECONDS_PER_MINUTE: u64 = 60;
 
-pub fn build_timestamp_from_source_date_epoch(source_date_epoch: Option<&str>) -> String {
+pub(crate) fn build_timestamp_from_source_date_epoch(source_date_epoch: Option<&str>) -> String {
     let Some(source_date_epoch) = source_date_epoch else {
         return UNKNOWN_BUILD_TIMESTAMP.to_string();
     };

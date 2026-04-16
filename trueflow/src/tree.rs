@@ -97,7 +97,7 @@ impl Tree {
         self.view_json_from(self.root)
     }
 
-    pub fn view_json_from(&self, id: TreeNodeId) -> Value {
+    fn view_json_from(&self, id: TreeNodeId) -> Value {
         let node = self.node(id);
         let children = node
             .children
@@ -141,7 +141,7 @@ impl Tree {
             .copied()
     }
 
-    pub fn block_has_child_blocks(&self, id: TreeNodeId) -> bool {
+    fn block_has_child_blocks(&self, id: TreeNodeId) -> bool {
         self.node(id)
             .children
             .iter()
