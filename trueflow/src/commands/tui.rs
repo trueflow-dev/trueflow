@@ -2676,18 +2676,26 @@ fn format_key_action(key: char, label: &str) -> String {
     }
 }
 
-fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
-    let ratio = if state.total_blocks > 0 {
-        (state.total_blocks - state.remaining_blocks) as f64 / state.total_blocks as f64
+fn footer_progress_counts(state: &AppState) -> (usize, usize) {
+    let total = state.initial_remaining_blocks;
+    let reviewed = total.saturating_sub(state.remaining_blocks);
+    (reviewed, total)
+}
+
+fn footer_progress_ratio(state: &AppState) -> f64 {
+    let (reviewed, total) = footer_progress_counts(state);
+    if total > 0 {
+        reviewed as f64 / total as f64
     } else {
         1.0
-    };
+    }
+}
 
-    let label = format!(
-        " {}/{} reviewed ",
-        state.total_blocks - state.remaining_blocks,
-        state.total_blocks
-    );
+fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
+    let ratio = footer_progress_ratio(state);
+    let (reviewed, total) = footer_progress_counts(state);
+
+    let label = format!(" {reviewed}/{total} reviewed ");
 
     let gauge = Gauge::default()
         .block(UiBlock::default().borders(ratatui::widgets::Borders::NONE))
@@ -7626,6 +7634,32 @@ mod diff_scope_tests {
         let (fingerprint, kind) = fingerprint_and_target_kind_for_node(root_node);
         assert_eq!(fingerprint, root_node.hash.to_string());
         assert_eq!(kind, ReviewTargetKind::Tree);
+    }
+
+    #[test]
+    fn footer_progress_uses_session_remaining_blocks_not_scope_total() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.total_blocks = 5;
+        state.initial_remaining_blocks = 1;
+        state.remaining_blocks = 1;
+
+        let (reviewed, total) = footer_progress_counts(&state);
+
+        assert_eq!((reviewed, total), (0, 1));
+    }
+
+    #[test]
+    fn footer_progress_reaches_complete_when_session_blocks_are_done() {
+        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        state.total_blocks = 5;
+        state.initial_remaining_blocks = 1;
+        state.remaining_blocks = 0;
+
+        let ratio = footer_progress_ratio(&state);
+        let (reviewed, total) = footer_progress_counts(&state);
+
+        assert_eq!((reviewed, total), (1, 1));
+        assert!((ratio - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
