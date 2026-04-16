@@ -147,10 +147,13 @@ pub enum ReviewPathSelection {
     All,
     Specific(HashSet<RepoPath>),
     /// Explicit files plus one or more directory prefixes. A file matches
-    /// if it's in `files` or lives under any entry in `dirs`.
+    /// if it is explicitly selected, or if it lives under one of `dirs`.
+    /// When `changed` is present, directory matches are additionally
+    /// restricted to that changed-path set.
     Scoped {
         files: HashSet<RepoPath>,
         dirs: Vec<RepoPath>,
+        changed: Option<HashSet<RepoPath>>,
     },
 }
 
@@ -163,32 +166,54 @@ impl ReviewPathSelection {
         match self {
             Self::All => Ok(true),
             Self::Specific(targets) => {
-                if targets.contains(file_path) {
-                    return Ok(true);
-                }
-                if let Some(prefix) = workdir_prefix {
-                    let repo_path = RepoPath::new(format!("{prefix}/{file_path}"))?;
-                    return Ok(targets.contains(&repo_path));
-                }
-                Ok(false)
+                path_matches_specific_selection(targets, file_path, workdir_prefix)
             }
-            Self::Scoped { files, dirs } => {
-                if files.contains(file_path) {
+            Self::Scoped {
+                files,
+                dirs,
+                changed,
+            } => {
+                if path_matches_specific_selection(files, file_path, workdir_prefix)? {
                     return Ok(true);
                 }
-                if let Some(prefix) = workdir_prefix {
+
+                let dir_match = if dirs.iter().any(|dir| path_under_dir(file_path, dir)) {
+                    true
+                } else if let Some(prefix) = workdir_prefix {
                     let repo_path = RepoPath::new(format!("{prefix}/{file_path}"))?;
-                    if files.contains(&repo_path) {
-                        return Ok(true);
-                    }
-                    if dirs.iter().any(|dir| path_under_dir(&repo_path, dir)) {
-                        return Ok(true);
-                    }
+                    dirs.iter().any(|dir| path_under_dir(&repo_path, dir))
+                } else {
+                    false
+                };
+
+                if !dir_match {
+                    return Ok(false);
                 }
-                Ok(dirs.iter().any(|dir| path_under_dir(file_path, dir)))
+
+                match changed {
+                    Some(changed_paths) => {
+                        path_matches_specific_selection(changed_paths, file_path, workdir_prefix)
+                    }
+                    None => Ok(true),
+                }
             }
         }
     }
+}
+
+fn path_matches_specific_selection(
+    targets: &HashSet<RepoPath>,
+    file_path: &RepoPath,
+    workdir_prefix: Option<&str>,
+) -> Result<bool> {
+    if targets.contains(file_path) {
+        return Ok(true);
+    }
+    if let Some(prefix) = workdir_prefix {
+        let repo_path = RepoPath::new(format!("{prefix}/{file_path}"))?;
+        return Ok(targets.contains(&repo_path));
+    }
+    Ok(false)
 }
 
 /// True if `file` equals `dir` or lives under `dir` as a subtree.
@@ -390,11 +415,10 @@ where
     let Some(since) = since else {
         return Ok(values.to_vec());
     };
-    if !values.is_empty() {
-        return Err(anyhow!("--since cannot be combined with --target"));
-    }
 
-    Ok(vec![since_review_target_with(since, validate_revision)?])
+    let mut targets = values.to_vec();
+    targets.push(since_review_target_with(since, validate_revision)?);
+    Ok(targets)
 }
 
 pub fn since_review_target(since: &str) -> Result<ReviewTarget> {
@@ -763,7 +787,8 @@ fn collect_diff_review_files(
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
-    let mut selected_paths = selected_review_paths(&query.path_selection, &head_files_by_path);
+    let mut selected_paths =
+        selected_review_paths(&query.path_selection, &head_files_by_path, workdir_prefix)?;
     selected_paths.sort();
 
     let mut review_files = Vec::new();
@@ -842,17 +867,34 @@ fn collect_diff_review_files(
 fn selected_review_paths(
     path_selection: &ReviewPathSelection,
     head_files_by_path: &HashMap<RepoPath, crate::block::FileState>,
-) -> Vec<RepoPath> {
+    workdir_prefix: Option<&str>,
+) -> Result<Vec<RepoPath>> {
     match path_selection {
-        ReviewPathSelection::All => head_files_by_path.keys().cloned().collect(),
-        ReviewPathSelection::Specific(paths) => paths.iter().cloned().collect(),
-        ReviewPathSelection::Scoped { files, dirs } => head_files_by_path
-            .keys()
-            .filter(|path| {
-                files.contains(*path) || dirs.iter().any(|dir| path_under_dir(path, dir))
-            })
-            .cloned()
-            .collect(),
+        ReviewPathSelection::All => Ok(head_files_by_path.keys().cloned().collect()),
+        ReviewPathSelection::Specific(paths) => Ok(paths.iter().cloned().collect()),
+        ReviewPathSelection::Scoped {
+            files,
+            dirs: _,
+            changed,
+        } => {
+            let candidate_paths = if let Some(changed_paths) = changed {
+                files
+                    .iter()
+                    .chain(changed_paths.iter())
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            } else {
+                head_files_by_path.keys().cloned().collect::<HashSet<_>>()
+            };
+
+            let mut selected = Vec::new();
+            for path in candidate_paths {
+                if path_selection.includes(&path, workdir_prefix)? {
+                    selected.push(path);
+                }
+            }
+            Ok(selected)
+        }
     }
 }
 
@@ -1075,21 +1117,22 @@ fn resolve_review_content_source(targets: &[ReviewTarget]) -> Result<ReviewConte
 }
 
 fn resolve_review_path_selection(targets: &[ReviewTarget]) -> Result<ReviewPathSelection> {
-    let mut paths = HashSet::new();
+    let mut files = HashSet::new();
     let mut dirs: Vec<RepoPath> = Vec::new();
+    let mut changed = HashSet::new();
 
     for target in targets {
         match target {
             ReviewTarget::DirtyWorktree => {
                 if let Ok(dirty) = get_dirty_files() {
-                    paths.extend(dirty);
+                    changed.extend(dirty);
                 }
             }
             ReviewTarget::MainDiff => {
-                paths.extend(vcs::files_changed_main_to_head()?);
+                changed.extend(vcs::files_changed_main_to_head()?);
             }
             ReviewTarget::File(path) => {
-                paths.insert(path.clone());
+                files.insert(path.clone());
             }
             ReviewTarget::Dir(path) => {
                 if !dirs.contains(path) {
@@ -1097,10 +1140,10 @@ fn resolve_review_path_selection(targets: &[ReviewTarget]) -> Result<ReviewPathS
                 }
             }
             ReviewTarget::Revision(revision) => {
-                paths.extend(vcs::files_changed_in_revision(revision.as_str())?);
+                changed.extend(vcs::files_changed_in_revision(revision.as_str())?);
             }
             ReviewTarget::RevisionRange(range) => {
-                paths.extend(vcs::files_changed_in_range(
+                changed.extend(vcs::files_changed_in_range(
                     range.start.as_str(),
                     range.end.as_str(),
                 )?);
@@ -1109,9 +1152,18 @@ fn resolve_review_path_selection(targets: &[ReviewTarget]) -> Result<ReviewPathS
     }
 
     if dirs.is_empty() {
-        Ok(ReviewPathSelection::Specific(paths))
+        files.extend(changed);
+        Ok(ReviewPathSelection::Specific(files))
     } else {
-        Ok(ReviewPathSelection::Scoped { files: paths, dirs })
+        Ok(ReviewPathSelection::Scoped {
+            files,
+            dirs,
+            changed: if changed.is_empty() {
+                None
+            } else {
+                Some(changed)
+            },
+        })
     }
 }
 
@@ -1120,7 +1172,7 @@ fn resolve_review_diff_selection(targets: &[ReviewTarget]) -> ReviewDiffSelectio
 
     for target in targets {
         let Some(diff_target) = target.diff_target() else {
-            return ReviewDiffSelection::None;
+            continue;
         };
         diff_targets.push(diff_target);
     }
@@ -1562,20 +1614,26 @@ mod tests {
 
     #[test]
     fn dir_target_parses() {
-        let target = ReviewTarget::from_cli("dir:website").expect("dir target should parse");
+        let target = ReviewTarget::from_cli("dir:website")
+            .unwrap_or_else(|error| panic!("dir target should parse: {error}"));
         assert_eq!(
             target,
-            ReviewTarget::Dir(RepoPath::new("website").expect("valid repo path"))
+            ReviewTarget::Dir(
+                RepoPath::new("website").unwrap_or_else(|error| panic!("valid repo path: {error}")),
+            )
         );
     }
 
     #[test]
     fn dir_target_parses_nested_path() {
-        let target =
-            ReviewTarget::from_cli("dir:trueflow/src/commands").expect("nested dir target");
+        let target = ReviewTarget::from_cli("dir:trueflow/src/commands")
+            .unwrap_or_else(|error| panic!("nested dir target: {error}"));
         assert_eq!(
             target,
-            ReviewTarget::Dir(RepoPath::new("trueflow/src/commands").expect("valid repo path"))
+            ReviewTarget::Dir(
+                RepoPath::new("trueflow/src/commands")
+                    .unwrap_or_else(|error| panic!("valid repo path: {error}")),
+            )
         );
     }
 
@@ -1595,9 +1653,9 @@ mod tests {
     fn dir_target_resolves_to_scoped_selection() {
         let target = ReviewTarget::Dir(RepoPath::new("website").unwrap());
         let selection = resolve_review_path_selection(std::slice::from_ref(&target))
-            .expect("resolve should succeed for dir target");
+            .unwrap_or_else(|error| panic!("resolve should succeed for dir target: {error}"));
         match selection {
-            ReviewPathSelection::Scoped { files, dirs } => {
+            ReviewPathSelection::Scoped { files, dirs, .. } => {
                 assert!(files.is_empty());
                 assert_eq!(dirs, vec![RepoPath::new("website").unwrap()]);
             }
@@ -1613,8 +1671,10 @@ mod tests {
             ReviewTarget::File(file_path.clone()),
             ReviewTarget::Dir(dir_path.clone()),
         ];
-        match resolve_review_path_selection(&targets).expect("resolve succeeds") {
-            ReviewPathSelection::Scoped { files, dirs } => {
+        match resolve_review_path_selection(&targets)
+            .unwrap_or_else(|error| panic!("resolve succeeds: {error}"))
+        {
+            ReviewPathSelection::Scoped { files, dirs, .. } => {
                 assert!(files.contains(&file_path));
                 assert_eq!(dirs, vec![dir_path]);
             }
@@ -1629,7 +1689,9 @@ mod tests {
             ReviewTarget::Dir(dir.clone()),
             ReviewTarget::Dir(dir.clone()),
         ];
-        match resolve_review_path_selection(&targets).expect("resolve succeeds") {
+        match resolve_review_path_selection(&targets)
+            .unwrap_or_else(|error| panic!("resolve succeeds: {error}"))
+        {
             ReviewPathSelection::Scoped { dirs, .. } => {
                 assert_eq!(dirs, vec![dir]);
             }
@@ -1642,6 +1704,7 @@ mod tests {
         let selection = ReviewPathSelection::Scoped {
             files: HashSet::new(),
             dirs: vec![RepoPath::new("website").unwrap()],
+            changed: None,
         };
         assert!(
             selection
@@ -1666,6 +1729,7 @@ mod tests {
         let selection = ReviewPathSelection::Scoped {
             files: HashSet::new(),
             dirs: vec![RepoPath::new("website").unwrap()],
+            changed: None,
         };
         assert!(
             !selection
@@ -1688,8 +1752,56 @@ mod tests {
         let selection = ReviewPathSelection::Scoped {
             files,
             dirs: vec![RepoPath::new("website").unwrap()],
+            changed: None,
         };
         assert!(selection.includes(&explicit, None).unwrap());
+    }
+
+    #[test]
+    fn scoped_selection_with_changed_paths_requires_dir_intersection() {
+        let mut changed = HashSet::new();
+        changed.insert(RepoPath::new("website/index.html").unwrap());
+        let selection = ReviewPathSelection::Scoped {
+            files: HashSet::new(),
+            dirs: vec![RepoPath::new("website").unwrap()],
+            changed: Some(changed),
+        };
+        assert!(
+            selection
+                .includes(&RepoPath::new("website/index.html").unwrap(), None)
+                .unwrap()
+        );
+        assert!(
+            !selection
+                .includes(&RepoPath::new("website/other.html").unwrap(), None)
+                .unwrap()
+        );
+        assert!(
+            !selection
+                .includes(&RepoPath::new("docs/index.html").unwrap(), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_selection_uses_workdir_prefix_for_repo_relative_dir_targets() {
+        let mut changed = HashSet::new();
+        changed.insert(RepoPath::new("src/nested/keep.rs").unwrap());
+        let selection = ReviewPathSelection::Scoped {
+            files: HashSet::new(),
+            dirs: vec![RepoPath::new("src/nested").unwrap()],
+            changed: Some(changed),
+        };
+        assert!(
+            selection
+                .includes(&RepoPath::new("nested/keep.rs").unwrap(), Some("src"))
+                .unwrap()
+        );
+        assert!(
+            !selection
+                .includes(&RepoPath::new("other.rs").unwrap(), Some("src"))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1821,13 +1933,20 @@ mod tests {
     }
 
     #[test]
-    fn expand_cli_review_targets_rejects_since_with_explicit_targets() {
-        let err =
-            expand_cli_review_targets_with(&[ReviewTarget::MainDiff], Some("abc1234"), &|_| Ok(()))
-                .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("--since cannot be combined with --target")
+    fn expand_cli_review_targets_combines_since_with_explicit_targets() {
+        let targets = expand_cli_review_targets_with(
+            &[ReviewTarget::Dir(RepoPath::new("src").unwrap())],
+            Some("abc1234"),
+            &|_| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("expected combined since+target expansion: {error}"));
+
+        assert_eq!(
+            targets,
+            vec![
+                ReviewTarget::Dir(RepoPath::new("src").unwrap()),
+                ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "HEAD").unwrap()),
+            ]
         );
     }
 

@@ -271,6 +271,49 @@ fn test_review_since_matches_revision_range_target() -> Result<()> {
 }
 
 #[test]
+fn test_review_since_with_dir_matches_revision_range_dir_target() -> Result<()> {
+    let repo = TestRepo::new("review_since_dir_range")?;
+    repo.write("src/nested/keep.rs", "pub fn keep() {}\n")?;
+    repo.write("src/skip.rs", "pub fn skip() {}\n")?;
+    repo.write("docs/guide.md", "before\n")?;
+    repo.commit_all("Initial")?;
+    let base = head_revision(&repo)?;
+
+    repo.write(
+        "src/nested/keep.rs",
+        "pub fn keep() { println!(\"inside\"); }\n",
+    )?;
+    repo.write("src/skip.rs", "pub fn skip() { println!(\"outside\"); }\n")?;
+    repo.write("docs/guide.md", "after\n")?;
+    repo.commit_all("Update multiple paths")?;
+
+    let since_output = repo.run(&[
+        "review",
+        "--since",
+        &base,
+        "--target",
+        "dir:src/nested",
+        "--json",
+    ])?;
+    let range_output = repo.run(&[
+        "review",
+        "--target",
+        "dir:src/nested",
+        "--target",
+        &format!("rev:{base}..HEAD"),
+        "--json",
+    ])?;
+
+    assert_eq!(json(&since_output)?, json(&range_output)?);
+
+    let files = json_array(&since_output)?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"].as_str(), Some("src/nested/keep.rs"));
+
+    Ok(())
+}
+
+#[test]
 fn test_review_since_rejects_unknown_revision() -> Result<()> {
     let repo = TestRepo::new("review_since_invalid")?;
     repo.write("src/lib.rs", "pub fn one() {}\n")?;

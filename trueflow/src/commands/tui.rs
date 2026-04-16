@@ -12,7 +12,7 @@ use crate::commands::review::{
     resolve_cli_review_scope, resolve_review_request,
 };
 use crate::config::{
-    BlockFilters, TuiConfig, BatchConfirmPolicy, TuiDiffFocusMode, TuiDiffLineNumbers,
+    BatchConfirmPolicy, BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers,
     TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
 use crate::context::TrueflowContext;
@@ -4507,7 +4507,7 @@ mod diff_scope_tests {
                 format!("function-{index}"),
                 "src/lib.rs".to_string(),
                 Block::new(
-                    format!("fn block_{}() {{}}\n", index),
+                    format!("fn block_{index}() {{}}\n"),
                     BlockKind::Function,
                     index,
                     index + 1,

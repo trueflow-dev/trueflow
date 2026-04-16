@@ -83,7 +83,7 @@ pub enum Commands {
         all: bool,
 
         /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
-        #[arg(long, value_name = "TARGET", conflicts_with = "since")]
+        #[arg(long, value_name = "TARGET")]
         target: Vec<ReviewTarget>,
 
         /// Review committed changes since this commit (equivalent to `rev:COMMIT..HEAD`)
@@ -156,7 +156,7 @@ pub enum Commands {
         all: bool,
 
         /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
-        #[arg(long, value_name = "TARGET", conflicts_with = "since")]
+        #[arg(long, value_name = "TARGET")]
         target: Vec<ReviewTarget>,
 
         /// Review committed changes since this commit (equivalent to `rev:COMMIT..HEAD`)
@@ -434,18 +434,39 @@ mod tests {
     }
 
     #[test]
-    fn review_command_rejects_since_with_target() {
-        let err = match Cli::try_parse_from([
-            "trueflow", "review", "--since", "abc1234", "--target", "main",
-        ]) {
-            Ok(_) => panic!("expected clap to reject --since with --target"),
-            Err(err) => err,
-        };
-        let rendered = err.to_string();
-        assert!(
-            rendered.contains("--since") && rendered.contains("--target"),
-            "unexpected clap error: {rendered}"
-        );
+    fn review_command_parses_since_with_target() {
+        let cli = Cli::parse_from([
+            "trueflow", "review", "--since", "abc1234", "--target", "dir:src",
+        ]);
+
+        match cli.command {
+            Commands::Review { target, since, .. } => {
+                assert_eq!(since.as_deref(), Some("abc1234"));
+                assert_eq!(
+                    target,
+                    vec![ReviewTarget::Dir(RepoPath::new("src").unwrap())]
+                );
+            }
+            _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
+    fn tui_command_parses_since_with_target() {
+        let cli = Cli::parse_from([
+            "trueflow", "tui", "--since", "abc1234", "--target", "dir:src",
+        ]);
+
+        match cli.command {
+            Commands::Tui { target, since, .. } => {
+                assert_eq!(since.as_deref(), Some("abc1234"));
+                assert_eq!(
+                    target,
+                    vec![ReviewTarget::Dir(RepoPath::new("src").unwrap())]
+                );
+            }
+            _ => panic!("expected tui command"),
+        }
     }
 
     #[test]

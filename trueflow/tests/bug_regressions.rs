@@ -715,6 +715,178 @@ fn test_review_historical_revision_range_from_subdir_uses_end_revision_content()
 }
 
 #[test]
+fn test_review_historical_revision_dir_target_from_subdir_filters_subtree() -> Result<()> {
+    let repo = TestRepo::new("review_historical_revision_dir_subdir")?;
+    repo.write(
+        "src/nested/keep.rs",
+        "pub fn keep() {\n    println!(\"before keep\");\n}\n",
+    )?;
+    repo.write(
+        "src/skip.rs",
+        "pub fn skip() {\n    println!(\"before skip\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+
+    repo.git(&["checkout", "-b", "feature/history-dir-subdir"])?;
+    repo.write(
+        "src/nested/keep.rs",
+        "pub fn keep() {\n    println!(\"target keep marker\");\n}\n",
+    )?;
+    repo.write(
+        "src/skip.rs",
+        "pub fn skip() {\n    println!(\"target skip marker\");\n}\n",
+    )?;
+    repo.commit_all("Target revision")?;
+
+    let target_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let target_revision = target_revision.trim().to_string();
+    let subdir = repo.path.join("src");
+
+    repo.write(
+        "src/nested/keep.rs",
+        "pub fn keep() {\n    println!(\"later keep marker\");\n}\n",
+    )?;
+    repo.write(
+        "src/skip.rs",
+        "pub fn skip() {\n    println!(\"later skip marker\");\n}\n",
+    )?;
+    repo.commit_all("Later revision")?;
+
+    let output = repo.run_in(
+        &[
+            "review",
+            "--json",
+            "--target",
+            "dir:src/nested",
+            "--target",
+            &format!("rev:{target_revision}"),
+        ],
+        &subdir,
+    )?;
+    let files = json_array(&output)?;
+
+    assert_eq!(
+        files.len(),
+        1,
+        "expected only the nested subtree file: {files:?}"
+    );
+    let blocks = files[0]["blocks"].as_array().context("blocks")?;
+    let contents = blocks
+        .iter()
+        .filter_map(|block| block["content"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("target keep marker")),
+        "historical revision dir review did not use target subtree content: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("target skip marker")),
+        "historical revision dir review leaked content outside the subtree: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("later keep marker")
+                && !content.contains("later skip marker")),
+        "historical revision dir review leaked later HEAD content: {contents:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_review_historical_revision_range_dir_target_from_subdir_filters_subtree() -> Result<()> {
+    let repo = TestRepo::new("review_historical_revision_range_dir_subdir")?;
+    repo.write(
+        "src/nested/keep.rs",
+        "pub fn keep() {\n    println!(\"before keep\");\n}\n",
+    )?;
+    repo.write(
+        "src/skip.rs",
+        "pub fn skip() {\n    println!(\"before skip\");\n}\n",
+    )?;
+    repo.commit_all("Initial")?;
+    let start_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let start_revision = start_revision.trim().to_string();
+
+    repo.git(&["checkout", "-b", "feature/history-range-dir-subdir"])?;
+    repo.write(
+        "src/nested/keep.rs",
+        "pub fn keep() {\n    println!(\"range keep marker\");\n}\n",
+    )?;
+    repo.write(
+        "src/skip.rs",
+        "pub fn skip() {\n    println!(\"range skip marker\");\n}\n",
+    )?;
+    repo.commit_all("Range end")?;
+
+    let end_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let end_revision = end_revision.trim().to_string();
+    let subdir = repo.path.join("src");
+
+    repo.write(
+        "src/nested/keep.rs",
+        "pub fn keep() {\n    println!(\"later keep marker\");\n}\n",
+    )?;
+    repo.write(
+        "src/skip.rs",
+        "pub fn skip() {\n    println!(\"later skip marker\");\n}\n",
+    )?;
+    repo.commit_all("Later revision")?;
+
+    let output = repo.run_in(
+        &[
+            "review",
+            "--json",
+            "--target",
+            "dir:src/nested",
+            "--target",
+            &format!("rev:{start_revision}..{end_revision}"),
+        ],
+        &subdir,
+    )?;
+    let files = json_array(&output)?;
+
+    assert_eq!(
+        files.len(),
+        1,
+        "expected only the nested subtree file: {files:?}"
+    );
+    let blocks = files[0]["blocks"].as_array().context("blocks")?;
+    let contents = blocks
+        .iter()
+        .filter_map(|block| block["content"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("range keep marker")),
+        "historical range dir review did not use end revision subtree content: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("range skip marker")),
+        "historical range dir review leaked content outside the subtree: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("later keep marker")
+                && !content.contains("later skip marker")),
+        "historical range dir review leaked later HEAD content: {contents:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_review_historical_deletion_target_and_range_preserve_deleted_base_content() -> Result<()> {
     // GIVEN: a historical target deletes a file and later HEAD reintroduces that path with different content
     let repo = TestRepo::new("review_historical_deleted_content")?;

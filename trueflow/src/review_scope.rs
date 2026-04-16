@@ -104,7 +104,7 @@ impl CliSemanticReviewScope {
             Self::DirtyWorktree => "dirty worktree".to_string(),
             Self::MainDiff => "diff vs main".to_string(),
             Self::File(path) => format!("file {path}"),
-            Self::Dir(path) => format!("dir {path}"),
+            Self::Dir(path) => format!("dir:{path}"),
             Self::Revision(revision) => format!("revision {revision}"),
             Self::RevisionRange(range) => {
                 format!("revisions {}..{}", range.start, range.end)
@@ -124,6 +124,8 @@ impl CliSemanticReviewScope {
                 start: range.start.as_str().to_string(),
                 end: range.end.as_str().to_string(),
             },
+            // Workdir-scoped explicit path selections still render through the
+            // main-diff TUI view; the CLI scope carries the path restriction.
             Self::DirtyWorktree
             | Self::MainDiff
             | Self::File(_)
@@ -320,6 +322,21 @@ mod tests {
             CliSemanticReviewScope::File(RepoPath::new("src/lib.rs").unwrap())
         );
         assert_eq!(scope.label(), "file src/lib.rs");
+        assert_eq!(scope.tui_scope(), ReviewScope::MainDiff);
+    }
+
+    #[test]
+    fn cli_semantic_review_scope_preserves_single_dir_target() {
+        let scope = CliSemanticReviewScope::from_cli(
+            false,
+            &[ReviewTarget::Dir(RepoPath::new("src/nested").unwrap())],
+        )
+        .unwrap_or_else(|error| panic!("expected dir cli scope: {error}"));
+        assert_eq!(
+            scope,
+            CliSemanticReviewScope::Dir(RepoPath::new("src/nested").unwrap())
+        );
+        assert_eq!(scope.label(), "dir:src/nested");
         assert_eq!(scope.tui_scope(), ReviewScope::MainDiff);
     }
 
