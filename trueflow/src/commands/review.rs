@@ -3,7 +3,6 @@ use crate::block::{Block, BlockKind};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::coverage::{CoverageBuildOptions, CoverageIndex};
-use crate::path_utils;
 use crate::policy::{should_skip_container_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
 use crate::review_metadata;
@@ -316,7 +315,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         &tree,
         &database,
         &CoverageBuildOptions {
-            workdir_prefix: workdir_prefix.clone(),
+            workdir_prefix,
         },
     )?;
 
@@ -325,10 +324,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     let mut unreviewed_block_nodes = HashSet::new();
 
     for file in files {
-        if !query
-            .path_selection
-            .includes(&file.path, workdir_prefix.as_deref())?
-        {
+        if !query.path_selection.includes(&file.path) {
             continue;
         }
 
@@ -336,12 +332,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         let file_diff_hunks = if let (Some(repo), Some(diff_targets)) =
             (review_repo.as_ref(), query.diff_selection.targets())
         {
-            Some(diff_hunks_for_file_targets(
-                repo,
-                diff_targets,
-                &file.path,
-                workdir_prefix.as_deref(),
-            )?)
+            Some(diff_hunks_for_file_targets(repo, diff_targets, &file.path)?)
         } else {
             None
         };
@@ -451,13 +442,8 @@ fn collect_diff_scoped_review(
     files: Vec<crate::block::FileState>,
     diagnostics: Vec<ReviewDiagnostic>,
 ) -> Result<CollectedReview> {
-    let review_files = collect_diff_review_files(
-        query,
-        diff_context.repo,
-        files,
-        diff_context.diff_targets,
-        diff_context.workdir_prefix,
-    )?;
+    let review_files =
+        collect_diff_review_files(query, diff_context.repo, files, diff_context.diff_targets)?;
     let (tree, diff_block_sides, file_change_kinds, block_change_kinds) =
         build_tree_from_diff_review_files(&review_files)?;
     let coverage = CoverageIndex::build(
@@ -562,33 +548,26 @@ fn collect_diff_review_files(
     repo: &gix::Repository,
     files: Vec<crate::block::FileState>,
     diff_targets: &[ReviewDiffTarget],
-    workdir_prefix: Option<&str>,
 ) -> Result<Vec<DiffReviewFile>> {
     let mut head_files_by_path = files
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
-    let mut selected_paths =
-        selected_review_paths(&query.path_selection, &head_files_by_path, workdir_prefix)?;
+    let mut selected_paths = selected_review_paths(&query.path_selection, &head_files_by_path);
     selected_paths.sort();
 
     let mut review_files = Vec::new();
     for path in selected_paths {
-        let display_path = display_path_for_workdir_prefix(&path, workdir_prefix)?;
-        let repo_relative_path = RepoPath::new(path_utils::repo_relative_path_for_diff(
-            display_path.as_str(),
-            workdir_prefix,
-        ))?;
-        let head_file = head_files_by_path
-            .remove(&path)
-            .or_else(|| head_files_by_path.remove(&display_path));
+        let display_path = path.clone();
+        let repo_relative_path = path.clone();
+        let head_file = head_files_by_path.remove(&path);
         let base_files = base_file_states_for_diff_targets(
             repo,
             diff_targets,
             &display_path,
             &repo_relative_path,
         )?;
-        let hunks = diff_hunks_for_file_targets(repo, diff_targets, &display_path, workdir_prefix)?;
+        let hunks = diff_hunks_for_file_targets(repo, diff_targets, &display_path)?;
 
         let mut base_blocks = dedupe_blocks(
             base_files
@@ -651,10 +630,9 @@ fn collect_diff_review_files(
 fn selected_review_paths(
     path_selection: &ReviewPathSelection,
     head_files_by_path: &HashMap<RepoPath, crate::block::FileState>,
-    workdir_prefix: Option<&str>,
-) -> Result<Vec<RepoPath>> {
+) -> Vec<RepoPath> {
     match path_selection {
-        ReviewPathSelection::All => Ok(head_files_by_path.keys().cloned().collect()),
+        ReviewPathSelection::All => head_files_by_path.keys().cloned().collect(),
         ReviewPathSelection::Scoped {
             files,
             dirs,
@@ -674,35 +652,13 @@ fn selected_review_paths(
 
             let mut selected = Vec::new();
             for path in candidate_paths {
-                if path_selection.includes(&path, workdir_prefix)? {
+                if path_selection.includes(&path) {
                     selected.push(path);
                 }
             }
-            Ok(selected)
+            selected
         }
     }
-}
-
-fn display_path_for_workdir_prefix(
-    path: &RepoPath,
-    workdir_prefix: Option<&str>,
-) -> Result<RepoPath> {
-    let Some(prefix) = workdir_prefix
-        .map(path_utils::normalize_path_str)
-        .filter(|prefix| !prefix.is_empty())
-    else {
-        return Ok(path.clone());
-    };
-
-    let normalized = path_utils::normalize_path_str(path.as_str());
-    let prefixed_root = format!("{prefix}/");
-    if let Some(stripped) = normalized.strip_prefix(&prefixed_root) {
-        return RepoPath::new(stripped);
-    }
-    if normalized == prefix {
-        return RepoPath::new(path.as_str());
-    }
-    RepoPath::new(path.as_str())
 }
 
 fn base_file_states_for_diff_targets(
@@ -864,25 +820,20 @@ fn diff_hunks_for_file_targets(
     repo: &gix::Repository,
     targets: &[ReviewDiffTarget],
     file_path: &RepoPath,
-    workdir_prefix: Option<&str>,
 ) -> Result<Vec<vcs::DiffHunk>> {
-    let repo_relative_path = RepoPath::new(path_utils::repo_relative_path_for_diff(
-        file_path.as_str(),
-        workdir_prefix,
-    ))?;
     let mut hunks = Vec::new();
 
     for target in targets {
         let target_hunks = match target {
-            ReviewDiffTarget::MainDiff => vcs::diff_hunks_for_file(repo, &repo_relative_path)?,
+            ReviewDiffTarget::MainDiff => vcs::diff_hunks_for_file(repo, file_path)?,
             ReviewDiffTarget::Revision(revision) => {
-                vcs::diff_hunks_for_file_in_revision(repo, revision.as_str(), &repo_relative_path)?
+                vcs::diff_hunks_for_file_in_revision(repo, revision.as_str(), file_path)?
             }
             ReviewDiffTarget::RevisionRange(range) => vcs::diff_hunks_for_file_in_range(
                 repo,
                 range.start.as_str(),
                 range.end.as_str(),
-                &repo_relative_path,
+                file_path,
             )?,
         };
         hunks.extend(target_hunks);

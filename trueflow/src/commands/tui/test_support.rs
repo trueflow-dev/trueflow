@@ -559,7 +559,6 @@ where
         editing_validation: None,
         confirm_batch: crate::config::BatchConfirmPolicy::Never,
         repo_name: "repo".to_string(),
-        workdir_prefix: None,
         file_cache: HashMap::new(),
         root_cursor,
         focus_block: None,
@@ -642,7 +641,6 @@ fn build_state_with_single_rust_block_file(
         editing_validation: None,
         confirm_batch: crate::config::BatchConfirmPolicy::Never,
         repo_name: "repo".to_string(),
-        workdir_prefix: None,
         file_cache: HashMap::from([(
             PathBuf::from(repo_path),
             Arc::from(

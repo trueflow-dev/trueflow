@@ -125,7 +125,8 @@ pub struct ScanResult {
 }
 
 pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<ScanResult> {
-    let root = root.as_ref();
+    let root = canonicalize_or_original(root.as_ref());
+    let repo_path_base = repo_path_base_for_scan_root(&root);
     let mut diagnostics = Vec::new();
     let mut cache = ScanCacheReport {
         read: ScanCacheReadStatus::Disabled,
@@ -135,7 +136,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     };
 
     let cached_entry = if options.cache_mode.reads_enabled() {
-        match load_cache_entry(root, options) {
+        match load_cache_entry(&root, options) {
             Ok(Some(entry)) => {
                 cache.read = ScanCacheReadStatus::Hit;
                 Some(index_cached_files(entry))
@@ -158,7 +159,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         None
     };
 
-    let inventory = collect_scan_inventory(root, options, &mut diagnostics)?;
+    let inventory = collect_scan_inventory(&root, &repo_path_base, options, &mut diagnostics)?;
 
     let mut files = Vec::new();
     let mut cache_files = Vec::with_capacity(inventory.len());
@@ -176,7 +177,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
             }
             None => {
                 cache.rescanned_files += 1;
-                scan_file(root, &scan_input)
+                scan_file(&repo_path_base, &scan_input)
             }
         };
 
@@ -188,7 +189,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     sort_diagnostics(&mut diagnostics);
 
     if options.cache_mode.writes_enabled() {
-        match write_cache(root, options, cache_files) {
+        match write_cache(&root, options, cache_files) {
             Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
             Err(err) => {
                 cache.write = ScanCacheWriteStatus::Error;
@@ -209,10 +210,9 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     })
 }
 
-fn build_walker(root: &Path, options: &ScanOptions) -> Result<ignore::Walk> {
-    let matcher = IgnoreMatcher::new(root, options)?;
-    let root = root.to_path_buf();
-    let mut builder = WalkBuilder::new(&root);
+fn build_walker(root: &Path, repo_path_base: &Path, options: &ScanOptions) -> Result<ignore::Walk> {
+    let matcher = IgnoreMatcher::new(root, repo_path_base, options)?;
+    let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
         .git_ignore(true)
@@ -220,18 +220,20 @@ fn build_walker(root: &Path, options: &ScanOptions) -> Result<ignore::Walk> {
         .git_global(true)
         .parents(true)
         .require_git(false);
-    builder.filter_entry(move |entry| !matcher.matches(&root, entry));
+    builder.filter_entry(move |entry| !matcher.matches(entry));
     Ok(builder.build())
 }
 
 struct IgnoreMatcher {
+    walk_root: PathBuf,
+    repo_path_base: PathBuf,
     names: HashSet<String>,
     path_prefixes: Vec<RepoPath>,
     glob_matcher: Gitignore,
 }
 
 impl IgnoreMatcher {
-    fn new(root: &Path, options: &ScanOptions) -> Result<Self> {
+    fn new(root: &Path, repo_path_base: &Path, options: &ScanOptions) -> Result<Self> {
         let mut builder = GitignoreBuilder::new(root);
         builder.allow_unclosed_class(false);
         for pattern in &options.ignore_globs {
@@ -239,6 +241,8 @@ impl IgnoreMatcher {
         }
 
         Ok(Self {
+            walk_root: root.to_path_buf(),
+            repo_path_base: repo_path_base.to_path_buf(),
             names: options.ignore_names.iter().cloned().collect(),
             path_prefixes: options.ignore_path_prefixes.clone(),
             glob_matcher: if options.ignore_globs.is_empty() {
@@ -249,7 +253,7 @@ impl IgnoreMatcher {
         })
     }
 
-    fn matches(&self, root: &Path, entry: &DirEntry) -> bool {
+    fn matches(&self, entry: &DirEntry) -> bool {
         let Some(name) = entry.path().file_name().and_then(|name| name.to_str()) else {
             return false;
         };
@@ -260,10 +264,13 @@ impl IgnoreMatcher {
         let is_dir = entry
             .file_type()
             .is_some_and(|file_type| file_type.is_dir());
-        let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+        let relative = entry
+            .path()
+            .strip_prefix(&self.walk_root)
+            .unwrap_or(entry.path());
 
         if !self.path_prefixes.is_empty()
-            && let Ok(repo_path) = RepoPath::from_relative_path(relative)
+            && let Ok(repo_path) = normalize_cache_key(&self.repo_path_base, entry.path())
             && self
                 .path_prefixes
                 .iter()
@@ -441,14 +448,26 @@ fn cache_root_hash(root: &Path) -> String {
     hash_str(identity.to_string_lossy().as_ref())
 }
 
+fn repo_path_base_for_scan_root(root: &Path) -> PathBuf {
+    gix::discover(root)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
+fn canonicalize_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn collect_scan_inventory(
     root: &Path,
+    repo_path_base: &Path,
     options: &ScanOptions,
     diagnostics: &mut Vec<ScanDiagnostic>,
 ) -> Result<Vec<ScanInput>> {
     let mut inputs = Vec::new();
 
-    for entry in build_walker(root, options)? {
+    for entry in build_walker(root, repo_path_base, options)? {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -465,12 +484,13 @@ fn collect_scan_inventory(
             continue;
         }
 
-        let path = normalize_cache_key(root, entry.path())?;
+        let path = normalize_cache_key(repo_path_base, entry.path())?;
         let metadata = match fs::metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(err) => {
                 let err = anyhow::Error::from(err);
-                let diagnostic = diagnostic_for_process_file_error(root, entry.path(), &err);
+                let diagnostic =
+                    diagnostic_for_process_file_error(repo_path_base, entry.path(), &err);
                 log_process_file_error(&diagnostic, &err);
                 diagnostics.push(diagnostic);
                 continue;
@@ -480,7 +500,8 @@ fn collect_scan_inventory(
             Ok(modified) => modified,
             Err(err) => {
                 let err = anyhow::Error::from(err);
-                let diagnostic = diagnostic_for_process_file_error(root, entry.path(), &err);
+                let diagnostic =
+                    diagnostic_for_process_file_error(repo_path_base, entry.path(), &err);
                 log_process_file_error(&diagnostic, &err);
                 diagnostics.push(diagnostic);
                 continue;
@@ -501,14 +522,15 @@ fn collect_scan_inventory(
     Ok(inputs)
 }
 
-fn scan_file(root: &Path, input: &ScanInput) -> CachedFileEntry {
-    let outcome = match process_file(root, &input.full_path) {
+fn scan_file(repo_path_base: &Path, input: &ScanInput) -> CachedFileEntry {
+    let outcome = match process_file(repo_path_base, &input.full_path) {
         Ok(file_scan) => CachedFileOutcome::Included {
             file_state: file_scan.file_state,
             diagnostics: file_scan.diagnostics,
         },
         Err(err) => {
-            let diagnostic = diagnostic_for_process_file_error(root, &input.full_path, &err);
+            let diagnostic =
+                diagnostic_for_process_file_error(repo_path_base, &input.full_path, &err);
             log_process_file_error(&diagnostic, &err);
             CachedFileOutcome::Skipped {
                 diagnostics: vec![diagnostic],
@@ -542,8 +564,8 @@ fn append_cached_outcome(
     }
 }
 
-fn normalize_cache_key(root: &Path, path: &Path) -> Result<RepoPath> {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+fn normalize_cache_key(repo_path_base: &Path, path: &Path) -> Result<RepoPath> {
+    let relative = path.strip_prefix(repo_path_base).unwrap_or(path);
     RepoPath::from_relative_path(relative)
 }
 
@@ -599,11 +621,11 @@ fn diagnostic_for_walk_error(_root: &Path, err: &ignore::Error) -> ScanDiagnosti
 }
 
 fn diagnostic_for_process_file_error(
-    root: &Path,
+    repo_path_base: &Path,
     path: &Path,
     err: &anyhow::Error,
 ) -> ScanDiagnostic {
-    let path = normalize_cache_key(root, path).ok();
+    let path = normalize_cache_key(repo_path_base, path).ok();
     let reason = if err.downcast_ref::<std::str::Utf8Error>().is_some() {
         "skipped invalid UTF-8 file".to_string()
     } else if err
@@ -625,9 +647,9 @@ struct ProcessedFile {
     diagnostics: Vec<ScanDiagnostic>,
 }
 
-fn process_file(root: &Path, path: &Path) -> Result<ProcessedFile> {
+fn process_file(repo_path_base: &Path, path: &Path) -> Result<ProcessedFile> {
     let file_type = analysis::analyze_file(path);
-    let relative_path = path.strip_prefix(root).unwrap_or(path);
+    let relative_path = path.strip_prefix(repo_path_base).unwrap_or(path);
     let normalized_path = RepoPath::from_relative_path(relative_path)?;
 
     if matches!(file_type, FileType::Binary) {
@@ -668,6 +690,7 @@ fn process_file(root: &Path, path: &Path) -> Result<ProcessedFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::Duration;
 
     #[test]
@@ -692,6 +715,32 @@ mod tests {
             &RepoPath::new("src/generate.rs").unwrap(),
             &prefix,
         ));
+    }
+
+    #[test]
+    fn scan_directory_uses_repo_root_relative_paths_from_subdir_roots() {
+        let repo_root = std::env::temp_dir().join("trueflow_tests").join(format!(
+            "scanner_repo_root_relative_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(repo_root.join("src/nested")).unwrap();
+        fs::write(repo_root.join("src/nested/lib.rs"), "fn demo() {}\n").unwrap();
+
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let scan = scan_directory(repo_root.join("src"), &ScanOptions::default())
+            .unwrap_or_else(|error| panic!("scan from subdir root: {error}"));
+        let paths = scan
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![RepoPath::new("src/nested/lib.rs").unwrap()]);
     }
 
     #[test]

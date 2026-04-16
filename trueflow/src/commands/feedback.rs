@@ -207,12 +207,12 @@ fn collect_feedback_entries(
     let mut entries = Vec::new();
     for file in files {
         if let Some(selection) = &explicit_selection
-            && !selection.includes(&file.path, workdir_prefix)?
+            && !selection.includes(&file.path)
         {
             continue;
         }
         if let Some(selection) = &changed_selection
-            && !selection.includes(&file.path, workdir_prefix)?
+            && !selection.includes(&file.path)
         {
             continue;
         }

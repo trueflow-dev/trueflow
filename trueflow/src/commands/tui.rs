@@ -275,7 +275,6 @@ struct AppState {
     editing_validation: Option<EditingValidation>,
     confirm_batch: BatchConfirmPolicy,
     repo_name: String,
-    workdir_prefix: Option<String>,
     file_cache: HashMap<PathBuf, Arc<[String]>>,
     root_cursor: Option<TreeNodeId>,
     focus_block: Option<TreeNodeId>,
@@ -303,7 +302,6 @@ struct ReviewStateBuildOptions {
     diff_line_numbers: TuiDiffLineNumbers,
     keybinds: TuiKeybindsConfig,
     scope_label: String,
-    workdir_prefix: Option<String>,
     speed_read_config: TuiSpeedReadConfig,
     speed_read_config_path: PathBuf,
 }
@@ -530,7 +528,6 @@ pub fn run(
                     diff_line_numbers: config.tui.diff_line_numbers,
                     keybinds: config.tui.keybinds,
                     scope_label: launch.scope_label,
-                    workdir_prefix: workdir_prefix_from_git_root(),
                     speed_read_config: config.tui.speed_read.clone(),
                     speed_read_config_path: speed_read_config_path_for_repo_root(),
                 },
@@ -687,7 +684,6 @@ fn build_review_state(
         editing_validation: None,
         confirm_batch: options.confirm_batch,
         repo_name: detect_repo_name(context),
-        workdir_prefix: options.workdir_prefix,
         file_cache: HashMap::new(),
         root_cursor,
         focus_block,
@@ -3890,9 +3886,7 @@ fn cached_file_diff_for_node<'a>(
     }
 
     let review_scope = state.review_scope.clone();
-    let workdir_prefix = state.workdir_prefix.clone();
-    let diff_path =
-        path_utils::repo_relative_path_for_diff(node.path.as_str(), workdir_prefix.as_deref());
+    let diff_path = node.path.as_str().to_string();
     let path = PathBuf::from(&diff_path);
 
     Some(ensure_cached_file_diff(
@@ -4426,7 +4420,6 @@ mod diff_scope_tests {
 
     fn build_test_state(
         review_scope: ScopePreset,
-        workdir_prefix: Option<String>,
         file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
     ) -> AppState {
         let tree = TreeBuilder::new().finalize();
@@ -4451,7 +4444,6 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
-            workdir_prefix,
             file_cache: HashMap::new(),
             root_cursor: None,
             focus_block: None,
@@ -4518,7 +4510,6 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
-            workdir_prefix: None,
             file_cache: HashMap::new(),
             root_cursor: None,
             focus_block: Some(block_id),
@@ -4599,7 +4590,6 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
-            workdir_prefix: None,
             file_cache: HashMap::new(),
             root_cursor: Some(first_file),
             focus_block: None,
@@ -4690,7 +4680,6 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
-            workdir_prefix: None,
             file_cache: HashMap::from([(
                 PathBuf::from(&repo_path),
                 Arc::from(
@@ -4777,7 +4766,6 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Threshold(2),
             repo_name: "repo".to_string(),
-            workdir_prefix: None,
             file_cache: HashMap::new(),
             root_cursor: Some(file),
             focus_block: None,
@@ -4845,7 +4833,6 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
-            workdir_prefix: None,
             file_cache: HashMap::from([(
                 PathBuf::from(repo_path),
                 Arc::from(
@@ -5635,7 +5622,6 @@ mod diff_scope_tests {
                 diff_line_numbers: TuiDiffLineNumbers::Disabled,
                 keybinds: TuiKeybindsConfig::default(),
                 scope_label: "rev:abc1234..HEAD".to_string(),
-                workdir_prefix: None,
                 speed_read_config: TuiSpeedReadConfig::default(),
                 speed_read_config_path: PathBuf::from("trueflow.toml"),
             },
@@ -5855,7 +5841,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_mouse_event_scrolls_when_pointer_is_inside_code_pane() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.code_rect = Rect {
             x: 10,
             y: 5,
@@ -5885,7 +5871,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_mouse_event_ignores_scroll_outside_code_pane() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.code_rect = Rect {
             x: 10,
             y: 5,
@@ -5915,7 +5901,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_mouse_event_ignores_scroll_while_editing() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.code_rect = Rect {
             x: 10,
             y: 5,
@@ -6263,7 +6249,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_editing_submit_with_empty_note_sets_validation_and_keeps_editing() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6286,7 +6272,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_editing_submit_with_action_error_preserves_editor_state() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6311,7 +6297,7 @@ mod diff_scope_tests {
 
     #[test]
     fn editing_cancel_clears_non_empty_buffer_before_exit() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6333,7 +6319,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_appends_single_line_text_while_editing() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6353,7 +6339,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_preserves_multiline_text_while_editing() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6370,7 +6356,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_ignores_normal_mode() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_buffer = "note".to_string();
 
         let rerender = handle_paste_event(&mut state, " plus");
@@ -6381,7 +6367,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_ignores_confirm_batch_mode() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::ConfirmBatch {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -7258,7 +7244,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_mode_banner_line_shows_navigation_mode() {
-        let mut state = build_test_state(ScopePreset::All, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::All, HashMap::new());
         state.total_blocks = 1;
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 1;
@@ -7908,7 +7894,6 @@ mod diff_scope_tests {
                 id: revision,
                 summary: "Update greeting".to_string(),
             },
-            Some("pkg".to_string()),
             HashMap::from([(
                 PathBuf::from("pkg/src/lib.rs"),
                 vcs::FileDiff::Text {
@@ -7980,7 +7965,7 @@ mod diff_scope_tests {
 
     #[test]
     fn footer_progress_uses_session_remaining_blocks_not_scope_total() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.total_blocks = 5;
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 1;
@@ -7992,7 +7977,7 @@ mod diff_scope_tests {
 
     #[test]
     fn footer_progress_reaches_complete_when_session_blocks_are_done() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.total_blocks = 5;
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 0;
@@ -8006,7 +7991,7 @@ mod diff_scope_tests {
 
     #[test]
     fn recap_summary_reports_no_activity_when_session_is_empty() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.total_blocks = 3;
         state.initial_remaining_blocks = 0;
         state.remaining_blocks = 0;
@@ -8022,7 +8007,7 @@ mod diff_scope_tests {
 
     #[test]
     fn recap_summary_reports_scope_coverage_delta_and_rollups() {
-        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.total_blocks = 10;
         state.initial_remaining_blocks = 4;
         state.remaining_blocks = 0;
@@ -8143,7 +8128,7 @@ mod diff_scope_tests {
 
     #[test]
     fn toggle_speed_read_mode_ignores_non_block_nodes() {
-        let mut state = build_test_state(ScopePreset::All, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::All, HashMap::new());
         state.navigator.jump_root();
 
         toggle_speed_read_mode(&mut state);

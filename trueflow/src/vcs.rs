@@ -461,20 +461,8 @@ fn collect_file_states_in_tree(
     Ok(())
 }
 
-fn display_path_for_tree_entry(path: &str, workdir_prefix: Option<&str>) -> Result<RepoPath> {
+fn display_path_for_tree_entry(path: &str, _workdir_prefix: Option<&str>) -> Result<RepoPath> {
     let normalized_path = path_utils::normalize_path_str(path);
-    let Some(prefix) = workdir_prefix
-        .map(path_utils::normalize_path_str)
-        .filter(|prefix| !prefix.is_empty())
-    else {
-        return RepoPath::new(normalized_path);
-    };
-
-    let prefixed_root = format!("{prefix}/");
-    if let Some(stripped) = normalized_path.strip_prefix(&prefixed_root) {
-        return RepoPath::new(stripped);
-    }
-
     RepoPath::new(normalized_path)
 }
 

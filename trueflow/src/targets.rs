@@ -109,9 +109,9 @@ pub enum ReviewPathSelection {
 }
 
 impl ReviewPathSelection {
-    pub fn includes(&self, file_path: &RepoPath, workdir_prefix: Option<&str>) -> Result<bool> {
+    pub fn includes(&self, file_path: &RepoPath) -> bool {
         match self {
-            Self::All => Ok(true),
+            Self::All => true,
             Self::Scoped {
                 files,
                 dirs,
@@ -120,53 +120,28 @@ impl ReviewPathSelection {
                 let explicit_match = if files.is_empty() && dirs.is_empty() {
                     true
                 } else {
-                    path_matches_specific_selection(files, file_path, workdir_prefix)?
-                        || path_matches_dir_selection(dirs, file_path, workdir_prefix)?
+                    path_matches_specific_selection(files, file_path)
+                        || path_matches_dir_selection(dirs, file_path)
                 };
 
                 if !explicit_match {
-                    return Ok(false);
+                    return false;
                 }
 
-                match changed {
-                    Some(changed_paths) => {
-                        path_matches_specific_selection(changed_paths, file_path, workdir_prefix)
-                    }
-                    None => Ok(true),
-                }
+                changed.as_ref().is_none_or(|changed_paths| {
+                    path_matches_specific_selection(changed_paths, file_path)
+                })
             }
         }
     }
 }
 
-fn path_matches_specific_selection(
-    targets: &HashSet<RepoPath>,
-    file_path: &RepoPath,
-    workdir_prefix: Option<&str>,
-) -> Result<bool> {
-    if targets.contains(file_path) {
-        return Ok(true);
-    }
-    if let Some(prefix) = workdir_prefix {
-        let repo_path = RepoPath::new(format!("{prefix}/{file_path}"))?;
-        return Ok(targets.contains(&repo_path));
-    }
-    Ok(false)
+fn path_matches_specific_selection(targets: &HashSet<RepoPath>, file_path: &RepoPath) -> bool {
+    targets.contains(file_path)
 }
 
-fn path_matches_dir_selection(
-    dirs: &[RepoPath],
-    file_path: &RepoPath,
-    workdir_prefix: Option<&str>,
-) -> Result<bool> {
-    if dirs.iter().any(|dir| path_under_dir(file_path, dir)) {
-        return Ok(true);
-    }
-    if let Some(prefix) = workdir_prefix {
-        let repo_path = RepoPath::new(format!("{prefix}/{file_path}"))?;
-        return Ok(dirs.iter().any(|dir| path_under_dir(&repo_path, dir)));
-    }
-    Ok(false)
+fn path_matches_dir_selection(dirs: &[RepoPath], file_path: &RepoPath) -> bool {
+    dirs.iter().any(|dir| path_under_dir(file_path, dir))
 }
 
 /// True if `file` equals `dir` or lives under `dir` as a subtree.
@@ -550,21 +525,9 @@ mod tests {
             dirs: vec![RepoPath::new("website").unwrap()],
             changed: None,
         };
-        assert!(
-            selection
-                .includes(&RepoPath::new("website/index.html").unwrap(), None)
-                .unwrap()
-        );
-        assert!(
-            selection
-                .includes(&RepoPath::new("website/a/b/c.js").unwrap(), None)
-                .unwrap()
-        );
-        assert!(
-            selection
-                .includes(&RepoPath::new("website").unwrap(), None)
-                .unwrap()
-        );
+        assert!(selection.includes(&RepoPath::new("website/index.html").unwrap()));
+        assert!(selection.includes(&RepoPath::new("website/a/b/c.js").unwrap()));
+        assert!(selection.includes(&RepoPath::new("website").unwrap()));
     }
 
     #[test]
@@ -574,16 +537,8 @@ mod tests {
             dirs: vec![RepoPath::new("website").unwrap()],
             changed: None,
         };
-        assert!(
-            !selection
-                .includes(&RepoPath::new("docs/intro.md").unwrap(), None)
-                .unwrap()
-        );
-        assert!(
-            !selection
-                .includes(&RepoPath::new("website-next/index.html").unwrap(), None)
-                .unwrap()
-        );
+        assert!(!selection.includes(&RepoPath::new("docs/intro.md").unwrap()));
+        assert!(!selection.includes(&RepoPath::new("website-next/index.html").unwrap()));
     }
 
     #[test]
@@ -594,7 +549,7 @@ mod tests {
             dirs: vec![RepoPath::new("website").unwrap()],
             changed: None,
         };
-        assert!(selection.includes(&explicit, None).unwrap());
+        assert!(selection.includes(&explicit));
     }
 
     #[test]
@@ -606,25 +561,13 @@ mod tests {
                 [RepoPath::new("website/index.html").unwrap()],
             )),
         };
-        assert!(
-            selection
-                .includes(&RepoPath::new("website/index.html").unwrap(), None)
-                .unwrap()
-        );
-        assert!(
-            !selection
-                .includes(&RepoPath::new("website/other.html").unwrap(), None)
-                .unwrap()
-        );
-        assert!(
-            !selection
-                .includes(&RepoPath::new("docs/index.html").unwrap(), None)
-                .unwrap()
-        );
+        assert!(selection.includes(&RepoPath::new("website/index.html").unwrap()));
+        assert!(!selection.includes(&RepoPath::new("website/other.html").unwrap()));
+        assert!(!selection.includes(&RepoPath::new("docs/index.html").unwrap()));
     }
 
     #[test]
-    fn scoped_selection_uses_workdir_prefix_for_repo_relative_dir_targets() {
+    fn scoped_selection_matches_repo_relative_paths_directly() {
         let selection = ReviewPathSelection::Scoped {
             files: HashSet::new(),
             dirs: vec![RepoPath::new("src/nested").unwrap()],
@@ -632,16 +575,8 @@ mod tests {
                 [RepoPath::new("src/nested/keep.rs").unwrap()],
             )),
         };
-        assert!(
-            selection
-                .includes(&RepoPath::new("nested/keep.rs").unwrap(), Some("src"))
-                .unwrap()
-        );
-        assert!(
-            !selection
-                .includes(&RepoPath::new("other.rs").unwrap(), Some("src"))
-                .unwrap()
-        );
+        assert!(selection.includes(&RepoPath::new("src/nested/keep.rs").unwrap()));
+        assert!(!selection.includes(&RepoPath::new("src/other.rs").unwrap()));
     }
 
     #[test]
@@ -737,8 +672,8 @@ mod tests {
         .unwrap_or_else(|error| panic!("expected resolved targets: {error}"));
 
         let selection = resolved.path_selection();
-        assert!(!selection.includes(&file, None).unwrap());
-        assert!(!selection.includes(&other, None).unwrap());
+        assert!(!selection.includes(&file));
+        assert!(!selection.includes(&other));
     }
 
     #[test]
@@ -754,8 +689,8 @@ mod tests {
         );
 
         let selection = resolved.path_selection();
-        assert!(selection.includes(&changed, None).unwrap());
-        assert!(!selection.includes(&other, None).unwrap());
+        assert!(selection.includes(&changed));
+        assert!(!selection.includes(&other));
     }
 
     #[test]
