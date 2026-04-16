@@ -4142,44 +4142,12 @@ mod diff_scope_tests {
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
     use crate::store::ReviewTargetKind;
+    use crate::test_git::{run_git, run_git_stdout};
     use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use uuid::Uuid;
-
-    fn run_git(path: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to execute git {args:?}: {error}"));
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn run_git_stdout(path: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to execute git {args:?}: {error}"));
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .unwrap_or_else(|error| panic!("invalid UTF-8 from git {args:?}: {error}"))
-    }
 
     fn build_test_state(
         review_scope: ReviewScope,

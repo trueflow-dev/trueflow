@@ -4,6 +4,10 @@ use crate::code_comments;
 use crate::hashing::TreeHash;
 use crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
+use crate::tree_sitter_support::{
+    classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
+    kotlin_type_body,
+};
 use crate::{languages, nix_blocks, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
 use tracing::info;
@@ -867,13 +871,6 @@ fn same_tree_sitter_node(left: tree_sitter::Node<'_>, right: tree_sitter::Node<'
         && left.end_byte() == right.end_byte()
 }
 
-fn elisp_list_head_symbol<'a>(node: tree_sitter::Node<'a>, content: &'a str) -> Option<&'a str> {
-    let head = node.named_child(0)?;
-    (head.kind() == "symbol")
-        .then(|| head.utf8_text(content.as_bytes()).ok())
-        .flatten()
-}
-
 fn collect_rust_impl_items(parent: &Block, impl_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
     Ok(rust::collect_impl_member_spans(impl_node)
         .into_iter()
@@ -1633,19 +1630,6 @@ fn collect_java_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<B
         .collect()
 }
 
-fn kotlin_type_body(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
-    first_child_of_kind(node, "class_body").or_else(|| first_child_of_kind(node, "enum_class_body"))
-}
-
-fn first_child_of_kind<'a>(
-    node: tree_sitter::Node<'a>,
-    kind: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
 fn collect_kotlin_type_items(
     parent: &Block,
     body: tree_sitter::Node<'_>,
@@ -1705,30 +1689,6 @@ fn collect_csharp_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec
             ))
         })
         .collect()
-}
-
-fn classify_kotlin_class_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
-    let name_start = node
-        .child_by_field_name("name")
-        .map(|name| name.start_byte())
-        .unwrap_or_else(|| node.end_byte());
-    let header = &content[node.start_byte()..name_start.min(node.end_byte())];
-
-    if header.contains("interface") {
-        BlockKind::Interface
-    } else if header.contains("enum") {
-        BlockKind::Enum
-    } else {
-        BlockKind::Class
-    }
-}
-
-fn classify_kotlin_property_kind(text: &str) -> BlockKind {
-    if text.contains("var ") {
-        BlockKind::Variable
-    } else {
-        BlockKind::Const
-    }
 }
 
 fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {

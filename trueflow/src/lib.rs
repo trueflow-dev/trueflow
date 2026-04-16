@@ -35,7 +35,10 @@ pub mod store;
 pub mod sub_splitter;
 pub(crate) mod swift;
 pub mod targets;
+#[cfg(test)]
+pub(crate) mod test_git;
 pub mod text_split;
 pub(crate) mod toml_blocks;
 pub mod tree;
+pub(crate) mod tree_sitter_support;
 pub mod vcs;

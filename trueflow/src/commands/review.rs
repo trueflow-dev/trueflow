@@ -1223,44 +1223,10 @@ fn line_range_overlap(a: &std::ops::Range<u32>, b: &std::ops::Range<u32>) -> u32
 mod tests {
     use super::*;
     use crate::hashing::TreeHash;
+    use crate::test_git::{CurrentDirGuard, run_git};
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
     use uuid::Uuid;
-
-    struct CurrentDirGuard(std::path::PathBuf);
-
-    impl CurrentDirGuard {
-        fn push(path: &Path) -> Self {
-            let current = std::env::current_dir()
-                .unwrap_or_else(|error| panic!("failed to read current directory: {error}"));
-            std::env::set_current_dir(path)
-                .unwrap_or_else(|error| panic!("failed to enter test directory {path:?}: {error}"));
-            Self(current)
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.0)
-                .unwrap_or_else(|error| panic!("failed to restore current directory: {error}"));
-        }
-    }
-
-    fn run_git(path: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to execute git {args:?}: {error}"));
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     fn make_block(kind: BlockKind, tags: &[&str]) -> Block {
         Block {

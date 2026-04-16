@@ -5,6 +5,10 @@ use crate::complexity;
 use crate::hashing::TreeHash;
 use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
+use crate::tree_sitter_support::{
+    classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
+    first_child_of_kind, kotlin_type_body,
+};
 use crate::{languages, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
 use std::sync::LazyLock;
@@ -953,15 +957,6 @@ fn collect_nix_binding_boundaries(
         .collect()
 }
 
-fn first_child_of_kind<'a>(
-    node: tree_sitter::Node<'a>,
-    kind: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
 fn classify_nix_node_kind(kind: &str) -> BlockKind {
     match kind {
         "binding" | "variable_expression" => BlockKind::Variable,
@@ -1065,13 +1060,6 @@ fn map_elisp_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
 
 fn elisp_special_form_head(node: tree_sitter::Node<'_>) -> Option<&str> {
     Some(node.child(1)?.kind())
-}
-
-fn elisp_list_head_symbol<'a>(node: tree_sitter::Node<'a>, content: &'a str) -> Option<&'a str> {
-    let head = node.named_child(0)?;
-    (head.kind() == "symbol")
-        .then(|| head.utf8_text(content.as_bytes()).ok())
-        .flatten()
 }
 
 fn elisp_form_name<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
@@ -1182,30 +1170,6 @@ fn map_kotlin_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
         "class_declaration" => classify_kotlin_class_kind(node, content),
         "object_declaration" => BlockKind::Class,
         _ => BlockKind::Code,
-    }
-}
-
-fn classify_kotlin_class_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
-    let name_start = node
-        .child_by_field_name("name")
-        .map(|name| name.start_byte())
-        .unwrap_or_else(|| node.end_byte());
-    let header = &content[node.start_byte()..name_start.min(node.end_byte())];
-
-    if header.contains("interface") {
-        BlockKind::Interface
-    } else if header.contains("enum") {
-        BlockKind::Enum
-    } else {
-        BlockKind::Class
-    }
-}
-
-fn classify_kotlin_property_kind(text: &str) -> BlockKind {
-    if text.contains("var ") {
-        BlockKind::Variable
-    } else {
-        BlockKind::Const
     }
 }
 
@@ -1416,10 +1380,6 @@ fn collect_kotlin_type_items(
             })
         })
         .collect()
-}
-
-fn kotlin_type_body(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
-    first_child_of_kind(node, "class_body").or_else(|| first_child_of_kind(node, "enum_class_body"))
 }
 
 fn map_kotlin_type_member_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
