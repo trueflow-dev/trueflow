@@ -577,7 +577,10 @@ fn collect_diff_review_files(
     let mut review_files = Vec::new();
     for path in selected_paths {
         let display_path = display_path_for_workdir_prefix(&path, workdir_prefix)?;
-        let repo_relative_path = repo_relative_path_for_diff(&display_path, workdir_prefix)?;
+        let repo_relative_path = RepoPath::new(path_utils::repo_relative_path_for_diff(
+            display_path.as_str(),
+            workdir_prefix,
+        ))?;
         let head_file = head_files_by_path
             .remove(&path)
             .or_else(|| head_files_by_path.remove(&display_path));
@@ -865,7 +868,10 @@ fn diff_hunks_for_file_targets(
     file_path: &RepoPath,
     workdir_prefix: Option<&str>,
 ) -> Result<Vec<vcs::DiffHunk>> {
-    let repo_relative_path = repo_relative_path_for_diff(file_path, workdir_prefix)?;
+    let repo_relative_path = RepoPath::new(path_utils::repo_relative_path_for_diff(
+        file_path.as_str(),
+        workdir_prefix,
+    ))?;
     let mut hunks = Vec::new();
 
     for target in targets {
@@ -885,16 +891,6 @@ fn diff_hunks_for_file_targets(
     }
 
     Ok(hunks)
-}
-
-fn repo_relative_path_for_diff(
-    file_path: &RepoPath,
-    workdir_prefix: Option<&str>,
-) -> Result<RepoPath> {
-    RepoPath::new(path_utils::repo_relative_path_for_diff(
-        file_path.as_str(),
-        workdir_prefix,
-    ))
 }
 
 pub fn collect_main_diff_summary() -> Result<ReviewSummary> {

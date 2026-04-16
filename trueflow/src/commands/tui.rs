@@ -647,7 +647,7 @@ where
     F: FnMut(&str) -> Result<HashSet<RepoPath>>,
 {
     let Some(prefix) = workdir_prefix
-        .map(normalize_path_str)
+        .map(path_utils::normalize_path_str)
         .filter(|p| !p.is_empty())
     else {
         return commits;
@@ -659,16 +659,12 @@ where
             match changed_paths_for_revision(&commit.id) {
                 Ok(paths) => paths
                     .iter()
-                    .any(|path| path_matches_workdir_prefix(path.as_str(), &prefix)),
+                    .any(|path| path_utils::path_matches_workdir_prefix(path.as_str(), &prefix)),
                 // If we can't resolve changed paths, keep the option instead of hiding it.
                 Err(_) => true,
             }
         })
         .collect()
-}
-
-fn path_matches_workdir_prefix(path: &str, prefix: &str) -> bool {
-    path_utils::path_matches_workdir_prefix(path, prefix)
 }
 
 fn workdir_prefix_from_git_root() -> Option<String> {
@@ -683,13 +679,6 @@ fn speed_read_config_path_for_repo_root() -> PathBuf {
     }
 }
 
-fn normalize_path_str(path: &str) -> String {
-    path_utils::normalize_path_str(path)
-}
-
-fn repo_relative_path_for_diff(path: &str, workdir_prefix: Option<&str>) -> String {
-    path_utils::repo_relative_path_for_diff(path, workdir_prefix)
-}
 
 #[derive(Default)]
 struct EventPump {
@@ -3632,7 +3621,8 @@ fn cached_file_diff_for_node<'a>(
 
     let review_scope = state.review_scope.clone();
     let workdir_prefix = state.workdir_prefix.clone();
-    let diff_path = repo_relative_path_for_diff(node.path.as_str(), workdir_prefix.as_deref());
+    let diff_path =
+        path_utils::repo_relative_path_for_diff(node.path.as_str(), workdir_prefix.as_deref());
     let path = PathBuf::from(&diff_path);
 
     Some(ensure_cached_file_diff(
@@ -4713,13 +4703,16 @@ mod diff_scope_tests {
     }
     #[test]
     fn path_matches_workdir_prefix_matches_exact_and_descendants() {
-        assert!(path_matches_workdir_prefix(
+        assert!(path_utils::path_matches_workdir_prefix(
             "trueflow/src/lib.rs",
             "trueflow"
         ));
-        assert!(path_matches_workdir_prefix("trueflow", "trueflow"));
-        assert!(!path_matches_workdir_prefix("other/src/lib.rs", "trueflow"));
-        assert!(!path_matches_workdir_prefix(
+        assert!(path_utils::path_matches_workdir_prefix("trueflow", "trueflow"));
+        assert!(!path_utils::path_matches_workdir_prefix(
+            "other/src/lib.rs",
+            "trueflow"
+        ));
+        assert!(!path_utils::path_matches_workdir_prefix(
             "trueflowish/src/lib.rs",
             "trueflow"
         ));

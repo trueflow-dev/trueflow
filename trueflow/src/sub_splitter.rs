@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::code_comments;
 use crate::hashing::TreeHash;
-use crate::review_units::{MAX_REVIEW_UNIT_SPAN_LINES, block_line_span};
+use crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
 use crate::{languages, nix_blocks, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
@@ -133,7 +133,7 @@ fn split_result_with_options(
                 registration.semantics,
                 languages::LanguageSubSplitSemantics::ReviewUnits
             )
-            && block_line_span(block) <= MAX_REVIEW_UNIT_SPAN_LINES
+            && block.line_span().len() <= MAX_REVIEW_UNIT_SPAN_LINES
         {
             let result = SubSplitResult {
                 blocks: vec![block.clone()],
@@ -141,7 +141,7 @@ fn split_result_with_options(
             };
             info!(
                 "sub_splitter kept parent review unit (lines={}, max_lines={})",
-                block_line_span(block),
+                block.line_span().len(),
                 MAX_REVIEW_UNIT_SPAN_LINES
             );
             return Ok(result);
@@ -211,7 +211,7 @@ fn split_result_with_options(
         };
         info!(
             "sub_splitter kept parent review unit (lines={}, max_lines={})",
-            block_line_span(block),
+            block.line_span().len(),
             MAX_REVIEW_UNIT_SPAN_LINES
         );
         return Ok(result);
@@ -258,7 +258,7 @@ fn split_result_with_options(
 
 fn should_keep_parent_review_unit(plan: SplitPlan, block: &Block) -> bool {
     !matches!(plan, SplitPlan::IdentityReviewUnit)
-        && block_line_span(block) <= MAX_REVIEW_UNIT_SPAN_LINES
+        && block.line_span().len() <= MAX_REVIEW_UNIT_SPAN_LINES
 }
 
 fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
