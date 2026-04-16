@@ -8,8 +8,8 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewTarget, collect_review,
-    resolve_cli_review_scope, resolve_review_request,
+    BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewSummary, ReviewTarget,
+    collect_review, resolve_cli_review_scope, resolve_review_request,
 };
 use crate::config::{
     BatchConfirmPolicy, BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers,
@@ -58,12 +58,74 @@ pub mod test_support;
 
 #[derive(Debug, Clone)]
 struct ScopeSelector {
-    options: Vec<ScopeOption>,
+    options: Vec<ScopeSelectorOption>,
     selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopeSelectorOption {
+    label: String,
+    scope: ReviewScope,
+    status: ScopeSelectorStatus,
+}
+
+impl ScopeSelectorOption {
+    fn from_scope_option(option: ScopeOption, status: ScopeSelectorStatus) -> Self {
+        Self {
+            label: option.label,
+            scope: option.scope,
+            status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeSelectorStatus {
+    Pending {
+        remaining_blocks: usize,
+        total_blocks: usize,
+    },
+    Reviewed {
+        total_blocks: usize,
+    },
+    Empty,
+    Unavailable,
+}
+
+impl ScopeSelectorStatus {
+    fn from_summary(summary: &ReviewSummary) -> Self {
+        let remaining_blocks = summary
+            .files
+            .iter()
+            .map(|file| file.blocks.len())
+            .sum::<usize>();
+        match (summary.total_blocks, remaining_blocks) {
+            (0, _) => Self::Empty,
+            (_, 0) => Self::Reviewed {
+                total_blocks: summary.total_blocks,
+            },
+            (total_blocks, remaining_blocks) => Self::Pending {
+                remaining_blocks,
+                total_blocks,
+            },
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Pending {
+                remaining_blocks,
+                total_blocks,
+            } => format!("[{remaining_blocks}/{total_blocks} left]"),
+            Self::Reviewed { .. } => "[reviewed]".to_string(),
+            Self::Empty => "[no items]".to_string(),
+            Self::Unavailable => "[unavailable]".to_string(),
+        }
+    }
+}
+
 impl ScopeSelector {
-    fn new(options: Vec<ScopeOption>) -> Self {
+    fn new(options: Vec<ScopeSelectorOption>) -> Self {
         Self {
             options,
             selected: 0,
@@ -428,16 +490,13 @@ pub fn run(
                 scope_label: request.review_scope.label(),
             }
         } else {
-            let scope_options = load_scope_options()?;
-            let selection = run_scope_selector(
-                session.terminal_mut(),
-                ScopeSelector::new(scope_options),
-                &config.tui.keybinds,
-            )?;
+            let filters = config.review.resolve_filters(&[], &[]);
+            let selector = load_scope_selector(&filters, &scan_options)?;
+            let selection =
+                run_scope_selector(session.terminal_mut(), selector, &config.tui.keybinds)?;
             match selection {
                 ScopeSelection::Quit => return Ok(()),
                 ScopeSelection::Selected(scope) => {
-                    let filters = config.review.resolve_filters(&[], &[]);
                     let review = load_review_state(&scope, &filters, &scan_options)?;
                     LaunchSelection {
                         scope_label: scope.label(),
@@ -637,6 +696,36 @@ fn load_scope_options() -> Result<Vec<ScopeOption>> {
         vcs::files_changed_in_revision,
     );
     Ok(default_scope_options(&commits))
+}
+
+fn load_scope_selector(
+    filters: &BlockFilters,
+    scan_options: &crate::scanner::ScanOptions,
+) -> Result<ScopeSelector> {
+    let options = load_scope_options()?;
+    load_scope_selector_with(options, filters, scan_options, load_review_summary)
+}
+
+fn load_scope_selector_with<F>(
+    options: Vec<ScopeOption>,
+    filters: &BlockFilters,
+    scan_options: &crate::scanner::ScanOptions,
+    mut load_summary: F,
+) -> Result<ScopeSelector>
+where
+    F: FnMut(&ReviewScope, &BlockFilters, &crate::scanner::ScanOptions) -> Result<ReviewSummary>,
+{
+    let options = options
+        .into_iter()
+        .map(|option| {
+            let status = match load_summary(&option.scope, filters, scan_options) {
+                Ok(summary) => ScopeSelectorStatus::from_summary(&summary),
+                Err(_) => ScopeSelectorStatus::Unavailable,
+            };
+            ScopeSelectorOption::from_scope_option(option, status)
+        })
+        .collect();
+    Ok(ScopeSelector::new(options))
 }
 
 fn filter_commits_for_prefix<F>(
@@ -1830,6 +1919,14 @@ fn load_review_state(
     collect_review(&query)
 }
 
+fn load_review_summary(
+    scope: &ReviewScope,
+    filters: &BlockFilters,
+    scan_options: &crate::scanner::ScanOptions,
+) -> Result<ReviewSummary> {
+    Ok(load_review_state(scope, filters, scan_options)?.summary)
+}
+
 fn apply_action_locally(
     state: &mut AppState,
     node_id: TreeNodeId,
@@ -1906,6 +2003,16 @@ fn render_scope_selector(
         area,
     );
 
+    let block = UiBlock::default()
+        .title(" Review scope ")
+        .borders(ratatui::widgets::Borders::ALL)
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
+
+    let popup_area = centered_rect(area, 70, 60);
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    let layout = scope_selector_content_layout(inner_area);
+
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         "Select review scope",
@@ -1926,21 +2033,11 @@ fn render_scope_selector(
         } else {
             Style::default().fg(palette.dim).bg(palette.bg)
         };
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{}", option.label),
-            style,
-        )));
+        let status = option.status.label();
+        let row =
+            format_scope_selector_option_text(prefix, &option.label, &status, layout.content.width);
+        lines.push(Line::from(Span::styled(row, style)));
     }
-
-    let block = UiBlock::default()
-        .title(" Review scope ")
-        .borders(ratatui::widgets::Borders::ALL)
-        .style(Style::default().bg(palette.bg).fg(palette.fg));
-
-    let popup_area = centered_rect(area, 70, 60);
-    let inner_area = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-    let layout = scope_selector_content_layout(inner_area);
 
     if layout.content.height > 0 && layout.content.width > 0 {
         frame.render_widget(
@@ -1962,6 +2059,57 @@ fn render_scope_selector(
             layout.hints,
         );
     }
+}
+
+fn format_scope_selector_option_text(
+    prefix: &str,
+    label: &str,
+    status: &str,
+    width: u16,
+) -> String {
+    let max_width = usize::from(width);
+    if max_width == 0 {
+        return String::new();
+    }
+    if status.is_empty() {
+        return truncate_text_to_width(&format!("{prefix}{label}"), max_width);
+    }
+
+    let status_width = UnicodeWidthStr::width(status);
+    if status_width >= max_width {
+        return truncate_text_to_width(status, max_width);
+    }
+
+    let left_width_budget = max_width.saturating_sub(status_width + 1);
+    let left = truncate_text_to_width(&format!("{prefix}{label}"), left_width_budget);
+    let left_width = UnicodeWidthStr::width(left.as_str());
+    let gap_width = max_width.saturating_sub(left_width + status_width);
+    format!("{left}{}{status}", " ".repeat(gap_width))
+}
+
+fn truncate_text_to_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut truncated = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + 1 > max_width {
+            break;
+        }
+        truncated.push(ch);
+        width += ch_width;
+    }
+    truncated.push('…');
+    truncated
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4138,9 +4286,10 @@ mod diff_scope_tests {
         BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewSummary,
         UnreviewedFile,
     };
-    use crate::config::BatchConfirmPolicy;
+    use crate::config::{BatchConfirmPolicy, BlockFilters};
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
+    use crate::scanner::ScanOptions;
     use crate::store::ReviewTargetKind;
     use crate::test_git::{run_git, run_git_stdout, temp_git_repo, temp_test_dir};
     use crate::tree::{TreeBuilder, build_tree_from_files};
@@ -4856,6 +5005,127 @@ mod diff_scope_tests {
             scope_selector_hint_text(&keybinds),
             "[Enter] select  [m/i] move  [x] quit"
         );
+    }
+
+    #[test]
+    fn scope_selector_status_from_summary_distinguishes_pending_reviewed_and_empty() {
+        let pending_summary = ReviewSummary {
+            files: vec![UnreviewedFile {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                language: Language::Rust,
+                blocks: vec![
+                    Block::new("fn alpha() {}".to_string(), BlockKind::Function, 1, 2),
+                    Block::new("fn beta() {}".to_string(), BlockKind::Function, 3, 4),
+                ],
+            }],
+            total_blocks: 5,
+            diagnostics: Vec::new(),
+        };
+        assert_eq!(
+            ScopeSelectorStatus::from_summary(&pending_summary),
+            ScopeSelectorStatus::Pending {
+                remaining_blocks: 2,
+                total_blocks: 5,
+            }
+        );
+
+        let reviewed_summary = ReviewSummary {
+            files: Vec::new(),
+            total_blocks: 3,
+            diagnostics: Vec::new(),
+        };
+        let reviewed_status = ScopeSelectorStatus::from_summary(&reviewed_summary);
+        assert_eq!(
+            reviewed_status,
+            ScopeSelectorStatus::Reviewed { total_blocks: 3 }
+        );
+        assert_eq!(reviewed_status.label(), "[reviewed]");
+
+        let empty_summary = ReviewSummary {
+            files: Vec::new(),
+            total_blocks: 0,
+            diagnostics: Vec::new(),
+        };
+        assert_eq!(
+            ScopeSelectorStatus::from_summary(&empty_summary),
+            ScopeSelectorStatus::Empty
+        );
+    }
+
+    #[test]
+    fn format_scope_selector_option_text_right_aligns_status_and_preserves_it_when_narrow() {
+        let wide = format_scope_selector_option_text("> ", "All files", "[reviewed]", 28);
+        assert_eq!(UnicodeWidthStr::width(wide.as_str()), 28);
+        assert!(
+            wide.starts_with("> All files"),
+            "unexpected wide row: {wide:?}"
+        );
+        assert!(
+            wide.ends_with("[reviewed]"),
+            "unexpected wide row: {wide:?}"
+        );
+
+        let narrow = format_scope_selector_option_text(
+            "> ",
+            "An extremely long review scope label",
+            "[4/9 left]",
+            18,
+        );
+        assert_eq!(UnicodeWidthStr::width(narrow.as_str()), 18);
+        assert!(
+            narrow.ends_with("[4/9 left]"),
+            "unexpected narrow row: {narrow:?}"
+        );
+        assert!(narrow.starts_with(">"), "unexpected narrow row: {narrow:?}");
+    }
+
+    #[test]
+    fn load_scope_selector_with_populates_statuses_and_handles_lookup_failures() {
+        let options = vec![
+            ScopeOption {
+                label: "All files".to_string(),
+                scope: ReviewScope::All,
+            },
+            ScopeOption {
+                label: "Diff vs main".to_string(),
+                scope: ReviewScope::MainDiff,
+            },
+            ScopeOption {
+                label: "Commit abc1234".to_string(),
+                scope: ReviewScope::Commit {
+                    id: "abc1234".to_string(),
+                    summary: "Update".to_string(),
+                },
+            },
+        ];
+
+        let selector = load_scope_selector_with(
+            options,
+            &BlockFilters::default(),
+            &ScanOptions::default(),
+            |scope, _, _| match scope {
+                ReviewScope::All => Ok(ReviewSummary {
+                    files: Vec::new(),
+                    total_blocks: 3,
+                    diagnostics: Vec::new(),
+                }),
+                ReviewScope::MainDiff => Ok(ReviewSummary {
+                    files: Vec::new(),
+                    total_blocks: 0,
+                    diagnostics: Vec::new(),
+                }),
+                ReviewScope::Commit { .. } => Err(anyhow::anyhow!("lookup failed")),
+                ReviewScope::RevisionRange { .. } => panic!("unexpected test scope"),
+            },
+        )
+        .unwrap_or_else(|error| panic!("expected selector with statuses: {error}"));
+
+        assert_eq!(
+            selector.options[0].status,
+            ScopeSelectorStatus::Reviewed { total_blocks: 3 }
+        );
+        assert_eq!(selector.options[1].status, ScopeSelectorStatus::Empty);
+        assert_eq!(selector.options[2].status, ScopeSelectorStatus::Unavailable);
     }
 
     #[test]
