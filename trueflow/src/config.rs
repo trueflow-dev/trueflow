@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::block::BlockKind;
+use crate::feedback_since::FeedbackSinceExpr;
 use crate::repo_path::RepoPath;
 use crate::scanner::{ScanCacheMode, ScanOptions};
 
@@ -118,7 +119,7 @@ pub struct ScanConfig {
     pub cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub ignore_names: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_ignore_globs")]
     pub ignore_globs: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_repo_paths")]
     pub ignore_path_prefixes: Vec<RepoPath>,
@@ -126,12 +127,10 @@ pub struct ScanConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeedbackConfig {
-    #[serde(default, deserialize_with = "deserialize_block_kinds")]
-    pub only: Vec<BlockKind>,
-    #[serde(default, deserialize_with = "deserialize_block_kinds")]
-    pub exclude: Vec<BlockKind>,
+    #[serde(flatten)]
+    pub filters: BlockFilterConfig,
     #[serde(default = "default_feedback_since")]
-    pub default_since: String,
+    pub default_since: FeedbackSinceExpr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,8 +298,7 @@ impl Default for ScanConfig {
 impl Default for FeedbackConfig {
     fn default() -> Self {
         Self {
-            only: Vec::new(),
-            exclude: Vec::new(),
+            filters: BlockFilterConfig::default(),
             default_since: default_feedback_since(),
         }
     }
@@ -430,11 +428,11 @@ fn default_scan_write_cache() -> bool {
     true
 }
 
-fn default_feedback_since() -> String {
-    "all".to_string()
+fn default_feedback_since() -> FeedbackSinceExpr {
+    FeedbackSinceExpr::default()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct BlockFilterConfig {
     #[serde(default, deserialize_with = "deserialize_block_kinds")]
     pub only: Vec<BlockKind>,
@@ -462,30 +460,8 @@ impl BlockFilterConfig {
     }
 }
 
-impl FeedbackConfig {
-    pub fn resolve_filters(
-        &self,
-        cli_only: &[BlockKind],
-        cli_exclude: &[BlockKind],
-    ) -> BlockFilters {
-        let only_values = if cli_only.is_empty() {
-            &self.only
-        } else {
-            cli_only
-        };
-        let exclude_values = if cli_exclude.is_empty() {
-            &self.exclude
-        } else {
-            cli_exclude
-        };
-        BlockFilters::from_lists(only_values, exclude_values)
-    }
-}
-
 impl ScanConfig {
-    pub fn resolve_options(&self) -> Result<ScanOptions> {
-        validate_ignore_globs(&self.ignore_globs)?;
-
+    pub fn resolve_options(&self) -> ScanOptions {
         let mut options = ScanOptions {
             cache_mode: ScanCacheMode::from_flags(self.use_cache, self.write_cache),
             cache_dir: self.cache_dir.clone(),
@@ -506,7 +482,7 @@ impl ScanConfig {
             .extend(self.ignore_path_prefixes.iter().cloned());
         options.ignore_path_prefixes.sort();
         options.ignore_path_prefixes.dedup();
-        Ok(options)
+        options
     }
 }
 
@@ -597,6 +573,21 @@ where
         .collect()
 }
 
+fn deserialize_ignore_globs<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    let mut builder = GitignoreBuilder::new(".");
+    builder.allow_unclosed_class(false);
+    for pattern in &values {
+        builder.add_line(None, pattern).map_err(|err| {
+            serde::de::Error::custom(format!("invalid scan ignore glob {pattern:?}: {err}"))
+        })?;
+    }
+    Ok(values)
+}
+
 fn deserialize_single_char<'de, D>(deserializer: D) -> std::result::Result<char, D::Error>
 where
     D: Deserializer<'de>,
@@ -610,17 +601,6 @@ where
         return Err(serde::de::Error::custom("expected a single character"));
     }
     Ok(ch)
-}
-
-fn validate_ignore_globs(patterns: &[String]) -> Result<()> {
-    let mut builder = GitignoreBuilder::new(".");
-    builder.allow_unclosed_class(false);
-    for pattern in patterns {
-        builder
-            .add_line(None, pattern)
-            .map_err(|err| anyhow!("invalid scan ignore glob {pattern:?}: {err}"))?;
-    }
-    Ok(())
 }
 
 pub fn update_speed_read_defaults_in_file(
@@ -678,6 +658,7 @@ pub fn update_speed_read_defaults_in_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feedback_since::FeedbackSinceExpr;
 
     #[test]
     fn tui_config_defaults_to_whole_block_focus() {
@@ -878,7 +859,7 @@ punctuation_dwell_multiplier = 1.2
             Ok(config) => config,
             Err(err) => panic!("parse config: {err}"),
         };
-        assert_eq!(cfg.feedback.default_since, "all");
+        assert_eq!(cfg.feedback.default_since, FeedbackSinceExpr::default());
     }
 
     #[test]
@@ -887,7 +868,21 @@ punctuation_dwell_multiplier = 1.2
             Ok(config) => config,
             Err(err) => panic!("parse config: {err}"),
         };
-        assert_eq!(cfg.feedback.default_since, "last");
+        assert_eq!(
+            cfg.feedback.default_since,
+            FeedbackSinceExpr::new("last").unwrap()
+        );
+    }
+
+    #[test]
+    fn feedback_default_since_rejects_invalid_value() {
+        let err = toml::from_str::<TrueflowConfig>("[feedback]\ndefault_since = \"someday\"\n")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid feedback since value 'someday'"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]
@@ -909,8 +904,8 @@ exclude = ["comment"]
 
         assert_eq!(cfg.review.only, vec![BlockKind::FunctionSignature]);
         assert_eq!(cfg.review.exclude, vec![BlockKind::Gap]);
-        assert_eq!(cfg.feedback.only, vec![BlockKind::Struct]);
-        assert_eq!(cfg.feedback.exclude, vec![BlockKind::Comment]);
+        assert_eq!(cfg.feedback.filters.only, vec![BlockKind::Struct]);
+        assert_eq!(cfg.feedback.filters.exclude, vec![BlockKind::Comment]);
     }
 
     #[test]
@@ -939,10 +934,7 @@ ignore_path_prefixes = ["vendor", "generated"]
         )
         .unwrap_or_else(|err| panic!("parse config: {err}"));
 
-        let options = cfg
-            .scan
-            .resolve_options()
-            .unwrap_or_else(|err| panic!("resolve scan options: {err}"));
+        let options = cfg.scan.resolve_options();
         assert_eq!(options.cache_mode, ScanCacheMode::WriteOnly);
         assert_eq!(options.cache_dir, Some(PathBuf::from("custom-cache")));
         assert!(options.ignore_names.iter().any(|name| name == ".git"));
@@ -959,9 +951,7 @@ ignore_path_prefixes = ["vendor", "generated"]
 
     #[test]
     fn scan_config_rejects_invalid_ignore_globs() {
-        let cfg: TrueflowConfig = toml::from_str("[scan]\nignore_globs = [\"[\"]\n")
-            .unwrap_or_else(|err| panic!("parse config: {err}"));
-        let err = cfg.scan.resolve_options().unwrap_err();
+        let err = toml::from_str::<TrueflowConfig>("[scan]\nignore_globs = [\"[\"]\n").unwrap_err();
         assert!(
             err.to_string().contains("invalid scan ignore glob"),
             "unexpected scan config error: {err}"

@@ -77,7 +77,7 @@ pub fn run(
     coverage: bool,
 ) -> Result<()> {
     let config = load_config()?;
-    let scan_options = config.scan.resolve_options()?;
+    let scan_options = config.scan.resolve_options();
     let scan_result = scanner::scan_directory(".", &scan_options)?;
     let files = scan_result.files;
     let matched = find_matching_block(&files, fingerprint)?;

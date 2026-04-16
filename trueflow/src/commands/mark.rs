@@ -66,9 +66,9 @@ pub struct MarkParams {
     pub fingerprint: String,
     pub target_kind: Option<ReviewTargetKind>,
     pub verdict: Verdict,
-    pub check: String,
+    pub check: ReviewCheck,
     pub note: Option<String>,
-    pub path: Option<String>,
+    pub path: Option<RepoPath>,
     pub line: Option<u32>,
 }
 
@@ -124,7 +124,7 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         &params.verdict,
         &params.check,
         params.note.is_some(),
-        params.path.as_deref(),
+        params.path.as_ref().map(RepoPath::as_str),
         params.line
     );
     let store = FileStore::new()?;
@@ -168,10 +168,9 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         line,
     } = params;
 
-    let path_hint = path.map(RepoPath::new).transpose()?;
+    let path_hint = path;
     let target_kind = infer_target_kind(target_kind, &fingerprint, path_hint.as_ref(), line)?;
     let target = target_kind.parse_target(&fingerprint)?;
-    let check = ReviewCheck::new(check)?;
     let block_state: BlockState = vcs::block_state_for_path(
         &repo_snapshot,
         path_hint.as_ref().map(RepoPath::as_str),

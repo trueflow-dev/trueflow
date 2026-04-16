@@ -896,7 +896,7 @@ fn diff_hunks_for_file_targets(
 pub fn collect_main_diff_summary() -> Result<ReviewSummary> {
     let config = load_config()?;
     let filters = config.review.resolve_filters(&[], &[]);
-    let scan_options = config.scan.resolve_options()?;
+    let scan_options = config.scan.resolve_options();
     let query = resolve_review_request(
         ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
         filters,
@@ -913,7 +913,7 @@ pub(crate) fn run_request(
 ) -> Result<()> {
     let config = load_config()?;
     let filters = config.review.resolve_filters(only, exclude);
-    let scan_options = config.scan.resolve_options()?;
+    let scan_options = config.scan.resolve_options();
     let query = resolve_review_request(request, filters, scan_options)?;
     let summary = collect_review_summary(&query)?;
     print_review_summary(summary, json)

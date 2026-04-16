@@ -32,7 +32,7 @@ fn main() -> Result<()> {
             commands::mark::MarkParams {
                 fingerprint: fingerprint.clone(),
                 target_kind: None,
-                verdict: verdict.parse()?,
+                verdict: verdict.clone(),
                 check: check.clone(),
                 note: note.clone(),
                 path: path.clone(),
@@ -69,8 +69,8 @@ fn main() -> Result<()> {
             exclude,
         } => commands::feedback::run(
             &context,
-            commands::feedback::FeedbackFormat::from_arg(format),
-            since.as_deref(),
+            *format,
+            since.as_ref(),
             target,
             *include_approved,
             only,

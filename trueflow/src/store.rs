@@ -125,6 +125,14 @@ impl fmt::Display for ReviewCheck {
     }
 }
 
+impl FromStr for ReviewCheck {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(deny_unknown_fields)]
@@ -571,8 +579,7 @@ fn update_latest_verdict<K: Eq + std::hash::Hash>(
 
 fn block_path_candidates(path: &RepoPath, workdir_prefix: Option<&str>) -> Vec<RepoPath> {
     let mut candidates = Vec::new();
-    for candidate in path_utils::repo_path_candidates(path.as_str(), workdir_prefix, None)
-    {
+    for candidate in path_utils::repo_path_candidates(path.as_str(), workdir_prefix, None) {
         let Ok(candidate) = RepoPath::new(candidate) else {
             continue;
         };

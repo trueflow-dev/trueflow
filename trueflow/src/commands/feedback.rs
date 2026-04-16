@@ -2,6 +2,7 @@ use crate::block::{Block, BlockKind};
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::coverage::{CoverageBuildOptions, CoverageIndex};
+use crate::feedback_since::{FeedbackSinceExpr, ResolvedFeedbackSince};
 use crate::policy::should_skip_imports_by_default;
 use crate::scanner;
 use crate::store::{FileStore, Identity, Record, ReviewStore};
@@ -11,30 +12,17 @@ use crate::targets::{
 };
 use crate::tree;
 use crate::vcs;
-use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
+use anyhow::Result;
+use clap::ValueEnum;
 use std::fs;
 use std::path::Path;
 
 const FEEDBACK_CURSOR_FILE: &str = "feedback.cursor";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum FeedbackFormat {
     Xml,
     Json,
-}
-
-impl FeedbackFormat {
-    pub fn from_arg(raw: &str) -> Self {
-        if raw == "json" { Self::Json } else { Self::Xml }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FeedbackSince {
-    All,
-    Timestamp(i64),
-    Last,
 }
 
 #[derive(Debug, Clone)]
@@ -55,16 +43,16 @@ struct FeedbackCollectionOptions<'a> {
 pub fn run(
     _context: &TrueflowContext,
     format: FeedbackFormat,
-    since: Option<&str>,
+    since: Option<&FeedbackSinceExpr>,
     targets: &[ReviewTarget],
     include_approved: bool,
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<()> {
     let config = load_config()?;
-    let filters = config.feedback.resolve_filters(only, exclude);
-    let scan_options = config.scan.resolve_options()?;
-    let effective_since = since.or(Some(config.feedback.default_since.as_str()));
+    let filters = config.feedback.filters.resolve_filters(only, exclude);
+    let scan_options = config.scan.resolve_options();
+    let effective_since = since.unwrap_or(&config.feedback.default_since);
     let resolved_targets = resolve_targets(targets)?;
 
     // 1. Scan current or historical directory state.
@@ -82,7 +70,7 @@ pub fn run(
     let store = FileStore::new()?;
     let database = store.load_database()?;
     let max_history_timestamp = database.max_timestamp();
-    let since_mode = parse_feedback_since(effective_since)?;
+    let since_mode = effective_since.resolve()?;
     let since_threshold = resolve_since_threshold(&store, since_mode)?;
 
     let entries = collect_feedback_entries(
@@ -137,7 +125,7 @@ pub fn run(
         }
     }
 
-    if matches!(since_mode, FeedbackSince::Last)
+    if matches!(since_mode, ResolvedFeedbackSince::Last)
         && let Some(timestamp) = max_history_timestamp
     {
         write_feedback_cursor(feedback_cursor_path(&store).as_path(), timestamp)?;
@@ -276,86 +264,11 @@ fn collect_feedback_entries(
     Ok(entries)
 }
 
-fn parse_feedback_since(raw: Option<&str>) -> Result<FeedbackSince> {
-    parse_feedback_since_with_now(raw, Utc::now())
-}
-
-fn parse_feedback_since_with_now(raw: Option<&str>, now: DateTime<Utc>) -> Result<FeedbackSince> {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(FeedbackSince::All);
-    };
-
-    if raw.eq_ignore_ascii_case("all") {
-        return Ok(FeedbackSince::All);
-    }
-    if raw.eq_ignore_ascii_case("last") {
-        return Ok(FeedbackSince::Last);
-    }
-    if let Ok(timestamp) = raw.parse::<i64>() {
-        return Ok(FeedbackSince::Timestamp(timestamp));
-    }
-    if let Some(timestamp) = parse_relative_since_timestamp(raw, now)? {
-        return Ok(FeedbackSince::Timestamp(timestamp));
-    }
-
-    let parsed = DateTime::parse_from_rfc3339(raw)
-        .map(|value| value.with_timezone(&Utc).timestamp())
-        .map_err(|error| {
-            anyhow!(
-                "Invalid --since value '{raw}'. Use 'all', 'last', relative durations like '1h', unix timestamp, or RFC3339 ({error})"
-            )
-        })?;
-    Ok(FeedbackSince::Timestamp(parsed))
-}
-
-fn parse_relative_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<Option<i64>> {
-    let trimmed = raw.trim();
-    let trimmed = trimmed
-        .strip_suffix("ago")
-        .map(str::trim_end)
-        .unwrap_or(trimmed);
-    let compact = trimmed
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect::<String>();
-    if compact.is_empty() {
-        return Ok(None);
-    }
-
-    let split_at = compact
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(compact.len());
-    if split_at == 0 || split_at == compact.len() {
-        return Ok(None);
-    }
-
-    let amount = compact[..split_at]
-        .parse::<i64>()
-        .map_err(|error| anyhow!("invalid relative duration amount in '{raw}': {error}"))?;
-    let unit = compact[split_at..].to_ascii_lowercase();
-    let scale = match unit.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => 1,
-        "m" | "min" | "mins" | "minute" | "minutes" => 60,
-        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
-        "d" | "day" | "days" => 60 * 60 * 24,
-        "w" | "week" | "weeks" => 60 * 60 * 24 * 7,
-        _ => return Ok(None),
-    };
-    let seconds = amount
-        .checked_mul(scale)
-        .ok_or_else(|| anyhow!("relative --since value '{raw}' overflowed"))?;
-    let threshold = now
-        .timestamp()
-        .checked_sub(seconds)
-        .ok_or_else(|| anyhow!("relative --since value '{raw}' underflowed"))?;
-    Ok(Some(threshold))
-}
-
-fn resolve_since_threshold(store: &FileStore, since: FeedbackSince) -> Result<Option<i64>> {
+fn resolve_since_threshold(store: &FileStore, since: ResolvedFeedbackSince) -> Result<Option<i64>> {
     let threshold = match since {
-        FeedbackSince::All => None,
-        FeedbackSince::Timestamp(timestamp) => Some(timestamp),
-        FeedbackSince::Last => read_feedback_cursor(feedback_cursor_path(store).as_path())?,
+        ResolvedFeedbackSince::All => None,
+        ResolvedFeedbackSince::Timestamp(timestamp) => Some(timestamp),
+        ResolvedFeedbackSince::Last => read_feedback_cursor(feedback_cursor_path(store).as_path())?,
     };
     Ok(threshold)
 }
@@ -396,39 +309,13 @@ fn write_feedback_cursor(path: &Path, timestamp: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use clap::ValueEnum;
 
     #[test]
-    fn feedback_format_uses_json_for_json_arg() {
-        assert_eq!(FeedbackFormat::from_arg("json"), FeedbackFormat::Json);
-    }
-
-    #[test]
-    fn feedback_format_preserves_xml_default_behavior_for_non_json_args() {
-        assert_eq!(FeedbackFormat::from_arg("xml"), FeedbackFormat::Xml);
-        assert_eq!(FeedbackFormat::from_arg("yaml"), FeedbackFormat::Xml);
-        assert_eq!(FeedbackFormat::from_arg(""), FeedbackFormat::Xml);
-    }
-
-    #[test]
-    fn parse_feedback_since_supports_relative_hours() {
-        let now = Utc
-            .timestamp_opt(10_000, 0)
-            .single()
-            .unwrap_or_else(|| panic!("valid timestamp"));
-        let parsed = parse_feedback_since_with_now(Some("1h"), now)
-            .unwrap_or_else(|error| panic!("relative duration should parse: {error}"));
-        assert_eq!(parsed, FeedbackSince::Timestamp(6_400));
-    }
-
-    #[test]
-    fn parse_feedback_since_supports_relative_days_with_ago_suffix() {
-        let now = Utc
-            .timestamp_opt(200_000, 0)
-            .single()
-            .unwrap_or_else(|| panic!("valid timestamp"));
-        let parsed = parse_feedback_since_with_now(Some("2d ago"), now)
-            .unwrap_or_else(|error| panic!("relative duration with ago should parse: {error}"));
-        assert_eq!(parsed, FeedbackSince::Timestamp(27_200));
+    fn feedback_format_exposes_xml_and_json_variants() {
+        assert_eq!(
+            FeedbackFormat::value_variants(),
+            &[FeedbackFormat::Xml, FeedbackFormat::Json]
+        );
     }
 }

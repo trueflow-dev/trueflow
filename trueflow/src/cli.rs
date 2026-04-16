@@ -2,8 +2,12 @@ use clap::{ArgGroup, Parser, Subcommand};
 
 use crate::block::BlockKind;
 use crate::build_info;
+use crate::commands::feedback::FeedbackFormat;
 use crate::commands::review::ReviewTarget;
+use crate::feedback_since::FeedbackSinceExpr;
 use crate::logging::LoggingMode;
+use crate::repo_path::RepoPath;
+use crate::store::{ReviewCheck, Verdict};
 
 #[derive(Parser)]
 #[command(name = "trueflow")]
@@ -37,12 +41,12 @@ pub enum Commands {
         fingerprint: String,
 
         /// Verdict: approved, rejected, comment
-        #[arg(long, default_value = "approved")]
-        verdict: String,
+        #[arg(long, default_value_t = Verdict::Approved)]
+        verdict: Verdict,
 
         /// Check type: review, security, style, etc.
-        #[arg(long, default_value = "review")]
-        check: String,
+        #[arg(long, default_value_t = ReviewCheck::review())]
+        check: ReviewCheck,
 
         /// Optional note
         #[arg(long)]
@@ -50,7 +54,7 @@ pub enum Commands {
 
         /// Path hint for debugging/UI
         #[arg(long)]
-        path: Option<String>,
+        path: Option<RepoPath>,
 
         /// Line number hint
         #[arg(long)]
@@ -101,12 +105,12 @@ pub enum Commands {
     /// Export feedback for LLM/Agent consumption
     Feedback {
         /// Output format (xml or json)
-        #[arg(long, default_value = "xml")]
-        format: String,
+        #[arg(long, value_enum, default_value_t = FeedbackFormat::Xml)]
+        format: FeedbackFormat,
 
         /// Only include records since this point ("all", "last", relative durations like "1h", unix ts, or RFC3339)
         #[arg(long)]
-        since: Option<String>,
+        since: Option<FeedbackSinceExpr>,
 
         /// Feedback targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
         #[arg(long, value_name = "TARGET")]
@@ -185,8 +189,11 @@ mod tests {
     use crate::block::BlockKind;
     use crate::build_info;
     use crate::build_metadata::UNKNOWN_BUILD_TIMESTAMP;
+    use crate::commands::feedback::FeedbackFormat;
     use crate::commands::review::{ReviewTarget, RevisionSpec};
+    use crate::feedback_since::FeedbackSinceExpr;
     use crate::repo_path::RepoPath;
+    use crate::store::{ReviewCheck, Verdict};
     use chrono::DateTime;
     use clap::{CommandFactory, Parser};
 
@@ -329,8 +336,8 @@ mod tests {
                 only,
                 exclude,
             } => {
-                assert_eq!(format, "json");
-                assert_eq!(since.as_deref(), Some("last"));
+                assert_eq!(format, FeedbackFormat::Json);
+                assert_eq!(since, Some(FeedbackSinceExpr::new("last").unwrap()));
                 assert!(target.is_empty());
                 assert!(!include_approved);
                 assert!(only.is_empty());
@@ -509,6 +516,82 @@ mod tests {
             }
             _ => panic!("expected inspect command"),
         }
+    }
+
+    #[test]
+    fn mark_command_parses_typed_fields() {
+        let cli = Cli::parse_from([
+            "trueflow",
+            "mark",
+            "--fingerprint",
+            "abc1234",
+            "--verdict",
+            "comment",
+            "--check",
+            "security",
+            "--path",
+            "src/lib.rs",
+            "--line",
+            "42",
+        ]);
+
+        match cli.command {
+            Commands::Mark {
+                fingerprint,
+                verdict,
+                check,
+                path,
+                line,
+                ..
+            } => {
+                assert_eq!(fingerprint, "abc1234");
+                assert_eq!(verdict, Verdict::Comment);
+                assert_eq!(check, ReviewCheck::new("security").unwrap());
+                assert_eq!(path, Some(RepoPath::new("src/lib.rs").unwrap()));
+                assert_eq!(line, Some(42));
+            }
+            _ => panic!("expected mark command"),
+        }
+    }
+
+    #[test]
+    fn mark_command_rejects_invalid_repo_path() {
+        let err = match Cli::try_parse_from([
+            "trueflow",
+            "mark",
+            "--fingerprint",
+            "abc1234",
+            "--path",
+            "../src/lib.rs",
+        ]) {
+            Ok(_) => panic!("expected clap to reject invalid repo path"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("repo path contains invalid segment")
+        );
+    }
+
+    #[test]
+    fn feedback_command_rejects_unknown_format() {
+        let err = match Cli::try_parse_from(["trueflow", "feedback", "--format", "yaml"]) {
+            Ok(_) => panic!("expected clap to reject unknown feedback format"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("possible values"));
+    }
+
+    #[test]
+    fn feedback_command_rejects_invalid_since_expression() {
+        let err = match Cli::try_parse_from(["trueflow", "feedback", "--since", "someday"]) {
+            Ok(_) => panic!("expected clap to reject invalid feedback since value"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("Invalid feedback since value 'someday'")
+        );
     }
 
     #[test]

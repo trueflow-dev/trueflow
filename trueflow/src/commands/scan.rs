@@ -24,7 +24,7 @@ impl ScanOutputMode {
 
 pub fn run(_context: &TrueflowContext, output_mode: ScanOutputMode) -> Result<()> {
     let config = load_config()?;
-    let scan_options = config.scan.resolve_options()?;
+    let scan_options = config.scan.resolve_options();
     let result = scanner::scan_directory(".", &scan_options)?;
     match output_mode {
         ScanOutputMode::JsonTree => {

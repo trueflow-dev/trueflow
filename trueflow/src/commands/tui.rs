@@ -26,7 +26,7 @@ use crate::review_scope::{
 };
 use crate::review_session;
 use crate::review_speedread::PlaybackState;
-use crate::store::{ReviewTargetKind, Verdict};
+use crate::store::{ReviewCheck, ReviewTargetKind, Verdict};
 use crate::sub_splitter;
 use crate::targets::workdir_prefix_from_git_root;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
@@ -484,7 +484,7 @@ pub fn run(
     let mut session = TerminalSession::enter()?;
     let config = load_config()?;
     let run_result = (|| {
-        let scan_options = config.scan.resolve_options()?;
+        let scan_options = config.scan.resolve_options();
         let filters = config.review.resolve_filters(only, exclude);
         let mut pending_cli_request = cli_review_request(all, target, since, only, exclude)?;
 
@@ -1927,7 +1927,7 @@ fn mark_params_for_action(
     let path_hint = if node.path.is_root() {
         None
     } else {
-        Some(node.path.to_string())
+        Some(node.path.clone())
     };
 
     let line_hint = node
@@ -1939,7 +1939,7 @@ fn mark_params_for_action(
         fingerprint,
         target_kind: Some(target_kind),
         verdict,
-        check: "review".to_string(),
+        check: ReviewCheck::review(),
         note,
         path: path_hint,
         line: line_hint,

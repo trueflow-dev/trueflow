@@ -43,9 +43,9 @@ impl From<mark::MarkParams> for ScriptedMarkAction {
         Self {
             fingerprint: params.fingerprint,
             verdict: params.verdict,
-            check: params.check,
+            check: params.check.to_string(),
             note: params.note,
-            path: params.path,
+            path: params.path.map(|path| path.to_string()),
             line: params.line,
         }
     }
