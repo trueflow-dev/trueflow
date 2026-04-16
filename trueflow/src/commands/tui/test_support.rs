@@ -18,7 +18,7 @@ use crate::commands::mark;
 use crate::commands::review::{BlockChangeKind, FileChangeKind};
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
-use crate::review_scope::ReviewScope;
+use crate::review_scope::ScopePreset;
 use crate::store::Verdict;
 use crate::tree::{TreeBuilder, TreeNodeId, TreeNodeKind};
 use anyhow::{Result, bail};
@@ -193,7 +193,7 @@ where
         self.state.content_frame_cache.clear();
     }
 
-    pub fn set_review_scope(&mut self, review_scope: ReviewScope) {
+    pub fn set_review_scope(&mut self, review_scope: ScopePreset) {
         self.state.review_scope = review_scope;
     }
 
@@ -542,7 +542,7 @@ where
     navigator.jump_root();
 
     Ok(AppState {
-        review_scope: ReviewScope::All,
+        review_scope: ScopePreset::All,
         navigator,
         review_order,
         total_blocks: visible.len(),
@@ -625,7 +625,7 @@ fn build_state_with_single_rust_block_file(
     navigator.set_current(block_id);
 
     Ok(AppState {
-        review_scope: ReviewScope::All,
+        review_scope: ScopePreset::All,
         navigator,
         review_order,
         total_blocks: 1,

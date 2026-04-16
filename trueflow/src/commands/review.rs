@@ -7,7 +7,6 @@ use crate::path_utils;
 use crate::policy::{should_skip_container_by_default, should_skip_imports_by_default};
 use crate::repo_path::RepoPath;
 use crate::review_metadata;
-use crate::review_scope::CliSemanticReviewScope;
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
@@ -154,15 +153,28 @@ pub fn parse_review_request(
     values: &[ReviewTarget],
     since: Option<&str>,
 ) -> Result<ReviewRequest> {
-    Ok(resolve_cli_review_scope(all, values, since)?.review_request())
+    let targets = expand_cli_review_targets(values, since)?;
+    review_request_from_cli_targets(all, &targets)
 }
 
-pub fn resolve_cli_review_scope(
+pub(crate) fn review_request_from_cli_targets(
     all: bool,
-    values: &[ReviewTarget],
-    since: Option<&str>,
-) -> Result<CliSemanticReviewScope> {
-    resolve_cli_review_scope_with(all, values, since, validate_revision_exists_str)
+    targets: &[ReviewTarget],
+) -> Result<ReviewRequest> {
+    if all {
+        if !targets.is_empty() {
+            return Err(anyhow!(
+                "Explicit review targets cannot be combined with --all"
+            ));
+        }
+        return Ok(ReviewRequest::AllFiles);
+    }
+
+    if targets.is_empty() {
+        Ok(ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree]))
+    } else {
+        Ok(ReviewRequest::Targets(targets.to_vec()))
+    }
 }
 
 pub fn expand_cli_review_targets(
@@ -170,19 +182,6 @@ pub fn expand_cli_review_targets(
     since: Option<&str>,
 ) -> Result<Vec<ReviewTarget>> {
     expand_cli_review_targets_with(values, since, &validate_revision_exists_str)
-}
-
-pub(crate) fn resolve_cli_review_scope_with<F>(
-    all: bool,
-    values: &[ReviewTarget],
-    since: Option<&str>,
-    validate_revision: F,
-) -> Result<CliSemanticReviewScope>
-where
-    F: Fn(&str) -> Result<()>,
-{
-    let targets = expand_cli_review_targets_with(values, since, &validate_revision)?;
-    CliSemanticReviewScope::from_cli(all, &targets)
 }
 
 pub(crate) fn expand_cli_review_targets_with<F>(
@@ -1330,9 +1329,10 @@ mod tests {
 
     #[test]
     fn parse_review_request_expands_since_to_head_range() {
-        let scope = resolve_cli_review_scope_with(false, &[], Some("HEAD"), |_| Ok(()))
-            .unwrap_or_else(|error| panic!("expected since scope: {error}"));
-        let request = scope.review_request();
+        let targets = expand_cli_review_targets_with(&[], Some("HEAD"), &|_| Ok(()))
+            .unwrap_or_else(|error| panic!("expected since targets: {error}"));
+        let request = review_request_from_cli_targets(false, &targets)
+            .unwrap_or_else(|error| panic!("expected since request: {error}"));
 
         assert_eq!(
             request,

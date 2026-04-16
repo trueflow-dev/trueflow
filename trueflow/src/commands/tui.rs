@@ -8,8 +8,9 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewSummary, ReviewTarget,
-    collect_review, resolve_cli_review_scope, resolve_review_request,
+    BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewRequest,
+    ReviewSummary, ReviewTarget, collect_review, expand_cli_review_targets,
+    resolve_review_request, review_request_from_cli_targets,
 };
 use crate::config::{
     BatchConfirmPolicy, BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers,
@@ -21,9 +22,7 @@ use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::{ReviewAnchor, ReviewOrder};
-use crate::review_scope::{
-    CliSemanticReviewScope, DiffQuery, ReviewScope, ScopeOption, default_scope_options,
-};
+use crate::review_scope::{DiffQuery, ScopeOption, ScopePreset, default_scope_options};
 use crate::review_session;
 use crate::review_speedread::PlaybackState;
 use crate::store::{ReviewCheck, ReviewTargetKind, Verdict};
@@ -146,7 +145,7 @@ impl ScopeSelector {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    fn selected_scope(&self) -> Option<ReviewScope> {
+    fn selected_scope(&self) -> Option<ScopePreset> {
         self.options
             .get(self.selected)
             .map(|option| option.scope.clone())
@@ -155,7 +154,7 @@ impl ScopeSelector {
 
 enum ScopeSelection {
     Quit,
-    Selected(ReviewScope),
+    Selected(ScopePreset),
 }
 
 enum AppExit {
@@ -170,14 +169,16 @@ enum RecapAction {
 }
 
 struct LaunchSelection {
-    scope: ReviewScope,
+    scope: ScopePreset,
     review: CollectedReview,
     scope_label: String,
 }
 
 #[derive(Debug, Clone)]
 struct CliReviewRequest {
-    review_scope: CliSemanticReviewScope,
+    request: ReviewRequest,
+    scope: ScopePreset,
+    scope_label: String,
 }
 
 // --- Application Logic ---
@@ -257,7 +258,7 @@ enum InputMode {
 }
 
 struct AppState {
-    review_scope: ReviewScope,
+    review_scope: ScopePreset,
     navigator: ReviewNavigator,
     review_order: ReviewOrder,
     total_blocks: usize,
@@ -484,7 +485,6 @@ pub fn run(
     let mut session = TerminalSession::enter()?;
     let config = load_config()?;
     let run_result = (|| {
-        let scan_options = config.scan.resolve_options();
         let filters = config.review.resolve_filters(only, exclude);
         let mut pending_cli_request = cli_review_request(all, target, since, only, exclude)?;
 
@@ -492,16 +492,16 @@ pub fn run(
             let launch = if let Some(request) = pending_cli_request.take() {
                 let review = {
                     let query = resolve_review_request(
-                        request.review_scope.review_request(),
+                        request.request,
                         filters.clone(),
                         scan_options.clone(),
                     )?;
                     collect_review(&query)?
                 };
                 LaunchSelection {
-                    scope: request.review_scope.tui_scope(),
+                    scope: request.scope,
                     review,
-                    scope_label: request.review_scope.label(),
+                    scope_label: request.scope_label,
                 }
             } else {
                 let selector = load_scope_selector(&filters, &scan_options)?;
@@ -562,7 +562,14 @@ fn cli_review_request(
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<Option<CliReviewRequest>> {
-    cli_review_request_with(all, target, since, only, exclude, resolve_cli_review_scope)
+    cli_review_request_with(
+        all,
+        target,
+        since,
+        only,
+        exclude,
+        resolve_cli_review_request,
+    )
 }
 
 fn cli_review_request_with<F>(
@@ -571,10 +578,10 @@ fn cli_review_request_with<F>(
     since: Option<&str>,
     only: &[BlockKind],
     exclude: &[BlockKind],
-    scope_resolver: F,
+    request_resolver: F,
 ) -> Result<Option<CliReviewRequest>>
 where
-    F: Fn(bool, &[ReviewTarget], Option<&str>) -> Result<CliSemanticReviewScope>,
+    F: Fn(bool, &[ReviewTarget], Option<&str>) -> Result<CliReviewRequest>,
 {
     let has_cli_overrides =
         all || !target.is_empty() || since.is_some() || !only.is_empty() || !exclude.is_empty();
@@ -582,14 +589,56 @@ where
         return Ok(None);
     }
 
-    let review_scope = scope_resolver(all, target, since)?;
-    Ok(Some(CliReviewRequest { review_scope }))
+    Ok(Some(request_resolver(all, target, since)?))
+}
+
+fn resolve_cli_review_request(
+    all: bool,
+    target: &[ReviewTarget],
+    since: Option<&str>,
+) -> Result<CliReviewRequest> {
+    let targets = expand_cli_review_targets(target, since)?;
+    let request = review_request_from_cli_targets(all, &targets)?;
+    let (scope, scope_label) = scope_preset_for_cli_targets(all, &targets);
+    Ok(CliReviewRequest {
+        request,
+        scope,
+        scope_label,
+    })
+}
+
+fn scope_preset_for_cli_targets(all: bool, targets: &[ReviewTarget]) -> (ScopePreset, String) {
+    if all {
+        return (ScopePreset::All, "all files (CLI)".to_string());
+    }
+
+    match targets {
+        [] | [ReviewTarget::DirtyWorktree] => (ScopePreset::MainDiff, "dirty worktree".to_string()),
+        [ReviewTarget::MainDiff] => (ScopePreset::MainDiff, "diff vs main".to_string()),
+        [ReviewTarget::File(path)] => (ScopePreset::MainDiff, format!("file {path}")),
+        [ReviewTarget::Dir(path)] => (ScopePreset::MainDiff, format!("dir:{path}")),
+        [ReviewTarget::Revision(revision)] => (
+            ScopePreset::Commit {
+                id: revision.as_str().to_string(),
+                summary: String::new(),
+            },
+            format!("revision {revision}"),
+        ),
+        [ReviewTarget::RevisionRange(range)] => (
+            ScopePreset::RevisionRange {
+                start: range.start.as_str().to_string(),
+                end: range.end.as_str().to_string(),
+            },
+            format!("revisions {}..{}", range.start, range.end),
+        ),
+        _ => (ScopePreset::MainDiff, format!("{} targets", targets.len())),
+    }
 }
 
 fn build_review_state(
     context: &TrueflowContext,
     review: CollectedReview,
-    review_scope: ReviewScope,
+    review_scope: ScopePreset,
     options: ReviewStateBuildOptions,
 ) -> Result<AppState> {
     let CollectedReview {
@@ -1959,7 +2008,7 @@ fn fingerprint_and_target_kind_for_node(
 }
 
 fn load_review_state(
-    scope: &ReviewScope,
+    scope: &ScopePreset,
     filters: &BlockFilters,
     scan_options: &crate::scanner::ScanOptions,
 ) -> Result<CollectedReview> {
@@ -2698,7 +2747,7 @@ fn build_mode_banner_line(state: &AppState, palette: &UiPalette) -> Line<'static
 }
 
 fn should_show_change_metadata(state: &AppState) -> bool {
-    !matches!(state.review_scope, ReviewScope::All)
+    !matches!(state.review_scope, ScopePreset::All)
 }
 
 fn header_change_kind_for_node(
@@ -3850,7 +3899,7 @@ fn cached_file_diff_for_node<'a>(
         &mut state.file_diff_cache,
         &path,
         || {
-            let query = review_scope.diff_selection().query_for_path(&diff_path);
+            let query = review_scope.diff_query_for_path(&diff_path);
             let repo = vcs::repo_from_workdir()?;
             match query {
                 DiffQuery::MainDiff { path } => vcs::diff_for_file(&repo, &RepoPath::new(path)?),
@@ -4361,8 +4410,8 @@ mod diff_scope_tests {
     use crate::block_splitter;
     use crate::cli::Cli;
     use crate::commands::review::{
-        BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewSummary,
-        UnreviewedFile,
+        BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewRequest,
+        ReviewSummary, UnreviewedFile,
     };
     use crate::config::{BatchConfirmPolicy, BlockFilters};
     use crate::context::TrueflowContext;
@@ -4376,7 +4425,7 @@ mod diff_scope_tests {
     use std::path::{Path, PathBuf};
 
     fn build_test_state(
-        review_scope: ReviewScope,
+        review_scope: ScopePreset,
         workdir_prefix: Option<String>,
         file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
     ) -> AppState {
@@ -4452,7 +4501,7 @@ mod diff_scope_tests {
         navigator.set_current(block_id);
 
         let state = AppState {
-            review_scope: ReviewScope::All,
+            review_scope: ScopePreset::All,
             navigator,
             review_order,
             total_blocks: 1,
@@ -4533,7 +4582,7 @@ mod diff_scope_tests {
         navigator.jump_root();
 
         let state = AppState {
-            review_scope: ReviewScope::All,
+            review_scope: ScopePreset::All,
             navigator,
             review_order,
             total_blocks: 2,
@@ -4624,7 +4673,7 @@ mod diff_scope_tests {
         navigator.set_current(block_id);
 
         let state = AppState {
-            review_scope: ReviewScope::All,
+            review_scope: ScopePreset::All,
             navigator,
             review_order,
             total_blocks: 1,
@@ -4711,7 +4760,7 @@ mod diff_scope_tests {
         navigator.set_current(file);
 
         let state = AppState {
-            review_scope: ReviewScope::All,
+            review_scope: ScopePreset::All,
             navigator,
             review_order,
             total_blocks: visible.len(),
@@ -4779,7 +4828,7 @@ mod diff_scope_tests {
         navigator.set_current(file_id);
 
         let mut state = AppState {
-            review_scope: ReviewScope::All,
+            review_scope: ScopePreset::All,
             navigator,
             review_order,
             total_blocks: visible.len(),
@@ -4833,9 +4882,7 @@ mod diff_scope_tests {
 
     #[test]
     fn diff_query_uses_main_diff_for_main_scope() {
-        let query = ReviewScope::MainDiff
-            .diff_selection()
-            .query_for_path("src/lib.rs");
+        let query = ScopePreset::MainDiff.diff_query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::MainDiff {
@@ -4845,12 +4892,11 @@ mod diff_scope_tests {
     }
     #[test]
     fn diff_query_uses_revision_for_commit_scope() {
-        let query = ReviewScope::Commit {
+        let query = ScopePreset::Commit {
             id: "abc123".to_string(),
             summary: "test".to_string(),
         }
-        .diff_selection()
-        .query_for_path("src/lib.rs");
+        .diff_query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::Revision {
@@ -4862,12 +4908,11 @@ mod diff_scope_tests {
 
     #[test]
     fn diff_query_uses_revision_range_for_range_scope() {
-        let query = ReviewScope::RevisionRange {
+        let query = ScopePreset::RevisionRange {
             start: "abc123".to_string(),
             end: "def456".to_string(),
         }
-        .diff_selection()
-        .query_for_path("src/lib.rs");
+        .diff_query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::RevisionRange {
@@ -4880,9 +4925,7 @@ mod diff_scope_tests {
 
     #[test]
     fn diff_query_uses_main_diff_for_all_scope() {
-        let query = ReviewScope::All
-            .diff_selection()
-            .query_for_path("src/lib.rs");
+        let query = ScopePreset::All.diff_query_for_path("src/lib.rs");
         assert_eq!(
             query,
             DiffQuery::MainDiff {
@@ -5441,9 +5484,13 @@ mod diff_scope_tests {
         };
 
         assert_eq!(
-            request.review_scope,
-            CliSemanticReviewScope::File(RepoPath::new("src/lib.rs").unwrap())
+            request.request,
+            ReviewRequest::Targets(vec![ReviewTarget::File(
+                RepoPath::new("src/lib.rs").unwrap()
+            )])
         );
+        assert_eq!(request.scope, ScopePreset::MainDiff);
+        assert_eq!(request.scope_label, "file src/lib.rs");
     }
 
     #[test]
@@ -5458,11 +5505,19 @@ mod diff_scope_tests {
         };
 
         assert_eq!(
-            request.review_scope,
-            CliSemanticReviewScope::RevisionRange(
+            request.request,
+            ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
                 crate::commands::review::RevisionRangeExpr::new("abc1234", "def5678").unwrap(),
-            )
+            )])
         );
+        assert_eq!(
+            request.scope,
+            ScopePreset::RevisionRange {
+                start: "abc1234".to_string(),
+                end: "def5678".to_string(),
+            }
+        );
+        assert_eq!(request.scope_label, "revisions abc1234..def5678");
     }
 
     #[test]
@@ -5475,7 +5530,12 @@ mod diff_scope_tests {
             panic!("expected cli request");
         };
 
-        assert_eq!(request.review_scope, CliSemanticReviewScope::DirtyWorktree);
+        assert_eq!(
+            request.request,
+            ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree])
+        );
+        assert_eq!(request.scope, ScopePreset::MainDiff);
+        assert_eq!(request.scope_label, "dirty worktree");
     }
     #[test]
     fn cli_review_request_errors_when_all_is_combined_with_targets() {
@@ -5488,8 +5548,18 @@ mod diff_scope_tests {
     fn cli_review_request_since_uses_revision_range_scope() {
         let request =
             cli_review_request_with(false, &[], Some("HEAD"), &[], &[], |all, target, since| {
-                crate::commands::review::resolve_cli_review_scope_with(all, target, since, |_| {
-                    Ok(())
+                let targets = crate::commands::review::expand_cli_review_targets_with(
+                    target,
+                    since,
+                    &|_| Ok(()),
+                )?;
+                let request =
+                    crate::commands::review::review_request_from_cli_targets(all, &targets)?;
+                let (scope, scope_label) = scope_preset_for_cli_targets(all, &targets);
+                Ok(CliReviewRequest {
+                    request,
+                    scope,
+                    scope_label,
                 })
             })
             .unwrap_or_else(|error| panic!("expected since request: {error}"));
@@ -5498,11 +5568,19 @@ mod diff_scope_tests {
         };
 
         assert_eq!(
-            request.review_scope,
-            CliSemanticReviewScope::RevisionRange(
+            request.request,
+            ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
                 crate::commands::review::RevisionRangeExpr::new("HEAD", "HEAD").unwrap(),
-            )
+            )])
         );
+        assert_eq!(
+            request.scope,
+            ScopePreset::RevisionRange {
+                start: "HEAD".to_string(),
+                end: "HEAD".to_string(),
+            }
+        );
+        assert_eq!(request.scope_label, "revisions HEAD..HEAD");
     }
 
     #[test]
@@ -5547,7 +5625,7 @@ mod diff_scope_tests {
         let state = build_review_state(
             &context,
             review,
-            ReviewScope::RevisionRange {
+            ScopePreset::RevisionRange {
                 start: "abc1234".to_string(),
                 end: "HEAD".to_string(),
             },
@@ -5777,7 +5855,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_mouse_event_scrolls_when_pointer_is_inside_code_pane() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.code_rect = Rect {
             x: 10,
             y: 5,
@@ -5807,7 +5885,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_mouse_event_ignores_scroll_outside_code_pane() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.code_rect = Rect {
             x: 10,
             y: 5,
@@ -5837,7 +5915,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_mouse_event_ignores_scroll_while_editing() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.code_rect = Rect {
             x: 10,
             y: 5,
@@ -6185,7 +6263,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_editing_submit_with_empty_note_sets_validation_and_keeps_editing() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6208,7 +6286,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_editing_submit_with_action_error_preserves_editor_state() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6233,7 +6311,7 @@ mod diff_scope_tests {
 
     #[test]
     fn editing_cancel_clears_non_empty_buffer_before_exit() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6255,7 +6333,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_appends_single_line_text_while_editing() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6275,7 +6353,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_preserves_multiline_text_while_editing() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.input_mode = InputMode::Editing {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -6292,7 +6370,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_ignores_normal_mode() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.input_buffer = "note".to_string();
 
         let rerender = handle_paste_event(&mut state, " plus");
@@ -6303,7 +6381,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_paste_event_ignores_confirm_batch_mode() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.input_mode = InputMode::ConfirmBatch {
             action: PendingAction::Single {
                 node_id: TreeBuilder::new().root(),
@@ -7180,7 +7258,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_mode_banner_line_shows_navigation_mode() {
-        let mut state = build_test_state(ReviewScope::All, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::All, None, HashMap::new());
         state.total_blocks = 1;
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 1;
@@ -7214,7 +7292,7 @@ mod diff_scope_tests {
         let (state, file_id, _block_id) =
             build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
         let mut state = state;
-        state.review_scope = ReviewScope::MainDiff;
+        state.review_scope = ScopePreset::MainDiff;
         state
             .file_change_kinds
             .insert(file_id, FileChangeKind::Deleted);
@@ -7244,7 +7322,7 @@ mod diff_scope_tests {
         let (state, file_id, block_id) =
             build_state_with_block_file(&file_path, file_content, block_content, 0, 3);
         let mut state = state;
-        state.review_scope = ReviewScope::MainDiff;
+        state.review_scope = ScopePreset::MainDiff;
         state
             .file_change_kinds
             .insert(file_id, FileChangeKind::Changed);
@@ -7270,7 +7348,7 @@ mod diff_scope_tests {
         let (state, _file_id, block_id) =
             build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
         let mut state = state;
-        state.review_scope = ReviewScope::MainDiff;
+        state.review_scope = ScopePreset::MainDiff;
         let palette = UiPalette::default();
         let block_node = state.navigator.tree.node(block_id);
 
@@ -7826,7 +7904,7 @@ mod diff_scope_tests {
         );
 
         let mut state = build_test_state(
-            ReviewScope::Commit {
+            ScopePreset::Commit {
                 id: revision,
                 summary: "Update greeting".to_string(),
             },
@@ -7902,7 +7980,7 @@ mod diff_scope_tests {
 
     #[test]
     fn footer_progress_uses_session_remaining_blocks_not_scope_total() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.total_blocks = 5;
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 1;
@@ -7914,7 +7992,7 @@ mod diff_scope_tests {
 
     #[test]
     fn footer_progress_reaches_complete_when_session_blocks_are_done() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.total_blocks = 5;
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 0;
@@ -7928,7 +8006,7 @@ mod diff_scope_tests {
 
     #[test]
     fn recap_summary_reports_no_activity_when_session_is_empty() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.total_blocks = 3;
         state.initial_remaining_blocks = 0;
         state.remaining_blocks = 0;
@@ -7944,7 +8022,7 @@ mod diff_scope_tests {
 
     #[test]
     fn recap_summary_reports_scope_coverage_delta_and_rollups() {
-        let mut state = build_test_state(ReviewScope::MainDiff, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::MainDiff, None, HashMap::new());
         state.total_blocks = 10;
         state.initial_remaining_blocks = 4;
         state.remaining_blocks = 0;
@@ -8065,7 +8143,7 @@ mod diff_scope_tests {
 
     #[test]
     fn toggle_speed_read_mode_ignores_non_block_nodes() {
-        let mut state = build_test_state(ReviewScope::All, None, HashMap::new());
+        let mut state = build_test_state(ScopePreset::All, None, HashMap::new());
         state.navigator.jump_root();
 
         toggle_speed_read_mode(&mut state);

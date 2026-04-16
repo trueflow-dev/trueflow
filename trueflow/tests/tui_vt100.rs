@@ -7,7 +7,7 @@ use trueflow::commands::tui::test_support::{
     MarkActionRunner, ScriptedMarkAction, ScriptedSessionAction, ScriptedSessionRecap, ScriptedTui,
 };
 use trueflow::repo_path::RepoPath;
-use trueflow::review_scope::ReviewScope;
+use trueflow::review_scope::ScopePreset;
 use trueflow::review_speedread::PlaybackState;
 use trueflow::vcs;
 
@@ -159,7 +159,7 @@ fn diff_view_renders_file_deleted_banner_and_header_metadata() -> Result<()> {
         0,
         3,
     )?;
-    app.set_review_scope(ReviewScope::MainDiff);
+    app.set_review_scope(ScopePreset::MainDiff);
     app.set_current_file_change_kind(FileChangeKind::Deleted);
     app.show_diff();
     app.go_parent();
@@ -193,7 +193,7 @@ fn diff_view_renders_block_change_metadata_independent_from_file_change_metadata
         0,
         3,
     )?;
-    app.set_review_scope(ReviewScope::MainDiff);
+    app.set_review_scope(ScopePreset::MainDiff);
     app.set_current_file_change_kind(FileChangeKind::Changed);
     app.set_current_block_change_kind(BlockChangeKind::Added);
     app.show_diff();
