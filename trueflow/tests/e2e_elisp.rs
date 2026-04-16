@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-mod common;
-use common::*;
 use trueflow::analysis::Language;
 use trueflow::block::BlockKind;
 use trueflow::block_splitter;
 use trueflow::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use trueflow::sub_splitter::{self, SubSplitSemantics};
+use trueflow_test_support::*;
 
 fn fixture_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("example_repos/elisp_support/elisp-support.el")

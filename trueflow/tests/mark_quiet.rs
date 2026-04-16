@@ -1,7 +1,6 @@
 use anyhow::Result;
 
-mod common;
-use common::{TestRepo, first_block_hash, json_array};
+use trueflow_test_support::{TestRepo, first_block_hash, json_array};
 
 #[test]
 fn test_mark_quiet_suppresses_output() -> Result<()> {

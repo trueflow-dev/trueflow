@@ -11,9 +11,8 @@ use trueflow::review_scope::ReviewScope;
 use trueflow::review_speedread::PlaybackState;
 use trueflow::vcs;
 
-mod common;
-use common::vt100_backend::VT100Backend;
-use common::{TestRepo, read_review_records};
+use trueflow_test_support::vt100_backend::VT100Backend;
+use trueflow_test_support::{TestRepo, read_review_records};
 
 fn press_text(app: &mut ScriptedTui<VT100Backend>, text: &str) -> Result<()> {
     for ch in text.chars() {

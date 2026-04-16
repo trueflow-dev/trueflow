@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-mod common;
-use common::{TestRepo, json, json_array};
+use trueflow_test_support::{TestRepo, json, json_array};
 
 fn tree_contains_hash(node: &Value, target: &str) -> bool {
     if node.get("hash").and_then(|value| value.as_str()) == Some(target) {

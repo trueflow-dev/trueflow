@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 fn get_main_review_json(repo: &TestRepo) -> Result<Vec<Value>> {
     let output = repo.run(&["review", "--target", "main", "--json"])?;

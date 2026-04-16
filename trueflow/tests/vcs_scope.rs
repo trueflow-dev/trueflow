@@ -1,7 +1,6 @@
 use anyhow::Result;
 
-mod common;
-use common::{TestRepo, run_git_output};
+use trueflow_test_support::{TestRepo, run_git_output};
 
 #[test]
 fn test_recent_commits_in_repo_returns_head_first() -> Result<()> {

@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 fn scan_kotlin_fixture() -> Result<Vec<Value>> {
     let repo = TestRepo::fixture("kotlin_support")?;

@@ -8,8 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use vt100::Parser;
 
-mod common;
-use common::{TestRepo, read_review_records};
+use trueflow_test_support::{TestRepo, read_review_records};
 
 fn lock_output(output: &Arc<Mutex<Vec<u8>>>) -> MutexGuard<'_, Vec<u8>> {
     match output.lock() {

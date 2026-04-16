@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 #[test]
 fn test_c_fixture_detects_c_and_preserves_cpp_mappings() -> Result<()> {

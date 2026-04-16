@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 fn non_gap_kinds(blocks: &[Value]) -> Vec<&str> {
     blocks

@@ -1,9 +1,7 @@
-#![allow(dead_code)]
-
 #[path = "fs_support.rs"]
 mod fs_support;
 #[path = "vt100_backend.rs"]
-pub(crate) mod vt100_backend;
+pub mod vt100_backend;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -14,22 +12,21 @@ use std::process::Command;
 use trueflow::store::{Record, ReviewTargetRef};
 use uuid::Uuid;
 
-pub(crate) use fs_support::copy_dir_all;
-
-pub(crate) struct TestRepo {
+pub struct TestRepo {
     pub path: PathBuf,
 }
 
 impl TestRepo {
-    pub(crate) fn new(name: &str) -> Result<Self> {
+    pub fn new(name: &str) -> Result<Self> {
         let path = temp_dir("trueflow_tests", name);
         fs::create_dir_all(&path)?;
         init_git(&path)?;
         Ok(Self { path })
     }
 
-    pub(crate) fn fixture(name: &str) -> Result<Self> {
+    pub fn fixture(name: &str) -> Result<Self> {
         let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
             .join("example_repos")
             .join(name);
         if !src.is_dir() {
@@ -41,13 +38,12 @@ impl TestRepo {
             fs::remove_dir_all(&path)?;
         }
 
-        copy_dir_all(&src, &path)?;
-
+        fs_support::copy_dir_all(&src, &path)?;
         init_git(&path)?;
         Ok(Self { path })
     }
 
-    pub(crate) fn write(&self, path: &str, content: &str) -> Result<()> {
+    pub fn write(&self, path: &str, content: &str) -> Result<()> {
         let p = self.path.join(path);
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
@@ -56,49 +52,47 @@ impl TestRepo {
         Ok(())
     }
 
-    pub(crate) fn git(&self, args: &[&str]) -> Result<()> {
+    pub fn git(&self, args: &[&str]) -> Result<()> {
         run_git(&self.path, args)
     }
 
-    pub(crate) fn add(&self, path: &str) -> Result<()> {
+    pub fn add(&self, path: &str) -> Result<()> {
         self.git(&["add", path])
     }
 
-    pub(crate) fn commit(&self, msg: &str) -> Result<()> {
+    pub fn commit(&self, msg: &str) -> Result<()> {
         self.git(&["commit", "-m", msg])
     }
 
-    pub(crate) fn commit_all(&self, msg: &str) -> Result<()> {
+    pub fn commit_all(&self, msg: &str) -> Result<()> {
         self.add(".")?;
         self.commit(msg)
     }
 
-    pub(crate) fn run(&self, args: &[&str]) -> Result<String> {
+    pub fn run(&self, args: &[&str]) -> Result<String> {
         run_cmd(&self.path, args)
     }
 
-    pub(crate) fn run_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+    pub fn run_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
         run_cmd_with_env(&self.path, args, envs)
     }
 
-    pub(crate) fn run_in(&self, args: &[&str], dir: &Path) -> Result<String> {
+    pub fn run_in(&self, args: &[&str], dir: &Path) -> Result<String> {
         run_cmd(dir, args)
     }
 
-    pub(crate) fn run_err(&self, args: &[&str]) -> Result<String> {
-        let output = build_cmd(&self.path, args).output()?;
+    pub fn run_err(&self, args: &[&str]) -> Result<String> {
+        let output = build_cmd(&self.path, args)?.output()?;
         if output.status.success() {
             anyhow::bail!("trueflow succeeded but expected failure");
         }
         Ok(String::from_utf8(output.stderr)?)
     }
 
-    pub(crate) fn run_raw(&self, args: &[&str]) -> Result<std::process::Output> {
-        Ok(build_cmd(&self.path, args).output()?)
+    pub fn run_raw(&self, args: &[&str]) -> Result<std::process::Output> {
+        Ok(build_cmd(&self.path, args)?.output()?)
     }
 }
-
-// Helpers
 
 fn temp_dir(base: &str, name: &str) -> PathBuf {
     std::env::temp_dir()
@@ -114,14 +108,35 @@ fn init_git(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_cmd(dir: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_trueflow"));
+fn trueflow_bin() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_trueflow") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let test_exe = std::env::current_exe().context("failed to resolve current test executable")?;
+    let debug_dir = test_exe
+        .parent()
+        .and_then(Path::parent)
+        .context("failed to resolve target/debug directory from current test executable")?;
+    let candidate = debug_dir.join(format!("trueflow{}", std::env::consts::EXE_SUFFIX));
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+
+    anyhow::bail!(
+        "could not locate trueflow binary; checked CARGO_BIN_EXE_trueflow and {}",
+        candidate.display()
+    )
+}
+
+fn build_cmd(dir: &Path, args: &[&str]) -> Result<Command> {
+    let mut cmd = Command::new(trueflow_bin()?);
     cmd.args(args).current_dir(dir);
-    cmd
+    Ok(cmd)
 }
 
 fn run_cmd(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = build_cmd(dir, args).output()?;
+    let output = build_cmd(dir, args)?.output()?;
     if !output.status.success() {
         anyhow::bail!(
             "trueflow failed: {}",
@@ -132,7 +147,7 @@ fn run_cmd(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn run_cmd_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
-    let mut cmd = build_cmd(dir, args);
+    let mut cmd = build_cmd(dir, args)?;
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -147,7 +162,7 @@ fn run_cmd_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<
     Ok(String::from_utf8(output.stdout)?)
 }
 
-pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
+pub fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git").args(args).current_dir(dir).output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -160,7 +175,7 @@ pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
+pub fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git").args(args).current_dir(dir).output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -174,7 +189,7 @@ pub(crate) fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Parse CLI JSON output into a serde_json::Value.
-pub(crate) fn json(output: &str) -> Result<Value> {
+pub fn json(output: &str) -> Result<Value> {
     serde_json::from_str(output).with_context(|| format!("Invalid JSON: {}", truncate(output, 200)))
 }
 
@@ -190,7 +205,7 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// Supports both legacy top-level arrays and scan-result objects with a
 /// top-level `files` array.
-pub(crate) fn json_array(output: &str) -> Result<Vec<Value>> {
+pub fn json_array(output: &str) -> Result<Vec<Value>> {
     let json = json(output)?;
     if let Some(array) = json.as_array() {
         return Ok(array.clone());
@@ -202,12 +217,12 @@ pub(crate) fn json_array(output: &str) -> Result<Vec<Value>> {
 }
 
 /// Check if a block kind is "gap" (case-insensitive).
-pub(crate) fn is_gap(kind: &str) -> bool {
+pub fn is_gap(kind: &str) -> bool {
     kind.eq_ignore_ascii_case("gap")
 }
 
 /// Extract block kinds from a blocks array, filtering out gaps.
-pub(crate) fn block_kinds_without_gaps(blocks: &[Value]) -> Vec<&str> {
+pub fn block_kinds_without_gaps(blocks: &[Value]) -> Vec<&str> {
     blocks
         .iter()
         .filter_map(|block| block["kind"].as_str())
@@ -219,7 +234,7 @@ pub(crate) fn block_kinds_without_gaps(blocks: &[Value]) -> Vec<&str> {
 ///
 /// Input contract: JSON array or scan-result object with at least one file entry
 /// containing a `blocks` array.
-pub(crate) fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
+pub fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
     Ok(file["blocks"]
@@ -232,7 +247,7 @@ pub(crate) fn first_file_blocks(output: &str) -> Result<Vec<Value>> {
 ///
 /// Input contract: JSON array or scan-result object with at least one file entry
 /// containing `tree_hash`.
-pub(crate) fn first_file_tree_hash(output: &str) -> Result<String> {
+pub fn first_file_tree_hash(output: &str) -> Result<String> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
     let hash = file["tree_hash"]
@@ -245,7 +260,7 @@ pub(crate) fn first_file_tree_hash(output: &str) -> Result<String> {
 ///
 /// Input contract: JSON array or scan-result object with at least one file entry
 /// containing a non-empty `blocks` array.
-pub(crate) fn first_block_hash(output: &str) -> Result<String> {
+pub fn first_block_hash(output: &str) -> Result<String> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
     let blocks = file["blocks"]
@@ -261,7 +276,7 @@ pub(crate) fn first_block_hash(output: &str) -> Result<String> {
 ///
 /// Input contract: JSON array or scan-result object with at least one file entry
 /// containing a non-empty `blocks` array.
-pub(crate) fn first_block_info(output: &str) -> Result<(String, String)> {
+pub fn first_block_info(output: &str) -> Result<(String, String)> {
     let files = json_array(output)?;
     let file = files.first().context("Expected file in output")?;
     let path = file["path"].as_str().context("Path should be string")?;
@@ -275,12 +290,11 @@ pub(crate) fn first_block_info(output: &str) -> Result<(String, String)> {
 }
 
 /// Locate a tree node hash for the given path in scan --tree JSON output.
-pub(crate) fn find_tree_hash(root: &Value, path: &str) -> Result<String> {
+pub fn find_tree_hash(root: &Value, path: &str) -> Result<String> {
     find_tree_hash_inner(root, path)
         .with_context(|| format!("Tree node not found for path '{path}'"))
 }
 
-/// Depth-first search for a tree node hash by path.
 fn find_tree_hash_inner(node: &Value, path: &str) -> Option<String> {
     let node_path = node.get("path")?.as_str()?;
     if node_path == path {
@@ -299,23 +313,20 @@ fn find_tree_hash_inner(node: &Value, path: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn read_review_records(path: &Path) -> Result<Vec<Record>> {
+pub fn read_review_records(path: &Path) -> Result<Vec<Record>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let content = fs::read_to_string(path)?;
-    // Note: Skips invalid JSON lines intentionally. Some tests put
-    // corrupted data in the file to verify trueflow handles it gracefully.
     Ok(content
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Record>(line).ok())
         .collect())
 }
 
-/// Overrides for building test review records with stable defaults.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ReviewRecordOverrides<'a> {
+pub struct ReviewRecordOverrides<'a> {
     pub id: Option<&'a str>,
     pub check: Option<&'a str>,
     pub verdict: Option<&'a str>,
@@ -327,7 +338,7 @@ pub(crate) struct ReviewRecordOverrides<'a> {
     pub attestations: Option<Value>,
 }
 
-pub(crate) fn record_target_key(record: &Record) -> &str {
+pub fn record_target_key(record: &Record) -> &str {
     match &record.target {
         ReviewTargetRef::Block { hash }
         | ReviewTargetRef::File { hash }
@@ -335,8 +346,7 @@ pub(crate) fn record_target_key(record: &Record) -> &str {
     }
 }
 
-/// Build a review record JSON value for tests.
-pub(crate) fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_>) -> Value {
+pub fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_>) -> Value {
     let id = overrides
         .id
         .map(str::to_string)
@@ -368,7 +378,7 @@ pub(crate) fn build_review_record(target_key: &str, overrides: ReviewRecordOverr
     })
 }
 
-pub(crate) fn write_reviews_jsonl(dir: &Path, records: &[Value]) -> Result<()> {
+pub fn write_reviews_jsonl(dir: &Path, records: &[Value]) -> Result<()> {
     fs::create_dir_all(dir)?;
     let file = fs::File::create(dir.join("reviews.jsonl"))?;
     let mut writer = BufWriter::new(file);

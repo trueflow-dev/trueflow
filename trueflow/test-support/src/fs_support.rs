@@ -5,7 +5,7 @@ use std::path::Path;
 
 const FIXTURE_PLACEHOLDER: &str = ".fixture-root";
 
-pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)
         .with_context(|| format!("failed to create fixture dir {}", dst.display()))?;
 

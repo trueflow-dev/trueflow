@@ -1,9 +1,8 @@
 use anyhow::Result;
 use std::fs;
 
-mod common;
-use common::*;
 use trueflow::store::{BlockState, RepoRef, VcsSystem};
+use trueflow_test_support::*;
 
 #[test]
 fn test_review_skips_invalid_db_lines() -> Result<()> {

@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 #[test]
 fn test_optimizer_import_merge_preserves_content() -> Result<()> {

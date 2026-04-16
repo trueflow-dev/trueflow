@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 fn non_collapsible_rust_file(base: &str, helper_name: &str, call_target: &str) -> String {
     // Keep semantic blocks visible for kind-based review assertions.

@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use uuid::Uuid;
 
-#[path = "fs_support.rs"]
+#[path = "../../test-support/src/fs_support.rs"]
 mod fs_support;
 
 use trueflow::commands::review::{

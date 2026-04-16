@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 #[test]
 fn test_small_text_file_stays_one_review_block() -> Result<()> {

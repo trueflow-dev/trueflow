@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 #[test]
 fn test_small_markdown_section_stays_whole() -> Result<()> {

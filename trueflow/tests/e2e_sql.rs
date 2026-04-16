@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 use trueflow::analysis::Language;
 use trueflow::block::BlockKind;

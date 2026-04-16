@@ -2,9 +2,8 @@ use anyhow::Result;
 use std::fs;
 use std::process::Command;
 
-mod common;
-use common::*;
 use trueflow::store::{BlockState, ReviewTargetRef};
+use trueflow_test_support::*;
 
 #[test]
 fn test_mark_uncommitted_state() -> Result<()> {

@@ -20,13 +20,13 @@ impl Write for SharedParser {
     }
 }
 
-pub(crate) struct VT100Backend {
+pub struct VT100Backend {
     parser: Rc<RefCell<vt100::Parser>>,
     backend: CrosstermBackend<SharedParser>,
 }
 
 impl VT100Backend {
-    pub(crate) fn new(width: u16, height: u16) -> Self {
+    pub fn new(width: u16, height: u16) -> Self {
         crossterm::style::force_color_output(true);
         let parser = Rc::new(RefCell::new(vt100::Parser::new(height, width, 0)));
         let backend = CrosstermBackend::new(SharedParser {
@@ -35,11 +35,11 @@ impl VT100Backend {
         Self { parser, backend }
     }
 
-    pub(crate) fn screen_contents(&self) -> String {
+    pub fn screen_contents(&self) -> String {
         self.parser.borrow().screen().contents()
     }
 
-    pub(crate) fn rows(&self) -> Vec<String> {
+    pub fn rows(&self) -> Vec<String> {
         self.screen_contents()
             .lines()
             .map(ToString::to_string)

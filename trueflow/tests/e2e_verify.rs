@@ -1,6 +1,5 @@
 use anyhow::Result;
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 #[test]
 fn test_verify_unsigned_records() -> Result<()> {

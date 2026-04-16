@@ -3,8 +3,7 @@ use std::fs;
 use trueflow::scanner::ScanResult;
 use trueflow::sub_splitter;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 #[test]
 fn test_binary_file() -> Result<()> {

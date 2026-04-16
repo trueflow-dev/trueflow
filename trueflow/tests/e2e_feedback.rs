@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 fn path_matches(file: &serde_json::Value, expected: &str) -> bool {
     file["path"]

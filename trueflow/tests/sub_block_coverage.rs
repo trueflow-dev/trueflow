@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-mod common;
-use common::{TestRepo, first_block_hash, json_array};
+use trueflow_test_support::{TestRepo, first_block_hash, json_array};
 
 fn mark(repo: &TestRepo, hash: &str) -> Result<()> {
     repo.run(&[

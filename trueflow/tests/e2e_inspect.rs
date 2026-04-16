@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-mod common;
-use common::*;
+use trueflow_test_support::*;
 
 fn scan_blocks(repo: &TestRepo) -> Result<Vec<Value>> {
     let output = repo.run(&["scan", "--json"])?;

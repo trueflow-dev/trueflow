@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 
-mod common;
-use common::{TestRepo, first_file_blocks};
+use trueflow_test_support::{TestRepo, first_file_blocks};
 
 #[test]
 fn test_review_json_output_filters_marked_blocks() -> Result<()> {

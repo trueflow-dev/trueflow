@@ -1,7 +1,6 @@
 use anyhow::Result;
 
-mod common;
-use common::TestRepo;
+use trueflow_test_support::TestRepo;
 
 #[test]
 fn test_fixture_errors_when_missing() -> Result<()> {

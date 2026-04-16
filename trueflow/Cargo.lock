@@ -3641,11 +3641,25 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "trueflow-test-support",
  "unicode-width 0.1.14",
  "url",
  "uuid",
  "vt100",
  "walkdir",
+]
+
+[[package]]
+name = "trueflow-test-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "trueflow",
+ "uuid",
+ "vt100",
 ]
 
 [[package]]
