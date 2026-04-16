@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 
 use crate::block::BlockKind;
 use crate::build_info;
@@ -69,7 +69,7 @@ pub enum Commands {
         json: bool,
 
         /// Output the full Merkle tree
-        #[arg(long)]
+        #[arg(long, requires = "json")]
         tree: bool,
     },
     /// Interactive review of unreviewed blocks
@@ -140,6 +140,12 @@ pub enum Commands {
         coverage: bool,
     },
     /// Verify record attestations
+    #[command(group(
+        ArgGroup::new("verify_selection")
+            .required(true)
+            .multiple(false)
+            .args(["all", "id"])
+    ))]
     Verify {
         /// Verify all records
         #[arg(long)]
@@ -503,5 +509,44 @@ mod tests {
             }
             _ => panic!("expected inspect command"),
         }
+    }
+
+    #[test]
+    fn scan_command_rejects_tree_without_json() {
+        let err = match Cli::try_parse_from(["trueflow", "scan", "--tree"]) {
+            Ok(_) => panic!("expected clap to reject --tree without --json"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--json") && rendered.contains("--tree"),
+            "unexpected clap error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn verify_command_requires_selection() {
+        let err = match Cli::try_parse_from(["trueflow", "verify"]) {
+            Ok(_) => panic!("expected clap to require a verify selection"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--all") && rendered.contains("--id"),
+            "unexpected clap error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn verify_command_rejects_all_and_id_together() {
+        let err = match Cli::try_parse_from(["trueflow", "verify", "--all", "--id", "abc"]) {
+            Ok(_) => panic!("expected clap to reject --all with --id"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--all") && rendered.contains("--id"),
+            "unexpected clap error: {rendered}"
+        );
     }
 }

@@ -77,12 +77,13 @@ pub enum VerifySelection<'a> {
 }
 
 impl<'a> VerifySelection<'a> {
-    pub fn from_args(all: bool, id: Option<&'a str>) -> Result<Self> {
+    pub fn from_clap_args(all: bool, id: Option<&'a str>) -> Self {
         match (all, id) {
-            (true, None) => Ok(Self::All),
-            (false, Some(id)) => Ok(Self::Id(id)),
-            (true, Some(_)) => anyhow::bail!("Use --all or --id, not both"),
-            (false, None) => anyhow::bail!("Provide --all or --id"),
+            (true, None) => Self::All,
+            (false, Some(id)) => Self::Id(id),
+            (true, Some(_)) | (false, None) => {
+                panic!("clap invariant violated: expected exactly one of --all or --id")
+            }
         }
     }
 }
@@ -219,7 +220,7 @@ mod tests {
     #[test]
     fn verify_selection_accepts_all_without_id() {
         assert_eq!(
-            VerifySelection::from_args(true, None).unwrap(),
+            VerifySelection::from_clap_args(true, None),
             VerifySelection::All
         );
     }
@@ -227,21 +228,9 @@ mod tests {
     #[test]
     fn verify_selection_accepts_single_id_without_all() {
         assert_eq!(
-            VerifySelection::from_args(false, Some("abc")).unwrap(),
+            VerifySelection::from_clap_args(false, Some("abc")),
             VerifySelection::Id("abc")
         );
-    }
-
-    #[test]
-    fn verify_selection_rejects_all_and_id_together() {
-        let error = VerifySelection::from_args(true, Some("abc")).unwrap_err();
-        assert!(error.to_string().contains("Use --all or --id, not both"));
-    }
-
-    #[test]
-    fn verify_selection_requires_all_or_id() {
-        let error = VerifySelection::from_args(false, None).unwrap_err();
-        assert!(error.to_string().contains("Provide --all or --id"));
     }
 
     #[test]

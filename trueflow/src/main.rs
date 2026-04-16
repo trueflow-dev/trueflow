@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         Commands::Check => commands::check::run(&context),
         Commands::Scan { json, tree } => commands::scan::run(
             &context,
-            commands::scan::ScanOutputMode::from_flags(*json, *tree)?,
+            commands::scan::ScanOutputMode::from_flags(*json, *tree),
         ),
         Commands::Review {
             json,
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
             coverage,
         } => commands::inspect::run(&context, fingerprint, *split, *coverage),
         Commands::Verify { all, id } => commands::verify::run(
-            commands::verify::VerifySelection::from_args(*all, id.as_deref())?,
+            commands::verify::VerifySelection::from_clap_args(*all, id.as_deref()),
         ),
         Commands::Tui {
             all,

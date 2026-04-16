@@ -2,7 +2,7 @@ use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::scanner;
 use crate::tree;
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanOutputMode {
@@ -12,12 +12,12 @@ pub enum ScanOutputMode {
 }
 
 impl ScanOutputMode {
-    pub fn from_flags(json: bool, tree_output: bool) -> Result<Self> {
+    pub fn from_flags(json: bool, tree_output: bool) -> Self {
         match (json, tree_output) {
-            (false, false) => Ok(Self::Text),
-            (true, false) => Ok(Self::JsonFiles),
-            (true, true) => Ok(Self::JsonTree),
-            (false, true) => bail!("Tree output requires --json"),
+            (false, false) => Self::Text,
+            (true, false) => Self::JsonFiles,
+            (true, true) => Self::JsonTree,
+            (false, true) => panic!("clap invariant violated: --tree requires --json"),
         }
     }
 }
@@ -65,22 +65,16 @@ mod tests {
     #[test]
     fn scan_output_mode_maps_cli_flags_to_text_and_json_variants() {
         assert_eq!(
-            ScanOutputMode::from_flags(false, false).unwrap(),
+            ScanOutputMode::from_flags(false, false),
             ScanOutputMode::Text
         );
         assert_eq!(
-            ScanOutputMode::from_flags(true, false).unwrap(),
+            ScanOutputMode::from_flags(true, false),
             ScanOutputMode::JsonFiles
         );
         assert_eq!(
-            ScanOutputMode::from_flags(true, true).unwrap(),
+            ScanOutputMode::from_flags(true, true),
             ScanOutputMode::JsonTree
         );
-    }
-
-    #[test]
-    fn scan_output_mode_rejects_tree_without_json() {
-        let error = ScanOutputMode::from_flags(false, true).unwrap_err();
-        assert!(error.to_string().contains("Tree output requires --json"));
     }
 }
