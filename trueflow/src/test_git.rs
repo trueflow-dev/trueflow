@@ -1,5 +1,7 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use uuid::Uuid;
 
 pub(crate) struct CurrentDirGuard(PathBuf);
 
@@ -18,6 +20,27 @@ impl Drop for CurrentDirGuard {
         std::env::set_current_dir(&self.0)
             .unwrap_or_else(|error| panic!("failed to restore current directory: {error}"));
     }
+}
+
+pub(crate) fn temp_test_dir(name: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("trueflow_tests")
+        .join(name)
+        .join(Uuid::new_v4().to_string())
+}
+
+pub(crate) fn temp_git_repo(name: &str) -> PathBuf {
+    let path = temp_test_dir(name);
+    init_git_repo(&path);
+    path
+}
+
+fn init_git_repo(path: &Path) {
+    fs::create_dir_all(path)
+        .unwrap_or_else(|error| panic!("failed to create git test directory {path:?}: {error}"));
+    run_git(path, &["init", "-q"]);
+    run_git(path, &["config", "user.email", "test@example.com"]);
+    run_git(path, &["config", "user.name", "Test User"]);
 }
 
 pub(crate) fn run_git(path: &Path, args: &[&str]) {

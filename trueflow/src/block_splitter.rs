@@ -7,7 +7,8 @@ use crate::optimizer;
 use crate::text_split::split_by_paragraph_breaks;
 use crate::tree_sitter_support::{
     classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
-    first_child_of_kind, kotlin_type_body,
+    find_named_descendant, first_child_of_kind, kotlin_type_body, markdown_heading_level,
+    ruby_assignment_targets_constant, ruby_call_method_name,
 };
 use crate::{languages, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
@@ -997,31 +998,6 @@ fn collect_markdown_headings(
     }
 }
 
-fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8> {
-    match kind {
-        "atx_heading" => {
-            let line = content.get(start..)?.lines().next()?;
-            let level = line.chars().take_while(|ch| *ch == '#').count();
-            if level > 0 {
-                u8::try_from(level.min(6)).ok()
-            } else {
-                None
-            }
-        }
-        "setext_heading" => {
-            let line = content.get(start..)?.lines().next()?;
-            if line.chars().all(|ch| ch == '=') {
-                Some(1)
-            } else if line.chars().all(|ch| ch == '-') {
-                Some(2)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
     if let Some(registration) = languages::registration(lang) {
         return (registration.top_level.map_kind)(node, content);
@@ -1198,35 +1174,6 @@ fn ruby_call_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
     }
 }
 
-fn ruby_call_method_name(node: tree_sitter::Node<'_>, content: &str) -> Option<String> {
-    node.child_by_field_name("method")
-        .and_then(|method| method.utf8_text(content.as_bytes()).ok())
-        .map(str::to_string)
-}
-
-fn ruby_assignment_targets_constant(node: tree_sitter::Node<'_>) -> bool {
-    let Some(left) = node.child_by_field_name("left") else {
-        return false;
-    };
-
-    ruby_lhs_targets_constant(left)
-}
-
-fn ruby_lhs_targets_constant(node: tree_sitter::Node<'_>) -> bool {
-    match node.kind() {
-        "constant" => true,
-        "scope_resolution" => node
-            .child_by_field_name("name")
-            .is_some_and(|name| name.kind() == "constant"),
-        "left_assignment_list" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .all(ruby_lhs_targets_constant)
-        }
-        _ => false,
-    }
-}
-
 fn map_c_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
     match node.kind() {
         "comment" => BlockKind::Comment,
@@ -1385,7 +1332,7 @@ fn collect_kotlin_type_items(
 fn map_kotlin_type_member_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
     match node.kind() {
         "function_declaration" => {
-            if find_named_descendant_of_kind(node, "function_body").is_some() {
+            if find_named_descendant(node, "function_body").is_some() {
                 BlockKind::Method
             } else {
                 BlockKind::FunctionSignature
@@ -1399,24 +1346,6 @@ fn map_kotlin_type_member_kind(node: tree_sitter::Node<'_>, content: &str) -> Bl
         "secondary_constructor" => BlockKind::Method,
         _ => BlockKind::Code,
     }
-}
-
-fn find_named_descendant_of_kind<'a>(
-    node: tree_sitter::Node<'a>,
-    kind: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    if node.kind() == kind {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_of_kind(child, kind) {
-            return Some(found);
-        }
-    }
-
-    None
 }
 
 fn collect_csharp_namespace_items(

@@ -174,10 +174,7 @@ fn test_mark_signing_failure() -> Result<()> {
     let repo = TestRepo::new("signing_fail")?;
 
     // Configure signing key that doesn't exist
-    Command::new("git")
-        .args(["config", "user.signingkey", "DEADBEEF"])
-        .current_dir(&repo.path)
-        .output()?;
+    repo.git(&["config", "user.signingkey", "DEADBEEF"])?;
 
     let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
@@ -210,10 +207,7 @@ fn test_mark_signing_failure() -> Result<()> {
 #[test]
 fn test_store_parent_discovery_no_git() -> Result<()> {
     // Manually set up dirs without git
-    let root = std::env::temp_dir()
-        .join("trueflow_tests")
-        .join("no_git_discovery")
-        .join(uuid::Uuid::new_v4().to_string());
+    let root = temp_test_dir("no_git_discovery");
     fs::create_dir_all(&root)?;
 
     // Create .trueflow at root

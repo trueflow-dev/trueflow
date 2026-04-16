@@ -4142,12 +4142,11 @@ mod diff_scope_tests {
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
     use crate::store::ReviewTargetKind;
-    use crate::test_git::{run_git, run_git_stdout};
+    use crate::test_git::{run_git, run_git_stdout, temp_git_repo, temp_test_dir};
     use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use uuid::Uuid;
 
     fn build_test_state(
         review_scope: ReviewScope,
@@ -6016,13 +6015,13 @@ mod diff_scope_tests {
         assert_ne!(key_a, key_c);
     }
 
+    fn temp_test_file_path(name: &str) -> PathBuf {
+        temp_test_dir(name).join("src/lib.rs")
+    }
+
     #[test]
     fn build_block_lines_source_mode_includes_full_file_context_for_scroll() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_source_scroll_context")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_source_scroll_context");
         let file_content = "line1\nline2\nline3\nline4\nline5\nline6\n";
         let block_content = "line3\nline4\n";
         let (mut state, _file_id, block_id) =
@@ -6049,11 +6048,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_source_mode_renders_full_file_source() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_source_mode")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_source_mode");
         let file_content = "line1\nline2\nline3\n";
         let block_content = "line2\n";
         let (mut state, file_id, _block_id) =
@@ -6079,11 +6074,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_source_mode_focuses_changed_rows_within_selected_block() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_source_focuses_changed_rows")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_source_focuses_changed_rows");
         let file_content = concat!(
             "line1
 ",
@@ -6226,11 +6217,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_diff_mode_renders_diff_rows() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_diff_mode")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_diff_mode");
         let file_content = "line1 changed\nline2\n";
         let block_content = "line1 changed\n";
         let (mut state, file_id, _block_id) =
@@ -6303,11 +6290,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_diff_mode_can_render_old_new_line_numbers() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_diff_mode_old_new")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_diff_mode_old_new");
         let file_content = "line1\nline2\n";
         let block_content = "line1\n";
         let (mut state, file_id, _block_id) =
@@ -6380,11 +6363,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_diff_mode_uses_compact_gutter_when_code_width_is_narrow() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_diff_mode_narrow_gutter")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_diff_mode_narrow_gutter");
         let file_content =
             "fn demo() {\n    let value = \"this_is_a_very_long_changed_line\";\n}\n";
         let block_content = file_content;
@@ -6437,11 +6416,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_diff_mode_shows_no_changes_hint() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_diff_empty")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_diff_empty");
         let file_content = "line1\nline2\n";
         let block_content = "line1\n";
         let (mut state, file_id, _block_id) =
@@ -6473,11 +6448,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_diff_mode_uses_configured_toggle_view_key_for_source_hint() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_diff_toggle_hint")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_diff_toggle_hint");
         let file_content = "line1\nline2\n";
         let block_content = "line1\n";
         let (mut state, file_id, _block_id) =
@@ -6506,11 +6477,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_block_diff_lines_no_changes_include_source_hint() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_block_diff_empty")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_block_diff_empty");
         let file_content = "line1\nline2\n";
         let block_content = "line1\n";
         let (mut state, _file_id, block_id) =
@@ -6542,11 +6509,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_block_lines_diff_mode_focuses_changed_rows_in_long_block() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_block_diff_focuses_changed_rows")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_block_diff_focuses_changed_rows");
         let file_content = concat!(
             "line1\n",
             "line2\n",
@@ -6609,11 +6572,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_file_lines_diff_mode_focuses_changed_rows_within_selected_block() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_file_diff_focuses_changed_rows")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_file_diff_focuses_changed_rows");
         let file_content = concat!(
             "line1\n",
             "line2\n",
@@ -6671,11 +6630,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_block_lines_diff_mode_excludes_previous_function_rows() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_block_diff_scoped")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_block_diff_scoped");
         let file_content = concat!(
             "fn previous() {\n",
             "    Ok(());\n",
@@ -6736,11 +6691,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_block_lines_diff_mode_for_deleted_block_excludes_following_function_rows() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_deleted_block_diff_scoped")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_deleted_block_diff_scoped");
         let file_content = concat!("fn kept() {\n", "    body();\n", "}\n");
         let deleted_block_content = "fn removed() {\n    old_body();\n}\n";
         let (mut state, _file_id, block_id) =
@@ -6807,11 +6758,7 @@ mod diff_scope_tests {
     #[test]
     fn build_block_lines_source_mode_for_deleted_block_uses_base_content_only() {
         // GIVEN: a deleted base-only block exists at a path whose current file content is different
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_deleted_block_source_scoped")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_deleted_block_source_scoped");
         let file_content = concat!("fn kept() {\n", "    body();\n", "}\n");
         let deleted_block_content = "fn removed() {\n    old_body();\n}\n";
         let (mut state, _file_id, block_id) =
@@ -6862,11 +6809,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_mode_banner_line_shows_diff_mode() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_mode_banner_label")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_mode_banner_label");
         let file_content = "line1\n";
         let block_content = "line1\n";
         let (mut state, _file_id, _block_id) =
@@ -6916,11 +6859,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_header_lines_show_file_change_metadata_without_mode_row() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_header_change_label")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_header_change_label");
         let file_content = "line1\n";
         let block_content = "line1\n";
         let (state, file_id, _block_id) =
@@ -6950,11 +6889,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_header_lines_show_block_change_metadata_independent_from_file_metadata() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_header_block_change_label")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_header_block_change_label");
         let file_content = "fn demo() {\n    old();\n}\n";
         let block_content = file_content;
         let (state, file_id, block_id) =
@@ -6980,11 +6915,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_header_lines_show_unknown_change_when_diff_metadata_missing() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_header_unknown_change_label")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_header_unknown_change_label");
         let file_content = "line1\n";
         let block_content = "line1\n";
         let (state, _file_id, block_id) =
@@ -7293,11 +7224,7 @@ mod diff_scope_tests {
 
     #[test]
     fn handle_parent_preserves_child_focus_block_for_parent_file() {
-        let temp_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_parent_focus_anchor")
-            .join(Uuid::new_v4().to_string());
-        let file_path = temp_root.join("src/lib.rs");
+        let file_path = temp_test_file_path("tui_parent_focus_anchor");
         let file_content = "line1\nline2\nline3\n";
         let block_content = "line2\n";
         let (mut state, file_id, block_id) =
@@ -7478,10 +7405,7 @@ mod diff_scope_tests {
 
     #[test]
     fn build_block_diff_lines_uses_repo_relative_path_for_commit_scope_blocks() {
-        let repo_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("tui_commit_scope")
-            .join(Uuid::new_v4().to_string());
+        let repo_root = temp_git_repo("tui_commit_scope");
         let package_dir = repo_root.join("pkg");
         let file_path = package_dir.join("src/lib.rs");
         fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
@@ -7492,9 +7416,6 @@ mod diff_scope_tests {
         fs::write(&file_path, initial)
             .unwrap_or_else(|error| panic!("failed to write initial fixture file: {error}"));
 
-        run_git(&repo_root, &["init", "-q"]);
-        run_git(&repo_root, &["config", "user.email", "test@example.com"]);
-        run_git(&repo_root, &["config", "user.name", "Test User"]);
         run_git(&repo_root, &["add", "."]);
         run_git(&repo_root, &["commit", "-m", "Initial"]);
 

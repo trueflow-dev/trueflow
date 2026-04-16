@@ -116,6 +116,10 @@ impl Drop for ReviewBenchRepo {
     }
 }
 
+pub fn temp_test_dir(name: &str) -> PathBuf {
+    temp_dir("trueflow_tests", name)
+}
+
 fn temp_dir(base: &str, name: &str) -> PathBuf {
     std::env::temp_dir()
         .join(base)

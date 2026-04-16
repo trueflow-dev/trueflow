@@ -1223,10 +1223,9 @@ fn line_range_overlap(a: &std::ops::Range<u32>, b: &std::ops::Range<u32>) -> u32
 mod tests {
     use super::*;
     use crate::hashing::TreeHash;
-    use crate::test_git::{CurrentDirGuard, run_git};
+    use crate::test_git::{CurrentDirGuard, run_git, temp_git_repo};
     use std::fs;
     use std::path::Path;
-    use uuid::Uuid;
 
     fn make_block(kind: BlockKind, tags: &[&str]) -> Block {
         Block {
@@ -1625,10 +1624,7 @@ mod tests {
 
     #[test]
     fn collect_review_main_diff_includes_deleted_base_only_module_block() {
-        let repo_root = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join("review_deleted_module_collect")
-            .join(Uuid::new_v4().to_string());
+        let repo_root = temp_git_repo("review_deleted_module_collect");
         let file_path = repo_root.join("src/lib.rs");
         fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
             .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
@@ -1644,9 +1640,6 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("failed to write initial fixture file: {error}"));
 
-        run_git(&repo_root, &["init", "-q"]);
-        run_git(&repo_root, &["config", "user.email", "test@example.com"]);
-        run_git(&repo_root, &["config", "user.name", "Test User"]);
         run_git(&repo_root, &["add", "."]);
         run_git(&repo_root, &["commit", "-m", "Initial"]);
         run_git(&repo_root, &["branch", "-M", "main"]);
