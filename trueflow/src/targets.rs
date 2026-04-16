@@ -141,21 +141,7 @@ fn path_matches_specific_selection(targets: &HashSet<RepoPath>, file_path: &Repo
 }
 
 fn path_matches_dir_selection(dirs: &[RepoPath], file_path: &RepoPath) -> bool {
-    dirs.iter().any(|dir| path_under_dir(file_path, dir))
-}
-
-/// True if `file` equals `dir` or lives under `dir` as a subtree.
-/// Root directory matches every path.
-fn path_under_dir(file: &RepoPath, dir: &RepoPath) -> bool {
-    if dir.is_root() {
-        return true;
-    }
-
-    file == dir
-        || file
-            .as_str()
-            .strip_prefix(dir.as_str())
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    dirs.iter().any(|dir| file_path.is_under(dir))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -466,7 +452,7 @@ pub fn workdir_prefix_from_git_root() -> Option<String> {
 mod tests {
     use super::{
         ResolvedTargets, ReviewContentSource, ReviewDiffSelection, ReviewPathSelection,
-        ReviewTarget, RevisionExpr, RevisionRangeExpr, path_under_dir, resolve_targets_with,
+        ReviewTarget, RevisionExpr, RevisionRangeExpr, resolve_targets_with,
     };
     use crate::repo_path::RepoPath;
     use crate::store::CommitId;
@@ -580,27 +566,22 @@ mod tests {
     }
 
     #[test]
-    fn path_under_dir_matches_exact_and_subtree() {
+    fn repo_path_is_under_matches_exact_and_subtree() {
         let dir = RepoPath::new("website").unwrap();
-        assert!(path_under_dir(&RepoPath::new("website").unwrap(), &dir));
-        assert!(path_under_dir(
-            &RepoPath::new("website/index.html").unwrap(),
-            &dir
-        ));
-        assert!(!path_under_dir(
-            &RepoPath::new("website-next/index.html").unwrap(),
-            &dir
-        ));
-        assert!(!path_under_dir(&RepoPath::new("docs/x.md").unwrap(), &dir));
+        assert!(RepoPath::new("website").unwrap().is_under(&dir));
+        assert!(RepoPath::new("website/index.html").unwrap().is_under(&dir));
+        assert!(
+            !RepoPath::new("website-next/index.html")
+                .unwrap()
+                .is_under(&dir)
+        );
+        assert!(!RepoPath::new("docs/x.md").unwrap().is_under(&dir));
     }
 
     #[test]
-    fn path_under_dir_root_matches_everything() {
+    fn repo_path_is_under_root_matches_everything() {
         let root = RepoPath::root();
-        assert!(path_under_dir(
-            &RepoPath::new("anything.rs").unwrap(),
-            &root
-        ));
+        assert!(RepoPath::new("anything.rs").unwrap().is_under(&root));
     }
 
     #[test]

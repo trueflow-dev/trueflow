@@ -64,6 +64,18 @@ impl RepoPath {
         }
     }
 
+    pub fn is_under(&self, prefix: &RepoPath) -> bool {
+        if prefix.is_root() {
+            return true;
+        }
+
+        self == prefix
+            || self
+                .as_str()
+                .strip_prefix(prefix.as_str())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
     pub fn join(&self, child: &str) -> Result<Self> {
         if child.is_empty() {
             return Err(anyhow!("repo path child must not be empty"));
@@ -170,5 +182,22 @@ mod tests {
         assert!(RepoPath::new("../file.rs").is_err());
         assert!(RepoPath::new("src/../file.rs").is_err());
         assert!(RepoPath::new("src//file.rs").is_err());
+    }
+
+    #[test]
+    fn repo_path_is_under_matches_exact_and_descendants() {
+        let prefix = RepoPath::new("src/generated").unwrap();
+        assert!(RepoPath::new("src/generated").unwrap().is_under(&prefix));
+        assert!(
+            RepoPath::new("src/generated/out.rs")
+                .unwrap()
+                .is_under(&prefix)
+        );
+        assert!(!RepoPath::new("src/generate.rs").unwrap().is_under(&prefix));
+        assert!(
+            RepoPath::new("anything.rs")
+                .unwrap()
+                .is_under(&RepoPath::root())
+        );
     }
 }

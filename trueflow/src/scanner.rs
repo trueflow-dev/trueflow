@@ -274,7 +274,7 @@ impl IgnoreMatcher {
             && self
                 .path_prefixes
                 .iter()
-                .any(|prefix| repo_path_matches_prefix(&repo_path, prefix))
+                .any(|prefix| repo_path.is_under(prefix))
         {
             return true;
         }
@@ -283,17 +283,6 @@ impl IgnoreMatcher {
             .matched_path_or_any_parents(relative, is_dir)
             .is_ignore()
     }
-}
-
-fn repo_path_matches_prefix(path: &RepoPath, prefix: &RepoPath) -> bool {
-    if prefix.is_root() {
-        return true;
-    }
-    path == prefix
-        || path
-            .as_str()
-            .strip_prefix(prefix.as_str())
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -703,18 +692,13 @@ mod tests {
     #[test]
     fn repo_path_matches_prefix_checks_exact_or_descendant() {
         let prefix = RepoPath::new("src/generated").unwrap();
-        assert!(repo_path_matches_prefix(
-            &RepoPath::new("src/generated").unwrap(),
-            &prefix,
-        ));
-        assert!(repo_path_matches_prefix(
-            &RepoPath::new("src/generated/out.rs").unwrap(),
-            &prefix,
-        ));
-        assert!(!repo_path_matches_prefix(
-            &RepoPath::new("src/generate.rs").unwrap(),
-            &prefix,
-        ));
+        assert!(RepoPath::new("src/generated").unwrap().is_under(&prefix));
+        assert!(
+            RepoPath::new("src/generated/out.rs")
+                .unwrap()
+                .is_under(&prefix)
+        );
+        assert!(!RepoPath::new("src/generate.rs").unwrap().is_under(&prefix));
     }
 
     #[test]

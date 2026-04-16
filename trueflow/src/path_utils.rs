@@ -1,4 +1,4 @@
-use crate::repo_path::normalize_repo_path_string;
+use crate::repo_path::{RepoPath, normalize_repo_path_string};
 use std::path::{Path, PathBuf};
 
 pub fn normalize_path_str(path: &str) -> String {
@@ -107,10 +107,13 @@ pub fn repo_path_candidates(
 }
 
 pub fn path_matches_workdir_prefix(path: &str, prefix: &str) -> bool {
-    let normalized_path = normalize_path_str(path);
-    let normalized_prefix = normalize_path_str(prefix);
-    normalized_path == normalized_prefix
-        || normalized_path.starts_with(&format!("{normalized_prefix}/"))
+    let Ok(path) = RepoPath::new(path) else {
+        return false;
+    };
+    let Ok(prefix) = RepoPath::new(prefix) else {
+        return false;
+    };
+    path.is_under(&prefix)
 }
 
 fn canonicalize_or_original(path: &Path) -> PathBuf {

@@ -311,13 +311,8 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     }
 
     let tree = tree::build_tree_from_files(&files);
-    let coverage = CoverageIndex::build(
-        &tree,
-        &database,
-        &CoverageBuildOptions {
-            workdir_prefix,
-        },
-    )?;
+    let coverage =
+        CoverageIndex::build(&tree, &database, &CoverageBuildOptions { workdir_prefix })?;
 
     let mut unreviewed_files = Vec::new();
     let mut total_blocks = 0;
