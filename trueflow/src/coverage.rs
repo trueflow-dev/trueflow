@@ -800,13 +800,12 @@ fn collect_path_candidates(path_hint: &RepoPath, workdir_prefix: Option<&str>) -
     }
 
     let mut candidates = Vec::new();
-    for candidate in
-        path_utils::repo_path_candidates(path_hint.as_str(), workdir_prefix, None)
-            .into_iter()
-            .chain(path_utils::tree_path_candidates_for_repo_path(
-                path_hint.as_str(),
-                workdir_prefix,
-            ))
+    for candidate in path_utils::repo_path_candidates(path_hint.as_str(), workdir_prefix, None)
+        .into_iter()
+        .chain(path_utils::tree_path_candidates_for_repo_path(
+            path_hint.as_str(),
+            workdir_prefix,
+        ))
     {
         let Ok(candidate) = RepoPath::new(candidate) else {
             continue;
@@ -935,7 +934,7 @@ mod tests {
     use crate::hashing::{BytesHash, TreeHash};
     use crate::repo_path::RepoPath;
     use crate::store::{
-        BlockState, Identity, Record, RepoRef, RepoRevision, ReviewTargetRef, VcsSystem,
+        BlockState, CommitId, Identity, Record, RepoRef, ReviewTargetRef, VcsSystem,
     };
     use crate::tree::TreeBuilder;
 
@@ -1289,7 +1288,7 @@ mod tests {
             },
             repo_ref: RepoRef::Vcs {
                 system: VcsSystem::Git,
-                revision: RepoRevision::new("0123456789abcdef").unwrap(),
+                revision: CommitId::new("0123456789abcdef").unwrap(),
             },
             block_state: BlockState::Committed,
             timestamp,
@@ -1323,7 +1322,7 @@ mod tests {
             },
             repo_ref: RepoRef::Vcs {
                 system: VcsSystem::Git,
-                revision: RepoRevision::new("0123456789abcdef").unwrap(),
+                revision: CommitId::new("0123456789abcdef").unwrap(),
             },
             block_state: BlockState::Committed,
             timestamp,
@@ -1354,7 +1353,7 @@ mod tests {
             },
             repo_ref: RepoRef::Vcs {
                 system: VcsSystem::Git,
-                revision: RepoRevision::new("0123456789abcdef").unwrap(),
+                revision: CommitId::new("0123456789abcdef").unwrap(),
             },
             block_state: BlockState::Committed,
             timestamp,

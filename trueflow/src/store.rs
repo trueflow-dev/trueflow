@@ -50,14 +50,14 @@ pub enum VcsSystem {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct RepoRevision(String);
+pub struct CommitId(String);
 
-impl RepoRevision {
+impl CommitId {
     pub fn new(value: impl AsRef<str>) -> Result<Self> {
         let value = value.as_ref().trim();
         if !(7..=40).contains(&value.len()) || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
             return Err(anyhow!(
-                "repo revision must be a 7-40 character hex string: {value}"
+                "commit id must be a 7-40 character hex string: {value}"
             ));
         }
         Ok(Self(value.to_ascii_lowercase()))
@@ -68,9 +68,17 @@ impl RepoRevision {
     }
 }
 
-impl fmt::Display for RepoRevision {
+impl fmt::Display for CommitId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CommitId {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
     }
 }
 
@@ -80,7 +88,7 @@ impl fmt::Display for RepoRevision {
 pub enum RepoRef {
     Vcs {
         system: VcsSystem,
-        revision: RepoRevision,
+        revision: CommitId,
     },
     Unknown,
 }
@@ -851,7 +859,7 @@ mod tests {
             },
             repo_ref: RepoRef::Vcs {
                 system: VcsSystem::Git,
-                revision: RepoRevision::new("0123456789abcdef").unwrap(),
+                revision: CommitId::new("0123456789abcdef").unwrap(),
             },
             block_state: BlockState::Committed,
             timestamp,

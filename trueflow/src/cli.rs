@@ -190,7 +190,7 @@ mod tests {
     use crate::build_info;
     use crate::build_metadata::UNKNOWN_BUILD_TIMESTAMP;
     use crate::commands::feedback::FeedbackFormat;
-    use crate::commands::review::{ReviewTarget, RevisionSpec};
+    use crate::commands::review::{ReviewTarget, RevisionExpr};
     use crate::feedback_since::FeedbackSinceExpr;
     use crate::repo_path::RepoPath;
     use crate::store::{ReviewCheck, Verdict};
@@ -288,7 +288,7 @@ mod tests {
                     target,
                     vec![
                         ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
-                        ReviewTarget::Revision(RevisionSpec::new("abc1234").unwrap()),
+                        ReviewTarget::Revision(RevisionExpr::new("abc1234").unwrap()),
                     ]
                 );
                 assert!(since.is_none());
@@ -367,7 +367,7 @@ mod tests {
                     vec![
                         ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
                         ReviewTarget::Dir(RepoPath::new("src").unwrap()),
-                        ReviewTarget::Revision(RevisionSpec::new("abc1234").unwrap()),
+                        ReviewTarget::Revision(RevisionExpr::new("abc1234").unwrap()),
                     ]
                 );
             }

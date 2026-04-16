@@ -3,7 +3,7 @@ use crate::repo_path::RepoPath;
 use crate::scanner::ScanOptions;
 use crate::store::{
     Attestation, AttestationKind, BlockState, Canonicalization, FileStore, Identity, Record,
-    RepoRef, RepoRevision, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
+    RepoRef, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
 };
 use crate::tree::{self, TreeNodeKind};
 use crate::vcs;
@@ -145,17 +145,12 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     };
 
     let repo_snapshot = vcs::snapshot_from_workdir();
-    let revision = repo_snapshot
-        .repo_ref_revision
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let repo_ref = match RepoRevision::new(&revision) {
-        Ok(revision) => RepoRef::Vcs {
+    let repo_ref = match repo_snapshot.repo_ref_revision.clone() {
+        Some(revision) => RepoRef::Vcs {
             system: VcsSystem::Git,
             revision,
         },
-        Err(_) => RepoRef::Unknown,
+        None => RepoRef::Unknown,
     };
 
     let MarkParams {

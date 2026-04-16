@@ -766,7 +766,7 @@ where
     commits
         .into_iter()
         .filter(|commit| {
-            match changed_paths_for_revision(&commit.id) {
+            match changed_paths_for_revision(commit.id.as_str()) {
                 Ok(paths) => paths
                     .iter()
                     .any(|path| path_utils::path_matches_workdir_prefix(path.as_str(), &prefix)),
@@ -4368,7 +4368,7 @@ mod diff_scope_tests {
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
     use crate::scanner::ScanOptions;
-    use crate::store::ReviewTargetKind;
+    use crate::store::{CommitId, ReviewTargetKind};
     use crate::test_git::{run_git, run_git_stdout, temp_git_repo, temp_test_dir};
     use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
@@ -4913,26 +4913,26 @@ mod diff_scope_tests {
     fn filter_commits_for_prefix_keeps_only_commits_touching_prefix() {
         let commits = vec![
             vcs::CommitInfo {
-                id: "a".to_string(),
+                id: CommitId::new("aaaaaaa").unwrap(),
                 summary: "touches subtree".to_string(),
             },
             vcs::CommitInfo {
-                id: "b".to_string(),
+                id: CommitId::new("bbbbbbb").unwrap(),
                 summary: "outside subtree".to_string(),
             },
         ];
 
         let filtered = filter_commits_for_prefix(commits, Some("trueflow"), |revision| {
             let paths = match revision {
-                "a" => HashSet::from([RepoPath::new("trueflow/src/lib.rs").unwrap()]),
-                "b" => HashSet::from([RepoPath::new("README.md").unwrap()]),
+                "aaaaaaa" => HashSet::from([RepoPath::new("trueflow/src/lib.rs").unwrap()]),
+                "bbbbbbb" => HashSet::from([RepoPath::new("README.md").unwrap()]),
                 _ => HashSet::new(),
             };
             Ok(paths)
         });
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, "a");
+        assert_eq!(filtered[0].id, CommitId::new("aaaaaaa").unwrap());
     }
 
     #[test]
@@ -5449,7 +5449,7 @@ mod diff_scope_tests {
     #[test]
     fn cli_review_request_revision_range_target_uses_revision_range_scope() {
         let targets = vec![ReviewTarget::RevisionRange(
-            crate::commands::review::RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+            crate::commands::review::RevisionRangeExpr::new("abc1234", "def5678").unwrap(),
         )];
         let request = cli_review_request(false, &targets, None, &[], &[])
             .unwrap_or_else(|error| panic!("expected revision range request: {error}"));
@@ -5460,7 +5460,7 @@ mod diff_scope_tests {
         assert_eq!(
             request.review_scope,
             CliSemanticReviewScope::RevisionRange(
-                crate::commands::review::RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+                crate::commands::review::RevisionRangeExpr::new("abc1234", "def5678").unwrap(),
             )
         );
     }
@@ -5500,7 +5500,7 @@ mod diff_scope_tests {
         assert_eq!(
             request.review_scope,
             CliSemanticReviewScope::RevisionRange(
-                crate::commands::review::RevisionRangeSpec::new("HEAD", "HEAD").unwrap(),
+                crate::commands::review::RevisionRangeExpr::new("HEAD", "HEAD").unwrap(),
             )
         );
     }

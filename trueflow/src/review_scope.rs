@@ -1,4 +1,4 @@
-use crate::commands::review::{ReviewRequest, ReviewTarget, RevisionRangeSpec, RevisionSpec};
+use crate::commands::review::{ReviewRequest, ReviewTarget, RevisionExpr, RevisionRangeExpr};
 use crate::repo_path::RepoPath;
 use crate::vcs::CommitInfo;
 use anyhow::{Result, anyhow};
@@ -16,8 +16,8 @@ pub enum CliSemanticReviewScope {
     MainDiff,
     File(RepoPath),
     Dir(RepoPath),
-    Revision(RevisionSpec),
-    RevisionRange(RevisionRangeSpec),
+    Revision(RevisionExpr),
+    RevisionRange(RevisionRangeExpr),
     MultiTarget(Vec<ReviewTarget>),
 }
 
@@ -223,10 +223,10 @@ impl ReviewDiffSelection {
         match self {
             ReviewDiffSelection::MainDiff => Ok(ReviewTarget::MainDiff),
             ReviewDiffSelection::Revision { revision } => {
-                Ok(ReviewTarget::Revision(RevisionSpec::new(revision.clone())?))
+                Ok(ReviewTarget::Revision(RevisionExpr::new(revision.clone())?))
             }
             ReviewDiffSelection::RevisionRange { start, end } => Ok(ReviewTarget::RevisionRange(
-                RevisionRangeSpec::new(start.clone(), end.clone())?,
+                RevisionRangeExpr::new(start.clone(), end.clone())?,
             )),
         }
     }
@@ -252,7 +252,7 @@ pub fn default_scope_options(commits: &[CommitInfo]) -> Vec<ScopeOption> {
 }
 
 fn commit_scope_option(commit: &CommitInfo) -> ScopeOption {
-    let short_id = short_commit_id(&commit.id);
+    let short_id = short_commit_id(commit.id.as_str());
     let summary = truncate_text(&commit.summary, 60);
     let label = if summary.is_empty() {
         format!("Commit {short_id}")
@@ -263,7 +263,7 @@ fn commit_scope_option(commit: &CommitInfo) -> ScopeOption {
     ScopeOption {
         label,
         scope: ReviewScope::Commit {
-            id: commit.id.clone(),
+            id: commit.id.to_string(),
             summary: commit.summary.clone(),
         },
     }
@@ -296,6 +296,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::CommitId;
 
     #[test]
     fn cli_semantic_review_scope_defaults_to_dirty_worktree() {
@@ -345,14 +346,14 @@ mod tests {
         let scope = CliSemanticReviewScope::from_cli(
             false,
             &[ReviewTarget::RevisionRange(
-                RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+                RevisionRangeExpr::new("abc1234", "def5678").unwrap(),
             )],
         )
         .unwrap_or_else(|error| panic!("expected revision range cli scope: {error}"));
         assert_eq!(
             scope,
             CliSemanticReviewScope::RevisionRange(
-                RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+                RevisionRangeExpr::new("abc1234", "def5678").unwrap(),
             )
         );
         assert_eq!(scope.label(), "revisions abc1234..def5678");
@@ -547,7 +548,7 @@ mod tests {
         assert_eq!(
             request,
             ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
-                RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+                RevisionRangeExpr::new("abc1234", "def5678").unwrap(),
             )])
         );
     }
@@ -556,11 +557,11 @@ mod tests {
     fn default_scope_options_include_base_scopes_and_commits() {
         let commits = vec![
             CommitInfo {
-                id: "abcdef123456".to_string(),
+                id: CommitId::new("abcdef123456").unwrap(),
                 summary: "first summary".to_string(),
             },
             CommitInfo {
-                id: "1234567890ab".to_string(),
+                id: CommitId::new("1234567890ab").unwrap(),
                 summary: "second summary".to_string(),
             },
         ];
@@ -580,7 +581,7 @@ mod tests {
     #[test]
     fn default_scope_options_truncate_long_commit_summary() {
         let commits = vec![CommitInfo {
-            id: "abcdef123456".to_string(),
+            id: CommitId::new("abcdef123456").unwrap(),
             summary:
                 "this is a very long commit summary that should be truncated in selector labels"
                     .to_string(),

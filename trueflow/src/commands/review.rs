@@ -22,7 +22,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
-pub use crate::targets::{ReviewTarget, RevisionRangeSpec, RevisionSpec};
+pub use crate::targets::{ReviewTarget, RevisionExpr, RevisionRangeExpr};
 
 #[derive(Serialize)]
 pub struct UnreviewedFile {
@@ -210,10 +210,10 @@ fn since_review_target_with<F>(since: &str, validate_revision: &F) -> Result<Rev
 where
     F: Fn(&str) -> Result<()>,
 {
-    let start = RevisionSpec::new(since)?;
+    let start = RevisionExpr::new(since)?;
     validate_revision(start.as_str())?;
     validate_revision("HEAD")?;
-    Ok(ReviewTarget::RevisionRange(RevisionRangeSpec::new(
+    Ok(ReviewTarget::RevisionRange(RevisionRangeExpr::new(
         start.as_str(),
         "HEAD",
     )?))
@@ -221,8 +221,7 @@ where
 
 fn validate_revision_exists_str(revision: &str) -> Result<()> {
     let repo = vcs::repo_from_workdir().context("git repository required for revision targets")?;
-    repo.rev_parse_single(revision)
-        .with_context(|| format!("revision `{revision}` could not be resolved"))?;
+    vcs::resolve_commit_id_in_repo(&repo, revision)?;
     Ok(())
 }
 
@@ -1302,7 +1301,7 @@ mod tests {
             false,
             &[
                 ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
-                ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "def5678").unwrap()),
+                ReviewTarget::RevisionRange(RevisionRangeExpr::new("abc1234", "def5678").unwrap()),
             ],
             None,
         )
@@ -1312,7 +1311,7 @@ mod tests {
             request,
             ReviewRequest::Targets(vec![
                 ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap()),
-                ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "def5678").unwrap()),
+                ReviewTarget::RevisionRange(RevisionRangeExpr::new("abc1234", "def5678").unwrap()),
             ])
         );
     }
@@ -1338,7 +1337,7 @@ mod tests {
         assert_eq!(
             request,
             ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
-                RevisionRangeSpec::new("HEAD", "HEAD").unwrap()
+                RevisionRangeExpr::new("HEAD", "HEAD").unwrap()
             )])
         );
     }
@@ -1356,7 +1355,7 @@ mod tests {
             targets,
             vec![
                 ReviewTarget::Dir(RepoPath::new("src").unwrap()),
-                ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "HEAD").unwrap()),
+                ReviewTarget::RevisionRange(RevisionRangeExpr::new("abc1234", "HEAD").unwrap()),
             ]
         );
     }
@@ -1374,7 +1373,7 @@ mod tests {
     fn resolve_review_request_rejects_mixed_historical_and_worktree_content_sources() {
         let targets = vec![
             ReviewTarget::MainDiff,
-            ReviewTarget::Revision(RevisionSpec::new("abc1234").unwrap()),
+            ReviewTarget::Revision(RevisionExpr::new("abc1234").unwrap()),
         ];
 
         let err = resolve_review_request(

@@ -3,6 +3,7 @@ use crate::block::{Block, FileState};
 use crate::block_splitter;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
+use crate::store::CommitId;
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
@@ -15,7 +16,7 @@ use crate::hashing::TreeHash;
 
 #[derive(Clone)]
 pub struct RepoSnapshot {
-    pub repo_ref_revision: Option<String>,
+    pub repo_ref_revision: Option<CommitId>,
     repo: Option<gix::Repository>,
 }
 
@@ -138,7 +139,7 @@ pub struct GitConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitInfo {
-    pub id: String,
+    pub id: CommitId,
     pub summary: String,
 }
 
@@ -156,11 +157,27 @@ pub fn snapshot_from_workdir() -> RepoSnapshot {
     let repo_ref_revision = repo
         .as_ref()
         .and_then(|repo| repo.head_id().ok())
-        .map(|id| id.detach().to_string());
+        .and_then(|id| CommitId::new(id.detach().to_string()).ok());
     RepoSnapshot {
         repo_ref_revision,
         repo,
     }
+}
+
+pub fn resolve_commit_id_in_repo(repo: &gix::Repository, revision: &str) -> Result<CommitId> {
+    let object = repo
+        .rev_parse_single(revision)
+        .with_context(|| format!("revision `{revision}` could not be resolved"))?;
+    let commit = object
+        .object()?
+        .peel_to_commit()
+        .with_context(|| format!("revision `{revision}` must resolve to a commit"))?;
+    CommitId::new(commit.id().detach().to_string())
+}
+
+pub fn resolve_commit_id_from_workdir(revision: &str) -> Result<CommitId> {
+    let repo = repo_from_workdir()?;
+    resolve_commit_id_in_repo(&repo, revision)
 }
 
 pub fn git_config_from_workdir() -> Result<GitConfig> {
@@ -783,7 +800,7 @@ pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Ve
             |message| message.summary().to_str_lossy().to_string(),
         );
         commits.push(CommitInfo {
-            id: current.id().detach().to_string(),
+            id: CommitId::new(current.id().detach().to_string())?,
             summary,
         });
 

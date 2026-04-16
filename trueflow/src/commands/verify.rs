@@ -184,8 +184,7 @@ mod tests {
     use super::*;
     use crate::hashing::TreeHash;
     use crate::store::{
-        BlockState, Identity, RepoRef, RepoRevision, ReviewCheck, ReviewTargetRef, VcsSystem,
-        Verdict,
+        BlockState, CommitId, Identity, RepoRef, ReviewCheck, ReviewTargetRef, VcsSystem, Verdict,
     };
 
     fn record(id: &str) -> Record {
@@ -205,7 +204,7 @@ mod tests {
             },
             repo_ref: RepoRef::Vcs {
                 system: VcsSystem::Git,
-                revision: RepoRevision::new("0123456789abcdef").unwrap(),
+                revision: CommitId::new("0123456789abcdef").unwrap(),
             },
             block_state: BlockState::Committed,
             timestamp: 1,

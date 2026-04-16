@@ -1,5 +1,6 @@
 use crate::path_utils;
 use crate::repo_path::RepoPath;
+use crate::store::CommitId;
 use crate::vcs;
 use anyhow::{Result, anyhow};
 use std::collections::HashSet;
@@ -7,9 +8,9 @@ use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RevisionSpec(String);
+pub struct RevisionExpr(String);
 
-impl RevisionSpec {
+impl RevisionExpr {
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         let value = value.trim();
@@ -24,23 +25,23 @@ impl RevisionSpec {
     }
 }
 
-impl fmt::Display for RevisionSpec {
+impl fmt::Display for RevisionExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RevisionRangeSpec {
-    pub start: RevisionSpec,
-    pub end: RevisionSpec,
+pub struct RevisionRangeExpr {
+    pub start: RevisionExpr,
+    pub end: RevisionExpr,
 }
 
-impl RevisionRangeSpec {
+impl RevisionRangeExpr {
     pub fn new(start: impl Into<String>, end: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            start: RevisionSpec::new(start)?,
-            end: RevisionSpec::new(end)?,
+            start: RevisionExpr::new(start)?,
+            end: RevisionExpr::new(end)?,
         })
     }
 }
@@ -53,8 +54,8 @@ pub enum ReviewTarget {
     /// Scope the review to every reviewable file under `path` (inclusive).
     /// Uses the workdir as the content source, same as `File`.
     Dir(RepoPath),
-    Revision(RevisionSpec),
-    RevisionRange(RevisionRangeSpec),
+    Revision(RevisionExpr),
+    RevisionRange(RevisionRangeExpr),
 }
 
 impl ReviewTarget {
@@ -72,32 +73,11 @@ impl ReviewTarget {
         }
         if let Some(rest) = raw.strip_prefix("rev:") {
             if let Some((start, end)) = rest.split_once("..") {
-                return Ok(Self::RevisionRange(RevisionRangeSpec::new(start, end)?));
+                return Ok(Self::RevisionRange(RevisionRangeExpr::new(start, end)?));
             }
-            return Ok(Self::Revision(RevisionSpec::new(rest)?));
+            return Ok(Self::Revision(RevisionExpr::new(rest)?));
         }
         Err(anyhow!("Unknown review target: {raw}"))
-    }
-
-    pub(crate) fn historical_content_revision(&self) -> Option<&RevisionSpec> {
-        match self {
-            Self::Revision(revision) => Some(revision),
-            Self::RevisionRange(range) => Some(&range.end),
-            Self::DirtyWorktree | Self::MainDiff | Self::File(_) | Self::Dir(_) => None,
-        }
-    }
-
-    pub(crate) fn is_worktree_content_target(&self) -> bool {
-        matches!(self, Self::DirtyWorktree | Self::MainDiff)
-    }
-
-    pub(crate) fn diff_target(&self) -> Option<ReviewDiffTarget> {
-        match self {
-            Self::MainDiff => Some(ReviewDiffTarget::MainDiff),
-            Self::Revision(revision) => Some(ReviewDiffTarget::Revision(revision.clone())),
-            Self::RevisionRange(range) => Some(ReviewDiffTarget::RevisionRange(range.clone())),
-            Self::DirtyWorktree | Self::File(_) | Self::Dir(_) => None,
-        }
     }
 }
 
@@ -112,7 +92,7 @@ impl FromStr for ReviewTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewContentSource {
     Workdir,
-    Revision(RevisionSpec),
+    Revision(CommitId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,11 +183,17 @@ fn path_under_dir(file: &RepoPath, dir: &RepoPath) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommitRange {
+    pub start: CommitId,
+    pub end: CommitId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDiffTarget {
     MainDiff,
-    Revision(RevisionSpec),
-    RevisionRange(RevisionRangeSpec),
+    Revision(CommitId),
+    RevisionRange(CommitRange),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +281,7 @@ impl ResolvedTargets {
 pub fn resolve_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargets> {
     resolve_targets_with(
         targets,
+        |revision| vcs::resolve_commit_id_from_workdir(revision.as_str()),
         vcs::dirty_files_from_workdir,
         vcs::files_changed_main_to_head,
         vcs::files_changed_in_revision,
@@ -302,47 +289,51 @@ pub fn resolve_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargets> {
     )
 }
 
-pub(crate) fn resolve_targets_with<DirtyFn, MainFn, RevisionFn, RangeFn>(
+pub(crate) fn resolve_targets_with<ResolveFn, DirtyFn, MainFn, RevisionFn, RangeFn>(
     targets: &[ReviewTarget],
+    resolve_revision: ResolveFn,
     dirty_files: DirtyFn,
     main_diff_files: MainFn,
     revision_files: RevisionFn,
     range_files: RangeFn,
 ) -> Result<ResolvedTargets>
 where
+    ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<RepoPath>>,
     MainFn: Fn() -> Result<HashSet<RepoPath>>,
     RevisionFn: Fn(&str) -> Result<HashSet<RepoPath>>,
     RangeFn: Fn(&str, &str) -> Result<HashSet<RepoPath>>,
 {
-    let content_source = resolve_content_source(targets)?;
-    let diff_selection = resolve_diff_selection(targets);
+    reject_mixed_content_source_targets(targets)?;
+    let resolved_targets = resolve_target_exprs(targets, &resolve_revision)?;
+    let content_source = resolve_content_source(&resolved_targets)?;
+    let diff_selection = resolve_diff_selection(&resolved_targets);
     let mut files = HashSet::new();
     let mut dirs = Vec::new();
     let mut changed = HashSet::new();
 
-    for target in targets {
+    for target in resolved_targets {
         match target {
-            ReviewTarget::DirtyWorktree => {
+            ResolvedReviewTarget::DirtyWorktree => {
                 if let Ok(dirty) = dirty_files() {
                     changed.extend(dirty);
                 }
             }
-            ReviewTarget::MainDiff => {
+            ResolvedReviewTarget::MainDiff => {
                 changed.extend(main_diff_files()?);
             }
-            ReviewTarget::File(path) => {
-                files.insert(path.clone());
+            ResolvedReviewTarget::File(path) => {
+                files.insert(path);
             }
-            ReviewTarget::Dir(path) => {
-                if !dirs.contains(path) {
-                    dirs.push(path.clone());
+            ResolvedReviewTarget::Dir(path) => {
+                if !dirs.contains(&path) {
+                    dirs.push(path);
                 }
             }
-            ReviewTarget::Revision(revision) => {
+            ResolvedReviewTarget::Revision(revision) => {
                 changed.extend(revision_files(revision.as_str())?);
             }
-            ReviewTarget::RevisionRange(range) => {
+            ResolvedReviewTarget::RevisionRange(range) => {
                 changed.extend(range_files(range.start.as_str(), range.end.as_str())?);
             }
         }
@@ -357,7 +348,87 @@ where
     ))
 }
 
-fn resolve_content_source(targets: &[ReviewTarget]) -> Result<ReviewContentSource> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedReviewTarget {
+    DirtyWorktree,
+    MainDiff,
+    File(RepoPath),
+    Dir(RepoPath),
+    Revision(CommitId),
+    RevisionRange(CommitRange),
+}
+
+impl ResolvedReviewTarget {
+    fn historical_content_revision(&self) -> Option<&CommitId> {
+        match self {
+            Self::Revision(revision) => Some(revision),
+            Self::RevisionRange(range) => Some(&range.end),
+            Self::DirtyWorktree | Self::MainDiff | Self::File(_) | Self::Dir(_) => None,
+        }
+    }
+
+    fn is_worktree_content_target(&self) -> bool {
+        matches!(self, Self::DirtyWorktree | Self::MainDiff)
+    }
+
+    fn diff_target(&self) -> Option<ReviewDiffTarget> {
+        match self {
+            Self::MainDiff => Some(ReviewDiffTarget::MainDiff),
+            Self::Revision(revision) => Some(ReviewDiffTarget::Revision(revision.clone())),
+            Self::RevisionRange(range) => Some(ReviewDiffTarget::RevisionRange(range.clone())),
+            Self::DirtyWorktree | Self::File(_) | Self::Dir(_) => None,
+        }
+    }
+}
+
+fn reject_mixed_content_source_targets(targets: &[ReviewTarget]) -> Result<()> {
+    let saw_worktree = targets
+        .iter()
+        .any(|target| matches!(target, ReviewTarget::DirtyWorktree | ReviewTarget::MainDiff));
+    let saw_historical = targets.iter().any(|target| {
+        matches!(
+            target,
+            ReviewTarget::Revision(_) | ReviewTarget::RevisionRange(_)
+        )
+    });
+
+    if saw_worktree && saw_historical {
+        return Err(anyhow!(
+            "Historical targets cannot be mixed with worktree-based targets"
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_target_exprs<ResolveFn>(
+    targets: &[ReviewTarget],
+    resolve_revision: &ResolveFn,
+) -> Result<Vec<ResolvedReviewTarget>>
+where
+    ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
+{
+    targets
+        .iter()
+        .map(|target| match target {
+            ReviewTarget::DirtyWorktree => Ok(ResolvedReviewTarget::DirtyWorktree),
+            ReviewTarget::MainDiff => Ok(ResolvedReviewTarget::MainDiff),
+            ReviewTarget::File(path) => Ok(ResolvedReviewTarget::File(path.clone())),
+            ReviewTarget::Dir(path) => Ok(ResolvedReviewTarget::Dir(path.clone())),
+            ReviewTarget::Revision(revision) => {
+                Ok(ResolvedReviewTarget::Revision(resolve_revision(revision)?))
+            }
+            ReviewTarget::RevisionRange(range) => {
+                Ok(ResolvedReviewTarget::RevisionRange(CommitRange {
+                    start: resolve_revision(&range.start)?,
+                    end: resolve_revision(&range.end)?,
+                }))
+            }
+        })
+        .collect()
+}
+
+fn resolve_content_source(targets: &[ResolvedReviewTarget]) -> Result<ReviewContentSource> {
     let mut revision = None;
     let mut saw_worktree_target = false;
 
@@ -398,10 +469,10 @@ fn resolve_content_source(targets: &[ReviewTarget]) -> Result<ReviewContentSourc
         .unwrap_or(ReviewContentSource::Workdir))
 }
 
-fn resolve_diff_selection(targets: &[ReviewTarget]) -> ReviewDiffSelection {
+fn resolve_diff_selection(targets: &[ResolvedReviewTarget]) -> ReviewDiffSelection {
     let diff_targets = targets
         .iter()
-        .filter_map(ReviewTarget::diff_target)
+        .filter_map(ResolvedReviewTarget::diff_target)
         .collect::<Vec<_>>();
 
     if diff_targets.is_empty() {
@@ -420,9 +491,10 @@ pub fn workdir_prefix_from_git_root() -> Option<String> {
 mod tests {
     use super::{
         ResolvedTargets, ReviewContentSource, ReviewDiffSelection, ReviewPathSelection,
-        ReviewTarget, RevisionRangeSpec, RevisionSpec, path_under_dir, resolve_targets_with,
+        ReviewTarget, RevisionExpr, RevisionRangeExpr, path_under_dir, resolve_targets_with,
     };
     use crate::repo_path::RepoPath;
+    use crate::store::CommitId;
     use std::collections::HashSet;
 
     #[test]
@@ -458,8 +530,17 @@ mod tests {
     #[test]
     fn dir_target_is_workdir_content() {
         let target = ReviewTarget::Dir(RepoPath::new("website").unwrap());
-        assert!(target.historical_content_revision().is_none());
-        assert!(target.diff_target().is_none());
+        let resolved = resolve_targets_with(
+            &[target],
+            |revision| CommitId::new(revision.as_str()),
+            || Ok(HashSet::new()),
+            || Ok(HashSet::new()),
+            |_revision| Ok(HashSet::new()),
+            |_start, _end| Ok(HashSet::new()),
+        )
+        .unwrap_or_else(|error| panic!("expected resolved dir target: {error}"));
+        assert_eq!(resolved.content_source, ReviewContentSource::Workdir);
+        assert_eq!(resolved.diff_selection, ReviewDiffSelection::None);
     }
 
     #[test]
@@ -591,11 +672,12 @@ mod tests {
     fn resolve_targets_rejects_mixed_historical_and_worktree_content_sources() {
         let targets = vec![
             ReviewTarget::MainDiff,
-            ReviewTarget::Revision(RevisionSpec::new("abc1234").unwrap()),
+            ReviewTarget::Revision(RevisionExpr::new("abc1234").unwrap()),
         ];
 
         let err = resolve_targets_with(
             &targets,
+            |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
             || Ok(HashSet::new()),
             |_revision| Ok(HashSet::new()),
@@ -612,11 +694,12 @@ mod tests {
     #[test]
     fn resolve_targets_makes_historical_content_and_diff_explicit() {
         let targets = vec![ReviewTarget::RevisionRange(
-            RevisionRangeSpec::new("abc1234", "def5678").unwrap(),
+            RevisionRangeExpr::new("abc1234", "def5678").unwrap(),
         )];
 
         let resolved = resolve_targets_with(
             &targets,
+            |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
             || Ok(HashSet::new()),
             |_revision| Ok(HashSet::new()),
@@ -626,7 +709,7 @@ mod tests {
 
         assert_eq!(
             resolved.content_source,
-            ReviewContentSource::Revision(RevisionSpec::new("def5678").unwrap())
+            ReviewContentSource::Revision(CommitId::new("def5678").unwrap())
         );
         assert!(matches!(
             resolved.diff_selection,
@@ -640,11 +723,12 @@ mod tests {
         let other = RepoPath::new("src/other.rs").unwrap();
         let targets = vec![
             ReviewTarget::File(file.clone()),
-            ReviewTarget::RevisionRange(RevisionRangeSpec::new("abc1234", "def5678").unwrap()),
+            ReviewTarget::RevisionRange(RevisionRangeExpr::new("abc1234", "def5678").unwrap()),
         ];
 
         let resolved = resolve_targets_with(
             &targets,
+            |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
             || Ok(HashSet::new()),
             |_revision| Ok(HashSet::new()),
