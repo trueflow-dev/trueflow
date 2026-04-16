@@ -1,8 +1,8 @@
 use crate::block::{Block, BlockKind};
 use crate::commands::review::{
-    ReviewContentSource, ReviewPathSelection, ReviewTarget, RevisionSpec,
+    ReviewContentSource, ReviewPathSelection, ReviewTarget,
 };
-use crate::config::{BlockFilters, load as load_config};
+use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::coverage::{CoverageBuildOptions, CoverageIndex};
 use crate::path_utils;
