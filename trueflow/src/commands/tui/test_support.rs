@@ -2,12 +2,13 @@ use super::{
     AppState, EditingKeyAction, Event, InputMode, KeyCode, KeyEvent, KeyEventKind, KeybindAction,
     RecapAction, Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers, TuiKeybindsConfig,
     TuiSpeedReadConfig, UiMode, ViewMode, clear_editing_validation, clear_focus_scroll,
-    current_ui_mode, editing_key_action_for_event, execute_action_with, handle_child,
-    handle_confirm_cancel, handle_editing_cancel, handle_editing_submit_with, handle_mouse_event,
-    handle_next, handle_note_action, handle_parent, handle_paste_event, handle_prev,
-    handle_scroll_line_down, handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
-    handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
-    key_event_for_press_event, key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
+    current_ui_mode, editing_key_action_for_event, execute_action_with,
+    handle_advance_review_target, handle_child, handle_confirm_cancel, handle_editing_cancel,
+    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
+    handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
+    handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding,
+    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
+    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
     keybind_action_for_key_code, recap_action_for_key_code, set_focus_for_current_node,
     should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
 };
@@ -393,12 +394,25 @@ where
         }
 
         if key_event.kind == KeyEventKind::Repeat
+            && matches!(key_code, KeyCode::Char(' '))
+            && self.state.navigator.current_id() != self.state.navigator.tree.root()
+        {
+            return Ok(());
+        }
+
+        if key_event.kind == KeyEventKind::Repeat
             && !key_code_accepts_repeat_in_normal_mode(key_code)
         {
             return Ok(());
         }
 
         match key_code {
+            KeyCode::Char(' ')
+                if key_event.kind == KeyEventKind::Press
+                    && self.state.navigator.current_id() != self.state.navigator.tree.root() =>
+            {
+                handle_advance_review_target(&mut self.state);
+            }
             KeyCode::Char(' ') | KeyCode::PageDown => handle_scroll_page_down(&mut self.state),
             KeyCode::PageUp => handle_scroll_page_up(&mut self.state),
             KeyCode::Home => self.state.scroll_offset = 0,

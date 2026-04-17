@@ -104,3 +104,9 @@ Two things:
    - [ ] Audit for performance improvements and implement top candidates.
 ** TODO [Medium] Add mode in review for speed-reading word-by-word SPC -> pause;
    j back sentence; l forward sentence
+** TODO [HIGH] please move the pgup/down, and [h]prev next down up to the right side of the navigation legend. parent and child can be in the middle. on the left, approve and comment, then mode. quit stays on furthest right. please confirm the order and layout with me.
+ ** TODO [HIGH] off-by-1 in progress bar. seems to include summary page at end of review.
+** TODO [HIGH] Summary page should allow Go back to selection page to start new review flow
+** DONE [HIGH] Review selector start page should show reviewed status of selectables
+** DONE [HIGH] Comment shouldn't auto progress. If a user wants to progress to next block, let's use spacebar. Or approve.
+** TODO [HIGH] complexity analysis of code -> constrain agent to reduce complexity w/o behavior or test changes

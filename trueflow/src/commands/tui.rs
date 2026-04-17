@@ -20,7 +20,7 @@ use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
-use crate::review_order::ReviewOrder;
+use crate::review_order::{ReviewAnchor, ReviewOrder};
 use crate::review_scope::{
     CliSemanticReviewScope, DiffQuery, ReviewScope, ScopeOption, default_scope_options,
 };
@@ -1058,12 +1058,26 @@ fn run_app(
                 }
 
                 if key_event.kind == KeyEventKind::Repeat
+                    && matches!(key_code, KeyCode::Char(' '))
+                    && state.navigator.current_id() != state.navigator.tree.root()
+                {
+                    continue;
+                }
+
+                if key_event.kind == KeyEventKind::Repeat
                     && !key_code_accepts_repeat_in_normal_mode(key_code)
                 {
                     continue;
                 }
 
                 match key_code {
+                    KeyCode::Char(' ')
+                        if key_event.kind == KeyEventKind::Press
+                            && state.navigator.current_id() != state.navigator.tree.root() =>
+                    {
+                        handle_advance_review_target(&mut state);
+                        needs_render = true;
+                    }
                     KeyCode::Char(' ') => {
                         handle_scroll_page_down(&mut state);
                         needs_render = true;
@@ -1886,7 +1900,11 @@ where
         } => (node_id, verdict, note),
     };
 
-    let next_id = compute_next_review_target(state, node_id);
+    let next_id = if matches!(verdict, Verdict::Comment) {
+        Some(node_id)
+    } else {
+        compute_next_review_target(state, node_id)
+    };
     let params = mark_params_for_action(state, node_id, verdict.clone(), note);
     run_mark(params)?;
 
@@ -2004,6 +2022,34 @@ fn compute_next_review_target(state: &AppState, node_id: TreeNodeId) -> Option<T
         &state.reviewable_nodes,
         node_id,
     )
+}
+
+fn compute_manual_next_review_target(state: &AppState) -> Option<TreeNodeId> {
+    let current = state.navigator.current_id();
+    let tree = &state.navigator.tree;
+    if current == tree.root() {
+        return None;
+    }
+
+    match tree.node(current).kind {
+        TreeNodeKind::Block => state
+            .review_order
+            .next_remaining_after(ReviewAnchor::Block(current), &state.reviewable_nodes),
+        _ => first_focusable_descendant_block(state, current)
+            .filter(|node_id| state.reviewable_nodes.contains(node_id))
+            .or_else(|| compute_next_review_target(state, current)),
+    }
+}
+
+fn handle_advance_review_target(state: &mut AppState) {
+    let Some(next_id) = compute_manual_next_review_target(state) else {
+        return;
+    };
+
+    state.navigator.set_current(next_id);
+    state.scroll_offset = 0;
+    set_focus_for_current_node(state, None);
+    sync_speed_read_focus(state);
 }
 
 fn detect_repo_name(context: &TrueflowContext) -> String {
@@ -2751,6 +2797,7 @@ fn build_action_lines(
         ],
         UiMode::DiffReview | UiMode::SourceReview => vec![
             "[PgUp/PgDown]".to_string(),
+            "[Space]advance".to_string(),
             format_key_action(keybinds.prev, "prev"),
             format_key_action(keybinds.next, "next"),
             format_key_action(keybinds.scroll_down, "down"),
@@ -5207,6 +5254,7 @@ mod diff_scope_tests {
 
         assert_eq!(lines.len(), 1);
         assert!(joined.contains("[PgUp/PgDown]"));
+        assert!(joined.contains("[Space]advance"));
         assert!(!joined.contains("[r]speed"));
         assert!(joined.contains("[h]prev"));
         assert!(joined.contains("[l]next"));
@@ -7492,6 +7540,42 @@ mod diff_scope_tests {
             compute_next_review_target(&state, first_sentence_id),
             sentence_children.get(1).copied()
         );
+    }
+
+    #[test]
+    fn execute_action_with_comment_keeps_current_block_selected() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        let first_block = block_ids[0];
+        state.navigator.set_current(first_block);
+        state.focus_block = Some(first_block);
+
+        execute_action_with(
+            &mut state,
+            PendingAction::Single {
+                node_id: first_block,
+                verdict: Verdict::Comment,
+                note: Some("note".to_string()),
+            },
+            |_params| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("expected comment action to succeed: {error}"));
+
+        assert_eq!(state.navigator.current_id(), first_block);
+        assert_eq!(state.remaining_blocks, 2);
+        assert_eq!(state.session_recap.comments, 1);
+    }
+
+    #[test]
+    fn handle_advance_review_target_moves_to_next_remaining_block() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        let first_block = block_ids[0];
+        let second_block = block_ids[1];
+        state.navigator.set_current(first_block);
+        state.focus_block = Some(first_block);
+
+        handle_advance_review_target(&mut state);
+
+        assert_eq!(state.navigator.current_id(), second_block);
     }
 
     #[test]
