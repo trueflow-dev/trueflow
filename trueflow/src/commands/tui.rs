@@ -8,9 +8,9 @@ use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
-    BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewRequest,
-    ReviewSummary, ReviewTarget, collect_review, expand_cli_review_targets,
-    resolve_review_request, review_request_from_cli_targets,
+    BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewRequest, ReviewSummary,
+    ReviewTarget, collect_review, expand_cli_review_targets, resolve_review_request,
+    review_request_from_cli_targets,
 };
 use crate::config::{
     BatchConfirmPolicy, BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers,
@@ -64,7 +64,7 @@ struct ScopeSelector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopeSelectorOption {
     label: String,
-    scope: ReviewScope,
+    scope: ScopePreset,
     status: ScopeSelectorStatus,
 }
 
@@ -483,6 +483,7 @@ pub fn run(
     let mut session = TerminalSession::enter()?;
     let config = load_config()?;
     let run_result = (|| {
+        let scan_options = config.scan.resolve_options();
         let filters = config.review.resolve_filters(only, exclude);
         let mut pending_cli_request = cli_review_request(all, target, since, only, exclude)?;
 
@@ -778,7 +779,7 @@ fn load_scope_selector_with<F>(
     mut load_summary: F,
 ) -> Result<ScopeSelector>
 where
-    F: FnMut(&ReviewScope, &BlockFilters, &crate::scanner::ScanOptions) -> Result<ReviewSummary>,
+    F: FnMut(&ScopePreset, &BlockFilters, &crate::scanner::ScanOptions) -> Result<ReviewSummary>,
 {
     let options = options
         .into_iter()
@@ -2014,7 +2015,7 @@ fn load_review_state(
 }
 
 fn load_review_summary(
-    scope: &ReviewScope,
+    scope: &ScopePreset,
     filters: &BlockFilters,
     scan_options: &crate::scanner::ScanOptions,
 ) -> Result<ReviewSummary> {
@@ -5192,15 +5193,15 @@ mod diff_scope_tests {
         let options = vec![
             ScopeOption {
                 label: "All files".to_string(),
-                scope: ReviewScope::All,
+                scope: ScopePreset::All,
             },
             ScopeOption {
                 label: "Diff vs main".to_string(),
-                scope: ReviewScope::MainDiff,
+                scope: ScopePreset::MainDiff,
             },
             ScopeOption {
                 label: "Commit abc1234".to_string(),
-                scope: ReviewScope::Commit {
+                scope: ScopePreset::Commit {
                     id: "abc1234".to_string(),
                     summary: "Update".to_string(),
                 },
@@ -5212,18 +5213,18 @@ mod diff_scope_tests {
             &BlockFilters::default(),
             &ScanOptions::default(),
             |scope, _, _| match scope {
-                ReviewScope::All => Ok(ReviewSummary {
+                ScopePreset::All => Ok(ReviewSummary {
                     files: Vec::new(),
                     total_blocks: 3,
                     diagnostics: Vec::new(),
                 }),
-                ReviewScope::MainDiff => Ok(ReviewSummary {
+                ScopePreset::MainDiff => Ok(ReviewSummary {
                     files: Vec::new(),
                     total_blocks: 0,
                     diagnostics: Vec::new(),
                 }),
-                ReviewScope::Commit { .. } => Err(anyhow::anyhow!("lookup failed")),
-                ReviewScope::RevisionRange { .. } => panic!("unexpected test scope"),
+                ScopePreset::Commit { .. } => Err(anyhow::anyhow!("lookup failed")),
+                ScopePreset::RevisionRange { .. } => panic!("unexpected test scope"),
             },
         )
         .unwrap_or_else(|error| panic!("expected selector with statuses: {error}"));
