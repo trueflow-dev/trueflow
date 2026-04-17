@@ -17,6 +17,7 @@ use crate::config::{
     TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
 use crate::context::TrueflowContext;
+use crate::hashing::hash_str;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::review_metadata;
@@ -25,7 +26,7 @@ use crate::review_order::{ReviewAnchor, ReviewOrder};
 use crate::review_scope::{DiffQuery, ScopeOption, ScopePreset, default_scope_options};
 use crate::review_session;
 use crate::review_speedread::PlaybackState;
-use crate::store::{ReviewCheck, ReviewTargetKind, Verdict};
+use crate::store::{FileStore, ReviewCheck, ReviewTargetKind, Verdict};
 use crate::sub_splitter;
 use crate::targets::workdir_prefix_from_git_root;
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
@@ -43,15 +44,22 @@ use ratatui::{
         Block as UiBlock, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[cfg(any(test, feature = "tui-test-support"))]
 #[doc(hidden)]
 pub mod test_support;
+
+const REVIEW_COVERAGE_STATUS_CACHE_FILE: &str = "cache/review_coverage_status.json";
+const REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION: u32 = 1;
+const SCOPE_SELECTOR_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 // --- Core Structs ---
 
@@ -78,8 +86,9 @@ impl ScopeSelectorOption {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ScopeSelectorStatus {
+    Checking,
     Pending {
         remaining_blocks: usize,
         total_blocks: usize,
@@ -110,8 +119,16 @@ impl ScopeSelectorStatus {
         }
     }
 
+    fn is_cacheable(self) -> bool {
+        matches!(
+            self,
+            Self::Pending { .. } | Self::Reviewed { .. } | Self::Empty
+        )
+    }
+
     fn label(self) -> String {
         match self {
+            Self::Checking => "[checking...]".to_string(),
             Self::Pending {
                 remaining_blocks,
                 total_blocks,
@@ -121,6 +138,276 @@ impl ScopeSelectorStatus {
             Self::Unavailable => "[unavailable]".to_string(),
         }
     }
+}
+
+#[derive(Debug)]
+struct LoadedScopeSelector {
+    selector: ScopeSelector,
+    status_poller: Option<ScopeSelectorStatusPoller>,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeSelectorStatusJob {
+    index: usize,
+    scope: ScopePreset,
+    cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeSelectorStatusUpdate {
+    index: usize,
+    status: ScopeSelectorStatus,
+    cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct ReviewDatabaseFingerprint {
+    size_bytes: u64,
+    modified_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReviewCoverageStatusCacheFile {
+    format_version: u32,
+    review_db_fingerprint: ReviewDatabaseFingerprint,
+    entries: HashMap<String, ScopeSelectorStatus>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewCoverageStatusCacheStore {
+    path: PathBuf,
+    fingerprint: ReviewDatabaseFingerprint,
+    entries: HashMap<String, ScopeSelectorStatus>,
+    dirty: bool,
+}
+
+impl ReviewCoverageStatusCacheStore {
+    fn load() -> Option<Self> {
+        let store = FileStore::new().ok()?;
+        let path = store.trueflow_dir().join(REVIEW_COVERAGE_STATUS_CACHE_FILE);
+        let fingerprint = review_database_fingerprint(&store.db_path());
+        let entries = load_review_coverage_status_cache_file(&path, fingerprint)
+            .map(|cache| cache.entries)
+            .unwrap_or_default();
+        Some(Self {
+            path,
+            fingerprint,
+            entries,
+            dirty: false,
+        })
+    }
+
+    fn cached_status(&self, cache_key: &str) -> Option<ScopeSelectorStatus> {
+        self.entries
+            .get(cache_key)
+            .copied()
+            .filter(|status| status.is_cacheable())
+    }
+
+    fn record(&mut self, cache_key: &str, status: ScopeSelectorStatus) {
+        if !status.is_cacheable() {
+            return;
+        }
+
+        let previous = self.entries.insert(cache_key.to_string(), status);
+        if previous != Some(status) {
+            self.dirty = true;
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+
+        if let Some(parent) = self.path.parent()
+            && fs::create_dir_all(parent).is_err()
+        {
+            return;
+        }
+
+        let cache = ReviewCoverageStatusCacheFile {
+            format_version: REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION,
+            review_db_fingerprint: self.fingerprint,
+            entries: self.entries.clone(),
+        };
+        let Ok(contents) = serde_json::to_string_pretty(&cache) else {
+            return;
+        };
+        if fs::write(&self.path, format!("{contents}\n")).is_ok() {
+            self.dirty = false;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScopeSelectorStatusPoller {
+    receiver: mpsc::Receiver<ScopeSelectorStatusUpdate>,
+    pending_jobs: usize,
+    cache: Option<ReviewCoverageStatusCacheStore>,
+}
+
+impl ScopeSelectorStatusPoller {
+    fn spawn(
+        jobs: Vec<ScopeSelectorStatusJob>,
+        filters: &BlockFilters,
+        scan_options: &crate::scanner::ScanOptions,
+        cache: Option<ReviewCoverageStatusCacheStore>,
+    ) -> Option<Self> {
+        if jobs.is_empty() {
+            return None;
+        }
+
+        let pending_jobs = jobs.len();
+        let filters = Arc::new(filters.clone());
+        let scan_options = Arc::new(scan_options.clone());
+        let (sender, receiver) = mpsc::channel();
+        for job in jobs {
+            let sender = sender.clone();
+            let filters = Arc::clone(&filters);
+            let scan_options = Arc::clone(&scan_options);
+            thread::spawn(move || {
+                let status = match load_review_summary(&job.scope, &filters, &scan_options) {
+                    Ok(summary) => ScopeSelectorStatus::from_summary(&summary),
+                    Err(_) => ScopeSelectorStatus::Unavailable,
+                };
+                let _ = sender.send(ScopeSelectorStatusUpdate {
+                    index: job.index,
+                    status,
+                    cache_key: job.cache_key,
+                });
+            });
+        }
+        drop(sender);
+
+        Some(Self {
+            receiver,
+            pending_jobs,
+            cache,
+        })
+    }
+
+    fn has_pending_jobs(&self) -> bool {
+        self.pending_jobs > 0
+    }
+
+    fn drain_updates(&mut self, selector: &mut ScopeSelector) -> bool {
+        let mut updated = false;
+        loop {
+            match self.receiver.try_recv() {
+                Ok(update) => {
+                    self.pending_jobs = self.pending_jobs.saturating_sub(1);
+                    if let Some(option) = selector.options.get_mut(update.index) {
+                        option.status = update.status;
+                        updated = true;
+                    }
+                    if let (Some(cache_key), Some(cache)) =
+                        (update.cache_key.as_deref(), self.cache.as_mut())
+                    {
+                        cache.record(cache_key, update.status);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_jobs = 0;
+                    break;
+                }
+            }
+        }
+
+        if updated && let Some(cache) = self.cache.as_mut() {
+            cache.flush();
+        }
+
+        updated
+    }
+}
+
+fn load_review_coverage_status_cache_file(
+    path: &Path,
+    fingerprint: ReviewDatabaseFingerprint,
+) -> Option<ReviewCoverageStatusCacheFile> {
+    let contents = fs::read_to_string(path).ok()?;
+    let cache = serde_json::from_str::<ReviewCoverageStatusCacheFile>(&contents).ok()?;
+    if cache.format_version != REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION
+        || cache.review_db_fingerprint != fingerprint
+    {
+        return None;
+    }
+    Some(cache)
+}
+
+fn review_database_fingerprint(path: &Path) -> ReviewDatabaseFingerprint {
+    let Ok(metadata) = fs::metadata(path) else {
+        return ReviewDatabaseFingerprint::default();
+    };
+    ReviewDatabaseFingerprint {
+        size_bytes: metadata.len(),
+        modified_unix_ms: metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_unix_ms)
+            .unwrap_or_default(),
+    }
+}
+
+fn system_time_to_unix_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn review_coverage_status_cache_key(
+    scope: &ScopePreset,
+    filters: &BlockFilters,
+    workdir_prefix: Option<&str>,
+) -> Option<String> {
+    match scope {
+        ScopePreset::Commit { id, .. } => {
+            let fingerprint = hash_str(&format!(
+                "filters={filters:?}|workdir_prefix={}",
+                workdir_prefix.unwrap_or_default()
+            ));
+            Some(format!("commit:{id}:{fingerprint}"))
+        }
+        ScopePreset::All | ScopePreset::MainDiff | ScopePreset::RevisionRange { .. } => None,
+    }
+}
+
+fn build_scope_selector_with_status_jobs(
+    options: Vec<ScopeOption>,
+    filters: &BlockFilters,
+    _scan_options: &crate::scanner::ScanOptions,
+    workdir_prefix: Option<&str>,
+    cache: Option<&ReviewCoverageStatusCacheStore>,
+) -> (ScopeSelector, Vec<ScopeSelectorStatusJob>) {
+    let mut selector_options = Vec::with_capacity(options.len());
+    let mut jobs = Vec::new();
+
+    for (index, option) in options.into_iter().enumerate() {
+        let cache_key = review_coverage_status_cache_key(&option.scope, filters, workdir_prefix);
+        let cached_status = cache_key
+            .as_deref()
+            .and_then(|key| cache.and_then(|cache| cache.cached_status(key)));
+        match cached_status {
+            Some(status) => {
+                selector_options.push(ScopeSelectorOption::from_scope_option(option, status));
+            }
+            None => {
+                jobs.push(ScopeSelectorStatusJob {
+                    index,
+                    scope: option.scope.clone(),
+                    cache_key,
+                });
+                selector_options.push(ScopeSelectorOption::from_scope_option(
+                    option,
+                    ScopeSelectorStatus::Checking,
+                ));
+            }
+        }
+    }
+
+    (ScopeSelector::new(selector_options), jobs)
 }
 
 impl ScopeSelector {
@@ -503,9 +790,16 @@ pub fn run(
                     scope_label: request.scope_label,
                 }
             } else {
-                let selector = load_scope_selector(&filters, &scan_options)?;
-                let selection =
-                    run_scope_selector(session.terminal_mut(), selector, &config.tui.keybinds)?;
+                let LoadedScopeSelector {
+                    selector,
+                    status_poller,
+                } = load_scope_selector(&filters, &scan_options)?;
+                let selection = run_scope_selector(
+                    session.terminal_mut(),
+                    selector,
+                    status_poller,
+                    &config.tui.keybinds,
+                )?;
                 match selection {
                     ScopeSelection::Quit => return Ok(()),
                     ScopeSelection::Selected(scope) => {
@@ -767,11 +1061,25 @@ fn load_scope_options() -> Result<Vec<ScopeOption>> {
 fn load_scope_selector(
     filters: &BlockFilters,
     scan_options: &crate::scanner::ScanOptions,
-) -> Result<ScopeSelector> {
+) -> Result<LoadedScopeSelector> {
     let options = load_scope_options()?;
-    load_scope_selector_with(options, filters, scan_options, load_review_summary)
+    let workdir_prefix = workdir_prefix_from_git_root();
+    let cache = ReviewCoverageStatusCacheStore::load();
+    let (selector, jobs) = build_scope_selector_with_status_jobs(
+        options,
+        filters,
+        scan_options,
+        workdir_prefix.as_deref(),
+        cache.as_ref(),
+    );
+    let status_poller = ScopeSelectorStatusPoller::spawn(jobs, filters, scan_options, cache);
+    Ok(LoadedScopeSelector {
+        selector,
+        status_poller,
+    })
 }
 
+#[cfg(test)]
 fn load_scope_selector_with<F>(
     options: Vec<ScopeOption>,
     filters: &BlockFilters,
@@ -911,18 +1219,37 @@ where
 fn run_scope_selector(
     terminal: &mut TuiTerminal,
     mut selector: ScopeSelector,
+    mut status_poller: Option<ScopeSelectorStatusPoller>,
     keybinds: &TuiKeybindsConfig,
 ) -> Result<ScopeSelection> {
     let mut needs_render = true;
     let mut event_pump = EventPump::default();
 
     loop {
+        if let Some(poller) = status_poller.as_mut()
+            && poller.drain_updates(&mut selector)
+        {
+            needs_render = true;
+        }
+
         if needs_render {
             terminal.draw(|f| render_scope_selector(f, &selector, keybinds))?;
             needs_render = false;
         }
 
-        let event = event_pump.read_blocking()?;
+        let event = if status_poller
+            .as_ref()
+            .is_some_and(ScopeSelectorStatusPoller::has_pending_jobs)
+        {
+            event_pump
+                .read_with_deadline(Some(Instant::now() + SCOPE_SELECTOR_STATUS_POLL_INTERVAL))?
+        } else {
+            Some(event_pump.read_blocking()?)
+        };
+        let Some(event) = event else {
+            continue;
+        };
+
         let event = event_pump.coalesce_resize_burst(event)?;
         if should_rerender_on_event(&event) {
             needs_render = true;
@@ -4418,6 +4745,7 @@ mod diff_scope_tests {
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
 
     fn build_test_state(
         review_scope: ScopePreset,
@@ -5251,6 +5579,118 @@ mod diff_scope_tests {
         );
         assert_eq!(selector.options[1].status, ScopeSelectorStatus::Empty);
         assert_eq!(selector.options[2].status, ScopeSelectorStatus::Unavailable);
+    }
+
+    #[test]
+    fn scope_selector_status_label_includes_checking_marker() {
+        assert_eq!(ScopeSelectorStatus::Checking.label(), "[checking...]");
+    }
+
+    #[test]
+    fn build_scope_selector_with_status_jobs_uses_cached_commit_statuses() {
+        let filters = BlockFilters::default();
+        let scan_options = ScanOptions::default();
+        let options = vec![
+            ScopeOption {
+                label: "All files".to_string(),
+                scope: ScopePreset::All,
+            },
+            ScopeOption {
+                label: "Commit abc1234".to_string(),
+                scope: ScopePreset::Commit {
+                    id: "abc1234".to_string(),
+                    summary: "Update".to_string(),
+                },
+            },
+        ];
+        let cache_key = review_coverage_status_cache_key(&options[1].scope, &filters, Some("src"))
+            .unwrap_or_else(|| panic!("expected commit cache key"));
+        let cache = ReviewCoverageStatusCacheStore {
+            path: PathBuf::from("/tmp/review_coverage_status.json"),
+            fingerprint: ReviewDatabaseFingerprint {
+                size_bytes: 0,
+                modified_unix_ms: 0,
+            },
+            entries: HashMap::from([(
+                cache_key,
+                ScopeSelectorStatus::Reviewed { total_blocks: 7 },
+            )]),
+            dirty: false,
+        };
+
+        let (selector, jobs) = build_scope_selector_with_status_jobs(
+            options,
+            &filters,
+            &scan_options,
+            Some("src"),
+            Some(&cache),
+        );
+
+        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Checking);
+        assert_eq!(
+            selector.options[1].status,
+            ScopeSelectorStatus::Reviewed { total_blocks: 7 }
+        );
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].index, 0);
+        assert!(matches!(jobs[0].scope, ScopePreset::All));
+    }
+
+    #[test]
+    fn scope_selector_status_poller_applies_updates_and_writes_commit_cache_entries() {
+        let cache_dir = temp_test_dir("scope_selector_status_cache");
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("failed to create cache dir {cache_dir:?}: {error}"));
+        let cache_path = cache_dir.join("review_coverage_status.json");
+        let (sender, receiver) = mpsc::channel();
+        let mut selector = ScopeSelector::new(vec![ScopeSelectorOption {
+            label: "Commit abc1234".to_string(),
+            scope: ScopePreset::Commit {
+                id: "abc1234".to_string(),
+                summary: "Update".to_string(),
+            },
+            status: ScopeSelectorStatus::Checking,
+        }]);
+        let fingerprint = ReviewDatabaseFingerprint {
+            size_bytes: 42,
+            modified_unix_ms: 1234,
+        };
+        let mut poller = ScopeSelectorStatusPoller {
+            receiver,
+            pending_jobs: 1,
+            cache: Some(ReviewCoverageStatusCacheStore {
+                path: cache_path.clone(),
+                fingerprint,
+                entries: HashMap::new(),
+                dirty: false,
+            }),
+        };
+
+        sender
+            .send(ScopeSelectorStatusUpdate {
+                index: 0,
+                status: ScopeSelectorStatus::Reviewed { total_blocks: 3 },
+                cache_key: Some("commit:abc1234".to_string()),
+            })
+            .unwrap_or_else(|error| panic!("failed to send selector update: {error}"));
+        drop(sender);
+
+        assert!(poller.drain_updates(&mut selector));
+        assert_eq!(poller.pending_jobs, 0);
+        assert_eq!(
+            selector.options[0].status,
+            ScopeSelectorStatus::Reviewed { total_blocks: 3 }
+        );
+
+        let cache_contents = fs::read_to_string(&cache_path)
+            .unwrap_or_else(|error| panic!("failed to read cache file {cache_path:?}: {error}"));
+        let cache_file: ReviewCoverageStatusCacheFile = serde_json::from_str(&cache_contents)
+            .unwrap_or_else(|error| panic!("failed to parse cache json: {error}"));
+        assert_eq!(cache_file.review_db_fingerprint, fingerprint);
+        assert_eq!(
+            cache_file.entries.get("commit:abc1234"),
+            Some(&ScopeSelectorStatus::Reviewed { total_blocks: 3 })
+        );
     }
 
     #[test]
