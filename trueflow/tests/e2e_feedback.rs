@@ -429,6 +429,59 @@ fn test_feedback_target_revision_range_filters_by_record_revision() -> Result<()
 }
 
 #[test]
+fn test_feedback_target_revision_range_includes_in_range_reviews_on_unchanged_files() -> Result<()>
+{
+    let repo = TestRepo::new("feedback_target_revision_range_record_centric")?;
+    repo.write("src/stable.rs", "pub fn stable() {}\n")?;
+    repo.write("docs/seed.md", "seed\n")?;
+    repo.commit_all("A")?;
+    let start_revision = head_revision(&repo)?;
+
+    repo.write("docs/guide.md", "first docs change\n")?;
+    repo.commit_all("B")?;
+    let in_range_revision = head_revision(&repo)?;
+    let review_output = repo.run(&["review", "--all", "--json"])?;
+    let stable_hash = block_hash_for_path(&review_output, "src/stable.rs")?;
+    let stable_review = build_block_review_record(
+        &stable_hash,
+        &in_range_revision,
+        "src/stable.rs",
+        ReviewRecordOverrides {
+            id: Some("stable-in-range"),
+            verdict: Some("comment"),
+            timestamp: Some(1000),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[stable_review])?;
+
+    repo.write("docs/guide.md", "second docs change\n")?;
+    repo.commit_all("C")?;
+    let end_revision = head_revision(&repo)?;
+
+    let output = repo.run(&[
+        "feedback",
+        "--format",
+        "json",
+        "--since",
+        "all",
+        "--target",
+        &format!("rev:{start_revision}..{end_revision}"),
+    ])?;
+    let entries = feedback_entries(&output)?;
+    let reviews = entries[0]["reviews"]
+        .as_array()
+        .context("reviews should be array")?;
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["file"].as_str(), Some("src/stable.rs"));
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["id"].as_str(), Some("stable-in-range"));
+
+    Ok(())
+}
+
+#[test]
 fn test_feedback_target_revision_range_uses_record_revision_context_after_later_drift() -> Result<()>
 {
     let repo = TestRepo::new("feedback_target_revision_range_context")?;

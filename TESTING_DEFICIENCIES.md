@@ -23,10 +23,12 @@
 ### Missing record-centric range semantics tests for `rev:A..B`
 - Existing tests exercised historical content loading, but not whether feedback records were filtered by `repo_ref.revision` membership in the requested range.
 - Result: out-of-range records on matching paths could leak into exports, while in-range records could be omitted after later tree drift.
+- We also missed the case where a review happened at an in-range revision on a file that was *not itself changed* by that range, which let diff-path filtering stay incorrectly coupled to revision-range feedback export.
 - Missing test layer: end-to-end behavior tests asserting exact record inclusion/exclusion by revision range.
 - Follow-up: for every revision-scoped export path, test both:
   - in-range vs out-of-range record membership
   - later-drift historical context resolution
+  - in-range reviews on unchanged files
 
 ### Synthetic test records were too unrealistic in key places
 - Several tests used fabricated records without realistic `path_hint`, `line_hint`, or `repo_ref.revision` values.

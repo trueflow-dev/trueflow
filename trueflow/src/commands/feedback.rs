@@ -96,7 +96,7 @@ pub fn run(
     let store = FileStore::new()?;
     let database = store.load_database()?;
     let since_mode = effective_since.resolve()?;
-    let since_filter = resolve_since_filter(&store, since_mode.clone())?;
+    let since_filter = resolve_since_filter(&store, since_mode)?;
 
     let entries = collect_feedback_entries(
         &database,
