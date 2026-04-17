@@ -22,7 +22,7 @@ fn feedback_scenario_review_block_uses_cli_record_defaults() -> Result<()> {
             revision: record_revision,
             ..
         } => {
-            assert_eq!(record_revision.as_str(), revision)
+            assert_eq!(record_revision.as_str(), revision);
         }
         RepoRef::Unknown => panic!("expected review_block to record the current git revision"),
     }

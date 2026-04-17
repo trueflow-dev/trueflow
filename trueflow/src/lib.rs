@@ -13,6 +13,7 @@ pub mod complexity;
 pub mod config;
 pub mod context;
 pub mod coverage;
+pub(crate) mod feedback_export;
 pub mod feedback_since;
 pub mod finder;
 pub mod hashing;
