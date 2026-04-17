@@ -76,6 +76,16 @@ impl RepoPath {
                 .is_some_and(|suffix| suffix.starts_with('/'))
     }
 
+    pub fn resolve_from_prefix(&self, prefix: &RepoPath) -> Self {
+        if self.is_root() || prefix.is_root() || self.is_under(prefix) {
+            return self.clone();
+        }
+
+        let joined = format!("{}/{}", prefix.as_str(), self.as_str());
+        debug_assert!(Self::new(&joined).is_ok());
+        Self(joined)
+    }
+
     pub fn join(&self, child: &str) -> Result<Self> {
         if child.is_empty() {
             return Err(anyhow!("repo path child must not be empty"));
@@ -198,6 +208,23 @@ mod tests {
             RepoPath::new("anything.rs")
                 .unwrap()
                 .is_under(&RepoPath::root())
+        );
+    }
+
+    #[test]
+    fn repo_path_resolve_from_prefix_prefixes_relative_subdir_paths() {
+        let prefix = RepoPath::new("pkg").unwrap();
+        assert_eq!(
+            RepoPath::new("src/lib.rs")
+                .unwrap()
+                .resolve_from_prefix(&prefix),
+            RepoPath::new("pkg/src/lib.rs").unwrap()
+        );
+        assert_eq!(
+            RepoPath::new("pkg/src/lib.rs")
+                .unwrap()
+                .resolve_from_prefix(&prefix),
+            RepoPath::new("pkg/src/lib.rs").unwrap()
         );
     }
 }

@@ -43,7 +43,7 @@ fn test_mark_uncommitted_state() -> Result<()> {
 }
 
 #[test]
-fn test_mark_committed_state_with_subdir_relative_path_hint() -> Result<()> {
+fn test_mark_committed_state_normalizes_subdir_relative_path_hint() -> Result<()> {
     let repo = TestRepo::new("committed_state_subdir_hint")?;
 
     repo.write("pkg/src/lib.rs", "pub fn stable() {}\n")?;
@@ -71,6 +71,10 @@ fn test_mark_committed_state_with_subdir_relative_path_hint() -> Result<()> {
     let records = read_review_records(&db_path)?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].block_state, BlockState::Committed);
+    assert_eq!(
+        records[0].path_hint.as_ref().map(|path| path.as_str()),
+        Some("pkg/src/lib.rs")
+    );
 
     Ok(())
 }

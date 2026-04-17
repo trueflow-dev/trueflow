@@ -1,4 +1,5 @@
 use crate::context::TrueflowContext;
+use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::scanner::ScanOptions;
 use crate::store::{
@@ -117,6 +118,21 @@ pub fn terminal_suspend_requirement_from_workdir() -> TerminalSuspendRequirement
     runtime_config_from_git_config(vcs::git_config_from_workdir().ok()).terminal_suspend_requirement
 }
 
+fn normalize_path_hint_from_workdir(path: Option<RepoPath>) -> Option<RepoPath> {
+    let path = path?;
+
+    let prefix = vcs::git_root_from_workdir()
+        .ok()
+        .flatten()
+        .and_then(|repo_root| path_utils::current_workdir_prefix_for_repo_root(&repo_root))
+        .and_then(|prefix| RepoPath::new(prefix).ok());
+
+    Some(match prefix {
+        Some(prefix) => path.resolve_from_prefix(&prefix),
+        None => path,
+    })
+}
+
 pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     info!(
         "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?})",
@@ -163,7 +179,7 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         line,
     } = params;
 
-    let path_hint = path;
+    let path_hint = normalize_path_hint_from_workdir(path);
     let target_kind = infer_target_kind(target_kind, &fingerprint, path_hint.as_ref(), line)?;
     let target = target_kind.parse_target(&fingerprint)?;
     let block_state: BlockState = vcs::block_state_for_path(
