@@ -2842,17 +2842,17 @@ fn build_action_lines(
             quit_action,
         ],
         UiMode::DiffReview | UiMode::SourceReview => vec![
-            "[PgUp/PgDown]".to_string(),
+            approve_action,
+            note_action,
+            mode_action,
+            format_key_action(keybinds.parent, "parent"),
+            format_key_action(keybinds.child, "child"),
             "[Space]advance".to_string(),
+            "[PgUp/PgDown]".to_string(),
             format_key_action(keybinds.prev, "prev"),
             format_key_action(keybinds.next, "next"),
             format_key_action(keybinds.scroll_down, "down"),
             format_key_action(keybinds.scroll_up, "up"),
-            format_key_action(keybinds.parent, "parent"),
-            format_key_action(keybinds.child, "child"),
-            approve_action,
-            note_action,
-            mode_action,
             quit_action,
         ],
         UiMode::SpeedRead => vec![
@@ -4535,6 +4535,22 @@ mod diff_scope_tests {
         (state, block_id)
     }
 
+    fn assert_phrase_order(rendered: &str, phrases: &[&str]) {
+        let mut previous_index = None;
+        for phrase in phrases {
+            let index = rendered
+                .find(phrase)
+                .unwrap_or_else(|| panic!("expected phrase {phrase:?} in {rendered:?}"));
+            if let Some(previous_index) = previous_index {
+                assert!(
+                    previous_index < index,
+                    "expected phrases in order {phrases:?}, got {rendered:?}"
+                );
+            }
+            previous_index = Some(index);
+        }
+    }
+
     fn build_state_at_root_with_two_files() -> (AppState, TreeNodeId, TreeNodeId) {
         let mut builder = TreeBuilder::new();
         let root = builder.root();
@@ -5284,21 +5300,21 @@ mod diff_scope_tests {
         let joined = rendered.join(" ");
 
         assert_eq!(lines.len(), 1);
-        assert!(joined.contains("[PgUp/PgDown]"));
-        assert!(joined.contains("[Space]advance"));
         assert!(!joined.contains("[r]speed"));
+        assert!(joined.contains("[a]pprove"));
+        assert!(joined.contains("[c]omment"));
+        assert!(joined.contains("[m]ode"));
+        assert!(joined.contains("[P]arent"));
+        assert!(joined.contains("[C]hild"));
+        assert!(joined.contains("[Space]advance"));
+        assert!(joined.contains("[PgUp/PgDown]"));
         assert!(joined.contains("[h]prev"));
         assert!(joined.contains("[l]next"));
         assert!(joined.contains("[j]down"));
         assert!(joined.contains("[k]up"));
-        assert!(joined.contains("[P]arent"));
-        assert!(joined.contains("[C]hild"));
-        assert!(joined.contains("[a]pprove"));
-        assert!(joined.contains("[c]omment"));
-        assert!(joined.contains("[m]ode"));
+        assert!(joined.contains("[q]uit"));
         assert!(!joined.contains("[m]source"));
         assert!(!joined.contains("[m]diff"));
-        assert!(joined.contains("[q]uit"));
         assert!(!joined.contains('↓'));
         assert!(!joined.contains('↑'));
         assert!(!joined.contains('←'));
@@ -5309,6 +5325,28 @@ mod diff_scope_tests {
         assert!(!joined.contains("root"));
         assert!(!joined.contains("[c]comment"));
         assert!(!joined.contains("[q]quit"));
+
+        assert_phrase_order(
+            &joined,
+            &[
+                "[a]pprove",
+                "[c]omment",
+                "[m]ode",
+                "[P]arent",
+                "[C]hild",
+                "[Space]advance",
+                "[PgUp/PgDown]",
+                "[h]prev",
+                "[l]next",
+                "[j]down",
+                "[k]up",
+                "[q]uit",
+            ],
+        );
+        assert!(
+            joined.ends_with("[q]uit"),
+            "expected quit to be last: {joined}"
+        );
     }
 
     #[test]
@@ -5383,8 +5421,30 @@ mod diff_scope_tests {
         let keybinds = crate::config::TuiKeybindsConfig::default();
         let palette = UiPalette::default();
         let lines = build_action_lines(60, UiMode::DiffReview, &keybinds, &palette);
+        let joined = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
 
         assert!(lines.len() > 1, "expected narrow action area to wrap");
+        assert_phrase_order(
+            &joined,
+            &[
+                "[a]pprove",
+                "[c]omment",
+                "[m]ode",
+                "[P]arent",
+                "[C]hild",
+                "[Space]advance",
+                "[PgUp/PgDown]",
+                "[h]prev",
+                "[l]next",
+                "[j]down",
+                "[k]up",
+                "[q]uit",
+            ],
+        );
     }
 
     #[test]
