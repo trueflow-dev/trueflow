@@ -1,7 +1,11 @@
+#[path = "feedback_scenario.rs"]
+mod feedback_scenario;
 #[path = "fs_support.rs"]
 mod fs_support;
 #[path = "vt100_backend.rs"]
 pub mod vt100_backend;
+
+pub use feedback_scenario::FeedbackScenario;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -440,6 +444,17 @@ pub fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_
 }
 
 pub fn write_reviews_jsonl(dir: &Path, records: &[Value]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let file = fs::File::create(dir.join("reviews.jsonl"))?;
+    let mut writer = BufWriter::new(file);
+    for record in records {
+        serde_json::to_writer(&mut writer, record)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+pub fn write_review_records(dir: &Path, records: &[Record]) -> Result<()> {
     fs::create_dir_all(dir)?;
     let file = fs::File::create(dir.join("reviews.jsonl"))?;
     let mut writer = BufWriter::new(file);
