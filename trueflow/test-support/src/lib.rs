@@ -390,6 +390,9 @@ pub struct ReviewRecordOverrides<'a> {
     pub repo_revision: Option<&'a str>,
     pub block_state: Option<&'a str>,
     pub target_kind: Option<&'a str>,
+    pub path_hint: Option<&'a str>,
+    pub line_hint: Option<u32>,
+    pub note: Option<&'a str>,
     pub attestations: Option<Value>,
 }
 
@@ -413,6 +416,9 @@ pub fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_
     let block_state = overrides.block_state.unwrap_or("committed");
     let target_kind = overrides.target_kind.unwrap_or("block");
     let timestamp = overrides.timestamp.unwrap_or(0);
+    let path_hint = overrides.path_hint;
+    let line_hint = overrides.line_hint;
+    let note = overrides.note;
     let attestations = overrides.attestations.unwrap_or(Value::Null);
 
     serde_json::json!({
@@ -425,9 +431,9 @@ pub fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_
         "repo_ref": { "type": "vcs", "system": "git", "revision": repo_revision },
         "block_state": block_state,
         "timestamp": timestamp,
-        "path_hint": null,
-        "line_hint": null,
-        "note": null,
+        "path_hint": path_hint,
+        "line_hint": line_hint,
+        "note": note,
         "tags": null,
         "attestations": attestations
     })
