@@ -505,6 +505,61 @@ fn multiline_note_submit_persists_to_review_store_and_feedback_output() -> Resul
 }
 
 #[test]
+fn multiline_note_submit_feedback_file_target_filters_to_the_requested_file() -> Result<()> {
+    let repo = TestRepo::new("tui_vt100_comment_target_file")?;
+    let file_content = "fn demo() {\n    work();\n}\n";
+    repo.write("src/lib.rs", file_content)?;
+    repo.write("src/other.rs", "fn other() {\n    noop();\n}\n")?;
+
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(120, 20),
+        "src/lib.rs",
+        file_content,
+        file_content,
+        0,
+        3,
+    )?;
+    app.install_mark_action_runner(
+        trueflow::commands::tui::test_support::CliMarkActionRunner::new(
+            env!("CARGO_BIN_EXE_trueflow"),
+            &repo.path,
+        ),
+    );
+
+    app.open_note_overlay()?;
+    press_text(&mut app, "alpha")?;
+    app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))?;
+    press_text(&mut app, "beta")?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+    let keep_feedback = repo.run(&[
+        "feedback",
+        "--format",
+        "xml",
+        "--since",
+        "all",
+        "--target",
+        "file:src/lib.rs",
+    ])?;
+    assert!(keep_feedback.contains("<comment>alpha\nbeta</comment>"));
+    assert!(keep_feedback.contains("path=\"src/lib.rs\""));
+
+    let other_feedback = repo.run(&[
+        "feedback",
+        "--format",
+        "xml",
+        "--since",
+        "all",
+        "--target",
+        "file:src/other.rs",
+    ])?;
+    assert!(!other_feedback.contains("<comment>alpha\nbeta</comment>"));
+    assert!(!other_feedback.contains("path=\"src/lib.rs\""));
+
+    Ok(())
+}
+
+#[test]
 fn multiline_note_submit_preserves_exact_whitespace() -> Result<()> {
     let repo = TestRepo::new("tui_vt100_comment_whitespace")?;
     let file_content = "fn demo() {\n    work();\n}\n";
