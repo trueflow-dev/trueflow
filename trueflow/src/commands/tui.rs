@@ -59,6 +59,7 @@ pub mod test_support;
 
 const REVIEW_COVERAGE_STATUS_CACHE_FILE: &str = "cache/review_coverage_status.json";
 const REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION: u32 = 1;
+const REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES: usize = 128;
 const SCOPE_SELECTOR_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 // --- Core Structs ---
@@ -171,6 +172,8 @@ struct ReviewCoverageStatusCacheFile {
     format_version: u32,
     review_db_fingerprint: ReviewDatabaseFingerprint,
     entries: HashMap<String, ScopeSelectorStatus>,
+    #[serde(default)]
+    entry_updated_unix_ms: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +181,7 @@ struct ReviewCoverageStatusCacheStore {
     path: PathBuf,
     fingerprint: ReviewDatabaseFingerprint,
     entries: HashMap<String, ScopeSelectorStatus>,
+    entry_updated_unix_ms: HashMap<String, u64>,
     dirty: bool,
 }
 
@@ -186,15 +190,24 @@ impl ReviewCoverageStatusCacheStore {
         let store = FileStore::new().ok()?;
         let path = store.trueflow_dir().join(REVIEW_COVERAGE_STATUS_CACHE_FILE);
         let fingerprint = review_database_fingerprint(&store.db_path());
-        let entries = load_review_coverage_status_cache_file(&path, fingerprint)
-            .map(|cache| cache.entries)
-            .unwrap_or_default();
-        Some(Self {
+        let cache = load_review_coverage_status_cache_file(&path, fingerprint);
+        let mut store = Self {
             path,
             fingerprint,
-            entries,
+            entries: cache
+                .as_ref()
+                .map(|cache| cache.entries.clone())
+                .unwrap_or_default(),
+            entry_updated_unix_ms: cache
+                .map(|cache| cache.entry_updated_unix_ms)
+                .unwrap_or_default(),
             dirty: false,
-        })
+        };
+        if store.prune_to_bound() {
+            store.dirty = true;
+            store.flush();
+        }
+        Some(store)
     }
 
     fn cached_status(&self, cache_key: &str) -> Option<ScopeSelectorStatus> {
@@ -209,10 +222,46 @@ impl ReviewCoverageStatusCacheStore {
             return;
         }
 
+        let now = current_unix_ms();
         let previous = self.entries.insert(cache_key.to_string(), status);
+        self.entry_updated_unix_ms.insert(cache_key.to_string(), now);
         if previous != Some(status) {
             self.dirty = true;
         }
+    }
+
+    fn prune_to_bound(&mut self) -> bool {
+        self.entry_updated_unix_ms
+            .retain(|key, _| self.entries.contains_key(key));
+        if self.entries.len() <= REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES {
+            return false;
+        }
+
+        let mut ordered_keys = self.entries.keys().cloned().collect::<Vec<_>>();
+        ordered_keys.sort_by(|left, right| {
+            self.entry_updated_unix_ms
+                .get(left)
+                .copied()
+                .unwrap_or_default()
+                .cmp(
+                    &self
+                        .entry_updated_unix_ms
+                        .get(right)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                .then_with(|| left.cmp(right))
+        });
+
+        let remove_count = self
+            .entries
+            .len()
+            .saturating_sub(REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES);
+        for key in ordered_keys.into_iter().take(remove_count) {
+            self.entries.remove(&key);
+            self.entry_updated_unix_ms.remove(&key);
+        }
+        true
     }
 
     fn flush(&mut self) {
@@ -226,10 +275,12 @@ impl ReviewCoverageStatusCacheStore {
             return;
         }
 
+        self.prune_to_bound();
         let cache = ReviewCoverageStatusCacheFile {
             format_version: REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION,
             review_db_fingerprint: self.fingerprint,
             entries: self.entries.clone(),
+            entry_updated_unix_ms: self.entry_updated_unix_ms.clone(),
         };
         let Ok(contents) = serde_json::to_string_pretty(&cache) else {
             return;
@@ -355,6 +406,10 @@ fn system_time_to_unix_ms(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn current_unix_ms() -> u64 {
+    system_time_to_unix_ms(SystemTime::now()).unwrap_or_default()
 }
 
 fn review_coverage_status_cache_key(
@@ -6053,9 +6108,10 @@ mod diff_scope_tests {
                 modified_unix_ms: 0,
             },
             entries: HashMap::from([(
-                cache_key,
+                cache_key.clone(),
                 ScopeSelectorStatus::Reviewed { total_blocks: 7 },
             )]),
+            entry_updated_unix_ms: HashMap::from([(cache_key, 1234)]),
             dirty: false,
         };
 
@@ -6103,6 +6159,7 @@ mod diff_scope_tests {
                 path: cache_path.clone(),
                 fingerprint,
                 entries: HashMap::new(),
+                entry_updated_unix_ms: HashMap::new(),
                 dirty: false,
             }),
         };
@@ -6132,6 +6189,78 @@ mod diff_scope_tests {
             cache_file.entries.get("commit:abc1234"),
             Some(&ScopeSelectorStatus::Reviewed { total_blocks: 3 })
         );
+        assert!(cache_file.entry_updated_unix_ms.contains_key("commit:abc1234"));
+    }
+
+    #[test]
+    fn review_coverage_status_cache_store_prunes_oldest_entries_when_over_bound() {
+        let mut store = ReviewCoverageStatusCacheStore {
+            path: PathBuf::from("/tmp/review_coverage_status.json"),
+            fingerprint: ReviewDatabaseFingerprint::default(),
+            entries: HashMap::new(),
+            entry_updated_unix_ms: HashMap::new(),
+            dirty: false,
+        };
+
+        for index in 0..(REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES + 2) {
+            let key = format!("commit:{index:03}");
+            store
+                .entries
+                .insert(key.clone(), ScopeSelectorStatus::Reviewed { total_blocks: index });
+            store
+                .entry_updated_unix_ms
+                .insert(key, u64::try_from(index).unwrap_or(u64::MAX));
+        }
+
+        assert!(store.prune_to_bound());
+        assert_eq!(store.entries.len(), REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES);
+        assert!(!store.entries.contains_key("commit:000"));
+        assert!(!store.entries.contains_key("commit:001"));
+        assert!(store.entries.contains_key("commit:002"));
+        assert!(!store.entry_updated_unix_ms.contains_key("commit:000"));
+        assert!(!store.entry_updated_unix_ms.contains_key("commit:001"));
+    }
+
+    #[test]
+    fn load_review_coverage_status_cache_file_defaults_missing_entry_timestamps() {
+        let cache_dir = temp_test_dir("scope_selector_status_cache_legacy");
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("failed to create cache dir {cache_dir:?}: {error}"));
+        let cache_path = cache_dir.join("review_coverage_status.json");
+        let legacy = serde_json::json!({
+            "format_version": REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION,
+            "review_db_fingerprint": {
+                "size_bytes": 42,
+                "modified_unix_ms": 1234
+            },
+            "entries": {
+                "commit:abc1234": {
+                    "Reviewed": {
+                        "total_blocks": 3
+                    }
+                }
+            }
+        });
+        fs::write(
+            &cache_path,
+            format!("{}\n", serde_json::to_string_pretty(&legacy).unwrap()),
+        )
+        .unwrap_or_else(|error| panic!("failed to write legacy cache file: {error}"));
+
+        let cache = load_review_coverage_status_cache_file(
+            &cache_path,
+            ReviewDatabaseFingerprint {
+                size_bytes: 42,
+                modified_unix_ms: 1234,
+            },
+        )
+        .unwrap_or_else(|| panic!("expected legacy cache file to load"));
+
+        assert_eq!(
+            cache.entries.get("commit:abc1234"),
+            Some(&ScopeSelectorStatus::Reviewed { total_blocks: 3 })
+        );
+        assert!(cache.entry_updated_unix_ms.is_empty());
     }
 
     #[test]
