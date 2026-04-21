@@ -52,6 +52,36 @@ fn parsed_screen_contents(output: &Arc<Mutex<Vec<u8>>>, rows: u16, cols: u16) ->
     parser.screen().contents()
 }
 
+fn wait_for_screen_predicate<F>(
+    output: &Arc<Mutex<Vec<u8>>>,
+    rows: u16,
+    cols: u16,
+    description: &str,
+    timeout: Duration,
+    child: &mut (dyn Child + Send + Sync),
+    predicate: F,
+) -> Result<()>
+where
+    F: Fn(&str) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let screen = parsed_screen_contents(output, rows, cols);
+        if predicate(&screen) {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "trueflow tui exited before PTY screen {description}: {status}; screen: {screen}"
+            );
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for PTY screen {description}; screen: {screen}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn send_and_flush(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     writer.write_all(bytes)?;
     writer.flush()?;
@@ -165,10 +195,12 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
     repo.add("src/lib.rs")?;
     repo.commit("add demo")?;
 
+    let rows = 30;
+    let cols = 120;
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
-        rows: 30,
-        cols: 120,
+        rows,
+        cols,
         pixel_width: 0,
         pixel_height: 0,
     })?;
@@ -210,11 +242,14 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
     send_and_flush(&mut *writer, b"\n")?;
     send_and_flush(&mut *writer, b"b")?;
     send_and_flush(&mut *writer, b"\r")?;
-    wait_for_output(
+    wait_for_screen_predicate(
         &output,
-        "Files/dirs: 1",
+        rows,
+        cols,
+        "to close the note overlay after submit",
         Duration::from_secs(5),
         &mut *child,
+        |screen| !screen.contains("┌ Note"),
     )?;
     send_and_flush(&mut *writer, b"q")?;
     drop(writer);

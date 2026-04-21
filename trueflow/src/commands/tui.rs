@@ -4822,12 +4822,11 @@ fn format_context_line(
 }
 
 fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
-    let (overlay_kind, title, hints, content, cursor) = match &state.input_mode {
+    let overlay_width = input_overlay_width(area.width);
+    let (title, hints, content, cursor) = match &state.input_mode {
         InputMode::Editing { .. } => {
             let content = state.input_buffer.clone();
-            let input_lines = editing_input_lines(&content, input_overlay_width(area.width));
             (
-                InputOverlayKind::Editing { input_lines },
                 " Note ",
                 editing_overlay_hint(&content, state.editing_validation),
                 content,
@@ -4840,9 +4839,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
                 action.verdict_label(),
                 count
             );
-            let message_lines = editing_input_lines(&content, input_overlay_width(area.width));
             (
-                InputOverlayKind::ConfirmBatch { message_lines },
                 " Batch Action ",
                 "Enter to confirm • Esc to cancel",
                 content,
@@ -4851,7 +4848,10 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
         }
         InputMode::Normal => return,
     };
-    let popup_area = input_overlay_rect(area, overlay_kind);
+    let popup_area = input_overlay_rect(
+        area,
+        input_overlay_body_lines(&content, hints, overlay_width),
+    );
     frame.render_widget(ratatui::widgets::Clear, popup_area);
 
     let block = UiBlock::default()
@@ -4859,24 +4859,19 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
         .borders(ratatui::widgets::Borders::ALL)
         .style(Style::default().bg(palette.bg).fg(palette.fg));
     let inner_area = block.inner(popup_area);
-    let lines = input_overlay_lines(&content, hints, palette);
+    let lines = input_overlay_lines(&content, hints, palette, inner_area.width);
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        popup_area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 
     if let Some(cursor) = cursor {
-        frame.set_cursor_position(editing_cursor_position(&content, cursor, inner_area));
+        let hint_lines = usize_to_u16_saturating(wrapped_editor_line_count(
+            hints,
+            usize::from(inner_area.width.max(1)),
+        ));
+        frame.set_cursor_position(editing_cursor_position(
+            &content, cursor, inner_area, hint_lines,
+        ));
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputOverlayKind {
-    Editing { input_lines: u16 },
-    ConfirmBatch { message_lines: u16 },
 }
 
 fn input_overlay_width(area_width: u16) -> u16 {
@@ -4887,31 +4882,40 @@ fn input_overlay_width(area_width: u16) -> u16 {
     }
 }
 
-fn editing_input_lines(content: &str, overlay_width: u16) -> u16 {
+fn input_overlay_body_lines(content: &str, hints: &str, overlay_width: u16) -> u16 {
     let inner_width = usize::from(overlay_width.saturating_sub(2).max(1));
-    let wrapped_lines = content
-        .split('\n')
-        .map(|line| soft_wrapped_editor_line_count(line, inner_width))
-        .sum::<usize>()
-        .max(1);
-    usize_to_u16_saturating(wrapped_lines)
+    let body_lines = wrapped_editor_line_count(content, inner_width)
+        .saturating_add(1)
+        .saturating_add(wrapped_editor_line_count(hints, inner_width));
+    usize_to_u16_saturating(body_lines)
 }
 
-fn soft_wrapped_editor_line_count(line: &str, wrap_width: usize) -> usize {
-    editor_display_width(line)
-        .max(1)
-        .div_ceil(wrap_width.max(1))
+#[cfg(test)]
+fn editing_input_lines(content: &str, overlay_width: u16) -> u16 {
+    let inner_width = usize::from(overlay_width.saturating_sub(2).max(1));
+    usize_to_u16_saturating(wrapped_editor_line_count(content, inner_width))
+}
+
+fn wrapped_editor_line_count(text: &str, wrap_width: usize) -> usize {
+    cell_wrapped_editor_lines(text, wrap_width.max(1)).len()
+}
+
+fn cell_wrapped_editor_lines(text: &str, wrap_width: usize) -> Vec<String> {
+    text.split('\n')
+        .flat_map(|line| wrap_text_to_width(line, wrap_width.max(1)))
+        .collect()
 }
 
 fn editor_display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn editor_char_display_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(0)
-}
-
-fn editing_cursor_position(content: &str, cursor: InputCursor, inner_area: Rect) -> Position {
+fn editing_cursor_position(
+    content: &str,
+    cursor: InputCursor,
+    inner_area: Rect,
+    hint_lines: u16,
+) -> Position {
     if inner_area.width == 0 || inner_area.height == 0 {
         return Position {
             x: inner_area.x,
@@ -4920,7 +4924,10 @@ fn editing_cursor_position(content: &str, cursor: InputCursor, inner_area: Rect)
     }
 
     let (column, row) = editing_cursor_visual_offset(content, cursor.offset, inner_area.width);
-    let max_row = inner_area.height.saturating_sub(3);
+    let visible_content_rows = inner_area
+        .height
+        .saturating_sub(hint_lines.saturating_add(1));
+    let max_row = visible_content_rows.saturating_sub(1);
     Position {
         x: inner_area.x + column.min(inner_area.width.saturating_sub(1)),
         y: inner_area.y + row.min(max_row),
@@ -4938,59 +4945,21 @@ fn editing_cursor_visual_offset(
 
     let wrap_width = usize::from(wrap_width.max(1));
     let cursor_offset = clamp_cursor_offset_to_char_boundary(content, cursor_offset);
-    let mut row = 0usize;
-    let mut column = 0usize;
-
-    for ch in content[..cursor_offset].chars() {
-        if ch == '\n' {
-            row = row.saturating_add(1);
-            column = 0;
-            continue;
-        }
-
-        let char_width = editor_char_display_width(ch);
-        if char_width == 0 {
-            continue;
-        }
-
-        if column == wrap_width || (column > 0 && column.saturating_add(char_width) > wrap_width) {
-            row = row.saturating_add(1);
-            column = 0;
-        }
-
-        column = column.saturating_add(char_width);
-
-        if column > wrap_width {
-            let overflow = column.saturating_sub(1);
-            row = row.saturating_add(overflow / wrap_width);
-            column = overflow % wrap_width + 1;
-        }
-    }
-
-    if column == wrap_width && cursor_offset < content.len() {
-        row = row.saturating_add(1);
-        column = 0;
-    }
-
-    let display_column = if column == wrap_width {
-        wrap_width.saturating_sub(1)
-    } else {
-        column
-    };
+    let wrapped_prefix = cell_wrapped_editor_lines(&content[..cursor_offset], wrap_width);
+    let row = wrapped_prefix.len().saturating_sub(1);
+    let column = wrapped_prefix
+        .last()
+        .map(|line| editor_display_width(line))
+        .unwrap_or_default();
 
     (
-        usize_to_u16_saturating(display_column),
+        usize_to_u16_saturating(column.min(wrap_width.saturating_sub(1))),
         usize_to_u16_saturating(row),
     )
 }
 
-fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
-    let preferred_height = match kind {
-        InputOverlayKind::Editing { input_lines } => input_lines.saturating_add(4).clamp(5, 12),
-        InputOverlayKind::ConfirmBatch { message_lines } => {
-            message_lines.saturating_add(4).clamp(5, 12)
-        }
-    };
+fn input_overlay_rect(area: Rect, body_lines: u16) -> Rect {
+    let preferred_height = body_lines.saturating_add(2).clamp(5, 12);
     let height = area.height.min(preferred_height);
     let width = input_overlay_width(area.width);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -5003,19 +4972,23 @@ fn input_overlay_rect(area: Rect, kind: InputOverlayKind) -> Rect {
     }
 }
 
-fn input_overlay_lines(content: &str, hints: &str, palette: &UiPalette) -> Vec<Line<'static>> {
-    let mut lines = content
-        .split('\n')
-        .map(|line| Line::from(line.to_string()))
+fn input_overlay_lines(
+    content: &str,
+    hints: &str,
+    palette: &UiPalette,
+    wrap_width: u16,
+) -> Vec<Line<'static>> {
+    let wrap_width = usize::from(wrap_width.max(1));
+    let mut lines = cell_wrapped_editor_lines(content, wrap_width)
+        .into_iter()
+        .map(Line::from)
         .collect::<Vec<_>>();
-    if lines.is_empty() {
-        lines.push(Line::from(""));
-    }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        hints.to_string(),
-        Style::default().fg(palette.dim),
-    )));
+    lines.extend(
+        cell_wrapped_editor_lines(hints, wrap_width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(palette.dim)))),
+    );
     lines
 }
 
@@ -7015,7 +6988,7 @@ mod diff_scope_tests {
             width: 120,
             height: 40,
         };
-        let rect = input_overlay_rect(area, InputOverlayKind::Editing { input_lines: 1 });
+        let rect = input_overlay_rect(area, 3);
         assert_eq!(rect.width, 96);
         assert_eq!(rect.height, 5);
         assert_eq!(rect.y + rect.height, area.y + area.height);
@@ -7029,7 +7002,7 @@ mod diff_scope_tests {
             width: 120,
             height: 40,
         };
-        let rect = input_overlay_rect(area, InputOverlayKind::Editing { input_lines: 4 });
+        let rect = input_overlay_rect(area, 6);
         assert_eq!(rect.height, 8);
     }
 
@@ -7059,8 +7032,12 @@ mod diff_scope_tests {
             width: 30,
             height: 40,
         };
-        let input_lines = editing_input_lines(&"x".repeat(200), input_overlay_width(area.width));
-        let rect = input_overlay_rect(area, InputOverlayKind::Editing { input_lines });
+        let body_lines = input_overlay_body_lines(
+            &"x".repeat(200),
+            "Enter to submit • Ctrl+J newline • Esc to cancel",
+            input_overlay_width(area.width),
+        );
+        let rect = input_overlay_rect(area, body_lines);
         assert!(rect.height > 5);
     }
 
@@ -7072,7 +7049,7 @@ mod diff_scope_tests {
             width: 120,
             height: 40,
         };
-        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch { message_lines: 1 });
+        let rect = input_overlay_rect(area, 3);
         assert_eq!(rect.height, 5);
     }
 
@@ -7084,8 +7061,12 @@ mod diff_scope_tests {
             width: 30,
             height: 40,
         };
-        let message_lines = editing_input_lines(&"x".repeat(200), input_overlay_width(area.width));
-        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch { message_lines });
+        let body_lines = input_overlay_body_lines(
+            &"x".repeat(200),
+            "Enter to confirm • Esc to cancel",
+            input_overlay_width(area.width),
+        );
+        let rect = input_overlay_rect(area, body_lines);
         assert!(rect.height > 5);
     }
 
@@ -7097,7 +7078,7 @@ mod diff_scope_tests {
             width: 18,
             height: 3,
         };
-        let rect = input_overlay_rect(area, InputOverlayKind::ConfirmBatch { message_lines: 1 });
+        let rect = input_overlay_rect(area, 3);
         assert_eq!(rect.width, 18);
         assert_eq!(rect.height, 3);
         assert_eq!(rect.x, 3);
@@ -7407,7 +7388,11 @@ mod diff_scope_tests {
             width: 40,
             height: 12,
         };
-        let popup_area = input_overlay_rect(area, InputOverlayKind::Editing { input_lines: 1 });
+        let hints = editing_overlay_hint("hello", None);
+        let popup_area = input_overlay_rect(
+            area,
+            input_overlay_body_lines("hello", hints, input_overlay_width(area.width)),
+        );
         let inner = UiBlock::default()
             .title(" Note ")
             .borders(ratatui::widgets::Borders::ALL)
@@ -7507,6 +7492,7 @@ mod diff_scope_tests {
             "first line\nsecond line",
             "Enter to submit • Ctrl+J newline • Esc to cancel",
             &palette,
+            80,
         );
 
         assert_eq!(lines[0].to_string(), "first line");
@@ -7516,6 +7502,21 @@ mod diff_scope_tests {
             lines[3].to_string().contains("Ctrl+J newline"),
             "expected multiline hint line to include Ctrl+J guidance"
         );
+    }
+
+    #[test]
+    fn input_overlay_lines_cell_wrap_long_note_content() {
+        let palette = UiPalette::default();
+        let lines = input_overlay_lines(
+            "hello world",
+            "Enter to submit • Ctrl+J newline • Esc to cancel",
+            &palette,
+            8,
+        );
+
+        assert_eq!(lines[0].to_string(), "hello wo");
+        assert_eq!(lines[1].to_string(), "rld");
+        assert_eq!(lines[2].to_string(), "");
     }
 
     #[test]

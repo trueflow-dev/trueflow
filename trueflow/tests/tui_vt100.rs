@@ -342,6 +342,38 @@ fn left_arrow_inserts_text_in_the_middle_of_a_note() -> Result<()> {
 }
 
 #[test]
+fn note_overlay_cell_wraps_content_instead_of_word_wrapping() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(10, 12),
+        "src/lib.rs",
+        "fn demo() {\n    work();\n}\n",
+        "fn demo() {\n    work();\n}\n",
+        0,
+        3,
+    )?;
+
+    app.open_note_overlay()?;
+    press_text(&mut app, "hello world")?;
+    app.render()?;
+
+    let rows = app.backend().rows();
+    assert!(
+        rows.iter().any(|row| row.contains("hello wo")),
+        "expected note overlay to cell-wrap the first visual row: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("rld")),
+        "expected note overlay tail to continue on the next visual row: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("world")),
+        "did not expect word-wrapped second-row content: {rows:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn note_validation_clears_after_backspace() -> Result<()> {
     let mut app = app_with_validation_message()?;
 

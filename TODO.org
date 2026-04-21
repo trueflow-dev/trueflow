@@ -109,4 +109,5 @@ Two things:
 ** DONE [HIGH] Summary page should allow Go back to selection page to start new review flow
 ** DONE [HIGH] Review selector start page should show reviewed status of selectables
 ** DONE [HIGH] Comment shouldn't auto progress. If a user wants to progress to next block, let's use spacebar. Or approve.
+** DONE [HIGH] When a line wraps in the comment modal, it starts to look weird -- the cursor isn't at the end of the line and overwrites some of the text on the second line some characters earlier than it should.
 ** TODO [HIGH] complexity analysis of code -> constrain agent to reduce complexity w/o behavior or test changes
