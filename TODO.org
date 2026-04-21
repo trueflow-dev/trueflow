@@ -111,3 +111,5 @@ Two things:
 ** DONE [HIGH] Comment shouldn't auto progress. If a user wants to progress to next block, let's use spacebar. Or approve.
 ** DONE [HIGH] When a line wraps in the comment modal, it starts to look weird -- the cursor isn't at the end of the line and overwrites some of the text on the second line some characters earlier than it should.
 ** TODO [HIGH] complexity analysis of code -> constrain agent to reduce complexity w/o behavior or test changes
+** DONE [HIGH] When we make a comment on code in trueflow, if we're in a multi-page content pane, scope the comment (in the data of the comment) to the visible pane somehow. maybe comment_scope.{begin,end} or something. Also, same for the context -- scoped to the scope.
+** TODO [HIGH] When a comment is made on a scrollable review block, we shouldn't reset the scroll bar back to the top. No navigation should occur.

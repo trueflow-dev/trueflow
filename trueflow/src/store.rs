@@ -17,7 +17,7 @@ use crate::vcs;
 
 const TRUEFLOW_DIR: &str = ".trueflow";
 const DB_FILE: &str = "reviews.jsonl";
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(tag = "type")]
@@ -208,6 +208,15 @@ pub struct Attestation {
     pub public_key: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct CommentScope {
+    #[schemars(range(min = 0))]
+    pub start_line: u32,
+    #[schemars(range(min = 0))]
+    pub end_line: u32,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Record {
@@ -225,6 +234,8 @@ pub struct Record {
     pub path_hint: Option<RepoPath>,
     pub line_hint: Option<u32>,
     pub note: Option<String>,
+    pub comment_scope: Option<CommentScope>,
+    pub comment_context: Option<String>,
     #[schemars(inner(length(min = 1)))]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,7 +243,7 @@ pub struct Record {
 }
 
 #[derive(Serialize)]
-struct SignableRecord<'a> {
+struct SignableRecordV2<'a> {
     id: &'a str,
     version: u32,
     target: &'a ReviewTargetRef,
@@ -248,9 +259,48 @@ struct SignableRecord<'a> {
     tags: &'a Option<Vec<String>>,
 }
 
+#[derive(Serialize)]
+struct SignableRecordV3<'a> {
+    id: &'a str,
+    version: u32,
+    target: &'a ReviewTargetRef,
+    check: &'a ReviewCheck,
+    verdict: &'a Verdict,
+    identity: &'a Identity,
+    repo_ref: &'a RepoRef,
+    block_state: &'a BlockState,
+    timestamp: i64,
+    path_hint: &'a Option<RepoPath>,
+    line_hint: &'a Option<u32>,
+    note: &'a Option<String>,
+    comment_scope: &'a Option<CommentScope>,
+    comment_context: &'a Option<String>,
+    tags: &'a Option<Vec<String>>,
+}
+
 impl Record {
     pub fn signing_payload(&self) -> Result<String> {
-        Ok(serde_jcs::to_string(&SignableRecord {
+        if self.version >= 3 {
+            return Ok(serde_jcs::to_string(&SignableRecordV3 {
+                id: &self.id,
+                version: self.version,
+                target: &self.target,
+                check: &self.check,
+                verdict: &self.verdict,
+                identity: &self.identity,
+                repo_ref: &self.repo_ref,
+                block_state: &self.block_state,
+                timestamp: self.timestamp,
+                path_hint: &self.path_hint,
+                line_hint: &self.line_hint,
+                note: &self.note,
+                comment_scope: &self.comment_scope,
+                comment_context: &self.comment_context,
+                tags: &self.tags,
+            })?);
+        }
+
+        Ok(serde_jcs::to_string(&SignableRecordV2 {
             id: &self.id,
             version: self.version,
             target: &self.target,
@@ -831,6 +881,8 @@ mod tests {
             path_hint: Some(RepoPath::new("src/lib.rs").unwrap()),
             line_hint: Some(1),
             note: None,
+            comment_scope: None,
+            comment_context: None,
             tags: None,
             attestations: None,
         }
@@ -861,6 +913,35 @@ mod tests {
                 hash: TreeHash::parse(hash).unwrap()
             }
         );
+    }
+
+    #[test]
+    fn signing_payload_omits_scoped_comment_fields_for_legacy_versions() {
+        let mut legacy = record(
+            "legacy",
+            ReviewTargetRef::Block {
+                hash: TreeHash::parse(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            },
+            "review",
+            Verdict::Comment,
+            1,
+        );
+        legacy.version = 2;
+        legacy.comment_scope = Some(CommentScope {
+            start_line: 3,
+            end_line: 7,
+        });
+        legacy.comment_context = Some("scoped".to_string());
+
+        let payload = legacy
+            .signing_payload()
+            .unwrap_or_else(|error| panic!("legacy signing payload: {error}"));
+
+        assert!(!payload.contains("comment_scope"));
+        assert!(!payload.contains("comment_context"));
     }
 
     #[test]

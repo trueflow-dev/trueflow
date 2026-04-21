@@ -397,6 +397,8 @@ pub struct ReviewRecordOverrides<'a> {
     pub path_hint: Option<&'a str>,
     pub line_hint: Option<u32>,
     pub note: Option<&'a str>,
+    pub comment_scope: Option<(u32, u32)>,
+    pub comment_context: Option<&'a str>,
     pub attestations: Option<Value>,
 }
 
@@ -423,11 +425,13 @@ pub fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_
     let path_hint = overrides.path_hint;
     let line_hint = overrides.line_hint;
     let note = overrides.note;
+    let comment_scope = overrides.comment_scope;
+    let comment_context = overrides.comment_context;
     let attestations = overrides.attestations.unwrap_or(Value::Null);
 
     serde_json::json!({
         "id": id,
-        "version": 2,
+        "version": trueflow::store::CURRENT_VERSION,
         "target": { "kind": target_kind, "hash": target_key },
         "check": check,
         "verdict": verdict,
@@ -438,6 +442,11 @@ pub fn build_review_record(target_key: &str, overrides: ReviewRecordOverrides<'_
         "path_hint": path_hint,
         "line_hint": line_hint,
         "note": note,
+        "comment_scope": comment_scope.map(|(start_line, end_line)| serde_json::json!({
+            "start_line": start_line,
+            "end_line": end_line,
+        })),
+        "comment_context": comment_context,
         "tags": null,
         "attestations": attestations
     })

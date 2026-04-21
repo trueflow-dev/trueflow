@@ -407,6 +407,7 @@ fn resolve_feedback_context(
             .get(snapshot)
             .unwrap_or_else(|| panic!("snapshot cache should contain {snapshot:?}"));
         if let Some((file_path, block)) = resolve_record_in_files(record, files) {
+            let block = scoped_block_for_record(record, &block).unwrap_or(block);
             return Ok(ResolvedFeedbackContext {
                 snapshot: snapshot.clone(),
                 file_path: Some(file_path),
@@ -418,7 +419,52 @@ fn resolve_feedback_context(
     Ok(ResolvedFeedbackContext {
         snapshot: default_snapshot.clone(),
         file_path: record.path_hint.as_ref().map(RepoPath::to_string),
-        block: None,
+        block: scoped_unresolved_block_for_record(record),
+    })
+}
+
+fn scoped_block_for_record(record: &Record, block: &Block) -> Option<Block> {
+    let scope = record.comment_scope.as_ref()?;
+    let context = record.comment_context.as_ref()?;
+    let start_line = usize::try_from(scope.start_line).unwrap_or(usize::MAX);
+    let end_line = usize::try_from(scope.end_line).unwrap_or(usize::MAX);
+    if start_line >= end_line {
+        return None;
+    }
+
+    Some(Block {
+        hash: block.hash.clone(),
+        content: context.clone(),
+        kind: block.kind,
+        tags: block.tags.clone(),
+        complexity: block.complexity,
+        start_line,
+        end_line,
+    })
+}
+
+fn scoped_unresolved_block_for_record(record: &Record) -> Option<Block> {
+    let scope = record.comment_scope.as_ref()?;
+    let context = record.comment_context.as_ref()?;
+    let hash = match &record.target {
+        ReviewTargetRef::Block { hash }
+        | ReviewTargetRef::File { hash }
+        | ReviewTargetRef::Tree { hash } => hash.clone(),
+    };
+    let start_line = usize::try_from(scope.start_line).unwrap_or(usize::MAX);
+    let end_line = usize::try_from(scope.end_line).unwrap_or(usize::MAX);
+    if start_line >= end_line {
+        return None;
+    }
+
+    Some(Block {
+        hash,
+        content: context.clone(),
+        kind: BlockKind::Code,
+        tags: Vec::new(),
+        complexity: None,
+        start_line,
+        end_line,
     })
 }
 
@@ -553,6 +599,10 @@ fn path_matches_feedback_selections(
 }
 
 fn unresolved_block_for_record(record: &Record) -> Block {
+    if let Some(block) = scoped_unresolved_block_for_record(record) {
+        return block;
+    }
+
     let hash = match &record.target {
         ReviewTargetRef::Block { hash }
         | ReviewTargetRef::File { hash }
@@ -822,6 +872,8 @@ mod tests {
             ),
             line_hint: Some(0),
             note: None,
+            comment_scope: None,
+            comment_context: None,
             tags: None,
             attestations: None,
         }

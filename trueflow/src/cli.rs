@@ -60,6 +60,18 @@ pub enum Commands {
         #[arg(long)]
         line: Option<u32>,
 
+        /// Internal scoped comment line span start (0-indexed, inclusive)
+        #[arg(long, hide = true)]
+        comment_scope_start: Option<u32>,
+
+        /// Internal scoped comment line span end (0-indexed, exclusive)
+        #[arg(long, hide = true)]
+        comment_scope_end: Option<u32>,
+
+        /// Internal scoped comment context
+        #[arg(long, hide = true)]
+        comment_context: Option<String>,
+
         /// Suppress output for UI usage
         #[arg(long)]
         quiet: bool,

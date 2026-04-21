@@ -26,6 +26,9 @@ fn main() -> Result<()> {
             note,
             path,
             line,
+            comment_scope_start,
+            comment_scope_end,
+            comment_context,
             quiet: _,
         } => commands::mark::run(
             &context,
@@ -37,6 +40,13 @@ fn main() -> Result<()> {
                 note: note.clone(),
                 path: path.clone(),
                 line: *line,
+                comment_scope: comment_scope_start.zip(*comment_scope_end).map(
+                    |(start_line, end_line)| trueflow::store::CommentScope {
+                        start_line,
+                        end_line,
+                    },
+                ),
+                comment_context: comment_context.clone(),
             },
         ),
         Commands::Check => commands::check::run(&context),

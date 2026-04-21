@@ -1,17 +1,15 @@
 use super::{
     AppState, EditingActionResult, Event, InputCursor, InputMode, KeyCode, KeyEvent, KeyEventKind,
     KeybindAction, RecapAction, Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers,
-    TuiKeybindsConfig, TuiSpeedReadConfig, UiMode, ViewMode, clear_focus_scroll,
-    current_ui_mode, editing_key_action_for_event, execute_action_with,
-    handle_advance_review_target, handle_child, handle_confirm_cancel, handle_editing_key_action,
-    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action,
-    handle_parent, handle_paste_event, handle_prev, handle_scroll_line_down,
-    handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
-    handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
-    key_event_for_press_event, key_event_for_press_or_repeat_event,
-    keybind_action_accepts_repeat, keybind_action_for_key_code, recap_action_for_key_code,
-    set_focus_for_current_node, should_rerender_on_event, sync_speed_read_focus,
-    toggle_speed_read_mode, ui, vcs,
+    TuiKeybindsConfig, TuiSpeedReadConfig, UiMode, ViewMode, clear_focus_scroll, current_ui_mode,
+    editing_key_action_for_event, execute_action_with, handle_advance_review_target, handle_child,
+    handle_confirm_cancel, handle_editing_key_action, handle_editing_submit_with,
+    handle_mouse_event, handle_next, handle_note_action, handle_parent, handle_paste_event,
+    handle_prev, handle_scroll_line_down, handle_scroll_line_up, handle_scroll_page_down,
+    handle_scroll_page_up, handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
+    key_event_for_press_event, key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
+    keybind_action_for_key_code, recap_action_for_key_code, set_focus_for_current_node,
+    should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
@@ -20,7 +18,7 @@ use crate::commands::review::{BlockChangeKind, FileChangeKind};
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::ScopePreset;
-use crate::store::Verdict;
+use crate::store::{CommentScope, Verdict};
 use crate::tree::{TreeBuilder, TreeNodeId, TreeNodeKind};
 use anyhow::{Result, bail};
 use ratatui::{Terminal, backend::Backend};
@@ -37,6 +35,8 @@ pub struct ScriptedMarkAction {
     pub note: Option<String>,
     pub path: Option<String>,
     pub line: Option<u32>,
+    pub comment_scope: Option<CommentScope>,
+    pub comment_context: Option<String>,
 }
 
 impl From<mark::MarkParams> for ScriptedMarkAction {
@@ -48,6 +48,8 @@ impl From<mark::MarkParams> for ScriptedMarkAction {
             note: params.note,
             path: params.path.map(|path| path.to_string()),
             line: params.line,
+            comment_scope: params.comment_scope,
+            comment_context: params.comment_context,
         }
     }
 }
@@ -92,6 +94,16 @@ impl MarkActionRunner for CliMarkActionRunner {
         }
         if let Some(line) = action.line {
             command.arg("--line").arg(line.to_string());
+        }
+        if let Some(scope) = &action.comment_scope {
+            command
+                .arg("--comment-scope-start")
+                .arg(scope.start_line.to_string())
+                .arg("--comment-scope-end")
+                .arg(scope.end_line.to_string());
+        }
+        if let Some(context) = &action.comment_context {
+            command.arg("--comment-context").arg(context);
         }
 
         let output = command.output()?;
@@ -556,6 +568,7 @@ where
         content_height: 0,
         viewport_height: 0,
         code_rect: Rect::default(),
+        visible_comment_capture: None,
         view_mode: ViewMode::Diff,
         block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
         diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -648,6 +661,7 @@ fn build_state_with_single_rust_block_file(
         content_height: 0,
         viewport_height: 0,
         code_rect: Rect::default(),
+        visible_comment_capture: None,
         view_mode: ViewMode::Source,
         block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
         diff_line_numbers: TuiDiffLineNumbers::Disabled,

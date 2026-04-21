@@ -211,6 +211,8 @@ mod tests {
             path_hint: None,
             line_hint: None,
             note: None,
+            comment_scope: None,
+            comment_context: None,
             tags: None,
             attestations: None,
         }

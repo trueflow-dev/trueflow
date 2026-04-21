@@ -3,8 +3,8 @@ use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::scanner::ScanOptions;
 use crate::store::{
-    Attestation, AttestationKind, BlockState, Canonicalization, FileStore, Identity, Record,
-    RepoRef, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
+    Attestation, AttestationKind, BlockState, Canonicalization, CommentScope, FileStore, Identity,
+    Record, RepoRef, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
 };
 use crate::tree::{self, TreeNodeKind};
 use crate::vcs;
@@ -71,6 +71,8 @@ pub struct MarkParams {
     pub note: Option<String>,
     pub path: Option<RepoPath>,
     pub line: Option<u32>,
+    pub comment_scope: Option<CommentScope>,
+    pub comment_context: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,13 +137,15 @@ fn normalize_path_hint_from_workdir(path: Option<RepoPath>) -> Option<RepoPath> 
 
 pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     info!(
-        "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?})",
+        "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?}, comment_scope={:?}, comment_context_present={})",
         &params.fingerprint,
         &params.verdict,
         &params.check,
         params.note.is_some(),
         params.path.as_ref().map(RepoPath::as_str),
-        params.line
+        params.line,
+        params.comment_scope,
+        params.comment_context.is_some()
     );
     let store = FileStore::new()?;
 
@@ -177,6 +181,8 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         note,
         path,
         line,
+        comment_scope,
+        comment_context,
     } = params;
 
     let path_hint = normalize_path_hint_from_workdir(path);
@@ -202,6 +208,8 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         path_hint,
         line_hint: line,
         note,
+        comment_scope,
+        comment_context,
         tags: None,
         attestations: None,
     };

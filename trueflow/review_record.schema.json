@@ -44,6 +44,26 @@
       ],
       "type": "string"
     },
+    "CommentScope": {
+      "additionalProperties": false,
+      "properties": {
+        "end_line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_line",
+        "end_line"
+      ],
+      "type": "object"
+    },
     "Identity": {
       "oneOf": [
         {
@@ -192,6 +212,22 @@
     "check": {
       "type": "string"
     },
+    "comment_context": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "comment_scope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CommentScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "id": {
       "type": "string"
     },
@@ -261,6 +297,8 @@
     "path_hint",
     "line_hint",
     "note",
+    "comment_scope",
+    "comment_context",
     "tags"
   ],
   "title": "Record",

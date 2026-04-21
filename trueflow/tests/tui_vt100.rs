@@ -537,6 +537,74 @@ fn multiline_note_submit_persists_to_review_store_and_feedback_output() -> Resul
 }
 
 #[test]
+fn paged_note_submit_persists_comment_scope_and_scoped_feedback_context() -> Result<()> {
+    let repo = TestRepo::new("tui_vt100_comment_scope")?;
+    let file_lines = (1..=20)
+        .map(|index| format!("scope_line_{index:02}"))
+        .collect::<Vec<_>>();
+    let file_content = format!("{}\n", file_lines.join("\n"));
+    repo.write("src/lib.rs", &file_content)?;
+
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(80, 10),
+        "src/lib.rs",
+        &file_content,
+        &file_content,
+        0,
+        file_lines.len(),
+    )?;
+    app.install_mark_action_runner(
+        trueflow::commands::tui::test_support::CliMarkActionRunner::new(
+            env!("CARGO_BIN_EXE_trueflow"),
+            &repo.path,
+        ),
+    );
+
+    app.render()?;
+    for _ in 0..3 {
+        app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))?;
+    }
+    app.render()?;
+
+    app.open_note_overlay()?;
+    press_text(&mut app, "scoped note")?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+    let records = read_review_records(&repo.path.join(".trueflow").join("reviews.jsonl"))?;
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    let scope = record
+        .comment_scope
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected comment scope on paged note record"));
+    assert!(
+        scope.start_line > 0,
+        "expected scrolled pane scope: {scope:?}"
+    );
+    assert!(
+        usize::try_from(scope.end_line).unwrap_or(usize::MAX) < file_lines.len(),
+        "expected scoped pane to exclude some trailing lines: {scope:?}"
+    );
+    let expected_context = file_lines[usize::try_from(scope.start_line).unwrap_or(0)
+        ..usize::try_from(scope.end_line).unwrap_or(file_lines.len())]
+        .join("\n");
+    assert_eq!(
+        record.comment_context.as_deref(),
+        Some(expected_context.as_str())
+    );
+
+    let feedback = repo.run(&["feedback", "--format", "xml", "--since", "all"])?;
+    assert!(feedback.contains("<comment>scoped note</comment>"));
+    assert!(feedback.contains(&expected_context));
+    assert!(
+        !feedback.contains("scope_line_01"),
+        "did not expect feedback context to include lines outside the scoped pane:\n{feedback}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn multiline_note_submit_feedback_file_target_filters_to_the_requested_file() -> Result<()> {
     let repo = TestRepo::new("tui_vt100_comment_target_file")?;
     let file_content = "fn demo() {\n    work();\n}\n";

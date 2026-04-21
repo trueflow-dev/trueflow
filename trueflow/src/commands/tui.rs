@@ -224,7 +224,8 @@ impl ReviewCoverageStatusCacheStore {
 
         let now = current_unix_ms();
         let previous = self.entries.insert(cache_key.to_string(), status);
-        self.entry_updated_unix_ms.insert(cache_key.to_string(), now);
+        self.entry_updated_unix_ms
+            .insert(cache_key.to_string(), now);
         if previous != Some(status) {
             self.dirty = true;
         }
@@ -650,6 +651,7 @@ struct AppState {
     content_height: u16,
     viewport_height: u16,
     code_rect: Rect,
+    visible_comment_capture: Option<VisibleCommentCapture>,
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     diff_line_numbers: TuiDiffLineNumbers,
@@ -792,11 +794,25 @@ enum ContentFrameCacheVariant {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommentContextRow {
+    line_index: usize,
+    text: String,
+    display_row_range: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisibleCommentCapture {
+    scope: crate::store::CommentScope,
+    context: String,
+}
+
 #[derive(Clone)]
 struct ContentFrameCacheEntry {
     lines: Vec<Line<'static>>,
     total_lines: usize,
     focus_row_range: Option<std::ops::Range<usize>>,
+    comment_rows: Option<Vec<CommentContextRow>>,
 }
 
 #[derive(Clone)]
@@ -804,6 +820,7 @@ struct BuiltContent {
     lines: Vec<Line<'static>>,
     total_lines: usize,
     focus_row_range: Option<std::ops::Range<usize>>,
+    comment_rows: Option<Vec<CommentContextRow>>,
 }
 
 #[derive(Clone)]
@@ -1068,6 +1085,7 @@ fn build_review_state(
         content_height: 0,
         viewport_height: 0,
         code_rect: Rect::default(),
+        visible_comment_capture: None,
         view_mode: ViewMode::Diff,
         block_diff_focus_mode: options.block_diff_focus_mode,
         diff_line_numbers: options.diff_line_numbers,
@@ -2699,10 +2717,19 @@ fn mark_params_for_action(
         Some(node.path.clone())
     };
 
+    let scoped_comment = (matches!(verdict, Verdict::Comment)
+        && node_id == state.navigator.current_id())
+    .then(|| state.visible_comment_capture.clone())
+    .flatten();
     let line_hint = node
         .block
         .as_ref()
-        .map(|block| usize_to_u32_saturating(block.start_line));
+        .map(|block| usize_to_u32_saturating(block.start_line))
+        .or_else(|| {
+            scoped_comment
+                .as_ref()
+                .map(|capture| capture.scope.start_line)
+        });
 
     mark::MarkParams {
         fingerprint,
@@ -2712,6 +2739,8 @@ fn mark_params_for_action(
         note,
         path: path_hint,
         line: line_hint,
+        comment_scope: scoped_comment.as_ref().map(|capture| capture.scope.clone()),
+        comment_context: scoped_comment.map(|capture| capture.context),
     }
 }
 
@@ -3095,6 +3124,12 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     state.scroll_offset = state
         .scroll_offset
         .min(state.content_height.saturating_sub(state.viewport_height));
+    state.visible_comment_capture = visible_comment_capture_for_content(
+        &content,
+        state.scroll_offset,
+        state.viewport_height,
+        state.content_height,
+    );
 
     let meta_block = UiBlock::default()
         .borders(ratatui::widgets::Borders::ALL)
@@ -3167,6 +3202,7 @@ fn build_render_content(
             lines,
             total_lines,
             focus_row_range: None,
+            comment_rows: None,
         }
     } else {
         build_content_lines_with_frame_cache(state, node, palette, code_height, code_width)
@@ -3197,6 +3233,19 @@ fn wrapped_display_metrics_for_lines(
     focus_line_range: Option<&std::ops::Range<usize>>,
     width: u16,
 ) -> (usize, Option<std::ops::Range<usize>>) {
+    let display_row_prefixes = wrapped_display_row_prefixes(lines, width);
+    let total_rows = *display_row_prefixes.last().unwrap_or(&0);
+
+    let focus_row_range = focus_line_range.and_then(|range| {
+        let start = range.start.min(lines.len());
+        let end = range.end.max(start).min(lines.len());
+        (start < end).then_some(display_row_prefixes[start]..display_row_prefixes[end])
+    });
+
+    (total_rows, focus_row_range)
+}
+
+fn wrapped_display_row_prefixes(lines: &[Line<'static>], width: u16) -> Vec<usize> {
     let wrap_width = usize::from(width.max(1));
     let mut display_row_prefixes = Vec::with_capacity(lines.len().saturating_add(1));
     let mut total_rows = 0usize;
@@ -3209,13 +3258,46 @@ fn wrapped_display_metrics_for_lines(
         display_row_prefixes.push(total_rows);
     }
 
-    let focus_row_range = focus_line_range.and_then(|range| {
-        let start = range.start.min(lines.len());
-        let end = range.end.max(start).min(lines.len());
-        (start < end).then_some(display_row_prefixes[start]..display_row_prefixes[end])
-    });
+    display_row_prefixes
+}
 
-    (total_rows, focus_row_range)
+fn visible_comment_capture_for_content(
+    content: &BuiltContent,
+    scroll_offset: u16,
+    viewport_height: u16,
+    content_height: u16,
+) -> Option<VisibleCommentCapture> {
+    if content_height <= viewport_height {
+        return None;
+    }
+
+    let comment_rows = content.comment_rows.as_ref()?;
+    let visible_start = usize::from(scroll_offset);
+    let visible_end = visible_start
+        .saturating_add(usize::from(viewport_height))
+        .min(usize::from(content_height));
+    let visible_range = visible_start..visible_end;
+    let selected_rows = comment_rows
+        .iter()
+        .filter(|row| {
+            row.display_row_range.start < visible_range.end
+                && row.display_row_range.end > visible_range.start
+        })
+        .collect::<Vec<_>>();
+    let first_row = selected_rows.first()?;
+    let last_row = selected_rows.last()?;
+
+    Some(VisibleCommentCapture {
+        scope: crate::store::CommentScope {
+            start_line: usize_to_u32_saturating(first_row.line_index),
+            end_line: usize_to_u32_saturating(last_row.line_index.saturating_add(1)),
+        },
+        context: selected_rows
+            .into_iter()
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
 }
 
 fn build_speed_read_lines(
@@ -3377,6 +3459,7 @@ fn build_content_lines_with_frame_cache(
                 lines: cached.lines.clone(),
                 total_lines: cached.total_lines,
                 focus_row_range: cached.focus_row_range.clone(),
+                comment_rows: cached.comment_rows.clone(),
             };
         }
 
@@ -3387,6 +3470,7 @@ fn build_content_lines_with_frame_cache(
                 lines: content.lines.clone(),
                 total_lines: content.total_lines,
                 focus_row_range: content.focus_row_range.clone(),
+                comment_rows: content.comment_rows.clone(),
             },
         );
         return content;
@@ -3808,6 +3892,7 @@ fn build_content_lines(
                 lines,
                 total_lines,
                 focus_row_range: None,
+                comment_rows: None,
             }
         }
         TreeNodeKind::Root => {
@@ -3816,6 +3901,7 @@ fn build_content_lines(
                 lines,
                 total_lines,
                 focus_row_range: None,
+                comment_rows: None,
             }
         }
     }
@@ -3966,6 +4052,7 @@ fn build_source_context_content(
     state: &mut AppState,
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
+    code_width: u16,
 ) -> BuiltContent {
     if is_base_only_diff_node(state, node)
         && let Some(block) = node.block.as_ref()
@@ -3983,10 +4070,21 @@ fn build_source_context_content(
             })
             .collect::<Vec<_>>();
         let total_lines = lines.len();
+        let comment_rows = Some(source_comment_rows(
+            &lines,
+            &block
+                .content
+                .lines()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            block.start_line,
+            code_width,
+        ));
         return BuiltContent {
             lines,
             total_lines,
             focus_row_range: Some(0..total_lines),
+            comment_rows,
         };
     }
 
@@ -4007,10 +4105,21 @@ fn build_source_context_content(
                 })
                 .collect::<Vec<_>>();
             let total_lines = lines.len();
+            let comment_rows = Some(source_comment_rows(
+                &lines,
+                &block
+                    .content
+                    .lines()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                block.start_line,
+                code_width,
+            ));
             return BuiltContent {
                 lines,
                 total_lines,
                 focus_row_range: Some(0..total_lines),
+                comment_rows,
             };
         }
         return BuiltContent {
@@ -4020,6 +4129,7 @@ fn build_source_context_content(
             ))],
             total_lines: 1,
             focus_row_range: None,
+            comment_rows: None,
         };
     };
 
@@ -4056,11 +4166,37 @@ fn build_source_context_content(
         }
     }
 
+    let comment_rows = Some(source_comment_rows(
+        &lines,
+        file_lines.as_ref(),
+        0,
+        code_width,
+    ));
+
     BuiltContent {
         total_lines: lines.len(),
         lines,
         focus_row_range,
+        comment_rows,
     }
+}
+
+fn source_comment_rows(
+    lines: &[Line<'static>],
+    raw_lines: &[String],
+    start_line: usize,
+    code_width: u16,
+) -> Vec<CommentContextRow> {
+    let row_prefixes = wrapped_display_row_prefixes(lines, code_width);
+    raw_lines
+        .iter()
+        .enumerate()
+        .map(|(index, text)| CommentContextRow {
+            line_index: start_line.saturating_add(index),
+            text: text.clone(),
+            display_row_range: row_prefixes[index]..row_prefixes[index.saturating_add(1)],
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4428,6 +4564,7 @@ fn content_message(
         total_lines: lines.len(),
         lines,
         focus_row_range: None,
+        comment_rows: None,
     }
 }
 
@@ -4489,10 +4626,34 @@ fn build_diff_context_content(
             let focus_row_range = focus_row_range.as_ref().and_then(|focus| {
                 focus_row_range_for_wrapped_contextual_diff_rows(&rendered.row_ranges, focus)
             });
+            let comment_rows = Some(
+                rows.iter()
+                    .zip(rendered.row_ranges.iter())
+                    .map(|(row, display_row_range)| {
+                        let diff_line = vcs::DiffLine {
+                            kind: row.kind,
+                            old_line: row.old_line,
+                            new_line: row.new_line,
+                            text: row.text.clone(),
+                            is_focus: false,
+                        };
+                        CommentContextRow {
+                            line_index: row.anchor_index,
+                            text: format_diff_overlay_row_for_width(
+                                &diff_line,
+                                state.diff_line_numbers,
+                                code_width,
+                            ),
+                            display_row_range: display_row_range.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
             BuiltContent {
                 total_lines: rendered.lines.len(),
                 lines: rendered.lines,
                 focus_row_range,
+                comment_rows,
             }
         }
         vcs::FileDiff::NoTextChanges { .. } => content_message(
@@ -4544,10 +4705,43 @@ fn build_deleted_block_diff_content(
     }
 
     let total_lines = lines.len();
+    let comment_rows = Some(
+        block
+            .content
+            .lines()
+            .enumerate()
+            .scan(0usize, |display_start, (offset, line)| {
+                let diff_line = vcs::DiffLine {
+                    kind: vcs::DiffLineKind::Removed,
+                    old_line: Some(
+                        u32::try_from(block.start_line + offset + 1).unwrap_or(u32::MAX),
+                    ),
+                    new_line: None,
+                    text: line.to_string(),
+                    is_focus: false,
+                };
+                let row_line_count =
+                    wrap_diff_overlay_row(&diff_line, style, code_width, state.diff_line_numbers)
+                        .len();
+                let row = CommentContextRow {
+                    line_index: block.start_line.saturating_add(offset),
+                    text: format_diff_overlay_row_for_width(
+                        &diff_line,
+                        state.diff_line_numbers,
+                        code_width,
+                    ),
+                    display_row_range: *display_start..display_start.saturating_add(row_line_count),
+                };
+                *display_start = display_start.saturating_add(row_line_count);
+                Some(row)
+            })
+            .collect::<Vec<_>>(),
+    );
     BuiltContent {
         total_lines,
         lines,
         focus_row_range: Some(0..total_lines),
+        comment_rows,
     }
 }
 
@@ -4561,21 +4755,24 @@ fn build_block_lines(
     if state.view_mode == ViewMode::Diff {
         return build_diff_context_content(state, node, palette, code_width);
     }
-    build_source_context_content(state, node, palette)
+    build_source_context_content(state, node, palette, code_width)
+}
+
+fn format_diff_overlay_row_for_width(
+    line: &vcs::DiffLine,
+    line_numbers: TuiDiffLineNumbers,
+    code_width: u16,
+) -> String {
+    let available_width = usize::from(code_width.max(1));
+    let format = diff_overlay_format_for_width(code_width, line_numbers);
+    let prefix = diff_overlay_prefix(line, format, available_width);
+    let text = expand_tabs_for_display(&line.text);
+    format!("{prefix}{text}")
 }
 
 #[cfg(test)]
 fn format_diff_overlay_row(line: &vcs::DiffLine, line_numbers: TuiDiffLineNumbers) -> String {
-    let marker = diff_overlay_marker(line.kind);
-    let text = expand_tabs_for_display(&line.text);
-    match line_numbers {
-        TuiDiffLineNumbers::Disabled => format!("{marker} {text}"),
-        TuiDiffLineNumbers::OldNew => {
-            let old_col = format_diff_line_number(line.old_line);
-            let new_col = format_diff_line_number(line.new_line);
-            format!("{old_col} {new_col} {marker} {text}")
-        }
-    }
+    format_diff_overlay_row_for_width(line, line_numbers, u16::MAX)
 }
 
 fn format_diff_line_number(line: Option<u32>) -> String {
@@ -4642,7 +4839,7 @@ fn build_file_lines(
     if state.view_mode == ViewMode::Diff {
         return build_diff_context_content(state, node, palette, code_width);
     }
-    build_source_context_content(state, node, palette)
+    build_source_context_content(state, node, palette, code_width)
 }
 
 fn build_directory_lines(
@@ -5245,6 +5442,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
+            visible_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -5312,6 +5510,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
+            visible_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -5409,6 +5608,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
+            visible_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -5509,6 +5709,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
+            visible_comment_capture: None,
             view_mode: ViewMode::Source,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -5587,6 +5788,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
+            visible_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -5664,6 +5866,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
+            visible_comment_capture: None,
             view_mode: ViewMode::Source,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -6162,7 +6365,11 @@ mod diff_scope_tests {
             cache_file.entries.get("commit:abc1234"),
             Some(&ScopeSelectorStatus::Reviewed { total_blocks: 3 })
         );
-        assert!(cache_file.entry_updated_unix_ms.contains_key("commit:abc1234"));
+        assert!(
+            cache_file
+                .entry_updated_unix_ms
+                .contains_key("commit:abc1234")
+        );
     }
 
     #[test]
@@ -6177,16 +6384,22 @@ mod diff_scope_tests {
 
         for index in 0..(REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES + 2) {
             let key = format!("commit:{index:03}");
-            store
-                .entries
-                .insert(key.clone(), ScopeSelectorStatus::Reviewed { total_blocks: index });
+            store.entries.insert(
+                key.clone(),
+                ScopeSelectorStatus::Reviewed {
+                    total_blocks: index,
+                },
+            );
             store
                 .entry_updated_unix_ms
                 .insert(key, u64::try_from(index).unwrap_or(u64::MAX));
         }
 
         assert!(store.prune_to_bound());
-        assert_eq!(store.entries.len(), REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES);
+        assert_eq!(
+            store.entries.len(),
+            REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES
+        );
         assert!(!store.entries.contains_key("commit:000"));
         assert!(!store.entries.contains_key("commit:001"));
         assert!(store.entries.contains_key("commit:002"));
@@ -8041,6 +8254,91 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn visible_comment_capture_for_source_content_uses_scrolled_logical_lines() {
+        let file_path = temp_test_file_path("tui_comment_scope_source");
+        let file_lines = (1..=12)
+            .map(|index| format!("scope_line_{index:02}"))
+            .collect::<Vec<_>>();
+        let file_content = format!("{}\n", file_lines.join("\n"));
+        let (mut state, _file_id, block_id) = build_state_with_block_file(
+            &file_path,
+            &file_content,
+            &file_content,
+            0,
+            file_lines.len(),
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_block_lines(&mut state, &snapshot, &palette, 6, 40);
+        let capture = visible_comment_capture_for_content(&content, 3, 4, 12)
+            .unwrap_or_else(|| panic!("expected visible comment capture"));
+
+        assert_eq!(capture.scope.start_line, 3);
+        assert_eq!(capture.scope.end_line, 7);
+        assert_eq!(capture.context, file_lines[3..7].join("\n"));
+    }
+
+    #[test]
+    fn visible_comment_capture_for_diff_content_uses_scrolled_diff_rows() {
+        let file_path = temp_test_file_path("tui_comment_scope_diff");
+        let file_lines = (1..=8)
+            .map(|index| format!("diff_line_{index:02}"))
+            .collect::<Vec<_>>();
+        let file_content = format!("{}\n", file_lines.join("\n"));
+        let (mut state, _file_id, block_id) = build_state_with_block_file(
+            &file_path,
+            &file_content,
+            &file_content,
+            0,
+            file_lines.len(),
+        );
+        state.view_mode = ViewMode::Diff;
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: file_lines
+                        .iter()
+                        .map(|line| vcs::DiffHunkLine::context(format!("{line}\n")))
+                        .collect::<Vec<_>>(),
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_block_lines(&mut state, &snapshot, &palette, 6, 80);
+        let capture = visible_comment_capture_for_content(&content, 2, 3, 8)
+            .unwrap_or_else(|| panic!("expected visible comment capture"));
+
+        assert_eq!(capture.scope.start_line, 2);
+        assert_eq!(capture.scope.end_line, 5);
+        let expected = (3..=5)
+            .map(|index| {
+                format_diff_overlay_row(
+                    &vcs::DiffLine {
+                        kind: vcs::DiffLineKind::Context,
+                        old_line: Some(index),
+                        new_line: Some(index),
+                        text: format!("diff_line_{index:02}"),
+                        is_focus: false,
+                    },
+                    TuiDiffLineNumbers::Disabled,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(capture.context, expected);
+    }
+
+    #[test]
     fn build_file_lines_diff_mode_can_render_old_new_line_numbers() {
         let file_path = temp_test_file_path("tui_file_diff_mode_old_new");
         let file_content = "line1\nline2\n";
@@ -9101,6 +9399,7 @@ mod diff_scope_tests {
                 lines: vec![Line::from("a")],
                 total_lines: 1,
                 focus_row_range: None,
+                comment_rows: None,
             },
         );
         cache.insert(
@@ -9109,6 +9408,7 @@ mod diff_scope_tests {
                 lines: vec![Line::from("b")],
                 total_lines: 1,
                 focus_row_range: None,
+                comment_rows: None,
             },
         );
 
