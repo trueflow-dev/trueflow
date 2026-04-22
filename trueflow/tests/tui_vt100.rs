@@ -537,6 +537,62 @@ fn multiline_note_submit_persists_to_review_store_and_feedback_output() -> Resul
 }
 
 #[test]
+fn paged_note_submit_preserves_scroll_position() -> Result<()> {
+    let repo = TestRepo::new("tui_vt100_comment_scroll_preserve")?;
+    let file_lines = (1..=20)
+        .map(|index| format!("scroll_line_{index:02}"))
+        .collect::<Vec<_>>();
+    let file_content = format!("{}\n", file_lines.join("\n"));
+    repo.write("src/lib.rs", &file_content)?;
+
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(80, 10),
+        "src/lib.rs",
+        &file_content,
+        &file_content,
+        0,
+        file_lines.len(),
+    )?;
+    app.install_mark_action_runner(
+        trueflow::commands::tui::test_support::CliMarkActionRunner::new(
+            env!("CARGO_BIN_EXE_trueflow"),
+            &repo.path,
+        ),
+    );
+
+    app.render()?;
+    for _ in 0..3 {
+        app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))?;
+    }
+    app.render()?;
+
+    let scroll_before_submit = app.scroll_offset();
+    assert!(
+        scroll_before_submit > 0,
+        "expected long block to be scrolled before opening note"
+    );
+
+    app.open_note_overlay()?;
+    press_text(&mut app, "sticky scroll")?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+    app.render()?;
+
+    assert_eq!(app.scroll_offset(), scroll_before_submit);
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        !screen.contains("scroll_line_01"),
+        "expected submit to preserve scrolled viewport instead of jumping to the top:\n{screen}"
+    );
+
+    let records = read_review_records(&repo.path.join(".trueflow").join("reviews.jsonl"))?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].note.as_deref(), Some("sticky scroll"));
+
+    Ok(())
+}
+
+#[test]
 fn paged_note_submit_persists_comment_scope_and_scoped_feedback_context() -> Result<()> {
     let repo = TestRepo::new("tui_vt100_comment_scope")?;
     let file_lines = (1..=20)

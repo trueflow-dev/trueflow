@@ -2796,6 +2796,14 @@ fn apply_action_locally(
 
     state.navigator.prune_visible_to_block_ancestors();
 
+    if matches!(verdict, Verdict::Comment) {
+        sync_speed_read_focus(state);
+        return ActionImpact {
+            affected_blocks,
+            removed_reviewable,
+        };
+    }
+
     if let Some(node_id) = next_id {
         state.navigator.set_current(node_id);
         state.scroll_offset = 0;
@@ -9263,6 +9271,43 @@ mod diff_scope_tests {
 
         assert_eq!(state.navigator.current_id(), first_block);
         assert_eq!(state.remaining_blocks, 2);
+        assert_eq!(state.session_recap.comments, 1);
+    }
+
+    #[test]
+    fn execute_action_with_comment_preserves_scroll_position_and_focus_state() {
+        let file_path = temp_test_file_path("tui_comment_scroll_preserve");
+        let file_lines = (1..=20)
+            .map(|index| format!("scroll_line_{index:02}"))
+            .collect::<Vec<_>>();
+        let file_content = format!("{}\n", file_lines.join("\n"));
+        let (mut state, _file_id, block_id) = build_state_with_block_file(
+            &file_path,
+            &file_content,
+            &file_content,
+            0,
+            file_lines.len(),
+        );
+        state.navigator.set_current(block_id);
+        state.focus_block = Some(block_id);
+        state.pending_focus_scroll = false;
+        state.scroll_offset = 5;
+
+        execute_action_with(
+            &mut state,
+            PendingAction::Single {
+                node_id: block_id,
+                verdict: Verdict::Comment,
+                note: Some("note".to_string()),
+            },
+            |_params| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("expected comment action to succeed: {error}"));
+
+        assert_eq!(state.navigator.current_id(), block_id);
+        assert_eq!(state.scroll_offset, 5);
+        assert_eq!(state.focus_block, Some(block_id));
+        assert!(!state.pending_focus_scroll);
         assert_eq!(state.session_recap.comments, 1);
     }
 
