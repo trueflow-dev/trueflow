@@ -55,14 +55,14 @@ impl FeedbackScenario {
     }
 
     pub fn review_block(&self, path: &str, verdict: &str) -> Result<Record> {
-        self.review_block_with_overrides(path, verdict, ReviewRecordOverrides::default())
+        self.review_block_with_overrides(path, verdict, &ReviewRecordOverrides::default())
     }
 
     pub fn review_block_with_overrides(
         &self,
         path: &str,
         verdict: &str,
-        overrides: ReviewRecordOverrides<'_>,
+        overrides: &ReviewRecordOverrides<'_>,
     ) -> Result<Record> {
         let block = self.review_block_info(path)?;
         let cli_verdict = overrides.verdict.unwrap_or(verdict);
@@ -93,7 +93,7 @@ impl FeedbackScenario {
         let record = records
             .last_mut()
             .context("expected review record after mark")?;
-        apply_review_record_overrides(record, &overrides)?;
+        apply_review_record_overrides(record, overrides)?;
         let record = record.clone();
         self.write_reviews(&records)?;
         Ok(record)
@@ -118,7 +118,7 @@ impl FeedbackScenario {
             .as_u64()
             .context("start_line should be integer")?;
         let start_line = u32::try_from(start_line)
-            .map_err(|_| anyhow!("start_line should fit into u32 for mark CLI"))?;
+            .with_context(|| format!("start_line {start_line} should fit into u32 for mark CLI"))?;
         Ok(ReviewBlockInfo { hash, start_line })
     }
 

@@ -12,7 +12,7 @@ fn test_feedback_since_unix_timestamp_includes_boundary_timestamp() -> Result<()
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "rejected",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("old"),
             timestamp: Some(1000),
             ..Default::default()
@@ -21,7 +21,7 @@ fn test_feedback_since_unix_timestamp_includes_boundary_timestamp() -> Result<()
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("boundary"),
             timestamp: Some(2000),
             ..Default::default()
@@ -51,7 +51,7 @@ fn test_feedback_since_relative_duration_survives_tree_drift() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("recent-original"),
             timestamp: Some(recent_timestamp),
             ..Default::default()
@@ -90,7 +90,7 @@ fn test_feedback_target_file_filters_current_workdir() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/keep.rs",
         "rejected",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             timestamp: Some(1000),
             ..Default::default()
         },
@@ -98,7 +98,7 @@ fn test_feedback_target_file_filters_current_workdir() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/skip.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             timestamp: Some(1001),
             ..Default::default()
         },
@@ -121,7 +121,7 @@ fn test_feedback_target_revision_anchors_to_historical_tree() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "rejected",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             timestamp: Some(1000),
             ..Default::default()
         },
@@ -160,7 +160,7 @@ fn test_feedback_target_dir_and_revision_intersect() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "rejected",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             timestamp: Some(1000),
             ..Default::default()
         },
@@ -168,7 +168,7 @@ fn test_feedback_target_dir_and_revision_intersect() -> Result<()> {
     scenario.review_block_with_overrides(
         "docs/guide.md",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             timestamp: Some(1001),
             ..Default::default()
         },
@@ -207,7 +207,7 @@ fn test_feedback_since_last_includes_new_same_second_record_without_repeating_ol
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "rejected",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("first"),
             timestamp: Some(1000),
             ..Default::default()
@@ -224,7 +224,7 @@ fn test_feedback_since_last_includes_new_same_second_record_without_repeating_ol
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("second"),
             timestamp: Some(1000),
             ..Default::default()
@@ -253,7 +253,7 @@ fn test_feedback_target_revision_range_filters_by_record_revision() -> Result<()
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "rejected",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("in-range"),
             timestamp: Some(1000),
             ..Default::default()
@@ -265,7 +265,7 @@ fn test_feedback_target_revision_range_filters_by_record_revision() -> Result<()
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("outside-range"),
             timestamp: Some(1001),
             ..Default::default()
@@ -302,7 +302,7 @@ fn test_feedback_target_revision_range_includes_in_range_reviews_on_unchanged_fi
     scenario.review_block_with_overrides(
         "src/stable.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("stable-in-range"),
             timestamp: Some(1000),
             ..Default::default()
@@ -342,7 +342,7 @@ fn test_feedback_target_revision_range_uses_record_revision_context_after_later_
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("mid-review"),
             timestamp: Some(1000),
             ..Default::default()

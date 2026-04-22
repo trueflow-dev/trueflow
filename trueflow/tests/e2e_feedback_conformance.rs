@@ -21,7 +21,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("old"),
             timestamp: Some(1000),
             ..Default::default()
@@ -30,7 +30,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("boundary"),
             timestamp: Some(2000),
             ..Default::default()
@@ -39,7 +39,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("newest"),
             timestamp: Some(3000),
             ..Default::default()
@@ -86,7 +86,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
     relative_scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("older-than-window"),
             timestamp: Some((Utc::now() - Duration::hours(72)).timestamp()),
             ..Default::default()
@@ -95,7 +95,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
     relative_scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("inside-window"),
             timestamp: Some((Utc::now() - Duration::hours(1)).timestamp()),
             ..Default::default()
@@ -124,7 +124,7 @@ fn feedback_since_last_cursor_conformance_cases() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("first"),
             timestamp: Some(1000),
             ..Default::default()
@@ -168,7 +168,7 @@ fn feedback_since_last_cursor_conformance_cases() -> Result<()> {
             scenario.review_block_with_overrides(
                 "src/lib.rs",
                 verdict,
-                ReviewRecordOverrides {
+                &ReviewRecordOverrides {
                     id: Some(id),
                     timestamp: Some(timestamp),
                     ..Default::default()
@@ -205,7 +205,7 @@ fn feedback_revision_range_conformance_cases() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "rejected",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("in-range"),
             timestamp: Some(1000),
             ..Default::default()
@@ -217,7 +217,7 @@ fn feedback_revision_range_conformance_cases() -> Result<()> {
     scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("unchanged-file-record"),
             timestamp: Some(1001),
             ..Default::default()

@@ -39,7 +39,7 @@ fn feedback_scenario_review_block_with_overrides_requires_explicit_patch() -> Re
     let record = scenario.review_block_with_overrides(
         "src/lib.rs",
         "comment",
-        ReviewRecordOverrides {
+        &ReviewRecordOverrides {
             id: Some("patched"),
             verdict: Some("rejected"),
             timestamp: Some(1234),
