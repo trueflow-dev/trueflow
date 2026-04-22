@@ -162,6 +162,67 @@ fn cargo_manifest_bench_support_is_opt_in() -> Result<()> {
 }
 
 #[test]
+fn cargo_manifests_centralize_clippy_lints_via_workspace() -> Result<()> {
+    let cargo_toml_path = repo_root()?.join("trueflow/Cargo.toml");
+    let test_support_cargo_toml_path = repo_root()?.join("trueflow/test-support/Cargo.toml");
+    if !cargo_toml_path.exists() || !test_support_cargo_toml_path.exists() {
+        return Ok(());
+    }
+
+    let cargo_toml = fs::read_to_string(cargo_toml_path)?;
+    let test_support_cargo_toml = fs::read_to_string(test_support_cargo_toml_path)?;
+
+    assert_contains(
+        &cargo_toml,
+        "[workspace]",
+        "workspace Cargo.toml workspace table",
+    );
+    assert_contains(
+        &cargo_toml,
+        "members = [\"test-support\"]",
+        "workspace Cargo.toml workspace members",
+    );
+    assert_contains(
+        &cargo_toml,
+        "[workspace.lints.clippy]",
+        "workspace Cargo.toml shared clippy lints",
+    );
+    assert_contains(
+        &cargo_toml,
+        "dbg_macro = \"warn\"",
+        "workspace Cargo.toml dbg_macro lint",
+    );
+    assert_contains(
+        &cargo_toml,
+        "manual_assert = \"warn\"",
+        "workspace Cargo.toml manual_assert lint",
+    );
+    assert_contains(
+        &cargo_toml,
+        "match_wild_err_arm = \"warn\"",
+        "workspace Cargo.toml match_wild_err_arm lint",
+    );
+    assert_contains(
+        &cargo_toml,
+        "[lints]\nworkspace = true",
+        "workspace root package lint inheritance",
+    );
+    assert_not_contains(
+        &cargo_toml,
+        "[lints.clippy]",
+        "workspace root package should not duplicate clippy lints",
+    );
+
+    assert_contains(
+        &test_support_cargo_toml,
+        "[lints]\nworkspace = true",
+        "test-support package lint inheritance",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
     let justfile_path = repo_root()?.join("Justfile");
     if !justfile_path.exists() {

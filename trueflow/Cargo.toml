@@ -3,6 +3,11 @@ name = "trueflow"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+resolver = "3"
+members = ["test-support"]
+default-members = ["."]
+
 [features]
 bench = ["dep:criterion"]
 tui-test-support = []
@@ -81,7 +86,10 @@ name = "full_review"
 harness = false
 required-features = ["bench"]
 
-[lints.clippy]
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
 await_holding_lock = "warn"
 await_holding_refcell_ref = "warn"
 box_collection = "warn"
@@ -89,18 +97,22 @@ cast_possible_truncation = "warn"
 cast_possible_wrap = "warn"
 cast_sign_loss = "warn"
 cloned_instead_of_copied = "warn"
+dbg_macro = "warn"
 debug_assert_with_mut_call = "warn"
 expect_used = "warn"
 fallible_impl_from = "warn"
 float_cmp = "warn"
 fn_params_excessive_bools = "warn"
+from_iter_instead_of_collect = "warn"
 implicit_clone = "warn"
 index_refutable_slice = "warn"
 large_futures = "warn"
 large_stack_arrays = "warn"
 large_types_passed_by_value = "warn"
 linkedlist = "warn"
+manual_assert = "warn"
 map_err_ignore = "warn"
+match_wild_err_arm = "warn"
 mem_forget = "warn"
 mutex_atomic = "warn"
 needless_pass_by_value = "warn"

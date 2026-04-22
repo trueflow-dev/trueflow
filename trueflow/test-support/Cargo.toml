@@ -11,3 +11,6 @@ vt100 = "0.16.2"
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 trueflow = { path = ".." }
+
+[lints]
+workspace = true
