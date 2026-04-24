@@ -4,7 +4,10 @@ use super::tui_terminal::{
     TerminalCapabilities, enter_tui_mode, leave_tui_mode, tui_keyboard_enhancement_flags,
 };
 use super::tui_terminal::{TerminalSession, TuiTerminal};
-use crate::ai::{AiEnvironment, resolve_ai_availability};
+use crate::ai::{
+    AiAvailability, AiEnvironment, AiReviewContext, AiSuggestion, AiSuggestionKey,
+    AiSuggestionProvider, AiSuggestionRequest, resolve_ai_availability,
+};
 use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
@@ -668,7 +671,7 @@ struct AppState {
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     speed_read: SpeedReadController,
-    ai_modeline: String,
+    ai: TuiAiState,
 }
 
 const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
@@ -682,7 +685,93 @@ struct ReviewStateBuildOptions {
     scope_label: String,
     speed_read_config: TuiSpeedReadConfig,
     speed_read_config_path: PathBuf,
-    ai_modeline: String,
+    ai: TuiAiState,
+}
+
+struct TuiAiState {
+    availability: Option<AiAvailability>,
+    max_context_lines: usize,
+    cache_enabled: bool,
+    provider: Option<Arc<dyn AiSuggestionProvider>>,
+    cache: HashMap<AiSuggestionKey, AiSuggestion>,
+    pending: Option<PendingAiSuggestion>,
+    status: TuiAiStatus,
+}
+
+struct PendingAiSuggestion {
+    key: AiSuggestionKey,
+    receiver: mpsc::Receiver<AiSuggestionWorkerResult>,
+}
+
+struct AiSuggestionWorkerResult {
+    key: AiSuggestionKey,
+    result: std::result::Result<AiSuggestion, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TuiAiStatus {
+    Availability,
+    Loading {
+        key: AiSuggestionKey,
+    },
+    Suggestion {
+        key: AiSuggestionKey,
+        suggestion: AiSuggestion,
+    },
+    Error {
+        key: AiSuggestionKey,
+        message: String,
+    },
+}
+
+impl TuiAiState {
+    fn empty() -> Self {
+        Self {
+            availability: None,
+            max_context_lines: 80,
+            cache_enabled: true,
+            provider: None,
+            cache: HashMap::new(),
+            pending: None,
+            status: TuiAiStatus::Availability,
+        }
+    }
+
+    fn from_availability(
+        availability: AiAvailability,
+        max_context_lines: usize,
+        cache_enabled: bool,
+    ) -> Self {
+        Self {
+            availability: Some(availability),
+            max_context_lines,
+            cache_enabled,
+            provider: None,
+            cache: HashMap::new(),
+            pending: None,
+            status: TuiAiStatus::Availability,
+        }
+    }
+
+    fn modeline_text(&self) -> Option<String> {
+        match &self.status {
+            TuiAiStatus::Availability => self
+                .availability
+                .as_ref()
+                .map(AiAvailability::modeline_text),
+            TuiAiStatus::Loading { .. } => Some("AI: loading…".to_string()),
+            TuiAiStatus::Suggestion { suggestion, .. } => {
+                Some(format!("AI: {}", suggestion.sentence))
+            }
+            TuiAiStatus::Error { message, .. } => Some(format!("AI: error ({message})")),
+        }
+    }
+
+    fn ai_poll_deadline(&self) -> Option<Instant> {
+        self.pending
+            .as_ref()
+            .map(|_| Instant::now() + Duration::from_millis(50))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,7 +1068,7 @@ fn run_tui_review_loop(
                     scope_label: launch.scope_label,
                     speed_read_config: config.tui.speed_read.clone(),
                     speed_read_config_path: speed_read_config_path_for_repo_root(),
-                    ai_modeline: ai_modeline_for_config(config),
+                    ai: tui_ai_state_for_config(config),
                 },
             )?;
 
@@ -1300,12 +1389,16 @@ fn build_review_state(
             options.speed_read_config,
             options.speed_read_config_path,
         ),
-        ai_modeline: options.ai_modeline,
+        ai: options.ai,
     })
 }
 
-fn ai_modeline_for_config(config: &TrueflowConfig) -> String {
-    resolve_ai_availability(&config.ai, &AiEnvironment::detect_current()).modeline_text()
+fn tui_ai_state_for_config(config: &TrueflowConfig) -> TuiAiState {
+    TuiAiState::from_availability(
+        resolve_ai_availability(&config.ai, &AiEnvironment::detect_current()),
+        config.ai.max_context_lines,
+        config.ai.cache,
+    )
 }
 
 fn root_child_for_node(tree: &Tree, node_id: TreeNodeId) -> Option<TreeNodeId> {
@@ -1622,6 +1715,10 @@ fn run_app(
     let mut event_pump = EventPump::default();
 
     loop {
+        if refresh_ai_suggestion_state(&mut state) {
+            needs_render = true;
+        }
+
         if needs_render {
             session.terminal_mut().draw(|f| ui(f, &mut state))?;
             needs_render = false;
@@ -1837,7 +1934,172 @@ fn read_next_app_event(state: &AppState, event_pump: &mut EventPump) -> Result<O
 }
 
 fn next_app_deadline(state: &AppState) -> Option<Instant> {
-    state.speed_read.next_deadline(state.navigator.current_id())
+    earliest_deadline(
+        state.speed_read.next_deadline(state.navigator.current_id()),
+        state.ai.ai_poll_deadline(),
+    )
+}
+
+fn earliest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+fn refresh_ai_suggestion_state(state: &mut AppState) -> bool {
+    let mut changed = poll_ai_suggestion_result(state);
+    if ensure_ai_suggestion_for_current_focus(state) {
+        changed = true;
+    }
+    changed
+}
+
+fn poll_ai_suggestion_result(state: &mut AppState) -> bool {
+    let Some(poll_result) = state
+        .ai
+        .pending
+        .as_ref()
+        .map(|pending| (pending.key.clone(), pending.receiver.try_recv()))
+    else {
+        return false;
+    };
+
+    match poll_result {
+        (_, Ok(result)) => {
+            state.ai.pending = None;
+            match result.result {
+                Ok(suggestion) => {
+                    if state.ai.cache_enabled {
+                        state
+                            .ai
+                            .cache
+                            .insert(result.key.clone(), suggestion.clone());
+                    }
+                    state.ai.status = TuiAiStatus::Suggestion {
+                        key: result.key,
+                        suggestion,
+                    };
+                }
+                Err(message) => {
+                    state.ai.status = TuiAiStatus::Error {
+                        key: result.key,
+                        message: truncate_ai_error(&message),
+                    };
+                }
+            }
+            true
+        }
+        (_, Err(mpsc::TryRecvError::Empty)) => false,
+        (key, Err(mpsc::TryRecvError::Disconnected)) => {
+            state.ai.pending = None;
+            state.ai.status = TuiAiStatus::Error {
+                key,
+                message: "provider worker disconnected".to_string(),
+            };
+            true
+        }
+    }
+}
+
+fn ensure_ai_suggestion_for_current_focus(state: &mut AppState) -> bool {
+    let Some(request) = ai_suggestion_request_for_current_focus(state) else {
+        return reset_ai_status_to_availability(state);
+    };
+    let key = request.key.clone();
+
+    if state.ai.status.key() == Some(&key) {
+        return false;
+    }
+
+    if state.ai.cache_enabled
+        && let Some(suggestion) = state.ai.cache.get(&key).cloned()
+    {
+        state.ai.pending = None;
+        state.ai.status = TuiAiStatus::Suggestion { key, suggestion };
+        return true;
+    }
+
+    let Some(provider) = state.ai.provider.clone() else {
+        return reset_ai_status_to_availability(state);
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    let thread_key = key.clone();
+    let _worker = thread::spawn(move || {
+        let result = provider
+            .suggest(&request)
+            .map_err(|error| truncate_ai_error(&error.to_string()));
+        let _ = sender.send(AiSuggestionWorkerResult {
+            key: thread_key,
+            result,
+        });
+    });
+
+    state.ai.pending = Some(PendingAiSuggestion {
+        key: key.clone(),
+        receiver,
+    });
+    state.ai.status = TuiAiStatus::Loading { key };
+    true
+}
+
+fn reset_ai_status_to_availability(state: &mut AppState) -> bool {
+    state.ai.pending = None;
+    if matches!(state.ai.status, TuiAiStatus::Availability) {
+        return false;
+    }
+    state.ai.status = TuiAiStatus::Availability;
+    true
+}
+
+fn ai_suggestion_request_for_current_focus(state: &AppState) -> Option<AiSuggestionRequest> {
+    let AiAvailability::Ready { provider, model } = state.ai.availability.as_ref()? else {
+        return None;
+    };
+    let focus_block = state.focus_block?;
+    let node = state.navigator.tree.node(focus_block);
+    let block = node.block.as_ref()?;
+    let context = AiReviewContext {
+        path: node.path.as_str().to_string(),
+        language: node.language.unwrap_or_default(),
+        block_kind: block.kind,
+        block_hash: block.hash.clone(),
+        start_line: block.start_line,
+        end_line: block.end_line,
+        content: block.content.clone(),
+    };
+    Some(AiSuggestionRequest::new(
+        *provider,
+        model.clone(),
+        context,
+        state.ai.max_context_lines,
+    ))
+}
+
+impl TuiAiStatus {
+    fn key(&self) -> Option<&AiSuggestionKey> {
+        match self {
+            Self::Availability => None,
+            Self::Loading { key } | Self::Suggestion { key, .. } | Self::Error { key, .. } => {
+                Some(key)
+            }
+        }
+    }
+}
+
+fn truncate_ai_error(message: &str) -> String {
+    let max_chars = 120;
+    if message.chars().count() <= max_chars {
+        return message.to_string();
+    }
+    let mut out = message
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
 }
 
 fn sync_speed_read_focus(state: &mut AppState) {
@@ -3925,9 +4187,9 @@ fn build_header_lines(
 
 fn build_mode_banner_line(state: &AppState, palette: &UiPalette) -> Line<'static> {
     let mut text = mode_banner_label(current_ui_mode(state)).to_string();
-    if !state.ai_modeline.is_empty() {
+    if let Some(ai_modeline) = state.ai.modeline_text() {
         text.push_str(" | ");
-        text.push_str(&state.ai_modeline);
+        text.push_str(&ai_modeline);
     }
     Line::from(Span::styled(
         text,
@@ -5859,7 +6121,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
-            ai_modeline: String::new(),
+            ai: TuiAiState::empty(),
         }
     }
 
@@ -5928,7 +6190,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
-            ai_modeline: String::new(),
+            ai: TuiAiState::empty(),
         };
 
         (state, block_id)
@@ -6027,7 +6289,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
-            ai_modeline: String::new(),
+            ai: TuiAiState::empty(),
         };
 
         (state, first_file, second_file)
@@ -6129,7 +6391,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
-            ai_modeline: String::new(),
+            ai: TuiAiState::empty(),
         };
 
         (state, file, block_id)
@@ -6209,7 +6471,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
-            ai_modeline: String::new(),
+            ai: TuiAiState::empty(),
         };
 
         (state, file, block_ids)
@@ -6288,7 +6550,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
-            ai_modeline: String::new(),
+            ai: TuiAiState::empty(),
         };
         set_focus_for_current_node(&mut state, None);
 
@@ -7366,7 +7628,7 @@ mod diff_scope_tests {
                 scope_label: "rev:abc1234..HEAD".to_string(),
                 speed_read_config: TuiSpeedReadConfig::default(),
                 speed_read_config_path: PathBuf::from("trueflow.toml"),
-                ai_modeline: String::new(),
+                ai: TuiAiState::empty(),
             },
         )
         .unwrap_or_else(|error| panic!("expected review state: {error}"));
@@ -9527,12 +9789,107 @@ mod diff_scope_tests {
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 1;
         state.navigator.jump_root();
-        state.ai_modeline = "AI: ready (Anthropic)".to_string();
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
         let palette = UiPalette::default();
 
         assert_eq!(
             build_mode_banner_line(&state, &palette).to_string(),
             "Navigation Mode | AI: ready (Anthropic)"
+        );
+    }
+
+    #[test]
+    fn ai_suggestion_request_for_current_focus_uses_block_metadata() {
+        let file_path = temp_test_file_path("tui_ai_request");
+        let file_content = "fn checked() {\n    call();\n}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 3);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "claude-3-5-haiku".to_string(),
+            },
+            2,
+            true,
+        );
+
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+
+        assert_eq!(request.key.path, "src/lib.rs");
+        assert_eq!(request.key.model, "claude-3-5-haiku");
+        assert_eq!(request.key.start_line, 0);
+        assert_eq!(request.key.end_line, 3);
+        assert_eq!(request.key.max_context_lines, 2);
+        assert!(request.prompt.contains("fn checked() {\n    call();\n..."));
+    }
+
+    #[test]
+    fn refresh_ai_suggestion_state_uses_cached_suggestion_in_modeline() {
+        let file_path = temp_test_file_path("tui_ai_cached_suggestion");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        state.ai.cache.insert(
+            request.key,
+            AiSuggestion {
+                sentence: "looks good — straightforward wrapper.".to_string(),
+            },
+        );
+
+        assert!(refresh_ai_suggestion_state(&mut state));
+        let palette = UiPalette::default();
+        assert_eq!(
+            build_mode_banner_line(&state, &palette).to_string(),
+            "Source Mode | AI: looks good — straightforward wrapper."
+        );
+    }
+
+    #[test]
+    fn build_mode_banner_line_shows_ai_loading_state() {
+        let file_path = temp_test_file_path("tui_ai_loading");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        state.ai.status = TuiAiStatus::Loading { key: request.key };
+        let palette = UiPalette::default();
+
+        assert_eq!(
+            build_mode_banner_line(&state, &palette).to_string(),
+            "Source Mode | AI: loading…"
         );
     }
 

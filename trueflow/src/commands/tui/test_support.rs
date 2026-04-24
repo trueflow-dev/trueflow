@@ -1,13 +1,14 @@
 use super::{
     AppState, EditingActionResult, Event, InputCursor, InputMode, KeyCode, KeyEvent, KeyEventKind,
-    KeybindAction, RecapAction, Rect, SessionRecap, SpeedReadController, TuiDiffLineNumbers,
-    TuiKeybindsConfig, TuiSpeedReadConfig, UiMode, ViewMode, clear_focus_scroll, current_ui_mode,
-    editing_key_action_for_event, execute_action_with, handle_advance_review_target, handle_child,
-    handle_confirm_cancel, handle_editing_key_action, handle_editing_submit_with,
-    handle_mouse_event, handle_next, handle_note_action, handle_parent, handle_paste_event,
-    handle_prev, handle_scroll_line_down, handle_scroll_line_up, handle_scroll_page_down,
-    handle_scroll_page_up, handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
-    key_event_for_press_event, key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
+    KeybindAction, RecapAction, Rect, SessionRecap, SpeedReadController, TuiAiState,
+    TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, UiMode, ViewMode,
+    clear_focus_scroll, current_ui_mode, editing_key_action_for_event, execute_action_with,
+    handle_advance_review_target, handle_child, handle_confirm_cancel, handle_editing_key_action,
+    handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
+    handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
+    handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding,
+    key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
+    key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
     keybind_action_for_key_code, recap_action_for_key_code, set_focus_for_current_node,
     should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
 };
@@ -587,7 +588,7 @@ where
             TuiSpeedReadConfig::default(),
             PathBuf::from("trueflow.toml"),
         ),
-        ai_modeline: String::new(),
+        ai: TuiAiState::empty(),
     })
 }
 
@@ -681,6 +682,6 @@ fn build_state_with_single_rust_block_file(
             TuiSpeedReadConfig::default(),
             PathBuf::from("trueflow.toml"),
         ),
-        ai_modeline: String::new(),
+        ai: TuiAiState::empty(),
     })
 }

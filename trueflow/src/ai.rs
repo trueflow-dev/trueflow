@@ -1,4 +1,8 @@
+use crate::analysis::Language;
+use crate::block::BlockKind;
 use crate::config::{AiConfig, AiProviderConfig};
+use crate::hashing::TreeHash;
+use anyhow::{Result, anyhow};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -56,6 +60,141 @@ impl AiAvailability {
             Self::Unavailable { reason, .. } => format!("AI: unavailable ({reason})"),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AiSuggestionKey {
+    pub provider: AiProvider,
+    pub model: String,
+    pub path: String,
+    pub block_hash: TreeHash,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub max_context_lines: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReviewContext {
+    pub path: String,
+    pub language: Language,
+    pub block_kind: BlockKind,
+    pub block_hash: TreeHash,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiSuggestionRequest {
+    pub key: AiSuggestionKey,
+    pub context: AiReviewContext,
+    pub prompt: String,
+}
+
+impl AiSuggestionRequest {
+    pub fn new(
+        provider: AiProvider,
+        model: String,
+        context: AiReviewContext,
+        max_context_lines: usize,
+    ) -> Self {
+        let key = AiSuggestionKey {
+            provider,
+            model,
+            path: context.path.clone(),
+            block_hash: context.block_hash.clone(),
+            start_line: context.start_line,
+            end_line: context.end_line,
+            max_context_lines,
+        };
+        let prompt = build_review_hint_prompt(&context, max_context_lines);
+        Self {
+            key,
+            context,
+            prompt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiSuggestion {
+    pub sentence: String,
+}
+
+impl AiSuggestion {
+    pub fn from_provider_text(raw: &str) -> Result<Self> {
+        let collapsed = collapse_whitespace(raw);
+        if collapsed.is_empty() {
+            return Err(anyhow!("AI provider returned an empty suggestion"));
+        }
+        let sentence = truncate_for_modeline(first_sentence(&collapsed), 180);
+        Ok(Self { sentence })
+    }
+}
+
+pub trait AiSuggestionProvider: Send + Sync {
+    fn suggest(&self, request: &AiSuggestionRequest) -> Result<AiSuggestion>;
+}
+
+pub fn build_review_hint_prompt(context: &AiReviewContext, max_context_lines: usize) -> String {
+    let line_start = context.start_line.saturating_add(1);
+    let line_end = context.end_line.max(context.start_line.saturating_add(1));
+    let block_content = clipped_content(&context.content, max_context_lines);
+    format!(
+        "Return exactly one concise sentence that helps a code reviewer decide whether to approve or comment. If no issue is obvious, say that it looks good and why. Do not propose code edits.\n\nPath: {}\nLanguage: {:?}\nBlock kind: {}\nLines: {line_start}-{line_end}\n\n```\n{block_content}\n```",
+        context.path,
+        context.language,
+        context.block_kind.as_str(),
+    )
+}
+
+fn clipped_content(content: &str, max_context_lines: usize) -> String {
+    let max_context_lines = max_context_lines.max(1);
+    let mut out = String::new();
+    for (index, line) in content.lines().enumerate() {
+        if index >= max_context_lines {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("...");
+            break;
+        }
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn collapse_whitespace(raw: &str) -> String {
+    let mut out = String::new();
+    for part in raw.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+fn first_sentence(text: &str) -> &str {
+    for (index, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            return &text[..=index];
+        }
+    }
+    text
+}
+
+fn truncate_for_modeline(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let take_chars = max_chars.saturating_sub(1);
+    let mut truncated = text.chars().take(take_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +374,68 @@ mod tests {
             max_context_lines: 80,
             cache: true,
         }
+    }
+
+    fn review_context(content: &str) -> AiReviewContext {
+        AiReviewContext {
+            path: "src/lib.rs".to_string(),
+            language: Language::Rust,
+            block_kind: BlockKind::Function,
+            block_hash: TreeHash::from_content(content),
+            start_line: 4,
+            end_line: 8,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn review_hint_prompt_contains_metadata_and_clipped_block_content() {
+        let prompt = build_review_hint_prompt(&review_context("one\ntwo\nthree"), 2);
+
+        assert!(prompt.contains("Return exactly one concise sentence"));
+        assert!(prompt.contains("Path: src/lib.rs"));
+        assert!(prompt.contains("Language: Rust"));
+        assert!(prompt.contains("Block kind: function"));
+        assert!(prompt.contains("Lines: 5-8"));
+        assert!(prompt.contains("one\ntwo\n..."));
+        assert!(!prompt.contains("three"));
+    }
+
+    #[test]
+    fn suggestion_normalization_keeps_only_first_sentence_for_modeline() {
+        let suggestion = AiSuggestion::from_provider_text(
+            "  consider asking why unwrap is safe. second sentence should not render. ",
+        )
+        .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
+
+        assert_eq!(suggestion.sentence, "consider asking why unwrap is safe.");
+    }
+
+    #[test]
+    fn suggestion_normalization_rejects_empty_provider_output() {
+        let error = match AiSuggestion::from_provider_text(" \n\t ") {
+            Ok(suggestion) => panic!("expected empty suggestion error, got {suggestion:?}"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("empty suggestion"));
+    }
+
+    #[test]
+    fn suggestion_request_key_includes_provider_model_and_context_limit() {
+        let request = AiSuggestionRequest::new(
+            AiProvider::Anthropic,
+            "claude-3-5-haiku".to_string(),
+            review_context("fn checked() {}"),
+            40,
+        );
+
+        assert_eq!(request.key.provider, AiProvider::Anthropic);
+        assert_eq!(request.key.model, "claude-3-5-haiku");
+        assert_eq!(request.key.path, "src/lib.rs");
+        assert_eq!(request.key.start_line, 4);
+        assert_eq!(request.key.end_line, 8);
+        assert_eq!(request.key.max_context_lines, 40);
     }
 
     #[test]
