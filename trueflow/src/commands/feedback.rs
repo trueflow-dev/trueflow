@@ -239,9 +239,12 @@ where
     let store = FileStore::for_root(repo_root)?;
     let ledger_path = store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE);
     let mut ledger = GitHubDeliveryLedger::load(&ledger_path)?;
-    ledger.sync_pending_reviews(&prepared.metadata.pr, |review_id| {
+    let ledger_changed = ledger.sync_pending_reviews(&prepared.metadata.pr, |review_id| {
         client.pull_request_review_status(&prepared.metadata.pr, review_id)
     })?;
+    if ledger_changed {
+        ledger.save(&ledger_path)?;
+    }
 
     if submit {
         return run_prepared_pull_request_feedback_submission(
@@ -1929,6 +1932,9 @@ mod tests {
             Some(PullRequestFeedbackSubmission::NoPendingReview)
         );
         assert!(client.submitted.borrow().is_empty());
+        let ledger =
+            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        assert!(ledger.pending_reviews(&metadata.pr).is_empty());
 
         Ok(())
     }

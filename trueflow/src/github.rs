@@ -286,7 +286,8 @@ impl GitHubClient for GhGitHubClient {
                 "startSide": comment.start_side,
             }
         }))?;
-        run_gh_api_with_body(&pr.host, "POST", "graphql", &body)?;
+        let response = run_gh_api_with_body(&pr.host, "POST", "graphql", &body)?;
+        ensure_graphql_response_success(&response)?;
         Ok(())
     }
 
@@ -701,6 +702,37 @@ fn run_gh_api_with_args<'a>(host: &str, args: impl IntoIterator<Item = &'a str>)
     String::from_utf8(output.stdout).with_context(|| "gh api output was not utf8".to_string())
 }
 
+fn ensure_graphql_response_success(raw: &str) -> Result<()> {
+    let response: serde_json::Value = serde_json::from_str(raw)
+        .with_context(|| "failed to parse GitHub GraphQL response JSON".to_string())?;
+    let Some(errors) = response.get("errors") else {
+        return Ok(());
+    };
+    let Some(errors) = errors.as_array() else {
+        return Err(anyhow!(
+            "GitHub GraphQL response had non-array errors field"
+        ));
+    };
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    let messages = errors
+        .iter()
+        .map(|error| {
+            error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string())
+        })
+        .collect::<Vec<_>>();
+    Err(anyhow!(
+        "GitHub GraphQL request failed: {}",
+        messages.join("; ")
+    ))
+}
+
 fn parse_posted_pull_request_review(raw: &str) -> Result<PostedPullRequestReview> {
     let review: PullRequestReviewApiResponse = serde_json::from_str(raw)
         .with_context(|| "failed to parse pull request review JSON".to_string())?;
@@ -920,8 +952,9 @@ mod tests {
     use super::{
         GH_MAX_PULL_REQUEST_COMMITS, GitHubReviewDraft, GitRemote, PostedPullRequestReview,
         PullRequestCommit, PullRequestMetadata, PullRequestRef, ResolvedPullRequestRef,
-        fetch_pull_request_refs, parse_git_remotes_config, parse_pull_request_metadata,
-        prepare_pull_request_review_with, resolve_pull_request_ref, select_matching_remote,
+        ensure_graphql_response_success, fetch_pull_request_refs, parse_git_remotes_config,
+        parse_pull_request_metadata, prepare_pull_request_review_with, resolve_pull_request_ref,
+        select_matching_remote,
     };
     use crate::store::CommitId;
     use crate::test_git::{run_git, run_git_stdout, temp_git_repo};
@@ -1025,6 +1058,33 @@ mod tests {
     fn pull_request_ref_rejects_invalid_shape() {
         let err = PullRequestRef::from_cli("pr:jmqd/trueflow").unwrap_err();
         assert!(err.to_string().contains(super::PULL_REQUEST_REFERENCE_HELP));
+    }
+
+    #[test]
+    fn graphql_response_success_accepts_data_without_errors() {
+        ensure_graphql_response_success(r#"{"data":{"ok":true}}"#).unwrap();
+    }
+
+    #[test]
+    fn graphql_response_success_rejects_errors_array() {
+        let err = ensure_graphql_response_success(
+            r#"{"data":null,"errors":[{"message":"Field 'line' doesn't exist"},{"message":"bad input"}]}"#,
+        )
+        .unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("GitHub GraphQL request failed"));
+        assert!(rendered.contains("Field 'line' doesn't exist"));
+        assert!(rendered.contains("bad input"));
+    }
+
+    #[test]
+    fn graphql_response_success_rejects_invalid_json() {
+        let err = ensure_graphql_response_success("not json").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to parse GitHub GraphQL response JSON")
+        );
     }
 
     #[test]

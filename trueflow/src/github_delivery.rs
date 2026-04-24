@@ -80,13 +80,15 @@ impl GitHubDeliveryLedger {
         &mut self,
         pr: &ResolvedPullRequestRef,
         mut lookup: F,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         F: FnMut(u64) -> Result<Option<PostedPullRequestReview>>,
     {
         let Some(state) = self.pull_request_state_mut(pr) else {
-            return Ok(());
+            return Ok(false);
         };
+        let original_delivered_record_ids = state.delivered_record_ids.clone();
+        let original_pending_reviews = state.pending_reviews.clone();
 
         let mut delivered_ids = state
             .delivered_record_ids
@@ -114,7 +116,8 @@ impl GitHubDeliveryLedger {
         state.delivered_record_ids = delivered_ids.into_iter().collect();
         state.delivered_record_ids.sort();
         state.pending_reviews = pending;
-        Ok(())
+        Ok(state.delivered_record_ids != original_delivered_record_ids
+            || state.pending_reviews != original_pending_reviews)
     }
 
     pub fn record_pending_review(
@@ -303,6 +306,60 @@ mod tests {
     }
 
     #[test]
+    fn sync_pending_reviews_reports_no_change_for_current_pending_review() {
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &pr(),
+            PostedPullRequestReview {
+                id: 1,
+                html_url: "https://example.test/review/1".to_string(),
+                state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
+            },
+            &CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+            vec!["staged".to_string()],
+        );
+
+        let changed = ledger
+            .sync_pending_reviews(&pr(), |_| {
+                Ok(Some(PostedPullRequestReview {
+                    id: 1,
+                    html_url: "https://example.test/review/1".to_string(),
+                    state: PullRequestReviewState::Pending,
+                    body: "<!-- trueflow:pending-review -->".to_string(),
+                    node_id: Some("R_1".to_string()),
+                }))
+            })
+            .unwrap();
+
+        assert!(!changed);
+    }
+
+    #[test]
+    fn sync_pending_reviews_reports_change_for_missing_review() {
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &pr(),
+            PostedPullRequestReview {
+                id: 1,
+                html_url: "https://example.test/review/1".to_string(),
+                state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
+            },
+            &CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+            vec!["staged".to_string()],
+        );
+
+        let changed = ledger.sync_pending_reviews(&pr(), |_| Ok(None)).unwrap();
+
+        assert!(changed);
+        assert!(ledger.pending_reviews(&pr()).is_empty());
+        assert!(ledger.excluded_record_ids(&pr()).is_empty());
+    }
+
+    #[test]
     fn sync_pending_reviews_moves_submitted_ids_to_delivered() {
         let mut ledger = GitHubDeliveryLedger::default();
         ledger.record_pending_review(
@@ -318,7 +375,7 @@ mod tests {
             vec!["staged".to_string()],
         );
 
-        ledger
+        let changed = ledger
             .sync_pending_reviews(&pr(), |_| {
                 Ok(Some(PostedPullRequestReview {
                     id: 1,
@@ -330,6 +387,7 @@ mod tests {
             })
             .unwrap();
 
+        assert!(changed);
         let state = ledger.pull_request_state(&pr()).unwrap();
         assert!(state.pending_reviews.is_empty());
         assert_eq!(state.delivered_record_ids, vec!["staged".to_string()]);
