@@ -4,6 +4,7 @@ use super::tui_terminal::{
     TerminalCapabilities, enter_tui_mode, leave_tui_mode, tui_keyboard_enhancement_flags,
 };
 use super::tui_terminal::{TerminalSession, TuiTerminal};
+use crate::ai::{AiEnvironment, resolve_ai_availability};
 use crate::analysis::Language;
 use crate::block::BlockKind;
 use crate::commands::mark;
@@ -667,6 +668,7 @@ struct AppState {
     content_frame_cache: HashMap<ContentFrameCacheKey, ContentFrameCacheEntry>,
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     speed_read: SpeedReadController,
+    ai_modeline: String,
 }
 
 const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
@@ -680,6 +682,7 @@ struct ReviewStateBuildOptions {
     scope_label: String,
     speed_read_config: TuiSpeedReadConfig,
     speed_read_config_path: PathBuf,
+    ai_modeline: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,6 +979,7 @@ fn run_tui_review_loop(
                     scope_label: launch.scope_label,
                     speed_read_config: config.tui.speed_read.clone(),
                     speed_read_config_path: speed_read_config_path_for_repo_root(),
+                    ai_modeline: ai_modeline_for_config(config),
                 },
             )?;
 
@@ -1296,7 +1300,12 @@ fn build_review_state(
             options.speed_read_config,
             options.speed_read_config_path,
         ),
+        ai_modeline: options.ai_modeline,
     })
+}
+
+fn ai_modeline_for_config(config: &TrueflowConfig) -> String {
+    resolve_ai_availability(&config.ai, &AiEnvironment::detect_current()).modeline_text()
 }
 
 fn root_child_for_node(tree: &Tree, node_id: TreeNodeId) -> Option<TreeNodeId> {
@@ -3915,8 +3924,13 @@ fn build_header_lines(
 }
 
 fn build_mode_banner_line(state: &AppState, palette: &UiPalette) -> Line<'static> {
+    let mut text = mode_banner_label(current_ui_mode(state)).to_string();
+    if !state.ai_modeline.is_empty() {
+        text.push_str(" | ");
+        text.push_str(&state.ai_modeline);
+    }
     Line::from(Span::styled(
-        mode_banner_label(current_ui_mode(state)).to_string(),
+        text,
         Style::default()
             .fg(palette.fg)
             .bg(palette.bg)
@@ -5845,6 +5859,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
+            ai_modeline: String::new(),
         }
     }
 
@@ -5913,6 +5928,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
+            ai_modeline: String::new(),
         };
 
         (state, block_id)
@@ -6011,6 +6027,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
+            ai_modeline: String::new(),
         };
 
         (state, first_file, second_file)
@@ -6112,6 +6129,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
+            ai_modeline: String::new(),
         };
 
         (state, file, block_id)
@@ -6191,6 +6209,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
+            ai_modeline: String::new(),
         };
 
         (state, file, block_ids)
@@ -6269,6 +6288,7 @@ mod diff_scope_tests {
                 TuiSpeedReadConfig::default(),
                 PathBuf::from("trueflow.toml"),
             ),
+            ai_modeline: String::new(),
         };
         set_focus_for_current_node(&mut state, None);
 
@@ -7346,6 +7366,7 @@ mod diff_scope_tests {
                 scope_label: "rev:abc1234..HEAD".to_string(),
                 speed_read_config: TuiSpeedReadConfig::default(),
                 speed_read_config_path: PathBuf::from("trueflow.toml"),
+                ai_modeline: String::new(),
             },
         )
         .unwrap_or_else(|error| panic!("expected review state: {error}"));
@@ -9496,6 +9517,22 @@ mod diff_scope_tests {
         assert_eq!(
             build_mode_banner_line(&state, &palette).to_string(),
             "Speed Read Mode"
+        );
+    }
+
+    #[test]
+    fn build_mode_banner_line_appends_ai_modeline_when_present() {
+        let mut state = build_test_state(ScopePreset::All, HashMap::new());
+        state.total_blocks = 1;
+        state.initial_remaining_blocks = 1;
+        state.remaining_blocks = 1;
+        state.navigator.jump_root();
+        state.ai_modeline = "AI: ready (Anthropic)".to_string();
+        let palette = UiPalette::default();
+
+        assert_eq!(
+            build_mode_banner_line(&state, &palette).to_string(),
+            "Navigation Mode | AI: ready (Anthropic)"
         );
     }
 

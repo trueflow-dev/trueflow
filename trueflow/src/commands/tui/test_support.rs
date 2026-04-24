@@ -587,6 +587,7 @@ where
             TuiSpeedReadConfig::default(),
             PathBuf::from("trueflow.toml"),
         ),
+        ai_modeline: String::new(),
     })
 }
 
@@ -680,5 +681,6 @@ fn build_state_with_single_rust_block_file(
             TuiSpeedReadConfig::default(),
             PathBuf::from("trueflow.toml"),
         ),
+        ai_modeline: String::new(),
     })
 }

@@ -22,6 +22,8 @@ pub struct TrueflowConfig {
     pub tui: TuiConfig,
     #[serde(default)]
     pub scan: ScanConfig,
+    #[serde(default)]
+    pub ai: AiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +109,31 @@ pub struct TuiKeybindsConfig {
         deserialize_with = "deserialize_single_char"
     )]
     pub quit: char,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiConfig {
+    #[serde(default = "default_ai_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ai_provider")]
+    pub provider: AiProviderConfig,
+    #[serde(default = "default_ai_model")]
+    pub model: String,
+    #[serde(default = "default_ai_max_context_lines")]
+    pub max_context_lines: usize,
+    #[serde(default = "default_ai_cache")]
+    pub cache: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiProviderConfig {
+    Auto,
+    Anthropic,
+    OpenAi,
+    ClaudeCli,
+    CodexCli,
+    None,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -282,6 +309,18 @@ impl Default for TuiSpeedReadConfig {
     }
 }
 
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ai_enabled(),
+            provider: default_ai_provider(),
+            model: default_ai_model(),
+            max_context_lines: default_ai_max_context_lines(),
+            cache: default_ai_cache(),
+        }
+    }
+}
+
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
@@ -418,6 +457,26 @@ fn default_speed_read_punctuation_dwell() -> TuiSpeedReadPunctuationDwell {
 
 fn default_speed_read_punctuation_dwell_multiplier() -> f64 {
     1.15
+}
+
+fn default_ai_enabled() -> bool {
+    false
+}
+
+fn default_ai_provider() -> AiProviderConfig {
+    AiProviderConfig::Auto
+}
+
+fn default_ai_model() -> String {
+    "auto".to_string()
+}
+
+fn default_ai_max_context_lines() -> usize {
+    80
+}
+
+fn default_ai_cache() -> bool {
+    true
 }
 
 fn default_scan_use_cache() -> bool {
@@ -659,6 +718,41 @@ pub fn update_speed_read_defaults_in_file(
 mod tests {
     use super::*;
     use crate::feedback_since::FeedbackSinceExpr;
+
+    #[test]
+    fn ai_config_defaults_to_opt_in_auto_detection() {
+        let cfg: TrueflowConfig = match toml::from_str("") {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert!(!cfg.ai.enabled);
+        assert_eq!(cfg.ai.provider, AiProviderConfig::Auto);
+        assert_eq!(cfg.ai.model, "auto");
+        assert_eq!(cfg.ai.max_context_lines, 80);
+        assert!(cfg.ai.cache);
+    }
+
+    #[test]
+    fn ai_config_parses_overrides() {
+        let cfg: TrueflowConfig = match toml::from_str(
+            r#"
+[ai]
+enabled = true
+provider = "anthropic"
+model = "claude-3-5-haiku-latest"
+max_context_lines = 40
+cache = false
+"#,
+        ) {
+            Ok(config) => config,
+            Err(err) => panic!("parse config: {err}"),
+        };
+        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.provider, AiProviderConfig::Anthropic);
+        assert_eq!(cfg.ai.model, "claude-3-5-haiku-latest");
+        assert_eq!(cfg.ai.max_context_lines, 40);
+        assert!(!cfg.ai.cache);
+    }
 
     #[test]
     fn tui_config_defaults_to_whole_block_focus() {

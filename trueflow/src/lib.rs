@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod analysis;
 pub mod block;
 pub mod block_splitter;
