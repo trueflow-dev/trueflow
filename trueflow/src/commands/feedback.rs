@@ -148,6 +148,7 @@ enum PullRequestFeedbackSkipReason {
     AmbiguousLineTranslation,
     NotPresentInPrHeadDiff,
     MixedDiffRowsUnsupported,
+    PathRemappingUnsupported,
 }
 
 impl std::fmt::Display for PullRequestFeedbackSkipReason {
@@ -166,6 +167,9 @@ impl std::fmt::Display for PullRequestFeedbackSkipReason {
             }
             Self::MixedDiffRowsUnsupported => {
                 "diff anchor rows cannot be represented on a single GitHub diff side"
+            }
+            Self::PathRemappingUnsupported => {
+                "anchor path moved across the pull request in an unsupported or ambiguous way"
             }
         };
         f.write_str(message)
@@ -409,18 +413,24 @@ fn map_source_anchor_to_github_comment(
         return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
     }
 
-    let Some((first_line, last_line)) = translate_source_anchor_to_head(repo, metadata, anchor)?
-    else {
-        return Ok(Err(
-            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
-        ));
+    let translated = match translate_source_anchor_to_head(repo, metadata, anchor)? {
+        Ok(translated) => translated,
+        Err(reason) => return Ok(Err(reason)),
     };
-    if !head_diff_contains_right_side_range(repo, metadata, &anchor.path, first_line, last_line)? {
+    let first_line = translated.first_line;
+    let last_line = translated.last_line;
+    if !head_diff_contains_right_side_range(
+        repo,
+        metadata,
+        &translated.path,
+        first_line,
+        last_line,
+    )? {
         return Ok(Err(PullRequestFeedbackSkipReason::NotPresentInPrHeadDiff));
     }
 
     Ok(Ok(GitHubInlineComment {
-        path: anchor.path.clone(),
+        path: translated.path,
         line: last_line,
         side: GitHubCommentSide::Right,
         start_line: (first_line != last_line).then_some(first_line),
@@ -454,19 +464,24 @@ fn map_diff_anchor_to_github_comment(
         Err(reason) => return Ok(Err(reason)),
     };
     if let Some(mapped_lines) = left_lines {
-        let Some((first_line, last_line)) =
-            translate_left_diff_anchor_to_base(repo, metadata, anchor, &mapped_lines)?
-        else {
-            return Ok(Err(
-                PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
-            ));
-        };
-        if !head_diff_contains_left_side_range(repo, metadata, &anchor.path, first_line, last_line)?
-        {
+        let translated =
+            match translate_left_diff_anchor_to_base(repo, metadata, anchor, &mapped_lines)? {
+                Ok(translated) => translated,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        let first_line = translated.first_line;
+        let last_line = translated.last_line;
+        if !head_diff_contains_left_side_range(
+            repo,
+            metadata,
+            &translated.path,
+            first_line,
+            last_line,
+        )? {
             return Ok(Err(PullRequestFeedbackSkipReason::NotPresentInPrHeadDiff));
         }
         return Ok(Ok(GitHubInlineComment {
-            path: anchor.path.clone(),
+            path: translated.path,
             line: last_line,
             side: GitHubCommentSide::Left,
             start_line: (first_line != last_line).then_some(first_line),
@@ -507,13 +522,13 @@ fn translate_left_diff_anchor_to_base(
     metadata: &PullRequestMetadata,
     anchor: &DiffCommentAnchor,
     lines: &[u32],
-) -> Result<Option<(u32, u32)>> {
+) -> Result<std::result::Result<TranslatedSourceAnchor, PullRequestFeedbackSkipReason>> {
     let Some(anchor_commit_index) = metadata
         .commits
         .iter()
         .position(|commit| commit.sha == anchor.revision)
     else {
-        return Ok(None);
+        return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
     };
     let parent_revision = if anchor_commit_index == 0 {
         &metadata.base_sha
@@ -521,9 +536,12 @@ fn translate_left_diff_anchor_to_base(
         &metadata.commits[anchor_commit_index - 1].sha
     };
     if !path_exists_in_revision(repo, parent_revision, &anchor.path)? {
-        return Ok(None);
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+        ));
     }
 
+    let mut path = anchor.path.clone();
     let mut mapped_lines = lines.to_vec();
     for commit_index in (0..anchor_commit_index).rev() {
         let current = &metadata.commits[commit_index].sha;
@@ -532,15 +550,15 @@ fn translate_left_diff_anchor_to_base(
         } else {
             &metadata.commits[commit_index - 1].sha
         };
-        if !path_exists_in_revision(repo, previous, &anchor.path)? {
-            return Ok(None);
+        if !path_exists_in_revision(repo, previous, &path)? {
+            let Some(source_path) = pure_rename_source(repo, previous, current, &path)? else {
+                return Ok(Err(PullRequestFeedbackSkipReason::PathRemappingUnsupported));
+            };
+            path = source_path;
+            continue;
         }
-        let hunks = vcs::diff_hunks_for_file_in_range(
-            repo,
-            previous.as_str(),
-            current.as_str(),
-            &anchor.path,
-        )?;
+        let hunks =
+            vcs::diff_hunks_for_file_in_range(repo, previous.as_str(), current.as_str(), &path)?;
         if hunks.is_empty() {
             continue;
         }
@@ -549,32 +567,51 @@ fn translate_left_diff_anchor_to_base(
             .map(|line| translate_new_line_to_old_line_strict(line, &hunks))
             .collect::<Option<Vec<_>>>()
         else {
-            return Ok(None);
+            return Ok(Err(
+                PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+            ));
         };
         mapped_lines = previous_lines;
         if !is_contiguous(&mapped_lines) {
-            return Ok(None);
+            return Ok(Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation));
         }
     }
 
     Ok(mapped_lines
         .first()
         .zip(mapped_lines.last())
-        .map(|(first, last)| (*first, *last)))
+        .map(|(first, last)| TranslatedSourceAnchor {
+            path,
+            first_line: *first,
+            last_line: *last,
+        })
+        .ok_or(PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranslatedSourceAnchor {
+    path: crate::repo_path::RepoPath,
+    first_line: u32,
+    last_line: u32,
 }
 
 fn translate_source_anchor_to_head(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
     anchor: &SourceCommentAnchor,
-) -> Result<Option<(u32, u32)>> {
+) -> Result<std::result::Result<TranslatedSourceAnchor, PullRequestFeedbackSkipReason>> {
     if anchor.end_line <= anchor.start_line {
-        return Ok(None);
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+        ));
     }
     if !path_exists_in_revision(repo, &anchor.revision, &anchor.path)? {
-        return Ok(None);
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+        ));
     }
 
+    let mut path = anchor.path.clone();
     let mut mapped_lines =
         (anchor.start_line.saturating_add(1)..=anchor.end_line).collect::<Vec<_>>();
     let Some(start_index) = metadata
@@ -582,17 +619,21 @@ fn translate_source_anchor_to_head(
         .iter()
         .position(|commit| commit.sha == anchor.revision)
     else {
-        return Ok(None);
+        return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
     };
 
     for pair in metadata.commits[start_index..].windows(2) {
         let current = &pair[0].sha;
         let next = &pair[1].sha;
-        if !path_exists_in_revision(repo, next, &anchor.path)? {
-            return Ok(None);
+        if !path_exists_in_revision(repo, next, &path)? {
+            let Some(renamed_path) = pure_rename_target(repo, current, next, &path)? else {
+                return Ok(Err(PullRequestFeedbackSkipReason::PathRemappingUnsupported));
+            };
+            path = renamed_path;
+            continue;
         }
         let hunks =
-            vcs::diff_hunks_for_file_in_range(repo, current.as_str(), next.as_str(), &anchor.path)?;
+            vcs::diff_hunks_for_file_in_range(repo, current.as_str(), next.as_str(), &path)?;
         if hunks.is_empty() {
             continue;
         }
@@ -601,18 +642,25 @@ fn translate_source_anchor_to_head(
             .map(|line| translate_old_line_to_new_line_strict(line, &hunks))
             .collect::<Option<Vec<_>>>()
         else {
-            return Ok(None);
+            return Ok(Err(
+                PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+            ));
         };
         mapped_lines = next_lines;
         if !is_contiguous(&mapped_lines) {
-            return Ok(None);
+            return Ok(Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation));
         }
     }
 
     Ok(mapped_lines
         .first()
         .zip(mapped_lines.last())
-        .map(|(first, last)| (*first, *last)))
+        .map(|(first, last)| TranslatedSourceAnchor {
+            path,
+            first_line: *first,
+            last_line: *last,
+        })
+        .ok_or(PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit))
 }
 
 fn translate_old_line_to_new_line_strict(
@@ -787,6 +835,102 @@ fn visible_diff_lines_for_side(
         }
     }
     lines
+}
+
+fn pure_rename_target(
+    repo: &gix::Repository,
+    start: &CommitId,
+    end: &CommitId,
+    path: &crate::repo_path::RepoPath,
+) -> Result<Option<crate::repo_path::RepoPath>> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow!("rename remapping requires a non-bare git repository"))?;
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-status",
+            "--find-renames=100%",
+            "--diff-filter=R",
+            start.as_str(),
+            end.as_str(),
+            "--",
+        ])
+        .current_dir(workdir)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git diff --name-status failed while remapping rename history: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut matches = Vec::new();
+    for line in stdout.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let [status, old_path, new_path] = fields.as_slice() else {
+            continue;
+        };
+        if *status == "R100" && *old_path == path.as_str() {
+            matches.push(crate::repo_path::RepoPath::new(*new_path)?);
+        }
+    }
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [target] => Ok(Some(target.clone())),
+        _ => Ok(None),
+    }
+}
+
+fn pure_rename_source(
+    repo: &gix::Repository,
+    start: &CommitId,
+    end: &CommitId,
+    path: &crate::repo_path::RepoPath,
+) -> Result<Option<crate::repo_path::RepoPath>> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow!("rename remapping requires a non-bare git repository"))?;
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-status",
+            "--find-renames=100%",
+            "--diff-filter=R",
+            start.as_str(),
+            end.as_str(),
+            "--",
+        ])
+        .current_dir(workdir)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git diff --name-status failed while remapping rename history: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut matches = Vec::new();
+    for line in stdout.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let [status, old_path, new_path] = fields.as_slice() else {
+            continue;
+        };
+        if *status == "R100" && *new_path == path.as_str() {
+            matches.push(crate::repo_path::RepoPath::new(*old_path)?);
+        }
+    }
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [source] => Ok(Some(source.clone())),
+        _ => Ok(None),
+    }
 }
 
 fn path_exists_in_revision(
@@ -1052,6 +1196,291 @@ mod tests {
         assert_eq!(comment.side, GitHubCommentSide::Right);
         assert_eq!(comment.start_line, None);
         assert_eq!(comment.body, "nit: rename value");
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_remaps_source_anchor_across_pure_rename() -> Result<()> {
+        let repo_root = temp_git_repo("feedback_plan_single_rename");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        fs::write(&file_path, "pub fn value() -> u32 { 1 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "pub fn value() -> u32 { 2 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update value"]);
+        let anchor_sha = commit_id_at_head(&repo_root)?;
+
+        let renamed_path = repo_root.join("src/main.rs");
+        fs::rename(&file_path, &renamed_path)?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Rename lib to main"]);
+        let head_sha = commit_id_at_head(&repo_root)?;
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha,
+            vec![
+                (anchor_sha.clone(), "Update value"),
+                (commit_id_at_head(&repo_root)?, "Rename lib to main"),
+            ],
+        );
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "rename-source",
+            &anchor_sha,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: anchor_sha.clone(),
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                start_line: 0,
+                end_line: 1,
+            })),
+            Some("rename note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert_eq!(plan.draft.comments.len(), 1);
+        let comment = &plan.draft.comments[0];
+        assert_eq!(
+            comment.path,
+            crate::repo_path::RepoPath::new("src/main.rs")?
+        );
+        assert_eq!(comment.line, 1);
+        assert_eq!(comment.side, GitHubCommentSide::Right);
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_remaps_diff_anchor_across_pure_rename() -> Result<()> {
+        let repo_root = temp_git_repo("feedback_plan_diff_rename");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        fs::write(&file_path, "pub fn value() -> u32 { 1 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "pub fn value() -> u32 { 2 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update value"]);
+        let anchor_sha = commit_id_at_head(&repo_root)?;
+
+        let renamed_path = repo_root.join("src/main.rs");
+        fs::rename(&file_path, &renamed_path)?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Rename lib to main"]);
+        let head_sha = commit_id_at_head(&repo_root)?;
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha.clone(),
+            vec![
+                (anchor_sha.clone(), "Update value"),
+                (head_sha, "Rename lib to main"),
+            ],
+        );
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "rename-diff",
+            &anchor_sha,
+            Some(CommentAnchor::Diff(DiffCommentAnchor {
+                revision: anchor_sha.clone(),
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                rows: vec![crate::store::DiffCommentAnchorRow {
+                    kind: crate::store::CommentAnchorDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                }],
+            })),
+            Some("diff rename note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert_eq!(plan.draft.comments.len(), 1);
+        assert_eq!(
+            plan.draft.comments[0].path,
+            crate::repo_path::RepoPath::new("src/main.rs")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_remaps_source_anchor_across_multiple_renames() -> Result<()>
+    {
+        let repo_root = temp_git_repo("feedback_plan_multiple_renames");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        fs::write(&file_path, "pub fn value() -> u32 { 1 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "pub fn value() -> u32 { 2 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update value"]);
+        let anchor_sha = commit_id_at_head(&repo_root)?;
+
+        let main_path = repo_root.join("src/main.rs");
+        fs::rename(&file_path, &main_path)?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Rename lib to main"]);
+        let first_rename_sha = commit_id_at_head(&repo_root)?;
+
+        let app_path = repo_root.join("src/app.rs");
+        fs::rename(&main_path, &app_path)?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Rename main to app"]);
+        let head_sha = commit_id_at_head(&repo_root)?;
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha.clone(),
+            vec![
+                (anchor_sha.clone(), "Update value"),
+                (first_rename_sha, "Rename lib to main"),
+                (head_sha, "Rename main to app"),
+            ],
+        );
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "multi-rename-source",
+            &anchor_sha,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: anchor_sha.clone(),
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                start_line: 0,
+                end_line: 1,
+            })),
+            Some("multi rename note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert_eq!(plan.draft.comments.len(), 1);
+        assert_eq!(
+            plan.draft.comments[0].path,
+            crate::repo_path::RepoPath::new("src/app.rs")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_remaps_renamed_source_anchor_then_translates_lines()
+    -> Result<()> {
+        let repo_root = temp_git_repo("feedback_plan_rename_then_lines");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        fs::write(&file_path, "fn keep() {\n    old();\n}\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "fn keep() {\n    new();\n}\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update call"]);
+        let anchor_sha = commit_id_at_head(&repo_root)?;
+
+        let renamed_path = repo_root.join("src/main.rs");
+        fs::rename(&file_path, &renamed_path)?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Rename lib to main"]);
+        let rename_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&renamed_path, "fn keep() {\n    setup();\n    new();\n}\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Insert setup"]);
+        let head_sha = commit_id_at_head(&repo_root)?;
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha.clone(),
+            vec![
+                (anchor_sha.clone(), "Update call"),
+                (rename_sha, "Rename lib to main"),
+                (head_sha, "Insert setup"),
+            ],
+        );
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "rename-line-source",
+            &anchor_sha,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: anchor_sha.clone(),
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                start_line: 1,
+                end_line: 2,
+            })),
+            Some("line note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert_eq!(plan.draft.comments.len(), 1);
+        let comment = &plan.draft.comments[0];
+        assert_eq!(
+            comment.path,
+            crate::repo_path::RepoPath::new("src/main.rs")?
+        );
+        assert_eq!(comment.line, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_skips_non_pure_rename_history() -> Result<()> {
+        let repo_root = temp_git_repo("feedback_plan_non_pure_rename");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        fs::write(&file_path, "fn keep() {\n    old();\n}\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "fn keep() {\n    new();\n}\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update call"]);
+        let anchor_sha = commit_id_at_head(&repo_root)?;
+
+        let renamed_path = repo_root.join("src/main.rs");
+        fs::rename(&file_path, &renamed_path)?;
+        fs::write(&renamed_path, "completely different\ncontent\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Rewrite while renaming"]);
+        let head_sha = commit_id_at_head(&repo_root)?;
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha.clone(),
+            vec![
+                (anchor_sha.clone(), "Update call"),
+                (head_sha, "Rewrite while renaming"),
+            ],
+        );
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "non-pure-rename-source",
+            &anchor_sha,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: anchor_sha.clone(),
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                start_line: 1,
+                end_line: 2,
+            })),
+            Some("skip note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert!(plan.draft.comments.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(
+            plan.skipped[0].reason,
+            PullRequestFeedbackSkipReason::PathRemappingUnsupported
+        );
         Ok(())
     }
 
@@ -1509,6 +1938,37 @@ mod tests {
             path: crate::repo_path::RepoPath::new("src/lib.rs")?,
             rows,
         }))
+    }
+
+    fn commit_id_at_head(repo_root: &std::path::Path) -> Result<CommitId> {
+        CommitId::new(run_git_stdout(repo_root, &["rev-parse", "HEAD"]).trim())
+    }
+
+    fn pull_request_metadata(
+        base_sha: CommitId,
+        head_sha: CommitId,
+        commits: Vec<(CommitId, &str)>,
+    ) -> PullRequestMetadata {
+        PullRequestMetadata {
+            pr: ResolvedPullRequestRef {
+                host: "github.com".to_string(),
+                owner: "jmqd".to_string(),
+                repo: "trueflow".to_string(),
+                number: 11,
+            },
+            title: "Update value".to_string(),
+            base_ref: "main".to_string(),
+            base_sha,
+            head_ref: "feature/value".to_string(),
+            head_sha,
+            commits: commits
+                .into_iter()
+                .map(|(sha, summary)| crate::github::PullRequestCommit {
+                    sha,
+                    summary: summary.to_string(),
+                })
+                .collect(),
+        }
     }
 
     fn single_commit_pull_request_fixture(
