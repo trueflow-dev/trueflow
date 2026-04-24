@@ -9,14 +9,18 @@ use crate::block::BlockKind;
 use crate::commands::mark;
 use crate::commands::review::{
     BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewRequest, ReviewSummary,
-    ReviewTarget, collect_review, expand_cli_review_targets, resolve_review_request,
+    ReviewTarget, RevisionExpr, collect_review, expand_cli_review_targets, resolve_review_request,
     review_request_from_cli_targets,
 };
 use crate::config::{
-    BatchConfirmPolicy, BlockFilters, TuiConfig, TuiDiffFocusMode, TuiDiffLineNumbers,
-    TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
+    BatchConfirmPolicy, BlockFilters, TrueflowConfig, TuiConfig, TuiDiffFocusMode,
+    TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
 use crate::context::TrueflowContext;
+use crate::github::{
+    GhGitHubClient, PullRequestCommit, PullRequestMetadata, PullRequestRef,
+    prepare_pull_request_review,
+};
 use crate::hashing::hash_str;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
@@ -26,12 +30,15 @@ use crate::review_order::{ReviewAnchor, ReviewOrder};
 use crate::review_scope::{DiffQuery, ScopeOption, ScopePreset, default_scope_options};
 use crate::review_session;
 use crate::review_speedread::PlaybackState;
-use crate::store::{FileStore, ReviewCheck, ReviewTargetKind, Verdict};
+use crate::store::{
+    CommentAnchor, CommentAnchorDiffLineKind, DiffCommentAnchor, DiffCommentAnchorRow, FileStore,
+    ReviewCheck, ReviewTargetKind, SourceCommentAnchor, Verdict,
+};
 use crate::sub_splitter;
-use crate::targets::workdir_prefix_from_git_root;
+use crate::targets::{extract_pull_request_target, workdir_prefix_from_git_root};
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
@@ -45,7 +52,7 @@ use ratatui::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -795,16 +802,29 @@ enum ContentFrameCacheVariant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum CommentAnchorRowCapture {
+    SourceLine { line_index: usize },
+    DiffRow { row: DiffCommentAnchorRow },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CommentContextRow {
-    line_index: usize,
+    scope_line_index: usize,
     text: String,
     display_row_range: std::ops::Range<usize>,
+    anchor: CommentAnchorRowCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VisibleCommentCapture {
     scope: crate::store::CommentScope,
     context: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommentAnchorSelection {
+    Source { start_line: u32, end_line: u32 },
+    Diff { rows: Vec<DiffCommentAnchorRow> },
 }
 
 #[derive(Clone)]
@@ -864,15 +884,47 @@ pub fn run(
     only: &[BlockKind],
     exclude: &[BlockKind],
 ) -> Result<()> {
-    let mut session = TerminalSession::enter()?;
     let config = load_config()?;
-    let run_result = (|| {
-        let scan_options = config.scan.resolve_options();
-        let filters = config.review.resolve_filters(only, exclude);
-        let mut pending_cli_request = cli_review_request(all, target, since, only, exclude)?;
+    let scan_options = config.scan.resolve_options();
+    let filters = config.review.resolve_filters(only, exclude);
 
+    if let Some(pull_request) = resolve_pull_request_target_for_tui(all, target, since)? {
+        return run_pull_request_review(
+            context,
+            &config,
+            &scan_options,
+            &filters,
+            &pull_request,
+            only,
+            exclude,
+        );
+    }
+
+    let pending_cli_requests = cli_review_request(all, target, since, only, exclude)?
+        .into_iter()
+        .collect::<VecDeque<_>>();
+    run_tui_review_loop(
+        context,
+        &config,
+        &scan_options,
+        &filters,
+        pending_cli_requests,
+        true,
+    )
+}
+
+fn run_tui_review_loop(
+    context: &TrueflowContext,
+    config: &TrueflowConfig,
+    scan_options: &crate::scanner::ScanOptions,
+    filters: &BlockFilters,
+    mut pending_cli_requests: VecDeque<CliReviewRequest>,
+    allow_scope_selector: bool,
+) -> Result<()> {
+    let mut session = TerminalSession::enter()?;
+    let run_result = (|| {
         loop {
-            let launch = if let Some(request) = pending_cli_request.take() {
+            let launch = if let Some(request) = pending_cli_requests.pop_front() {
                 let review = {
                     let query = resolve_review_request(
                         request.request,
@@ -886,11 +938,11 @@ pub fn run(
                     review,
                     scope_label: request.scope_label,
                 }
-            } else {
+            } else if allow_scope_selector {
                 let LoadedScopeSelector {
                     selector,
                     status_poller,
-                } = load_scope_selector(&filters, &scan_options)?;
+                } = load_scope_selector(filters, scan_options)?;
                 let selection = run_scope_selector(
                     session.terminal_mut(),
                     selector,
@@ -900,7 +952,7 @@ pub fn run(
                 match selection {
                     ScopeSelection::Quit => return Ok(()),
                     ScopeSelection::Selected(scope) => {
-                        let review = load_review_state(&scope, &filters, &scan_options)?;
+                        let review = load_review_state(&scope, filters, scan_options)?;
                         LaunchSelection {
                             scope_label: scope.label(),
                             scope,
@@ -908,6 +960,8 @@ pub fn run(
                         }
                     }
                 }
+            } else {
+                return Ok(());
             };
 
             let state = build_review_state(
@@ -928,7 +982,9 @@ pub fn run(
             match run_app(context, &mut session, state)? {
                 AppExit::Quit => return Ok(()),
                 AppExit::ReviewSomethingElse => {
-                    pending_cli_request = None;
+                    if pending_cli_requests.is_empty() && !allow_scope_selector {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -942,6 +998,149 @@ pub fn run(
             "{primary:#}\nterminal restore also failed: {restore:#}"
         )),
     }
+}
+
+fn resolve_pull_request_target_for_tui(
+    all: bool,
+    target: &[ReviewTarget],
+    since: Option<&str>,
+) -> Result<Option<PullRequestRef>> {
+    let targets = expand_cli_review_targets(target, since)?;
+    let _ = review_request_from_cli_targets(all, &targets)?;
+    Ok(extract_pull_request_target(&targets)?.cloned())
+}
+
+fn run_pull_request_review(
+    context: &TrueflowContext,
+    config: &TrueflowConfig,
+    scan_options: &crate::scanner::ScanOptions,
+    filters: &BlockFilters,
+    pull_request: &PullRequestRef,
+    _only: &[BlockKind],
+    _exclude: &[BlockKind],
+) -> Result<()> {
+    let repo_root = vcs::git_root_from_workdir()?
+        .ok_or_else(|| anyhow!("git repository required for pull request review targets"))?;
+    let client = GhGitHubClient;
+    let prepared = prepare_pull_request_review(&repo_root, pull_request, &client)?;
+    let pending_cli_requests = build_pull_request_cli_requests(&prepared.metadata)?;
+    run_tui_review_loop(
+        context,
+        config,
+        scan_options,
+        filters,
+        pending_cli_requests,
+        false,
+    )
+}
+
+fn build_pull_request_cli_requests(
+    metadata: &PullRequestMetadata,
+) -> Result<VecDeque<CliReviewRequest>> {
+    if metadata.commits.is_empty() {
+        return Err(anyhow!(
+            "Pull request {} has no commits to review",
+            metadata.pr.number
+        ));
+    }
+
+    metadata
+        .commits
+        .iter()
+        .enumerate()
+        .map(|(index, commit)| pull_request_cli_review_request(metadata, index, commit))
+        .collect()
+}
+
+fn pull_request_cli_review_request(
+    metadata: &PullRequestMetadata,
+    index: usize,
+    commit: &PullRequestCommit,
+) -> Result<CliReviewRequest> {
+    let revision = RevisionExpr::new(commit.sha.as_str())?;
+    let request = ReviewRequest::Targets(vec![ReviewTarget::Revision(revision.clone())]);
+    let scope = ScopePreset::Commit {
+        id: revision.as_str().to_string(),
+        summary: commit.summary.clone(),
+    };
+    let scope_label = pull_request_scope_label(metadata, index, commit);
+    Ok(CliReviewRequest {
+        request,
+        scope,
+        scope_label,
+    })
+}
+
+fn pull_request_scope_label(
+    metadata: &PullRequestMetadata,
+    index: usize,
+    commit: &PullRequestCommit,
+) -> String {
+    let pr_title = truncate_scope_text(&metadata.title, 28);
+    let commit_summary = truncate_scope_text(&commit.summary, 40);
+    let short_sha = short_commit_id(commit.sha.as_str());
+    if pr_title.is_empty() && commit_summary.is_empty() {
+        format!(
+            "PR #{} [{}/{}] {}",
+            metadata.pr.number,
+            index + 1,
+            metadata.commits.len(),
+            short_sha
+        )
+    } else if commit_summary.is_empty() {
+        format!(
+            "PR #{} {} [{}/{}] {}",
+            metadata.pr.number,
+            pr_title,
+            index + 1,
+            metadata.commits.len(),
+            short_sha
+        )
+    } else if pr_title.is_empty() {
+        format!(
+            "PR #{} [{}/{}] {} {}",
+            metadata.pr.number,
+            index + 1,
+            metadata.commits.len(),
+            short_sha,
+            commit_summary
+        )
+    } else {
+        format!(
+            "PR #{} {} [{}/{}] {} {}",
+            metadata.pr.number,
+            pr_title,
+            index + 1,
+            metadata.commits.len(),
+            short_sha,
+            commit_summary
+        )
+    }
+}
+
+fn short_commit_id(id: &str) -> String {
+    id.chars().take(7).collect()
+}
+
+fn truncate_scope_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if max_chars == 0 || trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let cutoff = max_chars.saturating_sub(3).max(1);
+    let mut out = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx >= cutoff {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 fn cli_review_request(
@@ -2692,7 +2891,7 @@ where
     } else {
         compute_next_review_target(state, node_id)
     };
-    let params = mark_params_for_action(state, node_id, verdict.clone(), note);
+    let params = mark_params_for_action(state, node_id, verdict.clone(), note)?;
     run_mark(params)?;
 
     let impact = apply_action_locally(state, node_id, &verdict, next_id);
@@ -2701,11 +2900,11 @@ where
 }
 
 fn mark_params_for_action(
-    state: &AppState,
+    state: &mut AppState,
     node_id: TreeNodeId,
     verdict: Verdict,
     note: Option<String>,
-) -> mark::MarkParams {
+) -> Result<mark::MarkParams> {
     let node = state.navigator.tree.node(node_id);
     let (fingerprint, target_kind) = fingerprint_and_target_kind_for_node(node);
 
@@ -2731,7 +2930,14 @@ fn mark_params_for_action(
                 .map(|capture| capture.scope.start_line)
         });
 
-    mark::MarkParams {
+    let comment_anchor =
+        if matches!(verdict, Verdict::Comment) && node_id == state.navigator.current_id() {
+            comment_anchor_for_current_action(state, node_id, path_hint.as_ref())?
+        } else {
+            None
+        };
+
+    Ok(mark::MarkParams {
         fingerprint,
         target_kind: Some(target_kind),
         verdict,
@@ -2741,6 +2947,65 @@ fn mark_params_for_action(
         line: line_hint,
         comment_scope: scoped_comment.as_ref().map(|capture| capture.scope.clone()),
         comment_context: scoped_comment.map(|capture| capture.context),
+        comment_anchor,
+    })
+}
+
+fn comment_anchor_for_current_action(
+    state: &mut AppState,
+    node_id: TreeNodeId,
+    path_hint: Option<&RepoPath>,
+) -> Result<Option<CommentAnchor>> {
+    let Some(path) = path_hint.cloned() else {
+        return Ok(None);
+    };
+    let Some(revision) = review_scope_revision(state)? else {
+        return Ok(None);
+    };
+
+    let node = state.navigator.tree.node(node_id);
+    let snapshot = ContentNodeSnapshot::from_node(node);
+    let content = build_content_lines(
+        state,
+        &snapshot,
+        &UiPalette::default(),
+        state.code_rect.height.max(1),
+        state.code_rect.width.max(1),
+    );
+    let Some(selection) = comment_anchor_selection_for_content(
+        &content,
+        state.scroll_offset,
+        state.viewport_height,
+        state.content_height,
+    ) else {
+        return Ok(None);
+    };
+
+    Ok(Some(match selection {
+        CommentAnchorSelection::Source {
+            start_line,
+            end_line,
+        } => CommentAnchor::Source(SourceCommentAnchor {
+            revision,
+            path,
+            start_line,
+            end_line,
+        }),
+        CommentAnchorSelection::Diff { rows } => CommentAnchor::Diff(DiffCommentAnchor {
+            revision,
+            path,
+            rows,
+        }),
+    }))
+}
+
+fn review_scope_revision(state: &AppState) -> Result<Option<crate::store::CommitId>> {
+    match &state.review_scope {
+        ScopePreset::Commit { id, .. } => Ok(Some(crate::store::CommitId::new(id)?)),
+        ScopePreset::RevisionRange { end, .. } => Ok(Some(crate::store::CommitId::new(end)?)),
+        ScopePreset::All | ScopePreset::MainDiff => {
+            Ok(vcs::snapshot_from_workdir().repo_ref_revision)
+        }
     }
 }
 
@@ -3279,33 +3544,134 @@ fn visible_comment_capture_for_content(
         return None;
     }
 
-    let comment_rows = content.comment_rows.as_ref()?;
-    let visible_start = usize::from(scroll_offset);
-    let visible_end = visible_start
-        .saturating_add(usize::from(viewport_height))
-        .min(usize::from(content_height));
-    let visible_range = visible_start..visible_end;
-    let selected_rows = comment_rows
-        .iter()
-        .filter(|row| {
-            row.display_row_range.start < visible_range.end
-                && row.display_row_range.end > visible_range.start
-        })
-        .collect::<Vec<_>>();
-    let first_row = selected_rows.first()?;
-    let last_row = selected_rows.last()?;
+    let selected_rows = selected_comment_rows(
+        content,
+        scroll_offset,
+        viewport_height,
+        content_height,
+        CommentRowSelectionMode::VisibleOnly,
+    )?;
+    let (start_line, end_line) = selected_scope_lines(&selected_rows)?;
 
     Some(VisibleCommentCapture {
         scope: crate::store::CommentScope {
-            start_line: usize_to_u32_saturating(first_row.line_index),
-            end_line: usize_to_u32_saturating(last_row.line_index.saturating_add(1)),
+            start_line,
+            end_line,
         },
         context: selected_rows
-            .into_iter()
+            .iter()
             .map(|row| row.text.clone())
             .collect::<Vec<_>>()
             .join("\n"),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentRowSelectionMode {
+    VisibleOnly,
+    VisibleOrAll,
+}
+
+fn comment_anchor_selection_for_content(
+    content: &BuiltContent,
+    scroll_offset: u16,
+    viewport_height: u16,
+    content_height: u16,
+) -> Option<CommentAnchorSelection> {
+    let selected_rows = selected_comment_rows(
+        content,
+        scroll_offset,
+        viewport_height,
+        content_height,
+        CommentRowSelectionMode::VisibleOrAll,
+    )?;
+
+    let source_scope = selected_source_scope(&selected_rows);
+    if let Some((start_line, end_line)) = source_scope {
+        return Some(CommentAnchorSelection::Source {
+            start_line,
+            end_line,
+        });
+    }
+
+    let diff_rows = selected_rows
+        .iter()
+        .map(|row| match &row.anchor {
+            CommentAnchorRowCapture::DiffRow { row } => Some(row.clone()),
+            CommentAnchorRowCapture::SourceLine { .. } => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(CommentAnchorSelection::Diff { rows: diff_rows })
+}
+
+fn selected_comment_rows(
+    content: &BuiltContent,
+    scroll_offset: u16,
+    viewport_height: u16,
+    content_height: u16,
+    mode: CommentRowSelectionMode,
+) -> Option<Vec<CommentContextRow>> {
+    let comment_rows = content.comment_rows.as_ref()?;
+    let selected_range = if matches!(mode, CommentRowSelectionMode::VisibleOrAll)
+        && content_height <= viewport_height
+    {
+        0..usize::from(content_height)
+    } else {
+        let visible_start = usize::from(scroll_offset);
+        let visible_end = visible_start
+            .saturating_add(usize::from(viewport_height))
+            .min(usize::from(content_height));
+        visible_start..visible_end
+    };
+
+    let selected_rows = comment_rows
+        .iter()
+        .filter(|row| {
+            row.display_row_range.start < selected_range.end
+                && row.display_row_range.end > selected_range.start
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!selected_rows.is_empty()).then_some(selected_rows)
+}
+
+fn selected_scope_lines(selected_rows: &[CommentContextRow]) -> Option<(u32, u32)> {
+    let mut line_indices = selected_rows
+        .iter()
+        .map(|row| row.scope_line_index)
+        .collect::<Vec<_>>();
+    line_indices.sort_unstable();
+    let start_line = *line_indices.first()?;
+    let end_line = line_indices.last()?.saturating_add(1);
+    Some((
+        usize_to_u32_saturating(start_line),
+        usize_to_u32_saturating(end_line),
+    ))
+}
+
+fn selected_source_scope(selected_rows: &[CommentContextRow]) -> Option<(u32, u32)> {
+    let mut line_indices = selected_rows
+        .iter()
+        .map(|row| match row.anchor {
+            CommentAnchorRowCapture::SourceLine { line_index } => Some(line_index),
+            CommentAnchorRowCapture::DiffRow { .. } => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    line_indices.sort_unstable();
+    let start_line = *line_indices.first()?;
+    let end_line = line_indices.last()?.saturating_add(1);
+    Some((
+        usize_to_u32_saturating(start_line),
+        usize_to_u32_saturating(end_line),
+    ))
+}
+
+fn comment_anchor_diff_line_kind(kind: vcs::DiffLineKind) -> CommentAnchorDiffLineKind {
+    match kind {
+        vcs::DiffLineKind::Context => CommentAnchorDiffLineKind::Context,
+        vcs::DiffLineKind::Added => CommentAnchorDiffLineKind::Added,
+        vcs::DiffLineKind::Removed => CommentAnchorDiffLineKind::Removed,
+    }
 }
 
 fn build_speed_read_lines(
@@ -4200,9 +4566,12 @@ fn source_comment_rows(
         .iter()
         .enumerate()
         .map(|(index, text)| CommentContextRow {
-            line_index: start_line.saturating_add(index),
+            scope_line_index: start_line.saturating_add(index),
             text: text.clone(),
             display_row_range: row_prefixes[index]..row_prefixes[index.saturating_add(1)],
+            anchor: CommentAnchorRowCapture::SourceLine {
+                line_index: start_line.saturating_add(index),
+            },
         })
         .collect()
 }
@@ -4646,13 +5015,20 @@ fn build_diff_context_content(
                             is_focus: false,
                         };
                         CommentContextRow {
-                            line_index: row.anchor_index,
+                            scope_line_index: row.anchor_index,
                             text: format_diff_overlay_row_for_width(
                                 &diff_line,
                                 state.diff_line_numbers,
                                 code_width,
                             ),
                             display_row_range: display_row_range.clone(),
+                            anchor: CommentAnchorRowCapture::DiffRow {
+                                row: DiffCommentAnchorRow {
+                                    kind: comment_anchor_diff_line_kind(row.kind),
+                                    old_line: row.old_line,
+                                    new_line: row.new_line,
+                                },
+                            },
                         }
                     })
                     .collect::<Vec<_>>(),
@@ -4732,13 +5108,20 @@ fn build_deleted_block_diff_content(
                     wrap_diff_overlay_row(&diff_line, style, code_width, state.diff_line_numbers)
                         .len();
                 let row = CommentContextRow {
-                    line_index: block.start_line.saturating_add(offset),
+                    scope_line_index: block.start_line.saturating_add(offset),
                     text: format_diff_overlay_row_for_width(
                         &diff_line,
                         state.diff_line_numbers,
                         code_width,
                     ),
                     display_row_range: *display_start..display_start.saturating_add(row_line_count),
+                    anchor: CommentAnchorRowCapture::DiffRow {
+                        row: DiffCommentAnchorRow {
+                            kind: CommentAnchorDiffLineKind::Removed,
+                            old_line: diff_line.old_line,
+                            new_line: diff_line.new_line,
+                        },
+                    },
                 };
                 *display_start = display_start.saturating_add(row_line_count);
                 Some(row)
@@ -6797,6 +7180,80 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn resolve_pull_request_target_for_tui_accepts_single_pr_target() {
+        let pull_request = resolve_pull_request_target_for_tui(
+            false,
+            &[ReviewTarget::from_cli("pr:11").unwrap()],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("expected pull request target: {error}"));
+        assert_eq!(pull_request, Some(PullRequestRef::Number { number: 11 }));
+    }
+
+    #[test]
+    fn resolve_pull_request_target_for_tui_rejects_pr_target_with_all() {
+        let err = resolve_pull_request_target_for_tui(
+            true,
+            &[ReviewTarget::from_cli("pr:11").unwrap()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Explicit review targets cannot be combined with --all")
+        );
+    }
+
+    #[test]
+    fn build_pull_request_cli_requests_orders_commits_oldest_to_newest() {
+        let metadata = crate::github::PullRequestMetadata {
+            pr: crate::github::ResolvedPullRequestRef {
+                host: "github.com".to_string(),
+                owner: "jmqd".to_string(),
+                repo: "trueflow".to_string(),
+                number: 11,
+            },
+            title: "Add PR review support".to_string(),
+            base_ref: "main".to_string(),
+            base_sha: CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+            head_ref: "feature/pr-review".to_string(),
+            head_sha: CommitId::new("3333333333333333333333333333333333333333").unwrap(),
+            commits: vec![
+                crate::github::PullRequestCommit {
+                    sha: CommitId::new("2222222222222222222222222222222222222222").unwrap(),
+                    summary: "Seed review flow".to_string(),
+                },
+                crate::github::PullRequestCommit {
+                    sha: CommitId::new("3333333333333333333333333333333333333333").unwrap(),
+                    summary: "Fetch PR refs".to_string(),
+                },
+            ],
+        };
+
+        let requests = build_pull_request_cli_requests(&metadata)
+            .unwrap_or_else(|error| panic!("expected pull request review sequence: {error}"));
+        let requests = requests.into_iter().collect::<Vec<_>>();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].request,
+            ReviewRequest::Targets(vec![ReviewTarget::Revision(
+                RevisionExpr::new("2222222222222222222222222222222222222222").unwrap()
+            )])
+        );
+        assert_eq!(
+            requests[1].request,
+            ReviewRequest::Targets(vec![ReviewTarget::Revision(
+                RevisionExpr::new("3333333333333333333333333333333333333333").unwrap()
+            )])
+        );
+        assert!(requests[0].scope_label.contains("PR #11"));
+        assert!(requests[0].scope_label.contains("[1/2]"));
+        assert!(requests[1].scope_label.contains("[2/2]"));
+        assert!(requests[1].scope_label.contains("Fetch PR refs"));
+    }
+
+    #[test]
     fn cli_review_request_since_uses_revision_range_scope() {
         let request =
             cli_review_request_with(false, &[], Some("HEAD"), &[], &[], |all, target, since| {
@@ -8344,6 +8801,133 @@ mod diff_scope_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(capture.context, expected);
+    }
+
+    #[test]
+    fn mark_params_for_action_persists_source_comment_anchor_for_visible_source_block() {
+        let file_path = temp_test_file_path("tui_source_comment_anchor");
+        let file_content = "fn demo() {\n    alpha();\n    beta();\n}\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 4);
+        state.review_scope = ScopePreset::Commit {
+            id: "1111111111111111111111111111111111111111".to_string(),
+            summary: String::new(),
+        };
+        state.view_mode = ViewMode::Source;
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+        let content = build_block_lines(&mut state, &snapshot, &palette, 20, 80);
+        state.content_height = usize_to_u16_saturating(content.total_lines);
+        state.viewport_height = 20;
+
+        let params = mark_params_for_action(
+            &mut state,
+            block_id,
+            Verdict::Comment,
+            Some("note".to_string()),
+        )
+        .unwrap_or_else(|error| panic!("expected source comment params: {error}"));
+
+        assert!(params.comment_scope.is_none());
+        assert!(params.comment_context.is_none());
+        assert_eq!(
+            params.comment_anchor,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: crate::store::CommitId::new("1111111111111111111111111111111111111111")
+                    .unwrap(),
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                start_line: 0,
+                end_line: 4,
+            }))
+        );
+    }
+
+    #[test]
+    fn mark_params_for_action_persists_diff_comment_anchor_rows() {
+        let file_path = temp_test_file_path("tui_diff_comment_anchor");
+        let block_content = "fn demo() {\n    new();\n}\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, block_content, block_content, 0, 3);
+        state.review_scope = ScopePreset::Commit {
+            id: "2222222222222222222222222222222222222222".to_string(),
+            summary: String::new(),
+        };
+        state.view_mode = ViewMode::Diff;
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::context("fn demo() {\n"),
+                        vcs::DiffHunkLine::removed("    old();\n"),
+                        vcs::DiffHunkLine::added("    new();\n"),
+                        vcs::DiffHunkLine::context("}\n"),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+        let content = build_block_lines(&mut state, &snapshot, &palette, 20, 80);
+        state.content_height = usize_to_u16_saturating(content.total_lines);
+        state.viewport_height = 20;
+
+        let params = mark_params_for_action(
+            &mut state,
+            block_id,
+            Verdict::Comment,
+            Some("note".to_string()),
+        )
+        .unwrap_or_else(|error| panic!("expected diff comment params: {error}"));
+
+        assert_eq!(
+            params.comment_anchor,
+            Some(CommentAnchor::Diff(DiffCommentAnchor {
+                revision: crate::store::CommitId::new("2222222222222222222222222222222222222222")
+                    .unwrap(),
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                rows: vec![
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Context,
+                        old_line: Some(1),
+                        new_line: Some(1),
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(2),
+                        new_line: None,
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(2),
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Context,
+                        old_line: Some(3),
+                        new_line: Some(3),
+                    },
+                ],
+            }))
+        );
     }
 
     #[test]

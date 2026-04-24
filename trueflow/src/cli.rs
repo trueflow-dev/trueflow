@@ -5,6 +5,7 @@ use crate::build_info;
 use crate::commands::feedback::FeedbackFormat;
 use crate::commands::review::ReviewTarget;
 use crate::feedback_since::FeedbackSinceExpr;
+use crate::github::PullRequestRef;
 use crate::logging::LoggingMode;
 use crate::repo_path::RepoPath;
 use crate::store::{ReviewCheck, Verdict};
@@ -72,6 +73,10 @@ pub enum Commands {
         #[arg(long, hide = true)]
         comment_context: Option<String>,
 
+        /// Internal serialized comment anchor JSON
+        #[arg(long, hide = true)]
+        comment_anchor_json: Option<String>,
+
         /// Suppress output for UI usage
         #[arg(long)]
         quiet: bool,
@@ -123,6 +128,18 @@ pub enum Commands {
         /// Only include records since this point ("all", "last", relative durations like "1h", unix ts, or RFC3339)
         #[arg(long)]
         since: Option<FeedbackSinceExpr>,
+
+        /// Post feedback to a pull request such as `pr:11` or `https://github.com/owner/repo/pull/11`
+        #[arg(long, value_name = "PR", conflicts_with = "target")]
+        pr: Option<PullRequestRef>,
+
+        /// Print the pull request review plan without posting it. Requires `--pr`.
+        #[arg(long, requires = "pr")]
+        dry_run: bool,
+
+        /// Open the posted pending review in a browser. Requires `--pr` and conflicts with `--dry-run`.
+        #[arg(long, requires = "pr", conflicts_with = "dry_run")]
+        open: bool,
 
         /// Feedback targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
         #[arg(long, value_name = "TARGET")]
@@ -204,7 +221,9 @@ mod tests {
     use crate::commands::feedback::FeedbackFormat;
     use crate::commands::review::{ReviewTarget, RevisionExpr};
     use crate::feedback_since::FeedbackSinceExpr;
+    use crate::github::PullRequestRef;
     use crate::repo_path::RepoPath;
+    use crate::store::CommentAnchor;
     use crate::store::{ReviewCheck, Verdict};
     use chrono::DateTime;
     use clap::{CommandFactory, Parser};
@@ -343,6 +362,9 @@ mod tests {
             Commands::Feedback {
                 format,
                 since,
+                pr,
+                dry_run,
+                open,
                 target,
                 include_approved,
                 only,
@@ -350,6 +372,9 @@ mod tests {
             } => {
                 assert_eq!(format, FeedbackFormat::Json);
                 assert_eq!(since, Some(FeedbackSinceExpr::new("last").unwrap()));
+                assert!(pr.is_none());
+                assert!(!dry_run);
+                assert!(!open);
                 assert!(target.is_empty());
                 assert!(!include_approved);
                 assert!(only.is_empty());
@@ -373,7 +398,16 @@ mod tests {
         ]);
 
         match cli.command {
-            Commands::Feedback { target, .. } => {
+            Commands::Feedback {
+                pr,
+                dry_run,
+                open,
+                target,
+                ..
+            } => {
+                assert!(pr.is_none());
+                assert!(!dry_run);
+                assert!(!open);
                 assert_eq!(
                     target,
                     vec![
@@ -384,6 +418,91 @@ mod tests {
                 );
             }
             _ => panic!("expected feedback command"),
+        }
+    }
+
+    #[test]
+    fn feedback_command_parses_pull_request_mode() {
+        let cli = Cli::parse_from(["trueflow", "feedback", "--pr", "pr:11", "--dry-run"]);
+
+        match cli.command {
+            Commands::Feedback {
+                format,
+                since,
+                pr,
+                dry_run,
+                open,
+                target,
+                include_approved,
+                only,
+                exclude,
+            } => {
+                assert_eq!(format, FeedbackFormat::Xml);
+                assert!(since.is_none());
+                assert_eq!(pr, Some(PullRequestRef::Number { number: 11 }));
+                assert!(dry_run);
+                assert!(!open);
+                assert!(target.is_empty());
+                assert!(!include_approved);
+                assert!(only.is_empty());
+                assert!(exclude.is_empty());
+            }
+            _ => panic!("expected feedback command"),
+        }
+    }
+
+    #[test]
+    fn feedback_command_rejects_target_when_pr_is_present() {
+        let err = match Cli::try_parse_from([
+            "trueflow", "feedback", "--pr", "pr:11", "--target", "dir:src",
+        ]) {
+            Ok(_) => panic!("expected clap to reject mixed feedback target modes"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("cannot be used with '--target <TARGET>'"));
+    }
+
+    #[test]
+    fn feedback_command_parses_open_pull_request_mode() {
+        let cli = Cli::parse_from(["trueflow", "feedback", "--pr", "pr:11", "--open"]);
+
+        match cli.command {
+            Commands::Feedback {
+                pr, dry_run, open, ..
+            } => {
+                assert_eq!(pr, Some(PullRequestRef::Number { number: 11 }));
+                assert!(!dry_run);
+                assert!(open);
+            }
+            _ => panic!("expected feedback command"),
+        }
+    }
+
+    #[test]
+    fn tui_command_parses_pull_request_target() {
+        let cli = Cli::parse_from(["trueflow", "tui", "--target", "pr:11"]);
+
+        match cli.command {
+            Commands::Tui {
+                all,
+                target,
+                since,
+                only,
+                exclude,
+            } => {
+                assert!(!all);
+                assert_eq!(
+                    target,
+                    vec![ReviewTarget::PullRequest(PullRequestRef::Number {
+                        number: 11
+                    })]
+                );
+                assert!(since.is_none());
+                assert!(only.is_empty());
+                assert!(exclude.is_empty());
+            }
+            _ => panic!("expected tui command"),
         }
     }
 
@@ -583,6 +702,37 @@ mod tests {
             err.to_string()
                 .contains("repo path contains invalid segment")
         );
+    }
+
+    #[test]
+    fn mark_command_parses_hidden_comment_anchor_json() {
+        let comment_anchor =
+            serde_json::to_string(&CommentAnchor::Source(crate::store::SourceCommentAnchor {
+                revision: crate::store::CommitId::new("1111111111111111111111111111111111111111")
+                    .unwrap(),
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                start_line: 1,
+                end_line: 3,
+            }))
+            .unwrap();
+        let cli = Cli::parse_from([
+            "trueflow",
+            "mark",
+            "--fingerprint",
+            "abc1234",
+            "--comment-anchor-json",
+            &comment_anchor,
+        ]);
+
+        match cli.command {
+            Commands::Mark {
+                comment_anchor_json,
+                ..
+            } => {
+                assert_eq!(comment_anchor_json, Some(comment_anchor));
+            }
+            _ => panic!("expected mark command"),
+        }
     }
 
     #[test]

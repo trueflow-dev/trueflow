@@ -29,6 +29,7 @@ fn main() -> Result<()> {
             comment_scope_start,
             comment_scope_end,
             comment_context,
+            comment_anchor_json,
             quiet: _,
         } => commands::mark::run(
             &context,
@@ -47,6 +48,10 @@ fn main() -> Result<()> {
                     },
                 ),
                 comment_context: comment_context.clone(),
+                comment_anchor: comment_anchor_json
+                    .as_ref()
+                    .map(|value| serde_json::from_str::<trueflow::store::CommentAnchor>(value))
+                    .transpose()?,
             },
         ),
         Commands::Check => commands::check::run(&context),
@@ -73,18 +78,26 @@ fn main() -> Result<()> {
         Commands::Feedback {
             format,
             since,
+            pr,
+            dry_run,
+            open,
             target,
             include_approved,
             only,
             exclude,
         } => commands::feedback::run(
             &context,
-            *format,
-            since.as_ref(),
-            target,
-            *include_approved,
-            only,
-            exclude,
+            commands::feedback::FeedbackParams {
+                format: *format,
+                since: since.as_ref(),
+                pr: pr.as_ref(),
+                dry_run: *dry_run,
+                open: *open,
+                targets: target,
+                include_approved: *include_approved,
+                only,
+                exclude,
+            },
         ),
         Commands::Inspect {
             fingerprint,

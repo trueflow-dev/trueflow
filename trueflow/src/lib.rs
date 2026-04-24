@@ -16,6 +16,8 @@ pub mod coverage;
 pub(crate) mod feedback_export;
 pub mod feedback_since;
 pub mod finder;
+pub mod github;
+pub mod github_delivery;
 pub mod hashing;
 pub(crate) mod languages;
 pub mod logging;

@@ -3,8 +3,9 @@ use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::scanner::ScanOptions;
 use crate::store::{
-    Attestation, AttestationKind, BlockState, Canonicalization, CommentScope, FileStore, Identity,
-    Record, RepoRef, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem, Verdict,
+    Attestation, AttestationKind, BlockState, Canonicalization, CommentAnchor, CommentScope,
+    FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem,
+    Verdict,
 };
 use crate::tree::{self, TreeNodeKind};
 use crate::vcs;
@@ -73,6 +74,7 @@ pub struct MarkParams {
     pub line: Option<u32>,
     pub comment_scope: Option<CommentScope>,
     pub comment_context: Option<String>,
+    pub comment_anchor: Option<CommentAnchor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +139,7 @@ fn normalize_path_hint_from_workdir(path: Option<RepoPath>) -> Option<RepoPath> 
 
 pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
     info!(
-        "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?}, comment_scope={:?}, comment_context_present={})",
+        "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?}, comment_scope={:?}, comment_context_present={}, comment_anchor_present={})",
         &params.fingerprint,
         &params.verdict,
         &params.check,
@@ -145,7 +147,8 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         params.path.as_ref().map(RepoPath::as_str),
         params.line,
         params.comment_scope,
-        params.comment_context.is_some()
+        params.comment_context.is_some(),
+        params.comment_anchor.is_some()
     );
     let store = FileStore::new()?;
 
@@ -183,6 +186,7 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         line,
         comment_scope,
         comment_context,
+        comment_anchor,
     } = params;
 
     let path_hint = normalize_path_hint_from_workdir(path);
@@ -210,6 +214,7 @@ pub fn run(_context: &TrueflowContext, params: MarkParams) -> Result<()> {
         note,
         comment_scope,
         comment_context,
+        comment_anchor,
         tags: None,
         attestations: None,
     };

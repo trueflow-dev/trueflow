@@ -17,7 +17,7 @@ use crate::vcs;
 
 const TRUEFLOW_DIR: &str = ".trueflow";
 const DB_FILE: &str = "reviews.jsonl";
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(tag = "type")]
@@ -217,6 +217,50 @@ pub struct CommentScope {
     pub end_line: u32,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(deny_unknown_fields)]
+pub enum CommentAnchorDiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct SourceCommentAnchor {
+    pub revision: CommitId,
+    pub path: RepoPath,
+    #[schemars(range(min = 0))]
+    pub start_line: u32,
+    #[schemars(range(min = 0))]
+    pub end_line: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DiffCommentAnchorRow {
+    pub kind: CommentAnchorDiffLineKind,
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DiffCommentAnchor {
+    pub revision: CommitId,
+    pub path: RepoPath,
+    pub rows: Vec<DiffCommentAnchorRow>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[schemars(deny_unknown_fields)]
+pub enum CommentAnchor {
+    Source(SourceCommentAnchor),
+    Diff(DiffCommentAnchor),
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Record {
@@ -236,6 +280,8 @@ pub struct Record {
     pub note: Option<String>,
     pub comment_scope: Option<CommentScope>,
     pub comment_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_anchor: Option<CommentAnchor>,
     #[schemars(inner(length(min = 1)))]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,8 +324,49 @@ struct SignableRecordV3<'a> {
     tags: &'a Option<Vec<String>>,
 }
 
+#[derive(Serialize)]
+struct SignableRecordV4<'a> {
+    id: &'a str,
+    version: u32,
+    target: &'a ReviewTargetRef,
+    check: &'a ReviewCheck,
+    verdict: &'a Verdict,
+    identity: &'a Identity,
+    repo_ref: &'a RepoRef,
+    block_state: &'a BlockState,
+    timestamp: i64,
+    path_hint: &'a Option<RepoPath>,
+    line_hint: &'a Option<u32>,
+    note: &'a Option<String>,
+    comment_scope: &'a Option<CommentScope>,
+    comment_context: &'a Option<String>,
+    comment_anchor: &'a Option<CommentAnchor>,
+    tags: &'a Option<Vec<String>>,
+}
+
 impl Record {
     pub fn signing_payload(&self) -> Result<String> {
+        if self.version >= 4 {
+            return Ok(serde_jcs::to_string(&SignableRecordV4 {
+                id: &self.id,
+                version: self.version,
+                target: &self.target,
+                check: &self.check,
+                verdict: &self.verdict,
+                identity: &self.identity,
+                repo_ref: &self.repo_ref,
+                block_state: &self.block_state,
+                timestamp: self.timestamp,
+                path_hint: &self.path_hint,
+                line_hint: &self.line_hint,
+                note: &self.note,
+                comment_scope: &self.comment_scope,
+                comment_context: &self.comment_context,
+                comment_anchor: &self.comment_anchor,
+                tags: &self.tags,
+            })?);
+        }
+
         if self.version >= 3 {
             return Ok(serde_jcs::to_string(&SignableRecordV3 {
                 id: &self.id,
@@ -883,6 +970,7 @@ mod tests {
             note: None,
             comment_scope: None,
             comment_context: None,
+            comment_anchor: None,
             tags: None,
             attestations: None,
         }

@@ -44,6 +44,79 @@
       ],
       "type": "string"
     },
+    "CommentAnchor": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "end_line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "start_line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "source",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "path",
+            "start_line",
+            "end_line"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "rows": {
+              "items": {
+                "$ref": "#/$defs/DiffCommentAnchorRow"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "path",
+            "rows"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CommentAnchorDiffLineKind": {
+      "enum": [
+        "context",
+        "added",
+        "removed"
+      ],
+      "type": "string"
+    },
     "CommentScope": {
       "additionalProperties": false,
       "properties": {
@@ -61,6 +134,36 @@
       "required": [
         "start_line",
         "end_line"
+      ],
+      "type": "object"
+    },
+    "DiffCommentAnchorRow": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/CommentAnchorDiffLineKind"
+        },
+        "new_line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "old_line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "old_line",
+        "new_line"
       ],
       "type": "object"
     },
@@ -211,6 +314,16 @@
     },
     "check": {
       "type": "string"
+    },
+    "comment_anchor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CommentAnchor"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "comment_context": {
       "type": [

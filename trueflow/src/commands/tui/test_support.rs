@@ -18,7 +18,7 @@ use crate::commands::review::{BlockChangeKind, FileChangeKind};
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::ScopePreset;
-use crate::store::{CommentScope, Verdict};
+use crate::store::{CommentAnchor, CommentScope, Verdict};
 use crate::tree::{TreeBuilder, TreeNodeId, TreeNodeKind};
 use anyhow::{Result, bail};
 use ratatui::{Terminal, backend::Backend};
@@ -37,6 +37,7 @@ pub struct ScriptedMarkAction {
     pub line: Option<u32>,
     pub comment_scope: Option<CommentScope>,
     pub comment_context: Option<String>,
+    pub comment_anchor: Option<CommentAnchor>,
 }
 
 impl From<mark::MarkParams> for ScriptedMarkAction {
@@ -50,6 +51,7 @@ impl From<mark::MarkParams> for ScriptedMarkAction {
             line: params.line,
             comment_scope: params.comment_scope,
             comment_context: params.comment_context,
+            comment_anchor: params.comment_anchor,
         }
     }
 }
@@ -104,6 +106,11 @@ impl MarkActionRunner for CliMarkActionRunner {
         }
         if let Some(context) = &action.comment_context {
             command.arg("--comment-context").arg(context);
+        }
+        if let Some(anchor) = &action.comment_anchor {
+            command
+                .arg("--comment-anchor-json")
+                .arg(serde_json::to_string(anchor)?);
         }
 
         let output = command.output()?;

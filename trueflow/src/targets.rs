@@ -1,3 +1,4 @@
+use crate::github::PullRequestRef;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::CommitId;
@@ -56,6 +57,7 @@ pub enum ReviewTarget {
     Dir(RepoPath),
     Revision(RevisionExpr),
     RevisionRange(RevisionRangeExpr),
+    PullRequest(PullRequestRef),
 }
 
 impl ReviewTarget {
@@ -77,7 +79,22 @@ impl ReviewTarget {
             }
             return Ok(Self::Revision(RevisionExpr::new(rest)?));
         }
+        if raw.starts_with("pr:") || raw.starts_with("http://") || raw.starts_with("https://") {
+            return Ok(Self::PullRequest(PullRequestRef::from_cli(raw)?));
+        }
         Err(anyhow!("Unknown review target: {raw}"))
+    }
+
+    pub fn pull_request(&self) -> Option<&PullRequestRef> {
+        match self {
+            Self::PullRequest(pull_request) => Some(pull_request),
+            Self::DirtyWorktree
+            | Self::MainDiff
+            | Self::File(_)
+            | Self::Dir(_)
+            | Self::Revision(_)
+            | Self::RevisionRange(_) => None,
+        }
     }
 }
 
@@ -87,6 +104,26 @@ impl FromStr for ReviewTarget {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         Self::from_cli(raw)
     }
+}
+
+pub fn extract_pull_request_target(targets: &[ReviewTarget]) -> Result<Option<&PullRequestRef>> {
+    let mut pull_request = None;
+
+    for target in targets {
+        let Some(candidate) = target.pull_request() else {
+            continue;
+        };
+
+        if pull_request.is_some() || targets.len() != 1 {
+            return Err(anyhow!(
+                "Pull request targets cannot be combined with other review targets"
+            ));
+        }
+
+        pull_request = Some(candidate);
+    }
+
+    Ok(pull_request)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +422,9 @@ where
                     end: resolve_revision(&range.end)?,
                 }))
             }
+            ReviewTarget::PullRequest(_) => Err(anyhow!(
+                "Pull request targets require command-specific handling"
+            )),
         })
         .collect()
 }
@@ -452,8 +492,10 @@ pub fn workdir_prefix_from_git_root() -> Option<String> {
 mod tests {
     use super::{
         ResolvedTargets, ReviewContentSource, ReviewDiffSelection, ReviewPathSelection,
-        ReviewTarget, RevisionExpr, RevisionRangeExpr, resolve_targets_with,
+        ReviewTarget, RevisionExpr, RevisionRangeExpr, extract_pull_request_target,
+        resolve_targets_with,
     };
+    use crate::github::PullRequestRef;
     use crate::repo_path::RepoPath;
     use crate::store::CommitId;
     use std::collections::HashSet;
@@ -486,6 +528,40 @@ mod tests {
     #[test]
     fn dir_target_rejects_absolute_path() {
         assert!(ReviewTarget::from_cli("dir:/tmp/absolute").is_err());
+    }
+
+    #[test]
+    fn pull_request_target_parses_short_form() {
+        assert_eq!(
+            ReviewTarget::from_cli("pr:11").unwrap(),
+            ReviewTarget::PullRequest(PullRequestRef::Number { number: 11 })
+        );
+    }
+
+    #[test]
+    fn pull_request_target_parses_full_url() {
+        assert_eq!(
+            ReviewTarget::from_cli("https://github.com/jmqd/trueflow/pull/11").unwrap(),
+            ReviewTarget::PullRequest(PullRequestRef::HostedRepository {
+                host: "github.com".to_string(),
+                owner: "jmqd".to_string(),
+                repo: "trueflow".to_string(),
+                number: 11,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_pull_request_target_rejects_mixed_targets() {
+        let err = extract_pull_request_target(&[
+            ReviewTarget::PullRequest(PullRequestRef::Number { number: 11 }),
+            ReviewTarget::Dir(RepoPath::new("src").unwrap()),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Pull request targets cannot be combined with other review targets")
+        );
     }
 
     #[test]

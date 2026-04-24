@@ -1297,6 +1297,7 @@ mod tests {
             note: None,
             comment_scope: None,
             comment_context: None,
+            comment_anchor: None,
             tags: None,
             attestations: None,
         }
@@ -1333,6 +1334,7 @@ mod tests {
             note: None,
             comment_scope: None,
             comment_context: None,
+            comment_anchor: None,
             tags: None,
             attestations: None,
         }
@@ -1366,6 +1368,7 @@ mod tests {
             note: None,
             comment_scope: None,
             comment_context: None,
+            comment_anchor: None,
             tags: None,
             attestations: None,
         }

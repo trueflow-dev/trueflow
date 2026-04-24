@@ -11,7 +11,8 @@ use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
 use crate::targets::{
     ResolvedTargets, ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget,
-    ReviewPathSelection, resolve_targets, workdir_prefix_from_git_root,
+    ReviewPathSelection, extract_pull_request_target, resolve_targets,
+    workdir_prefix_from_git_root,
 };
 use crate::tree;
 use crate::vcs;
@@ -909,8 +910,26 @@ pub fn run(
     info!(
         "review start (json={json}, all={all}, target={target:?}, since={since:?}, only={only:?}, exclude={exclude:?})"
     );
-    let request = parse_review_request(all, target, since)?;
+    let targets = resolve_review_command_targets(all, target, since)?;
+    let request = review_request_from_cli_targets(all, &targets)?;
     run_request(json, request, only, exclude)
+}
+
+fn resolve_review_command_targets(
+    all: bool,
+    target: &[ReviewTarget],
+    since: Option<&str>,
+) -> Result<Vec<ReviewTarget>> {
+    let targets = expand_cli_review_targets(target, since)?;
+    let _ = review_request_from_cli_targets(all, &targets)?;
+
+    if let Some(_pull_request) = extract_pull_request_target(&targets)? {
+        return Err(anyhow!(
+            "Pull request targets are only supported by `trueflow tui --target ...`"
+        ));
+    }
+
+    Ok(targets)
 }
 
 fn kind_rank(block: &Block) -> u8 {
@@ -1270,6 +1289,20 @@ mod tests {
         assert_eq!(
             ReviewTarget::from_cli("main").unwrap(),
             ReviewTarget::MainDiff
+        );
+    }
+
+    #[test]
+    fn resolve_review_command_targets_rejects_pull_request_target() {
+        let err = resolve_review_command_targets(
+            false,
+            &[ReviewTarget::from_cli("pr:11").unwrap()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Pull request targets are only supported by `trueflow tui --target ...`")
         );
     }
 
