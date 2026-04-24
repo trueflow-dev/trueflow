@@ -125,12 +125,34 @@ impl GitHubDeliveryLedger {
         staged_record_ids: Vec<String>,
     ) {
         let state = self.ensure_pull_request_state(pr);
+        if let Some(existing) = state
+            .pending_reviews
+            .iter_mut()
+            .find(|pending| pending.review_id == review.id)
+        {
+            existing.html_url = review.html_url;
+            existing.head_sha = head_sha.clone();
+            existing.staged_record_ids.extend(staged_record_ids);
+            existing.staged_record_ids.sort();
+            existing.staged_record_ids.dedup();
+            return;
+        }
+
+        let mut staged_record_ids = staged_record_ids;
+        staged_record_ids.sort();
+        staged_record_ids.dedup();
         state.pending_reviews.push(PendingReviewState {
             review_id: review.id,
             html_url: review.html_url,
             head_sha: head_sha.clone(),
             staged_record_ids,
         });
+    }
+
+    pub fn pending_reviews(&self, pr: &ResolvedPullRequestRef) -> Vec<PendingReviewState> {
+        self.pull_request_state(pr)
+            .map(|state| state.pending_reviews.clone())
+            .unwrap_or_default()
     }
 
     fn pull_request_state(&self, pr: &ResolvedPullRequestRef) -> Option<&PullRequestDeliveryState> {
@@ -184,6 +206,8 @@ mod tests {
                 id: 1,
                 html_url: "https://example.test/review/1".to_string(),
                 state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
             },
             &CommitId::new("1111111111111111111111111111111111111111").unwrap(),
             vec!["staged".to_string()],
@@ -196,6 +220,44 @@ mod tests {
     }
 
     #[test]
+    fn record_pending_review_merges_staged_ids_for_existing_review() {
+        let mut ledger = GitHubDeliveryLedger::default();
+        let head_sha = CommitId::new("1111111111111111111111111111111111111111").unwrap();
+        ledger.record_pending_review(
+            &pr(),
+            PostedPullRequestReview {
+                id: 1,
+                html_url: "https://example.test/review/1".to_string(),
+                state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
+            },
+            &head_sha,
+            vec!["first".to_string()],
+        );
+        ledger.record_pending_review(
+            &pr(),
+            PostedPullRequestReview {
+                id: 1,
+                html_url: "https://example.test/review/1-updated".to_string(),
+                state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
+            },
+            &head_sha,
+            vec!["first".to_string(), "second".to_string()],
+        );
+
+        let pending = ledger.pending_reviews(&pr());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].html_url, "https://example.test/review/1-updated");
+        assert_eq!(
+            pending[0].staged_record_ids,
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
     fn sync_pending_reviews_moves_submitted_ids_to_delivered() {
         let mut ledger = GitHubDeliveryLedger::default();
         ledger.record_pending_review(
@@ -204,6 +266,8 @@ mod tests {
                 id: 1,
                 html_url: "https://example.test/review/1".to_string(),
                 state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
             },
             &CommitId::new("1111111111111111111111111111111111111111").unwrap(),
             vec!["staged".to_string()],
@@ -215,6 +279,8 @@ mod tests {
                     id: 1,
                     html_url: "https://example.test/review/1".to_string(),
                     state: PullRequestReviewState::Commented,
+                    body: "<!-- trueflow:pending-review -->".to_string(),
+                    node_id: Some("R_1".to_string()),
                 }))
             })
             .unwrap();

@@ -23,16 +23,12 @@ mod tests {
 
     #[test]
     fn chunk_is_comment_only_accepts_comment_lines() {
-        assert!(chunk_is_comment_only(
-            "# one\n// two\n/* three\n* four\n*/"
-        ));
+        assert!(chunk_is_comment_only("# one\n// two\n/* three\n* four\n*/"));
     }
 
     #[test]
     fn chunk_is_comment_only_rejects_code_lines() {
-        assert!(!chunk_is_comment_only(
-            "// note\nlet value = 1;"
-        ));
+        assert!(!chunk_is_comment_only("// note\nlet value = 1;"));
     }
 
     #[test]

@@ -166,6 +166,8 @@ pub struct PostedPullRequestReview {
     pub id: u64,
     pub html_url: String,
     pub state: PullRequestReviewState,
+    pub body: String,
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +188,12 @@ pub trait GitHubClient {
         head_sha: &CommitId,
         draft: &GitHubReviewDraft,
     ) -> Result<PostedPullRequestReview>;
+    fn add_comment_to_pending_pull_request_review(
+        &self,
+        pr: &ResolvedPullRequestRef,
+        review: &PostedPullRequestReview,
+        comment: &GitHubInlineComment,
+    ) -> Result<()>;
     fn pull_request_review_status(
         &self,
         pr: &ResolvedPullRequestRef,
@@ -225,6 +233,56 @@ impl GitHubClient for GhGitHubClient {
         }))?;
         let response = run_gh_api_with_body(&pr.host, "POST", &endpoint, &body)?;
         parse_posted_pull_request_review(&response)
+    }
+
+    fn add_comment_to_pending_pull_request_review(
+        &self,
+        pr: &ResolvedPullRequestRef,
+        review: &PostedPullRequestReview,
+        comment: &GitHubInlineComment,
+    ) -> Result<()> {
+        let review_node_id = review.node_id.as_ref().ok_or_else(|| {
+            anyhow!(
+                "GitHub review {} did not include a GraphQL node id; cannot append comments",
+                review.id
+            )
+        })?;
+        let body = serde_json::to_string(&serde_json::json!({
+            "query": r#"
+                mutation AddTrueflowPullRequestReviewComment(
+                    $pullRequestReviewId: ID!,
+                    $body: String!,
+                    $path: String!,
+                    $line: Int!,
+                    $side: DiffSide!,
+                    $startLine: Int,
+                    $startSide: DiffSide
+                ) {
+                    addPullRequestReviewComment(input: {
+                        pullRequestReviewId: $pullRequestReviewId,
+                        body: $body,
+                        path: $path,
+                        line: $line,
+                        side: $side,
+                        startLine: $startLine,
+                        startSide: $startSide
+                    }) {
+                        comment { id }
+                    }
+                }
+            "#,
+            "variables": {
+                "pullRequestReviewId": review_node_id,
+                "body": comment.body.as_str(),
+                "path": comment.path.as_str(),
+                "line": comment.line,
+                "side": comment.side,
+                "startLine": comment.start_line,
+                "startSide": comment.start_side,
+            }
+        }))?;
+        run_gh_api_with_body(&pr.host, "POST", "graphql", &body)?;
+        Ok(())
     }
 
     fn pull_request_review_status(
@@ -629,6 +687,8 @@ fn parse_posted_pull_request_review(raw: &str) -> Result<PostedPullRequestReview
         id: review.id,
         html_url: review.html_url,
         state: parse_pull_request_review_state(review.state.as_deref()),
+        body: review.body.unwrap_or_default(),
+        node_id: review.node_id,
     })
 }
 
@@ -830,6 +890,8 @@ struct PullRequestReviewApiResponse {
     id: u64,
     html_url: String,
     state: Option<String>,
+    body: Option<String>,
+    node_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -863,6 +925,15 @@ mod tests {
             _head_sha: &CommitId,
             _draft: &GitHubReviewDraft,
         ) -> Result<PostedPullRequestReview> {
+            Err(anyhow!("not used in tests"))
+        }
+
+        fn add_comment_to_pending_pull_request_review(
+            &self,
+            _pr: &ResolvedPullRequestRef,
+            _review: &PostedPullRequestReview,
+            _comment: &super::GitHubInlineComment,
+        ) -> Result<()> {
             Err(anyhow!("not used in tests"))
         }
 

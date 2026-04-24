@@ -916,6 +916,18 @@ pub struct FileStore {
 impl FileStore {
     pub fn new() -> Result<Self> {
         let location = StoreLocation::discover()?;
+        Self::from_location(location)
+    }
+
+    pub fn for_root(root_path: impl Into<PathBuf>) -> Result<Self> {
+        let location = StoreLocation {
+            root_path: root_path.into(),
+        };
+        location.ensure_trueflow_dir()?;
+        Self::from_location(location)
+    }
+
+    fn from_location(location: StoreLocation) -> Result<Self> {
         let backend = JsonlStoreBackend::new(location.db_path());
         Ok(Self { location, backend })
     }
