@@ -194,6 +194,11 @@ pub trait GitHubClient {
         review: &PostedPullRequestReview,
         comment: &GitHubInlineComment,
     ) -> Result<()>;
+    fn submit_pending_pull_request_review(
+        &self,
+        pr: &ResolvedPullRequestRef,
+        review_id: u64,
+    ) -> Result<PostedPullRequestReview>;
     fn pull_request_review_status(
         &self,
         pr: &ResolvedPullRequestRef,
@@ -283,6 +288,22 @@ impl GitHubClient for GhGitHubClient {
         }))?;
         run_gh_api_with_body(&pr.host, "POST", "graphql", &body)?;
         Ok(())
+    }
+
+    fn submit_pending_pull_request_review(
+        &self,
+        pr: &ResolvedPullRequestRef,
+        review_id: u64,
+    ) -> Result<PostedPullRequestReview> {
+        let endpoint = format!(
+            "repos/{}/{}/pulls/{}/reviews/{review_id}/events",
+            pr.owner, pr.repo, pr.number
+        );
+        let body = serde_json::to_string(&serde_json::json!({
+            "event": "COMMENT",
+        }))?;
+        let response = run_gh_api_with_body(&pr.host, "POST", &endpoint, &body)?;
+        parse_posted_pull_request_review(&response)
     }
 
     fn pull_request_review_status(
@@ -934,6 +955,14 @@ mod tests {
             _review: &PostedPullRequestReview,
             _comment: &super::GitHubInlineComment,
         ) -> Result<()> {
+            Err(anyhow!("not used in tests"))
+        }
+
+        fn submit_pending_pull_request_review(
+            &self,
+            _pr: &ResolvedPullRequestRef,
+            _review_id: u64,
+        ) -> Result<PostedPullRequestReview> {
             Err(anyhow!("not used in tests"))
         }
 

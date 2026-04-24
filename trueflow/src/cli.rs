@@ -137,9 +137,13 @@ pub enum Commands {
         #[arg(long, requires = "pr")]
         dry_run: bool,
 
-        /// Open the posted pending review in a browser. Requires `--pr` and conflicts with `--dry-run`.
+        /// Open the posted or submitted review in a browser. Requires `--pr` and conflicts with `--dry-run`.
         #[arg(long, requires = "pr", conflicts_with = "dry_run")]
         open: bool,
+
+        /// Submit the current trueflow-owned pending review as a COMMENT review. Requires `--pr`.
+        #[arg(long, requires = "pr")]
+        submit: bool,
 
         /// Feedback targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
         #[arg(long, value_name = "TARGET")]
@@ -365,6 +369,7 @@ mod tests {
                 pr,
                 dry_run,
                 open,
+                submit,
                 target,
                 include_approved,
                 only,
@@ -375,6 +380,7 @@ mod tests {
                 assert!(pr.is_none());
                 assert!(!dry_run);
                 assert!(!open);
+                assert!(!submit);
                 assert!(target.is_empty());
                 assert!(!include_approved);
                 assert!(only.is_empty());
@@ -432,6 +438,7 @@ mod tests {
                 pr,
                 dry_run,
                 open,
+                submit,
                 target,
                 include_approved,
                 only,
@@ -442,10 +449,32 @@ mod tests {
                 assert_eq!(pr, Some(PullRequestRef::Number { number: 11 }));
                 assert!(dry_run);
                 assert!(!open);
+                assert!(!submit);
                 assert!(target.is_empty());
                 assert!(!include_approved);
                 assert!(only.is_empty());
                 assert!(exclude.is_empty());
+            }
+            _ => panic!("expected feedback command"),
+        }
+    }
+
+    #[test]
+    fn feedback_command_parses_submit_pull_request_mode() {
+        let cli = Cli::parse_from(["trueflow", "feedback", "--pr", "pr:11", "--submit"]);
+
+        match cli.command {
+            Commands::Feedback {
+                pr,
+                dry_run,
+                open,
+                submit,
+                ..
+            } => {
+                assert_eq!(pr, Some(PullRequestRef::Number { number: 11 }));
+                assert!(!dry_run);
+                assert!(!open);
+                assert!(submit);
             }
             _ => panic!("expected feedback command"),
         }
@@ -469,11 +498,16 @@ mod tests {
 
         match cli.command {
             Commands::Feedback {
-                pr, dry_run, open, ..
+                pr,
+                dry_run,
+                open,
+                submit,
+                ..
             } => {
                 assert_eq!(pr, Some(PullRequestRef::Number { number: 11 }));
                 assert!(!dry_run);
                 assert!(open);
+                assert!(!submit);
             }
             _ => panic!("expected feedback command"),
         }

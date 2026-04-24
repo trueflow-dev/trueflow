@@ -155,6 +155,28 @@ impl GitHubDeliveryLedger {
             .unwrap_or_default()
     }
 
+    pub fn record_submitted_review(&mut self, pr: &ResolvedPullRequestRef, review_id: u64) {
+        let Some(state) = self.pull_request_state_mut(pr) else {
+            return;
+        };
+        let mut delivered_ids = state
+            .delivered_record_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut pending = Vec::new();
+        for review in state.pending_reviews.drain(..) {
+            if review.review_id == review_id {
+                delivered_ids.extend(review.staged_record_ids);
+            } else {
+                pending.push(review);
+            }
+        }
+        state.delivered_record_ids = delivered_ids.into_iter().collect();
+        state.delivered_record_ids.sort();
+        state.pending_reviews = pending;
+    }
+
     fn pull_request_state(&self, pr: &ResolvedPullRequestRef) -> Option<&PullRequestDeliveryState> {
         self.pull_requests.iter().find(|state| state.pr == *pr)
     }
@@ -255,6 +277,29 @@ mod tests {
             pending[0].staged_record_ids,
             vec!["first".to_string(), "second".to_string()]
         );
+    }
+
+    #[test]
+    fn record_submitted_review_moves_staged_ids_to_delivered() {
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &pr(),
+            PostedPullRequestReview {
+                id: 1,
+                html_url: "https://example.test/review/1".to_string(),
+                state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
+            },
+            &CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+            vec!["staged".to_string()],
+        );
+
+        ledger.record_submitted_review(&pr(), 1);
+
+        let state = ledger.pull_request_state(&pr()).unwrap();
+        assert!(state.pending_reviews.is_empty());
+        assert_eq!(state.delivered_record_ids, vec!["staged".to_string()]);
     }
 
     #[test]
