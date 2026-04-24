@@ -147,7 +147,7 @@ enum PullRequestFeedbackSkipReason {
     RangeDeletedByLaterCommit,
     AmbiguousLineTranslation,
     NotPresentInPrHeadDiff,
-    RemovedDiffRowsUnsupported,
+    MixedDiffRowsUnsupported,
 }
 
 impl std::fmt::Display for PullRequestFeedbackSkipReason {
@@ -164,8 +164,8 @@ impl std::fmt::Display for PullRequestFeedbackSkipReason {
             Self::NotPresentInPrHeadDiff => {
                 "anchored range is not present on the pull request head diff"
             }
-            Self::RemovedDiffRowsUnsupported => {
-                "diff anchors containing removed-only rows are not supported yet"
+            Self::MixedDiffRowsUnsupported => {
+                "diff anchor rows cannot be represented on a single GitHub diff side"
             }
         };
         f.write_str(message)
@@ -435,36 +435,132 @@ fn map_diff_anchor_to_github_comment(
     anchor: &DiffCommentAnchor,
     note: &str,
 ) -> Result<std::result::Result<GitHubInlineComment, PullRequestFeedbackSkipReason>> {
-    let new_lines = anchor
-        .rows
-        .iter()
-        .map(|row| {
-            row.new_line?;
-            Some(row.new_line)
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(new_lines) = new_lines else {
-        return Ok(Err(
-            PullRequestFeedbackSkipReason::RemovedDiffRowsUnsupported,
-        ));
+    let right_lines = match diff_anchor_lines_for_side(anchor, GitHubCommentSide::Right) {
+        Ok(lines) => lines,
+        Err(reason) => return Ok(Err(reason)),
     };
-    let mapped_lines = new_lines.into_iter().flatten().collect::<Vec<_>>();
-    if mapped_lines.is_empty() {
-        return Ok(Err(
-            PullRequestFeedbackSkipReason::RemovedDiffRowsUnsupported,
-        ));
-    }
-    if !is_contiguous(&mapped_lines) {
-        return Ok(Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation));
+    if let Some(mapped_lines) = right_lines {
+        let source_anchor = SourceCommentAnchor {
+            revision: anchor.revision.clone(),
+            path: anchor.path.clone(),
+            start_line: mapped_lines[0].saturating_sub(1),
+            end_line: *mapped_lines.last().unwrap_or(&mapped_lines[0]),
+        };
+        return map_source_anchor_to_github_comment(repo, metadata, &source_anchor, note);
     }
 
-    let source_anchor = SourceCommentAnchor {
-        revision: anchor.revision.clone(),
-        path: anchor.path.clone(),
-        start_line: mapped_lines[0].saturating_sub(1),
-        end_line: *mapped_lines.last().unwrap_or(&mapped_lines[0]),
+    let left_lines = match diff_anchor_lines_for_side(anchor, GitHubCommentSide::Left) {
+        Ok(lines) => lines,
+        Err(reason) => return Ok(Err(reason)),
     };
-    map_source_anchor_to_github_comment(repo, metadata, &source_anchor, note)
+    if let Some(mapped_lines) = left_lines {
+        let Some((first_line, last_line)) =
+            translate_left_diff_anchor_to_base(repo, metadata, anchor, &mapped_lines)?
+        else {
+            return Ok(Err(
+                PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+            ));
+        };
+        if !head_diff_contains_left_side_range(repo, metadata, &anchor.path, first_line, last_line)?
+        {
+            return Ok(Err(PullRequestFeedbackSkipReason::NotPresentInPrHeadDiff));
+        }
+        return Ok(Ok(GitHubInlineComment {
+            path: anchor.path.clone(),
+            line: last_line,
+            side: GitHubCommentSide::Left,
+            start_line: (first_line != last_line).then_some(first_line),
+            start_side: (first_line != last_line).then_some(GitHubCommentSide::Left),
+            body: note.to_string(),
+        }));
+    }
+
+    Ok(Err(PullRequestFeedbackSkipReason::MixedDiffRowsUnsupported))
+}
+
+fn diff_anchor_lines_for_side(
+    anchor: &DiffCommentAnchor,
+    side: GitHubCommentSide,
+) -> Result<Option<Vec<u32>>, PullRequestFeedbackSkipReason> {
+    let lines = anchor
+        .rows
+        .iter()
+        .map(|row| match side {
+            GitHubCommentSide::Left => row.old_line,
+            GitHubCommentSide::Right => row.new_line,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(lines) = lines else {
+        return Ok(None);
+    };
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    if !is_contiguous(&lines) {
+        return Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation);
+    }
+    Ok(Some(lines))
+}
+
+fn translate_left_diff_anchor_to_base(
+    repo: &gix::Repository,
+    metadata: &PullRequestMetadata,
+    anchor: &DiffCommentAnchor,
+    lines: &[u32],
+) -> Result<Option<(u32, u32)>> {
+    let Some(anchor_commit_index) = metadata
+        .commits
+        .iter()
+        .position(|commit| commit.sha == anchor.revision)
+    else {
+        return Ok(None);
+    };
+    let parent_revision = if anchor_commit_index == 0 {
+        &metadata.base_sha
+    } else {
+        &metadata.commits[anchor_commit_index - 1].sha
+    };
+    if !path_exists_in_revision(repo, parent_revision, &anchor.path)? {
+        return Ok(None);
+    }
+
+    let mut mapped_lines = lines.to_vec();
+    for commit_index in (0..anchor_commit_index).rev() {
+        let current = &metadata.commits[commit_index].sha;
+        let previous = if commit_index == 0 {
+            &metadata.base_sha
+        } else {
+            &metadata.commits[commit_index - 1].sha
+        };
+        if !path_exists_in_revision(repo, previous, &anchor.path)? {
+            return Ok(None);
+        }
+        let hunks = vcs::diff_hunks_for_file_in_range(
+            repo,
+            previous.as_str(),
+            current.as_str(),
+            &anchor.path,
+        )?;
+        if hunks.is_empty() {
+            continue;
+        }
+        let Some(previous_lines) = mapped_lines
+            .into_iter()
+            .map(|line| translate_new_line_to_old_line_strict(line, &hunks))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        mapped_lines = previous_lines;
+        if !is_contiguous(&mapped_lines) {
+            return Ok(None);
+        }
+    }
+
+    Ok(mapped_lines
+        .first()
+        .zip(mapped_lines.last())
+        .map(|(first, last)| (*first, *last)))
 }
 
 fn translate_source_anchor_to_head(
@@ -562,6 +658,49 @@ fn translate_old_line_to_new_line_strict(
     u32::try_from(mapped.max(1).min(i64::from(u32::MAX))).ok()
 }
 
+fn translate_new_line_to_old_line_strict(
+    new_line: u32,
+    hunks: &[crate::vcs::DiffHunk],
+) -> Option<u32> {
+    let mut old_cursor = 1u32;
+    let mut new_cursor = 1u32;
+
+    for hunk in hunks {
+        while new_cursor < hunk.new_start {
+            if new_line == new_cursor {
+                return Some(old_cursor);
+            }
+            old_cursor = old_cursor.saturating_add(1);
+            new_cursor = new_cursor.saturating_add(1);
+        }
+
+        for line in &hunk.lines {
+            match line.kind {
+                crate::vcs::DiffLineKind::Context => {
+                    if new_line == new_cursor {
+                        return Some(old_cursor);
+                    }
+                    old_cursor = old_cursor.saturating_add(1);
+                    new_cursor = new_cursor.saturating_add(1);
+                }
+                crate::vcs::DiffLineKind::Removed => {
+                    old_cursor = old_cursor.saturating_add(1);
+                }
+                crate::vcs::DiffLineKind::Added => {
+                    if new_line == new_cursor {
+                        return None;
+                    }
+                    new_cursor = new_cursor.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    let delta = i64::from(old_cursor) - i64::from(new_cursor);
+    let mapped = i64::from(new_line) + delta;
+    u32::try_from(mapped.max(1).min(i64::from(u32::MAX))).ok()
+}
+
 fn head_diff_contains_right_side_range(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
@@ -582,7 +721,38 @@ fn head_diff_contains_right_side_range(
     Ok((first_line..=last_line).all(|line| visible_lines.contains(&line)))
 }
 
+fn head_diff_contains_left_side_range(
+    repo: &gix::Repository,
+    metadata: &PullRequestMetadata,
+    path: &crate::repo_path::RepoPath,
+    first_line: u32,
+    last_line: u32,
+) -> Result<bool> {
+    let hunks = vcs::diff_hunks_for_file_in_range(
+        repo,
+        metadata.base_sha.as_str(),
+        metadata.head_sha.as_str(),
+        path,
+    )?;
+    if hunks.is_empty() {
+        return Ok(false);
+    }
+    let visible_lines = visible_base_diff_lines(&hunks);
+    Ok((first_line..=last_line).all(|line| visible_lines.contains(&line)))
+}
+
 fn visible_head_diff_lines(hunks: &[crate::vcs::DiffHunk]) -> HashSet<u32> {
+    visible_diff_lines_for_side(hunks, GitHubCommentSide::Right)
+}
+
+fn visible_base_diff_lines(hunks: &[crate::vcs::DiffHunk]) -> HashSet<u32> {
+    visible_diff_lines_for_side(hunks, GitHubCommentSide::Left)
+}
+
+fn visible_diff_lines_for_side(
+    hunks: &[crate::vcs::DiffHunk],
+    side: GitHubCommentSide,
+) -> HashSet<u32> {
     let mut lines = HashSet::new();
     for hunk in hunks {
         let mut old_line = hunk.old_start;
@@ -590,15 +760,27 @@ fn visible_head_diff_lines(hunks: &[crate::vcs::DiffHunk]) -> HashSet<u32> {
         for line in &hunk.lines {
             match line.kind {
                 crate::vcs::DiffLineKind::Context => {
-                    lines.insert(new_line);
+                    match side {
+                        GitHubCommentSide::Left => {
+                            lines.insert(old_line);
+                        }
+                        GitHubCommentSide::Right => {
+                            lines.insert(new_line);
+                        }
+                    }
                     old_line = old_line.saturating_add(1);
                     new_line = new_line.saturating_add(1);
                 }
                 crate::vcs::DiffLineKind::Added => {
-                    lines.insert(new_line);
+                    if side == GitHubCommentSide::Right {
+                        lines.insert(new_line);
+                    }
                     new_line = new_line.saturating_add(1);
                 }
                 crate::vcs::DiffLineKind::Removed => {
+                    if side == GitHubCommentSide::Left {
+                        lines.insert(old_line);
+                    }
                     old_line = old_line.saturating_add(1);
                 }
             }
@@ -1066,22 +1248,102 @@ mod tests {
     }
 
     #[test]
-    fn build_pull_request_feedback_plan_skips_removed_diff_rows() -> Result<()> {
+    fn build_pull_request_feedback_plan_maps_removed_diff_rows_to_left_comment() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_plan_removed")?;
         let repo = gix::discover(&repo_root)?;
         let record = review_record(
             "removed-diff",
             &metadata.head_sha,
-            Some(CommentAnchor::Diff(DiffCommentAnchor {
-                revision: metadata.head_sha.clone(),
-                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
-                rows: vec![crate::store::DiffCommentAnchorRow {
+            Some(diff_anchor(
+                &metadata,
+                vec![crate::store::DiffCommentAnchorRow {
                     kind: crate::store::CommentAnchorDiffLineKind::Removed,
                     old_line: Some(1),
                     new_line: None,
                 }],
-            })),
+            )?),
             Some("nit: removed line"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert_eq!(plan.staged_record_ids, vec!["removed-diff".to_string()]);
+        assert!(plan.skipped.is_empty());
+        assert_eq!(plan.draft.comments.len(), 1);
+        let comment = &plan.draft.comments[0];
+        assert_eq!(comment.path, crate::repo_path::RepoPath::new("src/lib.rs")?);
+        assert_eq!(comment.line, 1);
+        assert_eq!(comment.side, GitHubCommentSide::Left);
+        assert_eq!(comment.start_line, None);
+        assert_eq!(comment.start_side, None);
+        assert_eq!(comment.body, "nit: removed line");
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_maps_context_and_removed_rows_to_left_range() -> Result<()>
+    {
+        let (repo_root, metadata) = pull_request_fixture_with_file_contents(
+            "feedback_plan_context_removed",
+            "fn keep() {\n    old();\n}\n",
+            "fn keep() {\n}\n",
+        )?;
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "context-removed-diff",
+            &metadata.head_sha,
+            Some(diff_anchor(
+                &metadata,
+                vec![
+                    crate::store::DiffCommentAnchorRow {
+                        kind: crate::store::CommentAnchorDiffLineKind::Context,
+                        old_line: Some(1),
+                        new_line: Some(1),
+                    },
+                    crate::store::DiffCommentAnchorRow {
+                        kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(2),
+                        new_line: None,
+                    },
+                ],
+            )?),
+            Some("range note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert_eq!(plan.draft.comments.len(), 1);
+        let comment = &plan.draft.comments[0];
+        assert_eq!(comment.line, 2);
+        assert_eq!(comment.side, GitHubCommentSide::Left);
+        assert_eq!(comment.start_line, Some(1));
+        assert_eq!(comment.start_side, Some(GitHubCommentSide::Left));
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_skips_mixed_added_and_removed_rows() -> Result<()> {
+        let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_plan_mixed")?;
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "mixed-diff",
+            &metadata.head_sha,
+            Some(diff_anchor(
+                &metadata,
+                vec![
+                    crate::store::DiffCommentAnchorRow {
+                        kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                    },
+                    crate::store::DiffCommentAnchorRow {
+                        kind: crate::store::CommentAnchorDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                    },
+                ],
+            )?),
+            Some("mixed note"),
         );
 
         let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
@@ -1090,7 +1352,47 @@ mod tests {
         assert_eq!(plan.skipped.len(), 1);
         assert_eq!(
             plan.skipped[0].reason,
-            PullRequestFeedbackSkipReason::RemovedDiffRowsUnsupported
+            PullRequestFeedbackSkipReason::MixedDiffRowsUnsupported
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_skips_noncontiguous_removed_rows() -> Result<()> {
+        let (repo_root, metadata) = pull_request_fixture_with_file_contents(
+            "feedback_plan_removed_noncontiguous",
+            "one\ntwo\nthree\n",
+            "two\n",
+        )?;
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "noncontiguous-removed-diff",
+            &metadata.head_sha,
+            Some(diff_anchor(
+                &metadata,
+                vec![
+                    crate::store::DiffCommentAnchorRow {
+                        kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                    },
+                    crate::store::DiffCommentAnchorRow {
+                        kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(3),
+                        new_line: None,
+                    },
+                ],
+            )?),
+            Some("ambiguous note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert!(plan.draft.comments.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(
+            plan.skipped[0].reason,
+            PullRequestFeedbackSkipReason::AmbiguousLineTranslation
         );
         Ok(())
     }
@@ -1198,13 +1500,36 @@ mod tests {
         }))
     }
 
+    fn diff_anchor(
+        metadata: &PullRequestMetadata,
+        rows: Vec<crate::store::DiffCommentAnchorRow>,
+    ) -> Result<CommentAnchor> {
+        Ok(CommentAnchor::Diff(DiffCommentAnchor {
+            revision: metadata.head_sha.clone(),
+            path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+            rows,
+        }))
+    }
+
     fn single_commit_pull_request_fixture(
         name: &str,
+    ) -> Result<(std::path::PathBuf, PullRequestMetadata)> {
+        pull_request_fixture_with_file_contents(
+            name,
+            "pub fn value() -> u32 { 1 }\n",
+            "pub fn value() -> u32 { 2 }\n",
+        )
+    }
+
+    fn pull_request_fixture_with_file_contents(
+        name: &str,
+        base_contents: &str,
+        head_contents: &str,
     ) -> Result<(std::path::PathBuf, PullRequestMetadata)> {
         let repo_root = temp_git_repo(name);
         let file_path = repo_root.join("src/lib.rs");
         fs::create_dir_all(file_path.parent().unwrap())?;
-        fs::write(&file_path, "pub fn value() -> u32 { 1 }\n")?;
+        fs::write(&file_path, base_contents)?;
         run_git(&repo_root, &["add", "."]);
         run_git(&repo_root, &["commit", "-m", "Initial main"]);
         run_git(&repo_root, &["branch", "-M", "main"]);
@@ -1212,7 +1537,7 @@ mod tests {
             .trim()
             .to_string();
 
-        fs::write(&file_path, "pub fn value() -> u32 { 2 }\n")?;
+        fs::write(&file_path, head_contents)?;
         run_git(&repo_root, &["add", "."]);
         run_git(&repo_root, &["commit", "-m", "Update value"]);
         let head_sha = run_git_stdout(&repo_root, &["rev-parse", "HEAD"])
