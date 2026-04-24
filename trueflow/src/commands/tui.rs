@@ -5,8 +5,9 @@ use super::tui_terminal::{
 };
 use super::tui_terminal::{TerminalSession, TuiTerminal};
 use crate::ai::{
-    AiAvailability, AiEnvironment, AiReviewContext, AiSuggestion, AiSuggestionKey,
-    AiSuggestionProvider, AiSuggestionRequest, resolve_ai_availability,
+    AiAvailability, AiEnvironment, AiProvider, AiReviewContext, AiSuggestion, AiSuggestionKey,
+    AiSuggestionProvider, AiSuggestionRequest, CommandAiSuggestionProvider,
+    resolve_ai_availability,
 };
 use crate::analysis::Language;
 use crate::block::BlockKind;
@@ -755,10 +756,18 @@ impl TuiAiState {
 
     fn modeline_text(&self) -> Option<String> {
         match &self.status {
-            TuiAiStatus::Availability => self
-                .availability
-                .as_ref()
-                .map(AiAvailability::modeline_text),
+            TuiAiStatus::Availability => self.availability.as_ref().map(|availability| {
+                if self.provider.is_none()
+                    && let AiAvailability::Ready { provider, .. } = availability
+                    && !matches!(provider, AiProvider::ClaudeCli | AiProvider::CodexCli)
+                {
+                    return format!(
+                        "AI: unavailable ({} direct API suggestions not implemented; set provider = \"claude_cli\" or \"codex_cli\")",
+                        provider.label()
+                    );
+                }
+                availability.modeline_text()
+            }),
             TuiAiStatus::Loading { .. } => Some("AI: loading…".to_string()),
             TuiAiStatus::Suggestion { suggestion, .. } => {
                 Some(format!("AI: {}", suggestion.sentence))
@@ -1394,11 +1403,25 @@ fn build_review_state(
 }
 
 fn tui_ai_state_for_config(config: &TrueflowConfig) -> TuiAiState {
-    TuiAiState::from_availability(
-        resolve_ai_availability(&config.ai, &AiEnvironment::detect_current()),
-        config.ai.max_context_lines,
-        config.ai.cache,
-    )
+    let availability = resolve_ai_availability(&config.ai, &AiEnvironment::detect_current());
+    let mut state =
+        TuiAiState::from_availability(availability, config.ai.max_context_lines, config.ai.cache);
+    state.provider = ai_suggestion_provider_for_availability(state.availability.as_ref());
+    state
+}
+
+fn ai_suggestion_provider_for_availability(
+    availability: Option<&AiAvailability>,
+) -> Option<Arc<dyn AiSuggestionProvider>> {
+    let Some(AiAvailability::Ready { provider, model }) = availability else {
+        return None;
+    };
+    if !matches!(provider, AiProvider::ClaudeCli | AiProvider::CodexCli) {
+        return None;
+    }
+    CommandAiSuggestionProvider::new(*provider, model.clone())
+        .map(|provider| Arc::new(provider) as Arc<dyn AiSuggestionProvider>)
+        .ok()
 }
 
 fn root_child_for_node(tree: &Tree, node_id: TreeNodeId) -> Option<TreeNodeId> {
@@ -9791,7 +9814,7 @@ mod diff_scope_tests {
         state.navigator.jump_root();
         state.ai = TuiAiState::from_availability(
             AiAvailability::Ready {
-                provider: crate::ai::AiProvider::Anthropic,
+                provider: AiProvider::CodexCli,
                 model: "auto".to_string(),
             },
             80,
@@ -9801,7 +9824,44 @@ mod diff_scope_tests {
 
         assert_eq!(
             build_mode_banner_line(&state, &palette).to_string(),
-            "Navigation Mode | AI: ready (Anthropic)"
+            "Navigation Mode | AI: ready (Codex CLI)"
+        );
+    }
+
+    #[test]
+    fn ai_suggestion_provider_for_availability_supports_cli_providers_only() {
+        assert!(
+            ai_suggestion_provider_for_availability(Some(&AiAvailability::Ready {
+                provider: AiProvider::CodexCli,
+                model: "auto".to_string(),
+            }))
+            .is_some()
+        );
+        assert!(
+            ai_suggestion_provider_for_availability(Some(&AiAvailability::Ready {
+                provider: AiProvider::Anthropic,
+                model: "auto".to_string(),
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ai_modeline_reports_direct_api_suggestions_as_unimplemented() {
+        let state = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+
+        assert_eq!(
+            state.modeline_text().as_deref(),
+            Some(
+                "AI: unavailable (Anthropic direct API suggestions not implemented; set provider = \"claude_cli\" or \"codex_cli\")"
+            )
         );
     }
 
