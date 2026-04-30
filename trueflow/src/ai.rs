@@ -400,7 +400,7 @@ pub fn resolve_ai_availability(config: &AiConfig, env: &AiEnvironment) -> AiAvai
             .copied()
             .map(|provider| AiAvailability::Ready {
                 provider,
-                model: config.model.clone(),
+                model: effective_model_for_provider(provider, &config.model),
             })
             .unwrap_or_else(|| AiAvailability::Unavailable {
                 reason: format!(
@@ -413,33 +413,50 @@ pub fn resolve_ai_availability(config: &AiConfig, env: &AiEnvironment) -> AiAvai
             detected,
         },
         AiProviderConfig::Anthropic => {
-            resolve_explicit_provider(AiProvider::Anthropic, config.model.clone(), env, detected)
+            resolve_explicit_provider(AiProvider::Anthropic, &config.model, env, detected)
         }
         AiProviderConfig::OpenAi => {
-            resolve_explicit_provider(AiProvider::OpenAi, config.model.clone(), env, detected)
+            resolve_explicit_provider(AiProvider::OpenAi, &config.model, env, detected)
         }
         AiProviderConfig::ClaudeCli => {
-            resolve_explicit_provider(AiProvider::ClaudeCli, config.model.clone(), env, detected)
+            resolve_explicit_provider(AiProvider::ClaudeCli, &config.model, env, detected)
         }
         AiProviderConfig::CodexCli => {
-            resolve_explicit_provider(AiProvider::CodexCli, config.model.clone(), env, detected)
+            resolve_explicit_provider(AiProvider::CodexCli, &config.model, env, detected)
         }
     }
 }
 
 fn resolve_explicit_provider(
     provider: AiProvider,
-    model: String,
+    configured_model: &str,
     env: &AiEnvironment,
     detected: Vec<AiProvider>,
 ) -> AiAvailability {
     if env.has_provider(provider) {
-        AiAvailability::Ready { provider, model }
+        AiAvailability::Ready {
+            provider,
+            model: effective_model_for_provider(provider, configured_model),
+        }
     } else {
         AiAvailability::Unavailable {
             reason: format!("{} credentials or executable not found", provider.label()),
             detected,
         }
+    }
+}
+
+pub fn effective_model_for_provider(provider: AiProvider, configured_model: &str) -> String {
+    if configured_model != "auto" {
+        return configured_model.to_string();
+    }
+    fast_default_model_for_provider(provider).to_string()
+}
+
+pub fn fast_default_model_for_provider(provider: AiProvider) -> &'static str {
+    match provider {
+        AiProvider::Anthropic | AiProvider::ClaudeCli => "claude-3-5-haiku-latest",
+        AiProvider::OpenAi | AiProvider::CodexCli => "gpt-5-mini",
     }
 }
 
@@ -643,6 +660,22 @@ mod tests {
     }
 
     #[test]
+    fn effective_model_uses_fast_provider_default_for_auto_model() {
+        assert_eq!(
+            effective_model_for_provider(AiProvider::CodexCli, "auto"),
+            "gpt-5-mini"
+        );
+        assert_eq!(
+            effective_model_for_provider(AiProvider::ClaudeCli, "auto"),
+            "claude-3-5-haiku-latest"
+        );
+        assert_eq!(
+            effective_model_for_provider(AiProvider::CodexCli, "gpt-4.1-mini"),
+            "gpt-4.1-mini"
+        );
+    }
+
+    #[test]
     fn detection_prefers_api_keys_before_cli_tools() {
         let env = AiEnvironment::for_tests(true, true, ["claude", "codex"]);
 
@@ -677,10 +710,13 @@ mod tests {
             availability,
             AiAvailability::Ready {
                 provider: AiProvider::OpenAi,
-                model: "auto".to_string(),
+                model: "gpt-5-mini".to_string(),
             }
         );
-        assert_eq!(availability.modeline_text(), "AI: ready (OpenAI)");
+        assert_eq!(
+            availability.modeline_text(),
+            "AI: ready (OpenAI / gpt-5-mini)"
+        );
     }
 
     #[test]

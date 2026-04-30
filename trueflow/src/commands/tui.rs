@@ -3630,8 +3630,13 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     let header_lines = build_header_lines(node, state, palette);
     let mode_banner_line = build_mode_banner_line(state, palette);
+    let ai_hint_line = build_ai_hint_line(state, palette);
 
-    let focus_layout = compute_focus_layout(area, usize_to_u16_saturating(header_lines.len()));
+    let focus_layout = compute_focus_layout(
+        area,
+        usize_to_u16_saturating(header_lines.len()),
+        ai_hint_line.is_some(),
+    );
     let ui_mode = current_ui_mode(state);
     let actions_lines = build_action_lines(
         focus_layout.actions.width,
@@ -3704,11 +3709,6 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         .style(Style::default().bg(palette.meta_bg).fg(palette.fg));
 
     frame.render_widget(
-        Paragraph::new(mode_banner_line).alignment(Alignment::Center),
-        focus_layout.mode,
-    );
-
-    frame.render_widget(
         Paragraph::new(header_lines)
             .block(meta_block)
             .alignment(Alignment::Left),
@@ -3749,11 +3749,25 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         frame.render_stateful_widget(scrollbar, focus_layout.code, &mut scrollbar_state);
     }
 
+    if let Some(ai_hint_line) = ai_hint_line {
+        frame.render_widget(
+            Paragraph::new(ai_hint_line)
+                .alignment(Alignment::Left)
+                .style(Style::default().bg(palette.bg)),
+            focus_layout.ai_hint,
+        );
+    }
+
     let actions_paragraph = Paragraph::new(actions_lines)
         .alignment(Alignment::Center)
         .style(Style::default().bg(palette.bg));
 
     frame.render_widget(actions_paragraph, focus_layout.actions);
+
+    frame.render_widget(
+        Paragraph::new(mode_banner_line).alignment(Alignment::Center),
+        focus_layout.mode,
+    );
 }
 
 fn build_render_content(
@@ -4152,75 +4166,99 @@ fn build_header_lines(
     state: &AppState,
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
-    let header_text = match node.kind {
-        TreeNodeKind::Root => format!("Repository (Root node) @ {}", state.repo_name),
-        TreeNodeKind::Directory => format!("Directory @ {}/", node.name),
-        TreeNodeKind::File => format!("File @ {}", node.name),
-        TreeNodeKind::Block => {
-            if let Some(block) = &node.block {
-                let start = block.start_line + 1;
-                let end = block.end_line.max(start);
-                let path = if node.path.is_root() {
-                    "unknown"
-                } else {
-                    node.path.as_str()
-                };
-                format!("{} @ {}:{}-{}", block.kind.as_str(), path, start, end)
-            } else {
-                format!("Block @ {}", node.name)
-            }
-        }
-    };
-
-    lines.push(format_header_row(&header_text, palette, true));
+    let mut header_text = compact_header_text(node, state);
     if let Some(change_kind) = header_change_kind_for_node(node, state) {
-        lines.push(format_header_row(change_kind.label(), palette, false));
+        header_text = format!("{} · {header_text}", change_kind.label());
     }
 
-    if matches!(node.kind, TreeNodeKind::Block)
-        && let Some(breadcrumb) = review_metadata::block_breadcrumb(&state.navigator.tree, node.id)
-    {
-        lines.push(format_header_row(&breadcrumb, palette, false));
+    vec![format_header_row(&header_text, palette, true)]
+}
+
+fn compact_header_text(node: &crate::tree::TreeNode, state: &AppState) -> String {
+    match node.kind {
+        TreeNodeKind::Root => format!("Repository {}", state.repo_name),
+        TreeNodeKind::Directory => format!("Directory {}/", node.name),
+        TreeNodeKind::File => compact_file_header_text(node),
+        TreeNodeKind::Block => compact_block_header_text(&state.navigator.tree, node.id)
+            .unwrap_or_else(|| format!("Block {}", node.name)),
+    }
+}
+
+fn compact_file_header_text(node: &crate::tree::TreeNode) -> String {
+    if node.path.is_root() {
+        format!("File {}", node.name)
+    } else {
+        format!("File {}", node.path.as_str())
+    }
+}
+
+fn compact_block_header_text(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
+    let node = tree.node(node_id);
+    let block = node.block.as_ref()?;
+    let mut segments = vec![block_header_segment(block)];
+    let mut file_segment = None;
+
+    for ancestor_id in tree.ancestors(node_id).into_iter().skip(1) {
+        let ancestor = tree.node(ancestor_id);
+        match ancestor.kind {
+            TreeNodeKind::Block if tree.is_container_block(ancestor_id) => {
+                if let Some(block) = ancestor.block.as_ref() {
+                    segments.push(block_header_segment(block));
+                }
+            }
+            TreeNodeKind::File => {
+                file_segment = Some(compact_file_header_text(ancestor));
+            }
+            TreeNodeKind::Root | TreeNodeKind::Directory | TreeNodeKind::Block => {}
+        }
     }
 
-    if !matches!(node.kind, TreeNodeKind::Root)
-        && !node.path.is_root()
-        && !matches!(node.kind, TreeNodeKind::Block)
-    {
-        lines.push(format_header_row(node.path.as_str(), palette, false));
+    if let Some(file_segment) = file_segment {
+        segments.push(file_segment);
     }
 
-    let node_hash = node.hash.as_str();
-    if !matches!(node.kind, TreeNodeKind::Root) && !node_hash.is_empty() {
-        lines.push(format_header_row(
-            &format!("Hash: {}", &node_hash[..node_hash.len().min(12)]),
-            palette,
-            false,
-        ));
-    }
+    Some(segments.join(" @ "))
+}
 
-    if lines.is_empty() {
-        lines.push(format_header_row("(No details)", palette, true));
+fn block_header_segment(block: &crate::block::Block) -> String {
+    let kind = header_kind_label(block.kind);
+    match review_metadata::semantic_block_identifier(block) {
+        Some(identifier) => format!("{kind} {identifier}"),
+        None => kind,
     }
+}
 
-    lines
+fn header_kind_label(kind: BlockKind) -> String {
+    let raw = kind.as_str();
+    let mut chars = raw.chars();
+    let Some(first) = chars.next() else {
+        return "Block".to_string();
+    };
+    let mut out = first.to_uppercase().collect::<String>();
+    out.push_str(chars.as_str());
+    out
 }
 
 fn build_mode_banner_line(state: &AppState, palette: &UiPalette) -> Line<'static> {
-    let mut text = mode_banner_label(current_ui_mode(state)).to_string();
-    if let Some(ai_modeline) = state.ai.modeline_text() {
-        text.push_str(" | ");
-        text.push_str(&ai_modeline);
-    }
     Line::from(Span::styled(
-        text,
+        mode_banner_label(current_ui_mode(state)).to_string(),
         Style::default()
             .fg(palette.fg)
             .bg(palette.bg)
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+fn build_ai_hint_line(state: &AppState, palette: &UiPalette) -> Option<Line<'static>> {
+    state.ai.modeline_text().map(|text| {
+        Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(palette.fg)
+                .bg(palette.bg)
+                .add_modifier(Modifier::BOLD),
+        ))
+    })
 }
 
 fn should_show_change_metadata(state: &AppState) -> bool {
@@ -5935,16 +5973,18 @@ fn centered_rect(r: Rect, percent_x: u16, percent_y: u16) -> Rect {
 }
 
 struct FocusLayout {
-    mode: Rect,
     meta: Rect,
     code: Rect,
+    ai_hint: Rect,
     actions: Rect,
+    mode: Rect,
 }
 
 const ACTIONS_HEIGHT: u16 = 2;
+const AI_HINT_HEIGHT: u16 = 1;
 const MODE_BANNER_HEIGHT: u16 = 1;
 
-fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
+fn compute_focus_layout(area: Rect, header_lines: u16, show_ai_hint: bool) -> FocusLayout {
     let code_width = area.width.min(120);
     let desired_code_height = area.height.min(32);
     let padding = u16::try_from((u32::from(area.height) * 5 + 50) / 100).unwrap_or(u16::MAX);
@@ -5953,50 +5993,64 @@ fn compute_focus_layout(area: Rect, header_lines: u16) -> FocusLayout {
     let mode_height = MODE_BANNER_HEIGHT.min(available_height);
     let available_after_mode = available_height.saturating_sub(mode_height);
     let actions_height = ACTIONS_HEIGHT.min(available_after_mode.saturating_sub(2));
-    let available_for_header_and_code = available_after_mode.saturating_sub(actions_height);
+    let available_after_actions = available_after_mode.saturating_sub(actions_height);
+    let ai_hint_height = if show_ai_hint {
+        AI_HINT_HEIGHT.min(available_after_actions.saturating_sub(2))
+    } else {
+        0
+    };
+    let available_for_header_and_code = available_after_actions.saturating_sub(ai_hint_height);
     let min_header_height = 3.min(available_for_header_and_code);
     let desired_header_height = header_lines.saturating_add(2).max(min_header_height);
     let header_height = desired_header_height.min(available_for_header_and_code.saturating_sub(1));
     let code_height =
         desired_code_height.min(available_for_header_and_code.saturating_sub(header_height));
-    let total_height = mode_height + header_height + code_height + actions_height;
+    let total_height = header_height + code_height + ai_hint_height + actions_height + mode_height;
 
     let content_top = area.y + (area.height.saturating_sub(total_height)) / 2;
     let content_left = area.x + (area.width.saturating_sub(code_width)) / 2;
 
-    let mode = Rect {
-        x: content_left,
-        y: content_top,
-        width: code_width,
-        height: mode_height,
-    };
-
     let meta = Rect {
         x: content_left,
-        y: content_top + mode_height,
+        y: content_top,
         width: code_width,
         height: header_height,
     };
 
     let code = Rect {
         x: content_left,
-        y: content_top + mode_height + header_height,
+        y: content_top + header_height,
         width: code_width,
         height: code_height,
     };
 
+    let ai_hint = Rect {
+        x: content_left,
+        y: content_top + header_height + code_height,
+        width: code_width,
+        height: ai_hint_height,
+    };
+
     let actions = Rect {
         x: content_left,
-        y: content_top + mode_height + header_height + code_height,
+        y: content_top + header_height + code_height + ai_hint_height,
         width: code_width,
         height: actions_height,
     };
 
+    let mode = Rect {
+        x: content_left,
+        y: content_top + header_height + code_height + ai_hint_height + actions_height,
+        width: code_width,
+        height: mode_height,
+    };
+
     FocusLayout {
-        mode,
         meta,
         code,
+        ai_hint,
         actions,
+        mode,
     }
 }
 
@@ -6012,7 +6066,7 @@ mod focus_layout_tests {
             width: 80,
             height: 20,
         };
-        let layout = compute_focus_layout(area, 3);
+        let layout = compute_focus_layout(area, 3, false);
         assert!(layout.code.width <= 80);
         assert!(layout.code.height <= 20);
         assert!(layout.meta.y >= area.y);
@@ -6026,23 +6080,23 @@ mod focus_layout_tests {
             width: 200,
             height: 60,
         };
-        let layout = compute_focus_layout(area, 3);
+        let layout = compute_focus_layout(area, 3, false);
         assert_eq!(layout.code.width, 120);
         assert_eq!(layout.actions.height, 2);
         assert!(layout.code.y > area.y);
     }
 
     #[test]
-    fn focus_layout_reserves_mode_banner_row_above_header_box() {
+    fn focus_layout_places_mode_banner_below_action_rows() {
         let area = Rect {
             x: 0,
             y: 0,
             width: 120,
             height: 40,
         };
-        let layout = compute_focus_layout(area, 3);
+        let layout = compute_focus_layout(area, 3, false);
         assert_eq!(layout.mode.height, 1);
-        assert_eq!(layout.meta.y, layout.mode.y + layout.mode.height);
+        assert_eq!(layout.mode.y, layout.actions.y + layout.actions.height);
     }
 
     #[test]
@@ -6053,8 +6107,22 @@ mod focus_layout_tests {
             width: 120,
             height: 40,
         };
-        let layout = compute_focus_layout(area, 1);
+        let layout = compute_focus_layout(area, 1, false);
         assert_eq!(layout.meta.height, 3);
+    }
+
+    #[test]
+    fn focus_layout_places_ai_hint_between_code_and_actions() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = compute_focus_layout(area, 1, true);
+        assert_eq!(layout.ai_hint.height, 1);
+        assert_eq!(layout.ai_hint.y, layout.code.y + layout.code.height);
+        assert_eq!(layout.actions.y, layout.ai_hint.y + layout.ai_hint.height);
     }
 
     #[test]
@@ -6065,7 +6133,7 @@ mod focus_layout_tests {
             width: 80,
             height: 20,
         };
-        let layout = compute_focus_layout(area, 3);
+        let layout = compute_focus_layout(area, 3, false);
         assert!(
             layout.actions.y + layout.actions.height <= area.y + area.height,
             "actions rect should fit within content area"
@@ -9806,7 +9874,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn build_mode_banner_line_appends_ai_modeline_when_present() {
+    fn build_ai_hint_line_shows_ai_availability_on_own_line() {
         let mut state = build_test_state(ScopePreset::All, HashMap::new());
         state.total_blocks = 1;
         state.initial_remaining_blocks = 1;
@@ -9815,7 +9883,7 @@ mod diff_scope_tests {
         state.ai = TuiAiState::from_availability(
             AiAvailability::Ready {
                 provider: AiProvider::CodexCli,
-                model: "auto".to_string(),
+                model: "gpt-5-mini".to_string(),
             },
             80,
             true,
@@ -9824,7 +9892,11 @@ mod diff_scope_tests {
 
         assert_eq!(
             build_mode_banner_line(&state, &palette).to_string(),
-            "Navigation Mode | AI: ready (Codex CLI)"
+            "Navigation Mode"
+        );
+        assert_eq!(
+            build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
+            Some("AI: ready (Codex CLI / gpt-5-mini)".to_string())
         );
     }
 
@@ -9894,7 +9966,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn refresh_ai_suggestion_state_uses_cached_suggestion_in_modeline() {
+    fn refresh_ai_suggestion_state_uses_cached_suggestion_in_ai_hint_line() {
         let file_path = temp_test_file_path("tui_ai_cached_suggestion");
         let file_content = "fn checked() {}\n";
         let (mut state, _file_id, _block_id) =
@@ -9922,12 +9994,16 @@ mod diff_scope_tests {
         let palette = UiPalette::default();
         assert_eq!(
             build_mode_banner_line(&state, &palette).to_string(),
-            "Source Mode | AI: looks good — straightforward wrapper."
+            "Source Mode"
+        );
+        assert_eq!(
+            build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
+            Some("AI: looks good — straightforward wrapper.".to_string())
         );
     }
 
     #[test]
-    fn build_mode_banner_line_shows_ai_loading_state() {
+    fn build_ai_hint_line_shows_ai_loading_state() {
         let file_path = temp_test_file_path("tui_ai_loading");
         let file_content = "fn checked() {}\n";
         let (mut state, _file_id, _block_id) =
@@ -9949,7 +10025,54 @@ mod diff_scope_tests {
 
         assert_eq!(
             build_mode_banner_line(&state, &palette).to_string(),
-            "Source Mode | AI: loading…"
+            "Source Mode"
+        );
+        assert_eq!(
+            build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
+            Some("AI: loading…".to_string())
+        );
+    }
+
+    #[test]
+    fn compact_block_header_text_collapses_nested_breadcrumbs_into_one_row() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let impl_block = builder.add_block(
+            file,
+            "impl".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new(
+                "impl Thing {\n    fn do_it(&self) {}\n}\n".to_string(),
+                BlockKind::Impl,
+                0,
+                3,
+            ),
+            Language::Rust,
+        );
+        let method = builder.add_block(
+            impl_block,
+            "method".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new(
+                "fn do_it(&self) {}\n".to_string(),
+                BlockKind::Function,
+                1,
+                2,
+            ),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+
+        assert_eq!(
+            compact_block_header_text(&tree, method).as_deref(),
+            Some("Function do_it @ Impl Thing @ File src/lib.rs")
         );
     }
 
@@ -9972,7 +10095,7 @@ mod diff_scope_tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert!(header.iter().any(|line| line == "File Deleted"));
+        assert_eq!(header, vec!["File Deleted · File src/lib.rs"]);
         assert!(header.iter().all(|line| !line.starts_with("Mode: ")));
 
         state.view_mode = ViewMode::Source;
@@ -9980,7 +10103,7 @@ mod diff_scope_tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert!(source_header.iter().any(|line| line == "File Deleted"));
+        assert_eq!(source_header, vec!["File Deleted · File src/lib.rs"]);
     }
 
     #[test]
@@ -10005,7 +10128,10 @@ mod diff_scope_tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert!(header.iter().any(|line| line == "Block Added"));
+        assert_eq!(
+            header,
+            vec!["Block Added · Function demo @ File src/lib.rs"]
+        );
         assert!(header.iter().all(|line| line != "File Changed"));
     }
 
@@ -10025,7 +10151,7 @@ mod diff_scope_tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert!(header.iter().any(|line| line == "Unknown Change"));
+        assert_eq!(header, vec!["Unknown Change · Function @ File src/lib.rs"]);
     }
 
     #[test]
