@@ -4,9 +4,11 @@ use crate::config::{AiConfig, AiProviderConfig};
 use crate::hashing::TreeHash;
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashSet;
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
@@ -143,6 +145,7 @@ pub struct AiCliInvocation {
     pub program: String,
     pub args: Vec<String>,
     pub stdin: String,
+    pub final_message_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +198,7 @@ fn cli_prompt_for_request(request: &AiSuggestionRequest) -> String {
 }
 
 fn codex_invocation(model: &str, prompt: String) -> AiCliInvocation {
+    let final_message_path = temporary_codex_final_message_path();
     let mut args = vec![
         "exec".to_string(),
         "--sandbox".to_string(),
@@ -203,6 +207,10 @@ fn codex_invocation(model: &str, prompt: String) -> AiCliInvocation {
         "--skip-git-repo-check".to_string(),
         "--color".to_string(),
         "never".to_string(),
+        "-c".to_string(),
+        "model_reasoning_effort=\"low\"".to_string(),
+        "--output-last-message".to_string(),
+        final_message_path.to_string_lossy().to_string(),
     ];
     if model != "auto" {
         args.push("--model".to_string());
@@ -213,7 +221,19 @@ fn codex_invocation(model: &str, prompt: String) -> AiCliInvocation {
         program: "codex".to_string(),
         args,
         stdin: prompt,
+        final_message_path: Some(final_message_path),
     }
+}
+
+fn temporary_codex_final_message_path() -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "trueflow-codex-hint-{}-{now}.txt",
+        std::process::id()
+    ))
 }
 
 fn claude_invocation(model: &str, prompt: String) -> AiCliInvocation {
@@ -230,6 +250,7 @@ fn claude_invocation(model: &str, prompt: String) -> AiCliInvocation {
         program: "claude".to_string(),
         args,
         stdin: prompt,
+        final_message_path: None,
     }
 }
 
@@ -258,6 +279,18 @@ fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<String> {
             output.status,
             collapse_whitespace(&String::from_utf8_lossy(&output.stderr))
         ));
+    }
+
+    if let Some(path) = invocation.final_message_path.as_ref() {
+        let final_message = fs::read_to_string(path).with_context(|| {
+            format!(
+                "failed to read {} final message from {}",
+                invocation.program,
+                path.display()
+            )
+        })?;
+        let _cleanup = fs::remove_file(path);
+        return Ok(final_message);
     }
 
     String::from_utf8(output.stdout)
@@ -456,7 +489,8 @@ pub fn effective_model_for_provider(provider: AiProvider, configured_model: &str
 pub fn fast_default_model_for_provider(provider: AiProvider) -> &'static str {
     match provider {
         AiProvider::Anthropic | AiProvider::ClaudeCli => "claude-3-5-haiku-latest",
-        AiProvider::OpenAi | AiProvider::CodexCli => "gpt-5-mini",
+        AiProvider::OpenAi => "gpt-5-mini",
+        AiProvider::CodexCli => "auto",
     }
 }
 
@@ -584,23 +618,22 @@ mod tests {
     }
 
     #[test]
-    fn codex_cli_invocation_uses_read_only_ephemeral_exec_with_stdin_prompt() {
+    fn codex_cli_invocation_uses_read_only_low_effort_exec_with_final_message_capture() {
         let request = AiSuggestionRequest::new(
             AiProvider::CodexCli,
-            "gpt-5-mini".to_string(),
+            "auto".to_string(),
             review_context("fn checked() {}"),
             80,
         );
-        let invocation =
-            match cli_invocation_for_request(AiProvider::CodexCli, "gpt-5-mini", &request) {
-                Ok(invocation) => invocation,
-                Err(error) => panic!("expected codex invocation: {error}"),
-            };
+        let invocation = match cli_invocation_for_request(AiProvider::CodexCli, "auto", &request) {
+            Ok(invocation) => invocation,
+            Err(error) => panic!("expected codex invocation: {error}"),
+        };
 
         assert_eq!(invocation.program, "codex");
         assert_eq!(
-            invocation.args,
-            vec![
+            invocation.args[..9],
+            [
                 "exec",
                 "--sandbox",
                 "read-only",
@@ -608,11 +641,18 @@ mod tests {
                 "--skip-git-repo-check",
                 "--color",
                 "never",
-                "--model",
-                "gpt-5-mini",
-                "-",
+                "-c",
+                "model_reasoning_effort=\"low\"",
             ]
         );
+        assert!(
+            invocation
+                .args
+                .iter()
+                .any(|arg| arg == "--output-last-message")
+        );
+        assert!(invocation.final_message_path.is_some());
+        assert!(!invocation.args.iter().any(|arg| arg == "--model"));
         assert!(
             invocation
                 .stdin
@@ -663,7 +703,7 @@ mod tests {
     fn effective_model_uses_fast_provider_default_for_auto_model() {
         assert_eq!(
             effective_model_for_provider(AiProvider::CodexCli, "auto"),
-            "gpt-5-mini"
+            "auto"
         );
         assert_eq!(
             effective_model_for_provider(AiProvider::ClaudeCli, "auto"),
