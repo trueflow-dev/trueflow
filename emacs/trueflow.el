@@ -288,9 +288,11 @@ when they contain a path separator. Bare command names are resolved via
          (name-part (if (and name (not (string-empty-p name)))
                         (concat " " name)
                       ""))
-         (header (format "%s%s in %s (hash=%s), subblocks:" kind name-part path hash))
-         (labels (trueflow--subblock-labels block subblocks)))
-    (cons header (trueflow--tree-lines labels))))
+         (block-line (format "  -> %s%s (hash=%s)" kind name-part hash))
+         (labels (trueflow--subblock-labels block subblocks))
+         (tree-lines (mapcar (lambda (line) (concat "     " line))
+                             (trueflow--tree-lines labels))))
+    (append (list path block-line) tree-lines)))
 
 (defun trueflow--insert-review-header (block subblocks)
   "Insert the review header for BLOCK and SUBBLOCKS." 

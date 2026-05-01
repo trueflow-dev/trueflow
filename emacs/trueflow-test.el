@@ -157,6 +157,21 @@
               ((symbol-function 'executable-find) (lambda (&rest _) nil)))
       (should (equal (trueflow--resolve-executable) repo-bin)))))
 
+(ert-deftest trueflow-review-header-lines-prefer_path_then_named_block ()
+  "Review headers should use a compact path, named block line, and subblock tree."
+  (let ((block '((hash . "a85ccbc912345678")
+                 (content . "#[derive(Debug, Clone)]\nstruct Config {\n    name: String,\n}\n")
+                 (start_line . 0)
+                 (end_line . 3)
+                 (kind . "struct")
+                 (file . "./example_repos/all_languages/main.rs")))
+        (subblocks '(((kind . "CodeParagraph")))))
+    (cl-letf (((symbol-function 'trueflow-root) (lambda (&optional _) "/repo/")))
+      (should (equal (trueflow--review-header-lines block subblocks)
+                     '("example_repos/all_languages/main.rs"
+                       "  -> struct Config (hash=a85ccbc9)"
+                       "     └─ CodeParagraph"))))))
+
 (ert-deftest trueflow-focus-approve-refreshes-without-skipping-next-item ()
   "Approve should advance to the next refreshed item, not skip it."
   (pcase-let ((`(,opened ,review-index ,review-hashes)

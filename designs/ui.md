@@ -1,15 +1,18 @@
 # Trueflow UX Manual
 
 ## Review Header
-- Format: `{block_type} {block_name} in {path_from_root} (hash={shorthash}), subblocks:`
-- Follow with a tree list of subblock kinds, showing the first 2 and last 2 when there are more than 4.
+- Format:
+  - `{path_from_root}`
+  - `  -> {block_type} {block_name} (hash={shorthash})`
+- Follow with an indented tree list of subblock kinds, showing the first 2 and last 2 when there are more than 4.
 - Example:
-  - `function main in src/main.rs (hash=a1b2c3d4), subblocks:`
-  - `├─ CodeParagraph`
-  - `├─ CodeParagraph`
-  - `├─ ...`
-  - `├─ CodeParagraph`
-  - `└─ CodeParagraph`
+  - `src/main.rs`
+  - `  -> function main (hash=a1b2c3d4)`
+  - `     ├─ Signature`
+  - `     ├─ CodeParagraph`
+  - `     ├─ ...`
+  - `     ├─ CodeParagraph`
+  - `     └─ CodeParagraph`
 - Use the repository root for `path_from_root`.
 - `shorthash` should be the first 8 characters of the block hash.
 - `block_name` should use semantic names when available (function/class name); fall back to line ranges.
