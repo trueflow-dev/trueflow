@@ -5,8 +5,8 @@ use super::tui_terminal::{
 };
 use super::tui_terminal::{TerminalSession, TuiTerminal};
 use crate::ai::{
-    AiAvailability, AiEnvironment, AiProvider, AiReviewContext, AiSuggestion, AiSuggestionKey,
-    AiSuggestionProvider, AiSuggestionRequest, CommandAiSuggestionProvider,
+    AiAvailability, AiEnvironment, AiProvider, AiReviewContext, AiReviewSetContext, AiSuggestion,
+    AiSuggestionKey, AiSuggestionProvider, AiSuggestionRequest, CommandAiSuggestionProvider,
     resolve_ai_availability,
 };
 use crate::analysis::Language;
@@ -26,7 +26,7 @@ use crate::github::{
     GhGitHubClient, PullRequestCommit, PullRequestMetadata, PullRequestRef,
     prepare_pull_request_review,
 };
-use crate::hashing::hash_str;
+use crate::hashing::{TreeHash, hash_str};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::review_metadata;
@@ -692,6 +692,7 @@ struct ReviewStateBuildOptions {
 
 struct TuiAiState {
     availability: Option<AiAvailability>,
+    review_set: Option<AiReviewSetContext>,
     max_context_lines: usize,
     cache_enabled: bool,
     provider: Option<Arc<dyn AiSuggestionProvider>>,
@@ -730,6 +731,7 @@ impl TuiAiState {
     fn empty() -> Self {
         Self {
             availability: None,
+            review_set: None,
             max_context_lines: 80,
             cache_enabled: true,
             provider: None,
@@ -746,6 +748,7 @@ impl TuiAiState {
     ) -> Self {
         Self {
             availability: Some(availability),
+            review_set: None,
             max_context_lines,
             cache_enabled,
             provider: None,
@@ -770,7 +773,7 @@ impl TuiAiState {
                 availability.modeline_text()
             }),
             TuiAiStatus::Loading { .. } => Some("Loading suggestion…".to_string()),
-            TuiAiStatus::Suggestion { suggestion, .. } => Some(suggestion.sentence.clone()),
+            TuiAiStatus::Suggestion { suggestion, .. } => suggestion.visible_sentence().map(str::to_string),
             TuiAiStatus::Error { message, .. } => Some(format!("Suggestion error ({message})")),
         }
     }
@@ -779,7 +782,7 @@ impl TuiAiState {
         let TuiAiStatus::Suggestion { suggestion, .. } = &self.status else {
             return None;
         };
-        Some(suggestion.sentence.as_str())
+        suggestion.visible_sentence()
     }
 
     fn ai_poll_deadline(&self) -> Option<Instant> {
@@ -1365,6 +1368,16 @@ fn build_review_state(
         pending_focus_scroll = true;
     }
 
+    let mut ai = options.ai;
+    ai.review_set = Some(ai_review_set_context_for_tree(
+        &navigator.tree,
+        &reviewable_nodes,
+        &diff_block_sides,
+        &review_scope,
+        &options.scope_label,
+        ai.max_context_lines,
+    ));
+
     Ok(AppState {
         review_scope,
         navigator,
@@ -1405,7 +1418,7 @@ fn build_review_state(
             options.speed_read_config,
             options.speed_read_config_path,
         ),
-        ai: options.ai,
+        ai,
     })
 }
 
@@ -2084,25 +2097,213 @@ fn reset_ai_status_to_availability(state: &mut AppState) -> bool {
     true
 }
 
-fn ai_suggestion_request_for_current_focus(state: &AppState) -> Option<AiSuggestionRequest> {
-    let AiAvailability::Ready { provider, model } = state.ai.availability.as_ref()? else {
-        return None;
-    };
-    let focus_block = state.focus_block?;
-    let node = state.navigator.tree.node(focus_block);
+const AI_REVIEW_SET_CONTEXT_MAX_BLOCKS: usize = 120;
+const AI_REVIEW_SET_CONTEXT_LINES_PER_BLOCK: usize = 12;
+
+fn ai_review_set_context_for_tree(
+    tree: &Tree,
+    reviewable_nodes: &HashSet<TreeNodeId>,
+    diff_block_sides: &HashMap<TreeNodeId, DiffBlockSides>,
+    review_scope: &ScopePreset,
+    scope_label: &str,
+    max_context_lines: usize,
+) -> AiReviewSetContext {
+    let entries = ai_review_set_entries(tree, reviewable_nodes, diff_block_sides);
+    let review_set_hash = ai_review_set_hash(review_scope, scope_label, &entries);
+    let overview = ai_review_set_overview(scope_label, review_scope, &entries, max_context_lines);
+    AiReviewSetContext::new(review_set_hash, overview)
+}
+
+fn ai_review_set_entries(
+    tree: &Tree,
+    reviewable_nodes: &HashSet<TreeNodeId>,
+    diff_block_sides: &HashMap<TreeNodeId, DiffBlockSides>,
+) -> Vec<AiReviewContext> {
+    let mut entries = reviewable_nodes
+        .iter()
+        .filter_map(|node_id| ai_review_context_for_node(tree, *node_id, diff_block_sides))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        (
+            left.path.as_str(),
+            left.start_line,
+            left.end_line,
+            left.block_hash.as_str(),
+        )
+            .cmp(&(
+                right.path.as_str(),
+                right.start_line,
+                right.end_line,
+                right.block_hash.as_str(),
+            ))
+    });
+    entries
+}
+
+fn ai_review_set_hash(
+    review_scope: &ScopePreset,
+    scope_label: &str,
+    entries: &[AiReviewContext],
+) -> TreeHash {
+    let mut input = format!("scope:{review_scope:?}\nlabel:{scope_label}\n");
+    for entry in entries {
+        input.push_str(&format!(
+            "{}:{}:{}:{}:{}:{}\n",
+            entry.path,
+            entry.start_line,
+            entry.end_line,
+            entry.block_kind.as_str(),
+            entry.block_hash,
+            hash_str(&entry.content),
+        ));
+    }
+    TreeHash::new(hash_str(&input))
+}
+
+fn ai_review_set_overview(
+    scope_label: &str,
+    review_scope: &ScopePreset,
+    entries: &[AiReviewContext],
+    max_context_lines: usize,
+) -> String {
+    let mut lines = vec![
+        format!("Scope: {scope_label}"),
+        format!("Scope preset: {review_scope:?}"),
+        format!("Review blocks: {}", entries.len()),
+    ];
+    let mut used_content_lines = 0;
+    let content_line_budget = max_context_lines.max(1);
+
+    for (index, entry) in entries
+        .iter()
+        .take(AI_REVIEW_SET_CONTEXT_MAX_BLOCKS)
+        .enumerate()
+    {
+        if used_content_lines >= content_line_budget {
+            lines.push("...".to_string());
+            break;
+        }
+        let line_start = entry.start_line.saturating_add(1);
+        let line_end = entry.end_line.max(entry.start_line.saturating_add(1));
+        lines.push(format!(
+            "## {}. {} lines {line_start}-{line_end} {} {}",
+            index + 1,
+            entry.path,
+            entry.block_kind.as_str(),
+            short_ai_hash(&entry.block_hash),
+        ));
+        let remaining_lines = content_line_budget.saturating_sub(used_content_lines);
+        let snippet_lines = remaining_lines.min(AI_REVIEW_SET_CONTEXT_LINES_PER_BLOCK);
+        used_content_lines +=
+            push_ai_review_set_snippet_lines(&mut lines, &entry.content, snippet_lines);
+    }
+
+    if entries.len() > AI_REVIEW_SET_CONTEXT_MAX_BLOCKS {
+        lines.push(format!(
+            "... {} more review blocks omitted from AI context",
+            entries.len() - AI_REVIEW_SET_CONTEXT_MAX_BLOCKS
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn push_ai_review_set_snippet_lines(
+    out: &mut Vec<String>,
+    content: &str,
+    max_lines: usize,
+) -> usize {
+    if max_lines == 0 {
+        return 0;
+    }
+    let mut pushed = 0;
+    let mut lines = content.lines().peekable();
+    while pushed < max_lines {
+        let Some(line) = lines.next() else {
+            break;
+        };
+        out.push(line.to_string());
+        pushed += 1;
+    }
+    if lines.peek().is_some() {
+        out.push("...".to_string());
+    }
+    if pushed == 0 {
+        out.push("(empty block)".to_string());
+        return 1;
+    }
+    pushed
+}
+
+fn short_ai_hash(hash: &TreeHash) -> &str {
+    hash.as_str().get(..12).unwrap_or_else(|| hash.as_str())
+}
+
+fn ai_review_context_for_node(
+    tree: &Tree,
+    node_id: TreeNodeId,
+    diff_block_sides: &HashMap<TreeNodeId, DiffBlockSides>,
+) -> Option<AiReviewContext> {
+    let node = tree.node(node_id);
     let block = node.block.as_ref()?;
-    let context = AiReviewContext {
+    Some(AiReviewContext {
         path: node.path.as_str().to_string(),
         language: node.language.unwrap_or_default(),
         block_kind: block.kind,
         block_hash: block.hash.clone(),
         start_line: block.start_line,
         end_line: block.end_line,
-        content: block.content.clone(),
+        content: ai_block_context_content(block.content.as_str(), diff_block_sides.get(&node_id)),
+    })
+}
+
+fn ai_block_context_content(display_content: &str, sides: Option<&DiffBlockSides>) -> String {
+    let Some(sides) = sides else {
+        return display_content.to_string();
     };
+    let mut out = String::new();
+    if let Some(base) = sides.base.as_ref() {
+        out.push_str("[base]\n");
+        out.push_str(&base.content);
+        if !base.content.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if let Some(head) = sides.head.as_ref() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[head]\n");
+        out.push_str(&head.content);
+    }
+    if out.trim().is_empty() {
+        display_content.to_string()
+    } else {
+        out
+    }
+}
+
+fn ai_suggestion_request_for_current_focus(state: &AppState) -> Option<AiSuggestionRequest> {
+    let AiAvailability::Ready { provider, model } = state.ai.availability.as_ref()? else {
+        return None;
+    };
+    let focus_block = state.focus_block?;
+    let context =
+        ai_review_context_for_node(&state.navigator.tree, focus_block, &state.diff_block_sides)?;
+    let review_set = state.ai.review_set.clone().unwrap_or_else(|| {
+        ai_review_set_context_for_tree(
+            &state.navigator.tree,
+            &state.reviewable_nodes,
+            &state.diff_block_sides,
+            &state.review_scope,
+            &state.scope_label,
+            state.ai.max_context_lines,
+        )
+    });
     Some(AiSuggestionRequest::new(
         *provider,
         model.clone(),
+        review_set,
         context,
         state.ai.max_context_lines,
     ))
@@ -8357,7 +8558,8 @@ mod diff_scope_tests {
         state.ai.status = TuiAiStatus::Suggestion {
             key: request.key,
             suggestion: AiSuggestion {
-                sentence: "Consider asking why this unwrap is safe.".to_string(),
+                explanation: Some("This calls code that may panic.".to_string()),
+                proposed_change: Some("Consider asking why this unwrap is safe.".to_string()),
             },
         };
 
@@ -10156,7 +10358,59 @@ mod diff_scope_tests {
         assert_eq!(request.key.start_line, 0);
         assert_eq!(request.key.end_line, 3);
         assert_eq!(request.key.max_context_lines, 2);
+        assert_eq!(
+            request.key.review_set_hash,
+            request.review_set.review_set_hash
+        );
+        assert!(request.review_set.overview.contains("Review blocks: 1"));
+        assert!(request.review_set.overview.contains("fn checked() {"));
         assert!(request.prompt.contains("fn checked() {\n    call();\n..."));
+    }
+
+    #[test]
+    fn ai_suggestion_request_for_current_focus_includes_base_and_head_diff_context() {
+        let file_path = temp_test_file_path("tui_ai_diff_request");
+        let head_content = "fn checked() {\n    new_call();\n}\n";
+        let base_content = "fn checked() {\n    old_call();\n}\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, head_content, head_content, 0, 3);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "claude-3-5-haiku".to_string(),
+            },
+            20,
+            true,
+        );
+        state.diff_block_sides.insert(
+            block_id,
+            DiffBlockSides {
+                base: Some(Block::new(
+                    base_content.to_string(),
+                    BlockKind::Function,
+                    0,
+                    3,
+                )),
+                head: Some(Block::new(
+                    head_content.to_string(),
+                    BlockKind::Function,
+                    0,
+                    3,
+                )),
+            },
+        );
+
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+
+        assert!(request.prompt.contains("[base]\nfn checked() {"));
+        assert!(request.prompt.contains("old_call();"));
+        assert!(request.prompt.contains("[head]\nfn checked() {"));
+        assert!(request.prompt.contains("new_call();"));
+        assert!(request.review_set.overview.contains("[base]"));
+        assert!(request.review_set.overview.contains("[head]"));
     }
 
     #[test]
@@ -10180,7 +10434,8 @@ mod diff_scope_tests {
         state.ai.cache.insert(
             request.key,
             AiSuggestion {
-                sentence: "looks good — straightforward wrapper.".to_string(),
+                explanation: Some("This is a straightforward wrapper.".to_string()),
+                proposed_change: Some("Guard the wrapper against an empty input.".to_string()),
             },
         );
 
@@ -10192,8 +10447,38 @@ mod diff_scope_tests {
         );
         assert_eq!(
             build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
-            Some("looks good — straightforward wrapper.".to_string())
+            Some("Guard the wrapper against an empty input.".to_string())
         );
+    }
+
+    #[test]
+    fn build_ai_hint_line_hides_ai_suggestion_without_proposed_change() {
+        let file_path = temp_test_file_path("tui_ai_no_change_suggestion");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        state.ai.status = TuiAiStatus::Suggestion {
+            key: request.key,
+            suggestion: AiSuggestion {
+                explanation: Some("This is a straightforward wrapper.".to_string()),
+                proposed_change: None,
+            },
+        };
+        let palette = UiPalette::default();
+
+        assert!(build_ai_hint_line(&state, &palette).is_none());
     }
 
     #[test]

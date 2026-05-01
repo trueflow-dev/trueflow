@@ -3,11 +3,12 @@ use crate::block::BlockKind;
 use crate::config::{AiConfig, AiProviderConfig};
 use crate::hashing::TreeHash;
 use anyhow::{Context, Result, anyhow};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
@@ -70,11 +71,27 @@ impl AiAvailability {
 pub struct AiSuggestionKey {
     pub provider: AiProvider,
     pub model: String,
+    pub review_set_hash: TreeHash,
     pub path: String,
     pub block_hash: TreeHash,
     pub start_line: usize,
     pub end_line: usize,
     pub max_context_lines: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReviewSetContext {
+    pub review_set_hash: TreeHash,
+    pub overview: String,
+}
+
+impl AiReviewSetContext {
+    pub fn new(review_set_hash: TreeHash, overview: String) -> Self {
+        Self {
+            review_set_hash,
+            overview,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +108,7 @@ pub struct AiReviewContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiSuggestionRequest {
     pub key: AiSuggestionKey,
+    pub review_set: AiReviewSetContext,
     pub context: AiReviewContext,
     pub prompt: String,
 }
@@ -99,21 +117,28 @@ impl AiSuggestionRequest {
     pub fn new(
         provider: AiProvider,
         model: String,
+        review_set: AiReviewSetContext,
         context: AiReviewContext,
         max_context_lines: usize,
     ) -> Self {
         let key = AiSuggestionKey {
             provider,
             model,
+            review_set_hash: review_set.review_set_hash.clone(),
             path: context.path.clone(),
             block_hash: context.block_hash.clone(),
             start_line: context.start_line,
             end_line: context.end_line,
             max_context_lines,
         };
-        let prompt = build_review_hint_prompt(&context, max_context_lines);
+        let prompt = build_review_block_prompt(
+            &context,
+            Some(&review_set.review_set_hash),
+            max_context_lines,
+        );
         Self {
             key,
+            review_set,
             context,
             prompt,
         }
@@ -122,7 +147,8 @@ impl AiSuggestionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiSuggestion {
-    pub sentence: String,
+    pub explanation: Option<String>,
+    pub proposed_change: Option<String>,
 }
 
 impl AiSuggestion {
@@ -131,13 +157,38 @@ impl AiSuggestion {
         if collapsed.is_empty() {
             return Err(anyhow!("AI provider returned an empty suggestion"));
         }
-        let sentence = truncate_for_modeline(first_sentence(&collapsed), 180);
-        Ok(Self { sentence })
+
+        let parsed = parse_structured_provider_text(raw);
+        let explanation = parsed
+            .explanation
+            .as_deref()
+            .and_then(normalize_optional_sentence);
+        let mut proposed_change = parsed.change.as_deref().and_then(normalize_proposed_change);
+
+        if parsed.explanation.is_none() && parsed.change.is_none() {
+            proposed_change = normalize_unstructured_proposed_change(&collapsed);
+        }
+
+        Ok(Self {
+            explanation,
+            proposed_change,
+        })
+    }
+
+    pub fn visible_sentence(&self) -> Option<&str> {
+        self.proposed_change.as_deref()
     }
 }
 
 pub trait AiSuggestionProvider: Send + Sync {
     fn suggest(&self, request: &AiSuggestionRequest) -> Result<AiSuggestion>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiCliOutputFormat {
+    Text,
+    CodexJson,
+    ClaudeJson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,12 +197,36 @@ pub struct AiCliInvocation {
     pub args: Vec<String>,
     pub stdin: String,
     pub final_message_path: Option<PathBuf>,
+    pub output_format: AiCliOutputFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AiConversationKey {
+    provider: AiProvider,
+    model: String,
+    review_set_hash: TreeHash,
+}
+
+impl AiConversationKey {
+    fn from_request(provider: AiProvider, model: &str, request: &AiSuggestionRequest) -> Self {
+        Self {
+            provider,
+            model: model.to_string(),
+            review_set_hash: request.key.review_set_hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AiConversationState {
+    session_id: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct CommandAiSuggestionProvider {
     provider: AiProvider,
     model: String,
+    conversations: Arc<Mutex<HashMap<AiConversationKey, AiConversationState>>>,
 }
 
 impl CommandAiSuggestionProvider {
@@ -162,15 +237,67 @@ impl CommandAiSuggestionProvider {
                 provider.label()
             ));
         }
-        Ok(Self { provider, model })
+        Ok(Self {
+            provider,
+            model,
+            conversations: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn cached_session_id(&self, key: &AiConversationKey) -> Option<String> {
+        self.conversations
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(key).map(|state| state.session_id.clone()))
+    }
+
+    fn record_session_id(&self, key: AiConversationKey, session_id: String) {
+        if session_id.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.conversations.lock() {
+            cache.insert(key, AiConversationState { session_id });
+        }
+    }
+
+    fn forget_session_id(&self, key: &AiConversationKey) {
+        if let Ok(mut cache) = self.conversations.lock() {
+            cache.remove(key);
+        }
     }
 }
 
 impl AiSuggestionProvider for CommandAiSuggestionProvider {
     fn suggest(&self, request: &AiSuggestionRequest) -> Result<AiSuggestion> {
-        let invocation = cli_invocation_for_request(self.provider, &self.model, request)?;
-        let output = run_cli_invocation(&invocation)?;
-        AiSuggestion::from_provider_text(&output)
+        let conversation_key = AiConversationKey::from_request(self.provider, &self.model, request);
+        let cached_session_id = self.cached_session_id(&conversation_key);
+        let invocation = cli_invocation_for_request_with_session(
+            self.provider,
+            &self.model,
+            request,
+            cached_session_id.as_deref(),
+        )?;
+        let output = match run_cli_invocation(&invocation) {
+            Ok(output) => output,
+            Err(error) if cached_session_id.is_some() => {
+                self.forget_session_id(&conversation_key);
+                let fresh_invocation = cli_invocation_for_request_with_session(
+                    self.provider,
+                    &self.model,
+                    request,
+                    None,
+                )?;
+                run_cli_invocation(&fresh_invocation)
+                    .with_context(|| format!("failed to resume cached AI conversation ({error})"))?
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Some(session_id) = output.session_id.clone() {
+            self.record_session_id(conversation_key, session_id);
+        }
+
+        AiSuggestion::from_provider_text(&output.text)
     }
 }
 
@@ -179,10 +306,19 @@ pub fn cli_invocation_for_request(
     model: &str,
     request: &AiSuggestionRequest,
 ) -> Result<AiCliInvocation> {
-    let prompt = cli_prompt_for_request(request);
+    cli_invocation_for_request_with_session(provider, model, request, None)
+}
+
+fn cli_invocation_for_request_with_session(
+    provider: AiProvider,
+    model: &str,
+    request: &AiSuggestionRequest,
+    session_id: Option<&str>,
+) -> Result<AiCliInvocation> {
+    let prompt = cli_prompt_for_request(request, session_id.is_none());
     match provider {
-        AiProvider::CodexCli => Ok(codex_invocation(model, prompt)),
-        AiProvider::ClaudeCli => Ok(claude_invocation(model, prompt)),
+        AiProvider::CodexCli => Ok(codex_invocation(model, prompt, session_id)),
+        AiProvider::ClaudeCli => Ok(claude_invocation(model, prompt, session_id)),
         AiProvider::Anthropic | AiProvider::OpenAi => Err(anyhow!(
             "{} direct API suggestions are not implemented yet",
             provider.label()
@@ -190,31 +326,62 @@ pub fn cli_invocation_for_request(
     }
 }
 
-fn cli_prompt_for_request(request: &AiSuggestionRequest) -> String {
+fn cli_prompt_for_request(
+    request: &AiSuggestionRequest,
+    include_review_set_context: bool,
+) -> String {
+    let review_set_context = if include_review_set_context {
+        format!(
+            "Review-set context for this conversation. Keep this context for all later block prompts in the same review set.\nReview set hash: {}\n\n{}\n\n",
+            request.review_set.review_set_hash, request.review_set.overview,
+        )
+    } else {
+        format!(
+            "Use the review-set context already provided in this conversation. Review set hash: {}.\n\n",
+            request.review_set.review_set_hash,
+        )
+    };
+
     format!(
-        "{}\n\nImportant: return only the one-sentence review hint. Do not run shell commands, inspect additional files, modify files, or produce markdown fences.",
+        "{review_set_context}{}\n\nImportant: return exactly two plain-text lines, `EXPLANATION: ...` and `CHANGE: ...`. Use `CHANGE: NONE` unless there is a concrete, reasonable change to request. Do not run shell commands, inspect additional files, modify files, or produce markdown fences.",
         request.prompt
     )
 }
 
-fn codex_invocation(model: &str, prompt: String) -> AiCliInvocation {
+fn codex_invocation(model: &str, prompt: String, session_id: Option<&str>) -> AiCliInvocation {
     let final_message_path = temporary_codex_final_message_path();
-    let mut args = vec![
-        "exec".to_string(),
-        "--sandbox".to_string(),
-        "read-only".to_string(),
-        "--ephemeral".to_string(),
-        "--skip-git-repo-check".to_string(),
-        "--color".to_string(),
-        "never".to_string(),
-        "-c".to_string(),
-        "model_reasoning_effort=\"low\"".to_string(),
-        "--output-last-message".to_string(),
-        final_message_path.to_string_lossy().to_string(),
-    ];
+    let mut args = if session_id.is_some() {
+        vec![
+            "exec".to_string(),
+            "resume".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--json".to_string(),
+            "-c".to_string(),
+            "model_reasoning_effort=\"low\"".to_string(),
+            "--output-last-message".to_string(),
+            final_message_path.to_string_lossy().to_string(),
+        ]
+    } else {
+        vec![
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--color".to_string(),
+            "never".to_string(),
+            "--json".to_string(),
+            "-c".to_string(),
+            "model_reasoning_effort=\"low\"".to_string(),
+            "--output-last-message".to_string(),
+            final_message_path.to_string_lossy().to_string(),
+        ]
+    };
     if model != "auto" {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+    if let Some(session_id) = session_id {
+        args.push(session_id.to_string());
     }
     args.push("-".to_string());
     AiCliInvocation {
@@ -222,6 +389,7 @@ fn codex_invocation(model: &str, prompt: String) -> AiCliInvocation {
         args,
         stdin: prompt,
         final_message_path: Some(final_message_path),
+        output_format: AiCliOutputFormat::CodexJson,
     }
 }
 
@@ -236,12 +404,16 @@ fn temporary_codex_final_message_path() -> PathBuf {
     ))
 }
 
-fn claude_invocation(model: &str, prompt: String) -> AiCliInvocation {
+fn claude_invocation(model: &str, prompt: String, session_id: Option<&str>) -> AiCliInvocation {
     let mut args = vec![
         "--print".to_string(),
         "--output-format".to_string(),
-        "text".to_string(),
+        "json".to_string(),
     ];
+    if let Some(session_id) = session_id {
+        args.push("--resume".to_string());
+        args.push(session_id.to_string());
+    }
     if model != "auto" {
         args.push("--model".to_string());
         args.push(model.to_string());
@@ -251,10 +423,17 @@ fn claude_invocation(model: &str, prompt: String) -> AiCliInvocation {
         args,
         stdin: prompt,
         final_message_path: None,
+        output_format: AiCliOutputFormat::ClaudeJson,
     }
 }
 
-fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AiCliRunOutput {
+    text: String,
+    session_id: Option<String>,
+}
+
+fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<AiCliRunOutput> {
     let mut child = Command::new(&invocation.program)
         .args(&invocation.args)
         .stdin(Stdio::piped())
@@ -272,6 +451,8 @@ fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<String> {
     let output = child
         .wait_with_output()
         .with_context(|| format!("failed to wait for {}", invocation.program))?;
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("{} returned non-UTF-8 stdout", invocation.program))?;
     if !output.status.success() {
         return Err(anyhow!(
             "{} exited with {}: {}",
@@ -281,7 +462,14 @@ fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<String> {
         ));
     }
 
-    if let Some(path) = invocation.final_message_path.as_ref() {
+    let session_id = match invocation.output_format {
+        AiCliOutputFormat::Text => None,
+        AiCliOutputFormat::CodexJson | AiCliOutputFormat::ClaudeJson => {
+            extract_session_id_from_json_text(&stdout)
+        }
+    };
+
+    let text = if let Some(path) = invocation.final_message_path.as_ref() {
         let final_message = fs::read_to_string(path).with_context(|| {
             format!(
                 "failed to read {} final message from {}",
@@ -290,19 +478,34 @@ fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<String> {
             )
         })?;
         let _cleanup = fs::remove_file(path);
-        return Ok(final_message);
-    }
+        final_message
+    } else {
+        match invocation.output_format {
+            AiCliOutputFormat::Text | AiCliOutputFormat::CodexJson => stdout,
+            AiCliOutputFormat::ClaudeJson => parse_claude_json_result(&stdout)?,
+        }
+    };
 
-    String::from_utf8(output.stdout)
-        .with_context(|| format!("{} returned non-UTF-8 output", invocation.program))
+    Ok(AiCliRunOutput { text, session_id })
 }
 
 pub fn build_review_hint_prompt(context: &AiReviewContext, max_context_lines: usize) -> String {
+    build_review_block_prompt(context, None, max_context_lines)
+}
+
+fn build_review_block_prompt(
+    context: &AiReviewContext,
+    review_set_hash: Option<&TreeHash>,
+    max_context_lines: usize,
+) -> String {
     let line_start = context.start_line.saturating_add(1);
     let line_end = context.end_line.max(context.start_line.saturating_add(1));
     let block_content = clipped_content(&context.content, max_context_lines);
+    let review_set_line = review_set_hash
+        .map(|hash| format!("Review set hash: {hash}\n"))
+        .unwrap_or_default();
     format!(
-        "Return exactly one concise sentence that helps a code reviewer decide whether to approve or comment. If no issue is obvious, say that it looks good and why. Do not propose code edits.\n\nPath: {}\nLanguage: {:?}\nBlock kind: {}\nLines: {line_start}-{line_end}\n\n```\n{block_content}\n```",
+        "Review this block in the context of the full review set.\n{review_set_line}Return exactly two concise lines:\nEXPLANATION: one sentence explaining what this block is/does in context.\nCHANGE: one sentence with a concrete requested change, or NONE if there is no reasonable change to propose.\nBe conservative: do not propose style-only or speculative changes.\n\nPath: {}\nLanguage: {:?}\nBlock kind: {}\nLines: {line_start}-{line_end}\n\n```\n{block_content}\n```",
         context.path,
         context.language,
         context.block_kind.as_str(),
@@ -356,6 +559,167 @@ fn truncate_for_modeline(text: &str, max_chars: usize) -> String {
     let mut truncated = text.chars().take(take_chars).collect::<String>();
     truncated.push('…');
     truncated
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedProviderText {
+    explanation: Option<String>,
+    change: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderField {
+    Explanation,
+    Change,
+}
+
+fn parse_structured_provider_text(raw: &str) -> ParsedProviderText {
+    let mut parsed = ParsedProviderText::default();
+    let mut current_field = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = strip_provider_label(trimmed, "EXPLANATION") {
+            parsed.explanation = Some(rest.to_string());
+            current_field = Some(ProviderField::Explanation);
+            continue;
+        }
+        if let Some(rest) = strip_provider_label(trimmed, "CHANGE") {
+            parsed.change = Some(rest.to_string());
+            current_field = Some(ProviderField::Change);
+            continue;
+        }
+
+        match current_field {
+            Some(ProviderField::Explanation) => {
+                append_provider_field(&mut parsed.explanation, trimmed);
+            }
+            Some(ProviderField::Change) => append_provider_field(&mut parsed.change, trimmed),
+            None => {}
+        }
+    }
+
+    parsed
+}
+
+fn strip_provider_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    let trimmed = line
+        .trim_start_matches(|ch: char| ch == '-' || ch == '*' || ch.is_whitespace())
+        .trim_start();
+    let prefix = trimmed.get(..label.len())?;
+    if !prefix.eq_ignore_ascii_case(label) {
+        return None;
+    }
+    let rest = trimmed.get(label.len()..)?.trim_start();
+    if rest.is_empty() {
+        return Some(rest);
+    }
+    let rest = rest.strip_prefix(':')?.trim_start();
+    Some(rest)
+}
+
+fn append_provider_field(field: &mut Option<String>, line: &str) {
+    let Some(existing) = field else {
+        *field = Some(line.to_string());
+        return;
+    };
+    if !existing.is_empty() {
+        existing.push(' ');
+    }
+    existing.push_str(line);
+}
+
+fn normalize_optional_sentence(raw: &str) -> Option<String> {
+    let collapsed = collapse_whitespace(raw);
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(truncate_for_modeline(first_sentence(&collapsed), 180))
+}
+
+fn normalize_proposed_change(raw: &str) -> Option<String> {
+    let collapsed = collapse_whitespace(raw);
+    if collapsed.is_empty() || is_no_change_text(&collapsed) {
+        return None;
+    }
+    Some(truncate_for_modeline(first_sentence(&collapsed), 180))
+}
+
+fn normalize_unstructured_proposed_change(collapsed: &str) -> Option<String> {
+    if is_no_change_text(collapsed) {
+        return None;
+    }
+    Some(truncate_for_modeline(first_sentence(collapsed), 180))
+}
+
+fn is_no_change_text(text: &str) -> bool {
+    let lower = text
+        .trim()
+        .trim_matches(|ch: char| ch == '.' || ch == '!' || ch == '?' || ch == '`')
+        .to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "none" | "no" | "no change" | "no changes" | "no proposed change" | "no proposed changes"
+    ) || lower.contains("no reasonable change")
+        || lower.contains("no concrete change")
+        || lower.contains("nothing to change")
+        || lower.contains("looks good")
+        || lower.contains("looks fine")
+}
+
+fn parse_claude_json_result(stdout: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .with_context(|| "failed to parse claude JSON output")?;
+    value
+        .get("result")
+        .or_else(|| value.get("message"))
+        .or_else(|| value.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("claude JSON output did not include a text result"))
+}
+
+fn extract_session_id_from_json_text(stdout: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        && let Some(session_id) = extract_session_id_from_json_value(&value)
+    {
+        return Some(session_id);
+    }
+
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find_map(|value| extract_session_id_from_json_value(&value))
+}
+
+fn extract_session_id_from_json_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["session_id", "thread_id", "conversation_id"] {
+                if let Some(session_id) = map.get(key).and_then(serde_json::Value::as_str)
+                    && !session_id.trim().is_empty()
+                {
+                    return Some(session_id.to_string());
+                }
+            }
+            if let Some(thread_id) = map
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(serde_json::Value::as_str)
+                && !thread_id.trim().is_empty()
+            {
+                return Some(thread_id.to_string());
+            }
+            map.values().find_map(extract_session_id_from_json_value)
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().find_map(extract_session_id_from_json_value)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,11 +931,20 @@ mod tests {
         }
     }
 
+    fn review_set() -> AiReviewSetContext {
+        AiReviewSetContext::new(
+            TreeHash::from_content("review-set"),
+            "Scope: diff vs main\nReview blocks: 1".to_string(),
+        )
+    }
+
     #[test]
     fn review_hint_prompt_contains_metadata_and_clipped_block_content() {
         let prompt = build_review_hint_prompt(&review_context("one\ntwo\nthree"), 2);
 
-        assert!(prompt.contains("Return exactly one concise sentence"));
+        assert!(prompt.contains("Return exactly two concise lines"));
+        assert!(prompt.contains("EXPLANATION:"));
+        assert!(prompt.contains("CHANGE:"));
         assert!(prompt.contains("Path: src/lib.rs"));
         assert!(prompt.contains("Language: Rust"));
         assert!(prompt.contains("Block kind: function"));
@@ -581,13 +954,44 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_normalization_keeps_only_first_sentence_for_modeline() {
+    fn suggestion_normalization_keeps_only_first_sentence_for_visible_change() {
         let suggestion = AiSuggestion::from_provider_text(
             "  consider asking why unwrap is safe. second sentence should not render. ",
         )
         .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
 
-        assert_eq!(suggestion.sentence, "consider asking why unwrap is safe.");
+        assert_eq!(
+            suggestion.proposed_change.as_deref(),
+            Some("consider asking why unwrap is safe.")
+        );
+    }
+
+    #[test]
+    fn structured_suggestion_parses_explanation_and_hides_no_change() {
+        let suggestion = AiSuggestion::from_provider_text(
+            "EXPLANATION: This validates user input before saving it.\nCHANGE: NONE",
+        )
+        .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
+
+        assert_eq!(
+            suggestion.explanation.as_deref(),
+            Some("This validates user input before saving it.")
+        );
+        assert_eq!(suggestion.proposed_change, None);
+        assert_eq!(suggestion.visible_sentence(), None);
+    }
+
+    #[test]
+    fn structured_suggestion_surfaces_only_concrete_change() {
+        let suggestion = AiSuggestion::from_provider_text(
+            "EXPLANATION: This loads cached review state.\nCHANGE: Handle corrupt cache files instead of silently dropping all review status. Extra sentence.",
+        )
+        .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
+
+        assert_eq!(
+            suggestion.visible_sentence(),
+            Some("Handle corrupt cache files instead of silently dropping all review status.")
+        );
     }
 
     #[test]
@@ -602,15 +1006,18 @@ mod tests {
 
     #[test]
     fn suggestion_request_key_includes_provider_model_and_context_limit() {
+        let review_set = review_set();
         let request = AiSuggestionRequest::new(
             AiProvider::Anthropic,
             "claude-3-5-haiku".to_string(),
+            review_set.clone(),
             review_context("fn checked() {}"),
             40,
         );
 
         assert_eq!(request.key.provider, AiProvider::Anthropic);
         assert_eq!(request.key.model, "claude-3-5-haiku");
+        assert_eq!(request.key.review_set_hash, review_set.review_set_hash);
         assert_eq!(request.key.path, "src/lib.rs");
         assert_eq!(request.key.start_line, 4);
         assert_eq!(request.key.end_line, 8);
@@ -622,6 +1029,7 @@ mod tests {
         let request = AiSuggestionRequest::new(
             AiProvider::CodexCli,
             "auto".to_string(),
+            review_set(),
             review_context("fn checked() {}"),
             80,
         );
@@ -637,10 +1045,10 @@ mod tests {
                 "exec",
                 "--sandbox",
                 "read-only",
-                "--ephemeral",
                 "--skip-git-repo-check",
                 "--color",
                 "never",
+                "--json",
                 "-c",
                 "model_reasoning_effort=\"low\"",
             ]
@@ -652,13 +1060,58 @@ mod tests {
                 .any(|arg| arg == "--output-last-message")
         );
         assert!(invocation.final_message_path.is_some());
+        assert_eq!(invocation.output_format, AiCliOutputFormat::CodexJson);
         assert!(!invocation.args.iter().any(|arg| arg == "--model"));
+        assert!(invocation.stdin.contains("Review-set context"));
+        assert!(invocation.stdin.contains("CHANGE: NONE"));
+        assert!(invocation.stdin.contains("fn checked() {}"));
+    }
+
+    #[test]
+    fn codex_resume_invocation_reuses_cached_session_without_resending_review_set_context() {
+        let request = AiSuggestionRequest::new(
+            AiProvider::CodexCli,
+            "auto".to_string(),
+            review_set(),
+            review_context("fn checked() {}"),
+            80,
+        );
+        let invocation = cli_invocation_for_request_with_session(
+            AiProvider::CodexCli,
+            "auto",
+            &request,
+            Some("session-123"),
+        )
+        .unwrap_or_else(|error| panic!("expected codex resume invocation: {error}"));
+
+        assert_eq!(invocation.program, "codex");
+        assert_eq!(invocation.args[0], "exec");
+        assert_eq!(invocation.args[1], "resume");
+        assert!(invocation.args.iter().any(|arg| arg == "session-123"));
         assert!(
             invocation
                 .stdin
-                .contains("return only the one-sentence review hint")
+                .contains("already provided in this conversation")
         );
-        assert!(invocation.stdin.contains("fn checked() {}"));
+        assert!(!invocation.stdin.contains("Scope: diff vs main"));
+    }
+
+    #[test]
+    fn json_session_extraction_reads_codex_and_claude_shapes() {
+        assert_eq!(
+            extract_session_id_from_json_text(
+                r#"{"type":"thread.started","thread_id":"codex-thread"}"#
+            )
+            .as_deref(),
+            Some("codex-thread")
+        );
+        assert_eq!(
+            extract_session_id_from_json_text(
+                r#"{"type":"result","session_id":"claude-session","result":"ok"}"#
+            )
+            .as_deref(),
+            Some("claude-session")
+        );
     }
 
     #[test]
@@ -666,6 +1119,7 @@ mod tests {
         let request = AiSuggestionRequest::new(
             AiProvider::ClaudeCli,
             "auto".to_string(),
+            review_set(),
             review_context("fn checked() {}"),
             80,
         );
@@ -675,7 +1129,8 @@ mod tests {
         };
 
         assert_eq!(invocation.program, "claude");
-        assert_eq!(invocation.args, vec!["--print", "--output-format", "text"]);
+        assert_eq!(invocation.args, vec!["--print", "--output-format", "json"]);
+        assert_eq!(invocation.output_format, AiCliOutputFormat::ClaudeJson);
         assert!(!invocation.args.iter().any(|arg| arg == "--model"));
     }
 
@@ -684,6 +1139,7 @@ mod tests {
         let request = AiSuggestionRequest::new(
             AiProvider::Anthropic,
             "auto".to_string(),
+            review_set(),
             review_context("fn checked() {}"),
             80,
         );
