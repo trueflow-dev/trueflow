@@ -3996,15 +3996,6 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         frame.render_stateful_widget(scrollbar, focus_layout.code, &mut scrollbar_state);
     }
 
-    if let Some(ai_hint_line) = ai_hint_line {
-        frame.render_widget(
-            Paragraph::new(ai_hint_line)
-                .alignment(Alignment::Left)
-                .style(Style::default().bg(palette.bg)),
-            focus_layout.ai_hint,
-        );
-    }
-
     let actions_paragraph = Paragraph::new(actions_lines)
         .alignment(Alignment::Center)
         .style(Style::default().bg(palette.bg));
@@ -4015,6 +4006,15 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         Paragraph::new(mode_banner_line).alignment(Alignment::Center),
         focus_layout.mode,
     );
+
+    if let Some(ai_hint_line) = ai_hint_line {
+        frame.render_widget(
+            Paragraph::new(ai_hint_line)
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(palette.bg)),
+            focus_layout.ai_hint,
+        );
+    }
 }
 
 fn build_render_content(
@@ -6303,25 +6303,25 @@ fn compute_focus_layout(area: Rect, header_lines: u16, show_ai_hint: bool) -> Fo
         height: code_height,
     };
 
-    let ai_hint = Rect {
-        x: content_left,
-        y: content_top + header_height + code_height,
-        width: code_width,
-        height: ai_hint_height,
-    };
-
     let actions = Rect {
         x: content_left,
-        y: content_top + header_height + code_height + ai_hint_height,
+        y: content_top + header_height + code_height,
         width: code_width,
         height: actions_height,
     };
 
     let mode = Rect {
         x: content_left,
-        y: content_top + header_height + code_height + ai_hint_height + actions_height,
+        y: content_top + header_height + code_height + actions_height,
         width: code_width,
         height: mode_height,
+    };
+
+    let ai_hint = Rect {
+        x: content_left,
+        y: content_top + header_height + code_height + actions_height + mode_height,
+        width: code_width,
+        height: ai_hint_height,
     };
 
     FocusLayout {
@@ -6391,7 +6391,7 @@ mod focus_layout_tests {
     }
 
     #[test]
-    fn focus_layout_places_ai_hint_between_code_and_actions() {
+    fn focus_layout_places_ai_hint_below_mode_banner() {
         let area = Rect {
             x: 0,
             y: 0,
@@ -6400,8 +6400,8 @@ mod focus_layout_tests {
         };
         let layout = compute_focus_layout(area, 1, true);
         assert_eq!(layout.ai_hint.height, 1);
-        assert_eq!(layout.ai_hint.y, layout.code.y + layout.code.height);
-        assert_eq!(layout.actions.y, layout.ai_hint.y + layout.ai_hint.height);
+        assert_eq!(layout.mode.y, layout.actions.y + layout.actions.height);
+        assert_eq!(layout.ai_hint.y, layout.mode.y + layout.mode.height);
     }
 
     #[test]
