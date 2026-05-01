@@ -6318,6 +6318,7 @@ struct FocusLayout {
 const ACTIONS_HEIGHT: u16 = 2;
 const AI_HINT_HEIGHT: u16 = 1;
 const MODE_BANNER_HEIGHT: u16 = 1;
+const CONTROLS_PADDING_HEIGHT: u16 = 1;
 
 fn compute_focus_layout(area: Rect, header_lines: u16, show_ai_hint: bool) -> FocusLayout {
     let code_width = area.width.min(120);
@@ -6334,13 +6335,20 @@ fn compute_focus_layout(area: Rect, header_lines: u16, show_ai_hint: bool) -> Fo
     } else {
         0
     };
-    let available_for_header_and_code = available_after_actions.saturating_sub(ai_hint_height);
+    let available_after_ai = available_after_actions.saturating_sub(ai_hint_height);
+    let controls_padding_height = CONTROLS_PADDING_HEIGHT.min(available_after_ai.saturating_sub(2));
+    let available_for_header_and_code = available_after_ai.saturating_sub(controls_padding_height);
     let min_header_height = 3.min(available_for_header_and_code);
     let desired_header_height = header_lines.saturating_add(2).max(min_header_height);
     let header_height = desired_header_height.min(available_for_header_and_code.saturating_sub(1));
     let code_height =
         desired_code_height.min(available_for_header_and_code.saturating_sub(header_height));
-    let total_height = header_height + code_height + ai_hint_height + actions_height + mode_height;
+    let total_height = header_height
+        + code_height
+        + controls_padding_height
+        + ai_hint_height
+        + actions_height
+        + mode_height;
 
     let content_top = area.y + (area.height.saturating_sub(total_height)) / 2;
     let content_left = area.x + (area.width.saturating_sub(code_width)) / 2;
@@ -6361,21 +6369,26 @@ fn compute_focus_layout(area: Rect, header_lines: u16, show_ai_hint: bool) -> Fo
 
     let actions = Rect {
         x: content_left,
-        y: content_top + header_height + code_height,
+        y: content_top + header_height + code_height + controls_padding_height,
         width: code_width,
         height: actions_height,
     };
 
     let mode = Rect {
         x: content_left,
-        y: content_top + header_height + code_height + actions_height,
+        y: content_top + header_height + code_height + controls_padding_height + actions_height,
         width: code_width,
         height: mode_height,
     };
 
     let ai_hint = Rect {
         x: content_left,
-        y: content_top + header_height + code_height + actions_height + mode_height,
+        y: content_top
+            + header_height
+            + code_height
+            + controls_padding_height
+            + actions_height
+            + mode_height,
         width: code_width,
         height: ai_hint_height,
     };
@@ -6432,6 +6445,18 @@ mod focus_layout_tests {
         let layout = compute_focus_layout(area, 3, false);
         assert_eq!(layout.mode.height, 1);
         assert_eq!(layout.mode.y, layout.actions.y + layout.actions.height);
+    }
+
+    #[test]
+    fn focus_layout_leaves_blank_row_between_code_and_actions_when_space_allows() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = compute_focus_layout(area, 3, false);
+        assert_eq!(layout.actions.y, layout.code.y + layout.code.height + 1);
     }
 
     #[test]
