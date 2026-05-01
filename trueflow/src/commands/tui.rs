@@ -652,6 +652,7 @@ struct AppState {
     input_mode: InputMode,
     input_buffer: String,
     input_cursor: InputCursor,
+    input_draft: Option<String>,
     editing_validation: Option<EditingValidation>,
     confirm_batch: BatchConfirmPolicy,
     repo_name: String,
@@ -754,7 +755,7 @@ impl TuiAiState {
         }
     }
 
-    fn modeline_text(&self) -> Option<String> {
+    fn hint_line_text(&self) -> Option<String> {
         match &self.status {
             TuiAiStatus::Availability => self.availability.as_ref().map(|availability| {
                 if self.provider.is_none()
@@ -762,18 +763,23 @@ impl TuiAiState {
                     && !matches!(provider, AiProvider::ClaudeCli | AiProvider::CodexCli)
                 {
                     return format!(
-                        "AI: unavailable ({} direct API suggestions not implemented; set provider = \"claude_cli\" or \"codex_cli\")",
+                        "Suggestion unavailable ({} direct API suggestions not implemented; set provider = \"claude_cli\" or \"codex_cli\")",
                         provider.label()
                     );
                 }
                 availability.modeline_text()
             }),
-            TuiAiStatus::Loading { .. } => Some("AI: loading…".to_string()),
-            TuiAiStatus::Suggestion { suggestion, .. } => {
-                Some(format!("AI: {}", suggestion.sentence))
-            }
-            TuiAiStatus::Error { message, .. } => Some(format!("AI: error ({message})")),
+            TuiAiStatus::Loading { .. } => Some("Loading suggestion…".to_string()),
+            TuiAiStatus::Suggestion { suggestion, .. } => Some(suggestion.sentence.clone()),
+            TuiAiStatus::Error { message, .. } => Some(format!("Suggestion error ({message})")),
         }
+    }
+
+    fn current_suggestion_sentence(&self) -> Option<&str> {
+        let TuiAiStatus::Suggestion { suggestion, .. } = &self.status else {
+            return None;
+        };
+        Some(suggestion.sentence.as_str())
     }
 
     fn ai_poll_deadline(&self) -> Option<Instant> {
@@ -1375,6 +1381,7 @@ fn build_review_state(
         input_mode: InputMode::Normal,
         input_buffer: String::new(),
         input_cursor: InputCursor::default(),
+        input_draft: None,
         editing_validation: None,
         confirm_batch: options.confirm_batch,
         repo_name: detect_repo_name(context),
@@ -2255,6 +2262,7 @@ fn handle_editing_key_action(
     match action {
         EditingKeyAction::Submit => EditingActionResult::Submit,
         EditingKeyAction::InsertNewline => {
+            discard_input_draft(state);
             if insert_text_at_input_cursor(state, "\n") {
                 EditingActionResult::Handled
             } else {
@@ -2270,7 +2278,8 @@ fn handle_editing_key_action(
             if cleared_validation {
                 clear_editing_validation(state);
             }
-            if delete_before_input_cursor(state) || cleared_validation {
+            if discard_input_draft(state) || delete_before_input_cursor(state) || cleared_validation
+            {
                 EditingActionResult::Handled
             } else {
                 EditingActionResult::Noop
@@ -2281,7 +2290,8 @@ fn handle_editing_key_action(
             if cleared_validation {
                 clear_editing_validation(state);
             }
-            if delete_after_input_cursor(state) || cleared_validation {
+            if discard_input_draft(state) || delete_after_input_cursor(state) || cleared_validation
+            {
                 EditingActionResult::Handled
             } else {
                 EditingActionResult::Noop
@@ -2295,7 +2305,7 @@ fn handle_editing_key_action(
             }
         }
         EditingKeyAction::MoveRight => {
-            if move_input_cursor_right(state) {
+            if accept_input_draft(state) || move_input_cursor_right(state) {
                 EditingActionResult::Handled
             } else {
                 EditingActionResult::Noop
@@ -2330,6 +2340,7 @@ fn handle_editing_key_action(
             }
         }
         EditingKeyAction::InsertChar(c) => {
+            discard_input_draft(state);
             let mut utf8 = [0u8; 4];
             if insert_text_at_input_cursor(state, c.encode_utf8(&mut utf8)) {
                 EditingActionResult::Handled
@@ -2415,11 +2426,30 @@ fn next_line_start(content: &str, current_line_end: usize) -> Option<usize> {
     (current_line_end < content.len()).then_some(current_line_end + 1)
 }
 
+fn accept_input_draft(state: &mut AppState) -> bool {
+    if !matches!(state.input_mode, InputMode::Editing { .. }) || !state.input_buffer.is_empty() {
+        return false;
+    }
+    let Some(draft) = state.input_draft.take() else {
+        return false;
+    };
+    state.input_buffer = draft;
+    state.input_cursor.offset = state.input_buffer.len();
+    state.input_cursor.clear_goal_column();
+    clear_editing_validation(state);
+    true
+}
+
+fn discard_input_draft(state: &mut AppState) -> bool {
+    state.input_draft.take().is_some()
+}
+
 fn insert_text_at_input_cursor(state: &mut AppState, inserted: &str) -> bool {
     if inserted.is_empty() {
         return false;
     }
 
+    discard_input_draft(state);
     state.input_cursor = state.input_cursor.clamped_to_buffer(&state.input_buffer);
     clear_editing_validation(state);
     state
@@ -3075,9 +3105,19 @@ fn handle_note_action(state: &mut AppState) -> Result<()> {
     );
     state.input_mode = InputMode::Editing { action };
     state.input_buffer.clear();
+    state.input_draft = current_comment_draft(state);
     state.input_cursor.reset();
     clear_editing_validation(state);
     Ok(())
+}
+
+fn current_comment_draft(state: &AppState) -> Option<String> {
+    state
+        .ai
+        .current_suggestion_sentence()
+        .map(str::trim)
+        .filter(|sentence| !sentence.is_empty())
+        .map(str::to_string)
 }
 
 fn handle_editing_submit(
@@ -3106,12 +3146,14 @@ where
             clear_editing_validation(state);
             if let Some(count) = batch_confirmation_count_for_action(state, &action) {
                 state.input_buffer.clear();
+                state.input_draft = None;
                 state.input_cursor.reset();
                 state.input_mode = InputMode::ConfirmBatch { action, count };
             } else {
                 on_action(action, state)?;
                 state.input_mode = InputMode::Normal;
                 state.input_buffer.clear();
+                state.input_draft = None;
                 state.input_cursor.reset();
             }
         }
@@ -3123,9 +3165,11 @@ fn handle_editing_cancel(state: &mut AppState) {
     clear_editing_validation(state);
     if state.input_buffer.is_empty() {
         state.input_mode = InputMode::Normal;
+        state.input_draft = None;
         state.input_cursor.reset();
     } else {
         state.input_buffer.clear();
+        state.input_draft = None;
         state.input_cursor.reset();
     }
 }
@@ -3140,11 +3184,13 @@ fn handle_confirm_batch(
         _ => return Ok(()),
     };
     state.input_mode = InputMode::Normal;
+    state.input_draft = None;
     execute_action(session, context, state, action)
 }
 
 fn handle_confirm_cancel(state: &mut AppState) {
     state.input_mode = InputMode::Normal;
+    state.input_draft = None;
 }
 
 fn execute_action(
@@ -4250,7 +4296,7 @@ fn build_mode_banner_line(state: &AppState, palette: &UiPalette) -> Line<'static
 }
 
 fn build_ai_hint_line(state: &AppState, palette: &UiPalette) -> Option<Line<'static>> {
-    state.ai.modeline_text().map(|text| {
+    state.ai.hint_line_text().map(|text| {
         Line::from(Span::styled(
             text,
             Style::default()
@@ -5748,13 +5794,15 @@ fn format_context_line(
 
 fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
     let overlay_width = input_overlay_width(area.width);
-    let (title, hints, content, cursor) = match &state.input_mode {
+    let (title, hints, content, draft, cursor) = match &state.input_mode {
         InputMode::Editing { .. } => {
             let content = state.input_buffer.clone();
+            let draft = state.input_draft.as_deref().filter(|_| content.is_empty());
             (
                 " Note ",
-                editing_overlay_hint(&content, state.editing_validation),
+                editing_overlay_hint(&content, draft, state.editing_validation),
                 content,
+                draft,
                 Some(state.input_cursor.clamped_to_buffer(&state.input_buffer)),
             )
         }
@@ -5766,8 +5814,9 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             );
             (
                 " Batch Action ",
-                "Enter to confirm • Esc to cancel",
+                "Enter to confirm • Esc to cancel".to_string(),
                 content,
+                None,
                 None,
             )
         }
@@ -5775,7 +5824,7 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
     };
     let popup_area = input_overlay_rect(
         area,
-        input_overlay_body_lines(&content, hints, overlay_width),
+        input_overlay_body_lines(&content, draft, &hints, overlay_width),
     );
     frame.render_widget(ratatui::widgets::Clear, popup_area);
 
@@ -5784,18 +5833,26 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
         .borders(ratatui::widgets::Borders::ALL)
         .style(Style::default().bg(palette.bg).fg(palette.fg));
     let inner_area = block.inner(popup_area);
-    let lines = input_overlay_lines(&content, hints, palette, inner_area.width);
+    let lines = input_overlay_lines(&content, draft, &hints, palette, inner_area.width);
 
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 
     if let Some(cursor) = cursor {
         let hint_lines = usize_to_u16_saturating(wrapped_editor_line_count(
-            hints,
+            &hints,
             usize::from(inner_area.width.max(1)),
         ));
         frame.set_cursor_position(editing_cursor_position(
             &content, cursor, inner_area, hint_lines,
         ));
+    }
+}
+
+fn visible_editor_text<'a>(content: &'a str, draft: Option<&'a str>) -> &'a str {
+    if content.is_empty() {
+        draft.unwrap_or(content)
+    } else {
+        content
     }
 }
 
@@ -5807,9 +5864,15 @@ fn input_overlay_width(area_width: u16) -> u16 {
     }
 }
 
-fn input_overlay_body_lines(content: &str, hints: &str, overlay_width: u16) -> u16 {
+fn input_overlay_body_lines(
+    content: &str,
+    draft: Option<&str>,
+    hints: &str,
+    overlay_width: u16,
+) -> u16 {
     let inner_width = usize::from(overlay_width.saturating_sub(2).max(1));
-    let body_lines = wrapped_editor_line_count(content, inner_width)
+    let editor_text = visible_editor_text(content, draft);
+    let body_lines = wrapped_editor_line_count(editor_text, inner_width)
         .saturating_add(1)
         .saturating_add(wrapped_editor_line_count(hints, inner_width));
     usize_to_u16_saturating(body_lines)
@@ -5899,15 +5962,23 @@ fn input_overlay_rect(area: Rect, body_lines: u16) -> Rect {
 
 fn input_overlay_lines(
     content: &str,
+    draft: Option<&str>,
     hints: &str,
     palette: &UiPalette,
     wrap_width: u16,
 ) -> Vec<Line<'static>> {
     let wrap_width = usize::from(wrap_width.max(1));
-    let mut lines = cell_wrapped_editor_lines(content, wrap_width)
-        .into_iter()
-        .map(Line::from)
-        .collect::<Vec<_>>();
+    let mut lines = if content.is_empty() {
+        cell_wrapped_editor_lines(visible_editor_text(content, draft), wrap_width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(palette.dim))))
+            .collect::<Vec<_>>()
+    } else {
+        cell_wrapped_editor_lines(content, wrap_width)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>()
+    };
     lines.push(Line::from(""));
     lines.extend(
         cell_wrapped_editor_lines(hints, wrap_width)
@@ -5946,13 +6017,20 @@ fn clear_editing_validation(state: &mut AppState) {
     state.editing_validation = None;
 }
 
-fn editing_overlay_hint(content: &str, validation: Option<EditingValidation>) -> &'static str {
+fn editing_overlay_hint(
+    content: &str,
+    draft: Option<&str>,
+    validation: Option<EditingValidation>,
+) -> String {
     if matches!(validation, Some(EditingValidation::NoteRequired)) {
-        "Note required • Type a note • Ctrl+J newline • Esc to cancel"
+        return "Note required • Type a note • Ctrl+J newline • Esc to cancel".to_string();
+    }
+    if content.trim().is_empty() && draft.is_some() {
+        "Right arrow to use suggestion • Type to discard • Enter to submit • Ctrl+J newline • Esc to cancel".to_string()
     } else if content.trim().is_empty() {
-        "Type a note • Enter to submit • Ctrl+J newline • Esc to cancel"
+        "Type a note • Enter to submit • Ctrl+J newline • Esc to cancel".to_string()
     } else {
-        "Enter to submit • Ctrl+J newline • Esc to cancel"
+        "Enter to submit • Ctrl+J newline • Esc to cancel".to_string()
     }
 }
 
@@ -6189,6 +6267,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: InputCursor::default(),
+            input_draft: None,
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -6258,6 +6337,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: InputCursor::default(),
+            input_draft: None,
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -6357,6 +6437,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: InputCursor::default(),
+            input_draft: None,
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -6450,6 +6531,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: InputCursor::default(),
+            input_draft: None,
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -6539,6 +6621,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: InputCursor::default(),
+            input_draft: None,
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Threshold(2),
             repo_name: "repo".to_string(),
@@ -6609,6 +6692,7 @@ mod diff_scope_tests {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: InputCursor::default(),
+            input_draft: None,
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
@@ -8086,6 +8170,7 @@ mod diff_scope_tests {
         };
         let body_lines = input_overlay_body_lines(
             &"x".repeat(200),
+            None,
             "Enter to submit • Ctrl+J newline • Esc to cancel",
             input_overlay_width(area.width),
         );
@@ -8115,6 +8200,7 @@ mod diff_scope_tests {
         };
         let body_lines = input_overlay_body_lines(
             &"x".repeat(200),
+            None,
             "Enter to confirm • Esc to cancel",
             input_overlay_width(area.width),
         );
@@ -8248,6 +8334,85 @@ mod diff_scope_tests {
             editing_key_action_for_event(&KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
             EditingKeyAction::Delete
         );
+    }
+
+    #[test]
+    fn handle_note_action_seeds_comment_draft_from_current_ai_suggestion() {
+        let file_path = temp_test_file_path("tui_ai_comment_draft");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: AiProvider::CodexCli,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        state.ai.status = TuiAiStatus::Suggestion {
+            key: request.key,
+            suggestion: AiSuggestion {
+                sentence: "Consider asking why this unwrap is safe.".to_string(),
+            },
+        };
+
+        handle_note_action(&mut state).unwrap_or_else(|error| panic!("open note: {error}"));
+
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert!(state.input_buffer.is_empty());
+        assert_eq!(
+            state.input_draft.as_deref(),
+            Some("Consider asking why this unwrap is safe.")
+        );
+    }
+
+    #[test]
+    fn handle_editing_key_action_right_arrow_accepts_comment_draft() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_draft = Some("Consider asking why this unwrap is safe.".to_string());
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::MoveRight),
+            EditingActionResult::Handled
+        );
+        assert_eq!(
+            state.input_buffer,
+            "Consider asking why this unwrap is safe."
+        );
+        assert!(state.input_draft.is_none());
+        assert_eq!(state.input_cursor.offset, state.input_buffer.len());
+    }
+
+    #[test]
+    fn handle_editing_key_action_typing_discards_comment_draft() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_draft = Some("draft text".to_string());
+
+        assert_eq!(
+            handle_editing_key_action(&mut state, EditingKeyAction::InsertChar('x')),
+            EditingActionResult::Handled
+        );
+        assert_eq!(state.input_buffer, "x");
+        assert!(state.input_draft.is_none());
     }
 
     #[test]
@@ -8440,10 +8605,10 @@ mod diff_scope_tests {
             width: 40,
             height: 12,
         };
-        let hints = editing_overlay_hint("hello", None);
+        let hints = editing_overlay_hint("hello", None, None);
         let popup_area = input_overlay_rect(
             area,
-            input_overlay_body_lines("hello", hints, input_overlay_width(area.width)),
+            input_overlay_body_lines("hello", None, &hints, input_overlay_width(area.width)),
         );
         let inner = UiBlock::default()
             .title(" Note ")
@@ -8542,6 +8707,7 @@ mod diff_scope_tests {
         let palette = UiPalette::default();
         let lines = input_overlay_lines(
             "first line\nsecond line",
+            None,
             "Enter to submit • Ctrl+J newline • Esc to cancel",
             &palette,
             80,
@@ -8557,10 +8723,34 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn input_overlay_lines_render_comment_draft_as_visible_editor_text() {
+        let palette = UiPalette::default();
+        let lines = input_overlay_lines(
+            "",
+            Some("Consider asking why this unwrap is safe."),
+            "Right arrow to use suggestion • Type to discard • Enter to submit",
+            &palette,
+            80,
+        );
+
+        assert_eq!(
+            lines[0].to_string(),
+            "Consider asking why this unwrap is safe."
+        );
+        assert_eq!(lines[1].to_string(), "");
+        assert!(
+            lines[2]
+                .to_string()
+                .contains("Right arrow to use suggestion")
+        );
+    }
+
+    #[test]
     fn input_overlay_lines_cell_wrap_long_note_content() {
         let palette = UiPalette::default();
         let lines = input_overlay_lines(
             "hello world",
+            None,
             "Enter to submit • Ctrl+J newline • Esc to cancel",
             &palette,
             8,
@@ -8602,15 +8792,19 @@ mod diff_scope_tests {
     #[test]
     fn editing_overlay_hint_allows_empty_note_input() {
         assert_eq!(
-            editing_overlay_hint("", None),
+            editing_overlay_hint("", None, None),
             "Type a note • Enter to submit • Ctrl+J newline • Esc to cancel"
         );
         assert_eq!(
-            editing_overlay_hint("note", None),
+            editing_overlay_hint("", Some("draft"), None),
+            "Right arrow to use suggestion • Type to discard • Enter to submit • Ctrl+J newline • Esc to cancel"
+        );
+        assert_eq!(
+            editing_overlay_hint("note", None, None),
             "Enter to submit • Ctrl+J newline • Esc to cancel"
         );
         assert_eq!(
-            editing_overlay_hint("", Some(EditingValidation::NoteRequired)),
+            editing_overlay_hint("", None, Some(EditingValidation::NoteRequired)),
             "Note required • Type a note • Ctrl+J newline • Esc to cancel"
         );
     }
@@ -9930,9 +10124,9 @@ mod diff_scope_tests {
         );
 
         assert_eq!(
-            state.modeline_text().as_deref(),
+            state.hint_line_text().as_deref(),
             Some(
-                "AI: unavailable (Anthropic direct API suggestions not implemented; set provider = \"claude_cli\" or \"codex_cli\")"
+                "Suggestion unavailable (Anthropic direct API suggestions not implemented; set provider = \"claude_cli\" or \"codex_cli\")"
             )
         );
     }
@@ -9998,7 +10192,7 @@ mod diff_scope_tests {
         );
         assert_eq!(
             build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
-            Some("AI: looks good — straightforward wrapper.".to_string())
+            Some("looks good — straightforward wrapper.".to_string())
         );
     }
 
@@ -10029,7 +10223,7 @@ mod diff_scope_tests {
         );
         assert_eq!(
             build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
-            Some("AI: loading…".to_string())
+            Some("Loading suggestion…".to_string())
         );
     }
 
