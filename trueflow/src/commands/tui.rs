@@ -644,6 +644,7 @@ struct AppState {
     initial_remaining_blocks: usize,
     remaining_blocks: usize,
     reviewable_nodes: HashSet<TreeNodeId>,
+    commented_nodes: HashSet<TreeNodeId>,
     diff_block_sides: HashMap<TreeNodeId, DiffBlockSides>,
     file_change_kinds: HashMap<TreeNodeId, FileChangeKind>,
     block_change_kinds: HashMap<TreeNodeId, BlockChangeKind>,
@@ -1344,6 +1345,7 @@ fn build_review_state(
         summary,
         tree,
         unreviewed_block_nodes,
+        commented_block_nodes,
         diff_block_sides,
         file_change_kinds,
         block_change_kinds,
@@ -1354,6 +1356,10 @@ fn build_review_state(
         .filter(|&id| matches!(tree.node(id).kind, TreeNodeKind::Block))
         .collect();
     let remaining_blocks = reviewable_nodes.len();
+    let commented_nodes = commented_block_nodes
+        .intersection(&reviewable_nodes)
+        .copied()
+        .collect::<HashSet<_>>();
 
     let root_children = tree.node(tree.root()).children.clone();
     let review_order = ReviewOrder::from_tree(&tree, &unreviewed_block_nodes);
@@ -1386,6 +1392,7 @@ fn build_review_state(
         initial_remaining_blocks: remaining_blocks,
         remaining_blocks,
         reviewable_nodes,
+        commented_nodes,
         diff_block_sides,
         file_change_kinds,
         block_change_kinds,
@@ -2960,6 +2967,7 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
 
     let previous_remaining = state.reviewable_nodes.len();
     state.reviewable_nodes.remove(&node_id);
+    let parent_was_commented = state.commented_nodes.remove(&node_id);
 
     let inserted_ids = state
         .navigator
@@ -2971,6 +2979,9 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
 
     for child_id in &inserted_ids {
         state.reviewable_nodes.insert(*child_id);
+        if parent_was_commented {
+            state.commented_nodes.insert(*child_id);
+        }
     }
     state.navigator.reveal_blocks(inserted_ids.iter().copied());
     refresh_review_state_after_refinement(state, previous_remaining);
@@ -3591,7 +3602,8 @@ fn apply_action_locally(
 
     let mut removed_reviewable = 0;
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
-        for block_id in block_ids {
+        for &block_id in &block_ids {
+            state.commented_nodes.remove(&block_id);
             if state.navigator.remove_visible(block_id) && state.reviewable_nodes.remove(&block_id)
             {
                 removed_reviewable += 1;
@@ -3603,6 +3615,11 @@ fn apply_action_locally(
     state.navigator.prune_visible_to_block_ancestors();
 
     if matches!(verdict, Verdict::Comment) {
+        for &block_id in &block_ids {
+            if state.reviewable_nodes.contains(&block_id) {
+                state.commented_nodes.insert(block_id);
+            }
+        }
         sync_speed_read_focus(state);
         return ActionImpact {
             affected_blocks,
@@ -4697,34 +4714,73 @@ fn format_key_action(key: char, label: &str) -> String {
     }
 }
 
-fn footer_progress_counts(state: &AppState) -> (usize, usize) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FooterProgressCounts {
+    reviewed: usize,
+    commented: usize,
+    remaining: usize,
+    total: usize,
+}
+
+fn footer_progress_counts(state: &AppState) -> FooterProgressCounts {
     let total = state.initial_remaining_blocks;
     let reviewed = total.saturating_sub(state.remaining_blocks);
-    (reviewed, total)
+    // Commented blocks are still reviewable; `commented` is a highlighted subset of `remaining`.
+    let commented = state
+        .commented_nodes
+        .intersection(&state.reviewable_nodes)
+        .count();
+
+    FooterProgressCounts {
+        reviewed,
+        commented,
+        remaining: state.remaining_blocks,
+        total,
+    }
 }
 
 fn footer_progress_ratio(state: &AppState) -> f64 {
-    let (reviewed, total) = footer_progress_counts(state);
-    if total > 0 {
-        reviewed as f64 / total as f64
+    let counts = footer_progress_counts(state);
+    if counts.total > 0 {
+        counts.reviewed as f64 / counts.total as f64
     } else {
         1.0
     }
 }
 
+fn footer_progress_line(state: &AppState, palette: &UiPalette) -> Line<'static> {
+    let counts = footer_progress_counts(state);
+    let label_bg = Style::default().bg(palette.bg);
+    Line::from(vec![
+        Span::styled(
+            format!("{} reviewed", counts.reviewed),
+            label_bg.fg(palette.add),
+        ),
+        Span::styled(" · ", label_bg.fg(palette.dim)),
+        Span::styled(
+            format!("{} commented", counts.commented),
+            label_bg.fg(palette.orange),
+        ),
+        Span::styled(" · ", label_bg.fg(palette.dim)),
+        Span::styled(
+            format!("{} remaining", counts.remaining),
+            label_bg.fg(palette.yellow),
+        ),
+    ])
+}
+
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
-    let ratio = footer_progress_ratio(state);
-    let (reviewed, total) = footer_progress_counts(state);
-
-    let label = format!(" {reviewed}/{total} reviewed ");
-
     let gauge = Gauge::default()
         .block(UiBlock::default().borders(ratatui::widgets::Borders::NONE))
         .gauge_style(Style::default().fg(palette.add).bg(palette.bg))
-        .ratio(ratio)
-        .label(Span::styled(label, Style::default().fg(palette.fg)));
+        .ratio(footer_progress_ratio(state))
+        .label(Span::raw(""));
 
     frame.render_widget(gauge, area);
+    frame.render_widget(
+        Paragraph::new(footer_progress_line(state, palette)).alignment(Alignment::Right),
+        area,
+    );
 }
 
 fn render_recap_view(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -6460,6 +6516,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 0,
             remaining_blocks: 0,
             reviewable_nodes: HashSet::new(),
+            commented_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6530,6 +6587,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 1,
             remaining_blocks: 1,
             reviewable_nodes: visible,
+            commented_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6630,6 +6688,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 2,
             remaining_blocks: 2,
             reviewable_nodes: visible,
+            commented_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6724,6 +6783,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: 1,
             remaining_blocks: 1,
             reviewable_nodes: visible,
+            commented_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6814,6 +6874,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: visible.len(),
             remaining_blocks: visible.len(),
             reviewable_nodes: visible,
+            commented_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6885,6 +6946,7 @@ mod diff_scope_tests {
             initial_remaining_blocks: visible.len(),
             remaining_blocks: visible.len(),
             reviewable_nodes: visible,
+            commented_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -7983,6 +8045,7 @@ mod diff_scope_tests {
             },
             tree,
             unreviewed_block_nodes: HashSet::from([block_id]),
+            commented_block_nodes: HashSet::from([block_id]),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -8013,6 +8076,7 @@ mod diff_scope_tests {
         assert_eq!(state.focus_block, Some(block_id));
         assert!(state.pending_focus_scroll);
         assert_eq!(state.root_cursor, Some(src));
+        assert!(state.commented_nodes.contains(&block_id));
         assert_ne!(state.navigator.current_id(), state.navigator.tree.root());
     }
 
@@ -11297,9 +11361,12 @@ mod diff_scope_tests {
         state.initial_remaining_blocks = 1;
         state.remaining_blocks = 1;
 
-        let (reviewed, total) = footer_progress_counts(&state);
+        let counts = footer_progress_counts(&state);
 
-        assert_eq!((reviewed, total), (0, 1));
+        assert_eq!(counts.reviewed, 0);
+        assert_eq!(counts.commented, 0);
+        assert_eq!(counts.remaining, 1);
+        assert_eq!(counts.total, 1);
     }
 
     #[test]
@@ -11310,10 +11377,53 @@ mod diff_scope_tests {
         state.remaining_blocks = 0;
 
         let ratio = footer_progress_ratio(&state);
-        let (reviewed, total) = footer_progress_counts(&state);
+        let counts = footer_progress_counts(&state);
 
-        assert_eq!((reviewed, total), (1, 1));
+        assert_eq!(counts.reviewed, 1);
+        assert_eq!(counts.commented, 0);
+        assert_eq!(counts.remaining, 0);
+        assert_eq!(counts.total, 1);
         assert!((ratio - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn footer_progress_counts_commented_blocks_as_still_remaining() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        let first_block = block_ids[0];
+
+        execute_action_with(
+            &mut state,
+            PendingAction::Single {
+                node_id: first_block,
+                verdict: Verdict::Comment,
+                note: Some("note".to_string()),
+            },
+            |_params| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("expected comment action to succeed: {error}"));
+
+        let counts = footer_progress_counts(&state);
+
+        assert_eq!(counts.reviewed, 0);
+        assert_eq!(counts.commented, 1);
+        assert_eq!(counts.remaining, 2);
+        assert_eq!(counts.total, 2);
+    }
+
+    #[test]
+    fn footer_progress_line_formats_review_comment_and_remaining_counts() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        state.reviewable_nodes.remove(&block_ids[0]);
+        state.remaining_blocks = 1;
+        state.commented_nodes.insert(block_ids[1]);
+        let palette = UiPalette::default();
+
+        let line = footer_progress_line(&state, &palette);
+
+        assert_eq!(line.to_string(), "1 reviewed · 1 commented · 1 remaining");
+        assert_eq!(line.spans[0].style.fg, Some(palette.add));
+        assert_eq!(line.spans[2].style.fg, Some(palette.orange));
+        assert_eq!(line.spans[4].style.fg, Some(palette.yellow));
     }
 
     #[test]
@@ -11523,6 +11633,8 @@ struct UiPalette {
     dim: Color,
     add: Color,
     del: Color,
+    orange: Color,
+    yellow: Color,
     keyword: Color,
     string: Color,
     number: Color,
@@ -11542,6 +11654,8 @@ impl Default for UiPalette {
             dim: Color::Rgb(146, 131, 116),
             add: Color::Rgb(184, 187, 38),
             del: Color::Rgb(251, 73, 52),
+            orange: Color::Rgb(214, 93, 14),
+            yellow: Color::Rgb(215, 153, 33),
             keyword: Color::Rgb(69, 133, 136),
             string: Color::Rgb(215, 153, 33),
             number: Color::Rgb(177, 98, 134),

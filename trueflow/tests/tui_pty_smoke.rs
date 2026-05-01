@@ -230,11 +230,14 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
         }
     });
 
-    wait_for_output(
+    wait_for_screen_predicate(
         &output,
-        "0/1 reviewed",
+        rows,
+        cols,
+        "to show initial progress counts",
         Duration::from_secs(10),
         &mut *child,
+        |screen| screen.contains("0 reviewed · 0 commented · 1 remaining"),
     )?;
     send_and_flush(&mut *writer, b"c")?;
     wait_for_output(&output, "Type a note", Duration::from_secs(5), &mut *child)?;

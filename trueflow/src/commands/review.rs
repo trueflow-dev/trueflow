@@ -95,6 +95,7 @@ pub struct CollectedReview {
     pub summary: ReviewSummary,
     pub tree: tree::Tree,
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
+    pub commented_block_nodes: HashSet<tree::TreeNodeId>,
     pub diff_block_sides: HashMap<tree::TreeNodeId, DiffBlockSides>,
     pub file_change_kinds: HashMap<tree::TreeNodeId, FileChangeKind>,
     pub block_change_kinds: HashMap<tree::TreeNodeId, BlockChangeKind>,
@@ -318,6 +319,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     let mut unreviewed_files = Vec::new();
     let mut total_blocks = 0;
     let mut unreviewed_block_nodes = HashSet::new();
+    let mut commented_block_nodes = HashSet::new();
 
     for file in files {
         if !query.path_selection.includes(&file.path) {
@@ -372,9 +374,8 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         let mut unreviewed_blocks = Vec::new();
         for (block, node_id) in reviewable_blocks {
             let block_coverage = coverage.block(&file.path, &block);
-            if block_coverage.effective_latest_verdict_for(&review_check)
-                == Some(&Verdict::Approved)
-            {
+            let effective_verdict = block_coverage.effective_latest_verdict_for(&review_check);
+            if effective_verdict == Some(&Verdict::Approved) {
                 continue;
             }
 
@@ -395,6 +396,9 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
 
             if let Some(node_id) = node_id {
                 unreviewed_block_nodes.insert(node_id);
+                if effective_verdict == Some(&Verdict::Comment) {
+                    commented_block_nodes.insert(node_id);
+                }
             }
             unreviewed_blocks.push(block);
         }
@@ -426,6 +430,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         },
         tree,
         unreviewed_block_nodes,
+        commented_block_nodes,
         diff_block_sides: HashMap::new(),
         file_change_kinds: HashMap::new(),
         block_change_kinds: HashMap::new(),
@@ -453,6 +458,7 @@ fn collect_diff_scoped_review(
     let mut unreviewed_files = Vec::new();
     let mut total_blocks = 0usize;
     let mut unreviewed_block_nodes = HashSet::new();
+    let mut commented_block_nodes = HashSet::new();
 
     for file in review_files {
         let Some(file_node_id) = tree.find_by_path(file.path.as_str()) else {
@@ -481,9 +487,9 @@ fn collect_diff_scoped_review(
             }
             total_blocks += 1;
             let block_coverage = coverage.block(&file.path, &display_block);
-            if block_coverage.effective_latest_verdict_for(diff_context.review_check)
-                == Some(&Verdict::Approved)
-            {
+            let effective_verdict =
+                block_coverage.effective_latest_verdict_for(diff_context.review_check);
+            if effective_verdict == Some(&Verdict::Approved) {
                 continue;
             }
 
@@ -503,6 +509,9 @@ fn collect_diff_scoped_review(
             }
 
             unreviewed_block_nodes.insert(node_id);
+            if effective_verdict == Some(&Verdict::Comment) {
+                commented_block_nodes.insert(node_id);
+            }
             unreviewed_blocks.push(display_block);
         }
 
@@ -533,6 +542,7 @@ fn collect_diff_scoped_review(
         },
         tree,
         unreviewed_block_nodes,
+        commented_block_nodes,
         diff_block_sides,
         file_change_kinds,
         block_change_kinds,
