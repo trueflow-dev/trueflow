@@ -52,9 +52,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block as UiBlock, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Block as UiBlock, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -721,6 +719,7 @@ struct AppState {
     remaining_blocks: usize,
     reviewable_nodes: HashSet<TreeNodeId>,
     commented_nodes: HashSet<TreeNodeId>,
+    skipped_nodes: HashSet<TreeNodeId>,
     diff_block_sides: HashMap<TreeNodeId, DiffBlockSides>,
     file_change_kinds: HashMap<TreeNodeId, FileChangeKind>,
     block_change_kinds: HashMap<TreeNodeId, BlockChangeKind>,
@@ -1472,6 +1471,7 @@ fn build_review_state(
         remaining_blocks,
         reviewable_nodes,
         commented_nodes,
+        skipped_nodes: HashSet::new(),
         diff_block_sides,
         file_change_kinds,
         block_change_kinds,
@@ -3092,6 +3092,7 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
     let previous_remaining = state.reviewable_nodes.len();
     state.reviewable_nodes.remove(&node_id);
     let parent_was_commented = state.commented_nodes.remove(&node_id);
+    let parent_was_skipped = state.skipped_nodes.remove(&node_id);
 
     let inserted_ids = state
         .navigator
@@ -3105,6 +3106,8 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
         state.reviewable_nodes.insert(*child_id);
         if parent_was_commented {
             state.commented_nodes.insert(*child_id);
+        } else if parent_was_skipped {
+            state.skipped_nodes.insert(*child_id);
         }
     }
     state.navigator.reveal_blocks(inserted_ids.iter().copied());
@@ -3163,12 +3166,22 @@ fn handle_prev(state: &mut AppState) {
     sync_speed_read_focus(state);
 }
 
+fn mark_focused_block_temporarily_skipped(state: &mut AppState) {
+    let Some(block_id) = state.focus_block else {
+        return;
+    };
+    if state.reviewable_nodes.contains(&block_id) && !state.commented_nodes.contains(&block_id) {
+        state.skipped_nodes.insert(block_id);
+    }
+}
+
 fn handle_next(state: &mut AppState) {
     if state.navigator.current_id() == state.navigator.tree.root() {
         handle_child(state);
         return;
     }
 
+    mark_focused_block_temporarily_skipped(state);
     state.navigator.move_next();
     state.scroll_offset = 0;
     set_focus_for_current_node(state, None);
@@ -3728,6 +3741,7 @@ fn apply_action_locally(
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
         for &block_id in &block_ids {
             state.commented_nodes.remove(&block_id);
+            state.skipped_nodes.remove(&block_id);
             if state.navigator.remove_visible(block_id) && state.reviewable_nodes.remove(&block_id)
             {
                 removed_reviewable += 1;
@@ -3741,6 +3755,7 @@ fn apply_action_locally(
     if matches!(verdict, Verdict::Comment) {
         for &block_id in &block_ids {
             if state.reviewable_nodes.contains(&block_id) {
+                state.skipped_nodes.remove(&block_id);
                 state.commented_nodes.insert(block_id);
             }
         }
@@ -3795,7 +3810,11 @@ fn compute_manual_next_review_target(state: &AppState) -> Option<TreeNodeId> {
 }
 
 fn handle_advance_review_target(state: &mut AppState) {
-    let Some(next_id) = compute_manual_next_review_target(state) else {
+    let next_id = compute_manual_next_review_target(state);
+    if next_id != state.focus_block {
+        mark_focused_block_temporarily_skipped(state);
+    }
+    let Some(next_id) = next_id else {
         return;
     };
 
@@ -4842,27 +4861,44 @@ fn format_key_action(key: char, label: &str) -> String {
 struct FooterProgressCounts {
     reviewed: usize,
     commented: usize,
+    skipped: usize,
     remaining: usize,
     total: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FooterProgressBarWidths {
+    commented: u16,
+    skipped: u16,
+    reviewed: u16,
+    empty: u16,
 }
 
 fn footer_progress_counts(state: &AppState) -> FooterProgressCounts {
     let total = state.initial_remaining_blocks;
     let reviewed = total.saturating_sub(state.remaining_blocks);
-    // Commented blocks are still reviewable; `commented` is a highlighted subset of `remaining`.
+    // Commented and skipped blocks are still reviewable; both are highlighted subsets of
+    // `remaining`, with comments taking visual precedence over skip state.
     let commented = state
         .commented_nodes
         .intersection(&state.reviewable_nodes)
+        .count();
+    let skipped = state
+        .skipped_nodes
+        .intersection(&state.reviewable_nodes)
+        .filter(|node_id| !state.commented_nodes.contains(node_id))
         .count();
 
     FooterProgressCounts {
         reviewed,
         commented,
+        skipped,
         remaining: state.remaining_blocks,
         total,
     }
 }
 
+#[cfg(test)]
 fn footer_progress_ratio(state: &AppState) -> f64 {
     let counts = footer_progress_counts(state);
     if counts.total > 0 {
@@ -4872,10 +4908,71 @@ fn footer_progress_ratio(state: &AppState) -> f64 {
     }
 }
 
+fn footer_progress_bar_widths(counts: FooterProgressCounts, width: u16) -> FooterProgressBarWidths {
+    if width == 0 {
+        return FooterProgressBarWidths {
+            commented: 0,
+            skipped: 0,
+            reviewed: 0,
+            empty: 0,
+        };
+    }
+    if counts.total == 0 {
+        return FooterProgressBarWidths {
+            commented: 0,
+            skipped: 0,
+            reviewed: width,
+            empty: 0,
+        };
+    }
+
+    let commented_count = counts.commented.min(counts.total);
+    let skipped_count = counts
+        .skipped
+        .min(counts.total.saturating_sub(commented_count));
+    let reviewed_count = counts.reviewed.min(
+        counts
+            .total
+            .saturating_sub(commented_count.saturating_add(skipped_count)),
+    );
+    let commented_end = scaled_footer_progress_width(commented_count, counts.total, width);
+    let skipped_end = scaled_footer_progress_width(
+        commented_count.saturating_add(skipped_count),
+        counts.total,
+        width,
+    )
+    .max(commented_end);
+    let reviewed_end = scaled_footer_progress_width(
+        commented_count
+            .saturating_add(skipped_count)
+            .saturating_add(reviewed_count),
+        counts.total,
+        width,
+    )
+    .max(skipped_end);
+
+    FooterProgressBarWidths {
+        commented: commented_end,
+        skipped: skipped_end.saturating_sub(commented_end),
+        reviewed: reviewed_end.saturating_sub(skipped_end),
+        empty: width.saturating_sub(reviewed_end),
+    }
+}
+
+fn scaled_footer_progress_width(count: usize, total: usize, width: u16) -> u16 {
+    if total == 0 {
+        return width;
+    }
+    let count = count.min(total) as u128;
+    let total = total as u128;
+    let width = u128::from(width);
+    u16::try_from((count * width + (total / 2)) / total).unwrap_or(u16::MAX)
+}
+
 fn footer_progress_line(state: &AppState, palette: &UiPalette) -> Line<'static> {
     let counts = footer_progress_counts(state);
     let label_bg = Style::default().bg(palette.bg);
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("{} reviewed", counts.reviewed),
             label_bg.fg(palette.add),
@@ -4886,25 +4983,94 @@ fn footer_progress_line(state: &AppState, palette: &UiPalette) -> Line<'static> 
             label_bg.fg(palette.orange),
         ),
         Span::styled(" · ", label_bg.fg(palette.dim)),
-        Span::styled(
-            format!("{} remaining", counts.remaining),
-            label_bg.fg(palette.yellow),
-        ),
-    ])
+    ];
+    if counts.skipped > 0 {
+        spans.push(Span::styled(
+            format!("{} skipped", counts.skipped),
+            label_bg.fg(palette.dim),
+        ));
+        spans.push(Span::styled(" · ", label_bg.fg(palette.dim)));
+    }
+    spans.push(Span::styled(
+        format!("{} remaining", counts.remaining),
+        label_bg.fg(palette.yellow),
+    ));
+    Line::from(spans)
+}
+
+fn render_footer_progress_bar(
+    frame: &mut Frame,
+    counts: FooterProgressCounts,
+    area: Rect,
+    palette: &UiPalette,
+) {
+    let widths = footer_progress_bar_widths(counts, area.width);
+    let commented_end = widths.commented;
+    let skipped_end = commented_end.saturating_add(widths.skipped);
+    let reviewed_end = skipped_end.saturating_add(widths.reviewed);
+    let buffer = frame.buffer_mut();
+    let bottom = area.y.saturating_add(area.height);
+    let right = area.x.saturating_add(area.width);
+    for row in area.y..bottom {
+        for column in area.x..right {
+            let offset = column.saturating_sub(area.x);
+            let segment_color = if offset < commented_end {
+                Some(palette.orange)
+            } else if offset < skipped_end {
+                Some(palette.context)
+            } else if offset < reviewed_end {
+                Some(palette.add)
+            } else {
+                None
+            };
+            let Some(cell) = buffer.cell_mut((column, row)) else {
+                continue;
+            };
+            match segment_color {
+                Some(color) => {
+                    cell.set_symbol("█").set_fg(color).set_bg(palette.bg);
+                }
+                None => {
+                    cell.set_symbol(" ").set_bg(palette.bg);
+                }
+            }
+        }
+    }
+}
+
+fn render_right_aligned_line(frame: &mut Frame, area: Rect, line: &Line<'_>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text_width = UnicodeWidthStr::width(line.to_string().as_str());
+    let text_width = u16::try_from(text_width).unwrap_or(u16::MAX);
+    let mut x = area.x.saturating_add(area.width.saturating_sub(text_width));
+    let y = area.y;
+    let right = area.x.saturating_add(area.width);
+    let buffer = frame.buffer_mut();
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width == 0 {
+                continue;
+            }
+            if x >= right {
+                return;
+            }
+            let symbol = ch.to_string();
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_symbol(&symbol).set_style(span.style);
+            }
+            x = x.saturating_add(u16::try_from(width).unwrap_or(u16::MAX));
+        }
+    }
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
-    let gauge = Gauge::default()
-        .block(UiBlock::default().borders(ratatui::widgets::Borders::NONE))
-        .gauge_style(Style::default().fg(palette.add).bg(palette.bg))
-        .ratio(footer_progress_ratio(state))
-        .label(Span::raw(""));
-
-    frame.render_widget(gauge, area);
-    frame.render_widget(
-        Paragraph::new(footer_progress_line(state, palette)).alignment(Alignment::Right),
-        area,
-    );
+    let counts = footer_progress_counts(state);
+    render_footer_progress_bar(frame, counts, area, palette);
+    let line = footer_progress_line(state, palette);
+    render_right_aligned_line(frame, area, &line);
 }
 
 fn render_recap_view(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -6666,6 +6832,7 @@ mod diff_scope_tests {
             remaining_blocks: 0,
             reviewable_nodes: HashSet::new(),
             commented_nodes: HashSet::new(),
+            skipped_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6737,6 +6904,7 @@ mod diff_scope_tests {
             remaining_blocks: 1,
             reviewable_nodes: visible,
             commented_nodes: HashSet::new(),
+            skipped_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6838,6 +7006,7 @@ mod diff_scope_tests {
             remaining_blocks: 2,
             reviewable_nodes: visible,
             commented_nodes: HashSet::new(),
+            skipped_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -6933,6 +7102,7 @@ mod diff_scope_tests {
             remaining_blocks: 1,
             reviewable_nodes: visible,
             commented_nodes: HashSet::new(),
+            skipped_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -7024,6 +7194,7 @@ mod diff_scope_tests {
             remaining_blocks: visible.len(),
             reviewable_nodes: visible,
             commented_nodes: HashSet::new(),
+            skipped_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -7096,6 +7267,7 @@ mod diff_scope_tests {
             remaining_blocks: visible.len(),
             reviewable_nodes: visible,
             commented_nodes: HashSet::new(),
+            skipped_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -11485,6 +11657,54 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn handle_advance_review_target_marks_current_block_temporarily_skipped() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        let first_block = block_ids[0];
+        state.navigator.set_current(first_block);
+        state.focus_block = Some(first_block);
+
+        handle_advance_review_target(&mut state);
+
+        assert!(state.skipped_nodes.contains(&first_block));
+        let counts = footer_progress_counts(&state);
+        assert_eq!(counts.skipped, 1);
+        assert_eq!(counts.remaining, 2);
+    }
+
+    #[test]
+    fn handle_next_marks_current_block_temporarily_skipped() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        let first_block = block_ids[0];
+        state.navigator.set_current(first_block);
+        state.focus_block = Some(first_block);
+
+        handle_next(&mut state);
+
+        assert!(state.skipped_nodes.contains(&first_block));
+    }
+
+    #[test]
+    fn comment_action_clears_temporary_skip_state() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(1);
+        let block_id = block_ids[0];
+        state.skipped_nodes.insert(block_id);
+
+        execute_action_with(
+            &mut state,
+            PendingAction::Single {
+                node_id: block_id,
+                verdict: Verdict::Comment,
+                note: Some("note".to_string()),
+            },
+            |_params| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("expected comment action to succeed: {error}"));
+
+        assert!(!state.skipped_nodes.contains(&block_id));
+        assert!(state.commented_nodes.contains(&block_id));
+    }
+
+    #[test]
     fn batch_confirmation_threshold_defaults_to_skipping_single_sub_block_batch_actions() {
         let (state, file_id, _block_ids) = build_state_with_file_block_count(1);
         let action = PendingAction::from_node(&state.navigator.tree, file_id, Verdict::Approved);
@@ -11818,6 +12038,7 @@ mod diff_scope_tests {
 
         assert_eq!(counts.reviewed, 0);
         assert_eq!(counts.commented, 0);
+        assert_eq!(counts.skipped, 0);
         assert_eq!(counts.remaining, 1);
         assert_eq!(counts.total, 1);
     }
@@ -11834,6 +12055,7 @@ mod diff_scope_tests {
 
         assert_eq!(counts.reviewed, 1);
         assert_eq!(counts.commented, 0);
+        assert_eq!(counts.skipped, 0);
         assert_eq!(counts.remaining, 0);
         assert_eq!(counts.total, 1);
         assert!((ratio - 1.0).abs() < f64::EPSILON);
@@ -11859,6 +12081,7 @@ mod diff_scope_tests {
 
         assert_eq!(counts.reviewed, 0);
         assert_eq!(counts.commented, 1);
+        assert_eq!(counts.skipped, 0);
         assert_eq!(counts.remaining, 2);
         assert_eq!(counts.total, 2);
     }
@@ -11877,6 +12100,70 @@ mod diff_scope_tests {
         assert_eq!(line.spans[0].style.fg, Some(palette.add));
         assert_eq!(line.spans[2].style.fg, Some(palette.orange));
         assert_eq!(line.spans[4].style.fg, Some(palette.yellow));
+    }
+
+    #[test]
+    fn footer_progress_line_includes_skipped_count_when_present() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(3);
+        state.reviewable_nodes.remove(&block_ids[0]);
+        state.remaining_blocks = 2;
+        state.commented_nodes.insert(block_ids[1]);
+        state.skipped_nodes.insert(block_ids[2]);
+        let palette = UiPalette::default();
+
+        let line = footer_progress_line(&state, &palette);
+
+        assert_eq!(
+            line.to_string(),
+            "1 reviewed · 1 commented · 1 skipped · 2 remaining"
+        );
+        assert_eq!(line.spans[4].style.fg, Some(palette.dim));
+    }
+
+    #[test]
+    fn footer_progress_bar_widths_stack_comment_skip_and_review_segments() {
+        let counts = FooterProgressCounts {
+            reviewed: 2,
+            commented: 1,
+            skipped: 1,
+            remaining: 2,
+            total: 4,
+        };
+
+        let widths = footer_progress_bar_widths(counts, 20);
+
+        assert_eq!(
+            widths,
+            FooterProgressBarWidths {
+                commented: 5,
+                skipped: 5,
+                reviewed: 10,
+                empty: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn footer_progress_bar_widths_leave_empty_space_for_unseen_remaining_blocks() {
+        let counts = FooterProgressCounts {
+            reviewed: 1,
+            commented: 1,
+            skipped: 1,
+            remaining: 4,
+            total: 5,
+        };
+
+        let widths = footer_progress_bar_widths(counts, 20);
+
+        assert_eq!(
+            widths,
+            FooterProgressBarWidths {
+                commented: 4,
+                skipped: 4,
+                reviewed: 4,
+                empty: 8,
+            }
+        );
     }
 
     #[test]
