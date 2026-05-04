@@ -717,6 +717,7 @@ enum TuiAiStatus {
     Availability,
     Loading {
         key: AiSuggestionKey,
+        frame: usize,
     },
     Suggestion {
         key: AiSuggestionKey,
@@ -773,8 +774,10 @@ impl TuiAiState {
                 }
                 availability.modeline_text()
             }),
-            TuiAiStatus::Loading { .. } => Some("Loading suggestion…".to_string()),
-            TuiAiStatus::Suggestion { suggestion, .. } => suggestion.visible_sentence().map(str::to_string),
+            TuiAiStatus::Loading { frame, .. } => Some(ai_loading_hint_text(*frame).to_string()),
+            TuiAiStatus::Suggestion { suggestion, .. } => {
+                suggestion.visible_sentence().map(str::to_string)
+            }
             TuiAiStatus::Error { message, .. } => Some(format!("Suggestion error ({message})")),
         }
     }
@@ -783,13 +786,13 @@ impl TuiAiState {
         let TuiAiStatus::Suggestion { suggestion, .. } = &self.status else {
             return None;
         };
-        suggestion.visible_sentence()
+        suggestion.proposed_change_sentence()
     }
 
     fn ai_poll_deadline(&self) -> Option<Instant> {
         self.pending
             .as_ref()
-            .map(|_| Instant::now() + Duration::from_millis(50))
+            .map(|_| Instant::now() + AI_LOADING_FRAME_INTERVAL)
     }
 }
 
@@ -2003,6 +2006,9 @@ fn refresh_ai_suggestion_state(state: &mut AppState) -> bool {
     if ensure_ai_suggestion_for_current_focus(state) {
         changed = true;
     }
+    if !changed && advance_ai_loading_frame(state) {
+        changed = true;
+    }
     changed
 }
 
@@ -2091,7 +2097,25 @@ fn ensure_ai_suggestion_for_current_focus(state: &mut AppState) -> bool {
         key: key.clone(),
         receiver,
     });
-    state.ai.status = TuiAiStatus::Loading { key };
+    state.ai.status = TuiAiStatus::Loading { key, frame: 0 };
+    true
+}
+
+const AI_LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(160);
+const AI_LOADING_HINT_FRAMES: &[&str] = &["✦ · ·", "· ✧ ·", "· · ✦", "· ✧ ·"];
+
+fn ai_loading_hint_text(frame: usize) -> &'static str {
+    AI_LOADING_HINT_FRAMES[frame % AI_LOADING_HINT_FRAMES.len()]
+}
+
+fn advance_ai_loading_frame(state: &mut AppState) -> bool {
+    if state.ai.pending.is_none() {
+        return false;
+    }
+    let TuiAiStatus::Loading { frame, .. } = &mut state.ai.status else {
+        return false;
+    };
+    *frame = frame.saturating_add(1);
     true
 }
 
@@ -2320,7 +2344,7 @@ impl TuiAiStatus {
     fn key(&self) -> Option<&AiSuggestionKey> {
         match self {
             Self::Availability => None,
-            Self::Loading { key } | Self::Suggestion { key, .. } | Self::Error { key, .. } => {
+            Self::Loading { key, .. } | Self::Suggestion { key, .. } | Self::Error { key, .. } => {
                 Some(key)
             }
         }
@@ -8663,6 +8687,39 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn handle_note_action_does_not_seed_comment_draft_from_lgtm_explanation() {
+        let file_path = temp_test_file_path("tui_ai_comment_explanation_only");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: AiProvider::CodexCli,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        state.ai.status = TuiAiStatus::Suggestion {
+            key: request.key,
+            suggestion: AiSuggestion {
+                explanation: Some("This wrapper is straightforward; LGTM.".to_string()),
+                proposed_change: None,
+            },
+        };
+
+        handle_note_action(&mut state).unwrap_or_else(|error| panic!("open note: {error}"));
+
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert!(state.input_buffer.is_empty());
+        assert!(state.input_draft.is_none());
+    }
+
+    #[test]
     fn handle_editing_key_action_right_arrow_accepts_comment_draft() {
         let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.input_mode = InputMode::Editing {
@@ -10541,7 +10598,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn build_ai_hint_line_hides_ai_suggestion_without_proposed_change() {
+    fn build_ai_hint_line_shows_explanation_for_lgtm_suggestion_without_proposed_change() {
         let file_path = temp_test_file_path("tui_ai_no_change_suggestion");
         let file_content = "fn checked() {}\n";
         let (mut state, _file_id, _block_id) =
@@ -10561,13 +10618,16 @@ mod diff_scope_tests {
         state.ai.status = TuiAiStatus::Suggestion {
             key: request.key,
             suggestion: AiSuggestion {
-                explanation: Some("This is a straightforward wrapper.".to_string()),
+                explanation: Some("This wrapper is straightforward; LGTM.".to_string()),
                 proposed_change: None,
             },
         };
         let palette = UiPalette::default();
 
-        assert!(build_ai_hint_line(&state, &palette).is_none());
+        assert_eq!(
+            build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
+            Some("This wrapper is straightforward; LGTM.".to_string())
+        );
     }
 
     #[test]
@@ -10588,7 +10648,10 @@ mod diff_scope_tests {
             Some(request) => request,
             None => panic!("expected AI request for focused block"),
         };
-        state.ai.status = TuiAiStatus::Loading { key: request.key };
+        state.ai.status = TuiAiStatus::Loading {
+            key: request.key,
+            frame: 0,
+        };
         let palette = UiPalette::default();
 
         assert_eq!(
@@ -10597,7 +10660,43 @@ mod diff_scope_tests {
         );
         assert_eq!(
             build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
-            Some("Loading suggestion…".to_string())
+            Some("✦ · ·".to_string())
+        );
+    }
+
+    #[test]
+    fn refresh_ai_suggestion_state_advances_loading_hint_frame() {
+        let file_path = temp_test_file_path("tui_ai_loading_animation");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        let (_sender, receiver) = mpsc::channel();
+        state.ai.pending = Some(PendingAiSuggestion {
+            key: request.key.clone(),
+            receiver,
+        });
+        state.ai.status = TuiAiStatus::Loading {
+            key: request.key,
+            frame: 0,
+        };
+
+        assert!(refresh_ai_suggestion_state(&mut state));
+        let palette = UiPalette::default();
+        assert_eq!(
+            build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
+            Some("· ✧ ·".to_string())
         );
     }
 

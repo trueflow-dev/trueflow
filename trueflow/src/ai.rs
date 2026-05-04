@@ -145,6 +145,8 @@ impl AiSuggestionRequest {
     }
 }
 
+const DEFAULT_LGTM_EXPLANATION: &str = "No change suggested; LGTM.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiSuggestion {
     pub explanation: Option<String>,
@@ -176,6 +178,13 @@ impl AiSuggestion {
     }
 
     pub fn visible_sentence(&self) -> Option<&str> {
+        self.proposed_change
+            .as_deref()
+            .or(self.explanation.as_deref())
+            .or(Some(DEFAULT_LGTM_EXPLANATION))
+    }
+
+    pub fn proposed_change_sentence(&self) -> Option<&str> {
         self.proposed_change.as_deref()
     }
 }
@@ -343,7 +352,7 @@ fn cli_prompt_for_request(
     };
 
     format!(
-        "{review_set_context}{}\n\nImportant: return exactly two plain-text lines, `EXPLANATION: ...` and `CHANGE: ...`. Use `CHANGE: NONE` unless there is a concrete, reasonable change to request. Do not run shell commands, inspect additional files, modify files, or produce markdown fences.",
+        "{review_set_context}{}\n\nImportant: return exactly two plain-text lines, `EXPLANATION: ...` and `CHANGE: ...`. Use `CHANGE: NONE` unless there is a concrete, reasonable change to request. If `CHANGE: NONE`, make `EXPLANATION` a one-line what-this-does + LGTM-style note. Do not run shell commands, inspect additional files, modify files, or produce markdown fences.",
         request.prompt
     )
 }
@@ -505,7 +514,7 @@ fn build_review_block_prompt(
         .map(|hash| format!("Review set hash: {hash}\n"))
         .unwrap_or_default();
     format!(
-        "Review this block in the context of the full review set.\n{review_set_line}Return exactly two concise lines:\nEXPLANATION: one sentence explaining what this block is/does in context.\nCHANGE: one sentence with a concrete requested change, or NONE if there is no reasonable change to propose.\nBe conservative: do not propose style-only or speculative changes.\n\nPath: {}\nLanguage: {:?}\nBlock kind: {}\nLines: {line_start}-{line_end}\n\n```\n{block_content}\n```",
+        "Review this block in the context of the full review set.\n{review_set_line}Return exactly two concise lines:\nEXPLANATION: one sentence explaining what this block is/does in context; if no change is needed, include a brief LGTM-style reassurance in the same sentence.\nCHANGE: one sentence with a concrete requested change, or NONE if there is no reasonable change to propose.\nBe conservative: do not propose style-only or speculative changes.\n\nPath: {}\nLanguage: {:?}\nBlock kind: {}\nLines: {line_start}-{line_end}\n\n```\n{block_content}\n```",
         context.path,
         context.language,
         context.block_kind.as_str(),
@@ -945,6 +954,7 @@ mod tests {
         assert!(prompt.contains("Return exactly two concise lines"));
         assert!(prompt.contains("EXPLANATION:"));
         assert!(prompt.contains("CHANGE:"));
+        assert!(prompt.contains("LGTM-style reassurance"));
         assert!(prompt.contains("Path: src/lib.rs"));
         assert!(prompt.contains("Language: Rust"));
         assert!(prompt.contains("Block kind: function"));
@@ -967,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_suggestion_parses_explanation_and_hides_no_change() {
+    fn structured_suggestion_uses_explanation_as_visible_lgtm_text_without_change() {
         let suggestion = AiSuggestion::from_provider_text(
             "EXPLANATION: This validates user input before saving it.\nCHANGE: NONE",
         )
@@ -978,7 +988,23 @@ mod tests {
             Some("This validates user input before saving it.")
         );
         assert_eq!(suggestion.proposed_change, None);
-        assert_eq!(suggestion.visible_sentence(), None);
+        assert_eq!(
+            suggestion.visible_sentence(),
+            Some("This validates user input before saving it.")
+        );
+    }
+
+    #[test]
+    fn no_change_suggestion_has_stable_lgtm_fallback_text() {
+        let suggestion = AiSuggestion::from_provider_text("CHANGE: NONE")
+            .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
+
+        assert_eq!(suggestion.proposed_change, None);
+        assert_eq!(suggestion.explanation, None);
+        assert_eq!(
+            suggestion.visible_sentence(),
+            Some("No change suggested; LGTM.")
+        );
     }
 
     #[test]
