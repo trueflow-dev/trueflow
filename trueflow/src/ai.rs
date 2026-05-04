@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
+pub const DEFAULT_AI_RESPONSE_CHAR_LIMIT: usize = 90;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AiProvider {
@@ -77,6 +78,7 @@ pub struct AiSuggestionKey {
     pub start_line: usize,
     pub end_line: usize,
     pub max_context_lines: usize,
+    pub max_response_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +123,24 @@ impl AiSuggestionRequest {
         context: AiReviewContext,
         max_context_lines: usize,
     ) -> Self {
+        Self::with_response_char_limit(
+            provider,
+            model,
+            review_set,
+            context,
+            max_context_lines,
+            DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+        )
+    }
+
+    pub fn with_response_char_limit(
+        provider: AiProvider,
+        model: String,
+        review_set: AiReviewSetContext,
+        context: AiReviewContext,
+        max_context_lines: usize,
+        max_response_chars: usize,
+    ) -> Self {
         let key = AiSuggestionKey {
             provider,
             model,
@@ -130,11 +150,13 @@ impl AiSuggestionRequest {
             start_line: context.start_line,
             end_line: context.end_line,
             max_context_lines,
+            max_response_chars,
         };
         let prompt = build_review_block_prompt(
             &context,
             Some(&review_set.review_set_hash),
             max_context_lines,
+            max_response_chars,
         );
         Self {
             key,
@@ -352,8 +374,8 @@ fn cli_prompt_for_request(
     };
 
     format!(
-        "{review_set_context}{}\n\nImportant: return exactly two plain-text lines, `EXPLANATION: ...` and `CHANGE: ...`. Use `CHANGE: NONE` unless there is a concrete, reasonable change to request. If `CHANGE: NONE`, make `EXPLANATION` a one-line what-this-does + LGTM-style note. Do not run shell commands, inspect additional files, modify files, or produce markdown fences.",
-        request.prompt
+        "{review_set_context}{}\n\nImportant: return exactly two plain-text lines, `EXPLANATION: ...` and `CHANGE: ...`. Keep each value after the label within {} visible characters so the TUI hint fits. Use `CHANGE: NONE` unless there is a concrete, reasonable change to request. If `CHANGE: NONE`, make `EXPLANATION` a one-line what-this-does + LGTM-style note. Do not run shell commands, inspect additional files, modify files, or produce markdown fences.",
+        request.prompt, request.key.max_response_chars,
     )
 }
 
@@ -499,13 +521,19 @@ fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<AiCliRunOutput> {
 }
 
 pub fn build_review_hint_prompt(context: &AiReviewContext, max_context_lines: usize) -> String {
-    build_review_block_prompt(context, None, max_context_lines)
+    build_review_block_prompt(
+        context,
+        None,
+        max_context_lines,
+        DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+    )
 }
 
 fn build_review_block_prompt(
     context: &AiReviewContext,
     review_set_hash: Option<&TreeHash>,
     max_context_lines: usize,
+    max_response_chars: usize,
 ) -> String {
     let line_start = context.start_line.saturating_add(1);
     let line_end = context.end_line.max(context.start_line.saturating_add(1));
@@ -514,7 +542,7 @@ fn build_review_block_prompt(
         .map(|hash| format!("Review set hash: {hash}\n"))
         .unwrap_or_default();
     format!(
-        "Review this block in the context of the full review set.\n{review_set_line}Return exactly two concise lines:\nEXPLANATION: one sentence explaining what this block is/does in context; if no change is needed, include a brief LGTM-style reassurance in the same sentence.\nCHANGE: one sentence with a concrete requested change, or NONE if there is no reasonable change to propose.\nBe conservative: do not propose style-only or speculative changes.\n\nPath: {}\nLanguage: {:?}\nBlock kind: {}\nLines: {line_start}-{line_end}\n\n```\n{block_content}\n```",
+        "Review this block in the context of the full review set.\n{review_set_line}Return exactly two concise lines; keep each value after the label within {max_response_chars} visible characters:\nEXPLANATION: one sentence explaining what this block is/does in context; if no change is needed, include a brief LGTM-style reassurance in the same sentence.\nCHANGE: one sentence with a concrete requested change, or NONE if there is no reasonable change to propose.\nBe conservative: do not propose style-only or speculative changes.\n\nPath: {}\nLanguage: {:?}\nBlock kind: {}\nLines: {line_start}-{line_end}\n\n```\n{block_content}\n```",
         context.path,
         context.language,
         context.block_kind.as_str(),
@@ -952,6 +980,7 @@ mod tests {
         let prompt = build_review_hint_prompt(&review_context("one\ntwo\nthree"), 2);
 
         assert!(prompt.contains("Return exactly two concise lines"));
+        assert!(prompt.contains("within 90 visible characters"));
         assert!(prompt.contains("EXPLANATION:"));
         assert!(prompt.contains("CHANGE:"));
         assert!(prompt.contains("LGTM-style reassurance"));
@@ -1048,6 +1077,25 @@ mod tests {
         assert_eq!(request.key.start_line, 4);
         assert_eq!(request.key.end_line, 8);
         assert_eq!(request.key.max_context_lines, 40);
+        assert_eq!(
+            request.key.max_response_chars,
+            DEFAULT_AI_RESPONSE_CHAR_LIMIT
+        );
+    }
+
+    #[test]
+    fn suggestion_request_prompt_includes_custom_response_character_limit() {
+        let request = AiSuggestionRequest::with_response_char_limit(
+            AiProvider::Anthropic,
+            "claude-3-5-haiku".to_string(),
+            review_set(),
+            review_context("fn checked() {}"),
+            40,
+            72,
+        );
+
+        assert_eq!(request.key.max_response_chars, 72);
+        assert!(request.prompt.contains("within 72 visible characters"));
     }
 
     #[test]

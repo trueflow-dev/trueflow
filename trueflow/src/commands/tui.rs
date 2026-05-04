@@ -7,7 +7,7 @@ use super::tui_terminal::{TerminalSession, TuiTerminal};
 use crate::ai::{
     AiAvailability, AiEnvironment, AiProvider, AiReviewContext, AiReviewSetContext, AiSuggestion,
     AiSuggestionKey, AiSuggestionProvider, AiSuggestionRequest, CommandAiSuggestionProvider,
-    resolve_ai_availability,
+    DEFAULT_AI_RESPONSE_CHAR_LIMIT, resolve_ai_availability,
 };
 use crate::analysis::Language;
 use crate::block::BlockKind;
@@ -1768,13 +1768,14 @@ fn run_app(
     let mut event_pump = EventPump::default();
 
     loop {
-        if refresh_ai_suggestion_state(&mut state) {
-            needs_render = true;
-        }
-
         if needs_render {
             session.terminal_mut().draw(|f| ui(f, &mut state))?;
             needs_render = false;
+        }
+
+        if refresh_ai_suggestion_state(&mut state) {
+            needs_render = true;
+            continue;
         }
 
         let event = read_next_app_event(&state, &mut event_pump)?;
@@ -2331,13 +2332,23 @@ fn ai_suggestion_request_for_current_focus(state: &AppState) -> Option<AiSuggest
             state.ai.max_context_lines,
         )
     });
-    Some(AiSuggestionRequest::new(
+    Some(AiSuggestionRequest::with_response_char_limit(
         *provider,
         model.clone(),
         review_set,
         context,
         state.ai.max_context_lines,
+        ai_response_char_limit(state),
     ))
+}
+
+fn ai_response_char_limit(state: &AppState) -> usize {
+    let viewport_width = usize::from(state.code_rect.width);
+    if viewport_width == 0 {
+        DEFAULT_AI_RESPONSE_CHAR_LIMIT
+    } else {
+        viewport_width
+    }
 }
 
 impl TuiAiStatus {
@@ -10505,12 +10516,60 @@ mod diff_scope_tests {
         assert_eq!(request.key.end_line, 3);
         assert_eq!(request.key.max_context_lines, 2);
         assert_eq!(
+            request.key.max_response_chars,
+            DEFAULT_AI_RESPONSE_CHAR_LIMIT
+        );
+        assert!(request.prompt.contains("within 90 visible characters"));
+        assert_eq!(
             request.key.review_set_hash,
             request.review_set.review_set_hash
         );
         assert!(request.review_set.overview.contains("Review blocks: 1"));
         assert!(request.review_set.overview.contains("fn checked() {"));
         assert!(request.prompt.contains("fn checked() {\n    call();\n..."));
+    }
+
+    #[test]
+    fn ai_suggestion_request_for_current_focus_uses_viewport_width_for_response_limit() {
+        let file_path = temp_test_file_path("tui_ai_request_width");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 72,
+            height: 10,
+        };
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "claude-3-5-haiku".to_string(),
+            },
+            2,
+            true,
+        );
+
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+
+        assert_eq!(request.key.max_response_chars, 72);
+        assert!(request.prompt.contains("within 72 visible characters"));
+
+        state.code_rect.width = 120;
+        let wide_request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+
+        assert_eq!(wide_request.key.max_response_chars, 120);
+        assert!(
+            wide_request
+                .prompt
+                .contains("within 120 visible characters")
+        );
     }
 
     #[test]
