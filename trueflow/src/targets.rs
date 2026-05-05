@@ -135,6 +135,7 @@ pub enum ReviewContentSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewPathSelection {
     All,
+    Empty,
     /// Explicit files plus one or more directory prefixes. A file matches when
     /// it satisfies the explicit file/dir selection and, when `changed` is
     /// present, also appears in that changed-path set.
@@ -149,6 +150,7 @@ impl ReviewPathSelection {
     pub fn includes(&self, file_path: &RepoPath) -> bool {
         match self {
             Self::All => true,
+            Self::Empty => false,
             Self::Scoped {
                 files,
                 dirs,
@@ -220,6 +222,7 @@ pub struct ResolvedTargets {
     files: HashSet<RepoPath>,
     dirs: Vec<RepoPath>,
     changed: HashSet<RepoPath>,
+    changed_target_requested: bool,
 }
 
 impl ResolvedTargets {
@@ -235,6 +238,7 @@ impl ResolvedTargets {
             diff_selection,
             files,
             dirs,
+            changed_target_requested: !changed.is_empty(),
             changed,
         }
     }
@@ -252,7 +256,7 @@ impl ResolvedTargets {
     }
 
     pub fn changed_selection(&self) -> Option<ReviewPathSelection> {
-        if self.changed.is_empty() {
+        if self.changed.is_empty() && !self.changed_target_requested {
             None
         } else {
             Some(ReviewPathSelection::Scoped {
@@ -265,12 +269,18 @@ impl ResolvedTargets {
 
     pub fn path_selection(&self) -> ReviewPathSelection {
         if self.files.is_empty() && self.dirs.is_empty() && self.changed.is_empty() {
-            ReviewPathSelection::All
+            if self.changed_target_requested {
+                ReviewPathSelection::Empty
+            } else {
+                ReviewPathSelection::All
+            }
         } else {
             ReviewPathSelection::Scoped {
                 files: self.files.clone(),
                 dirs: self.dirs.clone(),
-                changed: (!self.changed.is_empty()).then_some(self.changed.clone()),
+                changed: self
+                    .changed_target_requested
+                    .then_some(self.changed.clone()),
             }
         }
     }
@@ -309,15 +319,18 @@ where
     let mut files = HashSet::new();
     let mut dirs = Vec::new();
     let mut changed = HashSet::new();
+    let mut changed_target_requested = false;
 
     for target in resolved_targets {
         match target {
             ResolvedReviewTarget::DirtyWorktree => {
+                changed_target_requested = true;
                 if let Ok(dirty) = dirty_files() {
                     changed.extend(dirty);
                 }
             }
             ResolvedReviewTarget::MainDiff => {
+                changed_target_requested = true;
                 changed.extend(main_diff_files()?);
             }
             ResolvedReviewTarget::File(path) => {
@@ -329,21 +342,24 @@ where
                 }
             }
             ResolvedReviewTarget::Revision(revision) => {
+                changed_target_requested = true;
                 changed.extend(revision_files(revision.as_str())?);
             }
             ResolvedReviewTarget::RevisionRange(range) => {
+                changed_target_requested = true;
                 changed.extend(range_files(range.start.as_str(), range.end.as_str())?);
             }
         }
     }
 
-    Ok(ResolvedTargets::new(
+    Ok(ResolvedTargets {
         content_source,
         diff_selection,
         files,
         dirs,
         changed,
-    ))
+        changed_target_requested,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,6 +747,44 @@ mod tests {
         let selection = resolved.path_selection();
         assert!(!selection.includes(&file));
         assert!(!selection.includes(&other));
+    }
+
+    #[test]
+    fn changed_target_with_no_changed_paths_selects_nothing() {
+        let other = RepoPath::new("src/other.rs").unwrap();
+        let resolved = resolve_targets_with(
+            &[ReviewTarget::MainDiff],
+            |revision| CommitId::new(revision.as_str()),
+            || Ok(HashSet::new()),
+            || Ok(HashSet::new()),
+            |_revision| Ok(HashSet::new()),
+            |_start, _end| Ok(HashSet::new()),
+        )
+        .unwrap_or_else(|error| panic!("expected resolved main target: {error}"));
+
+        let selection = resolved.path_selection();
+        assert_eq!(selection, ReviewPathSelection::Empty);
+        assert!(!selection.includes(&other));
+    }
+
+    #[test]
+    fn explicit_target_intersected_with_empty_changed_paths_selects_nothing() {
+        let file = RepoPath::new("src/lib.rs").unwrap();
+        let resolved = resolve_targets_with(
+            &[
+                ReviewTarget::File(file.clone()),
+                ReviewTarget::RevisionRange(RevisionRangeExpr::new("abc1234", "def5678").unwrap()),
+            ],
+            |revision| CommitId::new(revision.as_str()),
+            || Ok(HashSet::new()),
+            || Ok(HashSet::new()),
+            |_revision| Ok(HashSet::new()),
+            |_start, _end| Ok(HashSet::new()),
+        )
+        .unwrap_or_else(|error| panic!("expected resolved range target: {error}"));
+
+        let selection = resolved.path_selection();
+        assert!(!selection.includes(&file));
     }
 
     #[test]

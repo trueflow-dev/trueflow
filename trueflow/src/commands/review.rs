@@ -277,9 +277,18 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
 
     let review_check = ReviewCheck::review();
 
+    if matches!(query.path_selection, ReviewPathSelection::Empty) {
+        return Ok(empty_collected_review());
+    }
+
+    let selected_paths = preselected_paths_for_review(&query.path_selection);
     let (files, diagnostics) = match &query.content_source {
         ReviewContentSource::Workdir => {
-            let scan_result = scanner::scan_directory(".", &query.scan_options)?;
+            let scan_result = if let Some(paths) = selected_paths.as_ref() {
+                scanner::scan_paths(".", paths, &query.scan_options)?
+            } else {
+                scanner::scan_directory(".", &query.scan_options)?
+            };
             (
                 scan_result.files,
                 scan_result
@@ -293,10 +302,17 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             let Some(repo) = review_repo.as_ref() else {
                 return Err(anyhow!("review repo unavailable for revision target"));
             };
-            (
-                vcs::file_states_in_revision(repo, revision.as_str(), workdir_prefix.as_deref())?,
-                Vec::new(),
-            )
+            let files = if let Some(paths) = selected_paths.as_ref() {
+                vcs::file_states_for_paths_in_revision(
+                    repo,
+                    revision.as_str(),
+                    paths,
+                    workdir_prefix.as_deref(),
+                )?
+            } else {
+                vcs::file_states_in_revision(repo, revision.as_str(), workdir_prefix.as_deref())?
+            };
+            (files, Vec::new())
         }
     };
     info!("scanned {} files", files.len());
@@ -549,6 +565,45 @@ fn collect_diff_scoped_review(
     })
 }
 
+fn preselected_paths_for_review(path_selection: &ReviewPathSelection) -> Option<HashSet<RepoPath>> {
+    match path_selection {
+        ReviewPathSelection::All => None,
+        ReviewPathSelection::Empty => Some(HashSet::new()),
+        ReviewPathSelection::Scoped {
+            changed: Some(changed),
+            ..
+        } => Some(
+            changed
+                .iter()
+                .filter(|path| path_selection.includes(path))
+                .cloned()
+                .collect(),
+        ),
+        ReviewPathSelection::Scoped {
+            files,
+            dirs,
+            changed: None,
+        } if dirs.is_empty() => Some(files.clone()),
+        ReviewPathSelection::Scoped { .. } => None,
+    }
+}
+
+fn empty_collected_review() -> CollectedReview {
+    CollectedReview {
+        summary: ReviewSummary {
+            files: Vec::new(),
+            total_blocks: 0,
+            diagnostics: Vec::new(),
+        },
+        tree: tree::TreeBuilder::new().finalize(),
+        unreviewed_block_nodes: HashSet::new(),
+        commented_block_nodes: HashSet::new(),
+        diff_block_sides: HashMap::new(),
+        file_change_kinds: HashMap::new(),
+        block_change_kinds: HashMap::new(),
+    }
+}
+
 fn collect_diff_review_files(
     query: &ResolvedReviewQuery,
     repo: &gix::Repository,
@@ -639,6 +694,7 @@ fn selected_review_paths(
 ) -> Vec<RepoPath> {
     match path_selection {
         ReviewPathSelection::All => head_files_by_path.keys().cloned().collect(),
+        ReviewPathSelection::Empty => Vec::new(),
         ReviewPathSelection::Scoped {
             files,
             dirs,
@@ -1356,6 +1412,24 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("could not be resolved"));
+    }
+
+    #[test]
+    fn collect_review_returns_empty_without_scanning_when_path_selection_is_empty() {
+        let query = ResolvedReviewQuery {
+            filters: BlockFilters::default(),
+            scan_options: ScanOptions::default(),
+            content_source: ReviewContentSource::Workdir,
+            path_selection: ReviewPathSelection::Empty,
+            diff_selection: ReviewDiffSelection::Targets(vec![ReviewDiffTarget::MainDiff]),
+        };
+
+        let collected = collect_review(&query)
+            .unwrap_or_else(|error| panic!("expected empty review to collect: {error}"));
+
+        assert!(collected.summary.files.is_empty());
+        assert_eq!(collected.summary.total_blocks, 0);
+        assert!(collected.unreviewed_block_nodes.is_empty());
     }
 
     #[test]

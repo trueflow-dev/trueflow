@@ -135,29 +135,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         rescanned_files: 0,
     };
 
-    let cached_entry = if options.cache_mode.reads_enabled() {
-        match load_cache_entry(&root, options) {
-            Ok(Some(entry)) => {
-                cache.read = ScanCacheReadStatus::Hit;
-                Some(index_cached_files(entry))
-            }
-            Ok(None) => {
-                cache.read = ScanCacheReadStatus::Miss;
-                None
-            }
-            Err(err) => {
-                cache.read = ScanCacheReadStatus::Error;
-                diagnostics.push(ScanDiagnostic::new(
-                    None,
-                    format!("failed to load scan cache: {err}"),
-                ));
-                debug!("scan cache unavailable, continuing without cache: {err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let cached_entry = load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics);
 
     let inventory = collect_scan_inventory(&root, &repo_path_base, options, &mut diagnostics)?;
 
@@ -208,6 +186,132 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         diagnostics,
         cache,
     })
+}
+
+pub fn scan_paths<P: AsRef<Path>>(
+    root: P,
+    paths: &HashSet<RepoPath>,
+    options: &ScanOptions,
+) -> Result<ScanResult> {
+    let root = canonicalize_or_original(root.as_ref());
+    let repo_path_base = repo_path_base_for_scan_root(&root);
+    let mut diagnostics = Vec::new();
+    let mut cache = ScanCacheReport {
+        read: ScanCacheReadStatus::Disabled,
+        write: ScanCacheWriteStatus::Disabled,
+        reused_files: 0,
+        rescanned_files: 0,
+    };
+    let cached_entry = load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics);
+    let mut files = Vec::new();
+    let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
+    ordered_paths.sort();
+
+    for path in ordered_paths {
+        if path.is_root() || direct_scan_path_is_ignored(&path, options) {
+            continue;
+        }
+        let full_path = repo_path_base.join(path.as_str());
+        let Ok(metadata) = fs::metadata(&full_path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(err) => {
+                let err = anyhow::Error::from(err);
+                let diagnostic =
+                    diagnostic_for_process_file_error(&repo_path_base, &full_path, &err);
+                log_process_file_error(&diagnostic, &err);
+                diagnostics.push(diagnostic);
+                continue;
+            }
+        };
+        let input = ScanInput {
+            path,
+            full_path,
+            stamp: FileStamp {
+                modified_at: system_time_to_epoch(modified),
+                size: metadata.len(),
+            },
+        };
+        let reused_entry = cached_entry
+            .as_ref()
+            .and_then(|entries| entries.get(&input.path))
+            .filter(|entry| entry.stamp == input.stamp);
+        let cache_file = match reused_entry {
+            Some(entry) => {
+                cache.reused_files += 1;
+                entry.clone()
+            }
+            None => {
+                cache.rescanned_files += 1;
+                scan_file(&repo_path_base, &input)
+            }
+        };
+        append_cached_outcome(&cache_file.outcome, &mut files, &mut diagnostics);
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    sort_diagnostics(&mut diagnostics);
+
+    Ok(ScanResult {
+        files,
+        diagnostics,
+        cache,
+    })
+}
+
+fn direct_scan_path_is_ignored(path: &RepoPath, options: &ScanOptions) -> bool {
+    if options
+        .ignore_path_prefixes
+        .iter()
+        .any(|prefix| path.is_under(prefix))
+    {
+        return true;
+    }
+
+    let ignored_names = DEFAULT_IGNORE_NAMES
+        .iter()
+        .copied()
+        .chain(options.ignore_names.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    path.as_str()
+        .split('/')
+        .any(|segment| ignored_names.contains(segment))
+}
+
+fn load_scan_cache_for_read(
+    root: &Path,
+    options: &ScanOptions,
+    cache: &mut ScanCacheReport,
+    diagnostics: &mut Vec<ScanDiagnostic>,
+) -> Option<HashMap<RepoPath, CachedFileEntry>> {
+    if !options.cache_mode.reads_enabled() {
+        return None;
+    }
+
+    match load_cache_entry(root, options) {
+        Ok(Some(entry)) => {
+            cache.read = ScanCacheReadStatus::Hit;
+            Some(index_cached_files(entry))
+        }
+        Ok(None) => {
+            cache.read = ScanCacheReadStatus::Miss;
+            None
+        }
+        Err(err) => {
+            cache.read = ScanCacheReadStatus::Error;
+            diagnostics.push(ScanDiagnostic::new(
+                None,
+                format!("failed to load scan cache: {err}"),
+            ));
+            debug!("scan cache unavailable, continuing without cache: {err}");
+            None
+        }
+    }
 }
 
 fn build_walker(root: &Path, repo_path_base: &Path, options: &ScanOptions) -> Result<ignore::Walk> {
@@ -679,6 +783,7 @@ fn process_file(repo_path_base: &Path, path: &Path) -> Result<ProcessedFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_git::temp_test_dir;
     use std::process::Command;
     use std::time::Duration;
 
@@ -699,6 +804,55 @@ mod tests {
                 .is_under(&prefix)
         );
         assert!(!RepoPath::new("src/generate.rs").unwrap().is_under(&prefix));
+    }
+
+    #[test]
+    fn scan_paths_scans_only_requested_repo_paths() {
+        let repo = temp_test_dir("scanner_paths_only");
+        let src = repo.join("src");
+        fs::create_dir_all(&src).unwrap_or_else(|error| panic!("create src dir: {error}"));
+        fs::write(src.join("keep.rs"), "fn keep() {}\n")
+            .unwrap_or_else(|error| panic!("write keep file: {error}"));
+        fs::write(src.join("skip.rs"), "fn skip() {}\n")
+            .unwrap_or_else(|error| panic!("write skip file: {error}"));
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap_or_else(|error| panic!("git init failed: {error}"));
+
+        let paths = HashSet::from([RepoPath::new("src/keep.rs").unwrap()]);
+        let result = scan_paths(&repo, &paths, &ScanOptions::default())
+            .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
+
+        let scanned_paths = result
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(scanned_paths, vec!["src/keep.rs"]);
+    }
+
+    #[test]
+    fn scan_paths_keeps_default_ignored_directories_ignored() {
+        let repo = temp_test_dir("scanner_paths_ignores_trueflow");
+        let trueflow_dir = repo.join(".trueflow");
+        fs::create_dir_all(&trueflow_dir)
+            .unwrap_or_else(|error| panic!("create .trueflow dir: {error}"));
+        fs::write(trueflow_dir.join("reviews.jsonl"), "review log text\n")
+            .unwrap_or_else(|error| panic!("write review log: {error}"));
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap_or_else(|error| panic!("git init failed: {error}"));
+
+        let paths = HashSet::from([RepoPath::new(".trueflow/reviews.jsonl").unwrap()]);
+        let result = scan_paths(&repo, &paths, &ScanOptions::default())
+            .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
+
+        assert!(result.files.is_empty());
+        assert!(result.diagnostics.is_empty());
     }
 
     #[test]

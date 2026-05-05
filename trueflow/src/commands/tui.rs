@@ -379,7 +379,10 @@ impl ScopeSelectorStatusPoller {
                         break;
                     }
 
-                    let status = load_status(job.scope.clone());
+                    let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        load_status(job.scope.clone())
+                    }))
+                    .unwrap_or(ScopeSelectorStatus::Unavailable);
                     if cancelled.load(Ordering::Relaxed) {
                         break;
                     }
@@ -431,6 +434,12 @@ impl ScopeSelectorStatusPoller {
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_jobs = 0;
+                    for option in &mut selector.options {
+                        if option.status == ScopeSelectorStatus::Checking {
+                            option.status = ScopeSelectorStatus::Unavailable;
+                            updated = true;
+                        }
+                    }
                     break;
                 }
             }
@@ -548,8 +557,16 @@ fn build_scope_selector_with_status_jobs(
         }
         selector_options.push(ScopeSelectorOption::from_scope_option(option, status));
     }
+    jobs.sort_by_key(|job| (scope_selector_status_job_priority(&job.scope), job.index));
 
     (ScopeSelector::new(selector_options), jobs)
+}
+
+fn scope_selector_status_job_priority(scope: &ScopePreset) -> u8 {
+    match scope {
+        ScopePreset::MainDiff | ScopePreset::Commit { .. } | ScopePreset::RevisionRange { .. } => 0,
+        ScopePreset::All => 1,
+    }
 }
 
 impl ScopeSelector {
@@ -805,6 +822,7 @@ enum TuiAiStatus {
 }
 
 impl TuiAiState {
+    #[cfg(any(test, feature = "tui-test-support"))]
     fn empty() -> Self {
         Self {
             availability: None,
@@ -7811,8 +7829,38 @@ mod diff_scope_tests {
             ScopeSelectorStatus::Reviewed { total_blocks: 7 }
         );
         assert_eq!(jobs.len(), 2);
-        assert!(matches!(jobs[0].scope, ScopePreset::All));
+        assert!(matches!(jobs[0].scope, ScopePreset::Commit { .. }));
+        assert!(matches!(jobs[1].scope, ScopePreset::All));
+    }
+
+    #[test]
+    fn scope_selector_status_jobs_defer_expensive_all_scope_until_last() {
+        let filters = BlockFilters::default();
+        let scan_options = ScanOptions::default();
+        let options = vec![
+            ScopeOption {
+                label: "All files".to_string(),
+                scope: ScopePreset::All,
+            },
+            ScopeOption {
+                label: "Diff vs main".to_string(),
+                scope: ScopePreset::MainDiff,
+            },
+            ScopeOption {
+                label: "Commit abc1234".to_string(),
+                scope: ScopePreset::Commit {
+                    id: "abc1234".to_string(),
+                    summary: "Update".to_string(),
+                },
+            },
+        ];
+
+        let (_selector, jobs) =
+            build_scope_selector_with_status_jobs(options, &filters, &scan_options, None, None);
+
+        assert!(matches!(jobs[0].scope, ScopePreset::MainDiff));
         assert!(matches!(jobs[1].scope, ScopePreset::Commit { .. }));
+        assert!(matches!(jobs[2].scope, ScopePreset::All));
     }
 
     #[test]
@@ -7910,6 +7958,59 @@ mod diff_scope_tests {
                 .entry_updated_unix_ms
                 .contains_key("commit:abc1234")
         );
+    }
+
+    #[test]
+    fn scope_selector_status_poller_reports_unavailable_when_status_loader_panics() {
+        let jobs = vec![ScopeSelectorStatusJob {
+            index: 0,
+            scope: ScopePreset::MainDiff,
+            cache_key: "main-diff".to_string(),
+        }];
+        let mut selector = ScopeSelector::new(vec![ScopeSelectorOption {
+            label: "Diff vs main".to_string(),
+            scope: ScopePreset::MainDiff,
+            status: ScopeSelectorStatus::Checking,
+        }]);
+        let mut poller = ScopeSelectorStatusPoller::spawn_with_loader(jobs, None, move |_| {
+            panic!("simulated diff status panic");
+        })
+        .unwrap_or_else(|| panic!("expected status poller"));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut changed = false;
+        while Instant::now() < deadline {
+            if poller.drain_updates(&mut selector) {
+                changed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(changed, "expected panic to produce status update");
+        assert_eq!(poller.pending_jobs, 0);
+        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Unavailable);
+    }
+
+    #[test]
+    fn scope_selector_status_poller_marks_checking_rows_unavailable_on_worker_disconnect() {
+        let (sender, receiver) = mpsc::channel::<ScopeSelectorStatusUpdate>();
+        drop(sender);
+        let mut selector = ScopeSelector::new(vec![ScopeSelectorOption {
+            label: "Diff vs main".to_string(),
+            scope: ScopePreset::MainDiff,
+            status: ScopeSelectorStatus::Checking,
+        }]);
+        let mut poller = ScopeSelectorStatusPoller {
+            receiver,
+            pending_jobs: 1,
+            cache: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert!(poller.drain_updates(&mut selector));
+        assert_eq!(poller.pending_jobs, 0);
+        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Unavailable);
     }
 
     #[test]
