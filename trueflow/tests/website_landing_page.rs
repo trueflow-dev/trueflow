@@ -93,6 +93,21 @@ fn website_landing_page_has_install_command_above_the_fold() -> Result<()> {
     );
     assert_contains(
         &html,
+        "Optional AI hints for drafting review comments, explicit opt-in only",
+        "landing page ai hint hero note",
+    );
+    assert_contains(
+        &html,
+        "GitHub PR feedback support when you want local review context in pull requests",
+        "landing page github hero note",
+    );
+    assert_contains(
+        &html,
+        "explicit opt-in AI hints for comment drafting",
+        "landing page ai workflow copy",
+    );
+    assert_contains(
+        &html,
         "Keep review state attached to content",
         "benefit section content",
     );
