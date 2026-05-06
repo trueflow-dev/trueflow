@@ -3,6 +3,7 @@ use crate::hashing::{BytesHash, TreeHash};
 use crate::repo_path::RepoPath;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::fmt;
 use std::str::FromStr;
 
@@ -99,6 +100,7 @@ impl BlockKind {
                 | BlockKind::Class
                 | BlockKind::Struct
                 | BlockKind::Enum
+                | BlockKind::Section
         )
     }
 
@@ -363,7 +365,7 @@ impl FileState {
         mut blocks: Vec<Block>,
     ) -> Self {
         assert!(!path.is_root(), "FileState path must not be root");
-        blocks.sort_by_key(|block| (block.start_line, block.end_line));
+        blocks.sort_by_key(|block| (block.start_line, Reverse(block.end_line)));
         let tree_hash = if blocks.is_empty() {
             TreeHash::from_bytes_hash(&bytes_hash)
         } else {

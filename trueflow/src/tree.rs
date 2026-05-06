@@ -622,6 +622,38 @@ mod tests {
     }
 
     #[test]
+    fn build_tree_nests_section_children_that_share_parent_start_line() {
+        let parent = Block::new(
+            "# Guide\nIntro.\n\n## Install\nSteps.\n".to_string(),
+            BlockKind::Section,
+            0,
+            5,
+        );
+        let intro = Block::new("# Guide\nIntro.\n\n".to_string(), BlockKind::Section, 0, 3);
+        let child = Block::new("## Install\nSteps.\n".to_string(), BlockKind::Section, 3, 5);
+        let files = vec![FileState::new(
+            RepoPath::new("README.md").unwrap(),
+            Language::Markdown,
+            BytesHash::new("bytes-hash"),
+            vec![intro.clone(), child.clone(), parent.clone()],
+        )];
+
+        let tree = build_tree_from_files(&files);
+        let parent_id = tree
+            .find_block_node(RepoPath::new("README.md").unwrap(), &parent)
+            .unwrap_or_else(|| panic!("expected parent section node"));
+        let intro_id = tree
+            .find_block_node(RepoPath::new("README.md").unwrap(), &intro)
+            .unwrap_or_else(|| panic!("expected intro section node"));
+        let child_id = tree
+            .find_block_node(RepoPath::new("README.md").unwrap(), &child)
+            .unwrap_or_else(|| panic!("expected child section node"));
+
+        assert_eq!(tree.node(intro_id).parent, Some(parent_id));
+        assert_eq!(tree.node(child_id).parent, Some(parent_id));
+    }
+
+    #[test]
     fn build_tree_nests_swift_type_members_under_container_block() {
         let container = Block::new(
             "struct Worker {\n    func start() {}\n\n    func stop() {}\n}\n".to_string(),

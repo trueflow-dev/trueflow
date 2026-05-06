@@ -41,6 +41,40 @@ fn test_new_markdown_file_review_is_section_granular() -> Result<()> {
 }
 
 #[test]
+fn test_large_markdown_leaf_section_review_uses_body_blocks() -> Result<()> {
+    let repo = TestRepo::new("markdown_large_leaf_review")?;
+    let mut content = String::from("# Notes\n");
+    for index in 0..55 {
+        content.push_str(&format!(
+            "\nParagraph {index} covers one calm review unit.\n"
+        ));
+    }
+    repo.write("README.md", &content)?;
+    repo.commit_all("Add long README")?;
+
+    let revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let output = repo.run(&["review", "--target", &format!("rev:{revision}"), "--json"])?;
+    let files = json_array(&output)?;
+    let file = files
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some("README.md"))
+        .context("README.md review entry")?;
+    let blocks = file["blocks"].as_array().context("blocks")?;
+
+    assert!(blocks.len() > 1);
+    assert!(blocks.iter().all(|block| {
+        block["content"]
+            .as_str()
+            .is_none_or(|block_content| block_content != content)
+    }));
+    assert!(blocks.iter().any(|block| block["kind"] == "Paragraph"));
+
+    Ok(())
+}
+
+#[test]
 fn test_small_markdown_section_stays_whole() -> Result<()> {
     let repo = TestRepo::new("markdown_split")?;
     repo.write(

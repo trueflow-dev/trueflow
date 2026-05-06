@@ -1,1 +1,2 @@
 pub const MAX_REVIEW_UNIT_SPAN_LINES: usize = 32;
+pub const MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES: usize = 50;

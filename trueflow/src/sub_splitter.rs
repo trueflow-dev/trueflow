@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind};
 use crate::code_comments;
 use crate::hashing::TreeHash;
-use crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
+use crate::review_units::{MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES, MAX_REVIEW_UNIT_SPAN_LINES};
 use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
 use crate::tree_sitter_support::{
     classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
@@ -263,7 +263,16 @@ fn split_result_with_options(
 
 fn should_keep_parent_review_unit(plan: SplitPlan, block: &Block) -> bool {
     !matches!(plan, SplitPlan::IdentityReviewUnit)
-        && block.line_span().len() <= MAX_REVIEW_UNIT_SPAN_LINES
+        && block.line_span().len() <= max_review_unit_span_lines_for_plan(plan)
+}
+
+fn max_review_unit_span_lines_for_plan(plan: SplitPlan) -> usize {
+    match plan {
+        SplitPlan::MarkdownChildren | SplitPlan::MarkdownReviewUnits => {
+            MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES
+        }
+        _ => MAX_REVIEW_UNIT_SPAN_LINES,
+    }
 }
 
 fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
@@ -490,7 +499,11 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
     let child_sections =
         immediate_markdown_child_sections(&headings, root_heading.level, content.len());
     if child_sections.is_empty() {
-        return split_markdown_flat_range(block, 0, content.len());
+        let body = content.get(root_heading.end..).unwrap_or_default();
+        if body.trim().is_empty() {
+            return split_markdown_flat_range(block, 0, content.len());
+        }
+        return split_markdown_flat_range(block, root_heading.end, content.len());
     }
 
     let mut blocks = Vec::new();
@@ -1487,6 +1500,7 @@ fn markdown_kind(kind: &str) -> Option<BlockKind> {
     match kind {
         "atx_heading" | "setext_heading" => Some(BlockKind::Header),
         "paragraph" => Some(BlockKind::Paragraph),
+        "list" => Some(BlockKind::List),
         "list_item" => Some(BlockKind::ListItem),
         "fenced_code_block" | "indented_code_block" => Some(BlockKind::CodeBlock),
         "block_quote" => Some(BlockKind::Quote),
@@ -1880,26 +1894,19 @@ mod tests {
 
     #[test]
     fn test_split_markdown() {
-        let content = "# Header\n\nPara 1.\n\nPara 2.";
-        let block = make_large_block(content, BlockKind::Code);
+        let content = "Para 1.\n\nPara 2.";
+        let block = make_block_with_span(
+            content,
+            BlockKind::Code,
+            0,
+            MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES + 8,
+        );
         let chunks = split(&block, Language::Markdown).unwrap();
-
-        // Header
-        // Gap (\n\n)
-        // Paragraph
-        // Gap (\n\n)
-        // Paragraph
 
         let kinds: Vec<BlockKind> = chunks.iter().map(|b| b.kind).collect();
         assert_eq!(
             kinds,
-            vec![
-                BlockKind::Header,
-                BlockKind::Gap,
-                BlockKind::Paragraph,
-                BlockKind::Gap,
-                BlockKind::Paragraph
-            ]
+            vec![BlockKind::Paragraph, BlockKind::Gap, BlockKind::Paragraph]
         );
 
         assert_eq!(merge_blocks(chunks), content);
@@ -1996,6 +2003,25 @@ mod tests {
         );
         assert_eq!(sections[0].content, "## Coding\nDetails live here.\n\n");
         assert_eq!(sections[1].content, "## Testing\nTest details.\n");
+    }
+
+    #[test]
+    fn forced_markdown_leaf_section_split_reviews_body_without_header_only_child() {
+        let content = "# Notes\n\nPara one.\n\nPara two.";
+        let block = make_block(content, BlockKind::Section);
+        let result = split_result_for_child_navigation(&block, Language::Markdown).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+
+        let review_kinds: Vec<_> = result
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.kind)
+            .collect();
+        assert_eq!(
+            review_kinds,
+            vec![BlockKind::Paragraph, BlockKind::Paragraph]
+        );
     }
 
     #[test]
