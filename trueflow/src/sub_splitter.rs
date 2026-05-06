@@ -487,25 +487,28 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
         return split_markdown_flat_range(block, 0, content.len());
     };
 
-    let mut blocks = vec![create_sub_block_with_kind(
-        block,
-        &content[root_heading.start..root_heading.end],
-        root_heading.start,
-        root_heading.end,
-        BlockKind::Header,
-    )];
-
     let child_sections =
         immediate_markdown_child_sections(&headings, root_heading.level, content.len());
-    let content_end = child_sections
-        .first()
-        .map(|section| section.start)
-        .unwrap_or(content.len());
-    blocks.extend(split_markdown_flat_range(
-        block,
-        root_heading.end,
-        content_end,
-    )?);
+    if child_sections.is_empty() {
+        return split_markdown_flat_range(block, 0, content.len());
+    }
+
+    let mut blocks = Vec::new();
+    let content_end = child_sections[0].start;
+    // Keep headings attached to their body text, but do not create a standalone
+    // title-only child when the first subsection starts immediately.
+    let root_intro_body = content
+        .get(root_heading.end..content_end)
+        .unwrap_or_default();
+    if !root_intro_body.trim().is_empty() {
+        blocks.push(create_sub_block_with_kind(
+            block,
+            &content[root_heading.start..content_end],
+            root_heading.start,
+            content_end,
+            BlockKind::Section,
+        ));
+    }
 
     for section in child_sections {
         blocks.push(create_sub_block_with_kind(
@@ -1923,42 +1926,76 @@ mod tests {
     }
 
     #[test]
-    fn forced_markdown_section_split_creates_header_and_nested_section_children_under_threshold() {
+    fn forced_markdown_section_split_creates_inclusive_section_children_under_threshold() {
         let content =
             "# Root\nIntro paragraph.\n\n## Coding\nDetails live here.\n\n### Dev Guide\nSteps.\n";
         let block = make_block(content, BlockKind::Section);
         let result = split_result_for_child_navigation(&block, Language::Markdown).unwrap();
         assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
 
-        let kinds: Vec<_> = result
+        let sections: Vec<_> = result
             .blocks
             .iter()
             .filter(|block| block.kind != BlockKind::Gap)
-            .map(|block| block.kind)
             .collect();
+        assert_eq!(sections.len(), 2);
+        assert!(
+            sections
+                .iter()
+                .all(|block| block.kind == BlockKind::Section)
+        );
+        assert_eq!(sections[0].content, "# Root\nIntro paragraph.\n\n");
         assert_eq!(
-            kinds,
-            vec![BlockKind::Header, BlockKind::Paragraph, BlockKind::Section]
+            sections[1].content,
+            "## Coding\nDetails live here.\n\n### Dev Guide\nSteps.\n"
         );
         assert_eq!(merge_blocks(result.blocks.clone()), content);
 
         let coding_section = result
             .blocks
             .into_iter()
-            .find(|block| block.kind == BlockKind::Section)
+            .find(|block| block.content.starts_with("## Coding"))
             .unwrap_or_else(|| panic!("expected nested section child"));
         let nested =
             split_result_for_child_navigation(&coding_section, Language::Markdown).unwrap();
-        let nested_kinds: Vec<_> = nested
+        let nested_sections: Vec<_> = nested
             .blocks
             .iter()
             .filter(|block| block.kind != BlockKind::Gap)
-            .map(|block| block.kind)
             .collect();
-        assert_eq!(
-            nested_kinds,
-            vec![BlockKind::Header, BlockKind::Paragraph, BlockKind::Section]
+        assert_eq!(nested_sections.len(), 2);
+        assert!(
+            nested_sections
+                .iter()
+                .all(|block| block.kind == BlockKind::Section)
         );
+        assert_eq!(
+            nested_sections[0].content,
+            "## Coding\nDetails live here.\n\n"
+        );
+        assert_eq!(nested_sections[1].content, "### Dev Guide\nSteps.\n");
+    }
+
+    #[test]
+    fn forced_markdown_section_split_skips_title_only_root_before_child_sections() {
+        let content = "# Root\n\n## Coding\nDetails live here.\n\n## Testing\nTest details.\n";
+        let block = make_block(content, BlockKind::Section);
+        let result = split_result_for_child_navigation(&block, Language::Markdown).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
+
+        let sections: Vec<_> = result
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .collect();
+        assert_eq!(sections.len(), 2);
+        assert!(
+            sections
+                .iter()
+                .all(|block| block.kind == BlockKind::Section)
+        );
+        assert_eq!(sections[0].content, "## Coding\nDetails live here.\n\n");
+        assert_eq!(sections[1].content, "## Testing\nTest details.\n");
     }
 
     #[test]

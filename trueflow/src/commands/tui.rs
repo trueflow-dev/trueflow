@@ -7255,12 +7255,41 @@ mod diff_scope_tests {
         repo_path: &str,
         file_content: &str,
     ) -> (AppState, TreeNodeId, TreeNodeId) {
+        build_state_with_markdown_blocks(
+            repo_path,
+            file_content,
+            block_splitter::split(file_content, Language::Markdown).blocks,
+        )
+    }
+
+    fn build_state_with_single_markdown_section(
+        repo_path: &str,
+        file_content: &str,
+    ) -> (AppState, TreeNodeId, TreeNodeId) {
+        let end_line = file_content.lines().count();
+        build_state_with_markdown_blocks(
+            repo_path,
+            file_content,
+            vec![Block::new(
+                file_content.to_string(),
+                BlockKind::Section,
+                0,
+                end_line,
+            )],
+        )
+    }
+
+    fn build_state_with_markdown_blocks(
+        repo_path: &str,
+        file_content: &str,
+        blocks: Vec<Block>,
+    ) -> (AppState, TreeNodeId, TreeNodeId) {
         let file_state = FileState::from_text(
             RepoPath::new(repo_path)
                 .unwrap_or_else(|error| panic!("invalid repo path {repo_path}: {error}")),
             Language::Markdown,
             file_content.as_bytes(),
-            block_splitter::split(file_content, Language::Markdown).blocks,
+            blocks,
         );
         let tree = build_tree_from_files(&[file_state]);
         let file_id = tree
@@ -11536,12 +11565,11 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn handle_child_lazily_expands_small_markdown_section_into_header_paragraph_and_nested_section()
-    {
+    fn handle_child_lazily_expands_small_markdown_section_into_inclusive_sections() {
         let content =
             "# Root\nIntro paragraph.\n\n## Coding\nDetails live here.\n\n### Dev Guide\nSteps.\n";
         let (mut state, file_id, root_section) =
-            build_state_with_markdown_file("docs/guide.md", content);
+            build_state_with_single_markdown_section("docs/guide.md", content);
 
         assert_eq!(state.navigator.current_id(), file_id);
         assert_eq!(state.reviewable_nodes.len(), 1);
@@ -11553,37 +11581,35 @@ mod diff_scope_tests {
         let current = state.navigator.tree.node(state.navigator.current_id());
         assert_eq!(
             current.block.as_ref().map(|block| block.kind),
-            Some(BlockKind::Header)
+            Some(BlockKind::Section)
+        );
+        assert_eq!(
+            current.block.as_ref().map(|block| block.content.as_str()),
+            Some("# Root\nIntro paragraph.\n\n")
         );
 
-        let child_kinds: Vec<_> = state
+        let child_blocks: Vec<_> = state
             .navigator
             .tree
             .node(root_section)
             .children
             .iter()
-            .map(|child| {
-                state
-                    .navigator
-                    .tree
-                    .node(*child)
-                    .block
-                    .as_ref()
-                    .map(|block| block.kind)
-            })
+            .map(|child| state.navigator.tree.node(*child).block.as_ref().unwrap())
             .collect();
+        assert_eq!(child_blocks.len(), 2);
+        assert!(
+            child_blocks
+                .iter()
+                .all(|block| block.kind == BlockKind::Section)
+        );
+        assert_eq!(child_blocks[0].content, "# Root\nIntro paragraph.\n\n");
         assert_eq!(
-            child_kinds,
-            vec![
-                Some(BlockKind::Header),
-                Some(BlockKind::Paragraph),
-                Some(BlockKind::Section)
-            ]
+            child_blocks[1].content,
+            "## Coding\nDetails live here.\n\n### Dev Guide\nSteps.\n"
         );
         assert!(!state.reviewable_nodes.contains(&root_section));
-        assert_eq!(state.reviewable_nodes.len(), 3);
+        assert_eq!(state.reviewable_nodes.len(), 2);
 
-        handle_next(&mut state);
         handle_next(&mut state);
         let nested_section = state.navigator.current_id();
         assert_eq!(
@@ -11601,33 +11627,35 @@ mod diff_scope_tests {
         let nested_current = state.navigator.tree.node(state.navigator.current_id());
         assert_eq!(
             nested_current.block.as_ref().map(|block| block.kind),
-            Some(BlockKind::Header)
+            Some(BlockKind::Section)
+        );
+        assert_eq!(
+            nested_current
+                .block
+                .as_ref()
+                .map(|block| block.content.as_str()),
+            Some("## Coding\nDetails live here.\n\n")
         );
 
-        let nested_child_kinds: Vec<_> = state
+        let nested_child_blocks: Vec<_> = state
             .navigator
             .tree
             .node(nested_section)
             .children
             .iter()
-            .map(|child| {
-                state
-                    .navigator
-                    .tree
-                    .node(*child)
-                    .block
-                    .as_ref()
-                    .map(|block| block.kind)
-            })
+            .map(|child| state.navigator.tree.node(*child).block.as_ref().unwrap())
             .collect();
-        assert_eq!(
-            nested_child_kinds,
-            vec![
-                Some(BlockKind::Header),
-                Some(BlockKind::Paragraph),
-                Some(BlockKind::Section)
-            ]
+        assert_eq!(nested_child_blocks.len(), 2);
+        assert!(
+            nested_child_blocks
+                .iter()
+                .all(|block| block.kind == BlockKind::Section)
         );
+        assert_eq!(
+            nested_child_blocks[0].content,
+            "## Coding\nDetails live here.\n\n"
+        );
+        assert_eq!(nested_child_blocks[1].content, "### Dev Guide\nSteps.\n");
     }
 
     #[test]

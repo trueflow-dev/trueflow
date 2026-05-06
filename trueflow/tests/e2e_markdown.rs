@@ -2,6 +2,45 @@ use anyhow::{Context, Result};
 use trueflow_test_support::*;
 
 #[test]
+fn test_new_markdown_file_review_is_section_granular() -> Result<()> {
+    let repo = TestRepo::new("markdown_new_file_review")?;
+    repo.write(
+        "README.md",
+        "# Guide\nIntro sentence.\n\n## Install\nInstall paragraph one.\n\nInstall paragraph two.\n\n## Usage\nUsage paragraph one.\n\nUsage paragraph two.\n",
+    )?;
+    repo.commit_all("Add README")?;
+
+    let revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let output = repo.run(&["review", "--target", &format!("rev:{revision}"), "--json"])?;
+    let files = json_array(&output)?;
+    let file = files
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some("README.md"))
+        .context("README.md review entry")?;
+    let blocks = file["blocks"].as_array().context("blocks")?;
+    let section_contents = blocks
+        .iter()
+        .filter(|block| block["kind"] == "Section")
+        .filter_map(|block| block["content"].as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(section_contents.len(), 3);
+    assert_eq!(section_contents[0], "# Guide\nIntro sentence.\n\n");
+    assert_eq!(
+        section_contents[1],
+        "## Install\nInstall paragraph one.\n\nInstall paragraph two.\n\n"
+    );
+    assert_eq!(
+        section_contents[2],
+        "## Usage\nUsage paragraph one.\n\nUsage paragraph two.\n"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_small_markdown_section_stays_whole() -> Result<()> {
     let repo = TestRepo::new("markdown_split")?;
     repo.write(

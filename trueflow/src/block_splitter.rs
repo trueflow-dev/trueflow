@@ -571,60 +571,51 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
     collect_markdown_headings(root, content, &mut headings);
     headings.sort_by_key(|heading| heading.start);
 
-    let mut blocks = Vec::new();
-    let mut section_start = 0;
-    let mut current_level = 0;
-
-    for heading in headings {
-        if current_level == 0 {
-            if heading.start > section_start {
-                let chunk = &content[section_start..heading.start];
-                if !chunk.trim().is_empty() {
-                    blocks.push(create_block(
-                        chunk,
-                        BlockKind::Preamble,
-                        content,
-                        section_start,
-                        heading.start,
-                        Language::Markdown,
-                    ));
-                }
-            }
-            section_start = heading.start;
-            current_level = heading.level;
-            continue;
-        }
-
-        if heading.level <= current_level {
-            let chunk = &content[section_start..heading.start];
-            if !chunk.trim().is_empty() {
-                blocks.push(create_block(
-                    chunk,
-                    BlockKind::Section,
-                    content,
-                    section_start,
-                    heading.start,
-                    Language::Markdown,
-                ));
-            }
-            section_start = heading.start;
-            current_level = heading.level;
-        }
+    if headings.is_empty() {
+        return Ok(fallback_split_blocks(
+            content,
+            FallbackMode::Text,
+            Language::Markdown,
+        ));
     }
 
-    if section_start < content.len() {
-        let chunk = &content[section_start..];
+    let mut blocks = Vec::new();
+    let root_sections = markdown_immediate_sections(&headings, 0, content.len());
+    let first_section_start = root_sections
+        .first()
+        .map(|section| section.start)
+        .unwrap_or(content.len());
+    if first_section_start > 0 {
+        let chunk = &content[..first_section_start];
         if !chunk.trim().is_empty() {
             blocks.push(create_block(
                 chunk,
-                if current_level == 0 {
-                    BlockKind::Preamble
-                } else {
-                    BlockKind::Section
-                },
+                BlockKind::Preamble,
                 content,
-                section_start,
-                content.len(),
+                0,
+                first_section_start,
+                Language::Markdown,
+            ));
+        }
+    }
+
+    let section_spans = if root_sections.len() == 1 {
+        // Most Markdown docs have one H1 wrapping the entire file. Review its
+        // immediate subsections instead of presenting the whole document as one block.
+        markdown_refined_single_root_sections(content, &root_sections[0], &headings)
+    } else {
+        root_sections
+    };
+
+    for section in section_spans {
+        let chunk = &content[section.start..section.end];
+        if !chunk.trim().is_empty() {
+            blocks.push(create_block(
+                chunk,
+                BlockKind::Section,
+                content,
+                section.start,
+                section.end,
                 Language::Markdown,
             ));
         }
@@ -976,7 +967,86 @@ fn is_nix_comment_chunk(chunk: &str) -> bool {
 #[derive(Debug, Clone)]
 struct MarkdownHeading {
     start: usize,
+    end: usize,
     level: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarkdownSectionSpan {
+    start: usize,
+    end: usize,
+}
+
+fn markdown_refined_single_root_sections(
+    content: &str,
+    root_section: &MarkdownSectionSpan,
+    headings: &[MarkdownHeading],
+) -> Vec<MarkdownSectionSpan> {
+    let Some(root_heading) = headings
+        .iter()
+        .find(|heading| heading.start == root_section.start)
+    else {
+        return vec![*root_section];
+    };
+    let child_headings = headings
+        .iter()
+        .filter(|heading| heading.start > root_section.start && heading.start < root_section.end)
+        .cloned()
+        .collect::<Vec<_>>();
+    let child_sections =
+        markdown_immediate_sections(&child_headings, root_heading.level, root_section.end);
+    if child_sections.is_empty() {
+        return vec![*root_section];
+    }
+
+    let mut sections = Vec::new();
+    let root_content_end = child_sections[0].start;
+    // Keep headings attached to their body text, but do not create a standalone
+    // title-only review block when the first subsection starts immediately.
+    let root_intro_body = content
+        .get(root_heading.end..root_content_end)
+        .unwrap_or_default();
+    if !root_intro_body.trim().is_empty() {
+        sections.push(MarkdownSectionSpan {
+            start: root_section.start,
+            end: root_content_end,
+        });
+    }
+    sections.extend(child_sections);
+    sections
+}
+
+fn markdown_immediate_sections(
+    headings: &[MarkdownHeading],
+    root_level: u8,
+    content_len: usize,
+) -> Vec<MarkdownSectionSpan> {
+    let mut sections: Vec<MarkdownSectionSpan> = Vec::new();
+    let mut level_stack = vec![root_level];
+
+    for heading in headings {
+        while level_stack
+            .last()
+            .is_some_and(|level| *level >= heading.level)
+        {
+            level_stack.pop();
+        }
+
+        let parent_level = level_stack.last().copied().unwrap_or(root_level);
+        if parent_level == root_level {
+            if let Some(previous) = sections.last_mut() {
+                previous.end = heading.start;
+            }
+            sections.push(MarkdownSectionSpan {
+                start: heading.start,
+                end: content_len,
+            });
+        }
+
+        level_stack.push(heading.level);
+    }
+
+    sections
 }
 
 fn collect_markdown_headings(
@@ -987,6 +1057,7 @@ fn collect_markdown_headings(
     if let Some(level) = markdown_heading_level(node.kind(), node.start_byte(), content) {
         headings.push(MarkdownHeading {
             start: node.start_byte(),
+            end: node.end_byte(),
             level,
         });
         return;
@@ -2305,6 +2376,57 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].content, "# Root\n## Sub\n### SubSub\n");
         assert_eq!(blocks[1].content, "# Root 2");
+    }
+
+    #[test]
+    fn markdown_single_root_splits_into_intro_and_child_sections() {
+        let content = "# Guide\nIntro.\n\n## Install\nInstall steps.\n\n## Usage\nUsage details.\n";
+        let blocks = split_blocks(content, Language::Markdown);
+
+        let kinds = blocks.iter().map(|block| block.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![BlockKind::Section, BlockKind::Section, BlockKind::Section]
+        );
+        assert_eq!(blocks[0].content, "# Guide\nIntro.\n\n");
+        assert_eq!(blocks[1].content, "## Install\nInstall steps.\n\n");
+        assert_eq!(blocks[2].content, "## Usage\nUsage details.\n");
+    }
+
+    #[test]
+    fn markdown_single_root_without_intro_starts_at_child_sections() {
+        let content = "# Guide\n\n## Install\nInstall steps.\n\n## Usage\nUsage details.\n";
+        let blocks = split_blocks(content, Language::Markdown);
+
+        let kinds = blocks.iter().map(|block| block.kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec![BlockKind::Section, BlockKind::Section]);
+        assert_eq!(blocks[0].content, "## Install\nInstall steps.\n\n");
+        assert_eq!(blocks[1].content, "## Usage\nUsage details.\n");
+    }
+
+    #[test]
+    fn markdown_without_headings_splits_into_paragraph_review_blocks() {
+        let content = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.";
+        let blocks = split_blocks(content, Language::Markdown);
+
+        let kinds = blocks.iter().map(|block| block.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Paragraph,
+                BlockKind::Gap,
+                BlockKind::Paragraph,
+                BlockKind::Gap,
+                BlockKind::Paragraph
+            ]
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.content.as_str())
+                .collect::<String>(),
+            content
+        );
     }
 
     #[test]
