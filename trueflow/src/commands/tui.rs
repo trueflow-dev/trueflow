@@ -4109,12 +4109,17 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     let header_lines = build_header_lines(node, state, palette);
     let mode_banner_line = build_mode_banner_line(state, palette);
-    let ai_hint_line = build_ai_hint_line(state, palette);
+    let ai_hint_text = state.ai.hint_line_text();
+    let ai_hint_width = focus_code_width(area);
+    let ai_hint_lines = ai_hint_text
+        .as_deref()
+        .map(|text| ai_hint_wrapped_line_count(text, ai_hint_width))
+        .unwrap_or_default();
 
     let focus_layout = compute_focus_layout(
         area,
         usize_to_u16_saturating(header_lines.len()),
-        ai_hint_line.is_some(),
+        ai_hint_lines,
     );
     let ui_mode = current_ui_mode(state);
     let actions_lines = build_action_lines(
@@ -4239,11 +4244,15 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         focus_layout.mode,
     );
 
-    if let Some(ai_hint_line) = ai_hint_line {
+    if let Some(ai_hint_text) = ai_hint_text {
         frame.render_widget(
-            Paragraph::new(ai_hint_line)
-                .alignment(Alignment::Center)
-                .style(Style::default().bg(palette.bg)),
+            Paragraph::new(build_ai_hint_lines_from_text(
+                &ai_hint_text,
+                palette,
+                focus_layout.ai_hint.width,
+            ))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(palette.bg)),
             focus_layout.ai_hint,
         );
     }
@@ -4728,16 +4737,141 @@ fn build_mode_banner_line(state: &AppState, palette: &UiPalette) -> Line<'static
     ))
 }
 
+#[cfg(test)]
 fn build_ai_hint_line(state: &AppState, palette: &UiPalette) -> Option<Line<'static>> {
-    state.ai.hint_line_text().map(|text| {
-        Line::from(Span::styled(
-            text,
-            Style::default()
-                .fg(palette.fg)
-                .bg(palette.bg)
-                .add_modifier(Modifier::BOLD),
-        ))
-    })
+    state
+        .ai
+        .hint_line_text()
+        .map(|text| styled_ai_hint_line(text, palette))
+}
+
+#[cfg(test)]
+fn build_ai_hint_lines(
+    state: &AppState,
+    palette: &UiPalette,
+    width: u16,
+) -> Option<Vec<Line<'static>>> {
+    state
+        .ai
+        .hint_line_text()
+        .map(|text| build_ai_hint_lines_from_text(&text, palette, width))
+}
+
+fn build_ai_hint_lines_from_text(
+    text: &str,
+    palette: &UiPalette,
+    width: u16,
+) -> Vec<Line<'static>> {
+    word_wrapped_text_to_width(text, usize::from(width.max(1)))
+        .into_iter()
+        .map(|line| styled_ai_hint_line(line, palette))
+        .collect()
+}
+
+fn styled_ai_hint_line(text: String, palette: &UiPalette) -> Line<'static> {
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(palette.fg)
+            .bg(palette.bg)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn ai_hint_wrapped_line_count(text: &str, width: u16) -> u16 {
+    usize_to_u16_saturating(word_wrapped_text_to_width(text, usize::from(width.max(1))).len())
+}
+
+fn word_wrapped_text_to_width(text: &str, width: usize) -> Vec<String> {
+    text.split('\n')
+        .flat_map(|line| word_wrap_line_to_width(line, width.max(1)))
+        .collect()
+}
+
+fn word_wrap_line_to_width(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in line.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        if current.is_empty() {
+            push_word_wrapped(&mut wrapped, &mut current, &mut current_width, word, width);
+            continue;
+        }
+
+        if current_width.saturating_add(1).saturating_add(word_width) <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_width = current_width.saturating_add(1).saturating_add(word_width);
+        } else {
+            wrapped.push(std::mem::take(&mut current));
+            current_width = 0;
+            push_word_wrapped(&mut wrapped, &mut current, &mut current_width, word, width);
+        }
+    }
+
+    if !current.is_empty() || wrapped.is_empty() {
+        wrapped.push(current);
+    }
+    wrapped
+}
+
+fn push_word_wrapped(
+    wrapped: &mut Vec<String>,
+    current: &mut String,
+    current_width: &mut usize,
+    word: &str,
+    width: usize,
+) {
+    for segment in hard_wrap_word_to_width(word, width) {
+        if segment.width >= width {
+            wrapped.push(segment.text);
+            *current = String::new();
+            *current_width = 0;
+        } else {
+            *current = segment.text;
+            *current_width = segment.width;
+        }
+    }
+}
+
+struct WrappedWordSegment {
+    text: String,
+    width: usize,
+}
+
+fn hard_wrap_word_to_width(word: &str, width: usize) -> Vec<WrappedWordSegment> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in word.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width.saturating_add(ch_width) > width {
+            out.push(WrappedWordSegment {
+                text: std::mem::take(&mut current),
+                width: current_width,
+            });
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width = current_width.saturating_add(ch_width);
+    }
+
+    if !current.is_empty() || out.is_empty() {
+        out.push(WrappedWordSegment {
+            text: current,
+            width: current_width,
+        });
+    }
+    out
 }
 
 fn should_show_change_metadata(state: &AppState) -> bool {
@@ -6678,12 +6812,19 @@ struct FocusLayout {
 }
 
 const ACTIONS_HEIGHT: u16 = 2;
-const AI_HINT_HEIGHT: u16 = 1;
 const MODE_BANNER_HEIGHT: u16 = 1;
 const CONTROLS_PADDING_HEIGHT: u16 = 1;
 
-fn compute_focus_layout(area: Rect, header_lines: u16, show_ai_hint: bool) -> FocusLayout {
-    let code_width = area.width.min(120);
+fn focus_code_width(area: Rect) -> u16 {
+    area.width.min(120)
+}
+
+fn compute_focus_layout(
+    area: Rect,
+    header_lines: u16,
+    requested_ai_hint_height: u16,
+) -> FocusLayout {
+    let code_width = focus_code_width(area);
     let desired_code_height = area.height.min(32);
     let padding = u16::try_from((u32::from(area.height) * 5 + 50) / 100).unwrap_or(u16::MAX);
 
@@ -6692,11 +6833,7 @@ fn compute_focus_layout(area: Rect, header_lines: u16, show_ai_hint: bool) -> Fo
     let available_after_mode = available_height.saturating_sub(mode_height);
     let actions_height = ACTIONS_HEIGHT.min(available_after_mode.saturating_sub(2));
     let available_after_actions = available_after_mode.saturating_sub(actions_height);
-    let ai_hint_height = if show_ai_hint {
-        AI_HINT_HEIGHT.min(available_after_actions.saturating_sub(2))
-    } else {
-        0
-    };
+    let ai_hint_height = requested_ai_hint_height.min(available_after_actions.saturating_sub(2));
     let available_after_ai = available_after_actions.saturating_sub(ai_hint_height);
     let controls_padding_height = CONTROLS_PADDING_HEIGHT.min(available_after_ai.saturating_sub(2));
     let available_for_header_and_code = available_after_ai.saturating_sub(controls_padding_height);
@@ -6776,7 +6913,7 @@ mod focus_layout_tests {
             width: 80,
             height: 20,
         };
-        let layout = compute_focus_layout(area, 3, false);
+        let layout = compute_focus_layout(area, 3, 0);
         assert!(layout.code.width <= 80);
         assert!(layout.code.height <= 20);
         assert!(layout.meta.y >= area.y);
@@ -6790,7 +6927,7 @@ mod focus_layout_tests {
             width: 200,
             height: 60,
         };
-        let layout = compute_focus_layout(area, 3, false);
+        let layout = compute_focus_layout(area, 3, 0);
         assert_eq!(layout.code.width, 120);
         assert_eq!(layout.actions.height, 2);
         assert!(layout.code.y > area.y);
@@ -6804,7 +6941,7 @@ mod focus_layout_tests {
             width: 120,
             height: 40,
         };
-        let layout = compute_focus_layout(area, 3, false);
+        let layout = compute_focus_layout(area, 3, 0);
         assert_eq!(layout.mode.height, 1);
         assert_eq!(layout.mode.y, layout.actions.y + layout.actions.height);
     }
@@ -6817,7 +6954,7 @@ mod focus_layout_tests {
             width: 120,
             height: 40,
         };
-        let layout = compute_focus_layout(area, 3, false);
+        let layout = compute_focus_layout(area, 3, 0);
         assert_eq!(layout.actions.y, layout.code.y + layout.code.height + 1);
     }
 
@@ -6829,7 +6966,7 @@ mod focus_layout_tests {
             width: 120,
             height: 40,
         };
-        let layout = compute_focus_layout(area, 1, false);
+        let layout = compute_focus_layout(area, 1, 0);
         assert_eq!(layout.meta.height, 3);
     }
 
@@ -6841,9 +6978,22 @@ mod focus_layout_tests {
             width: 120,
             height: 40,
         };
-        let layout = compute_focus_layout(area, 1, true);
+        let layout = compute_focus_layout(area, 1, 1);
         assert_eq!(layout.ai_hint.height, 1);
         assert_eq!(layout.mode.y, layout.actions.y + layout.actions.height);
+        assert_eq!(layout.ai_hint.y, layout.mode.y + layout.mode.height);
+    }
+
+    #[test]
+    fn focus_layout_reserves_multiple_ai_hint_rows() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = compute_focus_layout(area, 1, 3);
+        assert_eq!(layout.ai_hint.height, 3);
         assert_eq!(layout.ai_hint.y, layout.mode.y + layout.mode.height);
     }
 
@@ -6855,7 +7005,7 @@ mod focus_layout_tests {
             width: 80,
             height: 20,
         };
-        let layout = compute_focus_layout(area, 3, false);
+        let layout = compute_focus_layout(area, 3, 0);
         assert!(
             layout.actions.y + layout.actions.height <= area.y + area.height,
             "actions rect should fit within content area"
@@ -11295,6 +11445,53 @@ mod diff_scope_tests {
         assert_eq!(
             build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
             Some("Guard the wrapper against an empty input.".to_string())
+        );
+    }
+
+    #[test]
+    fn build_ai_hint_lines_wrap_long_suggestions_on_word_boundaries() {
+        let file_path = temp_test_file_path("tui_ai_wrapped_suggestion");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        state.ai.status = TuiAiStatus::Suggestion {
+            key: request.key,
+            suggestion: AiSuggestion {
+                explanation: None,
+                proposed_change: Some(
+                    "Ask reviewers to require a concrete timeout before this network wait ships."
+                        .to_string(),
+                ),
+            },
+        };
+        let palette = UiPalette::default();
+
+        let rendered = build_ai_hint_lines(&state, &palette, 24)
+            .unwrap_or_else(|| panic!("expected AI hint lines"))
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "Ask reviewers to require",
+                "a concrete timeout",
+                "before this network wait",
+                "ships."
+            ]
         );
     }
 
