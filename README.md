@@ -190,9 +190,10 @@ output.
 
 ## Runtime config
 
-Trueflow looks for a `trueflow.toml` file in the current directory or any parent
-folder. It applies defaults for `review` and `feedback` unless overridden by CLI
-flags.
+Trueflow first loads `~/.trueflow.toml` as global defaults, if present. It then
+loads every `trueflow.toml` from the filesystem root down to the current
+directory, with closer files overriding earlier defaults key-by-key. CLI flags
+still take precedence over config values.
 
 ```toml
 [review]

@@ -11,6 +11,7 @@ use crate::repo_path::RepoPath;
 use crate::scanner::{ScanCacheMode, ScanOptions};
 
 const CONFIG_FILE_NAME: &str = "trueflow.toml";
+const GLOBAL_CONFIG_FILE_NAME: &str = ".trueflow.toml";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct TrueflowConfig {
@@ -587,27 +588,85 @@ impl BlockFilters {
 
 pub fn load() -> Result<TrueflowConfig> {
     let current_dir = std::env::current_dir()?;
-    let Some(path) = find_config_path(&current_dir) else {
-        return Ok(TrueflowConfig::default());
-    };
-
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read config: {}", path.display()))?;
-    let config = toml::from_str(&content)
-        .with_context(|| format!("Failed to parse config: {}", path.display()))?;
-    Ok(config)
+    let home_dir = dirs::home_dir();
+    load_from_start_dir(&current_dir, home_dir.as_deref())
 }
 
-fn find_config_path(start_dir: &Path) -> Option<PathBuf> {
+fn load_from_start_dir(start_dir: &Path, home_dir: Option<&Path>) -> Result<TrueflowConfig> {
+    let paths = config_paths_for_start_dir(start_dir, home_dir);
+    load_from_config_paths(&paths)
+}
+
+fn config_paths_for_start_dir(start_dir: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home_dir) = home_dir {
+        let global_config = home_dir.join(GLOBAL_CONFIG_FILE_NAME);
+        if global_config.is_file() {
+            paths.push(global_config);
+        }
+    }
+
+    let mut ancestor_paths = Vec::new();
     let mut current = Some(start_dir);
     while let Some(dir) = current {
         let candidate = dir.join(CONFIG_FILE_NAME);
         if candidate.is_file() {
-            return Some(candidate);
+            ancestor_paths.push(candidate);
         }
         current = dir.parent();
     }
-    None
+    ancestor_paths.reverse();
+    paths.extend(ancestor_paths);
+    paths
+}
+
+fn load_from_config_paths(paths: &[PathBuf]) -> Result<TrueflowConfig> {
+    if paths.is_empty() {
+        return Ok(TrueflowConfig::default());
+    }
+
+    let mut merged = toml::Value::Table(toml::Table::new());
+    for path in paths {
+        let value = read_config_value(path)?;
+        merge_toml_values(&mut merged, value);
+    }
+
+    merged.try_into().with_context(|| {
+        format!(
+            "Failed to parse merged config from {}",
+            config_path_list(paths)
+        )
+    })
+}
+
+fn read_config_value(path: &Path) -> Result<toml::Value> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config: {}", path.display()))?;
+    toml::from_str(&content).with_context(|| format!("Failed to parse config: {}", path.display()))
+}
+
+fn merge_toml_values(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, value) in overlay_table {
+                match base_table.get_mut(&key) {
+                    Some(existing) => merge_toml_values(existing, value),
+                    None => {
+                        base_table.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn config_path_list(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn deserialize_block_kinds<'de, D>(deserializer: D) -> std::result::Result<Vec<BlockKind>, D::Error>
@@ -1050,6 +1109,98 @@ ignore_path_prefixes = ["vendor", "generated"]
             err.to_string().contains("invalid scan ignore glob"),
             "unexpected scan config error: {err}"
         );
+    }
+
+    #[test]
+    fn load_uses_home_trueflow_toml_as_global_defaults() {
+        let root = temp_config_dir("global_defaults");
+        let home = root.join("home");
+        let workdir = root.join("repo").join("nested");
+        std::fs::create_dir_all(&workdir).unwrap_or_else(|err| panic!("create workdir: {err}"));
+        write_config(
+            &home.join(".trueflow.toml"),
+            r#"
+[ai]
+enabled = true
+provider = "claude_cli"
+model = "claude-3-5-haiku-latest"
+
+[tui]
+diff_line_numbers = "old_new"
+"#,
+        );
+
+        let cfg = load_from_start_dir(&workdir, Some(&home))
+            .unwrap_or_else(|err| panic!("load config: {err}"));
+
+        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.provider, AiProviderConfig::ClaudeCli);
+        assert_eq!(cfg.ai.model, "claude-3-5-haiku-latest");
+        assert_eq!(cfg.tui.diff_line_numbers, TuiDiffLineNumbers::OldNew);
+    }
+
+    #[test]
+    fn load_merges_global_and_ancestor_configs_with_closer_values_winning() {
+        let root = temp_config_dir("global_and_closer_overrides");
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let nested = repo.join("nested");
+        let workdir = nested.join("leaf");
+        std::fs::create_dir_all(&workdir).unwrap_or_else(|err| panic!("create workdir: {err}"));
+        write_config(
+            &home.join(".trueflow.toml"),
+            r#"
+[ai]
+enabled = true
+provider = "claude_cli"
+model = "global-model"
+max_context_lines = 11
+
+[tui]
+diff_line_numbers = "old_new"
+diff_focus_context_lines = 8
+"#,
+        );
+        write_config(
+            &repo.join("trueflow.toml"),
+            r#"
+[ai]
+model = "repo-model"
+
+[tui]
+diff_focus_context_lines = 5
+"#,
+        );
+        write_config(
+            &nested.join("trueflow.toml"),
+            r#"
+[ai]
+max_context_lines = 24
+"#,
+        );
+
+        let cfg = load_from_start_dir(&workdir, Some(&home))
+            .unwrap_or_else(|err| panic!("load config: {err}"));
+
+        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.provider, AiProviderConfig::ClaudeCli);
+        assert_eq!(cfg.ai.model, "repo-model");
+        assert_eq!(cfg.ai.max_context_lines, 24);
+        assert_eq!(cfg.tui.diff_line_numbers, TuiDiffLineNumbers::OldNew);
+        assert_eq!(cfg.tui.diff_focus_context_lines, 5);
+    }
+
+    fn temp_config_dir(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("trueflow_tests")
+            .join(format!("config_{name}_{}", uuid::Uuid::new_v4()))
+    }
+
+    fn write_config(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|err| panic!("create parent: {err}"));
+        }
+        std::fs::write(path, content).unwrap_or_else(|err| panic!("write config: {err}"));
     }
 
     #[test]
