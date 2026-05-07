@@ -797,6 +797,21 @@ struct TuiAiState {
 struct PendingAiSuggestion {
     key: AiSuggestionKey,
     receiver: mpsc::Receiver<AiSuggestionWorkerResult>,
+    next_frame_at: Instant,
+}
+
+impl PendingAiSuggestion {
+    fn new(
+        key: AiSuggestionKey,
+        receiver: mpsc::Receiver<AiSuggestionWorkerResult>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            key,
+            receiver,
+            next_frame_at: now + AI_LOADING_FRAME_INTERVAL,
+        }
+    }
 }
 
 struct AiSuggestionWorkerResult {
@@ -883,9 +898,7 @@ impl TuiAiState {
     }
 
     fn ai_poll_deadline(&self) -> Option<Instant> {
-        self.pending
-            .as_ref()
-            .map(|_| Instant::now() + AI_LOADING_FRAME_INTERVAL)
+        self.pending.as_ref().map(|pending| pending.next_frame_at)
     }
 }
 
@@ -2201,15 +2214,16 @@ fn ensure_ai_suggestion_for_current_focus(state: &mut AppState) -> bool {
         });
     });
 
-    state.ai.pending = Some(PendingAiSuggestion {
-        key: key.clone(),
+    state.ai.pending = Some(PendingAiSuggestion::new(
+        key.clone(),
         receiver,
-    });
+        Instant::now(),
+    ));
     state.ai.status = TuiAiStatus::Loading { key, frame: 0 };
     true
 }
 
-const AI_LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(160);
+const AI_LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(480);
 const AI_LOADING_HINT_FRAMES: &[&str] = &["✦ · ·", "· ✧ ·", "· · ✦", "· ✧ ·"];
 
 fn ai_loading_hint_text(frame: usize) -> &'static str {
@@ -2217,14 +2231,23 @@ fn ai_loading_hint_text(frame: usize) -> &'static str {
 }
 
 fn advance_ai_loading_frame(state: &mut AppState) -> bool {
-    if state.ai.pending.is_none() {
+    let Some(pending) = state.ai.pending.as_mut() else {
+        return false;
+    };
+    let now = Instant::now();
+    if pending.next_frame_at > now {
         return false;
     }
     let TuiAiStatus::Loading { frame, .. } = &mut state.ai.status else {
         return false;
     };
     *frame = frame.saturating_add(1);
+    pending.next_frame_at = now + AI_LOADING_FRAME_INTERVAL;
     true
+}
+
+fn cancel_ai_suggestion(state: &mut AppState) -> bool {
+    reset_ai_status_to_availability(state)
 }
 
 fn reset_ai_status_to_availability(state: &mut AppState) -> bool {
@@ -3280,17 +3303,25 @@ fn focus_block_for_node(
 }
 
 fn set_focus_for_current_node(state: &mut AppState, preferred_child: Option<TreeNodeId>) {
+    let previous_focus = state.focus_block;
     let current = state.navigator.current_id();
     state.focus_block = focus_block_for_node(state, current, preferred_child);
     state.pending_focus_scroll = matches!(
         state.navigator.tree.node(current).kind,
         TreeNodeKind::File | TreeNodeKind::Block
     ) && state.focus_block.is_some();
+    if state.focus_block != previous_focus {
+        cancel_ai_suggestion(state);
+    }
 }
 
 fn clear_focus_scroll(state: &mut AppState) {
+    let previous_focus = state.focus_block;
     state.focus_block = None;
     state.pending_focus_scroll = false;
+    if previous_focus.is_some() {
+        cancel_ai_suggestion(state);
+    }
 }
 
 fn scroll_offset_for_focus_range(
@@ -3470,9 +3501,11 @@ fn handle_note_action(state: &mut AppState) -> Result<()> {
         state.navigator.current_id(),
         Verdict::Comment,
     );
+    let draft = current_comment_draft(state);
+    cancel_ai_suggestion(state);
     state.input_mode = InputMode::Editing { action };
     state.input_buffer.clear();
-    state.input_draft = current_comment_draft(state);
+    state.input_draft = draft;
     state.input_cursor.reset();
     clear_editing_validation(state);
     Ok(())
@@ -3599,6 +3632,7 @@ where
         compute_next_review_target(state, node_id)
     };
     let params = mark_params_for_action(state, node_id, verdict.clone(), note)?;
+    cancel_ai_suggestion(state);
     run_mark(params)?;
 
     let impact = apply_action_locally(state, node_id, &verdict, next_id);
@@ -11314,10 +11348,11 @@ mod diff_scope_tests {
             None => panic!("expected AI request for focused block"),
         };
         let (_sender, receiver) = mpsc::channel();
-        state.ai.pending = Some(PendingAiSuggestion {
-            key: request.key.clone(),
+        state.ai.pending = Some(PendingAiSuggestion::new(
+            request.key.clone(),
             receiver,
-        });
+            Instant::now() - AI_LOADING_FRAME_INTERVAL,
+        ));
         state.ai.status = TuiAiStatus::Loading {
             key: request.key,
             frame: 0,
@@ -11329,6 +11364,120 @@ mod diff_scope_tests {
             build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
             Some("· ✧ ·".to_string())
         );
+    }
+
+    #[test]
+    fn refresh_ai_suggestion_state_waits_for_loading_hint_deadline() {
+        let file_path = temp_test_file_path("tui_ai_loading_animation_waits");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        let (_sender, receiver) = mpsc::channel();
+        state.ai.pending = Some(PendingAiSuggestion::new(
+            request.key.clone(),
+            receiver,
+            Instant::now(),
+        ));
+        state.ai.status = TuiAiStatus::Loading {
+            key: request.key,
+            frame: 0,
+        };
+
+        assert!(!refresh_ai_suggestion_state(&mut state));
+        let palette = UiPalette::default();
+        assert_eq!(
+            build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
+            Some("✦ · ·".to_string())
+        );
+    }
+
+    #[test]
+    fn ai_loading_hint_animation_is_slow_enough_to_not_starve_input() {
+        assert!(AI_LOADING_FRAME_INTERVAL >= Duration::from_millis(400));
+    }
+
+    #[test]
+    fn handle_next_cancels_pending_ai_suggestion_for_previous_focus() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        state.navigator.set_current(block_ids[0]);
+        state.focus_block = Some(block_ids[0]);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        let (_sender, receiver) = mpsc::channel();
+        state.ai.pending = Some(PendingAiSuggestion::new(
+            request.key.clone(),
+            receiver,
+            Instant::now(),
+        ));
+        state.ai.status = TuiAiStatus::Loading {
+            key: request.key,
+            frame: 0,
+        };
+
+        handle_next(&mut state);
+
+        assert_eq!(state.focus_block, Some(block_ids[1]));
+        assert!(state.ai.pending.is_none());
+        assert_eq!(state.ai.status, TuiAiStatus::Availability);
+    }
+
+    #[test]
+    fn handle_note_action_cancels_pending_ai_without_waiting() {
+        let file_path = temp_test_file_path("tui_ai_note_cancels_pending");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        let (_sender, receiver) = mpsc::channel();
+        state.ai.pending = Some(PendingAiSuggestion::new(
+            request.key.clone(),
+            receiver,
+            Instant::now(),
+        ));
+        state.ai.status = TuiAiStatus::Loading {
+            key: request.key,
+            frame: 0,
+        };
+
+        handle_note_action(&mut state).unwrap_or_else(|error| panic!("open note: {error}"));
+
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert!(state.input_draft.is_none());
+        assert!(state.ai.pending.is_none());
+        assert_eq!(state.ai.status, TuiAiStatus::Availability);
     }
 
     #[test]
