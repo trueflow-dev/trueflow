@@ -3,7 +3,10 @@ use crate::block::{Block, BlockKind};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::coverage::{CoverageBuildOptions, CoverageIndex};
-use crate::policy::{should_skip_container_by_default, should_skip_imports_by_default};
+use crate::policy::{
+    should_skip_container_by_default, should_skip_imports_by_default,
+    should_skip_whitespace_only_by_default,
+};
 use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
@@ -355,6 +358,9 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             if !query.filters.allows_block(block.kind) {
                 continue;
             }
+            if should_skip_whitespace_only_by_default(&block, &query.filters) {
+                continue;
+            }
             if should_skip_imports_by_default(file.path.as_str(), &block, &query.filters) {
                 continue;
             }
@@ -491,6 +497,9 @@ fn collect_diff_scoped_review(
         let mut unreviewed_blocks = Vec::new();
         for review_block in file.blocks {
             let display_block = review_block.display_block().clone();
+            if should_skip_whitespace_only_by_default(&display_block, &query.filters) {
+                continue;
+            }
             let Some(node_id) = tree.find_block_node(&file.path, &display_block) else {
                 continue;
             };
@@ -648,6 +657,7 @@ fn collect_diff_review_files(
             .filter(|review_block| {
                 let display_block = review_block.display_block();
                 query.filters.allows_block(display_block.kind)
+                    && !should_skip_whitespace_only_by_default(display_block, &query.filters)
                     && !should_skip_imports_by_default(
                         display_path.as_str(),
                         display_block,
@@ -1016,6 +1026,9 @@ fn is_subblock_covered(
     if !query.filters.allows_subblock(block.kind) {
         return true;
     }
+    if should_skip_whitespace_only_by_default(block, &query.filters) {
+        return true;
+    }
 
     if coverage
         .block(file_path, block)
@@ -1035,6 +1048,7 @@ fn is_subblock_covered(
     match sub_split.semantics {
         sub_splitter::SubSplitSemantics::ReviewUnits => sub_split.blocks.iter().all(|sub_block| {
             !query.filters.allows_subblock(sub_block.kind)
+                || should_skip_whitespace_only_by_default(sub_block, &query.filters)
                 || coverage
                     .block(file_path, sub_block)
                     .direct_latest_verdict_for(review_check)

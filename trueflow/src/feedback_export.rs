@@ -1,7 +1,7 @@
 use crate::block::{Block, BlockKind, FileState};
 use crate::config::BlockFilters;
 use crate::feedback_since::ResolvedFeedbackSince as ParsedFeedbackSince;
-use crate::policy::should_skip_imports_by_default;
+use crate::policy::{should_skip_imports_by_default, should_skip_whitespace_only_by_default};
 use crate::repo_path::RepoPath;
 use crate::scanner::{self, ScanOptions};
 use crate::store::{FileStore, Record, RepoRef, ReviewTargetRef, TreeHash};
@@ -157,6 +157,9 @@ pub fn collect_feedback_entries(
             .clone()
             .unwrap_or_else(|| unresolved_block_for_record(record));
         if !query.filters.allows_block(block.kind) {
+            continue;
+        }
+        if should_skip_whitespace_only_by_default(&block, &query.filters) {
             continue;
         }
         if file_path != "<unknown>"

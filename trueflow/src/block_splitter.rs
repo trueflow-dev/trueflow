@@ -1001,7 +1001,19 @@ fn split_markdown_section_for_review(
             .find(|heading| heading.start == section.start)
             .map(|heading| heading.end)
             .unwrap_or(section.start);
-        blocks.extend(split_markdown_flat_range(content, body_start, section.end)?);
+        if content[body_start..section.end].trim().is_empty() {
+            return Ok(blocks);
+        }
+        let attached_blocks = split_markdown_flat_range_attaching_heading(
+            content,
+            section.start,
+            body_start,
+            section.end,
+        )?;
+        if attached_blocks.len() == 1 && attached_blocks[0].content == section_content {
+            return Ok(attached_blocks);
+        }
+        blocks.extend(attached_blocks);
         return Ok(blocks);
     }
 
@@ -1073,7 +1085,32 @@ struct MarkdownSpan {
     kind: BlockKind,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MarkdownFlatPart {
+    start: usize,
+    end: usize,
+    kind: BlockKind,
+}
+
 fn split_markdown_flat_range(content: &str, start: usize, end: usize) -> Result<Vec<Block>> {
+    split_markdown_flat_range_with_attached_heading(content, None, start, end)
+}
+
+fn split_markdown_flat_range_attaching_heading(
+    content: &str,
+    heading_start: usize,
+    body_start: usize,
+    end: usize,
+) -> Result<Vec<Block>> {
+    split_markdown_flat_range_with_attached_heading(content, Some(heading_start), body_start, end)
+}
+
+fn split_markdown_flat_range_with_attached_heading(
+    content: &str,
+    attached_heading_start: Option<usize>,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Block>> {
     if start >= end {
         return Ok(Vec::new());
     }
@@ -1093,46 +1130,48 @@ fn split_markdown_flat_range(content: &str, start: usize, end: usize) -> Result<
     collect_markdown_spans(root, &mut spans);
     spans.sort_by_key(|span| span.start);
 
-    let mut blocks = Vec::new();
+    let mut parts = Vec::new();
     let mut last_end = 0;
     for span in spans {
         if span.start > last_end {
-            push_markdown_unstructured_span(
-                content,
-                slice,
-                start,
-                last_end,
-                span.start,
-                &mut blocks,
-            );
+            push_markdown_unstructured_part(slice, start, last_end, span.start, &mut parts);
         }
 
-        let chunk = &slice[span.start..span.end];
-        blocks.push(create_block(
-            chunk,
-            span.kind,
-            content,
-            start + span.start,
-            start + span.end,
-            Language::Markdown,
-        ));
+        parts.push(MarkdownFlatPart {
+            start: start + span.start,
+            end: start + span.end,
+            kind: span.kind,
+        });
         last_end = span.end;
     }
 
     if last_end < slice.len() {
-        push_markdown_unstructured_span(content, slice, start, last_end, slice.len(), &mut blocks);
+        push_markdown_unstructured_part(slice, start, last_end, slice.len(), &mut parts);
     }
 
-    Ok(blocks)
+    attach_markdown_heading_to_first_content(content, &mut parts, attached_heading_start);
+
+    Ok(parts
+        .into_iter()
+        .map(|part| {
+            create_block(
+                &content[part.start..part.end],
+                part.kind,
+                content,
+                part.start,
+                part.end,
+                Language::Markdown,
+            )
+        })
+        .collect())
 }
 
-fn push_markdown_unstructured_span(
-    content: &str,
+fn push_markdown_unstructured_part(
     slice: &str,
     offset: usize,
     start: usize,
     end: usize,
-    blocks: &mut Vec<Block>,
+    parts: &mut Vec<MarkdownFlatPart>,
 ) {
     let chunk = &slice[start..end];
     if chunk.is_empty() {
@@ -1143,14 +1182,31 @@ fn push_markdown_unstructured_span(
     } else {
         BlockKind::Paragraph
     };
-    blocks.push(create_block(
-        chunk,
+    parts.push(MarkdownFlatPart {
+        start: offset + start,
+        end: offset + end,
         kind,
-        content,
-        offset + start,
-        offset + end,
-        Language::Markdown,
-    ));
+    });
+}
+
+fn attach_markdown_heading_to_first_content(
+    content: &str,
+    parts: &mut Vec<MarkdownFlatPart>,
+    attached_heading_start: Option<usize>,
+) {
+    let Some(heading_start) = attached_heading_start else {
+        return;
+    };
+    let Some(first_content_index) = parts.iter().position(|part| {
+        part.kind != BlockKind::Gap && !content[part.start..part.end].trim().is_empty()
+    }) else {
+        return;
+    };
+
+    parts.drain(..first_content_index);
+    if let Some(first) = parts.first_mut() {
+        first.start = heading_start;
+    }
 }
 
 fn collect_markdown_spans(node: tree_sitter::Node<'_>, spans: &mut Vec<MarkdownSpan>) {
@@ -2585,7 +2641,7 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
     }
 
     #[test]
-    fn markdown_oversized_leaf_section_splits_to_paragraph_children() {
+    fn markdown_oversized_leaf_section_splits_to_heading_attached_children() {
         let mut content = String::from("# Long Notes\n");
         for index in 0..55 {
             content.push_str(&format!("\nParagraph {index} explains one idea.\n"));
@@ -2595,10 +2651,25 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(blocks[0].kind, BlockKind::Section);
         assert_eq!(blocks[0].content, content);
         assert!(blocks[0].line_span().len() > MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES);
+        let review_children = blocks[1..]
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .collect::<Vec<_>>();
+        assert_eq!(review_children[0].kind, BlockKind::Paragraph);
         assert!(
-            blocks[1..]
+            review_children[0]
+                .content
+                .starts_with("# Long Notes\n\nParagraph 0 explains one idea.")
+        );
+        assert!(
+            review_children[1..]
                 .iter()
                 .any(|block| block.kind == BlockKind::Paragraph)
+        );
+        assert!(
+            !blocks[1..]
+                .iter()
+                .any(|block| block.kind == BlockKind::Header)
         );
         assert!(blocks[1..].iter().all(|block| {
             block.kind == BlockKind::Gap
@@ -2614,13 +2685,21 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         }
         let blocks = split_blocks(&content, Language::Markdown);
 
-        assert_eq!(blocks[0].kind, BlockKind::Section);
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| { block.kind == BlockKind::Section && block.content == content })
+        );
         let lists = blocks
             .iter()
             .filter(|block| block.kind == BlockKind::List)
             .collect::<Vec<_>>();
         assert_eq!(lists.len(), 1);
-        assert!(lists[0].content.contains("- Task 0 stays with the list."));
+        assert!(
+            lists[0]
+                .content
+                .starts_with("# Tasks\n\n- Task 0 stays with the list.")
+        );
         assert!(lists[0].content.contains("- Task 59 stays with the list."));
     }
 
@@ -2633,13 +2712,17 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         content.push_str("```\n");
         let blocks = split_blocks(&content, Language::Markdown);
 
-        assert_eq!(blocks[0].kind, BlockKind::Section);
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| { block.kind == BlockKind::Section && block.content == content })
+        );
         let code_blocks = blocks
             .iter()
             .filter(|block| block.kind == BlockKind::CodeBlock)
             .collect::<Vec<_>>();
         assert_eq!(code_blocks.len(), 1);
-        assert!(code_blocks[0].content.starts_with("```rust\n"));
+        assert!(code_blocks[0].content.starts_with("# Example\n\n```rust\n"));
         assert!(code_blocks[0].content.contains("println!(\"line 59\");"));
         assert!(code_blocks[0].content.ends_with("```\n"));
     }

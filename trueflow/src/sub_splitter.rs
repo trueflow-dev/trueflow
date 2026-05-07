@@ -501,9 +501,18 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
     if child_sections.is_empty() {
         let body = content.get(root_heading.end..).unwrap_or_default();
         if body.trim().is_empty() {
-            return split_markdown_flat_range(block, 0, content.len());
+            return Ok(vec![block.clone()]);
         }
-        return split_markdown_flat_range(block, root_heading.end, content.len());
+        let attached_blocks = split_markdown_flat_range_attaching_heading(
+            block,
+            root_heading.start,
+            root_heading.end,
+            content.len(),
+        )?;
+        if attached_blocks.len() == 1 && attached_blocks[0].content == block.content {
+            return split_markdown_flat_range(block, root_heading.end, content.len());
+        }
+        return Ok(attached_blocks);
     }
 
     let mut blocks = Vec::new();
@@ -553,7 +562,32 @@ struct MarkdownSectionSpan {
     end: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MarkdownFlatPart {
+    start: usize,
+    end: usize,
+    kind: BlockKind,
+}
+
 fn split_markdown_flat_range(block: &Block, start: usize, end: usize) -> Result<Vec<Block>> {
+    split_markdown_flat_range_with_attached_heading(block, None, start, end)
+}
+
+fn split_markdown_flat_range_attaching_heading(
+    block: &Block,
+    heading_start: usize,
+    body_start: usize,
+    end: usize,
+) -> Result<Vec<Block>> {
+    split_markdown_flat_range_with_attached_heading(block, Some(heading_start), body_start, end)
+}
+
+fn split_markdown_flat_range_with_attached_heading(
+    block: &Block,
+    attached_heading_start: Option<usize>,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Block>> {
     if start >= end {
         return Ok(Vec::new());
     }
@@ -574,52 +608,82 @@ fn split_markdown_flat_range(block: &Block, start: usize, end: usize) -> Result<
     collect_markdown_spans(root, &mut spans);
     spans.sort_by_key(|span| span.start);
 
-    let mut blocks = Vec::new();
+    let mut parts = Vec::new();
     let mut last_end = 0;
     for span in spans {
         if span.start > last_end {
-            let gap = &slice[last_end..span.start];
-            if !gap.is_empty() {
-                blocks.push(create_sub_block_with_kind(
-                    block,
-                    gap,
-                    start + last_end,
-                    start + span.start,
-                    BlockKind::Gap,
-                ));
-            }
+            push_markdown_unstructured_part(slice, start, last_end, span.start, &mut parts);
         }
 
-        let chunk = &slice[span.start..span.end];
-        blocks.push(create_sub_block_with_kind(
-            block,
-            chunk,
-            start + span.start,
-            start + span.end,
-            span.kind,
-        ));
+        parts.push(MarkdownFlatPart {
+            start: start + span.start,
+            end: start + span.end,
+            kind: span.kind,
+        });
         last_end = span.end;
     }
 
     if last_end < slice.len() {
-        let tail = &slice[last_end..];
-        if !tail.is_empty() {
-            let kind = if tail.trim().is_empty() {
-                BlockKind::Gap
-            } else {
-                BlockKind::Paragraph
-            };
-            blocks.push(create_sub_block_with_kind(
-                block,
-                tail,
-                start + last_end,
-                end,
-                kind,
-            ));
-        }
+        push_markdown_unstructured_part(slice, start, last_end, slice.len(), &mut parts);
     }
 
-    Ok(blocks)
+    attach_markdown_heading_to_first_content(content, &mut parts, attached_heading_start);
+
+    Ok(parts
+        .into_iter()
+        .map(|part| {
+            create_sub_block_with_kind(
+                block,
+                &content[part.start..part.end],
+                part.start,
+                part.end,
+                part.kind,
+            )
+        })
+        .collect())
+}
+
+fn push_markdown_unstructured_part(
+    slice: &str,
+    offset: usize,
+    start: usize,
+    end: usize,
+    parts: &mut Vec<MarkdownFlatPart>,
+) {
+    let chunk = &slice[start..end];
+    if chunk.is_empty() {
+        return;
+    }
+    let kind = if chunk.trim().is_empty() {
+        BlockKind::Gap
+    } else {
+        BlockKind::Paragraph
+    };
+    parts.push(MarkdownFlatPart {
+        start: offset + start,
+        end: offset + end,
+        kind,
+    });
+}
+
+fn attach_markdown_heading_to_first_content(
+    content: &str,
+    parts: &mut Vec<MarkdownFlatPart>,
+    attached_heading_start: Option<usize>,
+) {
+    let Some(heading_start) = attached_heading_start else {
+        return;
+    };
+    let Some(first_content_index) = parts.iter().position(|part| {
+        part.kind != BlockKind::Gap && !content[part.start..part.end].trim().is_empty()
+    }) else {
+        return;
+    };
+
+    parts.drain(..first_content_index);
+    if let Some(first) = parts.first_mut() {
+        first.start = heading_start;
+    }
 }
 
 fn collect_markdown_heading_spans(
@@ -2006,22 +2070,40 @@ mod tests {
     }
 
     #[test]
-    fn forced_markdown_leaf_section_split_reviews_body_without_header_only_child() {
+    fn forced_markdown_leaf_section_split_attaches_header_to_first_body_child() {
         let content = "# Notes\n\nPara one.\n\nPara two.";
         let block = make_block(content, BlockKind::Section);
         let result = split_result_for_child_navigation(&block, Language::Markdown).unwrap();
         assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
 
-        let review_kinds: Vec<_> = result
+        let review_blocks: Vec<_> = result
             .blocks
             .iter()
             .filter(|block| block.kind != BlockKind::Gap)
-            .map(|block| block.kind)
             .collect();
-        assert_eq!(
-            review_kinds,
-            vec![BlockKind::Paragraph, BlockKind::Paragraph]
+        assert_eq!(review_blocks.len(), 2);
+        assert_eq!(review_blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(review_blocks[0].content, "# Notes\n\nPara one.\n");
+        assert_eq!(review_blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(review_blocks[1].content, "Para two.");
+        assert!(
+            !result
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Header)
         );
+        assert_eq!(merge_blocks(result.blocks), content);
+    }
+
+    #[test]
+    fn forced_markdown_title_only_section_does_not_create_standalone_header() {
+        let content = "# Notes\n";
+        let block = make_block(content, BlockKind::Section);
+        let result = split_result_for_child_navigation(&block, Language::Markdown).unwrap();
+
+        assert_eq!(result.blocks.len(), 1);
+        assert_eq!(result.blocks[0].kind, BlockKind::Section);
+        assert_eq!(result.blocks[0].content, content);
     }
 
     #[test]
