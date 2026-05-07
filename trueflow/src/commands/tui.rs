@@ -12205,6 +12205,93 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn highlight_line_markdown_recognizes_headings() {
+        let tokens = highlight_line("## Setup", Some(&Language::Markdown));
+        let rendered = tokens
+            .iter()
+            .map(|token| (token.text.as_str(), token.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![("##", TokenKind::Keyword), (" Setup", TokenKind::Strong)]
+        );
+    }
+
+    #[test]
+    fn highlight_line_markdown_recognizes_lists_and_inline_code() {
+        let tokens = highlight_line("- Run `trueflow tui` first", Some(&Language::Markdown));
+        let rendered = tokens
+            .iter()
+            .map(|token| (token.text.as_str(), token.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                ("-", TokenKind::Keyword),
+                (" Run ", TokenKind::Base),
+                ("`trueflow tui`", TokenKind::InlineCode),
+                (" first", TokenKind::Base),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_line_markdown_recognizes_bold_and_italic_spans() {
+        let tokens = highlight_line("Use **bold** and *italic* text", Some(&Language::Markdown));
+        let rendered = tokens
+            .iter()
+            .map(|token| (token.text.as_str(), token.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                ("Use ", TokenKind::Base),
+                ("**bold**", TokenKind::Strong),
+                (" and ", TokenKind::Base),
+                ("*italic*", TokenKind::Emphasis),
+                (" text", TokenKind::Base),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_line_markdown_recognizes_links_quotes_and_fences() {
+        let link_tokens = highlight_line(
+            "Read [docs](https://trueflow.dev).",
+            Some(&Language::Markdown),
+        );
+        assert_eq!(
+            link_tokens
+                .iter()
+                .map(|token| (token.text.as_str(), token.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Read ", TokenKind::Base),
+                ("[docs](https://trueflow.dev)", TokenKind::Link),
+                (".", TokenKind::Base),
+            ]
+        );
+
+        assert_eq!(
+            highlight_line("> quoted", Some(&Language::Markdown))
+                .iter()
+                .map(|token| (token.text.as_str(), token.kind))
+                .collect::<Vec<_>>(),
+            vec![("> quoted", TokenKind::Comment)]
+        );
+        assert_eq!(
+            highlight_line("```rust", Some(&Language::Markdown))
+                .iter()
+                .map(|token| (token.text.as_str(), token.kind))
+                .collect::<Vec<_>>(),
+            vec![("```rust", TokenKind::InlineCode)]
+        );
+    }
+
+    #[test]
     fn highlight_line_unknown_language_falls_back_to_plain_text() {
         let tokens = highlight_line("let value = 42; // note", Some(&Language::Unknown));
 
@@ -12729,6 +12816,10 @@ enum TokenKind {
     String,
     Number,
     Comment,
+    InlineCode,
+    Strong,
+    Emphasis,
+    Link,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12820,10 +12911,199 @@ impl LineHighlighter {
 }
 
 fn highlight_line(line: &str, language: Option<&Language>) -> Vec<HighlightToken> {
+    if matches!(language, Some(Language::Markdown)) {
+        return highlight_markdown_line(line);
+    }
+
     match line_highlighter_for(language) {
         Some(highlighter) => highlighter.tokenize_line(line),
         None => plain_text_tokens(line),
     }
+}
+
+fn highlight_markdown_line(line: &str) -> Vec<HighlightToken> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+
+    let content_start = markdown_content_start(line);
+    let (leading, content) = line.split_at(content_start);
+
+    if markdown_is_fence_line(content) {
+        return markdown_prefix_tokens(leading, content, TokenKind::InlineCode);
+    }
+
+    if let Some(marker_len) = markdown_heading_marker_len(content) {
+        let (marker, heading) = content.split_at(marker_len);
+        let mut tokens = Vec::new();
+        push_token(&mut tokens, leading, TokenKind::Base);
+        push_token(&mut tokens, marker, TokenKind::Keyword);
+        push_token(&mut tokens, heading, TokenKind::Strong);
+        return tokens;
+    }
+
+    if content.starts_with('>') {
+        return markdown_prefix_tokens(leading, content, TokenKind::Comment);
+    }
+
+    if let Some(marker_len) = markdown_list_marker_len(content) {
+        let (marker, rest) = content.split_at(marker_len);
+        let mut tokens = Vec::new();
+        push_token(&mut tokens, leading, TokenKind::Base);
+        push_token(&mut tokens, marker.trim_end(), TokenKind::Keyword);
+        let marker_tail = &marker[marker.trim_end().len()..];
+        push_token(&mut tokens, marker_tail, TokenKind::Base);
+        extend_tokens(&mut tokens, highlight_markdown_inline(rest));
+        return tokens;
+    }
+
+    let mut tokens = Vec::new();
+    push_token(&mut tokens, leading, TokenKind::Base);
+    extend_tokens(&mut tokens, highlight_markdown_inline(content));
+    tokens
+}
+
+fn markdown_content_start(line: &str) -> usize {
+    let mut spaces = 0usize;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            ' ' if spaces < 3 => spaces += 1,
+            _ => return index,
+        }
+    }
+    line.len()
+}
+
+fn markdown_prefix_tokens(leading: &str, content: &str, kind: TokenKind) -> Vec<HighlightToken> {
+    let mut tokens = Vec::new();
+    push_token(&mut tokens, leading, TokenKind::Base);
+    push_token(&mut tokens, content, kind);
+    tokens
+}
+
+fn markdown_is_fence_line(content: &str) -> bool {
+    content.starts_with("```") || content.starts_with("~~~")
+}
+
+fn markdown_heading_marker_len(content: &str) -> Option<usize> {
+    let marker_len = content.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&marker_len) {
+        return None;
+    }
+    if content.len() == marker_len
+        || content[marker_len..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        Some(marker_len)
+    } else {
+        None
+    }
+}
+
+fn markdown_list_marker_len(content: &str) -> Option<usize> {
+    if content.len() >= 2 {
+        let mut chars = content.chars();
+        if let (Some(marker @ ('-' | '*' | '+')), Some(space)) = (chars.next(), chars.next())
+            && space.is_whitespace()
+        {
+            return Some(marker.len_utf8() + space.len_utf8());
+        }
+    }
+
+    let digit_len = content.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len == 0 || digit_len > 9 {
+        return None;
+    }
+    let rest = &content[digit_len..];
+    let mut chars = rest.chars();
+    if let (Some(marker @ ('.' | ')')), Some(space)) = (chars.next(), chars.next())
+        && space.is_whitespace()
+    {
+        return Some(digit_len + marker.len_utf8() + space.len_utf8());
+    }
+    None
+}
+
+fn highlight_markdown_inline(line: &str) -> Vec<HighlightToken> {
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+
+    while index < line.len() {
+        let rest = &line[index..];
+
+        if let Some(token_len) = markdown_delimited_span_len(rest, "`") {
+            push_token(&mut tokens, &rest[..token_len], TokenKind::InlineCode);
+            index += token_len;
+            continue;
+        }
+
+        if let Some(token_len) = markdown_delimited_span_len(rest, "**") {
+            push_token(&mut tokens, &rest[..token_len], TokenKind::Strong);
+            index += token_len;
+            continue;
+        }
+
+        if let Some(token_len) = markdown_delimited_span_len(rest, "__") {
+            push_token(&mut tokens, &rest[..token_len], TokenKind::Strong);
+            index += token_len;
+            continue;
+        }
+
+        if let Some(token_len) = markdown_delimited_span_len(rest, "*") {
+            push_token(&mut tokens, &rest[..token_len], TokenKind::Emphasis);
+            index += token_len;
+            continue;
+        }
+
+        if let Some(token_len) = markdown_delimited_span_len(rest, "_") {
+            push_token(&mut tokens, &rest[..token_len], TokenKind::Emphasis);
+            index += token_len;
+            continue;
+        }
+
+        if let Some(token_len) = markdown_link_span_len(rest) {
+            push_token(&mut tokens, &rest[..token_len], TokenKind::Link);
+            index += token_len;
+            continue;
+        }
+
+        let plain_len = markdown_plain_span_len(rest);
+        push_token(&mut tokens, &rest[..plain_len], TokenKind::Base);
+        index += plain_len;
+    }
+
+    tokens
+}
+
+fn markdown_delimited_span_len(rest: &str, delimiter: &str) -> Option<usize> {
+    if !rest.starts_with(delimiter) {
+        return None;
+    }
+    let start = delimiter.len();
+    let end = rest[start..].find(delimiter)? + start;
+    (end > start).then_some(end + delimiter.len())
+}
+
+fn markdown_link_span_len(rest: &str) -> Option<usize> {
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let label_end = rest.find("](")?;
+    if label_end <= 1 {
+        return None;
+    }
+    let url_start = label_end + 2;
+    let url_end = rest[url_start..].find(')')? + url_start;
+    (url_end > url_start).then_some(url_end + 1)
+}
+
+fn markdown_plain_span_len(rest: &str) -> usize {
+    rest.char_indices()
+        .skip(1)
+        .find_map(|(index, ch)| matches!(ch, '`' | '*' | '_' | '[').then_some(index))
+        .unwrap_or(rest.len())
 }
 
 fn line_highlighter_for(language: Option<&Language>) -> Option<LineHighlighter> {
@@ -12979,6 +13259,12 @@ fn consume_identifier(rest: &str) -> Option<usize> {
         }
     }
     Some(end)
+}
+
+fn extend_tokens(tokens: &mut Vec<HighlightToken>, new_tokens: Vec<HighlightToken>) {
+    for token in new_tokens {
+        push_token(tokens, &token.text, token.kind);
+    }
 }
 
 fn push_token(tokens: &mut Vec<HighlightToken>, text: &str, kind: TokenKind) {
@@ -13216,6 +13502,18 @@ fn style_for_token(kind: TokenKind, palette: &UiPalette) -> Style {
         TokenKind::String => Style::default().fg(palette.string),
         TokenKind::Number => Style::default().fg(palette.number),
         TokenKind::Comment => Style::default().fg(palette.comment),
+        TokenKind::InlineCode => Style::default()
+            .fg(palette.string)
+            .add_modifier(Modifier::BOLD),
+        TokenKind::Strong => Style::default()
+            .fg(palette.code_fg)
+            .add_modifier(Modifier::BOLD),
+        TokenKind::Emphasis => Style::default()
+            .fg(palette.code_fg)
+            .add_modifier(Modifier::ITALIC),
+        TokenKind::Link => Style::default()
+            .fg(palette.keyword)
+            .add_modifier(Modifier::UNDERLINED),
     }
 }
 
