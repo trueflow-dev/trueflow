@@ -618,6 +618,7 @@ struct LaunchSelection {
     scope: ScopePreset,
     review: CollectedReview,
     scope_label: String,
+    initial_view_mode: ViewMode,
 }
 
 #[derive(Debug, Clone)]
@@ -625,6 +626,7 @@ struct CliReviewRequest {
     request: ReviewRequest,
     scope: ScopePreset,
     scope_label: String,
+    initial_view_mode: ViewMode,
 }
 
 // --- Application Logic ---
@@ -778,6 +780,7 @@ struct ReviewStateBuildOptions {
     diff_line_numbers: TuiDiffLineNumbers,
     keybinds: TuiKeybindsConfig,
     scope_label: String,
+    initial_view_mode: ViewMode,
     speed_read_config: TuiSpeedReadConfig,
     speed_read_config_path: PathBuf,
     ai: TuiAiState,
@@ -1157,6 +1160,7 @@ fn run_tui_review_loop(
                     scope: request.scope,
                     review,
                     scope_label: request.scope_label,
+                    initial_view_mode: request.initial_view_mode,
                 }
             } else if allow_scope_selector {
                 let LoadedScopeSelector {
@@ -1177,6 +1181,7 @@ fn run_tui_review_loop(
                             scope_label: scope.label(),
                             scope,
                             review,
+                            initial_view_mode: ViewMode::Diff,
                         }
                     }
                 }
@@ -1194,6 +1199,7 @@ fn run_tui_review_loop(
                     diff_line_numbers: config.tui.diff_line_numbers,
                     keybinds: config.tui.keybinds,
                     scope_label: launch.scope_label,
+                    initial_view_mode: launch.initial_view_mode,
                     speed_read_config: config.tui.speed_read.clone(),
                     speed_read_config_path: speed_read_config_path_for_repo_root(),
                     ai: tui_ai_state_for_config(config),
@@ -1289,6 +1295,7 @@ fn pull_request_cli_review_request(
         request,
         scope,
         scope_label,
+        initial_view_mode: ViewMode::Diff,
     })
 }
 
@@ -1409,11 +1416,24 @@ fn resolve_cli_review_request(
     let targets = expand_cli_review_targets(target, since)?;
     let request = review_request_from_cli_targets(all, &targets)?;
     let (scope, scope_label) = scope_preset_for_cli_targets(all, &targets);
+    let initial_view_mode = initial_view_mode_for_cli_targets(all, &targets);
     Ok(CliReviewRequest {
         request,
         scope,
         scope_label,
+        initial_view_mode,
     })
+}
+
+fn initial_view_mode_for_cli_targets(all: bool, targets: &[ReviewTarget]) -> ViewMode {
+    if all {
+        return ViewMode::Diff;
+    }
+
+    match targets {
+        [ReviewTarget::File(_)] => ViewMode::Source,
+        _ => ViewMode::Diff,
+    }
 }
 
 fn scope_preset_for_cli_targets(all: bool, targets: &[ReviewTarget]) -> (ScopePreset, String) {
@@ -1524,7 +1544,7 @@ fn build_review_state(
         viewport_height: 0,
         code_rect: Rect::default(),
         visible_comment_capture: None,
-        view_mode: ViewMode::Diff,
+        view_mode: options.initial_view_mode,
         block_diff_focus_mode: options.block_diff_focus_mode,
         diff_line_numbers: options.diff_line_numbers,
         keybinds: options.keybinds,
@@ -8512,6 +8532,19 @@ mod diff_scope_tests {
         );
         assert_eq!(request.scope, ScopePreset::MainDiff);
         assert_eq!(request.scope_label, "file src/lib.rs");
+        assert_eq!(request.initial_view_mode, ViewMode::Source);
+    }
+
+    #[test]
+    fn cli_review_request_main_diff_target_uses_diff_initial_mode() {
+        let targets = vec![ReviewTarget::MainDiff];
+        let request = cli_review_request(false, &targets, None, &[], &[])
+            .unwrap_or_else(|error| panic!("expected main diff request: {error}"));
+        let Some(request) = request else {
+            panic!("expected cli request");
+        };
+
+        assert_eq!(request.initial_view_mode, ViewMode::Diff);
     }
 
     #[test]
@@ -8655,6 +8688,7 @@ mod diff_scope_tests {
                     request,
                     scope,
                     scope_label,
+                    initial_view_mode: initial_view_mode_for_cli_targets(all, &targets),
                 })
             })
             .unwrap_or_else(|error| panic!("expected since request: {error}"));
@@ -8731,6 +8765,7 @@ mod diff_scope_tests {
                 diff_line_numbers: TuiDiffLineNumbers::Disabled,
                 keybinds: TuiKeybindsConfig::default(),
                 scope_label: "rev:abc1234..HEAD".to_string(),
+                initial_view_mode: ViewMode::Source,
                 speed_read_config: TuiSpeedReadConfig::default(),
                 speed_read_config_path: PathBuf::from("trueflow.toml"),
                 ai: TuiAiState::empty(),
@@ -8744,6 +8779,7 @@ mod diff_scope_tests {
         assert_eq!(state.root_cursor, Some(src));
         assert!(state.commented_nodes.contains(&block_id));
         assert_ne!(state.navigator.current_id(), state.navigator.tree.root());
+        assert_eq!(state.view_mode, ViewMode::Source);
     }
 
     #[test]
