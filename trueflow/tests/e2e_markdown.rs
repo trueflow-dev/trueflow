@@ -75,6 +75,37 @@ fn test_large_markdown_leaf_section_review_uses_body_blocks() -> Result<()> {
 }
 
 #[test]
+fn test_markdown_review_skips_gap_blocks_by_default() -> Result<()> {
+    let repo = TestRepo::new("markdown_review_skips_gaps")?;
+    let mut content = String::new();
+    for index in 0..55 {
+        content.push_str(&format!("Paragraph {index}.\n\n"));
+    }
+    repo.write("README.md", &content)?;
+    repo.commit_all("Add README")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let files = json_array(&output)?;
+    let file = files
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some("README.md"))
+        .context("README.md review entry")?;
+    let blocks = file["blocks"].as_array().context("blocks")?;
+    let kinds = blocks
+        .iter()
+        .filter_map(|block| block["kind"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(kinds.len() > 1);
+    assert!(
+        kinds.iter().all(|kind| *kind == "Paragraph"),
+        "expected only paragraph review blocks, got {kinds:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_small_markdown_section_stays_whole() -> Result<()> {
     let repo = TestRepo::new("markdown_split")?;
     repo.write(

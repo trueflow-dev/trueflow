@@ -171,8 +171,8 @@ trueflow feedback --format json --since 1h --target dir:trueflow/src
 # Review only functions
 trueflow review --all --only function --json
 
-# Exclude gaps and comments from feedback output
-trueflow feedback --exclude gap --exclude comment
+# Exclude comments from feedback output (gaps are skipped by default)
+trueflow feedback --exclude comment
 
 # Launch the TUI scoped to one file
 trueflow tui --target file:src/lib.rs
@@ -198,10 +198,10 @@ still take precedence over config values.
 ```toml
 [review]
 only = ["function", "struct"]
-exclude = ["gap", "comment"]
+exclude = ["comment"]
 
 [feedback]
-exclude = ["gap"]
+exclude = ["comment"]
 
 [tui]
 # disabled|old_new

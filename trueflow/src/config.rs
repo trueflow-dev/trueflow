@@ -546,16 +546,26 @@ impl ScanConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+const DEFAULT_EXCLUDED_BLOCK_KINDS: &[BlockKind] = &[BlockKind::Gap];
+
+#[derive(Debug, Clone)]
 pub struct BlockFilters {
     only: Option<HashSet<BlockKind>>,
     exclude: HashSet<BlockKind>,
+    default_exclude: HashSet<BlockKind>,
+}
+
+impl Default for BlockFilters {
+    fn default() -> Self {
+        Self::from_lists(&[], &[])
+    }
 }
 
 impl BlockFilters {
     pub fn from_lists(only: &[BlockKind], exclude: &[BlockKind]) -> Self {
         let only_set: HashSet<_> = only.iter().copied().collect();
         let exclude_set: HashSet<_> = exclude.iter().copied().collect();
+        let default_exclude = DEFAULT_EXCLUDED_BLOCK_KINDS.iter().copied().collect();
         let only = if only_set.is_empty() {
             None
         } else {
@@ -564,6 +574,7 @@ impl BlockFilters {
         Self {
             only,
             exclude: exclude_set,
+            default_exclude,
         }
     }
 
@@ -573,12 +584,15 @@ impl BlockFilters {
         }
         match &self.only {
             Some(only) => only.contains(&kind),
-            None => true,
+            None => !self.default_exclude.contains(&kind),
         }
     }
 
     pub fn allows_subblock(&self, kind: BlockKind) -> bool {
-        !self.exclude.contains(&kind)
+        if self.exclude.contains(&kind) {
+            return false;
+        }
+        self.only_contains(kind) || !self.default_exclude.contains(&kind)
     }
 
     pub fn only_contains(&self, kind: BlockKind) -> bool {
@@ -1059,6 +1073,40 @@ exclude = ["comment"]
         assert_eq!(cfg.review.exclude, vec![BlockKind::Gap]);
         assert_eq!(cfg.feedback.filters.only, vec![BlockKind::Struct]);
         assert_eq!(cfg.feedback.filters.exclude, vec![BlockKind::Comment]);
+    }
+
+    #[test]
+    fn block_filters_skip_gap_by_default() {
+        let filters = BlockFilters::default();
+
+        assert!(!filters.allows_block(BlockKind::Gap));
+        assert!(!filters.allows_subblock(BlockKind::Gap));
+        assert!(filters.allows_block(BlockKind::Function));
+    }
+
+    #[test]
+    fn block_filters_keep_gap_skipped_when_other_excludes_are_configured() {
+        let cfg: TrueflowConfig = toml::from_str(
+            r#"
+[review]
+exclude = ["comment"]
+"#,
+        )
+        .unwrap_or_else(|err| panic!("parse config: {err}"));
+        let filters = cfg.review.resolve_filters(&[], &[]);
+
+        assert!(!filters.allows_block(BlockKind::Gap));
+        assert!(!filters.allows_block(BlockKind::Comment));
+        assert!(filters.allows_block(BlockKind::Function));
+    }
+
+    #[test]
+    fn block_filters_allow_explicit_only_gap() {
+        let filters = BlockFilterConfig::default().resolve_filters(&[BlockKind::Gap], &[]);
+
+        assert!(filters.allows_block(BlockKind::Gap));
+        assert!(filters.allows_subblock(BlockKind::Gap));
+        assert!(!filters.allows_block(BlockKind::Function));
     }
 
     #[test]
