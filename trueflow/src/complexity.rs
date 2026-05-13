@@ -43,10 +43,40 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
 }
 
 fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) -> u32 {
-    let mut score = 0;
-    let kind = node.kind();
+    let mut score = 0u32;
+    // Deeply nested generated or DSL-like code can exceed the process stack if
+    // tree-sitter nodes are traversed recursively. Keep traversal state on the heap.
+    let mut stack = vec![(node, nesting)];
 
-    let is_control_flow = match lang {
+    while let Some((node, nesting)) = stack.pop() {
+        let kind = node.kind();
+        let is_control_flow = is_control_flow_node(node, kind, lang, source);
+        let is_logical_op = is_logical_op_node(kind, lang);
+
+        // Check specific logical operators for Python/others if nodes are named "boolean_operator".
+        if (matches!(lang, Language::Python) && kind == "boolean_operator") || is_logical_op {
+            score = score.saturating_add(1);
+        }
+
+        let child_nesting = if is_control_flow {
+            score = score.saturating_add(1u32.saturating_add(nesting));
+            nesting.saturating_add(1)
+        } else {
+            nesting
+        };
+
+        let mut cursor = node.walk();
+        stack.extend(
+            node.children(&mut cursor)
+                .map(|child| (child, child_nesting)),
+        );
+    }
+
+    score
+}
+
+fn is_control_flow_node(node: Node<'_>, kind: &str, lang: Language, source: &str) -> bool {
+    match lang {
         Language::Rust => matches!(
             kind,
             "if_expression"
@@ -189,9 +219,11 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
             "if_statement" | "for_statement" | "while_statement" | "case_statement"
         ),
         _ => false,
-    };
+    }
+}
 
-    let is_logical_op = match lang {
+fn is_logical_op_node(kind: &str, lang: Language) -> bool {
+    match lang {
         Language::Rust => matches!(kind, "&&" | "||"),
         Language::Elisp => matches!(kind, "and" | "or"),
         Language::Swift => {
@@ -209,41 +241,10 @@ fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) ->
         Language::Go => matches!(kind, "&&" | "||"),
         Language::C => matches!(kind, "&&" | "||"),
         Language::Cpp => matches!(kind, "&&" | "||"),
-        Language::Python => matches!(kind, "and" | "or"), // Python uses 'boolean_operator' usually, need to check grammar
+        Language::Python => matches!(kind, "and" | "or"),
         Language::Shell => matches!(kind, "&&" | "||"),
         _ => false,
-    };
-
-    // Check specific logical operators for Python/others if nodes are named "boolean_operator"
-    if (matches!(lang, Language::Python) && kind == "boolean_operator") || is_logical_op {
-        score += 1;
     }
-
-    if is_control_flow {
-        score += 1 + nesting;
-        // Increase nesting for children
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            score += calculate_node(child, nesting + 1, lang, source);
-        }
-    } else {
-        // Just recurse without increasing nesting, unless it's a function definition which resets nesting?
-        // Cognitive complexity says functions nest but usually we start counting FROM the function.
-        // Since we are analyzing a block which IS a function (mostly), we start at 0.
-        // If we encounter a nested function, it should probably increment nesting or complexity?
-        // Sonar says: "else", "catch" etc don't increment nesting level but pay for it.
-        // This is a simplified implementation.
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            score += calculate_node(child, nesting, lang, source);
-        }
-    }
-
-    // Special case for 'else' and 'else if' - they pay nesting but don't increment it?
-    // Simplified: Just +1 + nesting for now.
-
-    score
 }
 
 fn elisp_list_head_symbol<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {

@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use vt100::Parser;
 
-use trueflow_test_support::{TestRepo, read_review_records};
+use trueflow_test_support::{TestRepo, read_review_records, run_git_output};
 
 fn lock_output(output: &Arc<Mutex<Vec<u8>>>) -> MutexGuard<'_, Vec<u8>> {
     match output.lock() {
@@ -88,6 +88,113 @@ fn send_and_flush(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn deeply_nested_rust_function(depth: usize) -> String {
+    let mut content = String::from("pub fn nested(mut value: i32) -> i32 {\n");
+    for level in 1..=depth {
+        content.push_str(&format!("if value >= {level} {{\n"));
+    }
+    content.push_str("value += 1;\n");
+    for _ in 0..depth {
+        content.push_str("}\n");
+    }
+    content.push_str("value\n}\n");
+    content
+}
+
+fn wait_for_child_success(
+    child: &mut (dyn Child + Send + Sync),
+    output: &Arc<Mutex<Vec<u8>>>,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                let output = captured_output(output);
+                bail!("trueflow tui exited unsuccessfully: {status}; output: {output}");
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = captured_output(output);
+            bail!("timed out waiting for TUI PTY smoke test to exit; output: {output}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo = TestRepo::new("tui_pty_smoke_deep_nesting")?;
+    repo.write("src/lib.rs", &deeply_nested_rust_function(4_000))?;
+    repo.commit_all("add deeply nested function")?;
+    let revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let target = format!("rev:{}", revision.trim());
+
+    let rows = 24;
+    let cols = 100;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
+    cmd.arg("tui");
+    cmd.arg("--target");
+    cmd.arg(target);
+    cmd.cwd(&repo.path);
+    cmd.env("TERM", "xterm-256color");
+
+    let mut child = pair.slave.spawn_command(cmd)?;
+    let mut writer = pair.master.take_writer()?;
+    let mut reader = pair.master.try_clone_reader()?;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let output_reader = Arc::clone(&output);
+    let reader_thread = thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut output = lock_output(&output_reader);
+                    output.extend_from_slice(&buf[..count]);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    wait_for_output(&output, "Diff Mode", Duration::from_secs(15), &mut *child)?;
+
+    let keepalive_deadline = Instant::now() + Duration::from_millis(750);
+    while Instant::now() < keepalive_deadline {
+        if let Some(status) = child.try_wait()? {
+            let output = captured_output(&output);
+            bail!(
+                "trueflow tui exited while viewing deeply nested commit diff: {status}; output: {output}"
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    send_and_flush(&mut *writer, b"q")?;
+    drop(writer);
+    wait_for_child_success(&mut *child, &output)?;
+
+    if let Err(_panic) = reader_thread.join() {
+        bail!("reader thread panicked");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn pty_smoke_diff_mode_keeps_wrapped_rows_readable_in_narrow_terminal() -> Result<()> {
     if cfg!(windows) {
@@ -159,23 +266,7 @@ fn pty_smoke_diff_mode_keeps_wrapped_rows_readable_in_narrow_terminal() -> Resul
 
     send_and_flush(&mut *writer, b"q")?;
     drop(writer);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                let output = captured_output(&output);
-                bail!("trueflow tui exited unsuccessfully: {status}; output: {output}");
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = captured_output(&output);
-            bail!("timed out waiting for TUI PTY smoke test to exit; output: {output}");
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_child_success(&mut *child, &output)?;
 
     if let Err(_panic) = reader_thread.join() {
         bail!("reader thread panicked");
@@ -256,23 +347,7 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
     )?;
     send_and_flush(&mut *writer, b"q")?;
     drop(writer);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                let output = captured_output(&output);
-                bail!("trueflow tui exited unsuccessfully: {status}; output: {output}");
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = captured_output(&output);
-            bail!("timed out waiting for TUI PTY smoke test to exit; output: {output}");
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_child_success(&mut *child, &output)?;
 
     if let Err(_panic) = reader_thread.join() {
         bail!("reader thread panicked");
