@@ -105,6 +105,7 @@ impl ScopeSelectorOption {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ScopeSelectorStatus {
     Checking,
+    Deferred,
     Pending {
         remaining_blocks: usize,
         total_blocks: usize,
@@ -145,6 +146,7 @@ impl ScopeSelectorStatus {
     fn label(self) -> String {
         match self {
             Self::Checking => "[checking...]".to_string(),
+            Self::Deferred => "[select to scan]".to_string(),
             Self::Pending {
                 remaining_blocks,
                 total_blocks,
@@ -526,7 +528,7 @@ fn review_coverage_status_cache_key(
 fn scope_selector_status_should_refresh_when_cached(scope: &ScopePreset) -> bool {
     matches!(
         scope,
-        ScopePreset::All | ScopePreset::MainDiff | ScopePreset::RevisionRange { .. }
+        ScopePreset::MainDiff | ScopePreset::RevisionRange { .. }
     )
 }
 
@@ -541,6 +543,14 @@ fn build_scope_selector_with_status_jobs(
     let mut jobs = Vec::new();
 
     for (index, option) in options.into_iter().enumerate() {
+        if matches!(option.scope, ScopePreset::All) {
+            selector_options.push(ScopeSelectorOption::from_scope_option(
+                option,
+                ScopeSelectorStatus::Deferred,
+            ));
+            continue;
+        }
+
         let cache_key =
             review_coverage_status_cache_key(&option.scope, filters, scan_options, workdir_prefix);
         let cached_status = cache.and_then(|cache| cache.cached_status(&cache_key));
@@ -571,10 +581,11 @@ fn scope_selector_status_job_priority(scope: &ScopePreset) -> u8 {
 
 impl ScopeSelector {
     fn new(options: Vec<ScopeSelectorOption>) -> Self {
-        Self {
-            options,
-            selected: 0,
-        }
+        let selected = options
+            .iter()
+            .position(|option| matches!(option.scope, ScopePreset::MainDiff))
+            .unwrap_or(0);
+        Self { options, selected }
     }
 
     fn move_next(&mut self) {
@@ -7937,8 +7948,28 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn scope_selector_status_label_includes_checking_marker() {
+    fn scope_selector_status_label_includes_checking_and_deferred_markers() {
         assert_eq!(ScopeSelectorStatus::Checking.label(), "[checking...]");
+        assert_eq!(ScopeSelectorStatus::Deferred.label(), "[select to scan]");
+    }
+
+    #[test]
+    fn scope_selector_defaults_to_main_diff_when_available() {
+        let selector = ScopeSelector::new(vec![
+            ScopeSelectorOption {
+                label: "All files".to_string(),
+                scope: ScopePreset::All,
+                status: ScopeSelectorStatus::Deferred,
+            },
+            ScopeSelectorOption {
+                label: "Diff vs main".to_string(),
+                scope: ScopePreset::MainDiff,
+                status: ScopeSelectorStatus::Checking,
+            },
+        ]);
+
+        assert_eq!(selector.selected, 1);
+        assert_eq!(selector.selected_scope(), Some(ScopePreset::MainDiff));
     }
 
     #[test]
@@ -7987,14 +8018,12 @@ mod diff_scope_tests {
             Some(&cache),
         );
 
-        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Checking);
+        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Deferred);
         assert_eq!(
             selector.options[1].status,
             ScopeSelectorStatus::Reviewed { total_blocks: 7 }
         );
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].index, 0);
-        assert!(matches!(jobs[0].scope, ScopePreset::All));
+        assert!(jobs.is_empty());
     }
 
     #[test]
@@ -8050,24 +8079,17 @@ mod diff_scope_tests {
             Some(&cache),
         );
 
-        assert_eq!(
-            selector.options[0].status,
-            ScopeSelectorStatus::Pending {
-                remaining_blocks: 2,
-                total_blocks: 3,
-            }
-        );
+        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Deferred);
         assert_eq!(
             selector.options[1].status,
             ScopeSelectorStatus::Reviewed { total_blocks: 7 }
         );
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 1);
         assert!(matches!(jobs[0].scope, ScopePreset::Commit { .. }));
-        assert!(matches!(jobs[1].scope, ScopePreset::All));
     }
 
     #[test]
-    fn scope_selector_status_jobs_defer_expensive_all_scope_until_last() {
+    fn scope_selector_status_jobs_skip_expensive_all_scope() {
         let filters = BlockFilters::default();
         let scan_options = ScanOptions::default();
         let options = vec![
@@ -8091,9 +8113,9 @@ mod diff_scope_tests {
         let (_selector, jobs) =
             build_scope_selector_with_status_jobs(options, &filters, &scan_options, None, None);
 
+        assert_eq!(jobs.len(), 2);
         assert!(matches!(jobs[0].scope, ScopePreset::MainDiff));
         assert!(matches!(jobs[1].scope, ScopePreset::Commit { .. }));
-        assert!(matches!(jobs[2].scope, ScopePreset::All));
     }
 
     #[test]
