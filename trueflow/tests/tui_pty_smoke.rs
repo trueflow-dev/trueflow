@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
+use std::fs;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -86,6 +87,40 @@ fn send_and_flush(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     writer.write_all(bytes)?;
     writer.flush()?;
     Ok(())
+}
+
+fn alternate_screen_leave_count(output: &Arc<Mutex<Vec<u8>>>) -> usize {
+    lock_output(output)
+        .windows(b"\x1b[?1049l".len())
+        .filter(|window| *window == b"\x1b[?1049l")
+        .count()
+}
+
+fn write_fake_noninteractive_gpg(repo: &TestRepo) -> Result<String> {
+    let bin_dir = repo
+        .path
+        .parent()
+        .unwrap_or(repo.path.as_path())
+        .join("fake-bin");
+    fs::create_dir_all(&bin_dir)?;
+    let gpg_path = bin_dir.join("gpg");
+    fs::write(
+        &gpg_path,
+        r#"#!/bin/sh
+case " $* " in
+  *" --export "*) printf '%s\n' 'FAKE PUBLIC KEY'; exit 0 ;;
+  *) cat >/dev/null; printf '%s\n' 'FAKE SIGNATURE'; exit 0 ;;
+esac
+"#,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gpg_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    Ok(format!("{}:{path}", bin_dir.display()))
 }
 
 fn deeply_nested_rust_function(depth: usize) -> String {
@@ -191,6 +226,78 @@ fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
     if let Err(_panic) = reader_thread.join() {
         bail!("reader thread panicked");
     }
+
+    Ok(())
+}
+
+#[test]
+fn pty_smoke_signed_action_with_noninteractive_gpg_does_not_suspend_terminal() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo = TestRepo::new("tui_pty_smoke_signed_no_suspend")?;
+    repo.git(&["config", "user.signingkey", "ABC123"])?;
+    repo.write("src/lib.rs", "fn demo() {\n    work();\n}\n")?;
+    let path = write_fake_noninteractive_gpg(&repo)?;
+
+    let rows = 20;
+    let cols = 80;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
+    cmd.arg("tui");
+    cmd.arg("--all");
+    cmd.cwd(&repo.path);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("PATH", path);
+
+    let mut child = pair.slave.spawn_command(cmd)?;
+    let mut writer = pair.master.take_writer()?;
+    let mut reader = pair.master.try_clone_reader()?;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let output_reader = Arc::clone(&output);
+    let reader_thread = thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut output = lock_output(&output_reader);
+                    output.extend_from_slice(&buf[..count]);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    wait_for_output(&output, "Mode", Duration::from_secs(10), &mut *child)?;
+    send_and_flush(&mut *writer, b"a")?;
+    wait_for_output(
+        &output,
+        "review something else",
+        Duration::from_secs(10),
+        &mut *child,
+    )?;
+    send_and_flush(&mut *writer, b"q")?;
+    drop(writer);
+    wait_for_child_success(&mut *child, &output)?;
+
+    if let Err(_panic) = reader_thread.join() {
+        bail!("reader thread panicked");
+    }
+
+    assert_eq!(
+        alternate_screen_leave_count(&output),
+        1,
+        "signed non-interactive approval should only leave alternate screen on final TUI exit"
+    );
 
     Ok(())
 }

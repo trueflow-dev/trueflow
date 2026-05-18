@@ -2,114 +2,70 @@
 
 ## Current behavior
 
-As of this cleanup:
+The TUI now avoids terminal suspend for signing-enabled actions when GPG can sign non-interactively.
 
-- `src/commands/mark.rs` owns the suspend-policy decision via `TerminalSuspendRequirement`.
-- `src/commands/tui.rs` delegates to `mark::terminal_suspend_requirement_from_workdir()` instead of re-deriving the rule itself.
-- The current policy is still conservative:
-  - `user.signingkey` configured -> `TerminalSuspendRequirement::Required`
-  - no signing key configured -> `TerminalSuspendRequirement::NotRequired`
-- `mark::run()` signs records only in the `Required` case, so the TUI suspend policy and mark signing behavior are now structurally aligned.
+Action execution policy:
 
-This is safer than the prior state because the TUI no longer has a separate hand-rolled copy of the signing/suspend rule.
+- unsigned action:
+  - run `mark` directly
+  - do not leave raw mode / alternate screen
+- signed action with cached passphrase, no passphrase, GUI pinentry, or otherwise non-interactive GPG path:
+  - first try `mark` with non-interactive signing
+  - do not leave raw mode / alternate screen if that succeeds
+- signed action that cannot complete non-interactively:
+  - fall back to the previous conservative terminal suspend path
+  - run normal interactive signing while the TUI is suspended
+  - restore the TUI afterward
+- non-signing failures after the non-interactive attempt do not retry under suspend, avoiding duplicate action attempts after unrelated failures.
 
-## What is known
+The non-interactive signing attempt runs GPG with:
 
-From the current code structure:
+```text
+gpg --batch --no-tty --pinentry-mode error --detach-sign --armor
+```
 
-- The only obviously interactive subprocesses in the mark path are the GPG calls in `src/commands/mark.rs`:
-  - `gpg --detach-sign --armor`
-  - `gpg --armor --export`
-- Everything else in `mark::run()` appears non-interactive:
-  - loading git config
-  - building the review record
-  - computing block state
-  - appending to the store
-- We can therefore justify making the suspend *decision path* explicit and shared.
+Public-key export runs without terminal access:
 
-## What is not yet known
+```text
+gpg --batch --no-tty --armor --export
+```
 
-We do **not** yet have enough structural evidence to safely claim when a configured signing environment can avoid a TUI suspend.
+GPG stderr is captured and returned in the error instead of being written directly to the terminal.
 
-In particular, we have not established:
+## Remaining deliberate suspend behavior
 
-- when `gpg --detach-sign` will require terminal or pinentry access vs. when it can complete headlessly
-- whether `gpg --export` is always safe/non-interactive across supported environments
-- how agent/pinentry configuration changes behavior:
-  - `gpg-agent`
-  - `pinentry`
-  - `GPG_TTY`
-  - loopback pinentry
-  - cached passphrases
-  - smartcard / hardware-token flows
-- whether there are any other future mark backends that might introduce interactive behavior without going through the same policy surface
+Terminal suspend remains as a fallback only after non-interactive signing fails. This keeps support for setups that genuinely need terminal-mediated pinentry, hardware-token prompts, or other interactive GPG behavior.
 
-Because of those unknowns, we should **not** weaken the conservative signed-action behavior yet.
+The fallback is deliberately broad: if the non-interactive GPG signing/export phase fails, the TUI retries the action through the existing suspended interactive path. That preserves compatibility while eliminating the common flash for cached/non-interactive signing.
 
-## Recommended next step
+## Validation coverage
 
-Refactor `mark::run()` into explicit phases so the TUI can eventually suspend only around the actually interactive portion, if that becomes justified.
+Code-level tests cover:
 
-Suggested shape:
+- unsigned / no-suspend path runs directly
+- signed path skips suspend when non-interactive signing succeeds
+- signed path falls back to suspend after non-interactive signing failure
+- non-signing failures do not trigger a suspended retry
+- non-interactive signing failure classification
 
-1. Extract a pure/non-interactive preparation phase, e.g.:
-   - load runtime config
-   - build `Record`
-   - compute whether signing is needed
-2. Extract signing behind a small interface, e.g. a `Signer` trait or `SigningBackend` enum.
-3. Keep store append outside the signing backend.
-4. Add a TUI-facing entry point that can do:
-   - prepare without suspend
-   - suspend only around signing/export if signing is required
-   - resume and append afterward
+PTY smoke coverage verifies:
 
-That would narrow the suspend boundary without making any claim that signed flows are non-interactive.
+- a signing-enabled TUI approval with a fake non-interactive `gpg` does not leave alternate screen during approval
+- the only alternate-screen leave is the final TUI exit
 
-## Recommended tests / experiments
+## Still worth manual testing
 
-### Code-level tests
+Manual environment coverage is still useful for confidence across local GPG setups:
 
-Add tests that prove boundary placement, not environment-specific GPG behavior:
+- cached passphrase
+- uncached passphrase
+- GUI pinentry
+- curses pinentry with `GPG_TTY`
+- loopback pinentry
+- hardware token / smartcard
+- tmux vs plain terminal
 
-- unsigned path does not invoke the suspend wrapper
-- signed path invokes the suspend wrapper exactly around the signing backend
-- record append still happens after resume
-- failures during signing still restore the terminal cleanly
+Expected result:
 
-This likely requires dependency injection for:
-
-- the signing backend
-- the suspend wrapper
-- store append
-
-### Environment experiments
-
-Before changing signed behavior, manually test a small matrix:
-
-- signing key with cached passphrase
-- signing key with uncached passphrase
-- loopback pinentry enabled/disabled
-- `GPG_TTY` present/absent
-- hardware token / smartcard if supported
-- terminal multiplexer (`tmux`) vs plain terminal
-
-For each case, record:
-
-- whether suspend is actually necessary
-- whether failures are recoverable without corrupting the TUI
-- whether pinentry appears in the correct place
-
-## Safe change boundary for the next patch
-
-Safe:
-
-- more tests
-- internal refactors that separate prepare/sign/append phases
-- dependency injection that makes suspend boundaries testable
-- narrowing the boundary from `whole mark::run()` to `signing phase only`, **if** the refactor preserves the current conservative decision (`signed => suspend`)
-
-Not yet justified:
-
-- skipping suspend for signed actions based on heuristics about local GPG setup
-- claiming pinentry or signing is headless-safe in general
-- changing the policy based only on anecdotal environment behavior
+- cached/non-interactive paths do not flash the TUI
+- genuinely interactive paths may still suspend, but only after the non-interactive attempt fails
