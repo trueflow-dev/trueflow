@@ -5474,6 +5474,19 @@ fn is_base_only_diff_node(state: &AppState, node: &ContentNodeSnapshot) -> bool 
             .is_some_and(DiffBlockSides::is_base_only)
 }
 
+fn should_include_added_block_insertion_context(
+    state: &AppState,
+    node: &ContentNodeSnapshot,
+) -> bool {
+    // Newly inserted blocks need surrounding unchanged rows to show where the
+    // insertion lands; otherwise a trailing added blank line has no context.
+    matches!(node.kind, TreeNodeKind::Block)
+        && state
+            .block_change_kinds
+            .get(&node.id)
+            .is_some_and(|kind| matches!(kind, BlockChangeKind::Added))
+}
+
 fn focus_line_span_for_node(
     state: &AppState,
     node: &ContentNodeSnapshot,
@@ -6118,10 +6131,16 @@ fn build_diff_context_content(
     match file_diff {
         vcs::FileDiff::Text { hunks, .. } => {
             let rows = build_contextual_diff_rows(&file_lines, hunks);
+            let include_added_block_insertion_context =
+                should_include_added_block_insertion_context(state, node);
             let rows = match (&node.kind, display_line_span.as_ref()) {
                 (TreeNodeKind::Block, Some(display_span)) => rows
                     .into_iter()
-                    .filter(|row| display_span.contains(&row.anchor_index))
+                    .filter(|row| {
+                        display_span.contains(&row.anchor_index)
+                            || (include_added_block_insertion_context
+                                && row.kind == vcs::DiffLineKind::Context)
+                    })
                     .collect::<Vec<_>>(),
                 _ => rows,
             };
@@ -7285,6 +7304,26 @@ mod diff_scope_tests {
         block_start_line: usize,
         block_end_line: usize,
     ) -> (AppState, TreeNodeId, TreeNodeId) {
+        build_state_with_block_file_metadata(
+            file_path,
+            file_content,
+            block_content,
+            block_start_line,
+            block_end_line,
+            BlockKind::Function,
+            Language::Rust,
+        )
+    }
+
+    fn build_state_with_block_file_metadata(
+        file_path: &Path,
+        file_content: &str,
+        block_content: &str,
+        block_start_line: usize,
+        block_end_line: usize,
+        block_kind: BlockKind,
+        language: Language,
+    ) -> (AppState, TreeNodeId, TreeNodeId) {
         fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
             .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
         fs::write(file_path, file_content)
@@ -7304,20 +7343,20 @@ mod diff_scope_tests {
             file_name,
             repo_path.clone(),
             "file-hash".to_string(),
-            Language::Rust,
+            language,
         );
         let block = Block::new(
             block_content.to_string(),
-            BlockKind::Function,
+            block_kind,
             block_start_line,
             block_end_line,
         );
         let block_id = builder.add_block(
             file,
-            "function".to_string(),
+            block_kind.as_str().to_string(),
             repo_path.clone(),
             block,
-            Language::Rust,
+            language,
         );
         let tree = builder.finalize();
         let visible = HashSet::from([block_id]);
@@ -10856,6 +10895,86 @@ mod diff_scope_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rendered[1], "Press [v] to view source");
+    }
+
+    #[test]
+    fn build_added_markdown_section_diff_lines_include_greyed_continuation_context() {
+        let file_path =
+            temp_test_dir("tui_added_markdown_section_diff_context").join("src/README.md");
+        let file_content = concat!(
+            "# Guide\n",
+            "\n",
+            "## Added section\n",
+            "New paragraph.\n",
+            "\n",
+            "## Existing section\n",
+            "Existing continuation.\n"
+        );
+        let block_content = concat!("## Added section\n", "New paragraph.\n", "\n");
+        let (mut state, _file_id, block_id) = build_state_with_block_file_metadata(
+            &file_path,
+            file_content,
+            block_content,
+            2,
+            5,
+            BlockKind::Section,
+            Language::Markdown,
+        );
+        state.view_mode = ViewMode::Diff;
+        state
+            .block_change_kinds
+            .insert(block_id, BlockChangeKind::Added);
+        state.file_diff_cache.insert(
+            PathBuf::from("src/README.md"),
+            vcs::FileDiff::Text {
+                path: RepoPath::new("src/README.md").unwrap(),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/README.md").unwrap(),
+                    old_start: 3,
+                    new_start: 3,
+                    lines: vec![
+                        vcs::DiffHunkLine::added("## Added section\n"),
+                        vcs::DiffHunkLine::added("New paragraph.\n"),
+                        vcs::DiffHunkLine::added("\n"),
+                    ],
+                }],
+            },
+        );
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_block_lines(&mut state, &snapshot, &palette, 7, 80);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        let blank_added_index = rendered
+            .iter()
+            .position(|line| line == "+ ")
+            .unwrap_or_else(|| panic!("expected trailing blank added row: {rendered:?}"));
+        let continuation_index = rendered
+            .iter()
+            .position(|line| line.contains("## Existing section"))
+            .unwrap_or_else(|| {
+                panic!("expected continuation context after added block: {rendered:?}")
+            });
+        assert!(
+            blank_added_index < continuation_index,
+            "expected blank added row to separate added content from continuation context: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Existing continuation.")),
+            "expected file continuation context after added block: {rendered:?}"
+        );
+
+        let continuation_style = content.lines[continuation_index].spans[0].style;
+        assert_eq!(continuation_style.fg, Some(palette.context));
+        assert!(continuation_style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
