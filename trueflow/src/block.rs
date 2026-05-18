@@ -187,7 +187,7 @@ impl FromStr for BlockKind {
         let kind = match normalized.as_str() {
             "textblock" => BlockKind::TextBlock,
             "code" => BlockKind::Code,
-            "gap" => BlockKind::Gap,
+            "gap" | "whitespace" => BlockKind::Gap,
             "comment" => BlockKind::Comment,
             "section" => BlockKind::Section,
             "preamble" => BlockKind::Preamble,
@@ -478,6 +478,7 @@ mod tests {
             BlockKind::from_str("textblock").unwrap(),
             BlockKind::TextBlock
         );
+        assert_eq!(BlockKind::from_str("whitespace").unwrap(), BlockKind::Gap);
         assert_eq!(BlockKind::from_str("code").unwrap(), BlockKind::Code);
     }
 

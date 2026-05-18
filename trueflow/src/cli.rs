@@ -648,6 +648,18 @@ mod tests {
     }
 
     #[test]
+    fn review_command_accepts_whitespace_exclude_alias() {
+        let cli = Cli::parse_from(["trueflow", "review", "--exclude", "whitespace"]);
+
+        match cli.command {
+            Commands::Review { exclude, .. } => {
+                assert_eq!(exclude, vec![BlockKind::Gap]);
+            }
+            _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
     fn review_command_rejects_unknown_block_kind() {
         let err = match Cli::try_parse_from(["trueflow", "review", "--only", "not-a-kind"]) {
             Ok(_) => panic!("expected clap to reject unknown block kind"),
