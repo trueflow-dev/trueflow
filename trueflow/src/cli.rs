@@ -221,7 +221,6 @@ mod tests {
     use super::{Cli, Commands};
     use crate::block::BlockKind;
     use crate::build_info;
-    use crate::build_metadata::UNKNOWN_BUILD_TIMESTAMP;
     use crate::commands::feedback::FeedbackFormat;
     use crate::commands::review::{ReviewTarget, RevisionExpr};
     use crate::feedback_since::FeedbackSinceExpr;
@@ -229,7 +228,6 @@ mod tests {
     use crate::repo_path::RepoPath;
     use crate::store::CommentAnchor;
     use crate::store::{ReviewCheck, Verdict};
-    use chrono::DateTime;
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -246,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn long_help_includes_build_metadata_footer() {
+    fn long_help_includes_version_only_footer() {
         let mut command = Cli::command();
         let mut help = Vec::new();
         command
@@ -256,17 +254,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("help output was not utf8: {error}"));
 
         assert!(help.contains(build_info::HELP_FOOTER));
-    }
-
-    #[test]
-    fn build_timestamp_is_unknown_or_rfc3339() {
-        let build_timestamp = env!("TRUEFLOW_BUILD_TIMESTAMP");
-        if build_timestamp == UNKNOWN_BUILD_TIMESTAMP {
-            return;
-        }
-
-        DateTime::parse_from_rfc3339(build_timestamp)
-            .unwrap_or_else(|error| panic!("build timestamp was not RFC3339: {error}"));
+        assert!(!help.contains("Commit:"));
+        assert!(!help.contains("Built:"));
     }
 
     #[test]
