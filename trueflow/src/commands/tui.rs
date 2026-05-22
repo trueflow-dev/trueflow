@@ -5459,7 +5459,7 @@ fn load_file_lines(state: &mut AppState, path: &RepoPath) -> Option<Arc<[String]
         return Some(Arc::clone(lines));
     }
 
-    let contents = std::fs::read_to_string(path.as_str()).ok()?;
+    let contents = load_file_contents_for_scope(&state.review_scope, path)?;
     let lines: Arc<[String]> = contents
         .lines()
         .map(|line| line.to_string())
@@ -5467,6 +5467,22 @@ fn load_file_lines(state: &mut AppState, path: &RepoPath) -> Option<Arc<[String]
         .into();
     state.file_cache.insert(path_buf, Arc::clone(&lines));
     Some(lines)
+}
+
+fn load_file_contents_for_scope(scope: &ScopePreset, path: &RepoPath) -> Option<String> {
+    match scope {
+        ScopePreset::All | ScopePreset::MainDiff => std::fs::read_to_string(path.as_str()).ok(),
+        ScopePreset::Commit { id, .. } => load_file_contents_from_revision(id, path),
+        ScopePreset::RevisionRange { end, .. } => load_file_contents_from_revision(end, path),
+    }
+}
+
+fn load_file_contents_from_revision(revision: &str, path: &RepoPath) -> Option<String> {
+    let repo = vcs::repo_from_workdir().ok()?;
+    let workdir_prefix = workdir_prefix_from_git_root();
+    vcs::file_text_for_path_in_revision(&repo, revision, path, workdir_prefix.as_deref())
+        .ok()
+        .flatten()
 }
 
 fn focus_block_for_content_node(
@@ -7080,7 +7096,7 @@ mod diff_scope_tests {
     use crate::repo_path::RepoPath;
     use crate::scanner::ScanOptions;
     use crate::store::{CommitId, ReviewTargetKind};
-    use crate::test_git::{run_git, run_git_stdout, temp_git_repo, temp_test_dir};
+    use crate::test_git::{CurrentDirGuard, run_git, run_git_stdout, temp_git_repo, temp_test_dir};
     use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
     use ratatui::{Terminal, backend::TestBackend};
@@ -12673,6 +12689,84 @@ mod diff_scope_tests {
                 text: "let value = 42;".to_string(),
                 kind: TokenKind::Base,
             }]
+        );
+    }
+
+    #[test]
+    fn build_commit_scope_diff_uses_historical_file_content_when_current_path_is_missing() {
+        let repo_root = temp_git_repo("tui_commit_scope_missing_current_path");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
+
+        fs::write(
+            &file_path,
+            "pub fn demo() {\n    println!(\"before\");\n}\n",
+        )
+        .unwrap_or_else(|error| panic!("failed to write initial fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+
+        fs::write(
+            &file_path,
+            "pub fn demo() {\n    println!(\"historical target\");\n}\n",
+        )
+        .unwrap_or_else(|error| panic!("failed to write target fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update old path"]);
+        let target_revision = run_git_stdout(&repo_root, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        run_git(&repo_root, &["mv", "src/lib.rs", "src/renamed.rs"]);
+        run_git(&repo_root, &["commit", "-m", "Rename old path"]);
+        assert!(
+            !file_path.exists(),
+            "test setup should remove old path from current worktree"
+        );
+
+        let _cwd = CurrentDirGuard::push(&repo_root);
+        let mut state = build_test_state(
+            ScopePreset::Commit {
+                id: target_revision,
+                summary: "Update old path".to_string(),
+            },
+            HashMap::new(),
+        );
+        let node = ContentNodeSnapshot {
+            id: state.navigator.tree.root(),
+            kind: TreeNodeKind::Block,
+            path: RepoPath::new("src/lib.rs").unwrap(),
+            children: Vec::new(),
+            block: Some(Block {
+                hash: crate::hashing::TreeHash::new("block"),
+                content: "pub fn demo() {\n    println!(\"historical target\");\n}".to_string(),
+                kind: BlockKind::Function,
+                tags: vec![],
+                complexity: None,
+                start_line: 0,
+                end_line: 3,
+            }),
+            language: Some(Language::Rust),
+        };
+        let palette = UiPalette::default();
+
+        let content = build_block_lines(&mut state, &node, &palette, 5, 80);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().all(|line| !line.contains("(File missing)")),
+            "historical commit scope should not depend on current worktree path: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("historical target")),
+            "expected rendered diff to use historical file content: {rendered:?}"
         );
     }
 

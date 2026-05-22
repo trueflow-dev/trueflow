@@ -343,6 +343,21 @@ pub(crate) fn file_state_for_path_in_revision(
     file_state_for_path_in_tree(&tree, repo_relative_path.as_str(), output_path)
 }
 
+pub(crate) fn file_text_for_path_in_revision(
+    repo: &gix::Repository,
+    revision: &str,
+    path: &RepoPath,
+    workdir_prefix: Option<&str>,
+) -> Result<Option<String>> {
+    let tree = tree_for_revision(repo, revision)?;
+    for candidate in path_utils::tree_path_candidates_for_repo_path(path.as_str(), workdir_prefix) {
+        if let Some(text) = file_text_for_path_in_tree(&tree, &candidate)? {
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn file_state_for_path_in_revision_base(
     repo: &gix::Repository,
     revision: &str,
@@ -418,6 +433,22 @@ fn file_state_for_path_in_tree(
         tree_path,
         output_path.clone(),
     )))
+}
+
+fn file_text_for_path_in_tree(tree: &gix::Tree<'_>, tree_path_str: &str) -> Result<Option<String>> {
+    let tree_path = Path::new(tree_path_str);
+    let Some(entry) = tree.lookup_entry_by_path(tree_path)? else {
+        return Ok(None);
+    };
+    if entry.mode().kind() == EntryKind::Tree {
+        return Ok(None);
+    }
+
+    let blob = entry.object()?.try_into_blob()?;
+    let Ok(content) = std::str::from_utf8(&blob.data) else {
+        return Ok(None);
+    };
+    Ok(Some(content.to_string()))
 }
 
 fn collect_file_states_in_tree(
