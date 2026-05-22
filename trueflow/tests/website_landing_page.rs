@@ -272,6 +272,21 @@ fn website_install_page_explains_script_and_manual_downloads() -> Result<()> {
     );
     assert_contains(
         &html,
+        "# Open the TUI. The selector starts on Diff vs main.",
+        "install page first-run TUI guidance",
+    );
+    assert_contains(
+        &html,
+        "trueflow review --target dir:src --json",
+        "install page scoped review command",
+    );
+    assert_contains(
+        &html,
+        "trueflow tui --target rev:main..HEAD",
+        "install page revision range TUI command",
+    );
+    assert_contains(
+        &html,
         "nix run github:trueflow-dev/trueflow",
         "install page nix run command",
     );

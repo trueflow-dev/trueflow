@@ -33,12 +33,7 @@ The site and release flow use one domain:
 
 Current binary scope is Apple Silicon macOS and Linux x86_64.
 
-## Deployment shape
+## Deployment
 
-Planned AWS hosting:
-
-- `trueflow.dev` — canonical site host
-- `www.trueflow.dev` — redirect to `trueflow.dev`
-- private S3 bucket behind CloudFront OAC
-
-AWS infra is defined separately under `infra/terraform/`.
+Operator commands for redeploying the site and download artifacts live in
+`infra/README.md`.

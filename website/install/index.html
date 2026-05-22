@@ -100,6 +100,22 @@ install -m 0755 trueflow ~/.local/bin/trueflow</code></pre>
         </article>
 
         <article class="install-panel">
+          <h2>First run</h2>
+          <p>
+            Start with the current diff or a narrow target, then expand review
+            scope once you have momentum.
+          </p>
+          <pre class="command-line"><code># Open the TUI. The selector starts on Diff vs main.
+trueflow tui
+
+# Review one subtree from the CLI.
+trueflow review --target dir:src --json
+
+# Review a historical range.
+trueflow tui --target rev:main..HEAD</code></pre>
+        </article>
+
+        <article class="install-panel">
           <h2>Nix</h2>
           <p>
             If you already use Nix, install trueflow directly from the flake

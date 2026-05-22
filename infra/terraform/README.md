@@ -70,8 +70,8 @@ That one command will:
 
 - run `tofu init`, `tofu fmt -check`, `tofu validate`, and `tofu apply`
 - upload `website/`
-- package the Apple Silicon macOS binary artifact
-- upload `/download/` artifacts
+- package the Apple Silicon macOS binary artifact on Apple Silicon macOS
+- upload `/download/` artifacts from the versioned artifact directory
 
 For the common fast path after infra is already up:
 
@@ -103,11 +103,22 @@ To package and upload the current Apple Silicon macOS binary:
 ./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.0
 ```
 
+To package and smoke-test a native Linux x86_64 musl release on Linux x86_64:
+
+```sh
+./scripts/package-linux-release.sh
+./scripts/smoke-test-release.sh .trueflow/release-artifacts/v0.1.0/trueflow-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+```
+
 To upload a different artifact directory later:
 
 ```sh
 ./scripts/deploy-downloads.sh path/to/release-artifacts
 ```
+
+Important: `deploy-downloads.sh` uses `aws s3 sync --delete`, so upload only an
+artifact directory containing every platform artifact you still want published,
+plus the regenerated checksum file.
 
 ## State
 
