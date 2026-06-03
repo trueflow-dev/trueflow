@@ -142,42 +142,15 @@ fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<
 }
 
 fn collect_nested_blocks_for_node(node: Node<'_>, content: &str) -> Vec<NestedBlock> {
-    if node.kind() == "template_declaration"
-        && let Some(inner) = template_inner_node(node)
-    {
-        return collect_nested_blocks_for_node(inner, content);
-    }
-
-    match node.kind() {
-        "namespace_definition" => {
-            let Some(body) = node.child_by_field_name("body") else {
-                return Vec::new();
-            };
-            collect_recursive_child_blocks(body, content, false)
-        }
-        "class_specifier" | "struct_specifier" => {
-            let Some(body) = node.child_by_field_name("body") else {
-                return Vec::new();
-            };
-            collect_recursive_child_blocks(body, content, true)
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn collect_recursive_child_blocks(
-    body: Node<'_>,
-    content: &str,
-    in_container: bool,
-) -> Vec<NestedBlock> {
     let mut blocks = Vec::new();
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        if child.kind() == "access_specifier" {
-            continue;
-        }
+    let mut stack = nested_child_frames(node)
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
 
-        if let Some(kind) = classify_node(child, content, in_container)
+    while let Some((child, in_container)) = stack.pop() {
+        if child.kind() != "access_specifier"
+            && let Some(kind) = classify_node(child, content, in_container)
             && !matches!(kind, BlockKind::Code)
         {
             blocks.push(NestedBlock {
@@ -187,36 +160,57 @@ fn collect_recursive_child_blocks(
             });
         }
 
-        blocks.extend(collect_nested_blocks_for_node(child, content));
+        stack.extend(nested_child_frames(child).into_iter().rev());
     }
 
     blocks
 }
 
-fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
-    let mut ranges = Vec::new();
-    collect_test_ranges_from_node(tree.root_node(), source, &mut ranges)?;
-    Ok(ranges)
+fn nested_child_frames(node: Node<'_>) -> Vec<(Node<'_>, bool)> {
+    let node = if node.kind() == "template_declaration" {
+        template_inner_node(node).unwrap_or(node)
+    } else {
+        node
+    };
+
+    let (body, in_container) = match node.kind() {
+        "namespace_definition" => {
+            let Some(body) = node.child_by_field_name("body") else {
+                return Vec::new();
+            };
+            (body, false)
+        }
+        "class_specifier" | "struct_specifier" => {
+            let Some(body) = node.child_by_field_name("body") else {
+                return Vec::new();
+            };
+            (body, true)
+        }
+        _ => return Vec::new(),
+    };
+
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .map(|child| (child, in_container))
+        .collect()
 }
 
-fn collect_test_ranges_from_node(
-    node: Node<'_>,
-    source: &str,
-    ranges: &mut Vec<ByteSpan>,
-) -> Result<()> {
-    if node.kind() == "function_definition"
-        && let Some(name) = cpp_function_name(node, source)
-        && is_cpp_test_name(&name)
-    {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-    }
+fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
+    let mut ranges = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition"
+            && let Some(name) = cpp_function_name(node, source)
+            && is_cpp_test_name(&name)
+        {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_test_ranges_from_node(child, source, ranges)?;
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
-
-    Ok(())
+    Ok(ranges)
 }
 
 fn is_cpp_test_name(name: &str) -> bool {
@@ -230,64 +224,72 @@ fn cpp_function_name(function_node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn cpp_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier"
-        | "field_identifier"
-        | "type_identifier"
-        | "qualified_identifier"
-        | "destructor_name"
-        | "operator_name" => {
-            return node
-                .utf8_text(source.as_bytes())
-                .ok()
-                .map(std::string::ToString::to_string);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "qualified_identifier"
+            | "destructor_name"
+            | "operator_name" => {
+                return current
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(std::string::ToString::to_string);
+            }
+            _ => {}
         }
-        _ => {}
-    }
 
-    if let Some(name) = node.child_by_field_name("name")
-        && let Ok(text) = name.utf8_text(source.as_bytes())
-    {
-        return Some(text.to_string());
-    }
-
-    if let Some(declarator) = node.child_by_field_name("declarator")
-        && let Some(name) = cpp_declarator_name(declarator, source)
-    {
-        return Some(name);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(name) = cpp_declarator_name(child, source) {
-            return Some(name);
+        if let Some(name) = current.child_by_field_name("name")
+            && let Ok(text) = name.utf8_text(source.as_bytes())
+        {
+            return Some(text.to_string());
         }
+
+        let mut children = Vec::new();
+        if let Some(declarator) = current.child_by_field_name("declarator") {
+            children.push(declarator);
+        }
+        let mut cursor = current.walk();
+        children.extend(current.named_children(&mut cursor));
+        stack.extend(children.into_iter().rev());
     }
 
     None
 }
 
 fn node_contains_kind(node: Node<'_>, kind: &str) -> bool {
-    if node.kind() == kind {
-        return true;
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == kind {
+            return true;
+        }
 
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| node_contains_kind(child, kind))
+        let mut cursor = current.walk();
+        let children = current.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    false
 }
 
 fn node_contains_const_qualifier(node: Node<'_>, content: &str) -> bool {
-    if node.kind() == "type_qualifier" {
-        return node
-            .utf8_text(content.as_bytes())
-            .map(|text| text.trim() == "const")
-            .unwrap_or(false);
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "type_qualifier"
+            && current
+                .utf8_text(content.as_bytes())
+                .map(|text| text.trim() == "const")
+                .unwrap_or(false)
+        {
+            return true;
+        }
 
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| node_contains_const_qualifier(child, content))
+        let mut cursor = current.walk();
+        let children = current.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    false
 }
 
 fn sub_split(kind: BlockKind) -> SubSplitRegistration {
@@ -367,40 +369,39 @@ fn parse_tree(source: &str) -> Result<Tree> {
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
 }
 
 fn find_structural_container_descendant<'a>(node: Node<'a>) -> Option<Node<'a>> {
-    match node.kind() {
-        "namespace_definition" | "class_specifier" | "struct_specifier" | "enum_specifier" => {
-            return Some(node);
-        }
-        "template_declaration" => {
-            if let Some(inner) = template_inner_node(node)
-                && let Some(found) = find_structural_container_descendant(inner)
-            {
-                return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "namespace_definition" | "class_specifier" | "struct_specifier" | "enum_specifier" => {
+                return Some(current);
             }
+            "template_declaration" => {
+                if let Some(inner) = template_inner_node(current) {
+                    stack.push(inner);
+                }
+                continue;
+            }
+            _ => {}
         }
-        _ => {}
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_structural_container_descendant(child) {
-            return Some(found);
-        }
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

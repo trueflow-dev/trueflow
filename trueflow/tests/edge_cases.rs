@@ -105,6 +105,46 @@ fn test_empty_file() -> Result<()> {
 }
 
 #[test]
+fn test_scan_handles_deeply_nested_syntax_without_stack_overflow() -> Result<()> {
+    let repo = TestRepo::new("deeply_nested_syntax")?;
+    let expression = nested_parenthesized_expression(16_000, "1");
+
+    repo.write(
+        "deep.dart",
+        &format!("class A {{\n  var x = {expression};\n}}\n"),
+    )?;
+    repo.write("deep.clj", &format!("(defn deep [] {expression})\n"))?;
+    repo.write(
+        "deep.go",
+        &format!("package main\nfunc main() {{ var x = {expression}; _ = x }}\n"),
+    )?;
+    repo.write(
+        "deep.cpp",
+        &format!("int main() {{ auto x = {expression}; return x; }}\n"),
+    )?;
+
+    let output = repo.run_raw(&["scan", "--json"])?;
+    assert!(
+        output.status.success(),
+        "scan should not abort on deep nesting; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let scan: ScanResult = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(scan.files.len(), 4);
+
+    Ok(())
+}
+
+fn nested_parenthesized_expression(depth: usize, atom: &str) -> String {
+    let mut expression = String::with_capacity(atom.len().saturating_add(depth.saturating_mul(2)));
+    expression.push_str(&"(".repeat(depth));
+    expression.push_str(atom);
+    expression.push_str(&")".repeat(depth));
+    expression
+}
+
+#[test]
 fn test_scan_reports_structured_elisp_blocks_without_fallback_diagnostic() -> Result<()> {
     let repo = TestRepo::new("structured_elisp")?;
     repo.write(

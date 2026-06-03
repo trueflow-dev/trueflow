@@ -1210,18 +1210,20 @@ fn attach_markdown_heading_to_first_content(
 }
 
 fn collect_markdown_spans(node: tree_sitter::Node<'_>, spans: &mut Vec<MarkdownSpan>) {
-    if let Some(kind) = markdown_leaf_kind(node.kind()) {
-        spans.push(MarkdownSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            kind,
-        });
-        return;
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if let Some(kind) = markdown_leaf_kind(current.kind()) {
+            spans.push(MarkdownSpan {
+                start: current.start_byte(),
+                end: current.end_byte(),
+                kind,
+            });
+            continue;
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_markdown_spans(child, spans);
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 }
 
@@ -1280,18 +1282,20 @@ fn collect_markdown_headings(
     content: &str,
     headings: &mut Vec<MarkdownHeading>,
 ) {
-    if let Some(level) = markdown_heading_level(node.kind(), node.start_byte(), content) {
-        headings.push(MarkdownHeading {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            level,
-        });
-        return;
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if let Some(level) = markdown_heading_level(current.kind(), current.start_byte(), content) {
+            headings.push(MarkdownHeading {
+                start: current.start_byte(),
+                end: current.end_byte(),
+                level,
+            });
+            continue;
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_markdown_headings(child, content, headings);
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 }
 
@@ -1502,26 +1506,36 @@ fn map_c_declaration_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKi
 }
 
 fn node_contains_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
-    if node.kind() == kind {
-        return true;
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == kind {
+            return true;
+        }
 
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| node_contains_kind(child, kind))
+        let mut cursor = current.walk();
+        let children = current.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    false
 }
 
 fn c_node_contains_const_qualifier(node: tree_sitter::Node<'_>, content: &str) -> bool {
-    if node.kind() == "type_qualifier" {
-        return node
-            .utf8_text(content.as_bytes())
-            .map(|text| text.trim() == "const")
-            .unwrap_or(false);
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "type_qualifier"
+            && current
+                .utf8_text(content.as_bytes())
+                .map(|text| text.trim() == "const")
+                .unwrap_or(false)
+        {
+            return true;
+        }
 
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| c_node_contains_const_qualifier(child, content))
+        let mut cursor = current.walk();
+        let children = current.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    false
 }
 
 fn collect_swift_type_items(
@@ -1991,19 +2005,21 @@ fn collect_swift_xctest_ranges(
     source: &str,
     ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
-    if node.kind() == "class_declaration" {
-        let header_end = node
-            .child_by_field_name("body")
-            .map_or(node.end_byte(), |body| body.start_byte());
-        let header = &source[node.start_byte()..header_end];
-        if header.contains("XCTestCase") {
-            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "class_declaration" {
+            let header_end = current
+                .child_by_field_name("body")
+                .map_or(current.end_byte(), |body| body.start_byte());
+            let header = &source[current.start_byte()..header_end];
+            if header.contains("XCTestCase") {
+                ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+            }
         }
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_swift_xctest_ranges(child, source, ranges)?;
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     Ok(())
@@ -2014,24 +2030,26 @@ fn collect_kotlin_test_ranges(
     source: &str,
     ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
-    if node.kind() == "function_declaration" {
-        let name_is_test = node
-            .child_by_field_name("name")
-            .map(|name| name.utf8_text(source.as_bytes()))
-            .transpose()?
-            .is_some_and(|name| name.starts_with("test"));
-        let has_test_annotation = first_child_of_kind(node, "modifiers")
-            .map(|modifiers| &source[modifiers.start_byte()..modifiers.end_byte()])
-            .is_some_and(|modifiers| modifiers.contains("Test"));
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "function_declaration" {
+            let name_is_test = current
+                .child_by_field_name("name")
+                .map(|name| name.utf8_text(source.as_bytes()))
+                .transpose()?
+                .is_some_and(|name| name.starts_with("test"));
+            let has_test_annotation = first_child_of_kind(current, "modifiers")
+                .map(|modifiers| &source[modifiers.start_byte()..modifiers.end_byte()])
+                .is_some_and(|modifiers| modifiers.contains("Test"));
 
-        if name_is_test || has_test_annotation {
-            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+            if name_is_test || has_test_annotation {
+                ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+            }
         }
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_kotlin_test_ranges(child, source, ranges)?;
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     Ok(())
@@ -2080,25 +2098,27 @@ fn collect_elisp_test_ranges(
     source: &str,
     ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
-    match node.kind() {
-        "function_definition" | "macro_definition" => {
-            if let Some(name) = elisp_form_name(node, source)
-                && name.starts_with("test-")
-            {
-                ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "function_definition" | "macro_definition" => {
+                if let Some(name) = elisp_form_name(current, source)
+                    && name.starts_with("test-")
+                {
+                    ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+                }
             }
-        }
-        "list" => {
-            if matches!(elisp_list_head_symbol(node, source), Some("ert-deftest")) {
-                ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+            "list" => {
+                if matches!(elisp_list_head_symbol(current, source), Some("ert-deftest")) {
+                    ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_elisp_test_ranges(child, source, ranges)?;
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     Ok(())
@@ -2165,18 +2185,20 @@ fn collect_php_test_ranges(
     source: &str,
     ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
-    if matches!(node.kind(), "function_definition" | "method_declaration")
-        && let Some(name_node) = node.child_by_field_name("name")
-    {
-        let name = name_node.utf8_text(source.as_bytes())?;
-        if name.starts_with("test") {
-            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "function_definition" | "method_declaration")
+            && let Some(name_node) = current.child_by_field_name("name")
+        {
+            let name = name_node.utf8_text(source.as_bytes())?;
+            if name.starts_with("test") {
+                ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+            }
         }
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_php_test_ranges(child, source, ranges)?;
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     Ok(())
@@ -2187,16 +2209,18 @@ fn collect_c_test_ranges(
     source: &str,
     ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
-    if node.kind() == "function_definition"
-        && let Some(name) = c_function_name(node, source)
-        && name.starts_with("test_")
-    {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "function_definition"
+            && let Some(name) = c_function_name(current, source)
+            && name.starts_with("test_")
+        {
+            ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_c_test_ranges(child, source, ranges)?;
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     Ok(())
@@ -2208,24 +2232,22 @@ fn c_function_name(function_node: tree_sitter::Node<'_>, source: &str) -> Option
 }
 
 fn c_declarator_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
-    if node.kind() == "identifier" {
-        return node
-            .utf8_text(source.as_bytes())
-            .ok()
-            .map(std::string::ToString::to_string);
-    }
-
-    if let Some(declarator) = node.child_by_field_name("declarator")
-        && let Some(name) = c_declarator_name(declarator, source)
-    {
-        return Some(name);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(name) = c_declarator_name(child, source) {
-            return Some(name);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier" {
+            return current
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(std::string::ToString::to_string);
         }
+
+        let mut children = Vec::new();
+        if let Some(declarator) = current.child_by_field_name("declarator") {
+            children.push(declarator);
+        }
+        let mut cursor = current.walk();
+        children.extend(current.named_children(&mut cursor));
+        stack.extend(children.into_iter().rev());
     }
 
     None

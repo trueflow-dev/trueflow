@@ -98,20 +98,19 @@ fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<
 
 fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
     let mut ranges = Vec::new();
-    collect_test_ranges_from_node(tree.root_node(), source, &mut ranges);
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "list_lit"
+            && normalized_form_head(node, source).as_deref() == Some("deftest")
+        {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
     Ok(ranges)
-}
-
-fn collect_test_ranges_from_node(node: Node<'_>, source: &str, ranges: &mut Vec<ByteSpan>) {
-    if node.kind() == "list_lit" && normalized_form_head(node, source).as_deref() == Some("deftest")
-    {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_test_ranges_from_node(child, source, ranges);
-    }
 }
 
 fn split_function_like_block(block: &Block) -> Result<Vec<Block>> {

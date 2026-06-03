@@ -153,29 +153,21 @@ fn collect_container_blocks(
 
 fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
     let mut ranges = Vec::new();
-    collect_test_ranges_from_node(tree.root_node(), source, &mut ranges)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call"
+            && let Some(target) = call_target_name(node, source)
+            && target == "test"
+            && is_within_exunit_case_module(node, source)
+        {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
     Ok(ranges)
-}
-
-fn collect_test_ranges_from_node(
-    node: Node<'_>,
-    source: &str,
-    ranges: &mut Vec<ByteSpan>,
-) -> Result<()> {
-    if node.kind() == "call"
-        && let Some(target) = call_target_name(node, source)
-        && target == "test"
-        && is_within_exunit_case_module(node, source)
-    {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_test_ranges_from_node(child, source, ranges)?;
-    }
-
-    Ok(())
 }
 
 fn split_function_like_block(block: &Block) -> Result<Vec<Block>> {
@@ -439,18 +431,18 @@ fn call_target_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn find_call_with_targets<'a>(node: Node<'a>, source: &str, targets: &[&str]) -> Option<Node<'a>> {
-    if node.kind() == "call"
-        && let Some(target) = call_target_name(node, source)
-        && targets.iter().any(|candidate| *candidate == target)
-    {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_call_with_targets(child, source, targets) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call"
+            && let Some(target) = call_target_name(current, source)
+            && targets.iter().any(|candidate| *candidate == target)
+        {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

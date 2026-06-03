@@ -181,20 +181,18 @@ fn root_yaml_values(root: Node<'_>) -> Vec<Node<'_>> {
     values
 }
 
-fn semantic_yaml_node(node: Node<'_>) -> Node<'_> {
-    match node.kind() {
-        "block_node" | "flow_node" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if matches!(child.kind(), "anchor" | "tag") {
-                    continue;
-                }
-                return semantic_yaml_node(child);
-            }
-            node
-        }
-        _ => node,
+fn semantic_yaml_node(mut node: Node<'_>) -> Node<'_> {
+    while matches!(node.kind(), "block_node" | "flow_node") {
+        let mut cursor = node.walk();
+        let Some(child) = node
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "anchor" | "tag"))
+        else {
+            return node;
+        };
+        node = child;
     }
+    node
 }
 
 fn mapping_pairs(node: Node<'_>) -> Vec<Node<'_>> {

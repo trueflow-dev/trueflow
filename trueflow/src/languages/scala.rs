@@ -304,14 +304,21 @@ fn is_test_suite_node(node: Node<'_>, content: &str) -> bool {
 }
 
 fn container_has_obvious_test_members(node: Node<'_>, content: &str) -> bool {
-    container_children(node).into_iter().any(|child| {
-        is_test_case_call(child, content)
+    let mut stack = container_children(node);
+    while let Some(child) = stack.pop() {
+        if is_test_case_call(child, content)
             || matches!(child.kind(), "function_definition" | "function_declaration")
                 && declaration_name(child, content)
                     .is_some_and(|name| is_test_like_name(name.as_str()))
-            || can_contain_nested_members(child.kind())
-                && container_has_obvious_test_members(child, content)
-    })
+        {
+            return true;
+        }
+
+        if can_contain_nested_members(child.kind()) {
+            stack.extend(container_children(child));
+        }
+    }
+    false
 }
 
 fn header_text<'a>(node: Node<'_>, content: &'a str) -> Option<&'a str> {
@@ -350,40 +357,40 @@ fn is_test_case_call(node: Node<'_>, content: &str) -> bool {
     call_target_name(node, content).is_some_and(|name| TEST_CASE_NAMES.contains(&name))
 }
 
-fn call_target_name<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str> {
-    match node.kind() {
-        "identifier" | "operator_identifier" => node.utf8_text(content.as_bytes()).ok(),
-        "call_expression" => {
-            let function = node.child_by_field_name("function")?;
-            call_target_name(function, content)
+fn call_target_name<'a>(mut node: Node<'a>, content: &'a str) -> Option<&'a str> {
+    loop {
+        match node.kind() {
+            "identifier" | "operator_identifier" => return node.utf8_text(content.as_bytes()).ok(),
+            "call_expression" | "generic_function" => {
+                node = node.child_by_field_name("function")?;
+            }
+            "field_expression" => {
+                return node
+                    .child_by_field_name("field")
+                    .and_then(|field| field.utf8_text(content.as_bytes()).ok());
+            }
+            _ => return None,
         }
-        "field_expression" => node
-            .child_by_field_name("field")
-            .and_then(|field| field.utf8_text(content.as_bytes()).ok()),
-        "generic_function" => node
-            .child_by_field_name("function")
-            .and_then(|function| call_target_name(function, content)),
-        _ => None,
     }
 }
 
 fn find_test_case_call<'a>(node: Node<'a>, content: &str) -> Option<Node<'a>> {
-    if node.kind() == "call_expression"
-        && is_test_case_call(node, content)
-        && node
-            .child_by_field_name("arguments")
-            .is_some_and(|arguments| {
-                matches!(arguments.kind(), "block" | "case_block" | "colon_argument")
-            })
-    {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_test_case_call(child, content) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call_expression"
+            && is_test_case_call(current, content)
+            && current
+                .child_by_field_name("arguments")
+                .is_some_and(|arguments| {
+                    matches!(arguments.kind(), "block" | "case_block" | "colon_argument")
+                })
+        {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
@@ -391,24 +398,22 @@ fn find_test_case_call<'a>(node: Node<'a>, content: &str) -> Option<Node<'a>> {
 
 fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
     let mut ranges = Vec::new();
-    collect_test_ranges_from_node(tree.root_node(), source, &mut ranges);
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if is_test_case_node(node, source) {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
     ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
     ranges.dedup_by(|left, right| {
         left.start_byte == right.start_byte && left.end_byte == right.end_byte
     });
     Ok(ranges)
-}
-
-fn collect_test_ranges_from_node(node: Node<'_>, source: &str, ranges: &mut Vec<ByteSpan>) {
-    if is_test_case_node(node, source) {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_test_ranges_from_node(child, source, ranges);
-    }
 }
 
 fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
@@ -592,15 +597,15 @@ fn parse_tree(source: &str) -> Result<Tree> {
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

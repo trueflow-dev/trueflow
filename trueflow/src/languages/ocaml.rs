@@ -253,40 +253,49 @@ fn split_type_like(block: &Block) -> Result<Vec<Block>> {
 }
 
 fn collect_nested_file_blocks(node: Node<'_>, content: &str, lang: Language) -> Vec<Block> {
-    let mut nested = Vec::new();
-    collect_nested_file_blocks_into(node, content, lang, &mut nested);
-    nested
-}
+    enum Work<'tree> {
+        Visit(Node<'tree>),
+        Emit(NestedBlock),
+    }
 
-fn collect_nested_file_blocks_into(
-    node: Node<'_>,
-    content: &str,
-    lang: Language,
-    blocks: &mut Vec<Block>,
-) {
-    let Some(container) = stable_module_container(node) else {
-        return;
-    };
-
-    let children = collect_immediate_nested_blocks(container, content);
-    for child in children {
-        blocks.push(create_file_block(
-            &content[child.start_byte..child.end_byte],
-            child.kind,
-            content,
-            child.start_byte,
-            child.end_byte,
-            lang,
-        ));
-
-        if matches!(child.kind, BlockKind::Module | BlockKind::Interface) {
-            let child_node = find_named_node_by_span(node, child.start_byte, child.end_byte)
-                .or_else(|| find_named_node_by_span(container, child.start_byte, child.end_byte));
-            if let Some(child_node) = child_node {
-                collect_nested_file_blocks_into(child_node, content, lang, blocks);
+    let mut blocks = Vec::new();
+    let mut stack = vec![Work::Visit(node)];
+    while let Some(work) = stack.pop() {
+        match work {
+            Work::Emit(child) => blocks.push(create_file_block(
+                &content[child.start_byte..child.end_byte],
+                child.kind,
+                content,
+                child.start_byte,
+                child.end_byte,
+                lang,
+            )),
+            Work::Visit(current) => {
+                let Some(container) = stable_module_container(current) else {
+                    continue;
+                };
+                let children = collect_immediate_nested_blocks(container, content);
+                for child in children.into_iter().rev() {
+                    if matches!(child.kind, BlockKind::Module | BlockKind::Interface) {
+                        let child_node =
+                            find_named_node_by_span(current, child.start_byte, child.end_byte)
+                                .or_else(|| {
+                                    find_named_node_by_span(
+                                        container,
+                                        child.start_byte,
+                                        child.end_byte,
+                                    )
+                                });
+                        if let Some(child_node) = child_node {
+                            stack.push(Work::Visit(child_node));
+                        }
+                    }
+                    stack.push(Work::Emit(child));
+                }
             }
         }
     }
+    blocks
 }
 
 fn collect_immediate_nested_blocks(container: Node<'_>, content: &str) -> Vec<NestedBlock> {
@@ -574,43 +583,47 @@ fn has_named_child_of_kind(node: Node<'_>, kind: &str) -> bool {
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
 }
 
 fn find_named_node_by_span(node: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
-    if node.is_named() && node.start_byte() == start && node.end_byte() == end {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_node_by_span(child, start, end) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.is_named() && current.start_byte() == start && current.end_byte() == end {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
 }
 
 fn node_contains_kind(node: Node<'_>, kind: &str) -> bool {
-    if node.kind() == kind {
-        return true;
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == kind {
+            return true;
+        }
 
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| node_contains_kind(child, kind))
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    false
 }
 
 fn is_ocaml_attribute_like(kind: &str) -> bool {
@@ -716,10 +729,16 @@ fn parse_with_language(source: &str, language: &TsLanguage) -> Result<Tree> {
 }
 
 fn syntax_error_score(node: Node<'_>) -> usize {
-    let mut score = usize::from(node.is_error()) + usize::from(node.is_missing());
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        score += syntax_error_score(child);
+    let mut score = 0usize;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        score = score
+            .saturating_add(usize::from(current.is_error()))
+            .saturating_add(usize::from(current.is_missing()));
+
+        let mut cursor = current.walk();
+        let children = current.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
     score
 }

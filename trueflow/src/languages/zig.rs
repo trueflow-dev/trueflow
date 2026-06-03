@@ -163,20 +163,18 @@ fn collect_container_member_spans(container: Node<'_>, content: &str) -> Vec<Nes
 
 fn collect_test_ranges(tree: &Tree, _source: &str) -> Result<Vec<ByteSpan>> {
     let mut ranges = Vec::new();
-    collect_test_declaration_ranges(tree.root_node(), &mut ranges);
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "test_declaration" {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
     Ok(ranges)
-}
-
-fn collect_test_declaration_ranges(node: Node<'_>, ranges: &mut Vec<ByteSpan>) {
-    if node.kind() == "test_declaration" {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_test_declaration_ranges(child, ranges);
-    }
 }
 
 fn sub_split(kind: BlockKind) -> SubSplitRegistration {
@@ -243,30 +241,30 @@ fn function_like_body(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn find_stable_container_descendant<'a>(node: Node<'a>) -> Option<Node<'a>> {
-    if let Some(container) = stable_container_node(node) {
-        return Some(container);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_stable_container_descendant(child) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if let Some(container) = stable_container_node(current) {
+            return Some(container);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

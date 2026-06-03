@@ -142,28 +142,20 @@ fn collect_container_member_spans(type_node: Node<'_>, content: &str) -> Vec<Nes
 
 fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
     let mut ranges = Vec::new();
-    collect_test_ranges_from_node(tree.root_node(), source, &mut ranges)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "function_declaration" | "method_declaration")
+            && let Some(name) = function_name(node, source)
+            && is_go_test_name(&name)
+        {
+            ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
     Ok(ranges)
-}
-
-fn collect_test_ranges_from_node(
-    node: Node<'_>,
-    source: &str,
-    ranges: &mut Vec<ByteSpan>,
-) -> Result<()> {
-    if matches!(node.kind(), "function_declaration" | "method_declaration")
-        && let Some(name) = function_name(node, source)
-        && is_go_test_name(&name)
-    {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_test_ranges_from_node(child, source, ranges)?;
-    }
-
-    Ok(())
 }
 
 fn function_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -237,30 +229,30 @@ fn parse_tree(source: &str) -> Result<Tree> {
 }
 
 fn find_type_like_descendant<'a>(node: Node<'a>) -> Option<Node<'a>> {
-    if let Some(type_node) = type_like_node(node) {
-        return Some(type_node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_type_like_descendant(child) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if let Some(type_node) = type_like_node(current) {
+            return Some(type_node);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

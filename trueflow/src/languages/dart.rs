@@ -473,13 +473,17 @@ fn classify_member_declaration_kind(
 }
 
 fn contains_named_descendant_any(node: Node<'_>, kinds: &[&str]) -> bool {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return true;
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return true;
+        }
 
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| contains_named_descendant_any(child, kinds))
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    false
 }
 
 fn classify_variable_kind(text: &str) -> BlockKind {
@@ -506,21 +510,21 @@ fn member_tags(node: Node<'_>, content: &str) -> Vec<String> {
 }
 
 fn declaration_name<'a>(node: Node<'a>, content: &'a str) -> Option<String> {
-    if let Some(name) = node
-        .child_by_field_name("name")
-        .and_then(|name| name.utf8_text(content.as_bytes()).ok())
-    {
-        return Some(name.to_string());
-    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if let Some(name) = current
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+        {
+            return Some(name.to_string());
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "annotation" {
-            continue;
-        }
-        if let Some(name) = declaration_name(child, content) {
-            return Some(name);
-        }
+        let mut cursor = current.walk();
+        let children = current
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() != "annotation")
+            .collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
@@ -702,15 +706,15 @@ fn find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

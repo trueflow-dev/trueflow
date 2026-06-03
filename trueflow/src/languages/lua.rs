@@ -184,19 +184,23 @@ fn sole_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     children.next().is_none().then_some(child)
 }
 
-fn target_name(node: Node<'_>, content: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "string" => node.utf8_text(content.as_bytes()).ok().map(str::to_string),
-        "dot_index_expression" => node
-            .child_by_field_name("field")
-            .and_then(|field| target_name(field, content)),
-        "method_index_expression" => node
-            .child_by_field_name("method")
-            .and_then(|method| target_name(method, content)),
-        "field" => node
-            .child_by_field_name("name")
-            .and_then(|name| target_name(name, content)),
-        _ => None,
+fn target_name(mut node: Node<'_>, content: &str) -> Option<String> {
+    loop {
+        match node.kind() {
+            "identifier" | "string" => {
+                return node.utf8_text(content.as_bytes()).ok().map(str::to_string);
+            }
+            "dot_index_expression" => {
+                node = node.child_by_field_name("field")?;
+            }
+            "method_index_expression" => {
+                node = node.child_by_field_name("method")?;
+            }
+            "field" => {
+                node = node.child_by_field_name("name")?;
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -435,15 +439,15 @@ fn parse(source: &str) -> Result<tree_sitter::Tree> {
 }
 
 fn find_named_descendant_any<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

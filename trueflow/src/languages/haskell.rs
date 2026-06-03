@@ -339,20 +339,20 @@ fn node_text<'a>(node: Node<'_>, content: &'a str) -> Option<&'a str> {
 }
 
 fn first_named_descendant_text(node: Node<'_>, content: &str) -> Option<String> {
-    if let Some(text) = node_text(node, content)
-        && matches!(
-            node.kind(),
-            "variable" | "prefix_id" | "constructor" | "module_id"
-        )
-    {
-        return Some(text.to_string());
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(text) = first_named_descendant_text(child, content) {
-            return Some(text);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if let Some(text) = node_text(current, content)
+            && matches!(
+                current.kind(),
+                "variable" | "prefix_id" | "constructor" | "module_id"
+            )
+        {
+            return Some(text.to_string());
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
@@ -804,15 +804,15 @@ fn parse_tree(source: &str) -> Result<Tree> {
 }
 
 fn find_named_descendant_any<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None

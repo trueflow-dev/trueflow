@@ -94,23 +94,36 @@ impl Tree {
     }
 
     pub fn view_json(&self) -> Value {
-        self.view_json_from(self.root)
-    }
+        let mut values: HashMap<TreeNodeId, Value> = HashMap::new();
+        let mut stack = vec![(self.root, false)];
 
-    fn view_json_from(&self, id: TreeNodeId) -> Value {
-        let node = self.node(id);
-        let children = node
-            .children
-            .iter()
-            .map(|child| self.view_json_from(*child))
-            .collect::<Vec<_>>();
-        json!({
-            "type": node.kind.label(),
-            "name": node.name,
-            "path": node.path,
-            "hash": node.hash,
-            "children": children,
-        })
+        while let Some((id, visited)) = stack.pop() {
+            if visited {
+                let node = self.node(id);
+                let children = node
+                    .children
+                    .iter()
+                    .filter_map(|child| values.remove(child))
+                    .collect::<Vec<_>>();
+                values.insert(
+                    id,
+                    json!({
+                        "type": node.kind.label(),
+                        "name": node.name,
+                        "path": node.path,
+                        "hash": node.hash,
+                        "children": children,
+                    }),
+                );
+                continue;
+            }
+
+            stack.push((id, true));
+            let children = self.node(id).children.clone();
+            stack.extend(children.into_iter().rev().map(|child| (child, false)));
+        }
+
+        values.remove(&self.root).unwrap_or_else(|| json!({}))
     }
 
     pub fn find_by_path(&self, path: &str) -> Option<TreeNodeId> {
@@ -430,59 +443,68 @@ impl TreeBuilder {
         }
     }
 
-    fn attach_children(&mut self, id: TreeNodeId, mut children: Vec<TreeNodeId>) {
-        let kind = self.nodes[id.0].kind;
-        if kind.should_sort_children() {
-            children.sort_by(|a, b| {
-                let a_node = &self.nodes[a.0];
-                let b_node = &self.nodes[b.0];
-                a_node
-                    .kind
-                    .sort_key(&a_node.name)
-                    .cmp(&b_node.kind.sort_key(&b_node.name))
-            });
-        }
-        if let Some(node) = self.nodes.get_mut(id.0) {
-            node.children = children.clone();
-        }
-        for child in children {
-            let grand_children = self.children_by_id.get(&child).cloned().unwrap_or_default();
-            self.attach_children(child, grand_children);
+    fn attach_children(&mut self, id: TreeNodeId, children: Vec<TreeNodeId>) {
+        let mut stack = vec![(id, children)];
+        while let Some((current, mut children)) = stack.pop() {
+            let kind = self.nodes[current.0].kind;
+            if kind.should_sort_children() {
+                children.sort_by(|a, b| {
+                    let a_node = &self.nodes[a.0];
+                    let b_node = &self.nodes[b.0];
+                    a_node
+                        .kind
+                        .sort_key(&a_node.name)
+                        .cmp(&b_node.kind.sort_key(&b_node.name))
+                });
+            }
+            if let Some(node) = self.nodes.get_mut(current.0) {
+                node.children = children.clone();
+            }
+            stack.extend(children.into_iter().rev().map(|child| {
+                let grand_children = self.children_by_id.get(&child).cloned().unwrap_or_default();
+                (child, grand_children)
+            }));
         }
     }
 
     fn compute_hashes(&mut self, id: TreeNodeId) {
-        let children = self.nodes[id.0].children.clone();
-        for child in &children {
-            self.compute_hashes(*child);
-        }
+        let mut stack = vec![(id, false)];
+        while let Some((current, visited)) = stack.pop() {
+            if !visited {
+                stack.push((current, true));
+                let children = self.nodes[current.0].children.clone();
+                stack.extend(children.into_iter().rev().map(|child| (child, false)));
+                continue;
+            }
 
-        let kind = self.nodes[id.0].kind;
-        if matches!(kind, TreeNodeKind::Block | TreeNodeKind::File) {
-            return;
-        }
+            let children = self.nodes[current.0].children.clone();
+            let kind = self.nodes[current.0].kind;
+            if matches!(kind, TreeNodeKind::Block | TreeNodeKind::File) {
+                continue;
+            }
 
-        let mut entries: Vec<(String, TreeHash)> = children
-            .iter()
-            .filter_map(|child| {
-                let node = &self.nodes[child.0];
-                if !node.kind.is_hash_entry() {
-                    return None;
-                }
-                let entry_name = format!("{}:{}", node.kind.entry_prefix(), node.name);
-                Some((entry_name, node.hash.clone()))
-            })
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut entries: Vec<(String, TreeHash)> = children
+                .iter()
+                .filter_map(|child| {
+                    let node = &self.nodes[child.0];
+                    if !node.kind.is_hash_entry() {
+                        return None;
+                    }
+                    let entry_name = format!("{}:{}", node.kind.entry_prefix(), node.name);
+                    Some((entry_name, node.hash.clone()))
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut concatenated = String::new();
-        for (name, hash) in entries {
-            concatenated.push_str(&name);
-            concatenated.push(':');
-            concatenated.push_str(hash.as_str());
-            concatenated.push('|');
+            let mut concatenated = String::new();
+            for (name, hash) in entries {
+                concatenated.push_str(&name);
+                concatenated.push(':');
+                concatenated.push_str(hash.as_str());
+                concatenated.push('|');
+            }
+            self.nodes[current.0].hash = TreeHash::new(hash_str(&concatenated));
         }
-        self.nodes[id.0].hash = TreeHash::new(hash_str(&concatenated));
     }
 }
 

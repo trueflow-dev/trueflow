@@ -6,15 +6,15 @@ pub(crate) fn find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<No
 }
 
 pub(crate) fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    if kinds.iter().any(|kind| *kind == node.kind()) {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_named_descendant_any(child, kinds) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.iter().any(|kind| *kind == current.kind()) {
+            return Some(current);
         }
+
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 
     None
@@ -101,16 +101,24 @@ pub(crate) fn ruby_assignment_targets_constant(node: Node<'_>) -> bool {
 }
 
 fn ruby_lhs_targets_constant(node: Node<'_>) -> bool {
-    match node.kind() {
-        "constant" => true,
-        "scope_resolution" => node
-            .child_by_field_name("name")
-            .is_some_and(|name| name.kind() == "constant"),
-        "left_assignment_list" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .all(ruby_lhs_targets_constant)
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "constant" => {}
+            "scope_resolution" => {
+                if current
+                    .child_by_field_name("name")
+                    .is_none_or(|name| name.kind() != "constant")
+                {
+                    return false;
+                }
+            }
+            "left_assignment_list" => {
+                let mut cursor = current.walk();
+                stack.extend(current.named_children(&mut cursor));
+            }
+            _ => return false,
         }
-        _ => false,
     }
+    true
 }
