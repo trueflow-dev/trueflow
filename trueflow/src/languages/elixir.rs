@@ -105,48 +105,87 @@ fn collect_container_blocks(
     recurse: bool,
     blocks: &mut Vec<NestedBlock>,
 ) {
-    let Some(do_block) = first_named_child_of_kind(container, "do_block") else {
-        return;
-    };
+    #[derive(Clone, Copy)]
+    struct PendingBlock<'a> {
+        node: Node<'a>,
+        start_byte: usize,
+        end_byte: usize,
+        kind: BlockKind,
+        recurse: bool,
+    }
 
-    let mut cursor = do_block.walk();
-    let mut pending_start: Option<usize> = None;
+    enum Frame<'a> {
+        Container { node: Node<'a>, recurse: bool },
+        Block(PendingBlock<'a>),
+    }
 
-    for child in do_block.children(&mut cursor) {
-        let ts_kind = child.kind();
-        if !child.is_named() && ts_kind != "comment" {
-            continue;
-        }
+    let mut stack = vec![Frame::Container {
+        node: container,
+        recurse,
+    }];
 
-        let start_byte = child.start_byte();
-        let end_byte = child.end_byte();
-        if is_attribute_node(ts_kind) || is_elixir_attribute_node(child, content) {
-            if pending_start.is_none() {
-                pending_start = Some(start_byte);
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Container { node, recurse } => {
+                let Some(do_block) = first_named_child_of_kind(node, "do_block") else {
+                    continue;
+                };
+
+                let mut cursor = do_block.walk();
+                let mut pending_start: Option<usize> = None;
+                let mut pending_blocks = Vec::new();
+
+                for child in do_block.children(&mut cursor) {
+                    let ts_kind = child.kind();
+                    if !child.is_named() && ts_kind != "comment" {
+                        continue;
+                    }
+
+                    let start_byte = child.start_byte();
+                    let end_byte = child.end_byte();
+                    if is_attribute_node(ts_kind) || is_elixir_attribute_node(child, content) {
+                        if pending_start.is_none() {
+                            pending_start = Some(start_byte);
+                        }
+                        continue;
+                    }
+
+                    let kind = map_kind(child, content);
+                    if matches!(kind, BlockKind::Code | BlockKind::Comment) {
+                        pending_start = None;
+                        continue;
+                    }
+
+                    pending_blocks.push(PendingBlock {
+                        node: child,
+                        start_byte: pending_start.unwrap_or(start_byte),
+                        end_byte,
+                        kind,
+                        recurse: recurse
+                            && matches!(
+                                kind,
+                                BlockKind::Module | BlockKind::Interface | BlockKind::Impl
+                            ),
+                    });
+                    pending_start = None;
+                }
+
+                stack.extend(pending_blocks.into_iter().rev().map(Frame::Block));
             }
-            continue;
-        }
+            Frame::Block(block) => {
+                blocks.push(NestedBlock {
+                    start_byte: block.start_byte,
+                    end_byte: block.end_byte,
+                    kind: block.kind,
+                });
 
-        let kind = map_kind(child, content);
-        if matches!(kind, BlockKind::Code | BlockKind::Comment) {
-            pending_start = None;
-            continue;
-        }
-
-        blocks.push(NestedBlock {
-            start_byte: pending_start.unwrap_or(start_byte),
-            end_byte,
-            kind,
-        });
-        pending_start = None;
-
-        if recurse
-            && matches!(
-                kind,
-                BlockKind::Module | BlockKind::Interface | BlockKind::Impl
-            )
-        {
-            collect_container_blocks(child, content, true, blocks);
+                if block.recurse {
+                    stack.push(Frame::Container {
+                        node: block.node,
+                        recurse: true,
+                    });
+                }
+            }
         }
     }
 }

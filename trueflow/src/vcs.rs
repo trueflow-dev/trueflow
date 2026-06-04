@@ -457,38 +457,43 @@ fn collect_file_states_in_tree(
     workdir_prefix: Option<&str>,
     files: &mut Vec<FileState>,
 ) -> Result<()> {
-    for entry in tree.iter() {
-        let entry = entry?;
-        let file_name = entry.filename().to_str_lossy();
-        let full_path = if prefix.is_empty() {
-            file_name.to_string()
-        } else {
-            format!("{prefix}/{file_name}")
-        };
+    let mut pending = vec![(tree.clone(), prefix.to_string())];
 
-        match entry.kind() {
-            EntryKind::Tree => {
-                let child_tree = entry.object()?.try_into_tree()?;
-                collect_file_states_in_tree(&child_tree, &full_path, workdir_prefix, files)?;
-            }
-            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                if let Some(prefix) = workdir_prefix
-                    && !path_utils::path_matches_workdir_prefix(&full_path, prefix)
-                {
-                    continue;
+    while let Some((tree, prefix)) = pending.pop() {
+        for entry in tree.iter() {
+            let entry = entry?;
+            let file_name = entry.filename().to_str_lossy();
+            let full_path = if prefix.is_empty() {
+                file_name.to_string()
+            } else {
+                format!("{prefix}/{file_name}")
+            };
+
+            match entry.kind() {
+                EntryKind::Tree => {
+                    let child_tree = entry.object()?.try_into_tree()?;
+                    pending.push((child_tree, full_path));
                 }
+                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                    if let Some(prefix) = workdir_prefix
+                        && !path_utils::path_matches_workdir_prefix(&full_path, prefix)
+                    {
+                        continue;
+                    }
 
-                let output_path = display_path_for_tree_entry(&full_path, workdir_prefix)?;
-                let blob = entry.object()?.try_into_blob()?;
-                files.push(file_state_from_blob(
-                    &blob,
-                    Path::new(&full_path),
-                    output_path,
-                ));
+                    let output_path = display_path_for_tree_entry(&full_path, workdir_prefix)?;
+                    let blob = entry.object()?.try_into_blob()?;
+                    files.push(file_state_from_blob(
+                        &blob,
+                        Path::new(&full_path),
+                        output_path,
+                    ));
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
+
     Ok(())
 }
 

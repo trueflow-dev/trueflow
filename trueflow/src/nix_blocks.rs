@@ -149,29 +149,44 @@ fn collect_expression_children(node: Node<'_>, source: &str, offset: usize) -> V
     }
 }
 
-fn collect_function_children(node: Node<'_>, source: &str, offset: usize) -> Vec<NixSpan> {
-    let Some(body) = node.child_by_field_name("body").map(semantic_nix_node) else {
-        return vec![expression_child_span(node, offset)];
-    };
-
+fn collect_function_children(mut node: Node<'_>, source: &str, offset: usize) -> Vec<NixSpan> {
     let mut spans = Vec::new();
-    push_range(
-        &mut spans,
-        node.start_byte().saturating_sub(offset),
-        body.start_byte().saturating_sub(offset),
-        BlockKind::FunctionSignature,
-    );
-    if should_structurally_split_expression(body) {
-        spans.extend(collect_expression_children(body, source, offset));
-    } else {
-        spans.push(expression_child_span(body, offset));
+    let mut trailing_ranges = Vec::new();
+
+    loop {
+        let Some(body) = node.child_by_field_name("body").map(semantic_nix_node) else {
+            spans.push(expression_child_span(node, offset));
+            break;
+        };
+
+        push_range(
+            &mut spans,
+            node.start_byte().saturating_sub(offset),
+            body.start_byte().saturating_sub(offset),
+            BlockKind::FunctionSignature,
+        );
+        trailing_ranges.push((
+            body.end_byte().saturating_sub(offset),
+            node.end_byte().saturating_sub(offset),
+        ));
+
+        if body.kind() == "function_expression" {
+            node = body;
+            continue;
+        }
+
+        if should_structurally_split_expression(body) {
+            spans.extend(collect_expression_children(body, source, offset));
+        } else {
+            spans.push(expression_child_span(body, offset));
+        }
+        break;
     }
-    push_interstitial(
-        &mut spans,
-        source,
-        body.end_byte().saturating_sub(offset),
-        node.end_byte().saturating_sub(offset),
-    );
+
+    for (start, end) in trailing_ranges.into_iter().rev() {
+        push_interstitial(&mut spans, source, start, end);
+    }
+
     spans
 }
 

@@ -813,92 +813,89 @@ fn split_nix(content: &str) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn collect_nix_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
-    match node.kind() {
-        "function_expression" => collect_nix_function_boundaries(node),
-        "let_expression" => collect_nix_let_boundaries(node),
-        "with_expression" | "assert_expression" => collect_nix_prefix_and_body_boundaries(node),
-        "attrset_expression" | "let_attrset_expression" | "rec_attrset_expression" => {
-            collect_nix_attrset_boundaries(node)
-        }
-        _ => vec![NixBoundary {
-            end: node.end_byte(),
-            kind: classify_nix_node_kind(node.kind()),
-        }],
-    }
-}
-
-fn collect_nix_function_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
-    let Some(body) = node.child_by_field_name("body") else {
-        return vec![NixBoundary {
-            end: node.end_byte(),
-            kind: BlockKind::Function,
-        }];
-    };
-
-    let mut boundaries = Vec::with_capacity(2);
-    if body.start_byte() > node.start_byte() {
-        boundaries.push(NixBoundary {
-            end: body.start_byte(),
-            kind: BlockKind::FunctionSignature,
-        });
-    }
-    boundaries.extend(collect_nix_boundaries(body));
-    boundaries
-}
-
-fn collect_nix_let_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
+fn collect_nix_boundaries(mut node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
     let mut boundaries = Vec::new();
 
-    if let Some(binding_set) = first_child_of_kind(node, "binding_set") {
-        boundaries.extend(collect_nix_binding_boundaries(
-            binding_set,
-            binding_set.end_byte(),
-        ));
-    }
+    loop {
+        match node.kind() {
+            "function_expression" => {
+                let Some(body) = node.child_by_field_name("body") else {
+                    boundaries.push(NixBoundary {
+                        end: node.end_byte(),
+                        kind: BlockKind::Function,
+                    });
+                    break;
+                };
 
-    if let Some(body) = node.child_by_field_name("body") {
-        boundaries.extend(collect_nix_boundaries(body));
-    }
+                if body.start_byte() > node.start_byte() {
+                    boundaries.push(NixBoundary {
+                        end: body.start_byte(),
+                        kind: BlockKind::FunctionSignature,
+                    });
+                }
+                node = body;
+            }
+            "let_expression" => {
+                let boundary_count = boundaries.len();
+                if let Some(binding_set) = first_child_of_kind(node, "binding_set") {
+                    boundaries.extend(collect_nix_binding_boundaries(
+                        binding_set,
+                        binding_set.end_byte(),
+                    ));
+                }
 
-    if boundaries.is_empty() {
-        boundaries.push(NixBoundary {
-            end: node.end_byte(),
-            kind: BlockKind::Code,
-        });
+                if let Some(body) = node.child_by_field_name("body") {
+                    node = body;
+                    continue;
+                }
+
+                if boundaries.len() == boundary_count {
+                    boundaries.push(NixBoundary {
+                        end: node.end_byte(),
+                        kind: BlockKind::Code,
+                    });
+                }
+                break;
+            }
+            "with_expression" | "assert_expression" => {
+                let Some(body) = node.child_by_field_name("body") else {
+                    boundaries.push(NixBoundary {
+                        end: node.end_byte(),
+                        kind: BlockKind::Code,
+                    });
+                    break;
+                };
+
+                if body.start_byte() > node.start_byte() {
+                    boundaries.push(NixBoundary {
+                        end: body.start_byte(),
+                        kind: BlockKind::Code,
+                    });
+                }
+                node = body;
+            }
+            "attrset_expression" | "let_attrset_expression" | "rec_attrset_expression" => {
+                if let Some(binding_set) = first_child_of_kind(node, "binding_set") {
+                    boundaries.extend(collect_nix_binding_boundaries(binding_set, node.end_byte()));
+                } else {
+                    boundaries.push(NixBoundary {
+                        end: node.end_byte(),
+                        kind: BlockKind::Code,
+                    });
+                }
+                break;
+            }
+            _ => {
+                boundaries.push(NixBoundary {
+                    end: node.end_byte(),
+                    kind: classify_nix_node_kind(node.kind()),
+                });
+                break;
+            }
+        }
     }
 
     boundaries
-}
-
-fn collect_nix_prefix_and_body_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
-    let Some(body) = node.child_by_field_name("body") else {
-        return vec![NixBoundary {
-            end: node.end_byte(),
-            kind: BlockKind::Code,
-        }];
-    };
-
-    let mut boundaries = Vec::with_capacity(2);
-    if body.start_byte() > node.start_byte() {
-        boundaries.push(NixBoundary {
-            end: body.start_byte(),
-            kind: BlockKind::Code,
-        });
-    }
-    boundaries.extend(collect_nix_boundaries(body));
-    boundaries
-}
-
-fn collect_nix_attrset_boundaries(node: tree_sitter::Node<'_>) -> Vec<NixBoundary> {
-    let Some(binding_set) = first_child_of_kind(node, "binding_set") else {
-        return vec![NixBoundary {
-            end: node.end_byte(),
-            kind: BlockKind::Code,
-        }];
-    };
-
-    collect_nix_binding_boundaries(binding_set, node.end_byte())
 }
 
 fn collect_nix_binding_boundaries(
@@ -1722,8 +1719,8 @@ fn collect_ruby_scope_items(
     };
 
     let mut blocks = Vec::new();
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
+    let mut pending = ruby_scope_body_children(body);
+    while let Some(child) = pending.pop() {
         let kind = map_kind_for_node(lang, child, content);
         if matches!(kind, BlockKind::Code) {
             continue;
@@ -1738,12 +1735,21 @@ fn collect_ruby_scope_items(
             lang,
         ));
 
-        if matches!(child.kind(), "class" | "module") {
-            blocks.extend(collect_ruby_scope_items(child, content, lang));
+        if matches!(child.kind(), "class" | "module")
+            && let Some(body) = child.child_by_field_name("body")
+        {
+            pending.extend(ruby_scope_body_children(body));
         }
     }
 
     blocks
+}
+
+fn ruby_scope_body_children(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut cursor = body.walk();
+    let mut children = body.named_children(&mut cursor).collect::<Vec<_>>();
+    children.reverse();
+    children
 }
 
 fn collect_csharp_type_items(
@@ -2326,23 +2332,25 @@ fn collect_ruby_test_ranges(
     source: &str,
     ranges: &mut Vec<ByteSpan>,
 ) -> Result<()> {
-    if matches!(node.kind(), "method" | "singleton_method")
-        && let Some(name) = ruby_definition_name(node, source)?
-        && name.starts_with("test_")
-    {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-    }
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        if matches!(current.kind(), "method" | "singleton_method")
+            && let Some(name) = ruby_definition_name(current, source)?
+            && name.starts_with("test_")
+        {
+            ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+        }
 
-    if node.kind() == "class"
-        && let Some(name) = ruby_definition_name(node, source)?
-        && matches!(name.as_str(), value if value.ends_with("Test") || value.ends_with("Tests"))
-    {
-        ranges.push(ByteSpan::new(node.start_byte(), node.end_byte()));
-    }
+        if current.kind() == "class"
+            && let Some(name) = ruby_definition_name(current, source)?
+            && matches!(name.as_str(), value if value.ends_with("Test") || value.ends_with("Tests"))
+        {
+            ranges.push(ByteSpan::new(current.start_byte(), current.end_byte()));
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_ruby_test_ranges(child, source, ranges)?;
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        pending.extend(children.into_iter().rev());
     }
 
     Ok(())

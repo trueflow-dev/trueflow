@@ -138,7 +138,10 @@ fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<
 }
 
 fn collect_semantic_descendants(node: Node<'_>, content: &str, blocks: &mut Vec<NestedBlock>) {
-    for child in immediate_content_children(node) {
+    let mut pending = immediate_content_children(node);
+    pending.reverse();
+
+    while let Some(child) = pending.pop() {
         if !matches!(child.kind(), "element" | "style_element" | "script_element") {
             continue;
         }
@@ -153,7 +156,9 @@ fn collect_semantic_descendants(node: Node<'_>, content: &str, blocks: &mut Vec<
         }
 
         if kind == BlockKind::Section || child.kind() == "element" {
-            collect_semantic_descendants(child, content, blocks);
+            let mut children = immediate_content_children(child);
+            children.reverse();
+            pending.extend(children);
         }
     }
 }

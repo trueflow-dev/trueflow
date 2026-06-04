@@ -122,6 +122,7 @@ fn test_scan_handles_deeply_nested_syntax_without_stack_overflow() -> Result<()>
         "deep.cpp",
         &format!("int main() {{ auto x = {expression}; return x; }}\n"),
     )?;
+    repo.write("deep.nix", &nested_nix_functions(16_000))?;
 
     let output = repo.run_raw(&["scan", "--json"])?;
     assert!(
@@ -131,7 +132,7 @@ fn test_scan_handles_deeply_nested_syntax_without_stack_overflow() -> Result<()>
     );
 
     let scan: ScanResult = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(scan.files.len(), 4);
+    assert_eq!(scan.files.len(), 5);
 
     Ok(())
 }
@@ -142,6 +143,39 @@ fn nested_parenthesized_expression(depth: usize, atom: &str) -> String {
     expression.push_str(atom);
     expression.push_str(&")".repeat(depth));
     expression
+}
+
+fn nested_nix_functions(depth: usize) -> String {
+    let mut expression = String::new();
+    for index in 0..depth {
+        expression.push_str(&format!("arg{index}: "));
+    }
+    expression.push_str("1\n");
+    expression
+}
+
+fn nested_nix_attrset_function(depth: usize) -> String {
+    let mut expression = String::from("{ value = ");
+    for index in 0..depth {
+        expression.push_str(&format!("arg{index}: "));
+    }
+    expression.push_str("1; }\n");
+    expression
+}
+
+#[test]
+fn test_review_handles_deeply_nested_nix_subblocks_without_stack_overflow() -> Result<()> {
+    let repo = TestRepo::new("deeply_nested_nix_review")?;
+    repo.write("default.nix", &nested_nix_attrset_function(16_000))?;
+
+    let output = repo.run_raw(&["review", "--all", "--json"])?;
+    assert!(
+        output.status.success(),
+        "review should not abort on deep Nix subblocks; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(())
 }
 
 #[test]

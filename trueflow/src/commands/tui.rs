@@ -76,6 +76,7 @@ const REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION: u32 = 1;
 const REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES: usize = 128;
 const SCOPE_SELECTOR_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SCOPE_SELECTOR_STATUS_WORKER_COUNT: usize = 1;
+const SCOPE_SELECTOR_STATUS_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 // --- Core Structs ---
 
@@ -358,48 +359,55 @@ impl ScopeSelectorStatusPoller {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
         let worker_count = pending_jobs.min(SCOPE_SELECTOR_STATUS_WORKER_COUNT);
-        for _ in 0..worker_count {
+        for worker_index in 0..worker_count {
             let sender = sender.clone();
             let jobs = Arc::clone(&jobs);
             let load_status = Arc::clone(&load_status);
-            let cancelled = Arc::clone(&cancelled);
-            thread::spawn(move || {
-                loop {
-                    if cancelled.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let job = {
-                        let Ok(mut jobs) = jobs.lock() else {
+            let worker_cancelled = Arc::clone(&cancelled);
+            let spawn_result = thread::Builder::new()
+                .name(format!("trueflow-scope-selector-status-{worker_index}"))
+                .stack_size(SCOPE_SELECTOR_STATUS_WORKER_STACK_BYTES)
+                .spawn(move || {
+                    loop {
+                        if worker_cancelled.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let job = {
+                            let Ok(mut jobs) = jobs.lock() else {
+                                break;
+                            };
+                            jobs.pop_front()
+                        };
+                        let Some(job) = job else {
                             break;
                         };
-                        jobs.pop_front()
-                    };
-                    let Some(job) = job else {
-                        break;
-                    };
-                    if cancelled.load(Ordering::Relaxed) {
-                        break;
-                    }
+                        if worker_cancelled.load(Ordering::Relaxed) {
+                            break;
+                        }
 
-                    let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        load_status(job.scope.clone())
-                    }))
-                    .unwrap_or(ScopeSelectorStatus::Unavailable);
-                    if cancelled.load(Ordering::Relaxed) {
-                        break;
+                        let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            load_status(job.scope.clone())
+                        }))
+                        .unwrap_or(ScopeSelectorStatus::Unavailable);
+                        if worker_cancelled.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if sender
+                            .send(ScopeSelectorStatusUpdate {
+                                index: job.index,
+                                status,
+                                cache_key: job.cache_key,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    if sender
-                        .send(ScopeSelectorStatusUpdate {
-                            index: job.index,
-                            status,
-                            cache_key: job.cache_key,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+                });
+            if spawn_result.is_err() {
+                cancelled.store(true, Ordering::Relaxed);
+                return None;
+            }
         }
         drop(sender);
 

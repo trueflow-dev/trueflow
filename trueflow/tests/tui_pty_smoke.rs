@@ -159,6 +159,80 @@ fn wait_for_child_success(
 }
 
 #[test]
+fn pty_smoke_scope_selector_prechecks_deep_commit_without_stack_overflow() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo = TestRepo::new("tui_pty_smoke_scope_selector_deep_commit")?;
+    repo.write("src/lib.rs", &deeply_nested_rust_function(8_000))?;
+    repo.commit_all("add deeply nested function")?;
+
+    let rows = 24;
+    let cols = 100;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
+    cmd.arg("tui");
+    cmd.cwd(&repo.path);
+    cmd.env("TERM", "xterm-256color");
+
+    let mut child = pair.slave.spawn_command(cmd)?;
+    let mut writer = pair.master.take_writer()?;
+    let mut reader = pair.master.try_clone_reader()?;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let output_reader = Arc::clone(&output);
+    let reader_thread = thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut output = lock_output(&output_reader);
+                    output.extend_from_slice(&buf[..count]);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    wait_for_screen_predicate(
+        &output,
+        rows,
+        cols,
+        "to show the scope selector",
+        Duration::from_secs(10),
+        &mut *child,
+        |screen| screen.contains("Select review scope"),
+    )?;
+    wait_for_screen_predicate(
+        &output,
+        rows,
+        cols,
+        "to finish commit precheck",
+        Duration::from_secs(20),
+        &mut *child,
+        |screen| screen.contains("Commit ") && !screen.contains("[checking...]"),
+    )?;
+
+    send_and_flush(&mut *writer, b"q")?;
+    drop(writer);
+    wait_for_child_success(&mut *child, &output)?;
+
+    if let Err(_panic) = reader_thread.join() {
+        bail!("reader thread panicked");
+    }
+
+    Ok(())
+}
+
+#[test]
 fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
     if cfg!(windows) {
         return Ok(());

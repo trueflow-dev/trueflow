@@ -150,58 +150,99 @@ fn collect_container_spans(
     recurse: bool,
     spans: &mut Vec<SemanticSpan>,
 ) {
-    let mut pending_start: Option<usize> = None;
-    let mut pending_end = 0usize;
+    struct PendingSpan<'a> {
+        node: Node<'a>,
+        span: SemanticSpan,
+        nested_recurse: Option<bool>,
+    }
 
-    for child in container_children(container) {
-        let kind = child.kind();
-        if !child.is_named() && !matches!(kind, "comment" | "block_comment") {
-            continue;
-        }
+    enum Frame<'a> {
+        Container { node: Node<'a>, recurse: bool },
+        Span(PendingSpan<'a>),
+    }
 
-        if is_leading_node(kind) {
-            if pending_start.is_none() {
-                pending_start = Some(child.start_byte());
+    let mut stack = vec![Frame::Container {
+        node: container,
+        recurse,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Container { node, recurse } => {
+                let mut pending_start: Option<usize> = None;
+                let mut pending_end = 0usize;
+                let mut pending_spans = Vec::new();
+
+                for child in container_children(node) {
+                    let kind = child.kind();
+                    if !child.is_named() && !matches!(kind, "comment" | "block_comment") {
+                        continue;
+                    }
+
+                    if is_leading_node(kind) {
+                        if pending_start.is_none() {
+                            pending_start = Some(child.start_byte());
+                        }
+                        pending_end = child.end_byte();
+                        continue;
+                    }
+
+                    if child.kind() == "self_type" {
+                        pending_start = None;
+                        pending_end = 0;
+                        continue;
+                    }
+
+                    if child.kind() == "enum_case_definitions" {
+                        let mut enum_spans = Vec::new();
+                        collect_enum_case_spans(child, pending_start, content, &mut enum_spans);
+                        pending_spans.extend(enum_spans.into_iter().map(|span| PendingSpan {
+                            node: child,
+                            span,
+                            nested_recurse: None,
+                        }));
+                        pending_start = None;
+                        pending_end = 0;
+                        continue;
+                    }
+
+                    let block_kind = classify_node(
+                        child,
+                        content,
+                        functions_are_methods_in_container(node.kind()),
+                    );
+                    if matches!(block_kind, BlockKind::Code | BlockKind::Comment) {
+                        pending_start = None;
+                        pending_end = 0;
+                        continue;
+                    }
+
+                    pending_spans.push(PendingSpan {
+                        node: child,
+                        span: SemanticSpan {
+                            start_byte: pending_start.unwrap_or(child.start_byte()),
+                            end_byte: child.end_byte().max(pending_end),
+                            kind: block_kind,
+                            tags: semantic_tags(child, content),
+                        },
+                        nested_recurse: (recurse && can_contain_nested_members(child.kind()))
+                            .then_some(child.kind() == "package_clause"),
+                    });
+                    pending_start = None;
+                    pending_end = 0;
+                }
+
+                stack.extend(pending_spans.into_iter().rev().map(Frame::Span));
             }
-            pending_end = child.end_byte();
-            continue;
-        }
-
-        if child.kind() == "self_type" {
-            pending_start = None;
-            pending_end = 0;
-            continue;
-        }
-
-        if child.kind() == "enum_case_definitions" {
-            collect_enum_case_spans(child, pending_start, content, spans);
-            pending_start = None;
-            pending_end = 0;
-            continue;
-        }
-
-        let block_kind = classify_node(
-            child,
-            content,
-            functions_are_methods_in_container(container.kind()),
-        );
-        if matches!(block_kind, BlockKind::Code | BlockKind::Comment) {
-            pending_start = None;
-            pending_end = 0;
-            continue;
-        }
-
-        spans.push(SemanticSpan {
-            start_byte: pending_start.unwrap_or(child.start_byte()),
-            end_byte: child.end_byte().max(pending_end),
-            kind: block_kind,
-            tags: semantic_tags(child, content),
-        });
-        pending_start = None;
-        pending_end = 0;
-
-        if recurse && can_contain_nested_members(child.kind()) {
-            collect_container_spans(child, content, child.kind() == "package_clause", spans);
+            Frame::Span(pending) => {
+                spans.push(pending.span);
+                if let Some(recurse) = pending.nested_recurse {
+                    stack.push(Frame::Container {
+                        node: pending.node,
+                        recurse,
+                    });
+                }
+            }
         }
     }
 }

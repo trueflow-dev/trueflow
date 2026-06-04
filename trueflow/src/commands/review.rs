@@ -1023,50 +1023,51 @@ fn is_subblock_covered(
     review_check: &ReviewCheck,
     file_path: &RepoPath,
 ) -> bool {
-    if !query.filters.allows_subblock(block.kind) {
-        return true;
-    }
-    if should_skip_whitespace_only_by_default(block, &query.filters) {
-        return true;
-    }
+    let mut pending = vec![block.clone()];
 
-    if coverage
-        .block(file_path, block)
-        .direct_latest_verdict_for(review_check)
-        == Some(&Verdict::Approved)
-    {
-        return true;
-    }
+    while let Some(block) = pending.pop() {
+        if !query.filters.allows_subblock(block.kind) {
+            continue;
+        }
+        if should_skip_whitespace_only_by_default(&block, &query.filters) {
+            continue;
+        }
 
-    let Ok(sub_split) = sub_splitter::split_result(block, language) else {
-        return false;
-    };
-    if sub_split.blocks.is_empty() {
-        return false;
-    }
+        if coverage
+            .block(file_path, &block)
+            .direct_latest_verdict_for(review_check)
+            == Some(&Verdict::Approved)
+        {
+            continue;
+        }
 
-    match sub_split.semantics {
-        sub_splitter::SubSplitSemantics::ReviewUnits => sub_split.blocks.iter().all(|sub_block| {
-            !query.filters.allows_subblock(sub_block.kind)
-                || should_skip_whitespace_only_by_default(sub_block, &query.filters)
-                || coverage
-                    .block(file_path, sub_block)
-                    .direct_latest_verdict_for(review_check)
-                    == Some(&Verdict::Approved)
-        }),
-        sub_splitter::SubSplitSemantics::StructuralChildren => {
-            sub_split.blocks.iter().all(|sub_block| {
-                is_subblock_covered(
-                    sub_block,
-                    language,
-                    query,
-                    coverage,
-                    review_check,
-                    file_path,
-                )
-            })
+        let Ok(sub_split) = sub_splitter::split_result(&block, language) else {
+            return false;
+        };
+        if sub_split.blocks.is_empty() {
+            return false;
+        }
+
+        match sub_split.semantics {
+            sub_splitter::SubSplitSemantics::ReviewUnits => {
+                if sub_split.blocks.iter().any(|sub_block| {
+                    query.filters.allows_subblock(sub_block.kind)
+                        && !should_skip_whitespace_only_by_default(sub_block, &query.filters)
+                        && coverage
+                            .block(file_path, sub_block)
+                            .direct_latest_verdict_for(review_check)
+                            != Some(&Verdict::Approved)
+                }) {
+                    return false;
+                }
+            }
+            sub_splitter::SubSplitSemantics::StructuralChildren => {
+                pending.extend(sub_split.blocks);
+            }
         }
     }
+
+    true
 }
 
 fn collect_diff_review_blocks_for_file(

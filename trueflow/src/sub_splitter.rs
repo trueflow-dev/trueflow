@@ -691,18 +691,20 @@ fn collect_markdown_heading_spans(
     content: &str,
     headings: &mut Vec<MarkdownHeadingSpan>,
 ) {
-    if let Some(level) = markdown_heading_level(node.kind(), node.start_byte(), content) {
-        headings.push(MarkdownHeadingSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            level,
-        });
-        return;
-    }
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        if let Some(level) = markdown_heading_level(current.kind(), current.start_byte(), content) {
+            headings.push(MarkdownHeadingSpan {
+                start: current.start_byte(),
+                end: current.end_byte(),
+                level,
+            });
+            continue;
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_markdown_heading_spans(child, content, headings);
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        pending.extend(children.into_iter().rev());
     }
 }
 
@@ -1545,18 +1547,20 @@ struct MarkdownSpan {
 }
 
 fn collect_markdown_spans(node: tree_sitter::Node<'_>, spans: &mut Vec<MarkdownSpan>) {
-    if let Some(kind) = markdown_kind(node.kind()) {
-        spans.push(MarkdownSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            kind,
-        });
-        return;
-    }
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        if let Some(kind) = markdown_kind(current.kind()) {
+            spans.push(MarkdownSpan {
+                start: current.start_byte(),
+                end: current.end_byte(),
+                kind,
+            });
+            continue;
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_markdown_spans(child, spans);
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        pending.extend(children.into_iter().rev());
     }
 }
 
@@ -1751,8 +1755,8 @@ fn collect_ruby_scope_items(parent: &Block, scope_node: tree_sitter::Node<'_>) -
     };
 
     let mut blocks = Vec::new();
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
+    let mut pending = ruby_scope_body_children(body);
+    while let Some(child) = pending.pop() {
         let kind = match child.kind() {
             "class" => BlockKind::Class,
             "module" => BlockKind::Module,
@@ -1770,12 +1774,21 @@ fn collect_ruby_scope_items(parent: &Block, scope_node: tree_sitter::Node<'_>) -
             kind,
         ));
 
-        if matches!(child.kind(), "class" | "module") {
-            blocks.extend(collect_ruby_scope_items(parent, child));
+        if matches!(child.kind(), "class" | "module")
+            && let Some(body) = child.child_by_field_name("body")
+        {
+            pending.extend(ruby_scope_body_children(body));
         }
     }
 
     blocks
+}
+
+fn ruby_scope_body_children(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut cursor = body.walk();
+    let mut children = body.named_children(&mut cursor).collect::<Vec<_>>();
+    children.reverse();
+    children
 }
 
 fn ruby_call_is_import(node: tree_sitter::Node<'_>, content: &str) -> bool {

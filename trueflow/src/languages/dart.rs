@@ -300,21 +300,23 @@ fn collect_test_invocation_blocks(
 }
 
 fn collect_test_invocation_spans(node: Node<'_>, content: &str, spans: &mut Vec<SemanticSpan>) {
-    if node.kind() == "expression_statement"
-        && let Some(name) = leading_invocation_name(node, content)
-        && is_stable_test_invocation(name)
-    {
-        spans.push(SemanticSpan {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            kind: BlockKind::Function,
-            tags: vec!["test".to_string()],
-        });
-    }
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        if current.kind() == "expression_statement"
+            && let Some(name) = leading_invocation_name(current, content)
+            && is_stable_test_invocation(name)
+        {
+            spans.push(SemanticSpan {
+                start_byte: current.start_byte(),
+                end_byte: current.end_byte(),
+                kind: BlockKind::Function,
+                tags: vec!["test".to_string()],
+            });
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_test_invocation_spans(child, content, spans);
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        pending.extend(children.into_iter().rev());
     }
 }
 
