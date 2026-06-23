@@ -8,13 +8,9 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
-    beads = {
-      url = "github:steveyegge/beads";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, beads, ... }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -127,7 +123,6 @@
 
               gnupg
               trash-cli
-              beads.packages.${system}.default
             ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [ awscli2 ]
               ++ commonNativeBuildInputs;
 
