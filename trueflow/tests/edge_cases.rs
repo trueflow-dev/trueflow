@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use std::fs;
-use trueflow::scanner::ScanResult;
 use trueflow::sub_splitter;
 
 use trueflow_test_support::*;
+
+const DEEP_NESTING_DEPTH: usize = 16_000;
 
 #[test]
 fn test_binary_file() -> Result<()> {
@@ -12,18 +13,19 @@ fn test_binary_file() -> Result<()> {
     // Write binary content (null byte)
     fs::write(&file_path, [0, 255, 0, 1])?;
 
-    // Scan
-    let output = repo.run(&["scan", "--json"])?;
-    let arr = json_array(&output)?;
+    let scan = repo.scan_without_cache()?;
 
-    let file_obj = arr
+    let file_obj = scan
+        .files
         .iter()
-        .find(|obj| obj["path"].as_str().unwrap().contains("binary.bin"));
+        .find(|file| file.path.as_str().contains("binary.bin"));
     assert!(file_obj.is_some(), "Binary file should be in output");
     let file_obj = file_obj.unwrap();
-    assert_eq!(file_obj["bytes_hash"], file_obj["tree_hash"]);
-    assert!(file_obj["bytes_hash"].as_str().is_some());
-    assert!(file_obj["blocks"].as_array().unwrap().is_empty());
+    assert_eq!(
+        file_obj.bytes_hash.to_string(),
+        file_obj.tree_hash.to_string()
+    );
+    assert!(file_obj.blocks.is_empty());
 
     Ok(())
 }
@@ -35,27 +37,25 @@ fn test_invalid_utf8() -> Result<()> {
     // Invalid UTF-8 sequence (0xFF)
     fs::write(&file_path, [0xFF, 0xFE, 0xFD])?;
 
-    // Scan
-    let output = repo.run(&["scan", "--json"])?;
-    let arr = json_array(&output)?;
-    let scan = json(&output)?;
+    let scan = repo.scan_without_cache()?;
 
-    let file_obj = arr
+    let file_obj = scan
+        .files
         .iter()
-        .find(|obj| obj["path"].as_str().unwrap().contains("bad.txt"));
+        .find(|file| file.path.as_str().contains("bad.txt"));
     assert!(file_obj.is_none(), "Invalid UTF-8 file should be skipped");
-    let diagnostics = scan["diagnostics"]
-        .as_array()
-        .context("diagnostics should be array")?;
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic["path"].as_str() == Some("bad.txt")
-            && diagnostic["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("invalid UTF-8")
+    assert!(scan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.path.as_ref().map(|path| path.as_str()) == Some("bad.txt")
+            && diagnostic.reason.contains("invalid UTF-8")
     }));
-    assert!(scan["cache"]["read"].is_string());
-    assert!(scan["cache"]["write"].is_string());
+    assert_eq!(
+        scan.cache.read,
+        trueflow::scanner::ScanCacheReadStatus::Disabled
+    );
+    assert_eq!(
+        scan.cache.write,
+        trueflow::scanner::ScanCacheWriteStatus::Disabled
+    );
 
     Ok(())
 }
@@ -91,50 +91,80 @@ fn test_empty_file() -> Result<()> {
     let file_path = repo.path.join("empty.rs");
     fs::write(&file_path, "")?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let arr = json_array(&output)?;
+    let scan = repo.scan_without_cache()?;
 
-    let file_obj = arr
+    let file_obj = scan
+        .files
         .iter()
-        .find(|obj| obj["path"].as_str().unwrap().contains("empty.rs"));
+        .find(|file| file.path.as_str().contains("empty.rs"));
     assert!(file_obj.is_some());
-    let blocks = file_obj.unwrap()["blocks"].as_array().unwrap();
-    assert!(blocks.is_empty());
+    assert!(file_obj.unwrap().blocks.is_empty());
 
     Ok(())
 }
 
-#[test]
-fn test_scan_handles_deeply_nested_syntax_without_stack_overflow() -> Result<()> {
-    let repo = TestRepo::new("deeply_nested_syntax")?;
-    let expression = nested_parenthesized_expression(16_000, "1");
+fn scan_deeply_nested_file_without_stack_overflow(
+    repo_name: &str,
+    path: &str,
+    content: &str,
+) -> Result<()> {
+    let repo = TestRepo::new(repo_name)?;
+    repo.write(path, content)?;
 
-    repo.write(
+    let scan = repo.scan_without_cache()?;
+
+    assert_eq!(scan.files.len(), 1);
+    assert_eq!(scan.files[0].path.as_str(), path);
+    Ok(())
+}
+
+#[test]
+fn test_scan_handles_deeply_nested_dart_without_stack_overflow() -> Result<()> {
+    let expression = nested_parenthesized_expression(DEEP_NESTING_DEPTH, "1");
+    scan_deeply_nested_file_without_stack_overflow(
+        "deeply_nested_dart",
         "deep.dart",
         &format!("class A {{\n  var x = {expression};\n}}\n"),
-    )?;
-    repo.write("deep.clj", &format!("(defn deep [] {expression})\n"))?;
-    repo.write(
+    )
+}
+
+#[test]
+fn test_scan_handles_deeply_nested_clojure_without_stack_overflow() -> Result<()> {
+    let expression = nested_parenthesized_expression(DEEP_NESTING_DEPTH, "1");
+    scan_deeply_nested_file_without_stack_overflow(
+        "deeply_nested_clojure",
+        "deep.clj",
+        &format!("(defn deep [] {expression})\n"),
+    )
+}
+
+#[test]
+fn test_scan_handles_deeply_nested_go_without_stack_overflow() -> Result<()> {
+    let expression = nested_parenthesized_expression(DEEP_NESTING_DEPTH, "1");
+    scan_deeply_nested_file_without_stack_overflow(
+        "deeply_nested_go",
         "deep.go",
         &format!("package main\nfunc main() {{ var x = {expression}; _ = x }}\n"),
-    )?;
-    repo.write(
+    )
+}
+
+#[test]
+fn test_scan_handles_deeply_nested_cpp_without_stack_overflow() -> Result<()> {
+    let expression = nested_parenthesized_expression(DEEP_NESTING_DEPTH, "1");
+    scan_deeply_nested_file_without_stack_overflow(
+        "deeply_nested_cpp",
         "deep.cpp",
         &format!("int main() {{ auto x = {expression}; return x; }}\n"),
-    )?;
-    repo.write("deep.nix", &nested_nix_functions(16_000))?;
+    )
+}
 
-    let output = repo.run_raw(&["scan", "--json"])?;
-    assert!(
-        output.status.success(),
-        "scan should not abort on deep nesting; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let scan: ScanResult = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(scan.files.len(), 5);
-
-    Ok(())
+#[test]
+fn test_scan_handles_deeply_nested_nix_without_stack_overflow() -> Result<()> {
+    scan_deeply_nested_file_without_stack_overflow(
+        "deeply_nested_nix",
+        "deep.nix",
+        &nested_nix_functions(DEEP_NESTING_DEPTH),
+    )
 }
 
 fn nested_parenthesized_expression(depth: usize, atom: &str) -> String {
@@ -186,9 +216,8 @@ fn test_scan_reports_structured_elisp_blocks_without_fallback_diagnostic() -> Re
         "(require 'cl-lib)\n\n(defun greet ()\n  (message \"hi\"))\n",
     )?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let scan_result: ScanResult = serde_json::from_str(&output)?;
-    let file_state = scan_result
+    let scan = repo.scan_without_cache()?;
+    let file_state = scan
         .files
         .iter()
         .find(|file| file.path.as_str() == "main.el")
@@ -196,7 +225,7 @@ fn test_scan_reports_structured_elisp_blocks_without_fallback_diagnostic() -> Re
 
     assert_eq!(file_state.language, trueflow::analysis::Language::Elisp);
     assert!(!file_state.blocks.is_empty());
-    assert!(!scan_result.diagnostics.iter().any(|diagnostic| {
+    assert!(!scan.diagnostics.iter().any(|diagnostic| {
         diagnostic.path.as_ref().map(|path| path.as_str()) == Some("main.el")
             && diagnostic.reason.contains("unsupported language")
     }));
@@ -209,9 +238,8 @@ fn test_unknown_code_extension_falls_back_to_text_and_review_still_works() -> Re
     let repo = TestRepo::new("unknown_code_extension")?;
     repo.write("main.bf", "++++[>++++<-]>+.\n\n[-]\n")?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let scan_result: ScanResult = serde_json::from_str(&output)?;
-    let file_state = scan_result
+    let scan = repo.scan_without_cache()?;
+    let file_state = scan
         .files
         .iter()
         .find(|file| file.path.as_str() == "main.bf")
@@ -226,7 +254,7 @@ fn test_unknown_code_extension_falls_back_to_text_and_review_still_works() -> Re
             .any(|block| block.kind == trueflow::block::BlockKind::Paragraph)
     );
     assert!(
-        !scan_result.diagnostics.iter().any(|diagnostic| {
+        !scan.diagnostics.iter().any(|diagnostic| {
             diagnostic.path.as_ref().map(|path| path.as_str()) == Some("main.bf")
         }),
         "did not expect fallback diagnostics for unknown text-classified files"
@@ -273,9 +301,8 @@ fn test_sub_splitter_avoids_empty_blocks() -> Result<()> {
         fs::write(&file_path, content)?;
     }
 
-    let output = repo.run(&["scan", "--json"])?;
-    let scan_result: ScanResult = serde_json::from_str(&output)?;
-    let file_states = scan_result.files;
+    let scan = repo.scan_without_cache()?;
+    let file_states = scan.files;
 
     for &(name, _) in &test_cases {
         let file_state = file_states

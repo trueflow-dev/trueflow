@@ -291,7 +291,7 @@ for stage in "${stages[@]}"; do
   start_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   SECONDS=0
   set +e
-  bash -lc "cd '$repo_root' && set -euo pipefail && $command_text" \
+  bash -c "cd '$repo_root' && set -euo pipefail && $command_text" \
     > "$stage_dir/stdout.log" \
     2> "$stage_dir/stderr.log"
   status=$?

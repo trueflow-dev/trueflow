@@ -22,6 +22,10 @@ fn assert_not_contains(haystack: &str, needle: &str, context: &str) {
     );
 }
 
+fn rejected_default_shell_tool_name() -> String {
+    ["be", "ads"].concat()
+}
+
 #[test]
 fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
     let flake_path = repo_root()?.join("flake.nix");
@@ -99,6 +103,11 @@ fn flake_nix_package_build_policy_is_explicit() -> Result<()> {
         &flake,
         "apps.default = flake-utils.lib.mkApp { drv = defaultPackage; };",
         "flake default app follows default package",
+    );
+    assert_not_contains(
+        &flake,
+        &rejected_default_shell_tool_name(),
+        "flake default dev shell should not include heavyweight task tracker",
     );
     assert_contains(
         &flake,
@@ -223,6 +232,38 @@ fn cargo_manifests_centralize_clippy_lints_via_workspace() -> Result<()> {
 }
 
 #[test]
+fn cargo_build_metadata_does_not_invalidate_local_dev_builds() -> Result<()> {
+    let build_script_path = repo_root()?.join("trueflow/build.rs");
+    assert!(
+        !build_script_path.exists(),
+        "unused build.rs should not make Cargo rebuild trueflow when git refs change"
+    );
+
+    let src_dir = repo_root()?.join("trueflow/src");
+    for file_name in ["build_metadata.rs", "build_script_support.rs"] {
+        assert!(
+            !src_dir.join(file_name).exists(),
+            "unused {file_name} should not add test-only compile work"
+        );
+    }
+    for file_name in ["build_info.rs", "lib.rs"] {
+        let source = fs::read_to_string(src_dir.join(file_name))?;
+        assert_not_contains(
+            &source,
+            "TRUEFLOW_GIT_COMMIT",
+            "source should not depend on git commit build metadata",
+        );
+        assert_not_contains(
+            &source,
+            "TRUEFLOW_BUILD_TIMESTAMP",
+            "source should not depend on timestamp build metadata",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
     let justfile_path = repo_root()?.join("Justfile");
     if !justfile_path.exists() {
@@ -254,6 +295,16 @@ fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
         &justfile,
         "check-packaging: nix-check",
         "Justfile check-packaging recipe",
+    );
+    assert_contains(
+        &justfile,
+        "fix: fix-clippy fix-fmt fix-cargo",
+        "Justfile deterministic fix recipe",
+    );
+    assert_not_contains(
+        &justfile,
+        "fix: fix-clippy fix-fmt fix-audit fix-cargo",
+        "Justfile default fix recipe should not run network-bound audit repair",
     );
     assert_contains(
         &justfile,
@@ -299,6 +350,11 @@ fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
         &justfile,
         "fix-cargo:\n    cd trueflow && cargo fix --features tui-test-support --lib --bins --tests --examples --allow-dirty\n",
         "Justfile fix-cargo recipe",
+    );
+    assert_contains(
+        &justfile,
+        "fix-audit:\n    cd trueflow && cargo audit fix\n",
+        "Justfile explicit audit fix recipe",
     );
     assert_contains(
         &justfile,
@@ -493,6 +549,16 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
         &measure_script,
         "    check-code|check-full|current-check)\n      printf '%s\\n' test-code lint-code fmt-check audit doc coverage-check",
         "measure-check check-code profile",
+    );
+    assert_contains(
+        &measure_script,
+        "  bash -c \"cd '$repo_root' && set -euo pipefail && $command_text\" \\",
+        "measure-check stage runner avoids login shell startup files",
+    );
+    assert_not_contains(
+        &measure_script,
+        "bash -lc",
+        "measure-check stage runner should not source login shell startup files",
     );
 
     Ok(())

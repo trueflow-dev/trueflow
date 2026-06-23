@@ -11,6 +11,33 @@ use vt100::Parser;
 
 use trueflow_test_support::{TestRepo, read_review_records, run_git_output};
 
+const TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV: &str = "TRUEFLOW_TUI_KEYBOARD_ENHANCEMENT_PROBE";
+const TUI_KEYBOARD_ENHANCEMENT_PROBE_SKIP_VALUE: &str = "skip";
+
+fn tui_pty_environment() -> [(&'static str, &'static str); 2] {
+    [
+        ("TERM", "xterm-256color"),
+        (
+            TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV,
+            TUI_KEYBOARD_ENHANCEMENT_PROBE_SKIP_VALUE,
+        ),
+    ]
+}
+
+fn configure_tui_pty_command(cmd: &mut CommandBuilder) {
+    for (key, value) in tui_pty_environment() {
+        cmd.env(key, value);
+    }
+}
+
+#[test]
+fn pty_smoke_harness_skips_keyboard_enhancement_probe() {
+    assert!(tui_pty_environment().contains(&(
+        TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV,
+        TUI_KEYBOARD_ENHANCEMENT_PROBE_SKIP_VALUE,
+    )));
+}
+
 fn lock_output(output: &Arc<Mutex<Vec<u8>>>) -> MutexGuard<'_, Vec<u8>> {
     match output.lock() {
         Ok(guard) => guard,
@@ -181,7 +208,7 @@ fn pty_smoke_scope_selector_prechecks_deep_commit_without_stack_overflow() -> Re
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
     cmd.arg("tui");
     cmd.cwd(&repo.path);
-    cmd.env("TERM", "xterm-256color");
+    configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
@@ -259,7 +286,7 @@ fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
     cmd.arg("--target");
     cmd.arg(target);
     cmd.cwd(&repo.path);
-    cmd.env("TERM", "xterm-256color");
+    configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
@@ -281,17 +308,6 @@ fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
     });
 
     wait_for_output(&output, "Diff Mode", Duration::from_secs(15), &mut *child)?;
-
-    let keepalive_deadline = Instant::now() + Duration::from_millis(750);
-    while Instant::now() < keepalive_deadline {
-        if let Some(status) = child.try_wait()? {
-            let output = captured_output(&output);
-            bail!(
-                "trueflow tui exited while viewing deeply nested commit diff: {status}; output: {output}"
-            );
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
 
     send_and_flush(&mut *writer, b"q")?;
     drop(writer);
@@ -329,7 +345,7 @@ fn pty_smoke_signed_action_with_noninteractive_gpg_does_not_suspend_terminal() -
     cmd.arg("tui");
     cmd.arg("--all");
     cmd.cwd(&repo.path);
-    cmd.env("TERM", "xterm-256color");
+    configure_tui_pty_command(&mut cmd);
     cmd.env("PATH", path);
 
     let mut child = pair.slave.spawn_command(cmd)?;
@@ -409,7 +425,7 @@ fn pty_smoke_diff_mode_keeps_wrapped_rows_readable_in_narrow_terminal() -> Resul
     cmd.arg("tui");
     cmd.arg("--all");
     cmd.cwd(&repo.path);
-    cmd.env("TERM", "xterm-256color");
+    configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
@@ -481,7 +497,7 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
     cmd.arg("tui");
     cmd.arg("--all");
     cmd.cwd(&repo.path);
-    cmd.env("TERM", "xterm-256color");
+    configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;

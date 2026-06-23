@@ -1,20 +1,46 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
+use trueflow::block::BlockKind;
+use trueflow::commands::review::{ReviewRequest, ReviewTarget};
 
 use trueflow_test_support::*;
+
+fn review_all(repo: &TestRepo) -> Result<trueflow::commands::review::ReviewSummary> {
+    repo.review_summary(ReviewRequest::AllFiles, &[], &[])
+}
+
+fn review_main(repo: &TestRepo) -> Result<trueflow::commands::review::ReviewSummary> {
+    repo.review_summary(
+        ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
+        &[],
+        &[],
+    )
+}
+
+fn first_scan_block_hash_in_process(repo: &TestRepo) -> Result<String> {
+    let scan = repo.scan_without_cache()?;
+    let file = scan.files.first().context("Expected file in output")?;
+    let block = file.blocks.first().context("Expected block in output")?;
+    Ok(block.hash.to_string())
+}
 
 #[test]
 fn test_optimizer_import_merge_preserves_content() -> Result<()> {
     let repo = TestRepo::new("optimizer_import")?;
     repo.write("src/lib.rs", "use a;\n\nuse b;\nextern crate c;\n")?;
-    let output = repo.run(&["scan", "--json"])?;
-    let blocks = first_file_blocks(&output)?;
+    let scan = repo.scan_without_cache()?;
+    let blocks = &scan
+        .files
+        .first()
+        .context("Expected file in output")?
+        .blocks;
+
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0]["kind"], "Imports");
+    assert_eq!(blocks[0].kind, BlockKind::Imports);
 
     // Note: The optimizer preserves newlines between imports
-    assert_eq!(blocks[0]["content"], "use a;\nuse b;\nextern crate c;");
+    assert_eq!(blocks[0].content, "use a;\nuse b;\nextern crate c;");
     Ok(())
 }
 
@@ -22,17 +48,17 @@ fn test_optimizer_import_merge_preserves_content() -> Result<()> {
 fn test_optimizer_module_merge_preserves_content() -> Result<()> {
     let repo = TestRepo::new("optimizer_module")?;
     repo.write("src/lib.rs", "mod a;\nmod b;\n\nextern \"C\" { fn x(); }\n")?;
-    let output = repo.run(&["scan", "--json"])?;
-    let blocks = first_file_blocks(&output)?;
+    let scan = repo.scan_without_cache()?;
+    let blocks = &scan
+        .files
+        .first()
+        .context("Expected file in output")?
+        .blocks;
+
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0]["kind"], "Modules");
-    assert!(blocks[0]["content"].as_str().unwrap().contains("mod a"));
-    assert!(
-        blocks[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("extern \"C\"")
-    );
+    assert_eq!(blocks[0].kind, BlockKind::Modules);
+    assert!(blocks[0].content.contains("mod a"));
+    assert!(blocks[0].content.contains("extern \"C\""));
     Ok(())
 }
 
@@ -44,17 +70,20 @@ fn test_optimizer_module_merge_preserves_test_tags() -> Result<()> {
         "#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {}\n}\n\nmod helper {\n    pub fn noop() {}\n}\n",
     )?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let blocks = first_file_blocks(&output)?;
-    assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0]["kind"], "Modules");
+    let scan = repo.scan_without_cache()?;
+    let blocks = &scan
+        .files
+        .first()
+        .context("Expected file in output")?
+        .blocks;
 
-    let tags = blocks[0]["tags"]
-        .as_array()
-        .context("tags should be array")?;
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].kind, BlockKind::Modules);
+
     assert!(
-        tags.iter().any(|tag| tag.as_str() == Some("test")),
-        "expected merged module block to retain test tag, got {tags:?}"
+        blocks[0].tags.iter().any(|tag| tag == "test"),
+        "expected merged module block to retain test tag, got {:?}",
+        blocks[0].tags
     );
 
     Ok(())
@@ -68,11 +97,16 @@ fn test_optimizer_import_merge_respects_large_gap_boundary_e2e() -> Result<()> {
         "use std::fmt;\n\nuse std::io;\n\n\n\n\nuse std::fs;\n",
     )?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let blocks = first_file_blocks(&output)?;
+    let scan = repo.scan_without_cache()?;
+    let blocks = &scan
+        .files
+        .first()
+        .context("Expected file in output")?
+        .blocks;
+
     assert_eq!(blocks.len(), 2);
-    assert_eq!(blocks[0]["kind"], "Imports");
-    assert_eq!(blocks[1]["kind"], "import");
+    assert_eq!(blocks[0].kind, BlockKind::Imports);
+    assert_eq!(blocks[1].kind, BlockKind::Import);
 
     Ok(())
 }
@@ -85,14 +119,17 @@ fn test_optimizer_small_file_collapses_mixed_semantic_blocks_e2e() -> Result<()>
         "use std::fmt;\n\nfn run() {\n    if true {}\n}\n\nconst LIMIT: usize = 3;\n",
     )?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let blocks = first_file_blocks(&output)?;
-    assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0]["kind"], "code");
+    let scan = repo.scan_without_cache()?;
+    let blocks = &scan
+        .files
+        .first()
+        .context("Expected file in output")?
+        .blocks;
 
-    let complexity = blocks[0]["complexity"]
-        .as_u64()
-        .context("complexity should be u64")?;
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].kind, BlockKind::Code);
+
+    let complexity = blocks[0].complexity.context("complexity should be set")?;
     assert!(
         complexity >= 1,
         "expected collapsed block complexity to include function complexity, got {complexity}"
@@ -115,17 +152,18 @@ fn test_diff_blocks_match_post_hunk_file_content() -> Result<()> {
     repo.write("src/main.rs", updated)?;
     repo.commit_all("Update message")?;
 
-    // WHEN: we compute semantic diff JSON
-    let output = repo.run(&["review", "--target", "main", "--json"])?;
-    let blocks = first_file_blocks(&output)?;
+    // WHEN: we compute semantic diff output
+    let summary = review_main(&repo)?;
+    let blocks = &summary
+        .files
+        .first()
+        .context("Expected file in review output")?
+        .blocks;
 
     // THEN: semantic block content reflects the post-hunk file content
     let file_content = fs::read_to_string(repo.path.join("src/main.rs"))?;
     assert_eq!(blocks.len(), 1);
-    assert_eq!(
-        blocks[0]["content"].as_str().context("content")?,
-        file_content.trim_end_matches('\n')
-    );
+    assert_eq!(blocks[0].content, file_content.trim_end_matches('\n'));
     Ok(())
 }
 
@@ -136,8 +174,7 @@ fn test_review_ignores_non_review_checks() -> Result<()> {
     repo.commit_all("Add lib")?;
 
     // GIVEN: a reviewable block with no review verdicts
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let hash = first_block_hash(&output)?;
+    let hash = first_scan_block_hash_in_process(&repo)?;
 
     // WHEN: a non-review check is recorded for the block
     repo.run(&[
@@ -152,9 +189,8 @@ fn test_review_ignores_non_review_checks() -> Result<()> {
     ])?;
 
     // THEN: the block is still present in review output
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let files = json_array(&output)?;
-    assert!(!files.is_empty());
+    let summary = review_all(&repo)?;
+    assert!(!summary.files.is_empty());
     Ok(())
 }
 
@@ -165,8 +201,7 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
     repo.commit_all("Add lib")?;
 
     // GIVEN: two review records for the same block with different timestamps
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let hash = first_block_hash(&output)?;
+    let hash = first_scan_block_hash_in_process(&repo)?;
 
     let trueflow_dir = repo.path.join(".trueflow");
     let approved = build_review_record(
@@ -188,11 +223,10 @@ fn test_review_latest_timestamp_wins() -> Result<()> {
     write_reviews_jsonl(&trueflow_dir, &[approved, rejected])?;
 
     // WHEN: we re-run review
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let files = json_array(&output)?;
+    let summary = review_all(&repo)?;
 
     // THEN: the newer approval wins and nothing remains to review
-    assert!(files.is_empty());
+    assert!(summary.files.is_empty());
     Ok(())
 }
 
@@ -202,8 +236,7 @@ fn test_feedback_latest_timestamp_wins() -> Result<()> {
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
     repo.commit_all("Add lib")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let hash = first_block_hash(&output)?;
+    let hash = first_scan_block_hash_in_process(&repo)?;
 
     let trueflow_dir = repo.path.join(".trueflow");
     let newer_approved = build_review_record(
@@ -244,8 +277,7 @@ fn test_feedback_since_unix_timestamp_filters_history() -> Result<()> {
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
     repo.commit_all("Add lib")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let hash = first_block_hash(&output)?;
+    let hash = first_scan_block_hash_in_process(&repo)?;
 
     let trueflow_dir = repo.path.join(".trueflow");
     let old_review = build_review_record(
@@ -284,8 +316,7 @@ fn test_feedback_since_last_uses_cursor_file() -> Result<()> {
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
     repo.commit_all("Add lib")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let hash = first_block_hash(&output)?;
+    let hash = first_scan_block_hash_in_process(&repo)?;
 
     let trueflow_dir = repo.path.join(".trueflow");
     let first_review = build_review_record(
@@ -333,8 +364,7 @@ fn test_feedback_uses_config_default_since_when_omitted() -> Result<()> {
     repo.write("trueflow.toml", "[feedback]\ndefault_since = \"last\"\n")?;
     repo.commit_all("Add lib and config")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let hash = first_block_hash(&output)?;
+    let hash = first_scan_block_hash_in_process(&repo)?;
 
     let trueflow_dir = repo.path.join(".trueflow");
     let first_review = build_review_record(
@@ -1044,9 +1074,12 @@ fn test_review_progress_counts_duplicate_blocks() -> Result<()> {
     repo.write("src/lib.rs", content)?;
     repo.commit_all("Add duplicates")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let files = json_array(&output)?;
-    let blocks = &files[0]["blocks"].as_array().context("blocks")?;
+    let summary = review_all(&repo)?;
+    let blocks = &summary
+        .files
+        .first()
+        .context("Expected file in review output")?
+        .blocks;
 
     // Should have 2 blocks
     assert_eq!(blocks.len(), 2);
@@ -1063,25 +1096,24 @@ fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> 
     )?;
     repo.commit_all("Add duplicates")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let files = json_array(&output)?;
-    let blocks = files[0]["blocks"].as_array().context("blocks")?;
+    let summary = review_all(&repo)?;
+    let blocks = &summary
+        .files
+        .first()
+        .context("Expected file in review output")?
+        .blocks;
     assert_eq!(blocks.len(), 2, "expected duplicate blocks before approval");
 
-    let duplicate_hash = blocks[0]["hash"].as_str().context("duplicate hash")?;
-    let first_start_line = blocks[0]["start_line"]
-        .as_u64()
-        .context("first start line")?;
-    let second_start_line = blocks[1]["start_line"]
-        .as_u64()
-        .context("second start line")?;
-    assert_eq!(blocks[1]["hash"].as_str(), Some(duplicate_hash));
+    let duplicate_hash = blocks[0].hash.to_string();
+    let first_start_line = blocks[0].start_line;
+    let second_start_line = blocks[1].start_line;
+    assert_eq!(blocks[1].hash.to_string(), duplicate_hash);
     assert_ne!(first_start_line, second_start_line);
 
     repo.run(&[
         "mark",
         "--fingerprint",
-        duplicate_hash,
+        &duplicate_hash,
         "--verdict",
         "approved",
         "--path",
@@ -1091,19 +1123,19 @@ fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> 
         "--quiet",
     ])?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let files = json_array(&output)?;
-    let remaining_blocks = files[0]["blocks"].as_array().context("remaining blocks")?;
+    let summary = review_all(&repo)?;
+    let remaining_blocks = &summary
+        .files
+        .first()
+        .context("Expected remaining file in review output")?
+        .blocks;
 
     assert_eq!(
         remaining_blocks.len(),
         1,
         "expected one duplicate block to remain after exact approval"
     );
-    assert_eq!(
-        remaining_blocks[0]["start_line"].as_u64(),
-        Some(second_start_line)
-    );
+    assert_eq!(remaining_blocks[0].start_line, second_start_line);
 
     Ok(())
 }
@@ -1117,33 +1149,20 @@ fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
     )?;
     repo.commit_all("Add main")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let json: Value = serde_json::from_str(&output)?;
-    let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
-    let parent_hash = block["hash"].as_str().context("hash")?;
+    let scan = repo.scan_without_cache()?;
+    let file = scan.files.first().context("Expected file in output")?;
+    let block = file.blocks.first().context("Expected block in output")?;
+    let records = trueflow::sub_splitter::split(block, file.language)?
+        .into_iter()
+        .filter(|sub_block| sub_block.kind != BlockKind::Gap)
+        .map(|sub_block| {
+            build_review_record(sub_block.hash.as_str(), ReviewRecordOverrides::default())
+        })
+        .collect::<Vec<_>>();
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &records)?;
 
-    let output = repo.run(&["inspect", "--fingerprint", parent_hash, "--split"])?;
-    let sub_blocks: Vec<Value> = serde_json::from_str(&output)?;
-
-    for sub_block in &sub_blocks {
-        let kind = sub_block["kind"].as_str().context("kind")?;
-        if is_gap(kind) {
-            continue;
-        }
-        let hash = sub_block["hash"].as_str().context("hash")?;
-        repo.run(&[
-            "mark",
-            "--fingerprint",
-            hash,
-            "--verdict",
-            "approved",
-            "--quiet",
-        ])?;
-    }
-
-    let output = repo.run(&["review", "--all", "--exclude", "gap", "--json"])?;
-    let json: Value = serde_json::from_str(&output)?;
-    assert!(json.as_array().context("Expected array")?.is_empty());
+    let summary = repo.review_summary(ReviewRequest::AllFiles, &[], &[BlockKind::Gap])?;
+    assert!(summary.files.is_empty());
     Ok(())
 }
 
@@ -1163,20 +1182,19 @@ fn test_scan_skips_unreadable_entries() -> Result<()> {
     perms.set_mode(0o000);
     fs::set_permissions(&secret_dir, perms)?;
 
-    let output = repo.run(&["scan", "--json"])?;
+    let scan_result = repo.scan_without_cache();
 
     // Restore permissions so cleanup can remove the directory
     let mut perms = fs::metadata(&secret_dir)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&secret_dir, perms)?;
 
-    let files = json_array(&output)?;
-    assert!(files.iter().any(|entry| {
-        entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("src/main.rs")
-    }));
+    let scan = scan_result?;
+    assert!(
+        scan.files
+            .iter()
+            .any(|file| file.path.as_str().contains("src/main.rs"))
+    );
     Ok(())
 }
 
@@ -1328,21 +1346,18 @@ fn test_scan_ignores_mutants_out_directory() -> Result<()> {
     )?;
     repo.write("mutants.out/mutants.json", "{}\n")?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let files = json_array(&output)?;
+    let scan = repo.scan_without_cache()?;
 
-    assert!(files.iter().all(|entry| {
-        !entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("mutants.out/")
-    }));
-    assert!(files.iter().any(|entry| {
-        entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("src/main.rs")
-    }));
+    assert!(
+        scan.files
+            .iter()
+            .all(|file| !file.path.as_str().contains("mutants.out/"))
+    );
+    assert!(
+        scan.files
+            .iter()
+            .any(|file| file.path.as_str().contains("src/main.rs"))
+    );
     Ok(())
 }
 
@@ -1355,21 +1370,18 @@ fn test_scan_honors_gitignore_and_keeps_nonignored_dotfiles() -> Result<()> {
     repo.write(".envrc", "export DEV_MODE=1\n")?;
     repo.commit_all("Add scan fixtures")?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let files = json_array(&output)?;
+    let scan = repo.scan_without_cache()?;
 
-    assert!(files.iter().any(|entry| {
-        entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(".envrc")
-    }));
-    assert!(files.iter().all(|entry| {
-        !entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("ignored.txt")
-    }));
+    assert!(
+        scan.files
+            .iter()
+            .any(|file| file.path.as_str().contains(".envrc"))
+    );
+    assert!(
+        scan.files
+            .iter()
+            .all(|file| !file.path.as_str().contains("ignored.txt"))
+    );
 
     Ok(())
 }
@@ -1381,12 +1393,8 @@ fn test_scan_sorts_files_by_repo_path() -> Result<()> {
     repo.write("src/a.rs", "fn a() {}\n")?;
     repo.write("src/m.rs", "fn m() {}\n")?;
 
-    let output = repo.run(&["scan", "--json"])?;
-    let files = json_array(&output)?;
-    let paths: Vec<&str> = files
-        .iter()
-        .filter_map(|entry| entry["path"].as_str())
-        .collect();
+    let scan = repo.scan_without_cache()?;
+    let paths: Vec<&str> = scan.files.iter().map(|file| file.path.as_str()).collect();
     let mut sorted = paths.clone();
     sorted.sort();
     assert_eq!(paths, sorted);
@@ -1428,46 +1436,36 @@ fn test_feedback_uses_precise_block_lookup_for_coverage() -> Result<()> {
     )?;
     repo.commit_all("Add duplicate hash blocks")?;
 
-    let scan_output = repo.run(&["scan", "--json"])?;
-    let files = json_array(&scan_output)?;
-    let file = files
+    let scan = repo.scan_without_cache()?;
+    let file = scan
+        .files
         .iter()
-        .find(|entry| entry["path"].as_str() == Some("src/lib.rs"))
+        .find(|entry| entry.path.as_str() == "src/lib.rs")
         .context("expected src/lib.rs in scan output")?;
-    let blocks = file["blocks"]
-        .as_array()
-        .context("blocks should be array")?;
+    let blocks = &file.blocks;
 
     let impl_hash = blocks
         .iter()
-        .find(|block| block["kind"].as_str() == Some("impl"))
-        .and_then(|block| block["hash"].as_str())
-        .context("expected impl block hash")?
-        .to_string();
+        .find(|block| block.kind == BlockKind::Impl)
+        .map(|block| block.hash.to_string())
+        .context("expected impl block hash")?;
 
     let duplicate_hash = blocks
         .iter()
-        .find(|block| block["kind"].as_str() == Some("function"))
-        .and_then(|block| block["hash"].as_str())
-        .context("expected function block hash")?
-        .to_string();
+        .find(|block| block.kind == BlockKind::Function)
+        .map(|block| block.hash.to_string())
+        .context("expected function block hash")?;
 
     let function_start_line = blocks
         .iter()
-        .find(|block| {
-            block["kind"].as_str() == Some("function")
-                && block["hash"].as_str() == Some(duplicate_hash.as_str())
-        })
-        .and_then(|block| block["start_line"].as_u64())
+        .find(|block| block.kind == BlockKind::Function && block.hash.to_string() == duplicate_hash)
+        .map(|block| block.start_line as u64)
         .context("expected function start line")?;
 
     let method_start_line = blocks
         .iter()
-        .find(|block| {
-            block["kind"].as_str() == Some("method")
-                && block["hash"].as_str() == Some(duplicate_hash.as_str())
-        })
-        .and_then(|block| block["start_line"].as_u64())
+        .find(|block| block.kind == BlockKind::Method && block.hash.to_string() == duplicate_hash)
+        .map(|block| block.start_line as u64)
         .context("expected method start line")?;
 
     assert_ne!(function_start_line, method_start_line);
@@ -1554,11 +1552,11 @@ fn test_main_review_uses_merge_base() -> Result<()> {
 
     repo.git(&["checkout", "feature/one"])?;
 
-    let output = repo.run(&["review", "--target", "main", "--json"])?;
-    let changes = json_array(&output)?;
-    let files: Vec<&str> = changes
+    let summary = review_main(&repo)?;
+    let files: Vec<&str> = summary
+        .files
         .iter()
-        .filter_map(|entry| entry["path"].as_str())
+        .map(|file| file.path.as_str())
         .collect();
 
     assert!(files.contains(&"src/file1.rs"));
@@ -1584,14 +1582,13 @@ fn test_main_review_respects_file_coverage_from_subdir() -> Result<()> {
     repo.write("pkg/src/lib.rs", "pub fn value() { println!(\"two\"); }\n")?;
     repo.commit_all("Change value")?;
 
-    let scan = repo.run(&["scan", "--json"])?;
-    let files = json_array(&scan)?;
-    let file_hash = files
+    let scan = repo.scan_without_cache()?;
+    let file_hash = scan
+        .files
         .iter()
-        .find(|file| file["path"].as_str() == Some("pkg/src/lib.rs"))
-        .and_then(|file| file["tree_hash"].as_str())
-        .context("expected pkg/src/lib.rs tree hash")?
-        .to_string();
+        .find(|file| file.path.as_str() == "pkg/src/lib.rs")
+        .map(|file| file.tree_hash.to_string())
+        .context("expected pkg/src/lib.rs tree hash")?;
 
     let approved_file = build_review_record(
         &file_hash,
@@ -1602,17 +1599,20 @@ fn test_main_review_respects_file_coverage_from_subdir() -> Result<()> {
     );
     write_reviews_jsonl(&repo.path.join(".trueflow"), &[approved_file])?;
 
-    let root_output = repo.run(&["review", "--target", "main", "--json"])?;
-    let root_changes = json_array(&root_output)?;
-    assert!(root_changes.is_empty(), "expected root diff to be covered");
-
-    let pkg_output = repo.run_in(
-        &["review", "--target", "main", "--json"],
-        &repo.path.join("pkg"),
-    )?;
-    let pkg_changes = json_array(&pkg_output)?;
+    let root_summary = review_main(&repo)?;
     assert!(
-        pkg_changes.is_empty(),
+        root_summary.files.is_empty(),
+        "expected root diff to be covered"
+    );
+
+    let pkg_summary = repo.review_summary_in(
+        &repo.path.join("pkg"),
+        ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
+        &[],
+        &[],
+    )?;
+    assert!(
+        pkg_summary.files.is_empty(),
         "expected subdir diff to honor file coverage"
     );
 
@@ -1625,21 +1625,16 @@ fn test_feedback_xml_escapes_cdata_end() -> Result<()> {
     repo.write("src/lib.rs", "pub fn core() { println!(\"]]>\"); }\n")?;
     repo.commit_all("Add lib")?;
 
-    let output = repo.run(&["review", "--all", "--json"])?;
-    let json: Value = serde_json::from_str(&output)?;
-    let block = &json.as_array().context("Expected array")?[0]["blocks"][0];
-    let hash = block["hash"].as_str().context("hash")?;
-
-    repo.run(&[
-        "mark",
-        "--fingerprint",
-        hash,
-        "--verdict",
-        "rejected",
-        "--note",
-        "Contains CDATA terminator",
-        "--quiet",
-    ])?;
+    let hash = first_scan_block_hash_in_process(&repo)?;
+    let record = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            verdict: Some("rejected"),
+            note: Some("Contains CDATA terminator"),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[record])?;
 
     let output = repo.run(&["feedback", "--format", "xml"])?;
     assert!(output.contains("<trueflow_feedback>"));

@@ -3,10 +3,6 @@ pub mod analysis;
 pub mod block;
 pub mod block_splitter;
 pub mod build_info;
-#[cfg(test)]
-pub(crate) mod build_metadata;
-#[cfg(test)]
-pub(crate) mod build_script_support;
 pub mod cli;
 pub mod code_comments;
 pub mod commands;

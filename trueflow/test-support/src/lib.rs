@@ -14,6 +14,9 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex};
+use trueflow::block::BlockKind;
+use trueflow::commands::review::{ReviewRequest, ReviewSummary};
+use trueflow::scanner::{ScanCacheMode, ScanOptions, ScanResult};
 use trueflow::store::{Record, ReviewTargetRef};
 use uuid::Uuid;
 
@@ -90,6 +93,33 @@ impl TestRepo {
 
     pub fn run_raw(&self, args: &[&str]) -> Result<std::process::Output> {
         Ok(build_cmd(&self.path, args)?.output()?)
+    }
+
+    pub fn scan_without_cache(&self) -> Result<ScanResult> {
+        let options = ScanOptions {
+            cache_mode: ScanCacheMode::Disabled,
+            ..ScanOptions::default()
+        };
+        trueflow::scanner::scan_directory(&self.path, &options)
+    }
+
+    pub fn review_summary(
+        &self,
+        request: ReviewRequest,
+        only: &[BlockKind],
+        exclude: &[BlockKind],
+    ) -> Result<ReviewSummary> {
+        run_review_summary(&self.path, request, only, exclude)
+    }
+
+    pub fn review_summary_in(
+        &self,
+        dir: &Path,
+        request: ReviewRequest,
+        only: &[BlockKind],
+        exclude: &[BlockKind],
+    ) -> Result<ReviewSummary> {
+        run_review_summary(dir, request, only, exclude)
     }
 }
 
@@ -475,12 +505,26 @@ pub fn write_review_records(dir: &Path, records: &[Record]) -> Result<()> {
 }
 
 pub fn run_full_review(path: &Path) -> Result<trueflow::commands::review::ReviewSummary> {
+    run_review_summary(
+        path,
+        trueflow::commands::review::ReviewRequest::AllFiles,
+        &[],
+        &[],
+    )
+}
+
+pub fn run_review_summary(
+    path: &Path,
+    request: ReviewRequest,
+    only: &[BlockKind],
+    exclude: &[BlockKind],
+) -> Result<ReviewSummary> {
     with_current_dir(path, || {
-        let query = trueflow::commands::review::resolve_review_request(
-            trueflow::commands::review::ReviewRequest::AllFiles,
-            trueflow::config::BlockFilters::default(),
-            trueflow::scanner::ScanOptions::default(),
-        )?;
+        let config = trueflow::config::load()?;
+        let filters = config.review.resolve_filters(only, exclude);
+        let scan_options = config.scan.resolve_options();
+        let query =
+            trueflow::commands::review::resolve_review_request(request, filters, scan_options)?;
 
         trueflow::commands::review::collect_review_summary(&query)
     })

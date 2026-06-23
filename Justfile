@@ -45,8 +45,8 @@ measure-local-dev:
 measure-local-minimum:
     ./scripts/measure-checks.sh --profile local-minimum
 
-# Fix all auto-fixable issues
-fix: fix-clippy fix-fmt fix-audit fix-cargo
+# Fix deterministic local issues
+fix: fix-clippy fix-fmt fix-cargo
 
 # Compile the local developer target set without running tests
 compile-check:

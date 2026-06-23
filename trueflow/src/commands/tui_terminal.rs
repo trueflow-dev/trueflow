@@ -12,9 +12,45 @@ use crossterm::{
     tty::IsTty,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io::{self, Stdout};
+use std::{
+    env,
+    io::{self, Stdout},
+};
 
 pub(crate) type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+const TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV: &str = "TRUEFLOW_TUI_KEYBOARD_ENHANCEMENT_PROBE";
+const TUI_KEYBOARD_ENHANCEMENT_PROBE_AUTO_VALUE: &str = "auto";
+const TUI_KEYBOARD_ENHANCEMENT_PROBE_SKIP_VALUE: &str = "skip";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardEnhancementProbeMode {
+    Auto,
+    Skip,
+}
+
+impl KeyboardEnhancementProbeMode {
+    fn from_environment() -> Result<Self> {
+        match env::var(TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV) {
+            Ok(value) => Self::from_env_value(Some(value.as_str())),
+            Err(env::VarError::NotPresent) => Self::from_env_value(None),
+            Err(env::VarError::NotUnicode(_)) => Err(anyhow!(
+                "{TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV} must be valid UTF-8"
+            )),
+        }
+    }
+
+    fn from_env_value(value: Option<&str>) -> Result<Self> {
+        match value {
+            None => Ok(Self::Auto),
+            Some(TUI_KEYBOARD_ENHANCEMENT_PROBE_AUTO_VALUE) => Ok(Self::Auto),
+            Some(TUI_KEYBOARD_ENHANCEMENT_PROBE_SKIP_VALUE) => Ok(Self::Skip),
+            Some(value) => Err(anyhow!(
+                "unsupported {TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV} value {value:?}; expected {TUI_KEYBOARD_ENHANCEMENT_PROBE_AUTO_VALUE:?} or {TUI_KEYBOARD_ENHANCEMENT_PROBE_SKIP_VALUE:?}"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TerminalCapabilities {
@@ -22,8 +58,28 @@ pub(crate) struct TerminalCapabilities {
 }
 
 impl TerminalCapabilities {
-    pub(crate) fn detect() -> Self {
-        Self::from_keyboard_enhancement_support_result(supports_keyboard_enhancement())
+    pub(crate) fn detect() -> Result<Self> {
+        Ok(Self::detect_with_probe_mode(
+            KeyboardEnhancementProbeMode::from_environment()?,
+            supports_keyboard_enhancement,
+        ))
+    }
+
+    fn detect_with_probe_mode<F>(probe_mode: KeyboardEnhancementProbeMode, probe: F) -> Self
+    where
+        F: FnOnce() -> io::Result<bool>,
+    {
+        match probe_mode {
+            KeyboardEnhancementProbeMode::Auto => {
+                Self::from_keyboard_enhancement_support_result(probe())
+            }
+            KeyboardEnhancementProbeMode::Skip => {
+                Self::from_keyboard_enhancement_support_result(Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "keyboard enhancement probe skipped",
+                )))
+            }
+        }
     }
 
     fn from_keyboard_enhancement_support_result(result: io::Result<bool>) -> Self {
@@ -200,7 +256,7 @@ pub(crate) struct TerminalSession {
 impl TerminalSession {
     pub(crate) fn enter() -> Result<Self> {
         ensure_tty_preflight()?;
-        let capabilities = TerminalCapabilities::detect();
+        let capabilities = TerminalCapabilities::detect()?;
         let mut stdout = io::stdout();
         enter_tui_mode(&mut stdout, capabilities)?;
         if let Err(error) = enable_raw_mode() {
@@ -358,6 +414,53 @@ mod tests {
             assert!(unsupported.keyboard_enhancement_supported());
             assert!(error.keyboard_enhancement_supported());
         }
+    }
+
+    #[test]
+    fn terminal_capabilities_auto_mode_runs_keyboard_enhancement_probe() {
+        let mut probe_called = false;
+
+        let capabilities = TerminalCapabilities::detect_with_probe_mode(
+            KeyboardEnhancementProbeMode::Auto,
+            || {
+                probe_called = true;
+                Ok(true)
+            },
+        );
+
+        assert!(probe_called);
+        assert!(capabilities.keyboard_enhancement_supported());
+    }
+
+    #[test]
+    fn terminal_capabilities_skip_mode_avoids_keyboard_enhancement_probe() {
+        let capabilities = TerminalCapabilities::detect_with_probe_mode(
+            KeyboardEnhancementProbeMode::Skip,
+            || panic!("keyboard enhancement probe should not run in skip mode"),
+        );
+
+        if cfg!(windows) {
+            assert!(!capabilities.keyboard_enhancement_supported());
+        } else {
+            assert!(capabilities.keyboard_enhancement_supported());
+        }
+    }
+
+    #[test]
+    fn keyboard_enhancement_probe_mode_parses_explicit_env_values() {
+        assert_eq!(
+            KeyboardEnhancementProbeMode::from_env_value(None).unwrap(),
+            KeyboardEnhancementProbeMode::Auto
+        );
+        assert_eq!(
+            KeyboardEnhancementProbeMode::from_env_value(Some("auto")).unwrap(),
+            KeyboardEnhancementProbeMode::Auto
+        );
+        assert_eq!(
+            KeyboardEnhancementProbeMode::from_env_value(Some("skip")).unwrap(),
+            KeyboardEnhancementProbeMode::Skip
+        );
+        assert!(KeyboardEnhancementProbeMode::from_env_value(Some("later")).is_err());
     }
 
     #[test]
