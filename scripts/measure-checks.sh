@@ -10,7 +10,7 @@ Usage:
 
 Profiles:
   check           Default local gate (tests, lint, fmt)
-  check-fast      Faster no-test local gate (compile, lint, fmt)
+  check-fast      Faster no-test local gate (lint, fmt)
   check-heavy     Heavyweight code-only checks (audit, doc, coverage)
   check-code      Broad local code verification (tests/examples/lint/docs/coverage; benches excluded)
   check-packaging Separate host-default Nix package verification
@@ -139,7 +139,7 @@ profile_stages() {
       printf '%s\n' test lint fmt-check
       ;;
     check-fast|local-minimum)
-      printf '%s\n' compile-check lint fmt-check
+      printf '%s\n' lint fmt-check
       ;;
     check-heavy)
       printf '%s\n' audit doc coverage-check

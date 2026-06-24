@@ -5,8 +5,8 @@ default:
 # Run the default local gate (tests, lint, fmt)
 check: test lint fmt-check
 
-# Run the faster no-test local gate (compile, lint, fmt)
-check-fast: compile-check lint fmt-check
+# Run the faster no-test local gate (lint, fmt)
+check-fast: lint fmt-check
 
 # Run heavyweight code checks that are useful before CI / release work
 check-heavy: audit doc coverage-check

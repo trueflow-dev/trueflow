@@ -40,7 +40,7 @@ nix develop -c just coverage
 ```
 
 `just check` is the default local gate: tests, lint, and format checks.
-`just check-fast` keeps the faster compile-only path for cases where you want a quicker no-test loop.
+`just check-fast` keeps the faster no-test lint and format path for cases where you want a quicker local loop.
 `just check-code` runs the broader lib/bin/test/example code path plus audit, docs, and coverage, while still excluding benches.
 That code-focused path builds only this crate's docs (not dependency docs) and measures coverage for the main lib/bin/test target set.
 Bench targets are opt-in and only run through `just bench`.

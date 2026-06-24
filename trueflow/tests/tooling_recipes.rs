@@ -278,7 +278,7 @@ fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "check-fast: compile-check lint fmt-check",
+        "check-fast: lint fmt-check",
         "Justfile check-fast recipe",
     );
     assert_contains(
@@ -497,7 +497,7 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    check-fast|local-minimum)\n      printf '%s\\n' compile-check lint fmt-check",
+        "    check-fast|local-minimum)\n      printf '%s\\n' lint fmt-check",
         "measure-check check-fast profile",
     );
     assert_contains(
