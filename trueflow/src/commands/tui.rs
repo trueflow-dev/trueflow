@@ -3802,11 +3802,22 @@ fn comment_anchor_for_current_action(
 
 fn review_scope_revision(state: &AppState) -> Result<Option<crate::store::CommitId>> {
     match &state.review_scope {
-        ScopePreset::Commit { id, .. } => Ok(Some(crate::store::CommitId::new(id)?)),
-        ScopePreset::RevisionRange { end, .. } => Ok(Some(crate::store::CommitId::new(end)?)),
+        ScopePreset::Commit { id, .. } => Ok(Some(resolve_review_scope_revision(id)?)),
+        ScopePreset::RevisionRange { end, .. } => Ok(Some(resolve_review_scope_revision(end)?)),
         ScopePreset::All | ScopePreset::MainDiff => {
             Ok(vcs::snapshot_from_workdir().repo_ref_revision)
         }
+    }
+}
+
+fn resolve_review_scope_revision(revision: &str) -> Result<crate::store::CommitId> {
+    match vcs::resolve_commit_id_from_workdir(revision) {
+        Ok(commit_id) => Ok(commit_id),
+        Err(resolve_error) => crate::store::CommitId::new(revision).map_err(|parse_error| {
+            anyhow!(
+                "review scope revision `{revision}` could not be resolved as a git commit ({resolve_error}) or parsed as a commit id ({parse_error})"
+            )
+        }),
     }
 }
 
@@ -10756,6 +10767,116 @@ mod diff_scope_tests {
                 path: RepoPath::new("src/lib.rs").unwrap(),
                 start_line: 0,
                 end_line: 4,
+            }))
+        );
+    }
+
+    #[test]
+    fn review_scope_revision_resolves_symbolic_commit_scope_for_comment_anchors() {
+        let repo_root = temp_git_repo("tui_symbolic_commit_anchor_revision");
+        fs::write(repo_root.join("lib.rs"), "pub fn demo() {}\n")
+            .unwrap_or_else(|error| panic!("failed to write fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+        let expected_revision =
+            CommitId::new(run_git_stdout(&repo_root, &["rev-parse", "HEAD"]).trim())
+                .unwrap_or_else(|error| panic!("expected valid fixture revision: {error}"));
+
+        let _cwd = CurrentDirGuard::push(&repo_root);
+        let state = build_test_state(
+            ScopePreset::Commit {
+                id: "HEAD".to_string(),
+                summary: String::new(),
+            },
+            HashMap::new(),
+        );
+
+        let revision = review_scope_revision(&state)
+            .unwrap_or_else(|error| panic!("expected symbolic commit scope to resolve: {error}"));
+
+        assert_eq!(revision, Some(expected_revision));
+    }
+
+    #[test]
+    fn review_scope_revision_resolves_symbolic_revision_range_end_for_comment_anchors() {
+        let repo_root = temp_git_repo("tui_symbolic_range_anchor_revision");
+        fs::write(repo_root.join("lib.rs"), "pub fn demo() -> u8 { 1 }\n")
+            .unwrap_or_else(|error| panic!("failed to write fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+        fs::write(repo_root.join("lib.rs"), "pub fn demo() -> u8 { 2 }\n")
+            .unwrap_or_else(|error| panic!("failed to update fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Update"]);
+        let expected_revision =
+            CommitId::new(run_git_stdout(&repo_root, &["rev-parse", "HEAD"]).trim())
+                .unwrap_or_else(|error| panic!("expected valid fixture revision: {error}"));
+
+        let _cwd = CurrentDirGuard::push(&repo_root);
+        let state = build_test_state(
+            ScopePreset::RevisionRange {
+                start: "HEAD~1".to_string(),
+                end: "HEAD".to_string(),
+            },
+            HashMap::new(),
+        );
+
+        let revision = review_scope_revision(&state).unwrap_or_else(|error| {
+            panic!("expected symbolic revision range end to resolve: {error}")
+        });
+
+        assert_eq!(revision, Some(expected_revision));
+    }
+
+    #[test]
+    fn mark_params_for_action_resolves_symbolic_scope_for_source_comment_anchor() {
+        let repo_root = temp_git_repo("tui_symbolic_source_comment_anchor");
+        fs::write(repo_root.join("lib.rs"), "pub fn demo() {}\n")
+            .unwrap_or_else(|error| panic!("failed to write fixture file: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+        let expected_revision =
+            CommitId::new(run_git_stdout(&repo_root, &["rev-parse", "HEAD"]).trim())
+                .unwrap_or_else(|error| panic!("expected valid fixture revision: {error}"));
+
+        let file_path = temp_test_file_path("tui_symbolic_source_comment_anchor");
+        let file_content = "fn demo() {\n    alpha();\n}\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 3);
+        state.review_scope = ScopePreset::Commit {
+            id: "HEAD".to_string(),
+            summary: String::new(),
+        };
+        state.view_mode = ViewMode::Source;
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        let node = state.navigator.tree.node(block_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+        let content = build_block_lines(&mut state, &snapshot, &palette, 20, 80);
+        state.content_height = usize_to_u16_saturating(content.total_lines);
+        state.viewport_height = 20;
+
+        let _cwd = CurrentDirGuard::push(&repo_root);
+        let params = mark_params_for_action(
+            &mut state,
+            block_id,
+            Verdict::Comment,
+            Some("note".to_string()),
+        )
+        .unwrap_or_else(|error| panic!("expected symbolic source comment params: {error}"));
+
+        assert_eq!(
+            params.comment_anchor,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: expected_revision,
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                start_line: 0,
+                end_line: 3,
             }))
         );
     }
