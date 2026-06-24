@@ -352,6 +352,7 @@ impl SpeedReadController {
         let punctuation_dwell = self.config.punctuation_dwell;
         let punctuation_dwell_multiplier = self.config.punctuation_dwell_multiplier;
         if let Some(mode) = self.active.as_mut() {
+            let previous = mode.model.settings.wpm;
             let updated = next_wpm_step_up(mode.model.settings.wpm, self.config.max_wpm);
             set_wpm(
                 &mut mode.model,
@@ -359,6 +360,9 @@ impl SpeedReadController {
                 self.config.min_wpm,
                 self.config.max_wpm,
             );
+            if mode.model.settings.wpm == previous {
+                return;
+            }
             update_next_tick(mode, punctuation_dwell, punctuation_dwell_multiplier);
             self.schedule_defaults_persist();
         }
@@ -368,6 +372,7 @@ impl SpeedReadController {
         let punctuation_dwell = self.config.punctuation_dwell;
         let punctuation_dwell_multiplier = self.config.punctuation_dwell_multiplier;
         if let Some(mode) = self.active.as_mut() {
+            let previous = mode.model.settings.wpm;
             let updated = next_wpm_step_down(mode.model.settings.wpm, self.config.min_wpm);
             set_wpm(
                 &mut mode.model,
@@ -375,6 +380,9 @@ impl SpeedReadController {
                 self.config.min_wpm,
                 self.config.max_wpm,
             );
+            if mode.model.settings.wpm == previous {
+                return;
+            }
             update_next_tick(mode, punctuation_dwell, punctuation_dwell_multiplier);
             self.schedule_defaults_persist();
         }
@@ -384,12 +392,16 @@ impl SpeedReadController {
         let punctuation_dwell = self.config.punctuation_dwell;
         let punctuation_dwell_multiplier = self.config.punctuation_dwell_multiplier;
         if let Some(mode) = self.active.as_mut() {
+            let previous = mode.model.settings.chunk_words;
             let updated = mode
                 .model
                 .settings
                 .chunk_words
                 .saturating_add(1)
                 .min(self.config.max_chunk_words);
+            if updated == previous {
+                return;
+            }
             rechunk_preserving_progress(&mut mode.model, updated);
             update_next_tick(mode, punctuation_dwell, punctuation_dwell_multiplier);
             self.schedule_defaults_persist();
@@ -400,12 +412,16 @@ impl SpeedReadController {
         let punctuation_dwell = self.config.punctuation_dwell;
         let punctuation_dwell_multiplier = self.config.punctuation_dwell_multiplier;
         if let Some(mode) = self.active.as_mut() {
+            let previous = mode.model.settings.chunk_words;
             let updated = mode
                 .model
                 .settings
                 .chunk_words
                 .saturating_sub(1)
                 .max(self.config.min_chunk_words);
+            if updated == previous {
+                return;
+            }
             rechunk_preserving_progress(&mut mode.model, updated);
             update_next_tick(mode, punctuation_dwell, punctuation_dwell_multiplier);
             self.schedule_defaults_persist();

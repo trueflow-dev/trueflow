@@ -156,21 +156,29 @@ const WPM_STEP_NUM: u64 = 1_122_462;
 const WPM_STEP_DEN: u64 = 1_000_000;
 
 pub fn next_wpm_step_up(current_wpm: u16, max_wpm: u16) -> u16 {
+    if current_wpm >= max_wpm {
+        return max_wpm;
+    }
+
     let scaled = u64::from(current_wpm)
         .saturating_mul(WPM_STEP_NUM)
         .saturating_add(WPM_STEP_DEN / 2)
         / WPM_STEP_DEN;
     let scaled_u16 = u16::try_from(scaled).unwrap_or(u16::MAX);
-    scaled_u16.min(max_wpm)
+    scaled_u16.max(current_wpm.saturating_add(1)).min(max_wpm)
 }
 
 pub fn next_wpm_step_down(current_wpm: u16, min_wpm: u16) -> u16 {
+    if current_wpm <= min_wpm {
+        return min_wpm;
+    }
+
     let scaled = u64::from(current_wpm)
         .saturating_mul(WPM_STEP_DEN)
         .saturating_add(WPM_STEP_NUM / 2)
         / WPM_STEP_NUM;
     let scaled_u16 = u16::try_from(scaled).unwrap_or(u16::MAX);
-    scaled_u16.max(min_wpm)
+    scaled_u16.min(current_wpm.saturating_sub(1)).max(min_wpm)
 }
 
 #[cfg(test)]
@@ -244,5 +252,11 @@ mod tests {
         let down = next_wpm_step_down(320, 120);
         assert_eq!(up, 359);
         assert_eq!(down, 285);
+    }
+
+    #[test]
+    fn wpm_steps_make_progress_at_low_bounds() {
+        assert_eq!(next_wpm_step_up(1, 10), 2);
+        assert_eq!(next_wpm_step_down(10, 1), 9);
     }
 }

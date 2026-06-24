@@ -13360,6 +13360,42 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn speed_read_boundary_adjustments_do_not_write_unchanged_defaults() {
+        let dir = temp_test_dir("speed_read_noop_boundary_persist");
+        let config_path = dir.join("trueflow.toml");
+        let config = TuiSpeedReadConfig {
+            default_wpm: 900,
+            max_wpm: 900,
+            default_chunk_words: 5,
+            max_chunk_words: 5,
+            ..TuiSpeedReadConfig::default()
+        };
+        let (mut state, _) = build_state_with_single_block("alpha beta gamma delta");
+        state.speed_read = SpeedReadController::new(config, config_path.clone());
+
+        toggle_speed_read_mode(&mut state);
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char('=')
+        ));
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char(']')
+        ));
+
+        let did_flush = state
+            .speed_read
+            .flush_due_defaults(Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap_or_else(|error| panic!("flush speed-read defaults: {error}"));
+
+        assert!(!did_flush);
+        assert!(
+            !config_path.exists(),
+            "boundary no-op speed-read adjustments should not create a config file"
+        );
+    }
+
+    #[test]
     fn toggle_speed_read_mode_with_whitespace_only_content_stays_paused_without_next_tick() {
         let (mut state, _) = build_state_with_single_block("  \n\t  ");
 
