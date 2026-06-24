@@ -3,7 +3,7 @@ use ignore::gitignore::GitignoreBuilder;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Entry, Item, Table, value};
 
 use crate::block::BlockKind;
 use crate::feedback_since::FeedbackSinceExpr;
@@ -43,73 +43,153 @@ pub struct TuiConfig {
     pub speed_read: TuiSpeedReadConfig,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TuiKeybindsConfig {
+    pub scroll_up: char,
+    pub scroll_down: char,
+    pub prev: char,
+    pub next: char,
+    pub parent: char,
+    pub child: char,
+    pub approve: char,
+    pub note: char,
+    pub toggle_view: char,
+    pub speed_read: char,
+    pub root: char,
+    pub recap_done: char,
+    pub quit: char,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct TuiKeybindsConfigRepr {
     #[serde(
         default = "default_tui_keybind_scroll_up",
         deserialize_with = "deserialize_single_char"
     )]
-    pub scroll_up: char,
+    scroll_up: char,
     #[serde(
         default = "default_tui_keybind_scroll_down",
         deserialize_with = "deserialize_single_char"
     )]
-    pub scroll_down: char,
+    scroll_down: char,
     #[serde(
         default = "default_tui_keybind_prev",
         deserialize_with = "deserialize_single_char"
     )]
-    pub prev: char,
+    prev: char,
     #[serde(
         default = "default_tui_keybind_next",
         deserialize_with = "deserialize_single_char"
     )]
-    pub next: char,
+    next: char,
     #[serde(
         default = "default_tui_keybind_parent",
         deserialize_with = "deserialize_single_char"
     )]
-    pub parent: char,
+    parent: char,
     #[serde(
         default = "default_tui_keybind_child",
         deserialize_with = "deserialize_single_char"
     )]
-    pub child: char,
+    child: char,
     #[serde(
         default = "default_tui_keybind_approve",
         deserialize_with = "deserialize_single_char"
     )]
-    pub approve: char,
+    approve: char,
     #[serde(
         default = "default_tui_keybind_note",
         deserialize_with = "deserialize_single_char"
     )]
-    pub note: char,
+    note: char,
     #[serde(
         default = "default_tui_keybind_toggle_view",
         deserialize_with = "deserialize_single_char"
     )]
-    pub toggle_view: char,
+    toggle_view: char,
     #[serde(
         default = "default_tui_keybind_speed_read",
         deserialize_with = "deserialize_single_char"
     )]
-    pub speed_read: char,
+    speed_read: char,
     #[serde(
         default = "default_tui_keybind_root",
         deserialize_with = "deserialize_single_char"
     )]
-    pub root: char,
+    root: char,
     #[serde(
         default = "default_tui_keybind_recap_done",
         deserialize_with = "deserialize_single_char"
     )]
-    pub recap_done: char,
+    recap_done: char,
     #[serde(
         default = "default_tui_keybind_quit",
         deserialize_with = "deserialize_single_char"
     )]
-    pub quit: char,
+    quit: char,
+}
+
+impl From<TuiKeybindsConfigRepr> for TuiKeybindsConfig {
+    fn from(repr: TuiKeybindsConfigRepr) -> Self {
+        Self {
+            scroll_up: repr.scroll_up,
+            scroll_down: repr.scroll_down,
+            prev: repr.prev,
+            next: repr.next,
+            parent: repr.parent,
+            child: repr.child,
+            approve: repr.approve,
+            note: repr.note,
+            toggle_view: repr.toggle_view,
+            speed_read: repr.speed_read,
+            root: repr.root,
+            recap_done: repr.recap_done,
+            quit: repr.quit,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TuiKeybindsConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let config = Self::from(TuiKeybindsConfigRepr::deserialize(deserializer)?);
+        validate_tui_keybinds(&config).map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+fn validate_tui_keybinds(config: &TuiKeybindsConfig) -> std::result::Result<(), String> {
+    let keybinds = [
+        ("scroll_up", config.scroll_up),
+        ("scroll_down", config.scroll_down),
+        ("prev", config.prev),
+        ("next", config.next),
+        ("parent", config.parent),
+        ("child", config.child),
+        ("approve", config.approve),
+        ("note", config.note),
+        ("toggle_view", config.toggle_view),
+        ("speed_read", config.speed_read),
+        ("root", config.root),
+        ("recap_done", config.recap_done),
+        ("quit", config.quit),
+    ];
+
+    for (left_index, (left_name, left_key)) in keybinds.iter().enumerate() {
+        if let Some((right_name, _)) = keybinds
+            .iter()
+            .skip(left_index + 1)
+            .find(|(_, right_key)| right_key == left_key)
+        {
+            return Err(format!(
+                "duplicate TUI keybind '{left_key}' for {left_name} and {right_name}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,32 +310,110 @@ pub enum TuiSpeedReadPunctuationDwell {
     Light,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TuiSpeedReadConfig {
-    #[serde(default = "default_tui_speed_read_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_speed_read_wpm")]
     pub default_wpm: u16,
-    #[serde(default = "default_speed_read_min_wpm")]
     pub min_wpm: u16,
-    #[serde(default = "default_speed_read_max_wpm")]
     pub max_wpm: u16,
-    #[serde(default = "default_speed_read_chunk_words")]
     pub default_chunk_words: u8,
-    #[serde(default = "default_speed_read_min_chunk_words")]
     pub min_chunk_words: u8,
-    #[serde(default = "default_speed_read_max_chunk_words")]
     pub max_chunk_words: u8,
-    #[serde(default = "default_speed_read_loop_playback")]
     pub loop_playback: bool,
-    #[serde(default = "default_speed_read_show_orp_highlight")]
     pub show_orp_highlight: bool,
-    #[serde(default = "default_speed_read_show_prose_hint")]
     pub show_prose_optimization_hint: bool,
-    #[serde(default = "default_speed_read_punctuation_dwell")]
     pub punctuation_dwell: TuiSpeedReadPunctuationDwell,
-    #[serde(default = "default_speed_read_punctuation_dwell_multiplier")]
     pub punctuation_dwell_multiplier: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TuiSpeedReadConfigRepr {
+    #[serde(default = "default_tui_speed_read_enabled")]
+    enabled: bool,
+    #[serde(default = "default_speed_read_wpm")]
+    default_wpm: u16,
+    #[serde(default = "default_speed_read_min_wpm")]
+    min_wpm: u16,
+    #[serde(default = "default_speed_read_max_wpm")]
+    max_wpm: u16,
+    #[serde(default = "default_speed_read_chunk_words")]
+    default_chunk_words: u8,
+    #[serde(default = "default_speed_read_min_chunk_words")]
+    min_chunk_words: u8,
+    #[serde(default = "default_speed_read_max_chunk_words")]
+    max_chunk_words: u8,
+    #[serde(default = "default_speed_read_loop_playback")]
+    loop_playback: bool,
+    #[serde(default = "default_speed_read_show_orp_highlight")]
+    show_orp_highlight: bool,
+    #[serde(default = "default_speed_read_show_prose_hint")]
+    show_prose_optimization_hint: bool,
+    #[serde(default = "default_speed_read_punctuation_dwell")]
+    punctuation_dwell: TuiSpeedReadPunctuationDwell,
+    #[serde(default = "default_speed_read_punctuation_dwell_multiplier")]
+    punctuation_dwell_multiplier: f64,
+}
+
+impl From<TuiSpeedReadConfigRepr> for TuiSpeedReadConfig {
+    fn from(repr: TuiSpeedReadConfigRepr) -> Self {
+        Self {
+            enabled: repr.enabled,
+            default_wpm: repr.default_wpm,
+            min_wpm: repr.min_wpm,
+            max_wpm: repr.max_wpm,
+            default_chunk_words: repr.default_chunk_words,
+            min_chunk_words: repr.min_chunk_words,
+            max_chunk_words: repr.max_chunk_words,
+            loop_playback: repr.loop_playback,
+            show_orp_highlight: repr.show_orp_highlight,
+            show_prose_optimization_hint: repr.show_prose_optimization_hint,
+            punctuation_dwell: repr.punctuation_dwell,
+            punctuation_dwell_multiplier: repr.punctuation_dwell_multiplier,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TuiSpeedReadConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let config = Self::from(TuiSpeedReadConfigRepr::deserialize(deserializer)?);
+        validate_speed_read_bounds(&config).map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+fn validate_speed_read_bounds(
+    config: &TuiSpeedReadConfig,
+) -> std::result::Result<(), &'static str> {
+    if config.default_wpm == 0 || config.min_wpm == 0 || config.max_wpm == 0 {
+        return Err("speed-read WPM values must be greater than 0");
+    }
+    if config.default_chunk_words == 0 || config.min_chunk_words == 0 || config.max_chunk_words == 0
+    {
+        return Err("speed-read chunk word values must be greater than 0");
+    }
+    if config.min_wpm > config.max_wpm {
+        return Err("min_wpm must be <= max_wpm");
+    }
+    if config.default_wpm < config.min_wpm || config.default_wpm > config.max_wpm {
+        return Err("default_wpm must be between min_wpm and max_wpm");
+    }
+    if config.min_chunk_words > config.max_chunk_words {
+        return Err("min_chunk_words must be <= max_chunk_words");
+    }
+    if config.default_chunk_words < config.min_chunk_words
+        || config.default_chunk_words > config.max_chunk_words
+    {
+        return Err("default_chunk_words must be between min_chunk_words and max_chunk_words");
+    }
+    if !config.punctuation_dwell_multiplier.is_finite()
+        || config.punctuation_dwell_multiplier <= 0.0
+    {
+        return Err("punctuation_dwell_multiplier must be finite and greater than 0");
+    }
+    Ok(())
 }
 
 impl Default for TuiConfig {
@@ -760,28 +918,50 @@ pub fn update_speed_read_defaults_in_file(
     }
 
     let root = document.as_table_mut();
-    let tui_item = root.entry("tui").or_insert(Item::Table(Table::new()));
-    if !tui_item.is_table() {
-        *tui_item = Item::Table(Table::new());
-    }
-    let Some(tui_table) = tui_item.as_table_mut() else {
-        return Err(anyhow!("Expected [tui] to be a table"));
+    let tui_table = match root.entry("tui") {
+        Entry::Vacant(entry) => entry
+            .insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("Expected [tui] to be a table"))?,
+        Entry::Occupied(entry) => {
+            if !entry.get().is_table() {
+                return Err(anyhow!("Expected [tui] to be a table"));
+            }
+            entry
+                .into_mut()
+                .as_table_mut()
+                .ok_or_else(|| anyhow!("Expected [tui] to be a table"))?
+        }
     };
 
-    let speed_read_item = tui_table
-        .entry("speed_read")
-        .or_insert(Item::Table(Table::new()));
-    if !speed_read_item.is_table() {
-        *speed_read_item = Item::Table(Table::new());
-    }
-    let Some(speed_read_table) = speed_read_item.as_table_mut() else {
-        return Err(anyhow!("Expected [tui.speed_read] to be a table"));
+    let speed_read_table = match tui_table.entry("speed_read") {
+        Entry::Vacant(entry) => entry
+            .insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("Expected [tui.speed_read] to be a table"))?,
+        Entry::Occupied(entry) => {
+            if !entry.get().is_table() {
+                return Err(anyhow!("Expected [tui.speed_read] to be a table"));
+            }
+            entry
+                .into_mut()
+                .as_table_mut()
+                .ok_or_else(|| anyhow!("Expected [tui.speed_read] to be a table"))?
+        }
     };
 
     speed_read_table["default_wpm"] = value(i64::from(default_wpm));
     speed_read_table["default_chunk_words"] = value(i64::from(default_chunk_words));
 
-    std::fs::write(path, document.to_string())
+    let updated = document.to_string();
+    let _: TrueflowConfig = toml::from_str(&updated).with_context(|| {
+        format!(
+            "Updated speed-read defaults would make config invalid: {}",
+            path.display()
+        )
+    })?;
+
+    std::fs::write(path, updated)
         .with_context(|| format!("Failed to write config update: {}", path.display()))?;
 
     Ok(())
@@ -853,6 +1033,94 @@ cache = false
         assert_eq!(cfg.tui.keybinds.root, 'g');
         assert_eq!(cfg.tui.keybinds.recap_done, 'd');
         assert_eq!(cfg.tui.keybinds.quit, 'q');
+    }
+
+    #[test]
+    fn example_config_parses_and_tracks_current_defaults() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| panic!("crate should live under the repo root"));
+        let path = repo_root.join("trueflow.example.toml");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let cfg: TrueflowConfig = toml::from_str(&content)
+            .unwrap_or_else(|err| panic!("parse {}: {err}", path.display()));
+        let defaults = TrueflowConfig::default();
+
+        assert_eq!(cfg.review.only, defaults.review.only);
+        assert_eq!(cfg.review.exclude, defaults.review.exclude);
+        assert_eq!(cfg.feedback.filters.only, defaults.feedback.filters.only);
+        assert_eq!(
+            cfg.feedback.filters.exclude,
+            defaults.feedback.filters.exclude
+        );
+        assert_eq!(cfg.feedback.default_since, defaults.feedback.default_since);
+        assert_eq!(cfg.scan.use_cache, defaults.scan.use_cache);
+        assert_eq!(cfg.scan.write_cache, defaults.scan.write_cache);
+        assert_eq!(cfg.scan.cache_dir, defaults.scan.cache_dir);
+        assert_eq!(cfg.scan.ignore_names, defaults.scan.ignore_names);
+        assert_eq!(
+            cfg.scan.ignore_path_prefixes,
+            defaults.scan.ignore_path_prefixes
+        );
+        assert_eq!(cfg.scan.ignore_globs, defaults.scan.ignore_globs);
+        assert_eq!(
+            cfg.tui.confirm_batch_sub_blocks,
+            defaults.tui.confirm_batch_sub_blocks
+        );
+        assert_eq!(cfg.tui.diff_focus_mode, defaults.tui.diff_focus_mode);
+        assert_eq!(
+            cfg.tui.diff_focus_context_lines,
+            defaults.tui.diff_focus_context_lines
+        );
+        assert_eq!(cfg.tui.diff_line_numbers, defaults.tui.diff_line_numbers);
+        assert_eq!(cfg.tui.keybinds, defaults.tui.keybinds);
+        assert_eq!(cfg.tui.speed_read.enabled, defaults.tui.speed_read.enabled);
+        assert_eq!(
+            cfg.tui.speed_read.default_wpm,
+            defaults.tui.speed_read.default_wpm
+        );
+        assert_eq!(cfg.tui.speed_read.min_wpm, defaults.tui.speed_read.min_wpm);
+        assert_eq!(cfg.tui.speed_read.max_wpm, defaults.tui.speed_read.max_wpm);
+        assert_eq!(
+            cfg.tui.speed_read.default_chunk_words,
+            defaults.tui.speed_read.default_chunk_words
+        );
+        assert_eq!(
+            cfg.tui.speed_read.min_chunk_words,
+            defaults.tui.speed_read.min_chunk_words
+        );
+        assert_eq!(
+            cfg.tui.speed_read.max_chunk_words,
+            defaults.tui.speed_read.max_chunk_words
+        );
+        assert_eq!(
+            cfg.tui.speed_read.loop_playback,
+            defaults.tui.speed_read.loop_playback
+        );
+        assert_eq!(
+            cfg.tui.speed_read.show_orp_highlight,
+            defaults.tui.speed_read.show_orp_highlight
+        );
+        assert_eq!(
+            cfg.tui.speed_read.show_prose_optimization_hint,
+            defaults.tui.speed_read.show_prose_optimization_hint
+        );
+        assert_eq!(
+            cfg.tui.speed_read.punctuation_dwell,
+            defaults.tui.speed_read.punctuation_dwell
+        );
+        assert!(
+            (cfg.tui.speed_read.punctuation_dwell_multiplier
+                - defaults.tui.speed_read.punctuation_dwell_multiplier)
+                .abs()
+                <= f64::EPSILON
+        );
+        assert_eq!(cfg.ai.enabled, defaults.ai.enabled);
+        assert_eq!(cfg.ai.provider, defaults.ai.provider);
+        assert_eq!(cfg.ai.model, defaults.ai.model);
+        assert_eq!(cfg.ai.max_context_lines, defaults.ai.max_context_lines);
+        assert_eq!(cfg.ai.cache, defaults.ai.cache);
     }
 
     #[test]
@@ -962,6 +1230,22 @@ note = "jk"
     }
 
     #[test]
+    fn tui_config_rejects_duplicate_keybinds() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.keybinds]
+quit = "a"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate TUI keybind 'a' for approve and quit"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
     fn speed_read_config_defaults_are_populated() {
         let cfg: TrueflowConfig = match toml::from_str("") {
             Ok(config) => config,
@@ -1018,6 +1302,120 @@ punctuation_dwell_multiplier = 1.2
             TuiSpeedReadPunctuationDwell::Off
         );
         assert!((cfg.tui.speed_read.punctuation_dwell_multiplier - 1.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn speed_read_config_rejects_inverted_wpm_bounds() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.speed_read]
+enabled = false
+min_wpm = 900
+max_wpm = 120
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("min_wpm must be <= max_wpm"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn speed_read_config_rejects_default_wpm_outside_bounds() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.speed_read]
+default_wpm = 100
+min_wpm = 120
+max_wpm = 900
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("default_wpm must be between min_wpm and max_wpm"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn speed_read_config_rejects_inverted_chunk_word_bounds() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.speed_read]
+min_chunk_words = 5
+max_chunk_words = 1
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("min_chunk_words must be <= max_chunk_words"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn speed_read_config_rejects_default_chunk_words_outside_bounds() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.speed_read]
+default_chunk_words = 8
+min_chunk_words = 1
+max_chunk_words = 5
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "default_chunk_words must be between min_chunk_words and max_chunk_words"
+            ),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn speed_read_config_rejects_zero_values_that_make_tui_state_invalid() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.speed_read]
+default_wpm = 0
+min_wpm = 0
+max_wpm = 0
+default_chunk_words = 0
+min_chunk_words = 0
+max_chunk_words = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("speed-read WPM values must be greater than 0"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn speed_read_config_rejects_zero_punctuation_dwell_multiplier() {
+        let err = toml::from_str::<TrueflowConfig>(
+            r#"
+[tui.speed_read]
+punctuation_dwell_multiplier = 0.0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("punctuation_dwell_multiplier must be finite and greater than 0"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]
@@ -1251,11 +1649,13 @@ max_context_lines = 24
         std::fs::write(path, content).unwrap_or_else(|err| panic!("write config: {err}"));
     }
 
+    fn temp_speed_read_config_path(name: &str) -> PathBuf {
+        temp_config_dir(name).join("trueflow.toml")
+    }
+
     #[test]
     fn update_speed_read_defaults_creates_and_writes_config() {
-        let path = std::env::temp_dir()
-            .join("trueflow_tests")
-            .join(format!("speed_read_cfg_{}.toml", uuid::Uuid::new_v4()));
+        let path = temp_speed_read_config_path("speed_read_create");
 
         update_speed_read_defaults_in_file(&path, 360, 3)
             .unwrap_or_else(|err| panic!("update config: {err}"));
@@ -1270,10 +1670,7 @@ max_context_lines = 24
 
     #[test]
     fn update_speed_read_defaults_preserves_existing_comments_and_keys() {
-        let path = std::env::temp_dir().join("trueflow_tests").join(format!(
-            "speed_read_cfg_preserve_{}.toml",
-            uuid::Uuid::new_v4()
-        ));
+        let path = temp_speed_read_config_path("speed_read_preserve");
         let initial = r#"# user comment
 [review]
 exclude = ["gap"]
@@ -1282,9 +1679,7 @@ exclude = ["gap"]
 # important note
 confirm_batch_sub_blocks = 2
 "#;
-        std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
-            .unwrap_or_else(|err| panic!("create temp dir: {err}"));
-        std::fs::write(&path, initial).unwrap_or_else(|err| panic!("write initial: {err}"));
+        write_config(&path, initial);
 
         update_speed_read_defaults_in_file(&path, 420, 4)
             .unwrap_or_else(|err| panic!("update config: {err}"));
@@ -1304,5 +1699,63 @@ confirm_batch_sub_blocks = 2
             toml::from_str(&content).unwrap_or_else(|err| panic!("parse config: {err}"));
         assert_eq!(parsed.tui.speed_read.default_wpm, 420);
         assert_eq!(parsed.tui.speed_read.default_chunk_words, 4);
+    }
+
+    #[test]
+    fn update_speed_read_defaults_rejects_values_that_would_make_config_invalid() {
+        let path = temp_speed_read_config_path("speed_read_invalid_update");
+        let initial = r#"[tui.speed_read]
+min_wpm = 120
+max_wpm = 900
+min_chunk_words = 1
+max_chunk_words = 5
+"#;
+        write_config(&path, initial);
+
+        let err = update_speed_read_defaults_in_file(&path, 100, 6).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Updated speed-read defaults would make config invalid"),
+            "unexpected error: {err}"
+        );
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read config: {err}"));
+        assert_eq!(content, initial);
+    }
+
+    #[test]
+    fn update_speed_read_defaults_rejects_non_table_tui_config_without_overwriting() {
+        let path = temp_speed_read_config_path("speed_read_non_table_tui");
+        let initial = "tui = \"not a table\"\n";
+        write_config(&path, initial);
+
+        let err = update_speed_read_defaults_in_file(&path, 360, 3).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Expected [tui] to be a table"),
+            "unexpected error: {err}"
+        );
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read config: {err}"));
+        assert_eq!(content, initial);
+    }
+
+    #[test]
+    fn update_speed_read_defaults_rejects_non_table_speed_read_config_without_overwriting() {
+        let path = temp_speed_read_config_path("speed_read_non_table_speed_read");
+        let initial = "[tui]\nspeed_read = \"not a table\"\n";
+        write_config(&path, initial);
+
+        let err = update_speed_read_defaults_in_file(&path, 360, 3).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Expected [tui.speed_read] to be a table"),
+            "unexpected error: {err}"
+        );
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read config: {err}"));
+        assert_eq!(content, initial);
     }
 }
