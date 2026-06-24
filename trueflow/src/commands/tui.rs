@@ -3984,7 +3984,13 @@ fn render_scope_selector(
     )));
     lines.push(Line::from(""));
 
-    for (idx, option) in selector.options.iter().enumerate() {
+    let visible_options = visible_scope_selector_option_range(
+        selector.options.len(),
+        selector.selected,
+        usize::from(layout.content.height).saturating_sub(2),
+    );
+    for idx in visible_options {
+        let option = &selector.options[idx];
         let prefix = if idx == selector.selected { "> " } else { "  " };
         let style = if idx == selector.selected {
             Style::default()
@@ -4020,6 +4026,25 @@ fn render_scope_selector(
             layout.hints,
         );
     }
+}
+
+fn visible_scope_selector_option_range(
+    option_count: usize,
+    selected: usize,
+    max_visible_options: usize,
+) -> std::ops::Range<usize> {
+    if option_count == 0 || max_visible_options == 0 {
+        return 0..0;
+    }
+
+    let visible_count = max_visible_options.min(option_count);
+    let selected = selected.min(option_count - 1);
+    let end = selected
+        .saturating_add(1)
+        .max(visible_count)
+        .min(option_count);
+    let start = end - visible_count;
+    start..end
 }
 
 fn format_scope_selector_option_text(
@@ -7980,6 +8005,67 @@ mod diff_scope_tests {
             "unexpected narrow row: {narrow:?}"
         );
         assert!(narrow.starts_with(">"), "unexpected narrow row: {narrow:?}");
+    }
+
+    #[test]
+    fn visible_scope_selector_option_range_keeps_clamped_selection_visible() {
+        for option_count in 0..12 {
+            for selected in 0..14 {
+                for max_visible_options in 0..8 {
+                    let range = visible_scope_selector_option_range(
+                        option_count,
+                        selected,
+                        max_visible_options,
+                    );
+                    if option_count == 0 || max_visible_options == 0 {
+                        assert_eq!(range, 0..0);
+                        continue;
+                    }
+
+                    let clamped_selected = selected.min(option_count - 1);
+                    assert!(range.start <= clamped_selected, "range: {range:?}");
+                    assert!(clamped_selected < range.end, "range: {range:?}");
+                    assert!(range.end <= option_count, "range: {range:?}");
+                    assert_eq!(range.len(), option_count.min(max_visible_options));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scope_selector_render_keeps_selected_option_visible_when_options_overflow() {
+        let options = (0..10)
+            .map(|index| ScopeSelectorOption {
+                label: format!("Commit {index:02}"),
+                scope: ScopePreset::Commit {
+                    id: format!("{index:07}"),
+                    summary: format!("Commit {index:02}"),
+                },
+                status: ScopeSelectorStatus::Deferred,
+            })
+            .collect::<Vec<_>>();
+        let mut selector = ScopeSelector::new(options);
+        selector.selected = 9;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| render_scope_selector(frame, &selector, &TuiKeybindsConfig::default()))
+            .unwrap_or_else(|error| panic!("failed to render scope selector: {error}"));
+
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let screen = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            screen.contains("> Commit 09"),
+            "expected selected overflowing option to stay visible:\n{screen}"
+        );
     }
 
     #[test]
