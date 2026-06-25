@@ -50,6 +50,7 @@ test-code
 test-full
 lint
 lint-code
+lint-full
 lint-all-targets
 fmt-check
 audit
@@ -86,6 +87,9 @@ stage_command() {
       ;;
     lint-code|lint-all-targets)
       printf '%s\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'
+      ;;
+    lint-full)
+      printf '%s\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'
       ;;
     fmt-check)
       printf '%s\n' 'cd trueflow && cargo fmt --check --all'
@@ -142,7 +146,7 @@ profile_stages() {
       printf '%s\n' lint fmt-check
       ;;
     check-heavy)
-      printf '%s\n' audit doc coverage-check
+      printf '%s\n' audit doc coverage-check lint-full
       ;;
     check-packaging)
       printf '%s\n' nix-check

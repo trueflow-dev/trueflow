@@ -288,7 +288,7 @@ fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
     );
     assert_contains(
         &justfile,
-        "check-heavy: audit doc coverage-check",
+        "check-heavy: audit doc coverage-check lint-full",
         "Justfile check-heavy recipe",
     );
     assert_contains(
@@ -345,6 +345,11 @@ fn justfile_fast_and_code_gates_match_build_time_contract() -> Result<()> {
         &justfile,
         "lint-code:\n    cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings\n",
         "Justfile lint-code recipe",
+    );
+    assert_contains(
+        &justfile,
+        "lint-full:\n    cd trueflow && cargo clippy --all-features --all-targets -- -D warnings\n",
+        "Justfile lint-full recipe",
     );
     assert_contains(
         &justfile,
@@ -447,7 +452,7 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "compile-check\ncompile-check-code\ncompile-check-all-targets\ntest\ntest-code\ntest-full\nlint\nlint-code\nlint-all-targets",
+        "compile-check\ncompile-check-code\ncompile-check-all-targets\ntest\ntest-code\ntest-full\nlint\nlint-code\nlint-full\nlint-all-targets",
         "measure-check stage list",
     );
     assert_contains(
@@ -497,6 +502,11 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
+        "    lint-full)\n      printf '%s\\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'",
+        "measure-check lint-full stage",
+    );
+    assert_contains(
+        &measure_script,
         "    check|local-dev)\n      printf '%s\\n' test lint fmt-check",
         "measure-check default check profile",
     );
@@ -542,7 +552,7 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    check-heavy)\n      printf '%s\\n' audit doc coverage-check",
+        "    check-heavy)\n      printf '%s\\n' audit doc coverage-check lint-full",
         "measure-check check-heavy profile",
     );
     assert_contains(

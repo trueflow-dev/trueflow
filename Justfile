@@ -9,7 +9,7 @@ check: test lint fmt-check
 check-fast: lint fmt-check
 
 # Run heavyweight code checks that are useful before CI / release work
-check-heavy: audit doc coverage-check
+check-heavy: audit doc coverage-check lint-full
 
 # Run the broad local code gate (tests/examples/lint/docs/coverage; benches excluded)
 check-code: test-code lint-code fmt-check audit doc coverage-check
@@ -82,6 +82,10 @@ lint:
 # Run clippy across the broad local code target set without benches
 lint-code:
     cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings
+
+# Run clippy across every feature and target, including benches
+lint-full:
+    cd trueflow && cargo clippy --all-features --all-targets -- -D warnings
 
 # Check formatting
 fmt-check:

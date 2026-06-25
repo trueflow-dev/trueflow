@@ -104,6 +104,11 @@
 ** TODO [High] Local LLM context helper
    - [ ] Call a local model to explain context behind a change.
 ** TODO [High] Rust lint/check sweep
+   - [X] Confirm current all-features/all-targets clippy baseline passes with
+     `cargo clippy --all-features --all-targets --manifest-path trueflow/Cargo.toml -- -D warnings`.
+   - [X] Add explicit all-features/all-targets `lint-full` coverage while
+     keeping the fast `lint` path off bench-only targets; verified by
+     `justfile_fast_and_code_gates_match_build_time_contract`.
    - [ ] Evaluate high-quality Rust lints (deny, udeps, semver-checks, geiger, nextest) and wire into `just check`.
 ** TODO [High] Installation experience
    - [ ] Formalize a high-quality install plan (cargo install vs curl | sh vs package managers).
@@ -157,6 +162,16 @@ Two things:
    - [ ] Spin up Vultr infra and document deployment via the org meta repo.
 ** TODO [Low] Performance sweep
    - [ ] Audit for performance improvements and implement top candidates.
+   - [X] Skip rewriting the scan cache on complete cache hits while still
+     rewriting when cached entries disappear; verified by
+     `scan_cache_skips_write_on_complete_cache_hit` and
+     `scan_cache_rewrites_when_cached_file_is_deleted`.
+   - [X] Reuse one direct-scan ignore matcher per `scan_paths` call and keep
+     custom ignored directory names excluded for explicit paths; verified by
+     `scan_paths_keeps_custom_ignored_directories_ignored`.
+   - [ ] Investigate whether salsa or another incremental engine can improve
+     scanner/review cache invalidation without adding avoidable dependency
+     weight.
 ** TODO [Medium] Add mode in review for speed-reading word-by-word SPC -> pause;
    j back sentence; l forward sentence
 ** DONE [HIGH] please move the pgup/down, and [h]prev next down up to the right side of the navigation legend. parent and child can be in the middle. on the left, approve and comment, then mode. quit stays on furthest right. please confirm the order and layout with me.
