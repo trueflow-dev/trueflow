@@ -171,6 +171,10 @@ Two things:
    - [X] Reuse one direct-scan ignore matcher per `scan_paths` call and keep
      custom ignored directory names excluded for explicit paths; verified by
      `scan_paths_keeps_custom_ignored_directories_ignored`.
+   - [X] Let targeted `scan_paths` calls warm and refresh scan cache entries
+     without dropping unrelated cached files; verified by
+     `scan_paths_writes_and_reuses_requested_file_cache` and
+     `scan_paths_preserves_unrequested_cache_entries`.
    - [ ] Investigate whether salsa or another incremental engine can improve
      scanner/review cache invalidation without adding avoidable dependency
      weight.
