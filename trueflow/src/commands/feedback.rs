@@ -998,46 +998,7 @@ fn pure_rename_target(
     end: &CommitId,
     path: &crate::repo_path::RepoPath,
 ) -> Result<Option<crate::repo_path::RepoPath>> {
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| anyhow!("rename remapping requires a non-bare git repository"))?;
-    let output = Command::new("git")
-        .args([
-            "diff",
-            "--name-status",
-            "--find-renames=100%",
-            "--diff-filter=R",
-            start.as_str(),
-            end.as_str(),
-            "--",
-        ])
-        .current_dir(workdir)
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git diff --name-status failed while remapping rename history: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let stdout = String::from_utf8(output.stdout)?;
-    let mut matches = Vec::new();
-    for line in stdout.lines() {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        let [status, old_path, new_path] = fields.as_slice() else {
-            continue;
-        };
-        if *status == "R100" && *old_path == path.as_str() {
-            matches.push(crate::repo_path::RepoPath::new(*new_path)?);
-        }
-    }
-
-    match matches.as_slice() {
-        [] => Ok(None),
-        [target] => Ok(Some(target.clone())),
-        _ => Ok(None),
-    }
+    pure_rename_path(repo, start, end, path, PureRenameDirection::Target)
 }
 
 fn pure_rename_source(
@@ -1045,6 +1006,37 @@ fn pure_rename_source(
     start: &CommitId,
     end: &CommitId,
     path: &crate::repo_path::RepoPath,
+) -> Result<Option<crate::repo_path::RepoPath>> {
+    pure_rename_path(repo, start, end, path, PureRenameDirection::Source)
+}
+
+#[derive(Clone, Copy)]
+enum PureRenameDirection {
+    Source,
+    Target,
+}
+
+impl PureRenameDirection {
+    fn remapped_path<'a>(
+        self,
+        old_path: &'a str,
+        new_path: &'a str,
+        query_path: &crate::repo_path::RepoPath,
+    ) -> Option<&'a str> {
+        match self {
+            Self::Source if new_path == query_path.as_str() => Some(old_path),
+            Self::Target if old_path == query_path.as_str() => Some(new_path),
+            Self::Source | Self::Target => None,
+        }
+    }
+}
+
+fn pure_rename_path(
+    repo: &gix::Repository,
+    start: &CommitId,
+    end: &CommitId,
+    path: &crate::repo_path::RepoPath,
+    direction: PureRenameDirection,
 ) -> Result<Option<crate::repo_path::RepoPath>> {
     let workdir = repo
         .workdir()
@@ -1076,8 +1068,10 @@ fn pure_rename_source(
         let [status, old_path, new_path] = fields.as_slice() else {
             continue;
         };
-        if *status == "R100" && *new_path == path.as_str() {
-            matches.push(crate::repo_path::RepoPath::new(*old_path)?);
+        if *status == "R100"
+            && let Some(remapped_path) = direction.remapped_path(old_path, new_path, path)
+        {
+            matches.push(crate::repo_path::RepoPath::new(remapped_path)?);
         }
     }
 
