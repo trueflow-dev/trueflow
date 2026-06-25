@@ -810,8 +810,6 @@ fn diagnostic_for_process_file_error(
     ScanDiagnostic::new(path, reason)
 }
 
-// TODO: Investigate whether salsa can help incremental review caching.
-
 #[derive(Debug, Clone)]
 struct ProcessedFile {
     file_state: FileState,
