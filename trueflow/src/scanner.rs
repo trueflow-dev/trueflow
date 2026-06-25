@@ -227,9 +227,10 @@ pub fn scan_paths<P: AsRef<Path>>(
     let mut files = Vec::new();
     let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
     ordered_paths.sort();
+    let ignore_matcher = DirectScanPathIgnoreMatcher::new(options);
 
     for path in ordered_paths {
-        if path.is_root() || direct_scan_path_is_ignored(&path, options) {
+        if path.is_root() || ignore_matcher.matches(&path) {
             continue;
         }
         let full_path = repo_path_base.join(path.as_str());
@@ -285,23 +286,36 @@ pub fn scan_paths<P: AsRef<Path>>(
     })
 }
 
-fn direct_scan_path_is_ignored(path: &RepoPath, options: &ScanOptions) -> bool {
-    if options
-        .ignore_path_prefixes
-        .iter()
-        .any(|prefix| path.is_under(prefix))
-    {
-        return true;
+struct DirectScanPathIgnoreMatcher<'a> {
+    path_prefixes: &'a [RepoPath],
+    ignored_names: HashSet<&'a str>,
+}
+
+impl<'a> DirectScanPathIgnoreMatcher<'a> {
+    fn new(options: &'a ScanOptions) -> Self {
+        Self {
+            path_prefixes: &options.ignore_path_prefixes,
+            ignored_names: DEFAULT_IGNORE_NAMES
+                .iter()
+                .copied()
+                .chain(options.ignore_names.iter().map(String::as_str))
+                .collect(),
+        }
     }
 
-    let ignored_names = DEFAULT_IGNORE_NAMES
-        .iter()
-        .copied()
-        .chain(options.ignore_names.iter().map(String::as_str))
-        .collect::<HashSet<_>>();
-    path.as_str()
-        .split('/')
-        .any(|segment| ignored_names.contains(segment))
+    fn matches(&self, path: &RepoPath) -> bool {
+        if self
+            .path_prefixes
+            .iter()
+            .any(|prefix| path.is_under(prefix))
+        {
+            return true;
+        }
+
+        path.as_str()
+            .split('/')
+            .any(|segment| self.ignored_names.contains(segment))
+    }
 }
 
 fn load_scan_cache_for_read(
@@ -870,6 +884,30 @@ mod tests {
 
         let paths = HashSet::from([RepoPath::new(".trueflow/reviews.jsonl").unwrap()]);
         let result = scan_paths(&repo, &paths, &ScanOptions::default())
+            .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
+
+        assert!(result.files.is_empty());
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn scan_paths_keeps_custom_ignored_directories_ignored() {
+        let repo = temp_test_dir("scanner_paths_ignores_custom_names");
+        let generated_dir = repo.join("generated");
+        fs::create_dir_all(&generated_dir)
+            .unwrap_or_else(|error| panic!("create generated dir: {error}"));
+        fs::write(generated_dir.join("fixture.rs"), "fn generated() {}\n")
+            .unwrap_or_else(|error| panic!("write generated file: {error}"));
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap_or_else(|error| panic!("git init failed: {error}"));
+        let mut options = ScanOptions::default();
+        options.ignore_names.push("generated".to_string());
+
+        let paths = HashSet::from([RepoPath::new("generated/fixture.rs").unwrap()]);
+        let result = scan_paths(&repo, &paths, &options)
             .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
 
         assert!(result.files.is_empty());
