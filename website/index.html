@@ -141,6 +141,12 @@
             Move through a focused TUI or export machine-readable review output.
           </li>
           <li>
+            <strong>Review pull requests.</strong>
+            Run <code>trueflow tui --target pr:11</code> for fetch-only PR review,
+            then use <code>trueflow feedback --pr pr:11 --dry-run</code> before
+            staging GitHub feedback.
+          </li>
+          <li>
             <strong>Keep context.</strong>
             Store review records in append-only state outside the patch itself.
           </li>

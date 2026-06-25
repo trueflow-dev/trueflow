@@ -944,24 +944,9 @@ mod tests {
         let file_hash = tree.node(file_id).hash.clone();
         let function_hash = tree.node(function_id).hash.clone();
         let records = vec![
-            file_record(
-                "1",
-                file_hash,
-                "review",
-                Verdict::Approved,
-                "alice@example.com",
-                1,
-            ),
-            block_record(
-                "2",
-                function_hash,
-                "src/lib.rs",
-                1,
-                "security",
-                Verdict::Approved,
-                "bob@example.com",
-                2,
-            ),
+            approved_file_record("1", file_hash, "alice@example.com", 1),
+            approved_block_record("2", function_hash, "src/lib.rs", 1, "bob@example.com", 2)
+                .with_check("security"),
         ];
         let database = ReviewDatabase::from_records(records);
         let coverage =
@@ -1013,14 +998,7 @@ mod tests {
     fn effective_scope_policy_counts_inherited_reviews() {
         let (tree, file_id, function_id, _, _) = build_function_tree();
         let file_hash = tree.node(file_id).hash.clone();
-        let records = vec![file_record(
-            "1",
-            file_hash,
-            "review",
-            Verdict::Approved,
-            "alice@example.com",
-            1,
-        )];
+        let records = vec![approved_file_record("1", file_hash, "alice@example.com", 1)];
         let database = ReviewDatabase::from_records(records);
         let coverage =
             CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
@@ -1040,26 +1018,15 @@ mod tests {
         let (tree, _, function_id, _, _) = build_function_tree();
         let function_hash = tree.node(function_id).hash.clone();
         let records = vec![
-            block_record(
+            approved_block_record(
                 "1",
                 function_hash.clone(),
                 "src/lib.rs",
                 1,
-                "review",
-                Verdict::Approved,
                 "alice@example.com",
                 1,
             ),
-            block_record(
-                "2",
-                function_hash,
-                "src/lib.rs",
-                1,
-                "review",
-                Verdict::Approved,
-                "bob@example.com",
-                2,
-            ),
+            approved_block_record("2", function_hash, "src/lib.rs", 1, "bob@example.com", 2),
         ];
         let database = ReviewDatabase::from_records(records);
         let coverage =
@@ -1083,11 +1050,9 @@ mod tests {
         let (tree, first_id, second_id, first_hash, second_hash) = build_duplicate_hash_tree();
         assert_eq!(first_hash, second_hash);
 
-        let records = vec![hash_only_block_record(
+        let records = vec![approved_hash_only_block_record(
             "1",
             first_hash,
-            "review",
-            Verdict::Approved,
             "alice@example.com",
             1,
         )];
@@ -1119,26 +1084,8 @@ mod tests {
         let first_hash = tree.node(first_method_id).hash.clone();
         let second_hash = tree.node(second_method_id).hash.clone();
         let records = vec![
-            block_record(
-                "1",
-                first_hash,
-                "src/lib.rs",
-                2,
-                "review",
-                Verdict::Approved,
-                "alice@example.com",
-                1,
-            ),
-            block_record(
-                "2",
-                second_hash,
-                "src/lib.rs",
-                4,
-                "review",
-                Verdict::Approved,
-                "bob@example.com",
-                2,
-            ),
+            approved_block_record("1", first_hash, "src/lib.rs", 2, "alice@example.com", 1),
+            approved_block_record("2", second_hash, "src/lib.rs", 4, "bob@example.com", 2),
         ];
         let database = ReviewDatabase::from_records(records);
         let coverage =
@@ -1269,108 +1216,76 @@ mod tests {
         )
     }
 
-    fn file_record(
-        id: &str,
-        hash: TreeHash,
-        check: &str,
-        verdict: Verdict,
-        email: &str,
-        timestamp: i64,
-    ) -> Record {
-        Record {
-            id: id.to_string(),
-            version: crate::store::CURRENT_VERSION,
-            target: ReviewTargetRef::File { hash },
-            check: ReviewCheck::new(check).unwrap(),
-            verdict,
-            identity: Identity::Email {
-                email: email.to_string(),
-            },
-            repo_ref: RepoRef::Vcs {
-                system: VcsSystem::Git,
-                revision: CommitId::new("0123456789abcdef").unwrap(),
-            },
-            block_state: BlockState::Committed,
-            timestamp,
-            path_hint: Some(RepoPath::new("src/lib.rs").unwrap()),
-            line_hint: None,
-            note: None,
-            comment_scope: None,
-            comment_context: None,
-            comment_anchor: None,
-            tags: None,
-            attestations: None,
-        }
+    fn approved_file_record(id: &str, hash: TreeHash, email: &str, timestamp: i64) -> Record {
+        TestRecord::approved(id, ReviewTargetRef::File { hash }, email, timestamp)
+            .with_path_hint("src/lib.rs")
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn block_record(
+    fn approved_block_record(
         id: &str,
         hash: TreeHash,
         path: &str,
         start_line: u32,
-        check: &str,
-        verdict: Verdict,
         email: &str,
         timestamp: i64,
     ) -> Record {
-        Record {
-            id: id.to_string(),
-            version: crate::store::CURRENT_VERSION,
-            target: ReviewTargetRef::Block { hash },
-            check: ReviewCheck::new(check).unwrap(),
-            verdict,
-            identity: Identity::Email {
-                email: email.to_string(),
-            },
-            repo_ref: RepoRef::Vcs {
-                system: VcsSystem::Git,
-                revision: CommitId::new("0123456789abcdef").unwrap(),
-            },
-            block_state: BlockState::Committed,
-            timestamp,
-            path_hint: Some(RepoPath::new(path).unwrap()),
-            line_hint: Some(start_line),
-            note: None,
-            comment_scope: None,
-            comment_context: None,
-            comment_anchor: None,
-            tags: None,
-            attestations: None,
+        TestRecord::approved(id, ReviewTargetRef::Block { hash }, email, timestamp)
+            .with_path_hint(path)
+            .with_line_hint(start_line)
+    }
+
+    fn approved_hash_only_block_record(
+        id: &str,
+        hash: TreeHash,
+        email: &str,
+        timestamp: i64,
+    ) -> Record {
+        TestRecord::approved(id, ReviewTargetRef::Block { hash }, email, timestamp)
+    }
+
+    struct TestRecord;
+
+    impl TestRecord {
+        fn approved(id: &str, target: ReviewTargetRef, email: &str, timestamp: i64) -> Record {
+            let mut record = Record::new(
+                target,
+                ReviewCheck::review(),
+                Verdict::Approved,
+                Identity::Email {
+                    email: email.to_string(),
+                },
+                RepoRef::Vcs {
+                    system: VcsSystem::Git,
+                    revision: CommitId::new("0123456789abcdef").unwrap(),
+                },
+                BlockState::Committed,
+            );
+            record.id = id.to_string();
+            record.timestamp = timestamp;
+            record
         }
     }
 
-    fn hash_only_block_record(
-        id: &str,
-        hash: TreeHash,
-        check: &str,
-        verdict: Verdict,
-        email: &str,
-        timestamp: i64,
-    ) -> Record {
-        Record {
-            id: id.to_string(),
-            version: crate::store::CURRENT_VERSION,
-            target: ReviewTargetRef::Block { hash },
-            check: ReviewCheck::new(check).unwrap(),
-            verdict,
-            identity: Identity::Email {
-                email: email.to_string(),
-            },
-            repo_ref: RepoRef::Vcs {
-                system: VcsSystem::Git,
-                revision: CommitId::new("0123456789abcdef").unwrap(),
-            },
-            block_state: BlockState::Committed,
-            timestamp,
-            path_hint: None,
-            line_hint: None,
-            note: None,
-            comment_scope: None,
-            comment_context: None,
-            comment_anchor: None,
-            tags: None,
-            attestations: None,
+    trait TestRecordExt {
+        fn with_check(self, check: &str) -> Self;
+        fn with_path_hint(self, path: &str) -> Self;
+        fn with_line_hint(self, line: u32) -> Self;
+    }
+
+    impl TestRecordExt for Record {
+        fn with_check(mut self, check: &str) -> Self {
+            self.check = ReviewCheck::new(check).unwrap();
+            self
+        }
+
+        fn with_path_hint(mut self, path: &str) -> Self {
+            self.path_hint = Some(RepoPath::new(path).unwrap());
+            self
+        }
+
+        fn with_line_hint(mut self, line: u32) -> Self {
+            self.line_hint = Some(line);
+            self
         }
     }
 }

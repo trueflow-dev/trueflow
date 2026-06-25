@@ -345,6 +345,35 @@ struct SignableRecordV4<'a> {
 }
 
 impl Record {
+    pub fn new(
+        target: ReviewTargetRef,
+        check: ReviewCheck,
+        verdict: Verdict,
+        identity: Identity,
+        repo_ref: RepoRef,
+        block_state: BlockState,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: CURRENT_VERSION,
+            target,
+            check,
+            verdict,
+            identity,
+            repo_ref,
+            block_state,
+            timestamp: chrono::Utc::now().timestamp(),
+            path_hint: None,
+            line_hint: None,
+            note: None,
+            comment_scope: None,
+            comment_context: None,
+            comment_anchor: None,
+            tags: None,
+            attestations: None,
+        }
+    }
+
     pub fn signing_payload(&self) -> Result<String> {
         if self.version >= 4 {
             return Ok(serde_jcs::to_string(&SignableRecordV4 {
@@ -986,6 +1015,40 @@ mod tests {
             tags: None,
             attestations: None,
         }
+    }
+
+    #[test]
+    fn record_new_generates_identity_fields_and_empty_optional_metadata() {
+        let before = chrono::Utc::now().timestamp();
+        let target = ReviewTargetRef::Block {
+            hash: TreeHash::from_content("fn demo() {}\n"),
+        };
+        let record = Record::new(
+            target.clone(),
+            ReviewCheck::review(),
+            Verdict::Approved,
+            Identity::Email {
+                email: "dev@example.com".to_string(),
+            },
+            RepoRef::Unknown,
+            BlockState::Unknown,
+        );
+        let after = chrono::Utc::now().timestamp();
+
+        assert_eq!(record.version, CURRENT_VERSION);
+        assert_eq!(record.target, target);
+        assert_eq!(record.check, ReviewCheck::review());
+        assert_eq!(record.verdict, Verdict::Approved);
+        assert!(uuid::Uuid::parse_str(&record.id).is_ok());
+        assert!((before..=after).contains(&record.timestamp));
+        assert_eq!(record.path_hint, None);
+        assert_eq!(record.line_hint, None);
+        assert_eq!(record.note, None);
+        assert_eq!(record.comment_scope, None);
+        assert_eq!(record.comment_context, None);
+        assert_eq!(record.comment_anchor, None);
+        assert_eq!(record.tags, None);
+        assert!(record.attestations.is_none());
     }
 
     #[test]

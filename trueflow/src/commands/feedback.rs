@@ -133,7 +133,14 @@ fn validate_feedback_command_args(
 struct PullRequestFeedbackPlan {
     draft: GitHubReviewDraft,
     staged_record_ids: Vec<String>,
+    staged_comments: Vec<StagedPullRequestComment>,
     skipped: Vec<SkippedPullRequestRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedPullRequestComment {
+    record_id: String,
+    comment: GitHubInlineComment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +257,7 @@ where
         return run_prepared_pull_request_feedback_submission(
             &mut ledger,
             ledger_path.as_path(),
-            &prepared.metadata.pr,
+            &prepared.metadata,
             client,
             dry_run,
             open,
@@ -259,7 +266,8 @@ where
     }
 
     let database = store.load_database()?;
-    let excluded_ids = ledger.excluded_record_ids(&prepared.metadata.pr);
+    let excluded_ids =
+        ledger.excluded_record_ids_for_head(&prepared.metadata.pr, &prepared.metadata.head_sha);
     let plan = build_pull_request_feedback_plan(
         &repo,
         &prepared.metadata,
@@ -272,7 +280,7 @@ where
     } else {
         Some(select_pull_request_feedback_delivery(
             &ledger,
-            &prepared.metadata.pr,
+            &prepared.metadata,
             client,
         )?)
     };
@@ -306,21 +314,21 @@ where
             review_url
         }
         PullRequestFeedbackDelivery::AppendToPendingReview { review } => {
-            for comment in &plan.draft.comments {
+            for staged in &plan.staged_comments {
                 client.add_comment_to_pending_pull_request_review(
                     &prepared.metadata.pr,
                     &review,
-                    comment,
+                    &staged.comment,
                 )?;
+                ledger.record_pending_review(
+                    &prepared.metadata.pr,
+                    review.clone(),
+                    &prepared.metadata.head_sha,
+                    vec![staged.record_id.clone()],
+                );
+                ledger.save(&ledger_path)?;
             }
-            let review_url = review.html_url.clone();
-            ledger.record_pending_review(
-                &prepared.metadata.pr,
-                review,
-                &prepared.metadata.head_sha,
-                plan.staged_record_ids.clone(),
-            );
-            review_url
+            review.html_url
         }
     };
     ledger.save(&ledger_path)?;
@@ -340,7 +348,7 @@ where
 fn run_prepared_pull_request_feedback_submission<C, O>(
     ledger: &mut GitHubDeliveryLedger,
     ledger_path: &Path,
-    pr: &ResolvedPullRequestRef,
+    metadata: &PullRequestMetadata,
     client: &C,
     dry_run: bool,
     open: bool,
@@ -350,7 +358,8 @@ where
     C: GitHubClient,
     O: FnMut(&str) -> Result<()>,
 {
-    let Some(review) = find_trueflow_pending_review(ledger, pr, client)? else {
+    let pr = &metadata.pr;
+    let Some(review) = find_trueflow_pending_review(ledger, pr, &metadata.head_sha, client)? else {
         return Ok(PullRequestFeedbackOutcome {
             plan: empty_pull_request_feedback_plan(),
             delivery: None,
@@ -369,6 +378,7 @@ where
     }
 
     let submitted = client.submit_pending_pull_request_review(pr, review.id)?;
+    ensure_submitted_pull_request_review_state(&submitted)?;
     let review_url = submitted.html_url.clone();
     ledger.record_submitted_review(pr, review.id);
     ledger.save(ledger_path)?;
@@ -385,6 +395,18 @@ where
     })
 }
 
+fn ensure_submitted_pull_request_review_state(review: &PostedPullRequestReview) -> Result<()> {
+    if review.state.is_terminal() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "GitHub returned non-terminal review state {:?} after submitting review {}; leaving local pending review state unchanged",
+        review.state,
+        review.id
+    ))
+}
+
 fn empty_pull_request_feedback_plan() -> PullRequestFeedbackPlan {
     PullRequestFeedbackPlan {
         draft: GitHubReviewDraft {
@@ -392,19 +414,22 @@ fn empty_pull_request_feedback_plan() -> PullRequestFeedbackPlan {
             comments: Vec::new(),
         },
         staged_record_ids: Vec::new(),
+        staged_comments: Vec::new(),
         skipped: Vec::new(),
     }
 }
 
 fn select_pull_request_feedback_delivery<C>(
     ledger: &GitHubDeliveryLedger,
-    pr: &ResolvedPullRequestRef,
+    metadata: &PullRequestMetadata,
     client: &C,
 ) -> Result<PullRequestFeedbackDelivery>
 where
     C: GitHubClient,
 {
-    if let Some(review) = find_trueflow_pending_review(ledger, pr, client)? {
+    if let Some(review) =
+        find_trueflow_pending_review(ledger, &metadata.pr, &metadata.head_sha, client)?
+    {
         return Ok(PullRequestFeedbackDelivery::AppendToPendingReview { review });
     }
 
@@ -414,12 +439,16 @@ where
 fn find_trueflow_pending_review<C>(
     ledger: &GitHubDeliveryLedger,
     pr: &ResolvedPullRequestRef,
+    head_sha: &CommitId,
     client: &C,
 ) -> Result<Option<PostedPullRequestReview>>
 where
     C: GitHubClient,
 {
     for pending in ledger.pending_reviews(pr).into_iter().rev() {
+        if pending.head_sha != *head_sha {
+            continue;
+        }
         let Some(review) = client.pull_request_review_status(pr, pending.review_id)? else {
             continue;
         };
@@ -442,8 +471,7 @@ fn build_pull_request_feedback_plan(
     records: &[Record],
     excluded_ids: &HashSet<String>,
 ) -> Result<PullRequestFeedbackPlan> {
-    let mut comments = Vec::new();
-    let mut staged_record_ids = Vec::new();
+    let mut staged_comments = Vec::new();
     let mut skipped = Vec::new();
 
     for record in records {
@@ -461,10 +489,10 @@ fn build_pull_request_feedback_plan(
         }
 
         match map_record_to_github_comment(repo, metadata, record, note)? {
-            Ok(comment) => {
-                comments.push(comment);
-                staged_record_ids.push(record.id.clone());
-            }
+            Ok(comment) => staged_comments.push(StagedPullRequestComment {
+                record_id: record.id.clone(),
+                comment,
+            }),
             Err(reason) => skipped.push(SkippedPullRequestRecord {
                 record_id: record.id.clone(),
                 reason,
@@ -472,12 +500,22 @@ fn build_pull_request_feedback_plan(
         }
     }
 
-    comments.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then(left.line.cmp(&right.line))
-            .then(left.body.cmp(&right.body))
+    staged_comments.sort_by(|left, right| {
+        left.comment
+            .path
+            .cmp(&right.comment.path)
+            .then(left.comment.line.cmp(&right.comment.line))
+            .then(left.comment.body.cmp(&right.comment.body))
+            .then(left.record_id.cmp(&right.record_id))
     });
+    let comments = staged_comments
+        .iter()
+        .map(|staged| staged.comment.clone())
+        .collect::<Vec<_>>();
+    let mut staged_record_ids = staged_comments
+        .iter()
+        .map(|staged| staged.record_id.clone())
+        .collect::<Vec<_>>();
     staged_record_ids.sort();
     staged_record_ids.dedup();
 
@@ -487,6 +525,7 @@ fn build_pull_request_feedback_plan(
             comments,
         },
         staged_record_ids,
+        staged_comments,
         skipped,
     })
 }
@@ -1702,6 +1741,67 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_feedback_records_successful_appends_before_later_append_failure() -> Result<()>
+    {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_partial_append_failure")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "first-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("first note"),
+        ))?;
+        store.append(&review_record(
+            "second-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("second note"),
+        ))?;
+
+        let pending = posted_review(
+            17,
+            PullRequestReviewState::Pending,
+            TRUEFLOW_PENDING_REVIEW_MARKER,
+        );
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &metadata.pr,
+            pending.clone(),
+            &metadata.head_sha,
+            vec!["old-record".to_string()],
+        );
+        let ledger_path = store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE);
+        ledger.save(&ledger_path)?;
+
+        let client = FeedbackTestGitHubClient::new(vec![pending]).with_append_failure_at(2);
+        let prepared = prepared_review(metadata.clone());
+        let error = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared,
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected append failure"));
+        let appended = client.appended.borrow();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].1.body, "first note");
+
+        let ledger = GitHubDeliveryLedger::load(&ledger_path)?;
+        let excluded = ledger.excluded_record_ids(&metadata.pr);
+        assert!(excluded.contains("old-record"));
+        assert!(excluded.contains("first-record"));
+        assert!(!excluded.contains("second-record"));
+
+        Ok(())
+    }
+
+    #[test]
     fn pull_request_feedback_creates_fresh_review_when_marker_mismatches() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_marker_mismatch")?;
         let store = FileStore::for_root(&repo_root)?;
@@ -1751,6 +1851,66 @@ mod tests {
         let excluded = ledger.excluded_record_ids(&metadata.pr);
         assert!(excluded.contains("old-record"));
         assert!(excluded.contains("new-record"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_ignores_pending_review_from_stale_head() -> Result<()> {
+        let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_stale_head")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "old-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("old note"),
+        ))?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+
+        let stale_pending = posted_review(
+            17,
+            PullRequestReviewState::Pending,
+            TRUEFLOW_PENDING_REVIEW_MARKER,
+        );
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &metadata.pr,
+            stale_pending.clone(),
+            &metadata.base_sha,
+            vec!["old-record".to_string()],
+        );
+        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+
+        let client = FeedbackTestGitHubClient::new(vec![stale_pending]);
+        let prepared = prepared_review(metadata.clone());
+        let outcome = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared,
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert_eq!(
+            outcome.delivery,
+            Some(PullRequestFeedbackDelivery::CreatePendingReview)
+        );
+        assert!(client.appended.borrow().is_empty());
+        let created = client.created.borrow();
+        assert_eq!(created.len(), 1);
+        let comment_bodies = created[0]
+            .comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(comment_bodies, vec!["new note", "old note"]);
 
         Ok(())
     }
@@ -1868,6 +2028,54 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_feedback_submit_keeps_pending_when_response_state_is_unknown() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_submit_unknown_state")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let pending = posted_review(
+            17,
+            PullRequestReviewState::Pending,
+            TRUEFLOW_PENDING_REVIEW_MARKER,
+        );
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &metadata.pr,
+            pending.clone(),
+            &metadata.head_sha,
+            vec!["staged-record".to_string()],
+        );
+        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+
+        let client = FeedbackTestGitHubClient::new(vec![pending])
+            .with_submit_state(PullRequestReviewState::Unknown);
+        let prepared = prepared_review(metadata.clone());
+        let error = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared,
+            &client,
+            false,
+            false,
+            true,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("GitHub returned non-terminal review state")
+        );
+        assert_eq!(client.submitted.borrow().as_slice(), &[17]);
+        let ledger =
+            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        assert_eq!(ledger.pending_reviews(&metadata.pr).len(), 1);
+        let excluded = ledger.excluded_record_ids(&metadata.pr);
+        assert!(excluded.contains("staged-record"));
+
+        Ok(())
+    }
+
+    #[test]
     fn pull_request_feedback_submit_reports_no_pending_review() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_submit_none")?;
         let client = FeedbackTestGitHubClient::new(Vec::new());
@@ -1935,6 +2143,49 @@ mod tests {
         let ledger =
             GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
         assert!(ledger.pending_reviews(&metadata.pr).is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_submit_ignores_pending_review_from_stale_head() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_submit_stale_head")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let pending = posted_review(
+            17,
+            PullRequestReviewState::Pending,
+            TRUEFLOW_PENDING_REVIEW_MARKER,
+        );
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &metadata.pr,
+            pending.clone(),
+            &metadata.base_sha,
+            vec!["staged-record".to_string()],
+        );
+        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+
+        let client = FeedbackTestGitHubClient::new(vec![pending]);
+        let prepared = prepared_review(metadata.clone());
+        let outcome = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared,
+            &client,
+            false,
+            false,
+            true,
+            |_| Ok(()),
+        )?;
+
+        assert_eq!(
+            outcome.submission,
+            Some(PullRequestFeedbackSubmission::NoPendingReview)
+        );
+        assert!(client.submitted.borrow().is_empty());
+        let ledger =
+            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        assert_eq!(ledger.pending_reviews(&metadata.pr).len(), 1);
 
         Ok(())
     }
@@ -2135,6 +2386,8 @@ mod tests {
         created: RefCell<Vec<GitHubReviewDraft>>,
         appended: RefCell<Vec<(u64, GitHubInlineComment)>>,
         submitted: RefCell<Vec<u64>>,
+        submit_state: PullRequestReviewState,
+        append_failure_at: Option<usize>,
     }
 
     impl FeedbackTestGitHubClient {
@@ -2144,7 +2397,19 @@ mod tests {
                 created: RefCell::new(Vec::new()),
                 appended: RefCell::new(Vec::new()),
                 submitted: RefCell::new(Vec::new()),
+                submit_state: PullRequestReviewState::Commented,
+                append_failure_at: None,
             }
+        }
+
+        fn with_submit_state(mut self, submit_state: PullRequestReviewState) -> Self {
+            self.submit_state = submit_state;
+            self
+        }
+
+        fn with_append_failure_at(mut self, append_failure_at: usize) -> Self {
+            self.append_failure_at = Some(append_failure_at);
+            self
         }
     }
 
@@ -2176,6 +2441,10 @@ mod tests {
             review: &PostedPullRequestReview,
             comment: &GitHubInlineComment,
         ) -> Result<()> {
+            let append_index = self.appended.borrow().len() + 1;
+            if self.append_failure_at == Some(append_index) {
+                anyhow::bail!("injected append failure at {append_index}");
+            }
             self.appended
                 .borrow_mut()
                 .push((review.id, comment.clone()));
@@ -2190,7 +2459,7 @@ mod tests {
             self.submitted.borrow_mut().push(review_id);
             Ok(posted_review(
                 review_id,
-                PullRequestReviewState::Commented,
+                self.submit_state,
                 TRUEFLOW_PENDING_REVIEW_MARKER,
             ))
         }

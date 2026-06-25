@@ -240,13 +240,30 @@ fn extract_named_declaration(text: &str, keywords: &[&str]) -> Option<String> {
             .iter()
             .any(|keyword| token.eq_ignore_ascii_case(keyword))
         {
-            let next = tokens.get(index + 1)?;
-            if let Some(identifier) = leading_identifier(next) {
-                return Some(identifier);
+            let mut cursor = index + 1;
+            while let Some(next) = tokens.get(cursor) {
+                if is_inline_rust_attribute_token(next) {
+                    cursor += 1;
+                    while tokens
+                        .get(cursor.saturating_sub(1))
+                        .is_some_and(|token| !token.contains(']'))
+                    {
+                        cursor += 1;
+                    }
+                    continue;
+                }
+                if let Some(identifier) = leading_identifier(next) {
+                    return Some(identifier);
+                }
+                return None;
             }
         }
     }
     None
+}
+
+fn is_inline_rust_attribute_token(token: &str) -> bool {
+    token.starts_with("#[")
 }
 
 fn extract_macro_name(text: &str) -> Option<String> {
@@ -498,6 +515,21 @@ mod tests {
         assert_eq!(
             breadcrumb,
             Some("File (src/lib.rs) -> Struct (Config)".to_string())
+        );
+    }
+
+    #[test]
+    fn semantic_block_identifier_skips_inline_rust_attribute_after_declaration_keyword() {
+        let block = block(
+            "struct #[derive(Debug, Clone)] Config {\n    name: String,\n}\n",
+            BlockKind::Struct,
+            1,
+            4,
+        );
+
+        assert_eq!(
+            semantic_block_identifier(&block),
+            Some("Config".to_string())
         );
     }
 

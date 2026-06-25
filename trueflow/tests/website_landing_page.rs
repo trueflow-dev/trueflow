@@ -103,6 +103,21 @@ fn website_landing_page_has_install_command_above_the_fold() -> Result<()> {
     );
     assert_contains(
         &html,
+        "trueflow tui --target pr:11",
+        "landing page pull request review command",
+    );
+    assert_contains(
+        &html,
+        "trueflow feedback --pr pr:11 --dry-run",
+        "landing page pull request feedback dry-run command",
+    );
+    assert_contains(
+        &html,
+        "fetch-only PR review",
+        "landing page pull request fetch-only wording",
+    );
+    assert_contains(
+        &html,
         "explicit opt-in AI hints for comment drafting",
         "landing page ai workflow copy",
     );
@@ -202,6 +217,59 @@ fn readme_tui_controls_match_current_default_keybinds() -> Result<()> {
         "readme parent child controls",
     );
     assert_contains(&readme, "`c` add a comment", "readme comment control");
+    assert_contains(
+        &readme,
+        "`d` choose another review scope from the recap screen",
+        "readme recap done control",
+    );
+    assert_contains(
+        &readme,
+        "recap_done = \"d\"",
+        "readme default recap keybind config",
+    );
+    assert_contains(
+        &readme,
+        "recap_done = \"w\"",
+        "readme override recap keybind config",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn readme_documents_pull_request_review_and_feedback_workflow() -> Result<()> {
+    let readme = read_repo_file("README.md")?;
+
+    assert_contains(
+        &readme,
+        "trueflow tui --target pr:11",
+        "readme pull request TUI command",
+    );
+    assert_contains(
+        &readme,
+        "trueflow tui --target https://github.com/owner/repo/pull/11",
+        "readme pull request URL target command",
+    );
+    assert_contains(
+        &readme,
+        "Pull request review is fetch-only.",
+        "readme pull request fetch-only behavior",
+    );
+    assert_contains(
+        &readme,
+        "without checking out the branch or\nswitching the user worktree",
+        "readme pull request worktree safety",
+    );
+    assert_contains(
+        &readme,
+        "trueflow feedback --pr pr:11 --dry-run",
+        "readme pull request feedback dry run",
+    );
+    assert_contains(
+        &readme,
+        "trueflow feedback --pr pr:11 --submit",
+        "readme pull request feedback submit",
+    );
 
     Ok(())
 }

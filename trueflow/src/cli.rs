@@ -103,7 +103,7 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
+        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, `rev:abc1234..def5678`, or `pr:11`
         #[arg(long, value_name = "TARGET")]
         target: Vec<ReviewTarget>,
 
@@ -145,7 +145,7 @@ pub enum Commands {
         #[arg(long, requires = "pr")]
         submit: bool,
 
-        /// Feedback targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
+        /// Feedback export targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`; use `--pr` for pull request posting
         #[arg(long, value_name = "TARGET")]
         target: Vec<ReviewTarget>,
 
@@ -198,7 +198,7 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`
+        /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, `rev:abc1234..def5678`, or `pr:11`
         #[arg(long, value_name = "TARGET")]
         target: Vec<ReviewTarget>,
 
@@ -256,6 +256,44 @@ mod tests {
         assert!(help.contains(build_info::HELP_FOOTER));
         assert!(!help.contains("Commit:"));
         assert!(!help.contains("Built:"));
+    }
+
+    #[test]
+    fn help_documents_pull_request_review_and_feedback_targets() {
+        let mut command = Cli::command();
+
+        let review_help = subcommand_long_help(&mut command, "review");
+        let tui_help = subcommand_long_help(&mut command, "tui");
+        let feedback_help = subcommand_long_help(&mut command, "feedback");
+
+        assert!(
+            review_help.contains("rev:abc1234..def5678`, or `pr:11"),
+            "review target help should document PR targets:\n{review_help}"
+        );
+        assert!(
+            tui_help.contains("rev:abc1234..def5678`, or `pr:11"),
+            "TUI target help should document PR targets:\n{tui_help}"
+        );
+        assert!(
+            feedback_help.contains("use `--pr` for pull request posting"),
+            "feedback target help should point PR posting to --pr:\n{feedback_help}"
+        );
+        assert!(
+            feedback_help.contains("Post feedback to a pull request such as `pr:11`"),
+            "feedback --pr help should document pull request posting:\n{feedback_help}"
+        );
+    }
+
+    fn subcommand_long_help(command: &mut clap::Command, name: &str) -> String {
+        let subcommand = command
+            .find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("expected {name} subcommand"));
+        let mut help = Vec::new();
+        subcommand
+            .write_long_help(&mut help)
+            .unwrap_or_else(|error| panic!("failed to render {name} help output: {error}"));
+        String::from_utf8(help)
+            .unwrap_or_else(|error| panic!("{name} help output was not utf8: {error}"))
     }
 
     #[test]

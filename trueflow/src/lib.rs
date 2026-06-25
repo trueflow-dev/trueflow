@@ -15,6 +15,7 @@ pub mod feedback_since;
 pub mod finder;
 pub mod github;
 pub mod github_delivery;
+pub(crate) mod gpg;
 pub mod hashing;
 pub(crate) mod languages;
 pub mod logging;

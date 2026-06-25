@@ -47,6 +47,7 @@ note = "c"
 toggle_view = "m"
 speed_read = "r"
 root = "g"
+recap_done = "d"
 quit = "q"
 
 [tui.speed_read]

@@ -43,7 +43,7 @@ use crate::sub_splitter;
 use crate::targets::{extract_pull_request_target, workdir_prefix_from_git_root};
 use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
 use crate::vcs;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
@@ -770,6 +770,7 @@ struct AppState {
     editing_validation: Option<EditingValidation>,
     confirm_batch: BatchConfirmPolicy,
     repo_name: String,
+    repo_root: Option<PathBuf>,
     file_cache: HashMap<PathBuf, Arc<[String]>>,
     root_cursor: Option<TreeNodeId>,
     focus_block: Option<TreeNodeId>,
@@ -1554,6 +1555,7 @@ fn build_review_state(
         editing_validation: None,
         confirm_batch: options.confirm_batch,
         repo_name: detect_repo_name(context),
+        repo_root: vcs::git_root_from_workdir().ok().flatten(),
         file_cache: HashMap::new(),
         root_cursor,
         focus_block,
@@ -3802,16 +3804,32 @@ fn comment_anchor_for_current_action(
 
 fn review_scope_revision(state: &AppState) -> Result<Option<crate::store::CommitId>> {
     match &state.review_scope {
-        ScopePreset::Commit { id, .. } => Ok(Some(resolve_review_scope_revision(id)?)),
-        ScopePreset::RevisionRange { end, .. } => Ok(Some(resolve_review_scope_revision(end)?)),
+        ScopePreset::Commit { id, .. } => Ok(Some(resolve_review_scope_revision(
+            id,
+            state.repo_root.as_deref(),
+        )?)),
+        ScopePreset::RevisionRange { end, .. } => Ok(Some(resolve_review_scope_revision(
+            end,
+            state.repo_root.as_deref(),
+        )?)),
         ScopePreset::All | ScopePreset::MainDiff => {
             Ok(vcs::snapshot_from_workdir().repo_ref_revision)
         }
     }
 }
 
-fn resolve_review_scope_revision(revision: &str) -> Result<crate::store::CommitId> {
-    match vcs::resolve_commit_id_from_workdir(revision) {
+fn resolve_review_scope_revision(
+    revision: &str,
+    repo_root: Option<&Path>,
+) -> Result<crate::store::CommitId> {
+    let resolved = match repo_root {
+        Some(repo_root) => gix::open(repo_root)
+            .with_context(|| format!("failed to open git repository at {}", repo_root.display()))
+            .and_then(|repo| vcs::resolve_commit_id_in_repo(&repo, revision)),
+        None => vcs::resolve_commit_id_from_workdir(revision),
+    };
+
+    match resolved {
         Ok(commit_id) => Ok(commit_id),
         Err(resolve_error) => crate::store::CommitId::new(revision).map_err(|parse_error| {
             anyhow!(
@@ -4730,12 +4748,21 @@ fn build_header_lines(
     state: &AppState,
     palette: &UiPalette,
 ) -> Vec<Line<'static>> {
-    let mut header_text = compact_header_text(node, state);
+    let mut header_texts = block_header_lines(&state.navigator.tree, node.id)
+        .unwrap_or_else(|| vec![compact_header_text(node, state)]);
     if let Some(change_kind) = header_change_kind_for_node(node, state) {
-        header_text = format!("{} · {header_text}", change_kind.label());
+        if node.kind == TreeNodeKind::Block && header_texts.len() > 1 {
+            header_texts[1] = prefix_arrow_header_change(&header_texts[1], change_kind);
+        } else if let Some(header_text) = header_texts.first_mut() {
+            *header_text = format!("{} · {header_text}", change_kind.label());
+        }
     }
 
-    vec![format_header_row(&header_text, palette, true)]
+    header_texts
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| format_header_row(&text, palette, index == 0))
+        .collect()
 }
 
 fn compact_header_text(node: &crate::tree::TreeNode, state: &AppState) -> String {
@@ -4782,6 +4809,112 @@ fn compact_block_header_text(tree: &Tree, node_id: TreeNodeId) -> Option<String>
     }
 
     Some(segments.join(" @ "))
+}
+
+fn block_header_lines(tree: &Tree, node_id: TreeNodeId) -> Option<Vec<String>> {
+    let node = tree.node(node_id);
+    if node.kind != TreeNodeKind::Block {
+        return None;
+    }
+
+    let block = node.block.as_ref()?;
+    let file_path = block_file_path(tree, node_id)?;
+    let mut lines = vec![
+        file_path,
+        format!(
+            "  -> {} (hash={})",
+            raw_block_header_segment(block),
+            short_tree_hash(&block.hash)
+        ),
+    ];
+    lines.extend(subblock_tree_lines(tree, node_id));
+    Some(lines)
+}
+
+fn prefix_arrow_header_change(line: &str, change_kind: HeaderChangeKind) -> String {
+    let Some(rest) = line.strip_prefix("  -> ") else {
+        return format!("{} · {line}", change_kind.label());
+    };
+    format!("  -> {} · {rest}", change_kind.label())
+}
+
+fn block_file_path(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
+    tree.ancestors(node_id)
+        .into_iter()
+        .skip(1)
+        .find_map(|ancestor_id| {
+            let ancestor = tree.node(ancestor_id);
+            (ancestor.kind == TreeNodeKind::File).then(|| ancestor.path.as_str().to_string())
+        })
+}
+
+fn subblock_tree_lines(tree: &Tree, node_id: TreeNodeId) -> Vec<String> {
+    let children = block_child_ids(tree, node_id);
+    let mut lines = Vec::new();
+    append_subblock_tree_lines(tree, &children, &mut lines);
+    lines
+}
+
+fn append_subblock_tree_lines(tree: &Tree, children: &[TreeNodeId], lines: &mut Vec<String>) {
+    let mut stack = children
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, child_id)| (*child_id, String::new(), index + 1 == children.len()))
+        .collect::<Vec<_>>();
+
+    while let Some((child_id, prefix, is_last)) = stack.pop() {
+        let child = tree.node(child_id);
+        let connector = if is_last { "└─" } else { "├─" };
+        let label = child
+            .block
+            .as_ref()
+            .map(raw_block_header_segment)
+            .unwrap_or_else(|| child.name.clone());
+        lines.push(format!("     {prefix}{connector} {label}"));
+
+        let nested_children = block_child_ids(tree, child_id);
+        let nested_prefix = if is_last {
+            format!("{prefix}   ")
+        } else {
+            format!("{prefix}│  ")
+        };
+
+        stack.extend(
+            nested_children
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, nested_child_id)| {
+                    (
+                        *nested_child_id,
+                        nested_prefix.clone(),
+                        index + 1 == nested_children.len(),
+                    )
+                }),
+        );
+    }
+}
+
+fn block_child_ids(tree: &Tree, node_id: TreeNodeId) -> Vec<TreeNodeId> {
+    tree.node(node_id)
+        .children
+        .iter()
+        .copied()
+        .filter(|child_id| tree.node(*child_id).kind == TreeNodeKind::Block)
+        .collect()
+}
+
+fn raw_block_header_segment(block: &crate::block::Block) -> String {
+    let kind = block.kind.as_str();
+    match review_metadata::semantic_block_identifier(block) {
+        Some(identifier) => format!("{kind} {identifier}"),
+        None => kind.to_string(),
+    }
+}
+
+fn short_tree_hash(hash: &crate::hashing::TreeHash) -> String {
+    hash.as_str().chars().take(8).collect()
 }
 
 fn block_header_segment(block: &crate::block::Block) -> String {
@@ -5503,7 +5636,8 @@ fn load_file_lines(state: &mut AppState, path: &RepoPath) -> Option<Arc<[String]
         return Some(Arc::clone(lines));
     }
 
-    let contents = load_file_contents_for_scope(&state.review_scope, path)?;
+    let contents =
+        load_file_contents_for_scope(&state.review_scope, state.repo_root.as_deref(), path)?;
     let lines: Arc<[String]> = contents
         .lines()
         .map(|line| line.to_string())
@@ -5513,20 +5647,40 @@ fn load_file_lines(state: &mut AppState, path: &RepoPath) -> Option<Arc<[String]
     Some(lines)
 }
 
-fn load_file_contents_for_scope(scope: &ScopePreset, path: &RepoPath) -> Option<String> {
+fn load_file_contents_for_scope(
+    scope: &ScopePreset,
+    repo_root: Option<&Path>,
+    path: &RepoPath,
+) -> Option<String> {
     match scope {
         ScopePreset::All | ScopePreset::MainDiff => std::fs::read_to_string(path.as_str()).ok(),
-        ScopePreset::Commit { id, .. } => load_file_contents_from_revision(id, path),
-        ScopePreset::RevisionRange { end, .. } => load_file_contents_from_revision(end, path),
+        ScopePreset::Commit { id, .. } => load_file_contents_from_revision(repo_root, id, path),
+        ScopePreset::RevisionRange { end, .. } => {
+            load_file_contents_from_revision(repo_root, end, path)
+        }
     }
 }
 
-fn load_file_contents_from_revision(revision: &str, path: &RepoPath) -> Option<String> {
-    let repo = vcs::repo_from_workdir().ok()?;
-    let workdir_prefix = workdir_prefix_from_git_root();
+fn load_file_contents_from_revision(
+    repo_root: Option<&Path>,
+    revision: &str,
+    path: &RepoPath,
+) -> Option<String> {
+    let repo = repo_for_tui_state(repo_root).ok()?;
+    let workdir_prefix = repo_root
+        .and_then(path_utils::current_workdir_prefix_for_repo_root)
+        .or_else(workdir_prefix_from_git_root);
     vcs::file_text_for_path_in_revision(&repo, revision, path, workdir_prefix.as_deref())
         .ok()
         .flatten()
+}
+
+fn repo_for_tui_state(repo_root: Option<&Path>) -> Result<gix::Repository> {
+    match repo_root {
+        Some(repo_root) => gix::open(repo_root)
+            .with_context(|| format!("failed to open git repository at {}", repo_root.display())),
+        None => vcs::repo_from_workdir(),
+    }
 }
 
 fn focus_block_for_content_node(
@@ -6453,7 +6607,7 @@ fn cached_file_diff_for_node<'a>(
         &path,
         || {
             let query = review_scope.diff_query_for_path(&diff_path);
-            let repo = vcs::repo_from_workdir()?;
+            let repo = repo_for_tui_state(state.repo_root.as_deref())?;
             match query {
                 DiffQuery::MainDiff { path } => vcs::diff_for_file(&repo, &RepoPath::new(path)?),
                 DiffQuery::Revision { revision, path } => {
@@ -7140,7 +7294,7 @@ mod diff_scope_tests {
     use crate::repo_path::RepoPath;
     use crate::scanner::ScanOptions;
     use crate::store::{CommitId, ReviewTargetKind};
-    use crate::test_git::{CurrentDirGuard, run_git, run_git_stdout, temp_git_repo, temp_test_dir};
+    use crate::test_git::{run_git, run_git_stdout, temp_git_repo, temp_test_dir};
     use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
     use ratatui::{Terminal, backend::TestBackend};
@@ -7178,6 +7332,7 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
+            repo_root: None,
             file_cache: HashMap::new(),
             root_cursor: None,
             focus_block: None,
@@ -7250,6 +7405,7 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
+            repo_root: None,
             file_cache: HashMap::new(),
             root_cursor: None,
             focus_block: Some(block_id),
@@ -7352,6 +7508,7 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
+            repo_root: None,
             file_cache: HashMap::new(),
             root_cursor: Some(first_file),
             focus_block: None,
@@ -7468,6 +7625,7 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
+            repo_root: None,
             file_cache: HashMap::from([(
                 PathBuf::from(&repo_path),
                 Arc::from(
@@ -7560,6 +7718,7 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Threshold(2),
             repo_name: "repo".to_string(),
+            repo_root: None,
             file_cache: HashMap::new(),
             root_cursor: Some(file),
             focus_block: None,
@@ -7662,6 +7821,7 @@ mod diff_scope_tests {
             editing_validation: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
+            repo_root: None,
             file_cache: HashMap::from([(
                 PathBuf::from(repo_path),
                 Arc::from(
@@ -10782,14 +10942,14 @@ mod diff_scope_tests {
             CommitId::new(run_git_stdout(&repo_root, &["rev-parse", "HEAD"]).trim())
                 .unwrap_or_else(|error| panic!("expected valid fixture revision: {error}"));
 
-        let _cwd = CurrentDirGuard::push(&repo_root);
-        let state = build_test_state(
+        let mut state = build_test_state(
             ScopePreset::Commit {
                 id: "HEAD".to_string(),
                 summary: String::new(),
             },
             HashMap::new(),
         );
+        state.repo_root = Some(repo_root);
 
         let revision = review_scope_revision(&state)
             .unwrap_or_else(|error| panic!("expected symbolic commit scope to resolve: {error}"));
@@ -10812,14 +10972,14 @@ mod diff_scope_tests {
             CommitId::new(run_git_stdout(&repo_root, &["rev-parse", "HEAD"]).trim())
                 .unwrap_or_else(|error| panic!("expected valid fixture revision: {error}"));
 
-        let _cwd = CurrentDirGuard::push(&repo_root);
-        let state = build_test_state(
+        let mut state = build_test_state(
             ScopePreset::RevisionRange {
                 start: "HEAD~1".to_string(),
                 end: "HEAD".to_string(),
             },
             HashMap::new(),
         );
+        state.repo_root = Some(repo_root);
 
         let revision = review_scope_revision(&state).unwrap_or_else(|error| {
             panic!("expected symbolic revision range end to resolve: {error}")
@@ -10847,6 +11007,7 @@ mod diff_scope_tests {
             id: "HEAD".to_string(),
             summary: String::new(),
         };
+        state.repo_root = Some(repo_root);
         state.view_mode = ViewMode::Source;
         state.code_rect = Rect {
             x: 0,
@@ -10861,7 +11022,6 @@ mod diff_scope_tests {
         state.content_height = usize_to_u16_saturating(content.total_lines);
         state.viewport_height = 20;
 
-        let _cwd = CurrentDirGuard::push(&repo_root);
         let params = mark_params_for_action(
             &mut state,
             block_id,
@@ -12150,6 +12310,151 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn build_header_lines_show_block_path_named_hash_and_subblock_tree() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "main.rs".to_string(),
+            "example_repos/all_languages/main.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let struct_block = Block::new(
+            "#[derive(Debug, Clone)]\nstruct Config {\n    name: String,\n}\n".to_string(),
+            BlockKind::Struct,
+            0,
+            4,
+        );
+        let expected_hash = struct_block
+            .hash
+            .as_str()
+            .chars()
+            .take(8)
+            .collect::<String>();
+        let struct_id = builder.add_block(
+            file,
+            "struct".to_string(),
+            "example_repos/all_languages/main.rs".to_string(),
+            struct_block,
+            Language::Rust,
+        );
+        builder.add_block(
+            struct_id,
+            "CodeParagraph".to_string(),
+            "example_repos/all_languages/main.rs".to_string(),
+            Block::new(
+                "name: String,\n".to_string(),
+                BlockKind::CodeParagraph,
+                2,
+                3,
+            ),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let visible = HashSet::from([struct_id]);
+        let review_order = ReviewOrder::from_tree(&tree, &visible);
+        let mut navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        navigator.set_current(struct_id);
+        let mut state = build_test_state(ScopePreset::All, HashMap::new());
+        state.navigator = navigator;
+        state.review_order = review_order;
+        state.total_blocks = visible.len();
+        state.initial_remaining_blocks = visible.len();
+        state.remaining_blocks = visible.len();
+        state.reviewable_nodes = visible;
+        state.focus_block = Some(struct_id);
+        let palette = UiPalette::default();
+        let block_node = state.navigator.tree.node(struct_id);
+
+        let header = build_header_lines(block_node, &state, &palette)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            header,
+            vec![
+                "example_repos/all_languages/main.rs".to_string(),
+                format!("  -> struct Config (hash={expected_hash})"),
+                "     └─ CodeParagraph".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn subblock_tree_lines_render_nested_children_in_preorder() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let parent = builder.add_block(
+            file,
+            "impl".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new(
+                "impl Thing {\n    fn first(&self) {}\n    fn second(&self) {}\n}\n".to_string(),
+                BlockKind::Impl,
+                0,
+                4,
+            ),
+            Language::Rust,
+        );
+        let first = builder.add_block(
+            parent,
+            "function".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new(
+                "fn first(&self) {}\n".to_string(),
+                BlockKind::Function,
+                1,
+                2,
+            ),
+            Language::Rust,
+        );
+        builder.add_block(
+            first,
+            "CodeParagraph".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new(
+                "self.value();\n".to_string(),
+                BlockKind::CodeParagraph,
+                1,
+                2,
+            ),
+            Language::Rust,
+        );
+        builder.add_block(
+            parent,
+            "function".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new(
+                "fn second(&self) {}\n".to_string(),
+                BlockKind::Function,
+                2,
+                3,
+            ),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+
+        assert_eq!(
+            subblock_tree_lines(&tree, parent),
+            vec![
+                "     ├─ function first".to_string(),
+                "     │  └─ CodeParagraph".to_string(),
+                "     └─ function second".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn build_header_lines_show_file_change_metadata_without_mode_row() {
         let file_path = temp_test_file_path("tui_header_change_label");
         let file_content = "line1\n";
@@ -12203,7 +12508,13 @@ mod diff_scope_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             header,
-            vec!["Block Added · Function demo @ File src/lib.rs"]
+            vec![
+                "src/lib.rs".to_string(),
+                format!(
+                    "  -> Block Added · function demo (hash={})",
+                    short_tree_hash(&block_node.hash)
+                ),
+            ]
         );
         assert!(header.iter().all(|line| line != "File Changed"));
     }
@@ -12224,7 +12535,16 @@ mod diff_scope_tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
-        assert_eq!(header, vec!["Unknown Change · Function @ File src/lib.rs"]);
+        assert_eq!(
+            header,
+            vec![
+                "src/lib.rs".to_string(),
+                format!(
+                    "  -> Unknown Change · function (hash={})",
+                    short_tree_hash(&block_node.hash)
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -12940,7 +13260,6 @@ mod diff_scope_tests {
             "test setup should remove old path from current worktree"
         );
 
-        let _cwd = CurrentDirGuard::push(&repo_root);
         let mut state = build_test_state(
             ScopePreset::Commit {
                 id: target_revision,
@@ -12948,6 +13267,7 @@ mod diff_scope_tests {
             },
             HashMap::new(),
         );
+        state.repo_root = Some(repo_root);
         let node = ContentNodeSnapshot {
             id: state.navigator.tree.root(),
             kind: TreeNodeKind::Block,

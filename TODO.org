@@ -21,12 +21,18 @@
      - *Alternative:* Use `recursive-edit` in the file buffer.
 
 * Attestation & Verification
-** TODO [Medium] Add Record::new constructor in store.rs
-   - [ ] Encapsulate generation of `Uuid`, `SystemTime`, and `CURRENT_VERSION` in `Record::new` to simplify `mark.rs`.
-** TODO [Medium] Cache imported pubkeys in Verifier
-   - [ ] Optimize verification by maintaining a `HashSet` of imported key fingerprints to avoid redundant `gpg --import` calls.
-** TODO [Medium] Refactor GPG logic into src/gpg.rs
-   - [ ] Extract `GpgClient` to handle temp dir lifecycle and provide high-level `sign` and `verify` methods.
+** DONE [Medium] Add Record::new constructor in store.rs
+   - [X] Encapsulate generation of `Uuid`, `SystemTime`, and `CURRENT_VERSION`
+     in `Record::new` to simplify `mark.rs`; verified by
+     `record_new_generates_identity_fields_and_empty_optional_metadata`.
+** DONE [Medium] Cache imported pubkeys in Verifier
+   - [X] Optimize verification by maintaining a `HashSet` of imported public
+     keys to avoid redundant `gpg --import` calls; verified by
+     `verifier_imports_each_public_key_once`.
+** DONE [Medium] Refactor GPG logic into src/gpg.rs
+   - [X] Extract `GpgClient` to handle temp dir lifecycle and provide
+     high-level signing, public-key export, and verification methods; verified
+     by `gpg::tests`, `commands::mark::tests`, and `commands::verify::tests`.
 
 * Product & Platform Roadmap
 ** TODO [High] Coverage mode + heatmap
@@ -51,7 +57,50 @@
    - [ ] Support review types (security, dependencies, performance, readability, data structures, business logic).
    - [ ] Tag reviews with a type and make modes affect block ordering and filters (e.g., data structures shows structs).
 ** TODO [High] GitHub PR integration
-   - [ ] Fetch/check out PRs, map review targets to the right diff, and post feedback as comments.
+   - [X] Keep PR review fetch-only; do not check out or switch the user worktree.
+     - Verified by `fetch_pull_request_refs_fetches_hidden_refs_and_commit_objects`,
+       which asserts PR ref fetching preserves the current branch, HEAD, and
+       worktree file contents.
+   - [ ] Harden GitHub PR feedback posting against API drift and enterprise-host edge cases.
+     - [X] Keep unknown live GitHub review states pending in the local delivery
+       ledger instead of marking staged records delivered; verified by
+       `sync_pending_reviews_keeps_unknown_live_state_pending`.
+     - [X] Classify optional `gh api` review lookups as missing only for explicit
+       HTTP 404 / 404 Not Found output; verified by
+       `gh_api_output_not_found_detection_matches_explicit_http_404` and
+       `gh_api_output_not_found_detection_ignores_unrelated_404_text`.
+     - [X] Keep pending review ledger entries intact when GitHub returns a
+       non-terminal state after submit; verified by
+       `pull_request_feedback_submit_keeps_pending_when_response_state_is_unknown`.
+     - [X] Reject GitHub remote URLs with extra path segments instead of
+       inferring the wrong owner/repo; verified by
+       `parse_git_remotes_config_rejects_urls_with_extra_path_segments`.
+     - [X] Reject SCP-like Git remotes with an empty host instead of resolving
+       PRs against a blank GitHub hostname; verified by
+       `parse_git_remotes_config_rejects_scp_like_urls_with_empty_host`.
+     - [X] Reject truncated pull request commit metadata before feedback
+       mapping can silently miss PR commits; verified by
+       `parse_pull_request_metadata_rejects_truncated_commit_list`.
+     - [X] Reject pull request commit metadata that omits the advertised head
+       commit; verified by
+       `parse_pull_request_metadata_rejects_commit_list_missing_head_sha`.
+     - [X] Reject pull request commit metadata where the final returned commit
+       is not the advertised head commit; verified by
+       `parse_pull_request_metadata_rejects_commit_list_where_head_is_not_final`.
+     - [X] Reject malformed GraphQL add-comment responses that have no errors
+       field but omit `addPullRequestReviewComment.comment.id`; verified by
+       `add_review_comment_graphql_response_rejects_missing_comment_id`.
+     - [X] Persist each successfully appended pending-review comment before
+       attempting the next append, so retry does not duplicate earlier comments
+       after a later append failure; verified by
+       `pull_request_feedback_records_successful_appends_before_later_append_failure`.
+     - [X] Ignore trueflow-owned pending reviews recorded against an older PR
+       head when excluding records, appending comments, or submitting review
+       drafts for the current head; verified by
+       `excluded_record_ids_for_head_ignores_pending_ids_from_other_heads`,
+       `pull_request_feedback_ignores_pending_review_from_stale_head`, and
+       `pull_request_feedback_submit_ignores_pending_review_from_stale_head`.
+   - [X] Document PR review/export workflows in README and website docs.
 ** TODO [High] Local LLM context helper
    - [ ] Call a local model to explain context behind a change.
 ** TODO [High] Rust lint/check sweep
@@ -62,7 +111,7 @@
 ** TODO [Medium] Perform in-depth cargo mutants run, apply fixes
 ** TODO [Medium] Add some padding (maybe one line ish) of space between end of
    code block area and controls in TUI
-** TODO BUG: this output in TUI:
+** DONE BUG: this output in TUI:
 ```
 struct #[derive(Debug, Clone)] in ./example_repos/all_languages/main.rs (hash=a85ccbc9), subblocks:
                                                   └─ CodeParagraph
@@ -81,6 +130,12 @@ Two things:
      example_repos/all_languages/main.rs
        -> struct Config (hash=a85ccbc9)
          {directly embed the subblock tree here}
+   - [X] Fix semantic block identifiers so inline Rust attributes after a
+     declaration keyword do not become the displayed name; verified by
+     `semantic_block_identifier_skips_inline_rust_attribute_after_declaration_keyword`.
+   - [X] Reformat the TUI/tree output as the nested path and subblock tree
+     shape above; verified by
+     `build_header_lines_show_block_path_named_hash_and_subblock_tree`.
 
 ** TODO [READY] TUI UX: need a command to like batch approve a whole file (or module or dir, etc.)
 ** TODO [READY] There should be a trueflow command to reset the review state for the
@@ -105,7 +160,9 @@ Two things:
 ** TODO [Medium] Add mode in review for speed-reading word-by-word SPC -> pause;
    j back sentence; l forward sentence
 ** DONE [HIGH] please move the pgup/down, and [h]prev next down up to the right side of the navigation legend. parent and child can be in the middle. on the left, approve and comment, then mode. quit stays on furthest right. please confirm the order and layout with me.
- ** TODO [HIGH] off-by-1 in progress bar. seems to include summary page at end of review.
+** DONE [HIGH] off-by-1 in progress bar. seems to include summary page at end of review.
+   - Verified by `footer_progress_uses_session_remaining_blocks_not_scope_total`
+     and `footer_progress_reaches_complete_when_session_blocks_are_done`.
 ** DONE [HIGH] Summary page should allow Go back to selection page to start new review flow
 ** DONE [HIGH] Review selector start page should show reviewed status of selectables
 ** DONE [HIGH] Comment shouldn't auto progress. If a user wants to progress to next block, let's use spacebar. Or approve.

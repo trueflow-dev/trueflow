@@ -180,6 +180,15 @@ pub enum PullRequestReviewState {
     Unknown,
 }
 
+impl PullRequestReviewState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Commented | Self::Approved | Self::ChangesRequested | Self::Dismissed
+        )
+    }
+}
+
 pub trait GitHubClient {
     fn resolve_pull_request(&self, pr: &ResolvedPullRequestRef) -> Result<PullRequestMetadata>;
     fn create_pending_pull_request_review(
@@ -287,7 +296,7 @@ impl GitHubClient for GhGitHubClient {
             }
         }))?;
         let response = run_gh_api_with_body(&pr.host, "POST", "graphql", &body)?;
-        ensure_graphql_response_success(&response)?;
+        ensure_add_pull_request_review_comment_response_success(&response)?;
         Ok(())
     }
 
@@ -544,6 +553,24 @@ pub fn parse_pull_request_metadata(
 
     let commits: Vec<PullRequestCommitApiResponse> = serde_json::from_str(commits_json)
         .with_context(|| "failed to parse pull request commits JSON".to_string())?;
+    if commits.len() != pull.commit_count {
+        return Err(anyhow!(
+            "expected {} pull request commits, but GitHub returned {}",
+            pull.commit_count,
+            commits.len()
+        ));
+    }
+    let final_commit_sha = commits
+        .last()
+        .map(|commit| commit.sha.as_str())
+        .unwrap_or_default();
+    if final_commit_sha != pull.head.sha {
+        return Err(anyhow!(
+            "expected final pull request commit to be head {}, but GitHub returned {}",
+            pull.head.sha,
+            final_commit_sha
+        ));
+    }
 
     let commits = commits
         .into_iter()
@@ -640,13 +667,25 @@ fn run_gh_api_optional(host: &str, endpoint: &str) -> Result<Option<String>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stdout.contains("404") || stderr.contains("404") {
+    if gh_api_output_is_not_found(&stdout, &stderr) {
         return Ok(None);
     }
 
     Err(anyhow!(
         "gh api {endpoint} failed for host {host}: {stdout}{stderr}"
     ))
+}
+
+fn gh_api_output_is_not_found(stdout: &str, stderr: &str) -> bool {
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .any(gh_api_line_is_not_found)
+}
+
+fn gh_api_line_is_not_found(line: &str) -> bool {
+    let line = line.trim();
+    line.contains("HTTP 404") || line.contains("404 Not Found")
 }
 
 fn run_gh_api_with_body(host: &str, method: &str, endpoint: &str, body: &str) -> Result<String> {
@@ -731,6 +770,25 @@ fn ensure_graphql_response_success(raw: &str) -> Result<()> {
         "GitHub GraphQL request failed: {}",
         messages.join("; ")
     ))
+}
+
+fn ensure_add_pull_request_review_comment_response_success(raw: &str) -> Result<()> {
+    ensure_graphql_response_success(raw)?;
+
+    let response: serde_json::Value = serde_json::from_str(raw)
+        .with_context(|| "failed to parse GitHub GraphQL response JSON".to_string())?;
+    let comment_id = response
+        .pointer("/data/addPullRequestReviewComment/comment/id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if comment_id.is_empty() {
+        return Err(anyhow!(
+            "GitHub GraphQL response did not include addPullRequestReviewComment.comment.id"
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_posted_pull_request_review(raw: &str) -> Result<PostedPullRequestReview> {
@@ -860,6 +918,9 @@ fn parse_remote_repo_identity_from_scp_like_url(url: &str) -> Option<(String, St
     let host = host_part
         .rsplit_once('@')
         .map_or(host_part, |(_, host)| host);
+    if host.trim().is_empty() {
+        return None;
+    }
     parse_owner_repo_path(path_part).map(|(owner, repo)| (host.to_string(), owner, repo))
 }
 
@@ -872,6 +933,9 @@ fn parse_owner_repo_path(path: &str) -> Option<(String, String)> {
     let mut segments = trimmed.split('/').filter(|segment| !segment.is_empty());
     let owner = segments.next()?.to_string();
     let repo = segments.next()?.to_string();
+    if segments.next().is_some() {
+        return None;
+    }
     Some((owner, repo))
 }
 
@@ -952,9 +1016,9 @@ mod tests {
     use super::{
         GH_MAX_PULL_REQUEST_COMMITS, GitHubReviewDraft, GitRemote, PostedPullRequestReview,
         PullRequestCommit, PullRequestMetadata, PullRequestRef, ResolvedPullRequestRef,
-        ensure_graphql_response_success, fetch_pull_request_refs, parse_git_remotes_config,
-        parse_pull_request_metadata, prepare_pull_request_review_with, resolve_pull_request_ref,
-        select_matching_remote,
+        ensure_add_pull_request_review_comment_response_success, ensure_graphql_response_success,
+        fetch_pull_request_refs, parse_git_remotes_config, parse_pull_request_metadata,
+        prepare_pull_request_review_with, resolve_pull_request_ref, select_matching_remote,
     };
     use crate::store::CommitId;
     use crate::test_git::{run_git, run_git_stdout, temp_git_repo};
@@ -1088,6 +1152,46 @@ mod tests {
     }
 
     #[test]
+    fn add_review_comment_graphql_response_accepts_comment_id() {
+        ensure_add_pull_request_review_comment_response_success(
+            r#"{"data":{"addPullRequestReviewComment":{"comment":{"id":"PRRC_123"}}}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn add_review_comment_graphql_response_rejects_missing_comment_id() {
+        let err =
+            ensure_add_pull_request_review_comment_response_success(r#"{"data":{"ok":true}}"#)
+                .unwrap_err();
+
+        assert!(err.to_string().contains(
+            "GitHub GraphQL response did not include addPullRequestReviewComment.comment.id"
+        ));
+    }
+
+    #[test]
+    fn gh_api_output_not_found_detection_matches_explicit_http_404() {
+        assert!(super::gh_api_output_is_not_found(
+            "",
+            "gh: Not Found (HTTP 404)\n"
+        ));
+        assert!(super::gh_api_output_is_not_found("404 Not Found\n", ""));
+    }
+
+    #[test]
+    fn gh_api_output_not_found_detection_ignores_unrelated_404_text() {
+        assert!(!super::gh_api_output_is_not_found(
+            "",
+            "temporary proxy failure on port 4040\n"
+        ));
+        assert!(!super::gh_api_output_is_not_found(
+            "request id: 404-test\n",
+            "gh: authentication required\n"
+        ));
+    }
+
+    #[test]
     fn parse_git_remotes_config_supports_https_and_ssh_urls() {
         let remotes = parse_git_remotes_config(
             "remote.origin.url https://github.com/jmqd/trueflow.git\nremote.upstream.url git@github.company.com:trueflow/trueflow.git\n",
@@ -1113,6 +1217,24 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parse_git_remotes_config_rejects_urls_with_extra_path_segments() {
+        let remotes = parse_git_remotes_config(
+            "remote.bad-https.url https://github.com/jmqd/trueflow/extra.git\nremote.bad-ssh.url git@github.com:jmqd/trueflow/extra.git\n",
+        )
+        .unwrap();
+
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn parse_git_remotes_config_rejects_scp_like_urls_with_empty_host() {
+        let remotes =
+            parse_git_remotes_config("remote.origin.url git@:jmqd/trueflow.git\n").unwrap();
+
+        assert!(remotes.is_empty());
     }
 
     #[test]
@@ -1260,6 +1382,126 @@ mod tests {
     }
 
     #[test]
+    fn parse_pull_request_metadata_rejects_truncated_commit_list() {
+        let requested = ResolvedPullRequestRef {
+            host: "github.com".to_string(),
+            owner: "jmqd".to_string(),
+            repo: "trueflow".to_string(),
+            number: 11,
+        };
+        let pull_json = r#"{
+            "title": "Two commits",
+            "commits": 2,
+            "base": {
+                "ref": "main",
+                "sha": "1111111111111111111111111111111111111111",
+                "repo": {
+                    "name": "trueflow",
+                    "owner": { "login": "jmqd" }
+                }
+            },
+            "head": {
+                "ref": "feature",
+                "sha": "2222222222222222222222222222222222222222",
+                "repo": null
+            }
+        }"#;
+        let commits_json = r#"[
+            {
+                "sha": "2222222222222222222222222222222222222222",
+                "commit": { "message": "Only returned commit" }
+            }
+        ]"#;
+
+        let err = parse_pull_request_metadata(&requested, pull_json, commits_json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected 2 pull request commits, but GitHub returned 1")
+        );
+    }
+
+    #[test]
+    fn parse_pull_request_metadata_rejects_commit_list_missing_head_sha() {
+        let requested = ResolvedPullRequestRef {
+            host: "github.com".to_string(),
+            owner: "jmqd".to_string(),
+            repo: "trueflow".to_string(),
+            number: 11,
+        };
+        let pull_json = r#"{
+            "title": "Mismatched commits",
+            "commits": 1,
+            "base": {
+                "ref": "main",
+                "sha": "1111111111111111111111111111111111111111",
+                "repo": {
+                    "name": "trueflow",
+                    "owner": { "login": "jmqd" }
+                }
+            },
+            "head": {
+                "ref": "feature",
+                "sha": "2222222222222222222222222222222222222222",
+                "repo": null
+            }
+        }"#;
+        let commits_json = r#"[
+            {
+                "sha": "3333333333333333333333333333333333333333",
+                "commit": { "message": "Wrong commit" }
+            }
+        ]"#;
+
+        let err = parse_pull_request_metadata(&requested, pull_json, commits_json).unwrap_err();
+        assert!(err.to_string().contains(
+            "expected final pull request commit to be head 2222222222222222222222222222222222222222"
+        ));
+    }
+
+    #[test]
+    fn parse_pull_request_metadata_rejects_commit_list_where_head_is_not_final() {
+        let requested = ResolvedPullRequestRef {
+            host: "github.com".to_string(),
+            owner: "jmqd".to_string(),
+            repo: "trueflow".to_string(),
+            number: 11,
+        };
+        let pull_json = r#"{
+            "title": "Wrong order",
+            "commits": 2,
+            "base": {
+                "ref": "main",
+                "sha": "1111111111111111111111111111111111111111",
+                "repo": {
+                    "name": "trueflow",
+                    "owner": { "login": "jmqd" }
+                }
+            },
+            "head": {
+                "ref": "feature",
+                "sha": "3333333333333333333333333333333333333333",
+                "repo": null
+            }
+        }"#;
+        let commits_json = r#"[
+            {
+                "sha": "3333333333333333333333333333333333333333",
+                "commit": { "message": "Head commit returned first" }
+            },
+            {
+                "sha": "2222222222222222222222222222222222222222",
+                "commit": { "message": "Older commit returned last" }
+            }
+        ]"#;
+
+        let err = parse_pull_request_metadata(&requested, pull_json, commits_json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected final pull request commit to be head")
+        );
+    }
+
+    #[test]
     fn prepare_pull_request_review_uses_resolved_remote_and_metadata() {
         let repo_root = temp_git_repo("prepare_pr_review");
         run_git(
@@ -1349,6 +1591,15 @@ mod tests {
             &local_repo,
             &["remote", "add", "origin", remote_repo.to_str().unwrap()],
         );
+        let local_file_path = local_repo.join("src/lib.rs");
+        fs::create_dir_all(local_file_path.parent().unwrap()).unwrap();
+        fs::write(&local_file_path, "pub fn local_only() -> u32 { 99 }\n").unwrap();
+        run_git(&local_repo, &["add", "."]);
+        run_git(&local_repo, &["commit", "-m", "Local worktree state"]);
+        run_git(&local_repo, &["branch", "-M", "local-review"]);
+        let local_head_before = run_git_stdout(&local_repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
 
         let metadata = PullRequestMetadata {
             pr: ResolvedPullRequestRef {
@@ -1376,6 +1627,18 @@ mod tests {
 
         fetch_pull_request_refs(&local_repo, "origin", &metadata).unwrap();
 
+        assert_eq!(
+            run_git_stdout(&local_repo, &["branch", "--show-current"]).trim(),
+            "local-review"
+        );
+        assert_eq!(
+            run_git_stdout(&local_repo, &["rev-parse", "HEAD"]).trim(),
+            local_head_before
+        );
+        assert_eq!(
+            fs::read_to_string(&local_file_path).unwrap(),
+            "pub fn local_only() -> u32 { 99 }\n"
+        );
         assert_eq!(
             run_git_stdout(&local_repo, &["rev-parse", "refs/trueflow/pr/11/head"]).trim(),
             head_sha

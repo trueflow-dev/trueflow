@@ -1,4 +1,4 @@
-use crate::github::{PostedPullRequestReview, PullRequestReviewState, ResolvedPullRequestRef};
+use crate::github::{PostedPullRequestReview, ResolvedPullRequestRef};
 use crate::store::CommitId;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,22 @@ impl GitHubDeliveryLedger {
     }
 
     pub fn excluded_record_ids(&self, pr: &ResolvedPullRequestRef) -> HashSet<String> {
+        self.excluded_record_ids_with_pending_filter(pr, |_| true)
+    }
+
+    pub fn excluded_record_ids_for_head(
+        &self,
+        pr: &ResolvedPullRequestRef,
+        head_sha: &CommitId,
+    ) -> HashSet<String> {
+        self.excluded_record_ids_with_pending_filter(pr, |review| review.head_sha == *head_sha)
+    }
+
+    fn excluded_record_ids_with_pending_filter(
+        &self,
+        pr: &ResolvedPullRequestRef,
+        include_pending: impl Fn(&PendingReviewState) -> bool,
+    ) -> HashSet<String> {
         let Some(state) = self.pull_request_state(pr) else {
             return HashSet::new();
         };
@@ -71,6 +87,7 @@ impl GitHubDeliveryLedger {
                 state
                     .pending_reviews
                     .iter()
+                    .filter(|review| include_pending(review))
                     .flat_map(|review| review.staged_record_ids.iter().cloned()),
             )
             .collect()
@@ -98,18 +115,16 @@ impl GitHubDeliveryLedger {
         let mut pending = Vec::new();
 
         for review in state.pending_reviews.drain(..) {
-            match lookup(review.review_id)? {
-                Some(current) if current.state == PullRequestReviewState::Pending => {
+            if let Some(current) = lookup(review.review_id)? {
+                if current.state.is_terminal() {
+                    delivered_ids.extend(review.staged_record_ids);
+                } else {
                     pending.push(PendingReviewState {
                         review_id: current.id,
                         html_url: current.html_url,
                         ..review
                     });
                 }
-                Some(_) => {
-                    delivered_ids.extend(review.staged_record_ids);
-                }
-                None => {}
             }
         }
 
@@ -242,6 +257,30 @@ mod tests {
         let excluded = ledger.excluded_record_ids(&pr());
         assert!(excluded.contains("staged"));
         assert!(excluded.contains("done"));
+    }
+
+    #[test]
+    fn excluded_record_ids_for_head_ignores_pending_ids_from_other_heads() {
+        let mut ledger = GitHubDeliveryLedger::default();
+        let current_head = CommitId::new("1111111111111111111111111111111111111111").unwrap();
+        let stale_head = CommitId::new("2222222222222222222222222222222222222222").unwrap();
+        ledger.record_pending_review(
+            &pr(),
+            PostedPullRequestReview {
+                id: 1,
+                html_url: "https://example.test/review/1".to_string(),
+                state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
+            },
+            &stale_head,
+            vec!["stale".to_string()],
+        );
+        ledger.ensure_pull_request_state(&pr()).delivered_record_ids = vec!["done".to_string()];
+
+        let excluded = ledger.excluded_record_ids_for_head(&pr(), &current_head);
+        assert!(excluded.contains("done"));
+        assert!(!excluded.contains("stale"));
     }
 
     #[test]
@@ -391,5 +430,44 @@ mod tests {
         let state = ledger.pull_request_state(&pr()).unwrap();
         assert!(state.pending_reviews.is_empty());
         assert_eq!(state.delivered_record_ids, vec!["staged".to_string()]);
+    }
+
+    #[test]
+    fn sync_pending_reviews_keeps_unknown_live_state_pending() {
+        let mut ledger = GitHubDeliveryLedger::default();
+        ledger.record_pending_review(
+            &pr(),
+            PostedPullRequestReview {
+                id: 1,
+                html_url: "https://example.test/review/1".to_string(),
+                state: PullRequestReviewState::Pending,
+                body: "<!-- trueflow:pending-review -->".to_string(),
+                node_id: Some("R_1".to_string()),
+            },
+            &CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+            vec!["staged".to_string()],
+        );
+
+        let changed = ledger
+            .sync_pending_reviews(&pr(), |_| {
+                Ok(Some(PostedPullRequestReview {
+                    id: 1,
+                    html_url: "https://example.test/review/1-updated".to_string(),
+                    state: PullRequestReviewState::Unknown,
+                    body: "<!-- trueflow:pending-review -->".to_string(),
+                    node_id: Some("R_1".to_string()),
+                }))
+            })
+            .unwrap();
+
+        assert!(changed);
+        let state = ledger.pull_request_state(&pr()).unwrap();
+        assert!(state.delivered_record_ids.is_empty());
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert_eq!(
+            state.pending_reviews[0].html_url,
+            "https://example.test/review/1-updated"
+        );
+        assert!(ledger.excluded_record_ids(&pr()).contains("staged"));
     }
 }

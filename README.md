@@ -151,6 +151,9 @@ Website/deployment/infrastructure docs live in `infra/README.md`.
 # Launch the TUI. The main way to use trueflow.
 trueflow tui
 
+# Review a GitHub pull request in the TUI
+trueflow tui --target pr:11
+
 # Review current changes as JSON. Machine-readable, suitable for integrations.
 trueflow review --json
 
@@ -160,6 +163,9 @@ trueflow inspect --fingerprint <fp> --split
 
 # Export review feedback
 trueflow feedback --format xml
+
+# Stage review feedback on a GitHub pull request without submitting it
+trueflow feedback --pr pr:11 --dry-run
 
 # Export recent feedback for one subtree
 trueflow feedback --format json --since 1h --target dir:trueflow/src
@@ -183,6 +189,10 @@ trueflow tui --target dir:trueflow/src
 
 # Scope the TUI to a revision range with additional filtering
 trueflow tui --target rev:abc1234..def5678 --only function --exclude comment
+
+# Scope the TUI to a GitHub pull request by number or URL
+trueflow tui --target pr:11
+trueflow tui --target https://github.com/owner/repo/pull/11
 ```
 
 Block kinds are case-insensitive and match the semantic kinds shown in JSON
@@ -220,6 +230,7 @@ note = "c"
 toggle_view = "m"
 speed_read = "r"
 root = "g"
+recap_done = "d"
 quit = "q"
 
 [tui.speed_read]
@@ -248,6 +259,7 @@ Main review actions:
   - diff-mode line numbers are disabled by default; set `[tui] diff_line_numbers = "old_new"` to restore the old/new gutter
 - `r` toggle speed-reading
 - `g` jump to root
+- `d` choose another review scope from the recap screen
 - `q` quit
 
 To override the default TUI keys, add a `[tui.keybinds]` section to
@@ -266,6 +278,7 @@ note = "e"
 toggle_view = "v"
 speed_read = "s"
 root = "z"
+recap_done = "w"
 quit = "x"
 ```
 
@@ -288,6 +301,26 @@ identity surface is not fully unified yet.
 
 Review records can also carry metadata such as reviewer identity and review
 labels.
+
+### GitHub pull requests
+
+Pull request review is fetch-only. `trueflow tui --target pr:11` resolves the
+pull request metadata and reviews the PR diff without checking out the branch or
+switching the user worktree. PR targets can also use `pr:owner/repo/11` or a
+GitHub pull request URL.
+
+Feedback posting uses a separate flag because it writes to GitHub:
+
+```sh
+# Show which comments would be staged on the PR
+trueflow feedback --pr pr:11 --dry-run
+
+# Create or append to a trueflow-owned pending review
+trueflow feedback --pr pr:11
+
+# Submit the current trueflow-owned pending review as a COMMENT review
+trueflow feedback --pr pr:11 --submit
+```
 
 ## Contributing
 

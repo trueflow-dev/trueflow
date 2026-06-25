@@ -1,74 +1,7 @@
+use crate::gpg::GpgClient;
 use crate::store::{AttestationKind, Canonicalization, FileStore, Record, ReviewStore};
-use anyhow::{Context, Result};
-use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use anyhow::Result;
 use tracing::info;
-
-struct Verifier {
-    temp_dir: PathBuf,
-}
-
-impl Verifier {
-    fn new() -> Result<Self> {
-        let temp_dir = std::env::temp_dir()
-            .join("trueflow-gpg-verify")
-            .join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir_all(&temp_dir)?;
-        Ok(Self { temp_dir })
-    }
-
-    fn verify(&self, payload: &str, signature: &str, public_key: &str) -> Result<bool> {
-        // We reuse the temp dir, but write files to unique paths or overwrite.
-        let key_path = self.temp_dir.join("pubkey.asc");
-        let sig_path = self.temp_dir.join("signature.asc");
-        let payload_path = self.temp_dir.join("payload.txt");
-
-        fs::write(&key_path, public_key)?;
-        fs::write(&sig_path, signature)?;
-        fs::write(&payload_path, payload)?;
-
-        // Import key
-        let mut import = Command::new("gpg");
-        import
-            .arg("--batch")
-            .arg("--no-tty")
-            .arg("--homedir")
-            .arg(&self.temp_dir)
-            .arg("--import")
-            .arg(&key_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        let import_output = import.output().context("Failed to import gpg public key")?;
-        if !import_output.status.success() {
-            // If import fails, we can't verify.
-            return Ok(false);
-        }
-
-        // Verify signature
-        let mut verify = Command::new("gpg");
-        verify
-            .arg("--batch")
-            .arg("--no-tty")
-            .arg("--homedir")
-            .arg(&self.temp_dir)
-            .arg("--verify")
-            .arg(&sig_path)
-            .arg(&payload_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        let verify_output = verify.output().context("Failed to verify gpg signature")?;
-        Ok(verify_output.status.success())
-    }
-}
-
-impl Drop for Verifier {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.temp_dir);
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifySelection<'a> {
@@ -98,7 +31,7 @@ pub fn run(selection: VerifySelection<'_>) -> Result<()> {
     let mut unattested = 0;
     let mut invalid = 0;
 
-    let verifier = Verifier::new()?;
+    let mut gpg = GpgClient::new();
 
     for record in filtered {
         let Some(attestations) = record.attestations.as_ref() else {
@@ -128,7 +61,7 @@ pub fn run(selection: VerifySelection<'_>) -> Result<()> {
                 continue;
             }
 
-            match verifier.verify(&payload, &attestation.signature, &attestation.public_key) {
+            match gpg.verify(&payload, &attestation.signature, &attestation.public_key) {
                 Ok(true) => {}
                 Ok(false) => {
                     record_invalid = true;
@@ -186,7 +119,6 @@ mod tests {
     use crate::store::{
         BlockState, CommitId, Identity, RepoRef, ReviewCheck, ReviewTargetRef, VcsSystem, Verdict,
     };
-
     fn record(id: &str) -> Record {
         Record {
             id: id.to_string(),

@@ -1,4 +1,5 @@
 use crate::context::TrueflowContext;
+use crate::gpg::{GpgClient, SigningMode};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::scanner::ScanOptions;
@@ -9,87 +10,10 @@ use crate::store::{
 };
 use crate::tree::{self, TreeNodeKind};
 use crate::vcs;
-use anyhow::{Context, Result, anyhow};
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use anyhow::{Context, Result};
 use tracing::info;
-use uuid::Uuid;
 
 const NONINTERACTIVE_SIGNING_FAILURE_CONTEXT: &str = "non-interactive GPG signing failed";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SigningMode {
-    Interactive,
-    NonInteractive,
-}
-
-fn sign_data(data: &str, key_id: Option<&str>, mode: SigningMode) -> Result<String> {
-    let mut cmd = Command::new("gpg");
-    if matches!(mode, SigningMode::NonInteractive) {
-        cmd.arg("--batch")
-            .arg("--no-tty")
-            .arg("--pinentry-mode")
-            .arg("error");
-    }
-    cmd.arg("--detach-sign").arg("--armor");
-
-    if let Some(kid) = key_id {
-        cmd.arg("--local-user").arg(kid);
-    }
-
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn gpg")?;
-
-    {
-        let stdin = child.stdin.as_mut().context("Failed to open gpg stdin")?;
-        stdin.write_all(data.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-
-    if !output.status.success() {
-        return Err(gpg_error("GPG signing failed", &output.stderr));
-    }
-
-    let sig = String::from_utf8(output.stdout)?;
-    Ok(sig.trim().to_string())
-}
-
-fn export_public_key(key_id: Option<&str>) -> Result<String> {
-    let mut cmd = Command::new("gpg");
-    cmd.arg("--batch")
-        .arg("--no-tty")
-        .arg("--armor")
-        .arg("--export");
-
-    if let Some(kid) = key_id {
-        cmd.arg(kid);
-    }
-
-    let output = cmd.output().context("Failed to run gpg export")?;
-
-    if !output.status.success() {
-        return Err(gpg_error("GPG export failed", &output.stderr));
-    }
-
-    let key = String::from_utf8(output.stdout)?;
-    Ok(key.trim().to_string())
-}
-
-fn gpg_error(context: &str, stderr: &[u8]) -> anyhow::Error {
-    let stderr = String::from_utf8_lossy(stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        anyhow!(context.to_string())
-    } else {
-        anyhow!("{context}: {stderr}")
-    }
-}
 
 pub(crate) fn is_noninteractive_signing_failure(error: &anyhow::Error) -> bool {
     error
@@ -216,9 +140,7 @@ fn run_with_signing_mode(
     );
     let email = runtime_config.email;
     let signing_key = runtime_config.signing_key;
-
-    let now =
-        i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()).unwrap_or(i64::MAX);
+    let gpg = GpgClient::new();
 
     let identity = Identity::Email {
         email: email.clone(),
@@ -256,34 +178,29 @@ fn run_with_signing_mode(
     )
     .into();
 
-    let mut record = Record {
-        id: Uuid::new_v4().to_string(),
-        version: crate::store::CURRENT_VERSION,
+    let mut record = Record::new(
         target,
-        check: check.clone(),
-        verdict: verdict.clone(),
+        check.clone(),
+        verdict.clone(),
         identity,
         repo_ref,
         block_state,
-        timestamp: now,
-        path_hint,
-        line_hint: line,
-        note,
-        comment_scope,
-        comment_context,
-        comment_anchor,
-        tags: None,
-        attestations: None,
-    };
+    );
+    record.path_hint = path_hint;
+    record.line_hint = line;
+    record.note = note;
+    record.comment_scope = comment_scope;
+    record.comment_context = comment_context;
+    record.comment_anchor = comment_anchor;
 
     if should_sign {
         let payload = record.signing_payload()?;
         let signature = with_noninteractive_signing_context(
-            sign_data(&payload, signing_key.as_deref(), signing_mode),
+            gpg.sign_detached(&payload, signing_key.as_deref(), signing_mode),
             signing_mode,
         )?;
         let public_key = with_noninteractive_signing_context(
-            export_public_key(signing_key.as_deref()),
+            gpg.export_public_key(signing_key.as_deref()),
             signing_mode,
         )?;
         record.attestations = Some(vec![Attestation {
@@ -401,6 +318,7 @@ fn infer_target_kind_from_current_tree(fingerprint: &str) -> Result<Option<Revie
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn noninteractive_signing_failure_predicate_matches_context_chain() {
