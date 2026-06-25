@@ -18,7 +18,8 @@ use crate::store::{
     SourceCommentAnchor,
 };
 use crate::targets::{
-    ReviewTarget, extract_pull_request_target, resolve_targets, workdir_prefix_from_git_root,
+    ResolvedTargets, ReviewPathSelection, ReviewTarget, extract_pull_request_target,
+    resolve_targets, workdir_prefix_from_git_root,
 };
 use crate::vcs;
 use anyhow::{Result, anyhow};
@@ -79,11 +80,7 @@ pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()>
     let since_mode = effective_since.resolve()?;
     let since_filter = resolve_since_filter(&store, since_mode)?;
     let explicit_selection = resolved_targets.explicit_selection();
-    let changed_selection = targets
-        .iter()
-        .any(|target| matches!(target, ReviewTarget::DirtyWorktree))
-        .then(|| resolved_targets.changed_selection())
-        .flatten();
+    let changed_selection = feedback_changed_selection(targets, &resolved_targets);
     let allowed_revisions = resolve_allowed_revisions(&resolved_targets.diff_selection)?;
     let query = FeedbackQuery {
         filters,
@@ -127,6 +124,25 @@ fn validate_feedback_command_args(
     }
 
     Ok(())
+}
+
+fn feedback_changed_selection(
+    targets: &[ReviewTarget],
+    resolved_targets: &ResolvedTargets,
+) -> Option<ReviewPathSelection> {
+    targets
+        .iter()
+        .any(|target| {
+            matches!(
+                target,
+                ReviewTarget::DirtyWorktree
+                    | ReviewTarget::MainDiff
+                    | ReviewTarget::Revision(_)
+                    | ReviewTarget::RevisionRange(_)
+            )
+        })
+        .then(|| resolved_targets.changed_selection())
+        .flatten()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1348,6 +1364,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("use `feedback --pr ...` instead"));
+    }
+
+    #[test]
+    fn feedback_changed_selection_keeps_main_target_changed_paths() -> Result<()> {
+        let changed = crate::repo_path::RepoPath::new("src/changed.rs")?;
+        let unchanged = crate::repo_path::RepoPath::new("src/unchanged.rs")?;
+        let resolved_targets = ResolvedTargets::new(
+            crate::targets::ReviewContentSource::Workdir,
+            crate::targets::ReviewDiffSelection::Targets(vec![
+                crate::targets::ReviewDiffTarget::MainDiff,
+            ]),
+            HashSet::new(),
+            Vec::new(),
+            HashSet::from([changed.clone()]),
+        );
+
+        let selection = feedback_changed_selection(&[ReviewTarget::MainDiff], &resolved_targets)
+            .ok_or_else(|| anyhow!("expected main target to keep changed selection"))?;
+
+        assert!(selection.includes(&changed));
+        assert!(!selection.includes(&unchanged));
+        Ok(())
     }
 
     #[test]
