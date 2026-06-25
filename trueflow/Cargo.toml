@@ -81,6 +81,10 @@ trueflow-test-support = { path = "test-support" }
 uuid = { version = "1.19.0", features = ["v4"] }
 vt100 = "0.16.2"
 
+[[test]]
+name = "e2e_bench_fixture"
+required-features = ["bench"]
+
 [[bench]]
 name = "full_review"
 harness = false

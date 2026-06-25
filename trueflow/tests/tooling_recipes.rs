@@ -166,6 +166,11 @@ fn cargo_manifest_bench_support_is_opt_in() -> Result<()> {
         "required-features = [\"bench\"]",
         "Cargo.toml bench target required feature",
     );
+    assert_contains(
+        &cargo_toml,
+        "[[test]]\nname = \"e2e_bench_fixture\"\nrequired-features = [\"bench\"]",
+        "Cargo.toml benchmark fixture test target required feature",
+    );
 
     Ok(())
 }
