@@ -515,15 +515,13 @@ fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(Stri
         ReviewTargetRef::Block { hash } => {
             if let Some(path_hint) = record.path_hint.as_ref()
                 && let Some(file) = files.iter().find(|file| file.path == *path_hint)
-                && let Some(block) = file.blocks.iter().find(|block| block.hash == *hash)
+                && let Some(block) = best_block_for_hash(file, hash, record.line_hint)
             {
                 return Some((file.path.as_str().to_string(), block.clone()));
             }
 
             files.iter().find_map(|file| {
-                file.blocks
-                    .iter()
-                    .find(|block| block.hash == *hash)
+                best_block_for_hash(file, hash, record.line_hint)
                     .map(|block| (file.path.as_str().to_string(), block.clone()))
             })
         }
@@ -557,6 +555,21 @@ fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(Stri
             })
         }
     }
+}
+
+fn best_block_for_hash<'a>(
+    file: &'a FileState,
+    hash: &TreeHash,
+    line_hint: Option<u32>,
+) -> Option<&'a Block> {
+    let line_hint = line_hint.map(|line| line as usize);
+    line_hint
+        .and_then(|line| {
+            file.blocks.iter().find(|block| {
+                block.hash == *hash && block.start_line <= line && line < block.end_line
+            })
+        })
+        .or_else(|| file.blocks.iter().find(|block| block.hash == *hash))
 }
 
 fn best_block_for_file(file: &FileState, line_hint: Option<u32>) -> Option<&Block> {
@@ -813,6 +826,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["earlier", "later"]
         );
+    }
+
+    #[test]
+    fn resolve_record_in_files_uses_line_hint_for_duplicate_block_hashes() {
+        let first = Block::new("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2);
+        let second = Block::new(
+            "fn duplicate() {}\n".to_string(),
+            BlockKind::Function,
+            10,
+            11,
+        );
+        let file = FileState::from_text(
+            RepoPath::new("src/lib.rs").unwrap(),
+            crate::analysis::Language::Rust,
+            b"fn duplicate() {}\n\nfn duplicate() {}\n",
+            vec![first.clone(), second.clone()],
+        );
+        let mut record = build_record("duplicate", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        record.target = ReviewTargetRef::Block { hash: first.hash };
+        record.line_hint = Some(10);
+
+        let (_, block) = resolve_record_in_files(&record, &[file])
+            .unwrap_or_else(|| panic!("expected duplicate block to resolve"));
+
+        assert_eq!(block.start_line, second.start_line);
     }
 
     #[test]
