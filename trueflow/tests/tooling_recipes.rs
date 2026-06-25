@@ -565,6 +565,21 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
         "bash -lc",
         "measure-check stage runner should not source login shell startup files",
     );
+    assert_contains(
+        &measure_script,
+        "clock_gettime(CLOCK_MONOTONIC)",
+        "measure-check stage durations should use a monotonic clock",
+    );
+    assert_not_contains(
+        &measure_script,
+        "SECONDS=0",
+        "measure-check stage durations should not use wall-clock-sensitive Bash SECONDS",
+    );
+    assert_not_contains(
+        &measure_script,
+        "duration=$SECONDS",
+        "measure-check stage durations should not use wall-clock-sensitive Bash SECONDS",
+    );
 
     Ok(())
 }

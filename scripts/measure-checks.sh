@@ -172,6 +172,10 @@ format_duration() {
   fi
 }
 
+monotonic_milliseconds() {
+  perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%d\n", clock_gettime(CLOCK_MONOTONIC) * 1000'
+}
+
 profile="check"
 output_dir=""
 run_name=""
@@ -289,14 +293,15 @@ for stage in "${stages[@]}"; do
   printf '%s\n' "$command_text" > "$stage_dir/command.txt"
 
   start_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  SECONDS=0
+  start_monotonic_milliseconds=$(monotonic_milliseconds)
   set +e
   bash -c "cd '$repo_root' && set -euo pipefail && $command_text" \
     > "$stage_dir/stdout.log" \
     2> "$stage_dir/stderr.log"
   status=$?
   set -e
-  duration=$SECONDS
+  end_monotonic_milliseconds=$(monotonic_milliseconds)
+  duration=$(((end_monotonic_milliseconds - start_monotonic_milliseconds) / 1000))
   end_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
   total_duration=$((total_duration + duration))
