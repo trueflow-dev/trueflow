@@ -3,11 +3,16 @@ use crate::{
     write_review_records,
 };
 use anyhow::{Context, Result, anyhow};
+use trueflow::block::Block;
+use trueflow::commands::feedback::{FeedbackCollectionParams, collect_feedback_json_values};
+use trueflow::commands::review::ReviewRequest;
+use trueflow::feedback_since::FeedbackSinceExpr;
 use trueflow::repo_path::RepoPath;
 use trueflow::store::{
-    BlockState, CommitId, Identity, Record, RepoRef, ReviewCheck, ReviewTargetKind, VcsSystem,
-    Verdict,
+    BlockState, CommitId, Identity, Record, RepoRef, ReviewCheck, ReviewTargetKind,
+    ReviewTargetRef, VcsSystem, Verdict,
 };
+use trueflow::targets::ReviewTarget;
 
 pub struct FeedbackScenario {
     repo: TestRepo,
@@ -54,8 +59,68 @@ impl FeedbackScenario {
         json_array(&output)
     }
 
+    pub fn feedback_json_in_process(&self, extra_args: &[&str]) -> Result<Vec<serde_json::Value>> {
+        let request = parse_feedback_json_request(extra_args)?;
+        crate::with_current_dir(&self.repo.path, || {
+            collect_feedback_json_values(FeedbackCollectionParams {
+                since: request.since.as_ref(),
+                targets: &request.targets,
+                include_approved: request.include_approved,
+                only: &[],
+                exclude: &[],
+            })
+        })
+    }
+
     pub fn review_block(&self, path: &str, verdict: &str) -> Result<Record> {
         self.review_block_with_overrides(path, verdict, &ReviewRecordOverrides::default())
+    }
+
+    pub fn review_block_in_process(&self, path: &str, verdict: &str) -> Result<Record> {
+        self.review_block_in_process_with_overrides(
+            path,
+            verdict,
+            &ReviewRecordOverrides::default(),
+        )
+    }
+
+    pub fn review_block_in_process_with_overrides(
+        &self,
+        path: &str,
+        verdict: &str,
+        overrides: &ReviewRecordOverrides<'_>,
+    ) -> Result<Record> {
+        let block = self.review_block_from_summary(path)?;
+        let cli_verdict = overrides.verdict.unwrap_or(verdict);
+        let revision = self.head_revision()?;
+        let mut record = Record::new(
+            ReviewTargetRef::Block {
+                hash: block.hash.clone(),
+            },
+            ReviewCheck::review(),
+            parse_verdict(cli_verdict)?,
+            Identity::Email {
+                email: "test@example.com".to_string(),
+            },
+            RepoRef::Vcs {
+                system: VcsSystem::Git,
+                revision: CommitId::new(revision)?,
+            },
+            BlockState::Committed,
+        );
+        record.path_hint = Some(RepoPath::new(path)?);
+        record.line_hint = Some(u32::try_from(block.start_line).with_context(|| {
+            format!(
+                "start_line {} should fit into u32 for synthetic feedback record",
+                block.start_line
+            )
+        })?);
+        apply_review_record_overrides(&mut record, overrides)?;
+
+        let mut records = self.reviews()?;
+        records.push(record.clone());
+        self.write_reviews(&records)?;
+        Ok(record)
     }
 
     pub fn review_block_with_overrides(
@@ -99,6 +164,21 @@ impl FeedbackScenario {
         Ok(record)
     }
 
+    fn review_block_from_summary(&self, path: &str) -> Result<Block> {
+        let summary = self
+            .repo
+            .review_summary(ReviewRequest::AllFiles, &[], &[])?;
+        let file = summary
+            .files
+            .iter()
+            .find(|file| file.path.as_str().trim_start_matches("./") == path)
+            .with_context(|| format!("missing review output for {path}"))?;
+        file.blocks
+            .first()
+            .cloned()
+            .context("expected at least one block")
+    }
+
     fn review_block_info(&self, path: &str) -> Result<ReviewBlockInfo> {
         let output = self.repo.run(&["review", "--all", "--json"])?;
         let files = json_array(&output)?;
@@ -134,6 +214,50 @@ impl FeedbackScenario {
 struct ReviewBlockInfo {
     hash: String,
     start_line: u32,
+}
+
+struct FeedbackJsonRequest {
+    since: Option<FeedbackSinceExpr>,
+    targets: Vec<ReviewTarget>,
+    include_approved: bool,
+}
+
+fn parse_feedback_json_request(extra_args: &[&str]) -> Result<FeedbackJsonRequest> {
+    let mut since = None;
+    let mut targets = Vec::new();
+    let mut include_approved = false;
+    let mut index = 0;
+    while index < extra_args.len() {
+        match extra_args[index] {
+            "--since" => {
+                let value = extra_args
+                    .get(index + 1)
+                    .copied()
+                    .context("--since requires a value")?;
+                since = Some(FeedbackSinceExpr::new(value)?);
+                index += 2;
+            }
+            "--target" => {
+                let value = extra_args
+                    .get(index + 1)
+                    .copied()
+                    .context("--target requires a value")?;
+                targets.push(ReviewTarget::from_cli(value)?);
+                index += 2;
+            }
+            "--include-approved" => {
+                include_approved = true;
+                index += 1;
+            }
+            other => return Err(anyhow!("unsupported in-process feedback arg: {other}")),
+        }
+    }
+
+    Ok(FeedbackJsonRequest {
+        since,
+        targets,
+        include_approved,
+    })
 }
 
 fn path_matches(file: &serde_json::Value, expected: &str) -> bool {

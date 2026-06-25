@@ -25,7 +25,7 @@ use crate::vcs;
 use anyhow::{Result, anyhow};
 use clap::ValueEnum;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TRUEFLOW_PENDING_REVIEW_MARKER: &str = "<!-- trueflow:pending-review -->";
@@ -50,6 +50,25 @@ pub struct FeedbackParams<'a> {
     pub exclude: &'a [BlockKind],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FeedbackCollectionParams<'a> {
+    pub since: Option<&'a FeedbackSinceExpr>,
+    pub targets: &'a [ReviewTarget],
+    pub include_approved: bool,
+    pub only: &'a [BlockKind],
+    pub exclude: &'a [BlockKind],
+}
+
+struct FeedbackCommandResult {
+    entries: Vec<FeedbackEntry>,
+    cursor_update: Option<FeedbackCursorUpdate>,
+}
+
+struct FeedbackCursorUpdate {
+    path: PathBuf,
+    cursor: crate::feedback_export::FeedbackCursor,
+}
+
 pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()> {
     let FeedbackParams {
         format,
@@ -69,6 +88,38 @@ pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()>
         return run_pull_request_feedback(pr, dry_run, open, submit);
     }
 
+    let result = collect_local_feedback(FeedbackCollectionParams {
+        since,
+        targets,
+        include_approved,
+        only,
+        exclude,
+    })?;
+    render_feedback(format, result.entries)?;
+    write_feedback_cursor_update(result.cursor_update)?;
+
+    Ok(())
+}
+
+pub fn collect_feedback_json_values(
+    params: FeedbackCollectionParams<'_>,
+) -> Result<Vec<serde_json::Value>> {
+    let result = collect_local_feedback(params)?;
+    let values = feedback_entries_to_json_values(result.entries);
+    write_feedback_cursor_update(result.cursor_update)?;
+    Ok(values)
+}
+
+fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<FeedbackCommandResult> {
+    let FeedbackCollectionParams {
+        since,
+        targets,
+        include_approved,
+        only,
+        exclude,
+    } = params;
+
+    validate_feedback_command_args(targets, None)?;
     let config = load_config()?;
     let filters = config.feedback.filters.resolve_filters(only, exclude);
     let scan_options = config.scan.resolve_options();
@@ -98,14 +149,25 @@ pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()>
     let entries =
         collect_feedback_entries(database.records(), &since_filter, &query, &mut resolver)?;
 
-    render_feedback(format, entries)?;
+    let cursor_update = if matches!(since_mode, ParsedFeedbackSince::Last) {
+        build_feedback_cursor(database.records()).map(|cursor| FeedbackCursorUpdate {
+            path: feedback_cursor_path(&store),
+            cursor,
+        })
+    } else {
+        None
+    };
 
-    if matches!(since_mode, ParsedFeedbackSince::Last)
-        && let Some(cursor) = build_feedback_cursor(database.records())
-    {
-        write_feedback_cursor(feedback_cursor_path(&store).as_path(), &cursor)?;
+    Ok(FeedbackCommandResult {
+        entries,
+        cursor_update,
+    })
+}
+
+fn write_feedback_cursor_update(update: Option<FeedbackCursorUpdate>) -> Result<()> {
+    if let Some(update) = update {
+        write_feedback_cursor(update.path.as_path(), &update.cursor)?;
     }
-
     Ok(())
 }
 
@@ -1241,17 +1303,7 @@ fn is_contiguous(lines: &[u32]) -> bool {
 fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Result<()> {
     match format {
         FeedbackFormat::Json => {
-            let export_list = entries
-                .into_iter()
-                .map(|entry| {
-                    serde_json::json!({
-                        "file": entry.file_path,
-                        "block": entry.block,
-                        "reviews": entry.reviews,
-                        "latest_verdict": entry.latest_verdict,
-                    })
-                })
-                .collect::<Vec<_>>();
+            let export_list = feedback_entries_to_json_values(entries);
             println!("{}", serde_json::to_string_pretty(&export_list)?);
         }
         FeedbackFormat::Xml => {
@@ -1279,6 +1331,20 @@ fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Resul
     }
 
     Ok(())
+}
+
+fn feedback_entries_to_json_values(entries: Vec<FeedbackEntry>) -> Vec<serde_json::Value> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "file": entry.file_path,
+                "block": entry.block,
+                "reviews": entry.reviews,
+                "latest_verdict": entry.latest_verdict,
+            })
+        })
+        .collect()
 }
 
 fn print_block_xml(block: &crate::block::Block, reviews: &[crate::store::Record]) {

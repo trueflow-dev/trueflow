@@ -247,9 +247,10 @@ impl ReviewCoverageStatusCacheStore {
 
         let now = current_unix_ms();
         let previous = self.entries.insert(cache_key.to_string(), status);
-        self.entry_updated_unix_ms
+        let previous_updated = self
+            .entry_updated_unix_ms
             .insert(cache_key.to_string(), now);
-        if previous != Some(status) || !self.fresh {
+        if previous != Some(status) || previous_updated != Some(now) || !self.fresh {
             self.dirty = true;
         }
         self.fresh = true;
@@ -8785,6 +8786,46 @@ mod diff_scope_tests {
         let cache_file: ReviewCoverageStatusCacheFile = serde_json::from_str(&cache_contents)
             .unwrap_or_else(|error| panic!("failed to parse cache json: {error}"));
         assert_eq!(cache_file.review_db_fingerprint, fingerprint);
+    }
+
+    #[test]
+    fn fresh_cache_record_flushes_refreshed_timestamp_when_status_matches() {
+        let cache_dir = temp_test_dir("scope_selector_status_cache_fresh_refresh");
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("failed to create cache dir {cache_dir:?}: {error}"));
+        let cache_path = cache_dir.join("review_coverage_status.json");
+        let fingerprint = ReviewDatabaseFingerprint {
+            size_bytes: 42,
+            modified_unix_ms: 1234,
+        };
+        let mut cache = ReviewCoverageStatusCacheStore {
+            path: cache_path.clone(),
+            fingerprint,
+            entries: HashMap::from([(
+                "commit:abc1234".to_string(),
+                ScopeSelectorStatus::Reviewed { total_blocks: 3 },
+            )]),
+            entry_updated_unix_ms: HashMap::from([("commit:abc1234".to_string(), 1)]),
+            fresh: true,
+            dirty: false,
+        };
+
+        cache.record(
+            "commit:abc1234",
+            ScopeSelectorStatus::Reviewed { total_blocks: 3 },
+        );
+        cache.flush();
+
+        let cache_contents = fs::read_to_string(&cache_path)
+            .unwrap_or_else(|error| panic!("failed to read cache file {cache_path:?}: {error}"));
+        let cache_file: ReviewCoverageStatusCacheFile = serde_json::from_str(&cache_contents)
+            .unwrap_or_else(|error| panic!("failed to parse cache json: {error}"));
+        let refreshed = cache_file
+            .entry_updated_unix_ms
+            .get("commit:abc1234")
+            .copied()
+            .unwrap_or_else(|| panic!("expected refreshed timestamp"));
+        assert!(refreshed > 1);
     }
 
     #[test]
