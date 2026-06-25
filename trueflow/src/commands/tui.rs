@@ -427,19 +427,29 @@ impl ScopeSelectorStatusPoller {
         self.pending_jobs > 0
     }
 
+    fn apply_update(&mut self, selector: &mut ScopeSelector, update: &ScopeSelectorStatusUpdate) {
+        self.pending_jobs = self.pending_jobs.saturating_sub(1);
+        if let Some(option) = selector.options.get_mut(update.index) {
+            option.status = update.status;
+        }
+        if let Some(cache) = self.cache.as_mut() {
+            cache.record(&update.cache_key, update.status);
+        }
+    }
+
+    fn flush_cache_after_update(&mut self, updated: bool) {
+        if updated && let Some(cache) = self.cache.as_mut() {
+            cache.flush();
+        }
+    }
+
     fn drain_updates(&mut self, selector: &mut ScopeSelector) -> bool {
         let mut updated = false;
         loop {
             match self.receiver.try_recv() {
                 Ok(update) => {
-                    self.pending_jobs = self.pending_jobs.saturating_sub(1);
-                    if let Some(option) = selector.options.get_mut(update.index) {
-                        option.status = update.status;
-                        updated = true;
-                    }
-                    if let Some(cache) = self.cache.as_mut() {
-                        cache.record(&update.cache_key, update.status);
-                    }
+                    self.apply_update(selector, &update);
+                    updated = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -455,10 +465,33 @@ impl ScopeSelectorStatusPoller {
             }
         }
 
-        if updated && let Some(cache) = self.cache.as_mut() {
-            cache.flush();
-        }
+        self.flush_cache_after_update(updated);
+        updated
+    }
 
+    #[cfg(test)]
+    fn wait_for_update(&mut self, selector: &mut ScopeSelector, timeout: Duration) -> bool {
+        let updated = match self.receiver.recv_timeout(timeout) {
+            Ok(update) => {
+                self.apply_update(selector, &update);
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.pending_jobs = 0;
+                let mut changed = false;
+                for option in &mut selector.options {
+                    if option.status == ScopeSelectorStatus::Checking {
+                        option.status = ScopeSelectorStatus::Unavailable;
+                        changed = true;
+                    }
+                }
+                changed
+            }
+        };
+        let drained = self.drain_updates(selector);
+        let updated = updated || drained;
+        self.flush_cache_after_update(updated);
         updated
     }
 }
@@ -8617,15 +8650,7 @@ mod diff_scope_tests {
         })
         .unwrap_or_else(|| panic!("expected status poller"));
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let mut changed = false;
-        while Instant::now() < deadline {
-            if poller.drain_updates(&mut selector) {
-                changed = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        let changed = poller.wait_for_update(&mut selector, Duration::from_secs(1));
 
         assert!(changed, "expected panic to produce status update");
         assert_eq!(poller.pending_jobs, 0);
