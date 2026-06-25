@@ -136,6 +136,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     };
 
     let cached_entry = load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics);
+    let cached_entry_count = cached_entry.as_ref().map(HashMap::len);
 
     let inventory = collect_scan_inventory(&root, &repo_path_base, options, &mut diagnostics)?;
 
@@ -166,7 +167,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 
-    if options.cache_mode.writes_enabled() {
+    if should_write_scan_cache(options, &cache, cached_entry_count, cache_files.len()) {
         match write_cache(&root, options, cache_files) {
             Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
             Err(err) => {
@@ -179,6 +180,8 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
                 debug!("failed to write scan cache, continuing: {err}");
             }
         }
+    } else if options.cache_mode.writes_enabled() {
+        cache.write = ScanCacheWriteStatus::Skipped;
     }
 
     Ok(ScanResult {
@@ -186,6 +189,24 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         diagnostics,
         cache,
     })
+}
+
+fn should_write_scan_cache(
+    options: &ScanOptions,
+    cache: &ScanCacheReport,
+    cached_entry_count: Option<usize>,
+    current_entry_count: usize,
+) -> bool {
+    if !options.cache_mode.writes_enabled() {
+        return false;
+    }
+    if cache.read != ScanCacheReadStatus::Hit {
+        return true;
+    }
+    if cache.rescanned_files > 0 {
+        return true;
+    }
+    cached_entry_count != Some(current_entry_count)
 }
 
 pub fn scan_paths<P: AsRef<Path>>(
@@ -898,6 +919,71 @@ mod tests {
         assert_eq!(
             ScanCacheMode::from_flags(true, true),
             ScanCacheMode::ReadWrite
+        );
+    }
+
+    #[test]
+    fn scan_cache_skips_write_on_complete_cache_hit() {
+        let repo = temp_test_dir("scanner_cache_complete_hit");
+        let cache_dir = temp_test_dir("scanner_cache_complete_hit_cache");
+        fs::create_dir_all(repo.join("src")).unwrap_or_else(|error| panic!("create src: {error}"));
+        fs::write(repo.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n")
+            .unwrap_or_else(|error| panic!("write source: {error}"));
+        let options = ScanOptions {
+            cache_dir: Some(cache_dir),
+            ..ScanOptions::default()
+        };
+
+        let initial = scan_directory(&repo, &options)
+            .unwrap_or_else(|error| panic!("initial scan failed: {error}"));
+        assert_eq!(initial.cache.read, ScanCacheReadStatus::Miss);
+        assert_eq!(initial.cache.write, ScanCacheWriteStatus::Wrote);
+        assert_eq!(initial.cache.reused_files, 0);
+        assert_eq!(initial.cache.rescanned_files, 1);
+
+        let warm = scan_directory(&repo, &options)
+            .unwrap_or_else(|error| panic!("warm scan failed: {error}"));
+        assert_eq!(warm.cache.read, ScanCacheReadStatus::Hit);
+        assert_eq!(warm.cache.write, ScanCacheWriteStatus::Skipped);
+        assert_eq!(warm.cache.reused_files, 1);
+        assert_eq!(warm.cache.rescanned_files, 0);
+        assert_eq!(warm.files.len(), 1);
+    }
+
+    #[test]
+    fn scan_cache_rewrites_when_cached_file_is_deleted() {
+        let repo = temp_test_dir("scanner_cache_deleted_file");
+        let cache_dir = temp_test_dir("scanner_cache_deleted_file_cache");
+        fs::create_dir_all(repo.join("src")).unwrap_or_else(|error| panic!("create src: {error}"));
+        fs::write(repo.join("src/a.rs"), "pub fn a() -> u32 { 1 }\n")
+            .unwrap_or_else(|error| panic!("write a: {error}"));
+        fs::write(repo.join("src/b.rs"), "pub fn b() -> u32 { 2 }\n")
+            .unwrap_or_else(|error| panic!("write b: {error}"));
+        let options = ScanOptions {
+            cache_dir: Some(cache_dir),
+            ..ScanOptions::default()
+        };
+
+        let initial = scan_directory(&repo, &options)
+            .unwrap_or_else(|error| panic!("initial scan failed: {error}"));
+        assert_eq!(initial.cache.write, ScanCacheWriteStatus::Wrote);
+        assert_eq!(initial.cache.rescanned_files, 2);
+
+        fs::remove_file(repo.join("src/b.rs")).unwrap_or_else(|error| panic!("delete b: {error}"));
+        let pruned = scan_directory(&repo, &options)
+            .unwrap_or_else(|error| panic!("pruned scan failed: {error}"));
+
+        assert_eq!(pruned.cache.read, ScanCacheReadStatus::Hit);
+        assert_eq!(pruned.cache.write, ScanCacheWriteStatus::Wrote);
+        assert_eq!(pruned.cache.reused_files, 1);
+        assert_eq!(pruned.cache.rescanned_files, 0);
+        assert_eq!(
+            pruned
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs"]
         );
     }
 
