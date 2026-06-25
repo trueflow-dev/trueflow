@@ -229,7 +229,7 @@ pub fn scan_paths<P: AsRef<Path>>(
     let mut files = Vec::new();
     let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
     ordered_paths.sort();
-    let ignore_matcher = DirectScanPathIgnoreMatcher::new(options);
+    let ignore_matcher = DirectScanPathIgnoreMatcher::new(&repo_path_base, options)?;
 
     for path in ordered_paths {
         if path.is_root() || ignore_matcher.matches(&path) {
@@ -312,18 +312,30 @@ pub fn scan_paths<P: AsRef<Path>>(
 struct DirectScanPathIgnoreMatcher<'a> {
     path_prefixes: &'a [RepoPath],
     ignored_names: HashSet<&'a str>,
+    glob_matcher: Gitignore,
 }
 
 impl<'a> DirectScanPathIgnoreMatcher<'a> {
-    fn new(options: &'a ScanOptions) -> Self {
-        Self {
+    fn new(repo_path_base: &Path, options: &'a ScanOptions) -> Result<Self> {
+        let mut builder = GitignoreBuilder::new(repo_path_base);
+        builder.allow_unclosed_class(false);
+        for pattern in &options.ignore_globs {
+            builder.add_line(None, pattern)?;
+        }
+
+        Ok(Self {
             path_prefixes: &options.ignore_path_prefixes,
             ignored_names: DEFAULT_IGNORE_NAMES
                 .iter()
                 .copied()
                 .chain(options.ignore_names.iter().map(String::as_str))
                 .collect(),
-        }
+            glob_matcher: if options.ignore_globs.is_empty() {
+                Gitignore::empty()
+            } else {
+                builder.build()?
+            },
+        })
     }
 
     fn matches(&self, path: &RepoPath) -> bool {
@@ -338,6 +350,10 @@ impl<'a> DirectScanPathIgnoreMatcher<'a> {
         path.as_str()
             .split('/')
             .any(|segment| self.ignored_names.contains(segment))
+            || self
+                .glob_matcher
+                .matched_path_or_any_parents(Path::new(path.as_str()), false)
+                .is_ignore()
     }
 }
 
@@ -930,6 +946,31 @@ mod tests {
         options.ignore_names.push("generated".to_string());
 
         let paths = HashSet::from([RepoPath::new("generated/fixture.rs").unwrap()]);
+        let result = scan_paths(&repo, &paths, &options)
+            .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
+
+        assert!(result.files.is_empty());
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn scan_paths_keeps_custom_globs_ignored() {
+        let repo = temp_test_dir("scanner_paths_ignores_custom_globs");
+        let src = repo.join("src");
+        fs::create_dir_all(&src).unwrap_or_else(|error| panic!("create src dir: {error}"));
+        fs::write(src.join("snapshot.snap"), "generated snapshot\n")
+            .unwrap_or_else(|error| panic!("write snapshot file: {error}"));
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap_or_else(|error| panic!("git init failed: {error}"));
+        let options = ScanOptions {
+            ignore_globs: vec!["*.snap".to_string()],
+            ..ScanOptions::default()
+        };
+
+        let paths = HashSet::from([RepoPath::new("src/snapshot.snap").unwrap()]);
         let result = scan_paths(&repo, &paths, &options)
             .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
 
