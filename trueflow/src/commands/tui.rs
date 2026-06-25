@@ -3712,31 +3712,23 @@ fn execute_action(
     execute_action_with(state, action, |params| {
         let noninteractive_params = params.clone();
         execute_mark_for_tui(
-            mark::terminal_suspend_requirement_from_workdir(),
             move || mark::run_with_noninteractive_signing(context, noninteractive_params),
             || session.suspend(|| mark::run(context, params)),
         )
     })
 }
 
-fn execute_mark_for_tui<F, G>(
-    suspend_requirement: mark::TerminalSuspendRequirement,
-    run_noninteractive: F,
-    run_with_terminal_suspend: G,
-) -> Result<()>
+fn execute_mark_for_tui<F, G>(run_noninteractive: F, run_with_terminal_suspend: G) -> Result<()>
 where
     F: FnOnce() -> Result<()>,
     G: FnOnce() -> Result<()>,
 {
-    match suspend_requirement {
-        mark::TerminalSuspendRequirement::NotRequired => run_noninteractive(),
-        mark::TerminalSuspendRequirement::Required => match run_noninteractive() {
-            Ok(()) => Ok(()),
-            Err(error) if mark::is_noninteractive_signing_failure(&error) => {
-                run_with_terminal_suspend()
-            }
-            Err(error) => Err(error),
-        },
+    match run_noninteractive() {
+        Ok(()) => Ok(()),
+        Err(error) if mark::is_noninteractive_signing_failure(&error) => {
+            run_with_terminal_suspend()
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -13911,31 +13903,10 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn execute_mark_for_tui_without_suspend_requirement_runs_without_suspend() {
+    fn execute_mark_for_tui_runs_noninteractive_without_suspend() {
         let calls = std::cell::RefCell::new(Vec::new());
 
         execute_mark_for_tui(
-            mark::TerminalSuspendRequirement::NotRequired,
-            || {
-                calls.borrow_mut().push("noninteractive");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("suspend");
-                Ok(())
-            },
-        )
-        .unwrap_or_else(|error| panic!("expected mark execution: {error}"));
-
-        assert_eq!(calls.into_inner(), vec!["noninteractive"]);
-    }
-
-    #[test]
-    fn execute_mark_for_tui_with_suspend_requirement_skips_suspend_when_noninteractive_succeeds() {
-        let calls = std::cell::RefCell::new(Vec::new());
-
-        execute_mark_for_tui(
-            mark::TerminalSuspendRequirement::Required,
             || {
                 calls.borrow_mut().push("noninteractive");
                 Ok(())
@@ -13955,7 +13926,6 @@ mod diff_scope_tests {
         let calls = std::cell::RefCell::new(Vec::new());
 
         execute_mark_for_tui(
-            mark::TerminalSuspendRequirement::Required,
             || {
                 calls.borrow_mut().push("noninteractive");
                 Err(anyhow!("non-interactive GPG signing failed"))
@@ -13971,11 +13941,10 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn execute_mark_for_tui_with_suspend_requirement_does_not_retry_non_signing_failure() {
+    fn execute_mark_for_tui_does_not_retry_non_signing_failure() {
         let calls = std::cell::RefCell::new(Vec::new());
 
         let error = execute_mark_for_tui(
-            mark::TerminalSuspendRequirement::Required,
             || {
                 calls.borrow_mut().push("noninteractive");
                 Err(anyhow!("store append failed"))
