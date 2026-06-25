@@ -146,7 +146,7 @@ impl ReviewNavigator {
             if self.visible_block_nodes.contains(&node_id) {
                 blocks.push(node_id);
             }
-            for child in &node.children {
+            for child in node.children.iter().rev() {
                 stack.push(*child);
             }
         }
@@ -362,6 +362,20 @@ mod tests {
 
         navigator.move_prev();
         assert_eq!(navigator.current_id(), fixture.block_a);
+    }
+
+    #[test]
+    fn visible_descendant_block_ids_follow_tree_order() {
+        let fixture = build_fixture();
+        let unreviewed = HashSet::from([fixture.block_a, fixture.block_b]);
+        let navigator = ReviewNavigator::new(fixture.tree, unreviewed).unwrap_or_else(|error| {
+            panic!("failed to create navigator: {error}");
+        });
+
+        assert_eq!(
+            navigator.visible_descendant_block_ids(fixture.lib_file),
+            vec![fixture.block_a, fixture.block_b]
+        );
     }
 
     #[test]
