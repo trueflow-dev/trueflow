@@ -10611,6 +10611,56 @@ mod diff_scope_tests {
         assert_ne!(key_a, key_c);
     }
 
+    #[test]
+    fn content_cache_key_tracks_block_source_width() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            None,
+            TreeNodeKind::Block,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+            80,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            None,
+            TreeNodeKind::Block,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+            40,
+        );
+
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn content_cache_key_tracks_file_source_width() {
+        let node_id = crate::tree::TreeBuilder::new().root();
+        let key_a = content_frame_cache_key(
+            node_id,
+            None,
+            TreeNodeKind::File,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+            80,
+        );
+        let key_b = content_frame_cache_key(
+            node_id,
+            None,
+            TreeNodeKind::File,
+            ViewMode::Source,
+            vcs::BlockDiffFocusMode::WholeBlock,
+            20,
+            40,
+        );
+
+        assert_ne!(key_a, key_b);
+    }
+
     fn temp_test_file_path(name: &str) -> PathBuf {
         temp_test_dir(name).join("src/lib.rs")
     }
@@ -13057,7 +13107,7 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn content_cache_key_ignores_height_for_file_modes() {
+    fn content_cache_key_ignores_height_for_file_modes_when_width_matches() {
         let node_id = crate::tree::TreeBuilder::new().root();
         let key_a = content_frame_cache_key(
             node_id,
