@@ -167,22 +167,14 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 
-    if should_write_scan_cache(options, &cache, cached_entry_count, cache_files.len()) {
-        match write_cache(&root, options, cache_files) {
-            Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
-            Err(err) => {
-                cache.write = ScanCacheWriteStatus::Error;
-                diagnostics.push(ScanDiagnostic::new(
-                    None,
-                    format!("failed to write scan cache: {err}"),
-                ));
-                sort_diagnostics(&mut diagnostics);
-                debug!("failed to write scan cache, continuing: {err}");
-            }
-        }
-    } else if options.cache_mode.writes_enabled() {
-        cache.write = ScanCacheWriteStatus::Skipped;
-    }
+    finalize_scan_cache_write(
+        &root,
+        options,
+        &mut cache,
+        &mut diagnostics,
+        cached_entry_count,
+        cache_files,
+    );
 
     Ok(ScanResult {
         files,
@@ -207,6 +199,32 @@ fn should_write_scan_cache(
         return true;
     }
     cached_entry_count != Some(current_entry_count)
+}
+
+fn finalize_scan_cache_write(
+    root: &Path,
+    options: &ScanOptions,
+    cache: &mut ScanCacheReport,
+    diagnostics: &mut Vec<ScanDiagnostic>,
+    cached_entry_count: Option<usize>,
+    cache_files: Vec<CachedFileEntry>,
+) {
+    if should_write_scan_cache(options, cache, cached_entry_count, cache_files.len()) {
+        match write_cache(root, options, cache_files) {
+            Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
+            Err(err) => {
+                cache.write = ScanCacheWriteStatus::Error;
+                diagnostics.push(ScanDiagnostic::new(
+                    None,
+                    format!("failed to write scan cache: {err}"),
+                ));
+                sort_diagnostics(diagnostics);
+                debug!("failed to write scan cache, continuing: {err}");
+            }
+        }
+    } else if options.cache_mode.writes_enabled() {
+        cache.write = ScanCacheWriteStatus::Skipped;
+    }
 }
 
 pub fn scan_paths<P: AsRef<Path>>(
@@ -283,22 +301,14 @@ pub fn scan_paths<P: AsRef<Path>>(
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 
-    if should_write_scan_cache(options, &cache, cached_entry_count, cache_files.len()) {
-        match write_cache(&root, options, cache_files.into_values().collect()) {
-            Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
-            Err(err) => {
-                cache.write = ScanCacheWriteStatus::Error;
-                diagnostics.push(ScanDiagnostic::new(
-                    None,
-                    format!("failed to write scan cache: {err}"),
-                ));
-                sort_diagnostics(&mut diagnostics);
-                debug!("failed to write scan cache, continuing: {err}");
-            }
-        }
-    } else if options.cache_mode.writes_enabled() {
-        cache.write = ScanCacheWriteStatus::Skipped;
-    }
+    finalize_scan_cache_write(
+        &root,
+        options,
+        &mut cache,
+        &mut diagnostics,
+        cached_entry_count,
+        cache_files.into_values().collect(),
+    );
 
     Ok(ScanResult {
         files,
