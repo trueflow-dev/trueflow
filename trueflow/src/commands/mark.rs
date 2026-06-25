@@ -234,32 +234,40 @@ fn infer_target_kind(
         return Ok(kind);
     }
 
-    if let Some(kind) =
-        infer_target_kind_from_current_tree_location(fingerprint, path_hint, line_hint)?
-    {
-        return Ok(kind);
-    }
-
-    if let Some(kind) = infer_target_kind_from_current_tree(fingerprint)? {
+    if let Some(kind) = infer_target_kind_from_current_tree(fingerprint, path_hint, line_hint)? {
         return Ok(kind);
     }
 
     Ok(ReviewTargetKind::Block)
 }
 
-fn infer_target_kind_from_current_tree_location(
+fn infer_target_kind_from_current_tree(
     fingerprint: &str,
     path_hint: Option<&RepoPath>,
     line_hint: Option<u32>,
 ) -> Result<Option<ReviewTargetKind>> {
-    let Some(path_hint) = path_hint else {
-        return Ok(None);
-    };
     let scan_result = match crate::scanner::scan_directory(".", &ScanOptions::default()) {
         Ok(scan_result) => scan_result,
         Err(_) => return Ok(None),
     };
     let tree = tree::build_tree_from_files(&scan_result.files);
+
+    if let Some(kind) =
+        infer_target_kind_from_tree_location(&tree, fingerprint, path_hint, line_hint)
+    {
+        return Ok(Some(kind));
+    }
+
+    Ok(infer_target_kind_from_tree(&tree, fingerprint))
+}
+
+fn infer_target_kind_from_tree_location(
+    tree: &tree::Tree,
+    fingerprint: &str,
+    path_hint: Option<&RepoPath>,
+    line_hint: Option<u32>,
+) -> Option<ReviewTargetKind> {
+    let path_hint = path_hint?;
 
     if let Some(line_hint) = line_hint {
         for node in tree.nodes() {
@@ -273,7 +281,7 @@ fn infer_target_kind_from_current_tree_location(
                 continue;
             };
             if u32::try_from(block.start_line).ok() == Some(line_hint) {
-                return Ok(Some(ReviewTargetKind::Block));
+                return Some(ReviewTargetKind::Block);
             }
         }
     }
@@ -287,19 +295,13 @@ fn infer_target_kind_from_current_tree_location(
             TreeNodeKind::File => ReviewTargetKind::File,
             TreeNodeKind::Block => ReviewTargetKind::Block,
         };
-        return Ok(Some(kind));
+        return Some(kind);
     }
 
-    Ok(None)
+    None
 }
 
-fn infer_target_kind_from_current_tree(fingerprint: &str) -> Result<Option<ReviewTargetKind>> {
-    let scan_result = match crate::scanner::scan_directory(".", &ScanOptions::default()) {
-        Ok(scan_result) => scan_result,
-        Err(_) => return Ok(None),
-    };
-    let tree = tree::build_tree_from_files(&scan_result.files);
-
+fn infer_target_kind_from_tree(tree: &tree::Tree, fingerprint: &str) -> Option<ReviewTargetKind> {
     for node in tree.nodes() {
         if node.hash.as_str() != fingerprint {
             continue;
@@ -309,16 +311,80 @@ fn infer_target_kind_from_current_tree(fingerprint: &str) -> Result<Option<Revie
             TreeNodeKind::File => ReviewTargetKind::File,
             TreeNodeKind::Block => ReviewTargetKind::Block,
         };
-        return Ok(Some(kind));
+        return Some(kind);
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::{Block, BlockKind};
+    use crate::hashing::TreeHash;
+    use crate::tree::TreeBuilder;
     use anyhow::anyhow;
+
+    fn test_block(hash: &str, start_line: usize) -> Block {
+        Block {
+            hash: TreeHash::new(hash),
+            content: "fn demo() {}\n".to_string(),
+            kind: BlockKind::Function,
+            tags: Vec::new(),
+            complexity: None,
+            start_line,
+            end_line: start_line.saturating_add(1),
+        }
+    }
+
+    #[test]
+    fn target_kind_inference_prefers_exact_path_and_line_block_match() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), RepoPath::new("src").unwrap());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            RepoPath::new("src/lib.rs").unwrap(),
+            TreeHash::new("file"),
+            crate::analysis::Language::Rust,
+        );
+        builder.add_block(
+            file,
+            "demo".to_string(),
+            RepoPath::new("src/lib.rs").unwrap(),
+            test_block("same-hash", 4),
+            crate::analysis::Language::Rust,
+        );
+        let tree = builder.finalize();
+
+        assert_eq!(
+            infer_target_kind_from_tree_location(
+                &tree,
+                "same-hash",
+                Some(&RepoPath::new("src/lib.rs").unwrap()),
+                Some(4),
+            ),
+            Some(ReviewTargetKind::Block)
+        );
+    }
+
+    #[test]
+    fn target_kind_inference_falls_back_to_hash_only_tree_match() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        builder.add_dir(root, "src".to_string(), RepoPath::new("src").unwrap());
+        let tree = builder.finalize();
+        let dir_hash = tree
+            .find_by_path("src")
+            .map(|id| tree.node(id).hash.to_string())
+            .unwrap_or_else(|| panic!("expected src directory"));
+
+        assert_eq!(
+            infer_target_kind_from_tree(&tree, &dir_hash),
+            Some(ReviewTargetKind::Tree)
+        );
+    }
 
     #[test]
     fn noninteractive_signing_failure_predicate_matches_context_chain() {
