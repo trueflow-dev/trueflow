@@ -1280,7 +1280,6 @@ fn test_scan_cache_reuses_unchanged_files_when_one_file_changes() -> Result<()> 
     assert_eq!(initial_scan["cache"]["reused_files"].as_u64(), Some(0));
     assert_eq!(initial_scan["cache"]["rescanned_files"].as_u64(), Some(2));
 
-    std::thread::sleep(std::time::Duration::from_millis(5));
     repo.write("src/b.rs", "pub fn b() -> u32 { 22 }\n")?;
 
     let rescanned = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
