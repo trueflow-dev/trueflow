@@ -7300,7 +7300,7 @@ mod diff_scope_tests {
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc;
+    use std::sync::{Condvar, mpsc};
 
     fn build_test_state(
         review_scope: ScopePreset,
@@ -7430,6 +7430,50 @@ mod diff_scope_tests {
         };
 
         (state, block_id)
+    }
+
+    struct TestSignal {
+        ready: AtomicBool,
+        lock: Mutex<()>,
+        condvar: Condvar,
+    }
+
+    impl TestSignal {
+        fn new() -> Self {
+            Self {
+                ready: AtomicBool::new(false),
+                lock: Mutex::new(()),
+                condvar: Condvar::new(),
+            }
+        }
+
+        fn notify(&self) {
+            let _guard = self
+                .lock
+                .lock()
+                .unwrap_or_else(|error| panic!("failed to lock signal before notify: {error}"));
+            self.ready.store(true, Ordering::Relaxed);
+            self.condvar.notify_all();
+        }
+
+        fn wait(&self, timeout: Duration, description: &str) {
+            if self.ready.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let guard = self
+                .lock
+                .lock()
+                .unwrap_or_else(|error| panic!("failed to lock {description} signal: {error}"));
+            let (_guard, _timeout) = self
+                .condvar
+                .wait_timeout_while(guard, timeout, |_| !self.ready.load(Ordering::Relaxed))
+                .unwrap_or_else(|error| panic!("failed to wait for {description}: {error}"));
+            assert!(
+                self.ready.load(Ordering::Relaxed),
+                "timed out waiting for {description}"
+            );
+        }
     }
 
     fn assert_phrase_order(rendered: &str, phrases: &[&str]) {
@@ -8623,25 +8667,34 @@ mod diff_scope_tests {
             .collect::<Vec<_>>();
         let started_jobs = Arc::new(AtomicBool::new(false));
         let started_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_job_started = Arc::new(TestSignal::new());
+        let release_first_job = Arc::new(TestSignal::new());
+        let first_job_finished = Arc::new(TestSignal::new());
         let started_count_for_loader = Arc::clone(&started_count);
         let started_jobs_for_loader = Arc::clone(&started_jobs);
+        let first_job_started_for_loader = Arc::clone(&first_job_started);
+        let release_first_job_for_loader = Arc::clone(&release_first_job);
+        let first_job_finished_for_loader = Arc::clone(&first_job_finished);
         let poller = ScopeSelectorStatusPoller::spawn_with_loader(jobs, None, move |_| {
             started_jobs_for_loader.store(true, Ordering::Relaxed);
-            started_count_for_loader.fetch_add(1, Ordering::Relaxed);
-            thread::sleep(Duration::from_millis(100));
+            let previous_starts = started_count_for_loader.fetch_add(1, Ordering::Relaxed);
+            if previous_starts == 0 {
+                first_job_started_for_loader.notify();
+                release_first_job_for_loader.wait(Duration::from_secs(1), "first-job release");
+                first_job_finished_for_loader.notify();
+            }
             ScopeSelectorStatus::Reviewed { total_blocks: 1 }
         })
         .unwrap_or_else(|| panic!("expected status poller"));
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !started_jobs.load(Ordering::Relaxed) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
+        first_job_started.wait(Duration::from_secs(1), "first job to start");
+        assert!(started_jobs.load(Ordering::Relaxed));
         assert_eq!(started_count.load(Ordering::Relaxed), 1);
 
         poller.cancel();
         drop(poller);
-        thread::sleep(Duration::from_millis(150));
+        release_first_job.notify();
+        first_job_finished.wait(Duration::from_secs(1), "first job to finish");
 
         assert_eq!(started_count.load(Ordering::Relaxed), 1);
     }
