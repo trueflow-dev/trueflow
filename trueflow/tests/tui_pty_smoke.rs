@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::fs;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use vt100::Parser;
@@ -38,26 +38,107 @@ fn pty_smoke_harness_skips_keyboard_enhancement_probe() {
     )));
 }
 
-fn lock_output(output: &Arc<Mutex<Vec<u8>>>) -> MutexGuard<'_, Vec<u8>> {
-    match output.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+struct PtyOutput {
+    state: Mutex<PtyOutputState>,
+    changed: Condvar,
+}
+
+struct PtyOutputState {
+    bytes: Vec<u8>,
+    generation: u64,
+    reader_done: bool,
+}
+
+impl PtyOutput {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PtyOutputState {
+                bytes: Vec::new(),
+                generation: 0,
+                reader_done: false,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PtyOutputState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn append(&self, bytes: &[u8]) {
+        let mut state = self.lock_state();
+        state.bytes.extend_from_slice(bytes);
+        state.generation += 1;
+        self.changed.notify_all();
+    }
+
+    fn mark_reader_done(&self) {
+        let mut state = self.lock_state();
+        state.reader_done = true;
+        state.generation += 1;
+        self.changed.notify_all();
+    }
+
+    fn snapshot(&self) -> (Vec<u8>, u64) {
+        let state = self.lock_state();
+        (state.bytes.clone(), state.generation)
+    }
+
+    fn wait_for_change_or_deadline(&self, generation: u64, deadline: Instant) {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+
+        let state = self.lock_state();
+        if state.generation != generation || state.reader_done {
+            return;
+        }
+
+        let timeout = deadline.saturating_duration_since(now);
+        let _guard = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.generation == generation && !state.reader_done
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 }
 
-fn captured_output(output: &Arc<Mutex<Vec<u8>>>) -> String {
-    String::from_utf8_lossy(&lock_output(output).clone()).to_string()
+fn captured_output(output: &Arc<PtyOutput>) -> String {
+    let (bytes, _) = output.snapshot();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn spawn_reader_thread(
+    mut reader: Box<dyn Read + Send>,
+    output: Arc<PtyOutput>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => output.append(&buf[..count]),
+                Err(_) => break,
+            }
+        }
+        output.mark_reader_done();
+    })
 }
 
 fn wait_for_output(
-    output: &Arc<Mutex<Vec<u8>>>,
+    output: &Arc<PtyOutput>,
     needle: &str,
     timeout: Duration,
     child: &mut (dyn Child + Send + Sync),
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let current = captured_output(output);
+        let (bytes, generation) = output.snapshot();
+        let current = String::from_utf8_lossy(&bytes).to_string();
         if current.contains(needle) {
             return Ok(());
         }
@@ -69,19 +150,19 @@ fn wait_for_output(
         if Instant::now() >= deadline {
             bail!("timed out waiting for PTY output to contain {needle:?}; output: {current}");
         }
-        thread::sleep(Duration::from_millis(25));
+        output.wait_for_change_or_deadline(generation, deadline);
     }
 }
 
-fn parsed_screen_contents(output: &Arc<Mutex<Vec<u8>>>, rows: u16, cols: u16) -> String {
-    let bytes = lock_output(output).clone();
+fn parsed_screen_contents(output: &Arc<PtyOutput>, rows: u16, cols: u16) -> String {
+    let (bytes, _) = output.snapshot();
     let mut parser = Parser::new(rows, cols, 0);
     parser.process(&bytes);
     parser.screen().contents()
 }
 
 fn wait_for_screen_predicate<F>(
-    output: &Arc<Mutex<Vec<u8>>>,
+    output: &Arc<PtyOutput>,
     rows: u16,
     cols: u16,
     description: &str,
@@ -94,7 +175,10 @@ where
 {
     let deadline = Instant::now() + timeout;
     loop {
-        let screen = parsed_screen_contents(output, rows, cols);
+        let (bytes, generation) = output.snapshot();
+        let mut parser = Parser::new(rows, cols, 0);
+        parser.process(&bytes);
+        let screen = parser.screen().contents();
         if predicate(&screen) {
             return Ok(());
         }
@@ -106,7 +190,7 @@ where
         if Instant::now() >= deadline {
             bail!("timed out waiting for PTY screen {description}; screen: {screen}");
         }
-        thread::sleep(Duration::from_millis(25));
+        output.wait_for_change_or_deadline(generation, deadline);
     }
 }
 
@@ -116,8 +200,9 @@ fn send_and_flush(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn alternate_screen_leave_count(output: &Arc<Mutex<Vec<u8>>>) -> usize {
-    lock_output(output)
+fn alternate_screen_leave_count(output: &Arc<PtyOutput>) -> usize {
+    let (bytes, _) = output.snapshot();
+    bytes
         .windows(b"\x1b[?1049l".len())
         .filter(|window| *window == b"\x1b[?1049l")
         .count()
@@ -165,7 +250,7 @@ fn deeply_nested_rust_function(depth: usize) -> String {
 
 fn wait_for_child_success(
     child: &mut (dyn Child + Send + Sync),
-    output: &Arc<Mutex<Vec<u8>>>,
+    output: &Arc<PtyOutput>,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -181,7 +266,8 @@ fn wait_for_child_success(
             let output = captured_output(output);
             bail!("timed out waiting for TUI PTY smoke test to exit; output: {output}");
         }
-        thread::sleep(Duration::from_millis(50));
+        let (_, generation) = output.snapshot();
+        output.wait_for_change_or_deadline(generation, deadline);
     }
 }
 
@@ -212,22 +298,9 @@ fn pty_smoke_scope_selector_prechecks_deep_commit_without_stack_overflow() -> Re
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
-    let mut reader = pair.master.try_clone_reader()?;
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let output_reader = Arc::clone(&output);
-    let reader_thread = thread::spawn(move || {
-        let mut buf = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let mut output = lock_output(&output_reader);
-                    output.extend_from_slice(&buf[..count]);
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let reader = pair.master.try_clone_reader()?;
+    let output = PtyOutput::new();
+    let reader_thread = spawn_reader_thread(reader, Arc::clone(&output));
 
     wait_for_screen_predicate(
         &output,
@@ -290,22 +363,9 @@ fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
-    let mut reader = pair.master.try_clone_reader()?;
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let output_reader = Arc::clone(&output);
-    let reader_thread = thread::spawn(move || {
-        let mut buf = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let mut output = lock_output(&output_reader);
-                    output.extend_from_slice(&buf[..count]);
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let reader = pair.master.try_clone_reader()?;
+    let output = PtyOutput::new();
+    let reader_thread = spawn_reader_thread(reader, Arc::clone(&output));
 
     wait_for_output(&output, "Diff Mode", Duration::from_secs(15), &mut *child)?;
 
@@ -350,22 +410,9 @@ fn pty_smoke_signed_action_with_noninteractive_gpg_does_not_suspend_terminal() -
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
-    let mut reader = pair.master.try_clone_reader()?;
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let output_reader = Arc::clone(&output);
-    let reader_thread = thread::spawn(move || {
-        let mut buf = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let mut output = lock_output(&output_reader);
-                    output.extend_from_slice(&buf[..count]);
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let reader = pair.master.try_clone_reader()?;
+    let output = PtyOutput::new();
+    let reader_thread = spawn_reader_thread(reader, Arc::clone(&output));
 
     wait_for_output(&output, "Mode", Duration::from_secs(10), &mut *child)?;
     send_and_flush(&mut *writer, b"a")?;
@@ -429,22 +476,9 @@ fn pty_smoke_diff_mode_keeps_wrapped_rows_readable_in_narrow_terminal() -> Resul
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
-    let mut reader = pair.master.try_clone_reader()?;
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let output_reader = Arc::clone(&output);
-    let reader_thread = thread::spawn(move || {
-        let mut buf = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let mut output = lock_output(&output_reader);
-                    output.extend_from_slice(&buf[..count]);
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let reader = pair.master.try_clone_reader()?;
+    let output = PtyOutput::new();
+    let reader_thread = spawn_reader_thread(reader, Arc::clone(&output));
 
     wait_for_output(&output, "Diff Mode", Duration::from_secs(5), &mut *child)?;
     let screen = parsed_screen_contents(&output, rows, cols);
@@ -501,22 +535,9 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
 
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut writer = pair.master.take_writer()?;
-    let mut reader = pair.master.try_clone_reader()?;
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let output_reader = Arc::clone(&output);
-    let reader_thread = thread::spawn(move || {
-        let mut buf = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let mut output = lock_output(&output_reader);
-                    output.extend_from_slice(&buf[..count]);
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let reader = pair.master.try_clone_reader()?;
+    let output = PtyOutput::new();
+    let reader_thread = spawn_reader_thread(reader, Arc::clone(&output));
 
     wait_for_screen_predicate(
         &output,
