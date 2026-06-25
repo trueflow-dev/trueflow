@@ -333,11 +333,7 @@ impl<'a> DirectScanPathIgnoreMatcher<'a> {
 
         Ok(Self {
             path_prefixes: &options.ignore_path_prefixes,
-            ignored_names: DEFAULT_IGNORE_NAMES
-                .iter()
-                .copied()
-                .chain(options.ignore_names.iter().map(String::as_str))
-                .collect(),
+            ignored_names: options.ignore_names.iter().map(String::as_str).collect(),
             glob_matcher: if options.ignore_globs.is_empty() {
                 Gitignore::empty()
             } else {
@@ -934,6 +930,39 @@ mod tests {
             .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
 
         assert!(result.files.is_empty());
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn scan_paths_respects_empty_ignore_names() {
+        let repo = temp_test_dir("scanner_paths_empty_ignore_names");
+        let trueflow_dir = repo.join(".trueflow");
+        fs::create_dir_all(&trueflow_dir)
+            .unwrap_or_else(|error| panic!("create .trueflow dir: {error}"));
+        fs::write(trueflow_dir.join("reviews.jsonl"), "review log text\n")
+            .unwrap_or_else(|error| panic!("write review log: {error}"));
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap_or_else(|error| panic!("git init failed: {error}"));
+        let options = ScanOptions {
+            ignore_names: Vec::new(),
+            ..ScanOptions::default()
+        };
+
+        let paths = HashSet::from([RepoPath::new(".trueflow/reviews.jsonl").unwrap()]);
+        let result = scan_paths(&repo, &paths, &options)
+            .unwrap_or_else(|error| panic!("scan paths failed: {error}"));
+
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![".trueflow/reviews.jsonl"]
+        );
         assert!(result.diagnostics.is_empty());
     }
 
