@@ -3259,7 +3259,9 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
             state.skipped_nodes.insert(*child_id);
         }
     }
-    state.navigator.reveal_blocks(inserted_ids.iter().copied());
+    state
+        .navigator
+        .replace_visible_block_with_blocks(node_id, inserted_ids.iter().copied());
     refresh_review_state_after_refinement(state, previous_remaining);
     state.content_frame_cache.clear();
 
@@ -3950,15 +3952,14 @@ fn apply_action_locally(
         for &block_id in &block_ids {
             state.commented_nodes.remove(&block_id);
             state.skipped_nodes.remove(&block_id);
-            if state.navigator.remove_visible(block_id) && state.reviewable_nodes.remove(&block_id)
+            if state.navigator.remove_visible_block(block_id)
+                && state.reviewable_nodes.remove(&block_id)
             {
                 removed_reviewable += 1;
             }
         }
         state.remaining_blocks = state.remaining_blocks.saturating_sub(removed_reviewable);
     }
-
-    state.navigator.prune_visible_to_block_ancestors();
 
     if matches!(verdict, Verdict::Comment) {
         for &block_id in &block_ids {
@@ -12922,6 +12923,9 @@ mod diff_scope_tests {
             child_blocks[1].content,
             "## Coding\nDetails live here.\n\n### Dev Guide\nSteps.\n"
         );
+        let visible_child_blocks = state.navigator.visible_descendant_block_ids(root_section);
+        assert_eq!(visible_child_blocks.len(), 2);
+        assert!(!visible_child_blocks.contains(&root_section));
         assert!(!state.reviewable_nodes.contains(&root_section));
         assert_eq!(state.reviewable_nodes.len(), 2);
 
@@ -13693,6 +13697,31 @@ mod diff_scope_tests {
         assert_eq!(counts.skipped, 0);
         assert_eq!(counts.remaining, 2);
         assert_eq!(counts.total, 2);
+    }
+
+    #[test]
+    fn approve_action_prunes_visible_ancestors_after_last_block() {
+        let file_path = temp_test_file_path("tui_approve_prunes_ancestors");
+        let file_content = "fn checked() {}\n";
+        let (mut state, file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+
+        execute_action_with(
+            &mut state,
+            PendingAction::Single {
+                node_id: block_id,
+                verdict: Verdict::Approved,
+                note: None,
+            },
+            |_params| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("expected approve action to succeed: {error}"));
+
+        assert!(state.navigator.is_visible(state.navigator.tree.root()));
+        assert!(!state.navigator.is_visible(file_id));
+        assert!(!state.navigator.is_visible(block_id));
+        assert!(state.reviewable_nodes.is_empty());
+        assert_eq!(state.remaining_blocks, 0);
     }
 
     #[test]
