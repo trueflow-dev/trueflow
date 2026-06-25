@@ -497,12 +497,12 @@ fn measurement_profiles_and_stage_commands_match_recipe_split() -> Result<()> {
     );
     assert_contains(
         &measure_script,
-        "    lint-code|lint-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'",
+        "    lint-code)\n      printf '%s\\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'",
         "measure-check lint-code stage",
     );
     assert_contains(
         &measure_script,
-        "    lint-full)\n      printf '%s\\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'",
+        "    lint-full|lint-all-targets)\n      printf '%s\\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'",
         "measure-check lint-full stage",
     );
     assert_contains(

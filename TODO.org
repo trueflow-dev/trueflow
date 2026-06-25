@@ -109,6 +109,8 @@
    - [X] Add explicit all-features/all-targets `lint-full` coverage while
      keeping the fast `lint` path off bench-only targets; verified by
      `justfile_fast_and_code_gates_match_build_time_contract`.
+   - [X] Keep the measured `lint-all-targets` stage mapped to full clippy
+     coverage; verified by `measurement_profiles_and_stage_commands_match_recipe_split`.
    - [ ] Evaluate high-quality Rust lints (deny, udeps, semver-checks, geiger, nextest) and wire into `just check`.
 ** TODO [High] Installation experience
    - [ ] Formalize a high-quality install plan (cargo install vs curl | sh vs package managers).

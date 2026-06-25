@@ -11,7 +11,7 @@ Usage:
 Profiles:
   check           Default local gate (tests, lint, fmt)
   check-fast      Faster no-test local gate (lint, fmt)
-  check-heavy     Heavyweight code-only checks (audit, doc, coverage)
+  check-heavy     Heavyweight code-only checks (audit, doc, coverage, full lint)
   check-code      Broad local code verification (tests/examples/lint/docs/coverage; benches excluded)
   check-packaging Separate host-default Nix package verification
   current-check   Legacy alias for check-code
@@ -85,10 +85,10 @@ stage_command() {
     lint)
       printf '%s\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests -- -D warnings'
       ;;
-    lint-code|lint-all-targets)
+    lint-code)
       printf '%s\n' 'cd trueflow && cargo clippy --features tui-test-support --lib --bins --tests --examples -- -D warnings'
       ;;
-    lint-full)
+    lint-full|lint-all-targets)
       printf '%s\n' 'cd trueflow && cargo clippy --all-features --all-targets -- -D warnings'
       ;;
     fmt-check)
