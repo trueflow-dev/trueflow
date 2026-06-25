@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
+use std::path::Path;
 use trueflow::block::BlockKind;
 use trueflow::commands::review::{ReviewRequest, ReviewTarget};
+use trueflow::scanner::{
+    ScanCacheReadStatus, ScanCacheWriteStatus, ScanOptions, ScanResult, scan_directory,
+};
 
 use trueflow_test_support::*;
 
@@ -23,6 +27,20 @@ fn first_scan_block_hash_in_process(repo: &TestRepo) -> Result<String> {
     let file = scan.files.first().context("Expected file in output")?;
     let block = file.blocks.first().context("Expected block in output")?;
     Ok(block.hash.to_string())
+}
+
+fn scan_with_cache_dir(repo: &TestRepo, cache_dir: &Path) -> Result<ScanResult> {
+    scan_directory(
+        &repo.path,
+        &ScanOptions {
+            cache_dir: Some(cache_dir.to_path_buf()),
+            ..ScanOptions::default()
+        },
+    )
+}
+
+fn scan_contains_path(scan: &ScanResult, path: &str) -> bool {
+    scan.files.iter().any(|file| file.path.as_str() == path)
 }
 
 #[test]
@@ -1206,27 +1224,28 @@ fn test_scan_cache_write_permission_error_is_non_fatal() -> Result<()> {
     repo.write("src/main.rs", "fn main() {}\n")?;
     repo.commit_all("Add main")?;
 
-    let home = repo.path.join("readonly-home");
-    fs::create_dir_all(&home)?;
-    let mut perms = fs::metadata(&home)?.permissions();
+    let cache_dir = temp_test_dir("scan_cache_write_perm_store");
+    fs::create_dir_all(&cache_dir)?;
+    let mut perms = fs::metadata(&cache_dir)?.permissions();
     perms.set_mode(0o500);
-    fs::set_permissions(&home, perms)?;
+    fs::set_permissions(&cache_dir, perms)?;
 
-    let home_value = home.to_string_lossy().to_string();
-    let run_result = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())]);
+    let scan_result = scan_with_cache_dir(&repo, &cache_dir);
 
-    let mut reset = fs::metadata(&home)?.permissions();
+    let mut reset = fs::metadata(&cache_dir)?.permissions();
     reset.set_mode(0o755);
-    fs::set_permissions(&home, reset)?;
+    fs::set_permissions(&cache_dir, reset)?;
 
-    let output = run_result?;
-    let files = json_array(&output)?;
-    assert!(files.iter().any(|entry| {
-        entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("src/main.rs")
-    }));
+    let scan = scan_result?;
+    assert!(scan_contains_path(&scan, "src/main.rs"));
+    assert_eq!(scan.cache.write, ScanCacheWriteStatus::Error);
+    assert!(
+        scan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.reason.contains("failed to write scan cache")),
+        "expected scan cache write diagnostic, got {:?}",
+        scan.diagnostics
+    );
     Ok(())
 }
 
@@ -1236,29 +1255,15 @@ fn test_scan_cache_detects_new_untracked_files() -> Result<()> {
     repo.write("src/main.rs", "fn main() {}\n")?;
     repo.commit_all("Add main")?;
 
-    let home = repo.path.join("cache-home");
-    fs::create_dir_all(&home)?;
-    let home_value = home.to_string_lossy().to_string();
+    let cache_dir = temp_test_dir("scan_cache_new_untracked_store");
 
-    let initial = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
-    let initial_files = json_array(&initial)?;
-    assert!(initial_files.iter().any(|entry| {
-        entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("src/main.rs")
-    }));
+    let initial = scan_with_cache_dir(&repo, &cache_dir)?;
+    assert!(scan_contains_path(&initial, "src/main.rs"));
 
     repo.write("src/new_file.rs", "pub fn new_file() {}\n")?;
 
-    let rescanned = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
-    let rescanned_files = json_array(&rescanned)?;
-    assert!(rescanned_files.iter().any(|entry| {
-        entry["path"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("src/new_file.rs")
-    }));
+    let rescanned = scan_with_cache_dir(&repo, &cache_dir)?;
+    assert!(scan_contains_path(&rescanned, "src/new_file.rs"));
 
     Ok(())
 }
@@ -1270,23 +1275,19 @@ fn test_scan_cache_reuses_unchanged_files_when_one_file_changes() -> Result<()> 
     repo.write("src/b.rs", "pub fn b() -> u32 { 2 }\n")?;
     repo.commit_all("Add files")?;
 
-    let home = repo.path.join("cache-home");
-    fs::create_dir_all(&home)?;
-    let home_value = home.to_string_lossy().to_string();
+    let cache_dir = temp_test_dir("scan_cache_incremental_reuse_store");
 
-    let initial = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
-    let initial_scan = json(&initial)?;
-    assert_eq!(initial_scan["cache"]["read"].as_str(), Some("miss"));
-    assert_eq!(initial_scan["cache"]["reused_files"].as_u64(), Some(0));
-    assert_eq!(initial_scan["cache"]["rescanned_files"].as_u64(), Some(2));
+    let initial = scan_with_cache_dir(&repo, &cache_dir)?;
+    assert_eq!(initial.cache.read, ScanCacheReadStatus::Miss);
+    assert_eq!(initial.cache.reused_files, 0);
+    assert_eq!(initial.cache.rescanned_files, 2);
 
     repo.write("src/b.rs", "pub fn b() -> u32 { 22 }\n")?;
 
-    let rescanned = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
-    let rescanned_scan = json(&rescanned)?;
-    assert_eq!(rescanned_scan["cache"]["read"].as_str(), Some("hit"));
-    assert_eq!(rescanned_scan["cache"]["reused_files"].as_u64(), Some(1));
-    assert_eq!(rescanned_scan["cache"]["rescanned_files"].as_u64(), Some(1));
+    let rescanned = scan_with_cache_dir(&repo, &cache_dir)?;
+    assert_eq!(rescanned.cache.read, ScanCacheReadStatus::Hit);
+    assert_eq!(rescanned.cache.reused_files, 1);
+    assert_eq!(rescanned.cache.rescanned_files, 1);
 
     Ok(())
 }
@@ -1296,39 +1297,29 @@ fn test_scan_cache_reuses_invalid_utf8_diagnostic_for_unchanged_file() -> Result
     let repo = TestRepo::new("scan_cache_invalid_utf8_reuse")?;
     fs::write(repo.path.join("bad.txt"), [0xFF, 0xFE, 0xFD])?;
 
-    let home = repo.path.join("cache-home");
-    fs::create_dir_all(&home)?;
-    let home_value = home.to_string_lossy().to_string();
+    let cache_dir = temp_test_dir("scan_cache_invalid_utf8_reuse_store");
 
-    let initial = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
-    let initial_scan = json(&initial)?;
-    let initial_diagnostics = initial_scan["diagnostics"]
-        .as_array()
-        .context("diagnostics should be array")?;
-    assert!(initial_diagnostics.iter().any(|diagnostic| {
-        diagnostic["path"].as_str() == Some("bad.txt")
-            && diagnostic["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("invalid UTF-8")
+    let initial = scan_with_cache_dir(&repo, &cache_dir)?;
+    assert!(initial.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str() == "bad.txt")
+            && diagnostic.reason.contains("invalid UTF-8")
     }));
-    assert_eq!(initial_scan["cache"]["rescanned_files"].as_u64(), Some(1));
+    assert_eq!(initial.cache.rescanned_files, 1);
 
-    let reused = repo.run_with_env(&["scan", "--json"], &[("HOME", home_value.as_str())])?;
-    let reused_scan = json(&reused)?;
-    let reused_diagnostics = reused_scan["diagnostics"]
-        .as_array()
-        .context("diagnostics should be array")?;
-    assert!(reused_diagnostics.iter().any(|diagnostic| {
-        diagnostic["path"].as_str() == Some("bad.txt")
-            && diagnostic["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("invalid UTF-8")
+    let reused = scan_with_cache_dir(&repo, &cache_dir)?;
+    assert!(reused.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str() == "bad.txt")
+            && diagnostic.reason.contains("invalid UTF-8")
     }));
-    assert_eq!(reused_scan["cache"]["read"].as_str(), Some("hit"));
-    assert_eq!(reused_scan["cache"]["reused_files"].as_u64(), Some(1));
-    assert_eq!(reused_scan["cache"]["rescanned_files"].as_u64(), Some(0));
+    assert_eq!(reused.cache.read, ScanCacheReadStatus::Hit);
+    assert_eq!(reused.cache.reused_files, 1);
+    assert_eq!(reused.cache.rescanned_files, 0);
 
     Ok(())
 }
