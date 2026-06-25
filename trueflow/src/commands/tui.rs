@@ -1067,13 +1067,16 @@ enum ContentFrameCacheVariant {
     FileDiff {
         code_width: u16,
     },
-    FileSource,
+    FileSource {
+        code_width: u16,
+    },
     BlockDiff {
         focus_mode: vcs::BlockDiffFocusMode,
         code_width: u16,
     },
     BlockSource {
         code_height: u16,
+        code_width: u16,
     },
 }
 
@@ -4710,14 +4713,17 @@ fn content_frame_cache_key(
     let variant = match node_kind {
         TreeNodeKind::File => match view_mode {
             ViewMode::Diff => ContentFrameCacheVariant::FileDiff { code_width },
-            ViewMode::Source => ContentFrameCacheVariant::FileSource,
+            ViewMode::Source => ContentFrameCacheVariant::FileSource { code_width },
         },
         TreeNodeKind::Block => match view_mode {
             ViewMode::Diff => ContentFrameCacheVariant::BlockDiff {
                 focus_mode: block_diff_focus_mode,
                 code_width,
             },
-            ViewMode::Source => ContentFrameCacheVariant::BlockSource { code_height },
+            ViewMode::Source => ContentFrameCacheVariant::BlockSource {
+                code_height,
+                code_width,
+            },
         },
         TreeNodeKind::Directory | TreeNodeKind::Root => return None,
     };
