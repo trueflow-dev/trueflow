@@ -223,9 +223,9 @@ pub fn scan_paths<P: AsRef<Path>>(
         reused_files: 0,
         rescanned_files: 0,
     };
-    let cached_entry = load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics);
-    let cached_entry_count = cached_entry.as_ref().map(HashMap::len);
-    let mut cache_files = cached_entry.clone().unwrap_or_default();
+    let mut cache_files =
+        load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics).unwrap_or_default();
+    let cached_entry_count = (cache.read == ScanCacheReadStatus::Hit).then_some(cache_files.len());
     let mut files = Vec::new();
     let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
     ordered_paths.sort();
@@ -264,14 +264,12 @@ pub fn scan_paths<P: AsRef<Path>>(
                 size: metadata.len(),
             },
         };
-        let reused_entry = cached_entry
-            .as_ref()
-            .and_then(|entries| entries.get(&input.path))
-            .filter(|entry| entry.stamp == input.stamp);
+        let cached_file = cache_files.remove(&input.path);
+        let reused_entry = cached_file.filter(|entry| entry.stamp == input.stamp);
         let cache_file = match reused_entry {
             Some(entry) => {
                 cache.reused_files += 1;
-                entry.clone()
+                entry
             }
             None => {
                 cache.rescanned_files += 1;
