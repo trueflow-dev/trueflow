@@ -4268,8 +4268,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         focus_layout.code.height,
         render_code_width,
     );
-    let mut display_metrics =
-        display_metrics_for_content(state, &node_snapshot, &content, render_code_width);
+    let mut display_metrics = display_metrics_for_content(&content);
 
     loop {
         let show_scrollbar = display_metrics.0 > usize::from(focus_layout.code.height);
@@ -4290,8 +4289,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
             focus_layout.code.height,
             render_code_width,
         );
-        display_metrics =
-            display_metrics_for_content(state, &node_snapshot, &content, render_code_width);
+        display_metrics = display_metrics_for_content(&content);
     }
 
     let (display_total_lines, display_focus_row_range) = display_metrics;
@@ -4408,23 +4406,8 @@ fn build_render_content(
     }
 }
 
-fn display_metrics_for_content(
-    state: &AppState,
-    node: &ContentNodeSnapshot,
-    content: &BuiltContent,
-    code_width: u16,
-) -> (usize, Option<std::ops::Range<usize>>) {
-    if matches!(state.view_mode, ViewMode::Source)
-        && matches!(node.kind, TreeNodeKind::File | TreeNodeKind::Block)
-    {
-        wrapped_display_metrics_for_lines(
-            &content.lines,
-            content.focus_row_range.as_ref(),
-            code_width,
-        )
-    } else {
-        (content.total_lines, content.focus_row_range.clone())
-    }
+fn display_metrics_for_content(content: &BuiltContent) -> (usize, Option<std::ops::Range<usize>>) {
+    (content.total_lines, content.focus_row_range.clone())
 }
 
 fn wrapped_display_metrics_for_lines(
@@ -5877,7 +5860,6 @@ fn build_source_context_content(
                 )
             })
             .collect::<Vec<_>>();
-        let total_lines = lines.len();
         let comment_rows = Some(source_comment_rows(
             &lines,
             &block
@@ -5888,10 +5870,12 @@ fn build_source_context_content(
             block.start_line,
             code_width,
         ));
+        let (total_lines, focus_row_range) =
+            wrapped_display_metrics_for_lines(&lines, Some(&(0..lines.len())), code_width);
         return BuiltContent {
             lines,
             total_lines,
-            focus_row_range: Some(0..total_lines),
+            focus_row_range,
             comment_rows,
         };
     }
@@ -5912,7 +5896,6 @@ fn build_source_context_content(
                     )
                 })
                 .collect::<Vec<_>>();
-            let total_lines = lines.len();
             let comment_rows = Some(source_comment_rows(
                 &lines,
                 &block
@@ -5923,10 +5906,12 @@ fn build_source_context_content(
                 block.start_line,
                 code_width,
             ));
+            let (total_lines, focus_row_range) =
+                wrapped_display_metrics_for_lines(&lines, Some(&(0..lines.len())), code_width);
             return BuiltContent {
                 lines,
                 total_lines,
-                focus_row_range: Some(0..total_lines),
+                focus_row_range,
                 comment_rows,
             };
         }
@@ -5942,7 +5927,7 @@ fn build_source_context_content(
     };
 
     let highlight_line_span = focus_line_span_for_node(state, node, file_lines.len());
-    let focus_row_range = changed_focus_line_span_for_source_node(state, node, file_lines.len())
+    let focus_line_range = changed_focus_line_span_for_source_node(state, node, file_lines.len())
         .or_else(|| highlight_line_span.clone());
 
     let mut lines = Vec::with_capacity(file_lines.len());
@@ -5980,9 +5965,11 @@ fn build_source_context_content(
         0,
         code_width,
     ));
+    let (total_lines, focus_row_range) =
+        wrapped_display_metrics_for_lines(&lines, focus_line_range.as_ref(), code_width);
 
     BuiltContent {
-        total_lines: lines.len(),
+        total_lines,
         lines,
         focus_row_range,
         comment_rows,
@@ -10859,6 +10846,31 @@ mod diff_scope_tests {
 
         assert_eq!(total_lines, 3);
         assert_eq!(focus_row_range, Some(2..3));
+    }
+
+    #[test]
+    fn build_file_lines_source_mode_stores_wrapped_display_metrics() {
+        let file_path = temp_test_file_path("tui_file_source_cached_wrapped_metrics");
+        let file_content = "short\nthis_is_a_very_long_source_line_that_wraps_in_a_narrow_view\n";
+        let block_content = "this_is_a_very_long_source_line_that_wraps_in_a_narrow_view\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, block_content, 1, 2);
+        state.view_mode = ViewMode::Source;
+        let node = state.navigator.tree.node(file_id);
+        let snapshot = ContentNodeSnapshot::from_node(node);
+        let palette = UiPalette::default();
+
+        let content = build_file_lines(&mut state, &snapshot, &palette, 3, 12);
+        let display_metrics = display_metrics_for_content(&content);
+
+        assert!(
+            content.total_lines > content.lines.len(),
+            "narrow source content should cache wrapped display row count"
+        );
+        assert_eq!(
+            display_metrics,
+            (content.total_lines, content.focus_row_range)
+        );
     }
 
     #[test]
