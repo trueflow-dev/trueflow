@@ -2279,9 +2279,43 @@ fn ensure_ai_suggestion_for_current_focus(state: &mut AppState) -> bool {
         return reset_ai_status_to_availability(state);
     };
 
+    let receiver = match start_ai_suggestion_worker(provider, request, key.clone(), |worker| {
+        thread::Builder::new()
+            .name("trueflow-ai-suggestion".to_string())
+            .spawn(worker)
+    }) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            state.ai.pending = None;
+            state.ai.status = TuiAiStatus::Error {
+                key,
+                message: error,
+            };
+            return true;
+        }
+    };
+
+    state.ai.pending = Some(PendingAiSuggestion::new(
+        key.clone(),
+        receiver,
+        Instant::now(),
+    ));
+    state.ai.status = TuiAiStatus::Loading { key, frame: 0 };
+    true
+}
+
+fn start_ai_suggestion_worker<SpawnFn, WorkerHandle>(
+    provider: Arc<dyn AiSuggestionProvider>,
+    request: AiSuggestionRequest,
+    key: AiSuggestionKey,
+    spawn: SpawnFn,
+) -> std::result::Result<mpsc::Receiver<AiSuggestionWorkerResult>, String>
+where
+    SpawnFn: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<WorkerHandle>,
+{
     let (sender, receiver) = mpsc::channel();
-    let thread_key = key.clone();
-    let _worker = thread::spawn(move || {
+    let thread_key = key;
+    let worker = Box::new(move || {
         let result = provider
             .suggest(&request)
             .map_err(|error| truncate_ai_error(&error.to_string()));
@@ -2291,13 +2325,10 @@ fn ensure_ai_suggestion_for_current_focus(state: &mut AppState) -> bool {
         });
     });
 
-    state.ai.pending = Some(PendingAiSuggestion::new(
-        key.clone(),
-        receiver,
-        Instant::now(),
-    ));
-    state.ai.status = TuiAiStatus::Loading { key, frame: 0 };
-    true
+    spawn(worker)
+        .map_err(|error| truncate_ai_error(&format!("failed to start provider worker: {error}")))?;
+
+    Ok(receiver)
 }
 
 const AI_LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(480);
@@ -7328,6 +7359,17 @@ mod diff_scope_tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Condvar, mpsc};
 
+    struct StaticAiSuggestionProvider;
+
+    impl AiSuggestionProvider for StaticAiSuggestionProvider {
+        fn suggest(&self, _request: &AiSuggestionRequest) -> Result<AiSuggestion> {
+            Ok(AiSuggestion {
+                explanation: None,
+                proposed_change: Some("Use the cached suggestion.".to_string()),
+            })
+        }
+    }
+
     fn build_test_state(
         review_scope: ScopePreset,
         file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
@@ -12333,6 +12375,38 @@ mod diff_scope_tests {
             build_ai_hint_line(&state, &palette).map(|line| line.to_string()),
             Some("✦ · ·".to_string())
         );
+    }
+
+    #[test]
+    fn ai_worker_spawn_failure_reports_error() {
+        let file_path = temp_test_file_path("tui_ai_spawn_failure");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::from_availability(
+            AiAvailability::Ready {
+                provider: crate::ai::AiProvider::Anthropic,
+                model: "auto".to_string(),
+            },
+            80,
+            true,
+        );
+        let request = match ai_suggestion_request_for_current_focus(&state) {
+            Some(request) => request,
+            None => panic!("expected AI request for focused block"),
+        };
+        let key = request.key.clone();
+        let provider = Arc::new(StaticAiSuggestionProvider);
+
+        let result = start_ai_suggestion_worker(provider, request, key, |_worker| {
+            Err(std::io::Error::other("thread budget exhausted"))
+                as std::io::Result<std::thread::JoinHandle<()>>
+        });
+        let Err(error) = result else {
+            panic!("expected worker spawn failure");
+        };
+
+        assert!(error.contains("thread budget exhausted"));
     }
 
     #[test]
