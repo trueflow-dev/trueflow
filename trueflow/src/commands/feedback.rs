@@ -132,15 +132,7 @@ fn feedback_changed_selection(
 ) -> Option<ReviewPathSelection> {
     targets
         .iter()
-        .any(|target| {
-            matches!(
-                target,
-                ReviewTarget::DirtyWorktree
-                    | ReviewTarget::MainDiff
-                    | ReviewTarget::Revision(_)
-                    | ReviewTarget::RevisionRange(_)
-            )
-        })
+        .any(|target| matches!(target, ReviewTarget::DirtyWorktree | ReviewTarget::MainDiff))
         .then(|| resolved_targets.changed_selection())
         .flatten()
 }
@@ -1385,6 +1377,34 @@ mod tests {
 
         assert!(selection.includes(&changed));
         assert!(!selection.includes(&unchanged));
+        Ok(())
+    }
+
+    #[test]
+    fn feedback_changed_selection_keeps_revision_ranges_record_centric() -> Result<()> {
+        let changed = crate::repo_path::RepoPath::new("src/changed.rs")?;
+        let resolved_targets = ResolvedTargets::new(
+            crate::targets::ReviewContentSource::Revision(CommitId::new("bbbbbbb")?),
+            crate::targets::ReviewDiffSelection::Targets(vec![
+                crate::targets::ReviewDiffTarget::RevisionRange(crate::targets::CommitRange {
+                    start: CommitId::new("aaaaaaa")?,
+                    end: CommitId::new("bbbbbbb")?,
+                }),
+            ]),
+            HashSet::new(),
+            Vec::new(),
+            HashSet::from([changed]),
+        );
+
+        assert!(
+            feedback_changed_selection(
+                &[ReviewTarget::RevisionRange(
+                    crate::commands::review::RevisionRangeExpr::new("aaaaaaa", "bbbbbbb")?
+                )],
+                &resolved_targets,
+            )
+            .is_none()
+        );
         Ok(())
     }
 
