@@ -1,6 +1,117 @@
 #+title: Project Trueflow TODOs
 #+STARTUP: content hidestars
 
+
+* DEF_TODO High-confidence defect findings
+** DONE DEF_TODO [High] Resolve merge conflict markers blocking builds
+   - `flake.nix` contains an unresolved conflict at lines 126-131, so
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --features tui-test-support`
+     fails while parsing the flake.
+   - `trueflow/src/commands/tui.rs` contains unresolved conflict markers in
+     `apply_action_locally` and block-header helpers, so the Rust crate cannot
+     compile once the environment reaches crate parsing.
+   - Fixed by resolving the flake dev-shell package list to use
+     `commonNativeBuildInputs`, resolving the TUI conflicts to keep
+     `ReviewNavigator::remove_visible_block` and the nested block-header
+     renderer, and removing the orphaned helper left by the discarded side.
+   - Verified by `search` finding no conflict markers in `flake.nix` or
+     `trueflow/src/commands/tui.rs`, and by
+     `nix develop -c cargo check --manifest-path trueflow/Cargo.toml --features tui-test-support --lib --bins`.
+** DEF_TODO [High] Make review collection honor direct block verdicts under approved files
+   - `trueflow/src/commands/review.rs` skips an entire file when the file node
+     has an effective approved verdict before checking child blocks.
+   - Repro: approve a file target, then add a later block-level rejected/comment
+     record for a block in that file; `review --all --json` should still show
+     the block, but the early file skip hides it.
+** DEF_TODO [High] Count only approving identities for ApprovedOnly multi-person coverage
+   - `trueflow/src/coverage.rs` counts all identities for a check when enforcing
+     `CoveragePolicy::two_person_review()`, regardless of whether those records
+     approved or rejected/commented.
+   - Repro: Alice rejects/comments a block, Bob later approves it; latest verdict
+     is approved and two identities are counted even though only one person
+     approved.
+** DEF_TODO [High] Validate RepoPath during serde deserialization
+   - `trueflow/src/repo_path.rs` validates constructor input but derives
+     `Deserialize` directly into the private string field.
+   - Repro: `serde_json::from_str::<RepoPath>("\"../outside.rs\"")` currently
+     accepts a path normal construction rejects, allowing invalid persisted
+     review records and scan cache entries.
+** DEF_TODO [High] Reject scan cache entries whose payload path differs from the cache key
+   - `trueflow/src/scanner.rs` indexes cached entries by `CachedFileEntry.path`
+     and stamp, then blindly appends the embedded `FileState` from the cached
+     outcome.
+   - Repro: a cache entry keyed as `src/lib.rs` with the correct file stamp but
+     an included `file_state.path` of `other.rs` will be reused and poison the
+     scanned file set instead of being rejected or rescanned.
+** DEF_TODO [High] Make PR feedback honor accepted filters
+   - `trueflow/src/commands/feedback.rs` accepts `--since`, `--only`,
+     `--exclude`, and `--include-approved`, but the `--pr` path returns before
+     passing those filters into `run_pull_request_feedback`.
+   - Repro: create old and new anchored PR feedback records, run
+     `feedback --pr pr:11 --since <after-old> --dry-run`; the old filtered-out
+     record is still staged for GitHub.
+** DEF_TODO [High] Do not advance the feedback `last` cursor past filtered-out records
+   - `collect_local_feedback` builds the cursor from all database records, not
+     the exported records.
+   - Repro: export `feedback --since last --target file:src/a.rs` with newer
+     feedback in `src/b.rs`; the cursor advances past the unseen `src/b.rs`
+     record and later `--since last` exports skip it forever.
+** DEF_TODO [High] Suppress PR feedback records whose target was later approved
+   - Local feedback uses latest-verdict suppression, but
+     `build_pull_request_feedback_plan` stages any noted anchored record without
+     checking whether a later approved record resolved the same target.
+   - Repro: store a comment record with an anchor, then a later approved record
+     for the same target; `feedback --pr --dry-run` still stages the stale
+     comment.
+** DEF_TODO [Medium] Make relative feedback durations reject timestamp underflow
+   - `trueflow/src/feedback_since.rs` checks multiplication overflow but then
+     computes `now.timestamp() - seconds` directly.
+   - Repro: a huge but multiplication-safe duration such as an enormous day/week
+     count can underflow, panicking in debug builds or wrapping in release
+     instead of returning a validation error.
+** DEF_TODO [High] Roll back partially-entered TUI terminal modes on enter failure
+   - `enter_tui_mode` enters alternate screen, mouse capture, and bracketed
+     paste before optionally pushing keyboard enhancement flags.
+   - Repro: a writer that fails on the keyboard-enhancement write returns an
+     error after earlier terminal modes were already enabled, and
+     `TerminalSession::enter` does not call `leave_tui_mode` for that failure.
+** DEF_TODO [High] Best-effort leave alternate screen even if keyboard-pop fails
+   - `leave_tui_mode` returns immediately if `PopKeyboardEnhancementFlags`
+     fails, so `LeaveAlternateScreen` is never attempted.
+   - Repro: a writer that fails on the pop sequence records disable mouse/paste
+     bytes but no leave-alternate-screen bytes, and `Drop` retries the same
+     failing path.
+** DEF_TODO [Medium] Ignore or explicitly handle modified normal-mode TUI keypresses
+   - Normal-mode key handling matches only `KeyCode`, so Ctrl-C is treated like
+     plain `c` and opens the note overlay under the default keybinds.
+   - Repro: send `KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)` in
+     a vt100/test-support normal review scenario; it dispatches `KeybindAction::Note`.
+** DEF_TODO [High] Preserve full Dart and Lua review-unit content in sub-splits
+   - Dart type-like and Lua module-like splitters register `ReviewUnits` but
+     emit only member/table-field spans, dropping class/module headers, braces,
+     separators, and unrecognized chunks.
+   - Repro: assert concatenated sub-block content equals the parent block for a
+     Dart `class Worker { ... }` and a Lua `local Defaults = { ... }`; changed
+     headers/punctuation can otherwise be approved without review.
+** DEF_TODO [Medium] Stop Clojure namespace sub-splitting from classifying later clauses as imports
+   - `split_container_like_block` extends the last collected Clojure semantic
+     span to the end of the form.
+   - Repro: `(ns demo.core (:require [clojure.string :as str]) (:gen-class))`
+     makes the `:require` Import span include `(:gen-class)` and the closing
+     paren, so import filters can hide non-import namespace configuration.
+** DEF_TODO [High] Require review coverage for structural container headers
+   - Go/C++/Zig/Haskell structural-child splitters emit semantic children but no
+     header/preamble/trailer review unit, while `is_subblock_covered` treats all
+     covered structural children as covering the parent.
+   - Repro: approve all fields/methods of a large struct/class, then change only
+     the parent header; review can consider the parent covered because there is
+     no header sub-block to require approval.
+** DEF_TODO [Medium] Detect binary files with NUL bytes beyond the first kilobyte
+   - `analysis::analyze_file` comments say it checks the first 8KB for NUL but
+     actually reads only 1024 bytes.
+   - Repro: an extensionless file with a NUL at byte 1200 is classified as text;
+     `scanner::process_file` then attempts UTF-8 parsing and records a scan
+     diagnostic instead of returning a binary `FileState`.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of
