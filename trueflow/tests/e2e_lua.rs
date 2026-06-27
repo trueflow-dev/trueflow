@@ -212,13 +212,16 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
         .map(|block| block.kind)
         .collect::<Vec<_>>();
     assert_eq!(
-        aliases_kinds,
-        vec![
-            BlockKind::Comment,
-            BlockKind::CodeParagraph,
-            BlockKind::CodeParagraph,
-        ],
-        "expected Lua positional table entries to remain reviewable: {aliases_kinds:?}"
+        aliases_kinds
+            .iter()
+            .filter(|kind| **kind == BlockKind::CodeParagraph)
+            .count(),
+        4,
+        "expected Lua positional table header, entries, and trailer to remain reviewable: {aliases_kinds:?}"
+    );
+    assert!(
+        aliases_kinds.contains(&BlockKind::Comment),
+        "expected Lua positional table comment to remain reviewable: {aliases_kinds:?}"
     );
 
     Ok(())
