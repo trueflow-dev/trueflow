@@ -173,12 +173,16 @@
      cover the omitted header/preamble/trailer bytes.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib structural_child_coverage_does_not_cover_container_header`.
-** DEF_TODO [Medium] Detect binary files with NUL bytes beyond the first kilobyte
+** DONE DEF_TODO [Medium] Detect binary files with NUL bytes beyond the first kilobyte
    - `analysis::analyze_file` comments say it checks the first 8KB for NUL but
      actually reads only 1024 bytes.
    - Repro: an extensionless file with a NUL at byte 1200 is classified as text;
      `scanner::process_file` then attempts UTF-8 parsing and records a scan
      diagnostic instead of returning a binary `FileState`.
+   - Fixed by reading the documented 8 KiB binary-detection header instead of
+     1 KiB before checking for NUL bytes and shebangs.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib analyze_file_detects_binary_nul_after_first_kilobyte`.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of

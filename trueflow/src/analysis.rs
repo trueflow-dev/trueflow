@@ -130,7 +130,7 @@ pub fn analyze_file(path: &Path) -> FileType {
 
     if let Ok(mut file) = std::fs::File::open(path) {
         use std::io::Read;
-        let mut buffer = [0; 1024]; // 1KB check is usually enough
+        let mut buffer = [0; 8 * 1024];
         if let Ok(n) = file.read(&mut buffer) {
             let slice = &buffer[..n];
             if slice.contains(&0) {
@@ -223,6 +223,15 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, contents).unwrap_or_else(|error| panic!("write temp file: {error}"));
         TempPath::new(path)
+    }
+
+    #[test]
+    fn analyze_file_detects_binary_nul_after_first_kilobyte() {
+        let mut contents = vec![b'a'; 1500];
+        contents[1200] = 0;
+        let file = write_temp_file("payload", &contents);
+
+        assert!(matches!(analyze_file(file.path()), FileType::Binary));
     }
 
     #[test]
