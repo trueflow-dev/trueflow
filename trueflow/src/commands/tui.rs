@@ -6040,82 +6040,147 @@ fn build_contextual_diff_rows(
     file_lines: &[String],
     hunks: &[vcs::DiffHunk],
 ) -> Vec<ContextualDiffRow> {
+    build_contextual_diff_rows_matching(file_lines, hunks, None)
+}
+
+fn build_contextual_diff_rows_for_line_span(
+    file_lines: &[String],
+    hunks: &[vcs::DiffHunk],
+    line_span: &std::ops::Range<usize>,
+) -> Vec<ContextualDiffRow> {
+    build_contextual_diff_rows_matching(file_lines, hunks, Some(line_span))
+}
+
+fn build_contextual_diff_rows_matching(
+    file_lines: &[String],
+    hunks: &[vcs::DiffHunk],
+    line_span: Option<&std::ops::Range<usize>>,
+) -> Vec<ContextualDiffRow> {
     let mut rows = Vec::new();
     let mut old_line: u32 = 1;
     let mut new_line: u32 = 1;
 
     for hunk in hunks {
-        while new_line < hunk.new_start {
-            let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(usize::MAX);
-            if let Some(text) = file_lines.get(line_index) {
-                rows.push(ContextualDiffRow {
-                    kind: vcs::DiffLineKind::Context,
-                    old_line: Some(old_line),
-                    new_line: Some(new_line),
-                    text: text.clone(),
-                    anchor_index: line_index,
-                });
-            }
-            old_line = old_line.saturating_add(1);
-            new_line = new_line.saturating_add(1);
-        }
+        push_contextual_diff_gap_rows(
+            &mut rows,
+            file_lines,
+            &mut old_line,
+            &mut new_line,
+            hunk.new_start,
+            line_span,
+        );
 
         for line in &hunk.lines {
             match line.kind {
                 vcs::DiffLineKind::Context => {
                     let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(0);
-                    rows.push(ContextualDiffRow {
-                        kind: vcs::DiffLineKind::Context,
-                        old_line: Some(old_line),
-                        new_line: Some(new_line),
-                        text: line.text.trim_end_matches('\n').to_string(),
-                        anchor_index: line_index,
-                    });
+                    if contextual_diff_row_matches(line_span, line_index) {
+                        rows.push(ContextualDiffRow {
+                            kind: vcs::DiffLineKind::Context,
+                            old_line: Some(old_line),
+                            new_line: Some(new_line),
+                            text: line.text.trim_end_matches('\n').to_string(),
+                            anchor_index: line_index,
+                        });
+                    }
                     old_line = old_line.saturating_add(1);
                     new_line = new_line.saturating_add(1);
                 }
                 vcs::DiffLineKind::Added => {
                     let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(0);
-                    rows.push(ContextualDiffRow {
-                        kind: vcs::DiffLineKind::Added,
-                        old_line: None,
-                        new_line: Some(new_line),
-                        text: line.text.trim_end_matches('\n').to_string(),
-                        anchor_index: line_index,
-                    });
+                    if contextual_diff_row_matches(line_span, line_index) {
+                        rows.push(ContextualDiffRow {
+                            kind: vcs::DiffLineKind::Added,
+                            old_line: None,
+                            new_line: Some(new_line),
+                            text: line.text.trim_end_matches('\n').to_string(),
+                            anchor_index: line_index,
+                        });
+                    }
                     new_line = new_line.saturating_add(1);
                 }
                 vcs::DiffLineKind::Removed => {
                     let line_index = usize::try_from(new_line.saturating_sub(1)).unwrap_or(0);
-                    rows.push(ContextualDiffRow {
-                        kind: vcs::DiffLineKind::Removed,
-                        old_line: Some(old_line),
-                        new_line: None,
-                        text: line.text.trim_end_matches('\n').to_string(),
-                        anchor_index: line_index,
-                    });
+                    if contextual_diff_row_matches(line_span, line_index) {
+                        rows.push(ContextualDiffRow {
+                            kind: vcs::DiffLineKind::Removed,
+                            old_line: Some(old_line),
+                            new_line: None,
+                            text: line.text.trim_end_matches('\n').to_string(),
+                            anchor_index: line_index,
+                        });
+                    }
                     old_line = old_line.saturating_add(1);
                 }
             }
         }
     }
 
-    while let Ok(line_index) = usize::try_from(new_line.saturating_sub(1)) {
-        let Some(text) = file_lines.get(line_index) else {
-            break;
-        };
-        rows.push(ContextualDiffRow {
-            kind: vcs::DiffLineKind::Context,
-            old_line: Some(old_line),
-            new_line: Some(new_line),
-            text: text.clone(),
-            anchor_index: line_index,
-        });
-        old_line = old_line.saturating_add(1);
-        new_line = new_line.saturating_add(1);
-    }
+    let tail_end = u32::try_from(file_lines.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    push_contextual_diff_gap_rows(
+        &mut rows,
+        file_lines,
+        &mut old_line,
+        &mut new_line,
+        tail_end,
+        line_span,
+    );
 
     rows
+}
+
+fn push_contextual_diff_gap_rows(
+    rows: &mut Vec<ContextualDiffRow>,
+    file_lines: &[String],
+    old_line: &mut u32,
+    new_line: &mut u32,
+    end_new_line: u32,
+    line_span: Option<&std::ops::Range<usize>>,
+) {
+    if end_new_line <= *new_line {
+        return;
+    }
+
+    let start_new_line = *new_line;
+    let emit_start = line_span
+        .and_then(|span| u32::try_from(span.start).ok())
+        .map(|start| start.saturating_add(1).max(start_new_line))
+        .unwrap_or(start_new_line);
+    let emit_end = line_span
+        .and_then(|span| u32::try_from(span.end).ok())
+        .map(|end| end.saturating_add(1).min(end_new_line))
+        .unwrap_or(end_new_line);
+
+    if emit_start < emit_end {
+        let mut emit_old_line = old_line.saturating_add(emit_start.saturating_sub(start_new_line));
+        for current_new_line in emit_start..emit_end {
+            let line_index =
+                usize::try_from(current_new_line.saturating_sub(1)).unwrap_or(usize::MAX);
+            if let Some(text) = file_lines.get(line_index) {
+                rows.push(ContextualDiffRow {
+                    kind: vcs::DiffLineKind::Context,
+                    old_line: Some(emit_old_line),
+                    new_line: Some(current_new_line),
+                    text: text.clone(),
+                    anchor_index: line_index,
+                });
+            }
+            emit_old_line = emit_old_line.saturating_add(1);
+        }
+    }
+
+    let delta = end_new_line.saturating_sub(start_new_line);
+    *old_line = old_line.saturating_add(delta);
+    *new_line = end_new_line;
+}
+
+fn contextual_diff_row_matches(
+    line_span: Option<&std::ops::Range<usize>>,
+    anchor_index: usize,
+) -> bool {
+    line_span.is_none_or(|span| span.contains(&anchor_index))
 }
 
 fn focus_row_range_for_contextual_diff_rows(
@@ -6414,6 +6479,8 @@ fn build_diff_context_content(
     let display_line_span = focus_line_span_for_node(state, node, file_lines.len());
     let block_line_span = block_line_span_for_node(node, file_lines.len());
     let focus_block_line_span = focus_block_line_span_for_node(state, node, file_lines.len());
+    let include_added_block_insertion_context =
+        should_include_added_block_insertion_context(state, node);
 
     let Some(file_diff) = cached_file_diff_for_node(state, node) else {
         return content_message("(No path for diff)", None, palette);
@@ -6421,19 +6488,24 @@ fn build_diff_context_content(
 
     match file_diff {
         vcs::FileDiff::Text { hunks, .. } => {
-            let rows = build_contextual_diff_rows(&file_lines, hunks);
-            let include_added_block_insertion_context =
-                should_include_added_block_insertion_context(state, node);
-            let rows = match (&node.kind, display_line_span.as_ref()) {
-                (TreeNodeKind::Block, Some(display_span)) => rows
-                    .into_iter()
-                    .filter(|row| {
-                        display_span.contains(&row.anchor_index)
-                            || (include_added_block_insertion_context
-                                && row.kind == vcs::DiffLineKind::Context)
-                    })
-                    .collect::<Vec<_>>(),
-                _ => rows,
+            let rows = match (
+                node.kind,
+                display_line_span.as_ref(),
+                include_added_block_insertion_context,
+            ) {
+                (TreeNodeKind::Block, Some(display_span), false) => {
+                    build_contextual_diff_rows_for_line_span(&file_lines, hunks, display_span)
+                }
+                (TreeNodeKind::Block, Some(display_span), true) => {
+                    build_contextual_diff_rows(&file_lines, hunks)
+                        .into_iter()
+                        .filter(|row| {
+                            display_span.contains(&row.anchor_index)
+                                || row.kind == vcs::DiffLineKind::Context
+                        })
+                        .collect::<Vec<_>>()
+                }
+                _ => build_contextual_diff_rows(&file_lines, hunks),
             };
             let focus_row_range = focus_block_line_span
                 .as_ref()
@@ -9522,6 +9594,51 @@ mod diff_scope_tests {
         let style = style_for_contextual_diff_row(&row, Some(&(10..15)), &palette);
 
         assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn contextual_diff_rows_for_line_span_match_full_rows_filtered_to_span() {
+        let file_lines = (1..=20)
+            .map(|line| format!("line{line}"))
+            .collect::<Vec<_>>();
+        let hunks = vec![
+            vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 4,
+                new_start: 4,
+                lines: vec![
+                    vcs::DiffHunkLine::context("line4\n"),
+                    vcs::DiffHunkLine::removed("line5 old\n"),
+                    vcs::DiffHunkLine::added("line5 new\n"),
+                    vcs::DiffHunkLine::context("line6\n"),
+                ],
+            },
+            vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 16,
+                new_start: 16,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("line16 old\n"),
+                    vcs::DiffHunkLine::added("line16 new\n"),
+                ],
+            },
+        ];
+        let span = 3..6;
+
+        let full_filtered = build_contextual_diff_rows(&file_lines, &hunks)
+            .into_iter()
+            .filter(|row| span.contains(&row.anchor_index))
+            .collect::<Vec<_>>();
+        let clipped = build_contextual_diff_rows_for_line_span(&file_lines, &hunks, &span);
+
+        assert_eq!(clipped, full_filtered);
+        assert_eq!(
+            clipped
+                .iter()
+                .map(|row| row.anchor_index)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 4, 5]
+        );
     }
 
     #[test]
