@@ -105,12 +105,16 @@
      the existing "relative duration is too large" validation error on overflow.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib feedback_since::tests`.
-** DEF_TODO [High] Roll back partially-entered TUI terminal modes on enter failure
+** DONE DEF_TODO [High] Roll back partially-entered TUI terminal modes on enter failure
    - `enter_tui_mode` enters alternate screen, mouse capture, and bracketed
      paste before optionally pushing keyboard enhancement flags.
    - Repro: a writer that fails on the keyboard-enhancement write returns an
      error after earlier terminal modes were already enabled, and
      `TerminalSession::enter` does not call `leave_tui_mode` for that failure.
+   - Fixed by rolling back base TUI modes if keyboard enhancement setup fails
+     after alternate screen, mouse capture, and bracketed paste were enabled.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::tui_terminal::tests`.
 ** DEF_TODO [High] Best-effort leave alternate screen even if keyboard-pop fails
    - `leave_tui_mode` returns immediately if `PopKeyboardEnhancementFlags`
      fails, so `LeaveAlternateScreen` is never attempted.

@@ -118,12 +118,24 @@ pub(crate) fn enter_tui_mode<W: io::Write>(
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
-    if capabilities.keyboard_enhancement_supported() {
-        execute!(
+    if capabilities.keyboard_enhancement_supported()
+        && let Err(error) = execute!(
             writer,
             PushKeyboardEnhancementFlags(tui_keyboard_enhancement_flags())
-        )?;
+        )
+    {
+        let primary = anyhow::Error::new(error);
+        if let Err(restore) = leave_base_tui_mode(writer) {
+            return Err(merge_primary_and_restore_error(&primary, &restore));
+        }
+        return Err(primary);
     }
+    Ok(())
+}
+
+fn leave_base_tui_mode<W: io::Write>(writer: &mut W) -> Result<()> {
+    execute!(writer, DisableMouseCapture, DisableBracketedPaste)?;
+    execute!(writer, LeaveAlternateScreen)?;
     Ok(())
 }
 
@@ -502,6 +514,57 @@ mod tests {
             String::from_utf8(output).unwrap_or_else(|error| panic!("invalid ansi bytes: {error}"));
         assert!(rendered.contains("\u{1b}[?2004h"));
         assert!(!rendered.contains("\u{1b}[>11u"));
+    }
+
+    #[test]
+    fn enter_tui_mode_rolls_back_base_modes_when_keyboard_enhancement_fails() {
+        struct FailOnceOnKeyboardPush {
+            output: Vec<u8>,
+            failed: bool,
+        }
+
+        impl io::Write for FailOnceOnKeyboardPush {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let base_modes_entered = self
+                    .output
+                    .windows(b"\x1b[?2004h".len())
+                    .any(|part| part == b"\x1b[?2004h");
+                if !self.failed && base_modes_entered {
+                    self.failed = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "keyboard enhancement write failed",
+                    ));
+                }
+                self.output.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = FailOnceOnKeyboardPush {
+            output: Vec::new(),
+            failed: false,
+        };
+        let error = enter_tui_mode(
+            &mut writer,
+            TerminalCapabilities::with_keyboard_enhancement_supported(true),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("keyboard enhancement write failed")
+        );
+        let rendered = String::from_utf8(writer.output)
+            .unwrap_or_else(|error| panic!("invalid ansi bytes: {error}"));
+        assert!(rendered.contains("\u{1b}[?2004h"));
+        assert!(rendered.contains("\u{1b}[?2004l"));
+        assert!(rendered.contains("\u{1b}[?1049l"));
     }
 
     #[test]
