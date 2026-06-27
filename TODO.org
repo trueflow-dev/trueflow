@@ -17,12 +17,17 @@
    - Verified by `search` finding no conflict markers in `flake.nix` or
      `trueflow/src/commands/tui.rs`, and by
      `nix develop -c cargo check --manifest-path trueflow/Cargo.toml --features tui-test-support --lib --bins`.
-** DEF_TODO [High] Make review collection honor direct block verdicts under approved files
+** DONE DEF_TODO [High] Make review collection honor direct block verdicts under approved files
    - `trueflow/src/commands/review.rs` skips an entire file when the file node
      has an effective approved verdict before checking child blocks.
    - Repro: approve a file target, then add a later block-level rejected/comment
      record for a block in that file; `review --all --json` should still show
      the block, but the early file skip hides it.
+   - Fixed by removing the early file-level approved skip in normal and
+     diff-scoped review collection, leaving each block's effective verdict to
+     decide visibility so direct child verdicts override inherited file approval.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --features tui-test-support --test bug_regressions test_block_rejection_overrides_file_approval_in_review`.
 ** DEF_TODO [High] Count only approving identities for ApprovedOnly multi-person coverage
    - `trueflow/src/coverage.rs` counts all identities for a check when enforcing
      `CoveragePolicy::two_person_review()`, regardless of whether those records

@@ -1159,6 +1159,58 @@ fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> 
 }
 
 #[test]
+fn test_block_rejection_overrides_file_approval_in_review() -> Result<()> {
+    let repo = TestRepo::new("review_block_rejection_overrides_file_approval")?;
+    repo.write("src/lib.rs", "fn needs_review() { println!(\"check me\"); }\n")?;
+    repo.commit_all("Add review target")?;
+
+    let scan = repo.scan_without_cache()?;
+    let file = scan
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "src/lib.rs")
+        .context("expected src/lib.rs in scan output")?;
+    let block = file.blocks.first().context("expected review block")?;
+
+    let approved_file = build_review_record(
+        file.tree_hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("approved-file"),
+            target_kind: Some("file"),
+            verdict: Some("approved"),
+            timestamp: Some(1),
+            path_hint: Some("src/lib.rs"),
+            ..Default::default()
+        },
+    );
+    let rejected_block = build_review_record(
+        block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("rejected-block"),
+            target_kind: Some("block"),
+            verdict: Some("rejected"),
+            timestamp: Some(2),
+            path_hint: Some("src/lib.rs"),
+            line_hint: Some(u32::try_from(block.start_line).context("block line fits u32")?),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[approved_file, rejected_block])?;
+
+    let summary = review_all(&repo)?;
+    let blocks = summary
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "src/lib.rs")
+        .map(|file| file.blocks.as_slice())
+        .unwrap_or(&[]);
+
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].hash, block.hash);
+    Ok(())
+}
+
+#[test]
 fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
     let repo = TestRepo::new("exclude_gap_case")?;
     repo.write(

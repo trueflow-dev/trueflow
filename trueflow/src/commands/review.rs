@@ -382,16 +382,6 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
         total_blocks += reviewable_blocks.len();
 
-        let Some(file_node_id) = tree.find_by_path(file.path.as_str()) else {
-            continue;
-        };
-        if coverage
-            .node(file_node_id)
-            .effective_latest_verdict_for(&review_check)
-            == Some(&Verdict::Approved)
-        {
-            continue;
-        }
 
         let mut unreviewed_blocks = Vec::new();
         for (block, node_id) in reviewable_blocks {
@@ -483,16 +473,6 @@ fn collect_diff_scoped_review(
     let mut commented_block_nodes = HashSet::new();
 
     for file in review_files {
-        let Some(file_node_id) = tree.find_by_path(file.path.as_str()) else {
-            continue;
-        };
-        if coverage
-            .node(file_node_id)
-            .effective_latest_verdict_for(diff_context.review_check)
-            == Some(&Verdict::Approved)
-        {
-            continue;
-        }
 
         let mut unreviewed_blocks = Vec::new();
         for review_block in file.blocks {
