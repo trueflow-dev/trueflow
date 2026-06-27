@@ -297,6 +297,7 @@ fn pty_smoke_scope_selector_prechecks_deep_commit_without_stack_overflow() -> Re
     configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
     let mut writer = pair.master.take_writer()?;
     let reader = pair.master.try_clone_reader()?;
     let output = PtyOutput::new();
@@ -362,6 +363,7 @@ fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
     configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
     let mut writer = pair.master.take_writer()?;
     let reader = pair.master.try_clone_reader()?;
     let output = PtyOutput::new();
@@ -409,6 +411,7 @@ fn pty_smoke_signed_action_with_noninteractive_gpg_does_not_suspend_terminal() -
     cmd.env("PATH", path);
 
     let mut child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
     let mut writer = pair.master.take_writer()?;
     let reader = pair.master.try_clone_reader()?;
     let output = PtyOutput::new();
@@ -475,6 +478,7 @@ fn pty_smoke_diff_mode_keeps_wrapped_rows_readable_in_narrow_terminal() -> Resul
     configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
     let mut writer = pair.master.take_writer()?;
     let reader = pair.master.try_clone_reader()?;
     let output = PtyOutput::new();
@@ -534,6 +538,7 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
     configure_tui_pty_command(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
     let mut writer = pair.master.take_writer()?;
     let reader = pair.master.try_clone_reader()?;
     let output = PtyOutput::new();

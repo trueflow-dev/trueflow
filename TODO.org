@@ -187,6 +187,15 @@
      1 KiB before checking for NUL bytes and shebangs.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib analyze_file_detects_binary_nul_after_first_kilobyte`.
+** DONE DEF_TODO [High] Close parent-side PTY slave handles in smoke tests
+   - `trueflow/tests/tui_pty_smoke.rs` keeps the parent copy of the slave PTY
+     open after spawning `trueflow tui`.
+   - Repro: five `trueflow::tui_pty_smoke` tests pass their TUI assertions, then
+     hang while joining the reader thread because EOF never arrives on the PTY
+     master until the parent slave handle closes.
+   - Fixed by dropping `pair.slave` immediately after each spawned TUI child.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --test tui_pty_smoke --features tui-test-support`.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of
