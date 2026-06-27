@@ -1216,6 +1216,7 @@ fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> 
         1,
         "expected one duplicate block to remain after exact approval"
     );
+
     assert_eq!(remaining_blocks[0].start_line, second_start_line);
 
     Ok(())

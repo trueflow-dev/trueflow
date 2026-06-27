@@ -382,7 +382,6 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
         total_blocks += reviewable_blocks.len();
 
-
         let mut unreviewed_blocks = Vec::new();
         for (block, node_id) in reviewable_blocks {
             let block_coverage = coverage.block(&file.path, &block);
@@ -473,7 +472,6 @@ fn collect_diff_scoped_review(
     let mut commented_block_nodes = HashSet::new();
 
     for file in review_files {
-
         let mut unreviewed_blocks = Vec::new();
         for review_block in file.blocks {
             let display_block = review_block.display_block().clone();
@@ -1042,7 +1040,7 @@ fn is_subblock_covered(
                 }
             }
             sub_splitter::SubSplitSemantics::StructuralChildren => {
-                pending.extend(sub_split.blocks);
+                return false;
             }
         }
     }
@@ -1247,6 +1245,7 @@ fn line_range_overlap(a: &std::ops::Range<u32>, b: &std::ops::Range<u32>) -> u32
 mod tests {
     use super::*;
     use crate::hashing::TreeHash;
+    use crate::store::{Record, ReviewDatabase};
     use crate::test_git::{CurrentDirGuard, run_git, temp_git_repo};
     use std::fs;
     use std::path::Path;
@@ -1294,6 +1293,88 @@ mod tests {
         assert_eq!(data_rank, kind_rank(&make_block(BlockKind::Type, &[])));
         assert_eq!(data_rank, kind_rank(&make_block(BlockKind::Interface, &[])));
         assert_eq!(data_rank, kind_rank(&make_block(BlockKind::Class, &[])));
+    }
+
+    fn approved_record_for_block(block: &Block, path: &str) -> Record {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "version": crate::store::CURRENT_VERSION,
+            "target": { "kind": "block", "hash": block.hash.as_str() },
+            "check": "review",
+            "verdict": "approved",
+            "identity": { "type": "email", "email": "a@example.com" },
+            "repo_ref": { "type": "vcs", "system": "git", "revision": "deadbeef" },
+            "block_state": "committed",
+            "timestamp": 1,
+            "path_hint": path,
+            "line_hint": block.start_line,
+            "note": null,
+            "comment_scope": null,
+            "comment_context": null,
+            "comment_anchor": null,
+            "attestations": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn structural_child_coverage_does_not_cover_container_header() {
+        let source = "type User struct {\n\tName string\n\tAge int\n}\n";
+        let container = Block::new(source.to_string(), BlockKind::Struct, 1, 4);
+        let children =
+            sub_splitter::split_result(&container, Language::Go).expect("expected split result");
+        assert_eq!(
+            children.semantics,
+            sub_splitter::SubSplitSemantics::StructuralChildren
+        );
+        assert!(!children.blocks.is_empty());
+
+        let mut builder = crate::tree::TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "model.go".to_string(),
+            "src/model.go".to_string(),
+            "file-hash".to_string(),
+            Language::Go,
+        );
+        builder.add_block(
+            file,
+            "user".to_string(),
+            "src/model.go".to_string(),
+            container.clone(),
+            Language::Go,
+        );
+        let tree = builder.finalize();
+        let records = children
+            .blocks
+            .iter()
+            .map(|block| approved_record_for_block(block, "src/model.go"))
+            .collect::<Vec<_>>();
+        let database = ReviewDatabase::from_records(records);
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let query = ResolvedReviewQuery {
+            filters: BlockFilters::default(),
+            scan_options: ScanOptions::default(),
+            content_source: ReviewContentSource::Workdir,
+            path_selection: ReviewPathSelection::All,
+            diff_selection: ReviewDiffSelection::None,
+        };
+        let review_check = ReviewCheck::new("review").unwrap();
+        let file_path = RepoPath::new("src/model.go").unwrap();
+
+        assert!(
+            !is_subblock_covered(
+                &container,
+                Language::Go,
+                &query,
+                &coverage,
+                &review_check,
+                &file_path,
+            ),
+            "approved structural children must not cover omitted container header"
+        );
     }
 
     #[test]

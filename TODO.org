@@ -161,13 +161,18 @@
      non-child chunk path.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib languages::clojure::tests`.
-** DEF_TODO [High] Require review coverage for structural container headers
+** DONE DEF_TODO [High] Require review coverage for structural container headers
    - Go/C++/Zig/Haskell structural-child splitters emit semantic children but no
      header/preamble/trailer review unit, while `is_subblock_covered` treats all
      covered structural children as covering the parent.
    - Repro: approve all fields/methods of a large struct/class, then change only
      the parent header; review can consider the parent covered because there is
      no header sub-block to require approval.
+   - Fixed by treating structural-child coverage as insufficient unless the
+     container itself has a direct approval, because emitted children do not
+     cover the omitted header/preamble/trailer bytes.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib structural_child_coverage_does_not_cover_container_header`.
 ** DEF_TODO [Medium] Detect binary files with NUL bytes beyond the first kilobyte
    - `analysis::analyze_file` comments say it checks the first 8KB for NUL but
      actually reads only 1024 bytes.
