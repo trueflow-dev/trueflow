@@ -565,11 +565,48 @@ impl BlockLocator {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PathTargetLocator {
+    Hash(TreeHash),
+    Path { hash: TreeHash, path: RepoPath },
+}
+
+impl PathTargetLocator {
+    fn from_record(hash: &TreeHash, path_hint: Option<&RepoPath>) -> Self {
+        match path_hint {
+            Some(path) => Self::Path {
+                hash: hash.clone(),
+                path: path.clone(),
+            },
+            None => Self::Hash(hash.clone()),
+        }
+    }
+
+    fn candidates(hash: &TreeHash, path: &RepoPath, workdir_prefix: Option<&str>) -> Vec<Self> {
+        let paths = block_path_candidates(path, workdir_prefix);
+        let mut candidates = paths
+            .into_iter()
+            .map(|path| Self::Path {
+                hash: hash.clone(),
+                path,
+            })
+            .collect::<Vec<_>>();
+        candidates.push(Self::Hash(hash.clone()));
+        candidates
+    }
+
+    fn hash(&self) -> &TreeHash {
+        match self {
+            Self::Hash(hash) | Self::Path { hash, .. } => hash,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ApprovedTargets {
     block_targets: HashSet<BlockLocator>,
-    file_hashes: HashSet<TreeHash>,
-    tree_hashes: HashSet<TreeHash>,
+    file_targets: HashSet<PathTargetLocator>,
+    tree_targets: HashSet<PathTargetLocator>,
 }
 
 impl ApprovedTargets {
@@ -578,9 +615,35 @@ impl ApprovedTargets {
             ReviewTargetRef::Block { hash } => self
                 .block_targets
                 .contains(&BlockLocator::Hash(hash.clone())),
-            ReviewTargetRef::File { hash } => self.file_hashes.contains(hash),
-            ReviewTargetRef::Tree { hash } => self.tree_hashes.contains(hash),
+            ReviewTargetRef::File { hash } => {
+                self.file_targets.iter().any(|target| target.hash() == hash)
+            }
+            ReviewTargetRef::Tree { hash } => {
+                self.tree_targets.iter().any(|target| target.hash() == hash)
+            }
         }
+    }
+
+    pub fn contains_file(
+        &self,
+        hash: &TreeHash,
+        path: &RepoPath,
+        workdir_prefix: Option<&str>,
+    ) -> bool {
+        PathTargetLocator::candidates(hash, path, workdir_prefix)
+            .into_iter()
+            .any(|candidate| self.file_targets.contains(&candidate))
+    }
+
+    pub fn contains_tree(
+        &self,
+        hash: &TreeHash,
+        path: &RepoPath,
+        workdir_prefix: Option<&str>,
+    ) -> bool {
+        PathTargetLocator::candidates(hash, path, workdir_prefix)
+            .into_iter()
+            .any(|candidate| self.tree_targets.contains(&candidate))
     }
 
     pub fn contains_block(
@@ -598,51 +661,91 @@ impl ApprovedTargets {
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewIndex {
+    #[cfg(test)]
     latest_verdicts: HashMap<ReviewTargetRef, Verdict>,
     block_verdicts: HashMap<BlockLocator, Verdict>,
+    file_verdicts: HashMap<PathTargetLocator, Verdict>,
+    tree_verdicts: HashMap<PathTargetLocator, Verdict>,
 }
 
 impl ReviewIndex {
     pub fn from_records(records: &[Record], check_filter: Option<&ReviewCheck>) -> Self {
+        #[cfg(test)]
         let mut latest_by_target: HashMap<ReviewTargetRef, (i64, Verdict)> = HashMap::new();
         let mut block_verdicts: HashMap<BlockLocator, (i64, Verdict)> = HashMap::new();
+        let mut file_verdicts: HashMap<PathTargetLocator, (i64, Verdict)> = HashMap::new();
+        let mut tree_verdicts: HashMap<PathTargetLocator, (i64, Verdict)> = HashMap::new();
 
         for record in records {
             if check_filter.is_some_and(|check| &record.check != check) {
                 continue;
             }
 
-            match latest_by_target.get_mut(&record.target) {
-                Some((timestamp, verdict)) => {
-                    if record.timestamp >= *timestamp {
-                        *timestamp = record.timestamp;
-                        *verdict = record.verdict.clone();
+            #[cfg(test)]
+            {
+                match latest_by_target.get_mut(&record.target) {
+                    Some((timestamp, verdict)) => {
+                        if record.timestamp >= *timestamp {
+                            *timestamp = record.timestamp;
+                            *verdict = record.verdict.clone();
+                        }
                     }
-                }
-                None => {
-                    latest_by_target.insert(
-                        record.target.clone(),
-                        (record.timestamp, record.verdict.clone()),
-                    );
+                    None => {
+                        latest_by_target.insert(
+                            record.target.clone(),
+                            (record.timestamp, record.verdict.clone()),
+                        );
+                    }
                 }
             }
 
-            if let ReviewTargetRef::Block { hash } = &record.target {
-                update_latest_verdict(
-                    &mut block_verdicts,
-                    BlockLocator::from_record(hash, record.path_hint.as_ref(), record.line_hint),
-                    record.timestamp,
-                    record.verdict.clone(),
-                );
+            match &record.target {
+                ReviewTargetRef::Block { hash } => {
+                    update_latest_verdict(
+                        &mut block_verdicts,
+                        BlockLocator::from_record(
+                            hash,
+                            record.path_hint.as_ref(),
+                            record.line_hint,
+                        ),
+                        record.timestamp,
+                        record.verdict.clone(),
+                    );
+                }
+                ReviewTargetRef::File { hash } => {
+                    update_latest_verdict(
+                        &mut file_verdicts,
+                        PathTargetLocator::from_record(hash, record.path_hint.as_ref()),
+                        record.timestamp,
+                        record.verdict.clone(),
+                    );
+                }
+                ReviewTargetRef::Tree { hash } => {
+                    update_latest_verdict(
+                        &mut tree_verdicts,
+                        PathTargetLocator::from_record(hash, record.path_hint.as_ref()),
+                        record.timestamp,
+                        record.verdict.clone(),
+                    );
+                }
             }
         }
 
         Self {
+            #[cfg(test)]
             latest_verdicts: latest_by_target
                 .into_iter()
                 .map(|(target, (_, verdict))| (target, verdict))
                 .collect(),
             block_verdicts: block_verdicts
+                .into_iter()
+                .map(|(key, (_, verdict))| (key, verdict))
+                .collect(),
+            file_verdicts: file_verdicts
+                .into_iter()
+                .map(|(key, (_, verdict))| (key, verdict))
+                .collect(),
+            tree_verdicts: tree_verdicts
                 .into_iter()
                 .map(|(key, (_, verdict))| (key, verdict))
                 .collect(),
@@ -672,19 +775,18 @@ impl ReviewIndex {
 
     pub fn approved_targets(&self) -> ApprovedTargets {
         let mut approved = ApprovedTargets::default();
-        for (target, verdict) in &self.latest_verdicts {
+        for (locator, verdict) in &self.file_verdicts {
             if verdict != &Verdict::Approved {
                 continue;
             }
-            match target {
-                ReviewTargetRef::Block { .. } => {}
-                ReviewTargetRef::File { hash } => {
-                    approved.file_hashes.insert(hash.clone());
-                }
-                ReviewTargetRef::Tree { hash } => {
-                    approved.tree_hashes.insert(hash.clone());
-                }
+            approved.file_targets.insert(locator.clone());
+        }
+
+        for (locator, verdict) in &self.tree_verdicts {
+            if verdict != &Verdict::Approved {
+                continue;
             }
+            approved.tree_targets.insert(locator.clone());
         }
 
         for (locator, verdict) in &self.block_verdicts {
@@ -1243,6 +1345,25 @@ mod tests {
         assert!(approved_targets.contains_target(&ReviewTargetRef::Tree {
             hash: TreeHash::new("tree-hash")
         }));
+    }
+
+    #[test]
+    fn approved_targets_keep_path_scoped_file_hashes_distinct() {
+        let hash = TreeHash::new("shared-file-hash");
+        let mut approved = record(
+            "1",
+            ReviewTargetRef::File { hash: hash.clone() },
+            "review",
+            Verdict::Approved,
+            1,
+        );
+        approved.path_hint = Some(RepoPath::new("src/a.rs").unwrap());
+
+        let index = ReviewIndex::from_records(&[approved], Some(&ReviewCheck::review()));
+        let approved_targets = index.approved_targets();
+
+        assert!(approved_targets.contains_file(&hash, &RepoPath::new("src/a.rs").unwrap(), None));
+        assert!(!approved_targets.contains_file(&hash, &RepoPath::new("src/b.rs").unwrap(), None));
     }
 
     #[test]

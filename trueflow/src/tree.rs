@@ -248,18 +248,12 @@ impl Tree {
             let node = self.node(node_id);
             match node.kind {
                 TreeNodeKind::Root | TreeNodeKind::Directory => {
-                    let target = crate::store::ReviewTargetRef::Tree {
-                        hash: node.hash.clone(),
-                    };
-                    if approved_targets.contains_target(&target) {
+                    if approved_targets.contains_tree(&node.hash, &node.path, workdir_prefix) {
                         return true;
                     }
                 }
                 TreeNodeKind::File => {
-                    let target = crate::store::ReviewTargetRef::File {
-                        hash: node.hash.clone(),
-                    };
-                    if approved_targets.contains_target(&target) {
+                    if approved_targets.contains_file(&node.hash, &node.path, workdir_prefix) {
                         return true;
                     }
                 }

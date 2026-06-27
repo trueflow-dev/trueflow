@@ -944,7 +944,7 @@ mod tests {
         let file_hash = tree.node(file_id).hash.clone();
         let function_hash = tree.node(function_id).hash.clone();
         let records = vec![
-            approved_file_record("1", file_hash, "alice@example.com", 1),
+            approved_file_record("1", file_hash, "src/lib.rs", "alice@example.com", 1),
             approved_block_record("2", function_hash, "src/lib.rs", 1, "bob@example.com", 2)
                 .with_check("security"),
         ];
@@ -998,7 +998,13 @@ mod tests {
     fn effective_scope_policy_counts_inherited_reviews() {
         let (tree, file_id, function_id, _, _) = build_function_tree();
         let file_hash = tree.node(file_id).hash.clone();
-        let records = vec![approved_file_record("1", file_hash, "alice@example.com", 1)];
+        let records = vec![approved_file_record(
+            "1",
+            file_hash,
+            "src/lib.rs",
+            "alice@example.com",
+            1,
+        )];
         let database = ReviewDatabase::from_records(records);
         let coverage =
             CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
@@ -1011,6 +1017,36 @@ mod tests {
         assert!(coverage.node(function_id).is_well_reviewed(
             &CoveragePolicy::single_review().with_scope(CoverageScope::Effective)
         ));
+    }
+
+    #[test]
+    fn path_scoped_file_approval_does_not_cover_same_hash_sibling_file() {
+        let (tree, approved_file_id, approved_block_id, sibling_block_id) =
+            build_same_hash_file_tree();
+        let file_hash = tree.node(approved_file_id).hash.clone();
+        let records = vec![approved_file_record(
+            "1",
+            file_hash,
+            "src/a.rs",
+            "alice@example.com",
+            1,
+        )];
+        let database = ReviewDatabase::from_records(records);
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+
+        assert_eq!(
+            coverage
+                .node(approved_block_id)
+                .effective_latest_verdict_for(&ReviewCheck::review()),
+            Some(&Verdict::Approved)
+        );
+        assert_eq!(
+            coverage
+                .node(sibling_block_id)
+                .effective_latest_verdict_for(&ReviewCheck::review()),
+            None
+        );
     }
 
     #[test]
@@ -1130,6 +1166,43 @@ mod tests {
         (tree, file_id, function_id, file_hash, function_hash)
     }
 
+    fn build_same_hash_file_tree() -> (Tree, TreeNodeId, TreeNodeId, TreeNodeId) {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file_hash = BytesHash::new("same-bytes").to_string();
+        let first_file = builder.add_file(
+            src,
+            "a.rs".to_string(),
+            "src/a.rs".to_string(),
+            file_hash.clone(),
+            Language::Rust,
+        );
+        let second_file = builder.add_file(
+            src,
+            "b.rs".to_string(),
+            "src/b.rs".to_string(),
+            file_hash,
+            Language::Rust,
+        );
+        let first_block = builder.add_block(
+            first_file,
+            "fn duplicate".to_string(),
+            "src/a.rs".to_string(),
+            Block::new("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2),
+            Language::Rust,
+        );
+        let second_block = builder.add_block(
+            second_file,
+            "fn duplicate".to_string(),
+            "src/b.rs".to_string(),
+            Block::new("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2),
+            Language::Rust,
+        );
+
+        (builder.finalize(), first_file, first_block, second_block)
+    }
+
     fn build_duplicate_hash_tree() -> (Tree, TreeNodeId, TreeNodeId, TreeHash, TreeHash) {
         let shared_content = "fn dup() {}\n".to_string();
         let first = Block::new(shared_content.clone(), BlockKind::Function, 1, 2);
@@ -1216,9 +1289,15 @@ mod tests {
         )
     }
 
-    fn approved_file_record(id: &str, hash: TreeHash, email: &str, timestamp: i64) -> Record {
+    fn approved_file_record(
+        id: &str,
+        hash: TreeHash,
+        path: &str,
+        email: &str,
+        timestamp: i64,
+    ) -> Record {
         TestRecord::approved(id, ReviewTargetRef::File { hash }, email, timestamp)
-            .with_path_hint("src/lib.rs")
+            .with_path_hint(path)
     }
 
     fn approved_block_record(
