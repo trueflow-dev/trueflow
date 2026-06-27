@@ -138,7 +138,11 @@ fn parse_relative_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<Optio
     let seconds = amount
         .checked_mul(scale)
         .ok_or_else(|| anyhow!("relative duration is too large in '{raw}'"))?;
-    Ok(Some(now.timestamp() - seconds))
+    let timestamp = now
+        .timestamp()
+        .checked_sub(seconds)
+        .ok_or_else(|| anyhow!("relative duration is too large in '{raw}'"))?;
+    Ok(Some(timestamp))
 }
 
 #[cfg(test)]
@@ -170,6 +174,17 @@ mod tests {
             parsed,
             ResolvedFeedbackSince::Timestamp(now.timestamp() - 2 * 60 * 60 * 24)
         );
+    }
+
+    #[test]
+    fn feedback_since_expr_rejects_relative_duration_timestamp_underflow() {
+        let now = Utc.timestamp_opt(-100, 0).unwrap();
+        let duration = format!("{}s", i64::MAX);
+        let error = FeedbackSinceExpr::new(&duration)
+            .unwrap_or_else(|error| panic!("relative duration should parse: {error}"))
+            .resolve_at(now)
+            .unwrap_err();
+        assert!(error.to_string().contains("relative duration is too large"));
     }
 
     #[test]

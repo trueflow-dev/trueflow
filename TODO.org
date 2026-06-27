@@ -95,12 +95,16 @@
      which applies latest-verdict suppression unless `--include-approved` is set.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::feedback::tests::pull_request_feedback`.
-** DEF_TODO [Medium] Make relative feedback durations reject timestamp underflow
+** DONE DEF_TODO [Medium] Make relative feedback durations reject timestamp underflow
    - `trueflow/src/feedback_since.rs` checks multiplication overflow but then
      computes `now.timestamp() - seconds` directly.
    - Repro: a huge but multiplication-safe duration such as an enormous day/week
      count can underflow, panicking in debug builds or wrapping in release
      instead of returning a validation error.
+   - Fixed by using `checked_sub` for the timestamp subtraction and returning
+     the existing "relative duration is too large" validation error on overflow.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib feedback_since::tests`.
 ** DEF_TODO [High] Roll back partially-entered TUI terminal modes on enter failure
    - `enter_tui_mode` enters alternate screen, mouse capture, and bracketed
      paste before optionally pushing keyboard enhancement flags.
