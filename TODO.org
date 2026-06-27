@@ -136,13 +136,20 @@
      for uppercase bindings.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --features tui-test-support --lib keybind_action_ignores_control_modified_character_bindings`.
-** DEF_TODO [High] Preserve full Dart and Lua review-unit content in sub-splits
+** DONE DEF_TODO [High] Preserve full Dart and Lua review-unit content in sub-splits
    - Dart type-like and Lua module-like splitters register `ReviewUnits` but
      emit only member/table-field spans, dropping class/module headers, braces,
      separators, and unrecognized chunks.
    - Repro: assert concatenated sub-block content equals the parent block for a
      Dart `class Worker { ... }` and a Lua `local Defaults = { ... }`; changed
      headers/punctuation can otherwise be approved without review.
+   - Fixed by emitting review chunks for omitted gaps/prefixes/tails around
+     Dart type members and Lua table fields, preserving concatenated parent
+     content.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib split_type_like_review_units_preserves_full_class_content`
+     and
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib split_module_like_preserves_full_table_content`.
 ** DEF_TODO [Medium] Stop Clojure namespace sub-splitting from classifying later clauses as imports
    - `split_container_like_block` extends the last collected Clojure semantic
      span to the end of the form.

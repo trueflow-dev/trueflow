@@ -404,24 +404,47 @@ fn split_module_like(block: &Block) -> Result<Vec<Block>> {
         return sub_splitter::split_code_review_units(block);
     };
 
-    let items = collect_table_review_items(table, &block.content)
-        .into_iter()
-        .map(|(field, kind)| {
-            create_sub_block(
-                block,
-                &block.content[field.start_byte()..field.end_byte()],
-                field.start_byte(),
-                field.end_byte(),
-                kind,
-            )
-        })
-        .collect::<Vec<_>>();
-
+    let mut items = collect_table_review_items(table, &block.content);
+    items.sort_by_key(|(field, _)| (field.start_byte(), field.end_byte()));
     if items.is_empty() {
-        sub_splitter::split_code_review_units(block)
-    } else {
-        Ok(items)
+        return sub_splitter::split_code_review_units(block);
     }
+
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+    for (field, kind) in items {
+        if cursor < field.start_byte() {
+            let chunk = &block.content[cursor..field.start_byte()];
+            blocks.push(create_sub_block(
+                block,
+                chunk,
+                cursor,
+                field.start_byte(),
+                classify_review_chunk(chunk),
+            ));
+        }
+        blocks.push(create_sub_block(
+            block,
+            &block.content[field.start_byte()..field.end_byte()],
+            field.start_byte(),
+            field.end_byte(),
+            kind,
+        ));
+        cursor = field.end_byte().max(cursor);
+    }
+
+    if cursor < block.content.len() {
+        let chunk = &block.content[cursor..];
+        blocks.push(create_sub_block(
+            block,
+            chunk,
+            cursor,
+            block.content.len(),
+            classify_review_chunk(chunk),
+        ));
+    }
+
+    Ok(blocks)
 }
 
 fn first_module_statement(root: Node<'_>) -> Option<Node<'_>> {
@@ -674,5 +697,33 @@ fn create_sub_block(
         complexity: None,
         start_line,
         end_line,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_module_like_preserves_full_table_content() {
+        let source =
+            "local M = {\n  value = 1,\n\n  run = function()\n    return 2\n  end,\n}\nreturn M\n";
+        let block = Block {
+            hash: TreeHash::from_content(source),
+            content: source.to_string(),
+            kind: BlockKind::Module,
+            tags: Vec::new(),
+            complexity: None,
+            start_line: 1,
+            end_line: 8,
+        };
+
+        let blocks = split_module_like(&block).unwrap();
+        let rebuilt = blocks
+            .iter()
+            .map(|block| block.content.as_str())
+            .collect::<String>();
+
+        assert_eq!(rebuilt, source);
     }
 }

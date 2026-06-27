@@ -688,19 +688,50 @@ fn split_type_like_review_units(block: &Block) -> Result<Vec<Block>> {
         return crate::sub_splitter::split_code_review_units(block);
     }
 
-    Ok(spans
-        .into_iter()
-        .map(|span| {
-            create_sub_block(
+    Ok(review_unit_blocks_from_spans(block, spans))
+}
+
+fn review_unit_blocks_from_spans(block: &Block, mut spans: Vec<SemanticSpan>) -> Vec<Block> {
+    spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+
+    for span in spans {
+        if cursor < span.start_byte {
+            let chunk = &block.content[cursor..span.start_byte];
+            blocks.push(create_sub_block(
                 block,
-                &block.content[span.start_byte..span.end_byte],
+                chunk,
+                cursor,
                 span.start_byte,
-                span.end_byte,
-                span.kind,
-                span.tags,
-            )
-        })
-        .collect())
+                classify_review_chunk(chunk),
+                Vec::new(),
+            ));
+        }
+        blocks.push(create_sub_block(
+            block,
+            &block.content[span.start_byte..span.end_byte],
+            span.start_byte,
+            span.end_byte,
+            span.kind,
+            span.tags,
+        ));
+        cursor = span.end_byte.max(cursor);
+    }
+
+    if cursor < block.content.len() {
+        let chunk = &block.content[cursor..];
+        blocks.push(create_sub_block(
+            block,
+            chunk,
+            cursor,
+            block.content.len(),
+            classify_review_chunk(chunk),
+            Vec::new(),
+        ));
+    }
+
+    blocks
 }
 
 fn find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
@@ -836,6 +867,29 @@ mod tests {
                 .iter()
                 .any(|content| content.contains("test('works'"))
         );
+    }
+
+    #[test]
+    fn split_type_like_review_units_preserves_full_class_content() {
+        let source =
+            "class Worker {\n  final String name;\n\n  Worker(this.name);\n\n  void run() {}\n}\n";
+        let block = Block {
+            hash: TreeHash::from_content(source),
+            content: source.to_string(),
+            kind: BlockKind::Class,
+            tags: Vec::new(),
+            complexity: None,
+            start_line: 1,
+            end_line: 7,
+        };
+
+        let blocks = split_type_like_review_units(&block).unwrap();
+        let rebuilt = blocks
+            .iter()
+            .map(|block| block.content.as_str())
+            .collect::<String>();
+
+        assert_eq!(rebuilt, source);
     }
 
     fn parse_tree(source: &str) -> tree_sitter::Tree {
