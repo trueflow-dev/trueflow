@@ -353,6 +353,9 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         } else {
             None
         };
+        let file_changed_lines = file_diff_hunks
+            .as_deref()
+            .map(|hunks| vcs::DiffChangedLineIndex::from_hunks(hunks, vcs::DiffBlockSide::Head));
         let mut reviewable_blocks = Vec::new();
         for block in file.blocks {
             if !query.filters.allows_block(block.kind) {
@@ -372,8 +375,8 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             ) {
                 continue;
             }
-            if let Some(hunks) = file_diff_hunks.as_deref()
-                && vcs::block_has_changed_lines_in_diff(&block, hunks)
+            if let Some(changed_lines) = file_changed_lines.as_ref()
+                && changed_lines.change_kind_for_block(&block)
                     != vcs::BlockDiffChangeKind::ReviewableChanges
             {
                 continue;
@@ -1053,10 +1056,12 @@ fn collect_diff_review_blocks_for_file(
     head_blocks: &[Block],
     hunks: &[vcs::DiffHunk],
 ) -> Vec<DiffReviewBlock> {
+    let base_changed_lines = vcs::DiffChangedLineIndex::from_hunks(hunks, vcs::DiffBlockSide::Base);
+    let head_changed_lines = vcs::DiffChangedLineIndex::from_hunks(hunks, vcs::DiffBlockSide::Head);
     let changed_base_blocks = base_blocks
         .iter()
         .filter(|block| {
-            vcs::block_has_changed_lines_in_diff_for_side(block, hunks, vcs::DiffBlockSide::Base)
+            base_changed_lines.change_kind_for_block(block)
                 == vcs::BlockDiffChangeKind::ReviewableChanges
         })
         .cloned()
@@ -1064,7 +1069,7 @@ fn collect_diff_review_blocks_for_file(
     let changed_head_blocks = head_blocks
         .iter()
         .filter(|block| {
-            vcs::block_has_changed_lines_in_diff_for_side(block, hunks, vcs::DiffBlockSide::Head)
+            head_changed_lines.change_kind_for_block(block)
                 == vcs::BlockDiffChangeKind::ReviewableChanges
         })
         .cloned()
@@ -1074,12 +1079,16 @@ fn collect_diff_review_blocks_for_file(
         .into_iter()
         .map(Some)
         .collect::<Vec<_>>();
+    let head_match_index = HeadBlockMatchIndex::from_blocks(&unmatched_head_blocks);
     let mut diff_blocks = Vec::new();
 
     for base_block in changed_base_blocks {
-        if let Some(head_index) =
-            find_matching_head_block(&base_block, &unmatched_head_blocks, hunks)
-        {
+        if let Some(head_index) = find_matching_head_block(
+            &base_block,
+            &unmatched_head_blocks,
+            &head_match_index,
+            hunks,
+        ) {
             let head_block = unmatched_head_blocks[head_index]
                 .take()
                 .unwrap_or_else(|| panic!("matched head block should still be present"));
@@ -1134,29 +1143,52 @@ fn collect_diff_review_blocks_for_file(
     diff_blocks
 }
 
+struct HeadBlockMatchIndex {
+    semantic_matches: HashMap<(BlockKind, String), Vec<usize>>,
+}
+
+impl HeadBlockMatchIndex {
+    fn from_blocks(head_blocks: &[Option<Block>]) -> Self {
+        let mut semantic_matches: HashMap<(BlockKind, String), Vec<usize>> = HashMap::new();
+        for (index, head_block) in head_blocks.iter().enumerate() {
+            let Some(head_block) = head_block else {
+                continue;
+            };
+            let Some(identifier) = review_metadata::semantic_block_identifier(head_block) else {
+                continue;
+            };
+            semantic_matches
+                .entry((head_block.kind, identifier))
+                .or_default()
+                .push(index);
+        }
+        Self { semantic_matches }
+    }
+
+    fn unique_semantic_match(
+        &self,
+        base_block: &Block,
+        head_blocks: &[Option<Block>],
+    ) -> Option<usize> {
+        let identifier = review_metadata::semantic_block_identifier(base_block)?;
+        let candidate_indices = self.semantic_matches.get(&(base_block.kind, identifier))?;
+        let mut available_matches = candidate_indices
+            .iter()
+            .copied()
+            .filter(|index| head_blocks[*index].is_some());
+        let index = available_matches.next()?;
+        available_matches.next().is_none().then_some(index)
+    }
+}
+
 fn find_matching_head_block(
     base_block: &Block,
     head_blocks: &[Option<Block>],
+    head_match_index: &HeadBlockMatchIndex,
     hunks: &[vcs::DiffHunk],
 ) -> Option<usize> {
-    let base_identifier = review_metadata::semantic_block_identifier(base_block);
-    if let Some(identifier) = base_identifier.as_deref() {
-        let identifier_matches = head_blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, head_block)| {
-                let head_block = head_block.as_ref()?;
-                if head_block.kind != base_block.kind {
-                    return None;
-                }
-                (review_metadata::semantic_block_identifier(head_block).as_deref()
-                    == Some(identifier))
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if identifier_matches.len() == 1 {
-            return identifier_matches.into_iter().next();
-        }
+    if let Some(index) = head_match_index.unique_semantic_match(base_block, head_blocks) {
+        return Some(index);
     }
 
     let mapped_base_range = mapped_head_range_for_base_block(base_block, hunks);

@@ -132,6 +132,50 @@ pub(crate) enum DiffBlockSide {
     Head,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DiffChangedLineIndex {
+    changed_lines: Vec<IndexedChangedDiffLine>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedChangedDiffLine {
+    anchor_line: u32,
+    line: DiffLine,
+}
+
+impl DiffChangedLineIndex {
+    pub(crate) fn from_hunks(hunks: &[DiffHunk], side: DiffBlockSide) -> Self {
+        let mut changed_lines = Vec::new();
+        for hunk in hunks {
+            push_indexed_changed_lines_for_hunk(&mut changed_lines, hunk, side);
+        }
+        Self { changed_lines }
+    }
+
+    pub(crate) fn change_kind_for_block(&self, block: &Block) -> BlockDiffChangeKind {
+        let start = usize_to_u32_saturating(block.start_line).saturating_add(1); // 1-based for diff
+        let end_exclusive = usize_to_u32_saturating(block.end_line).saturating_add(1);
+        let first_changed_line = self
+            .changed_lines
+            .partition_point(|line| line.anchor_line < start);
+        let changed_line_refs = self.changed_lines[first_changed_line..]
+            .iter()
+            .take_while(|line| line.anchor_line < end_exclusive)
+            .map(|line| &line.line)
+            .collect::<Vec<_>>();
+
+        if changed_line_refs.is_empty() {
+            return BlockDiffChangeKind::NoTextChanges;
+        }
+
+        if all_changed_lines_are_nonreviewable(&changed_line_refs) {
+            BlockDiffChangeKind::OnlyNonreviewableChurn
+        } else {
+            BlockDiffChangeKind::ReviewableChanges
+        }
+    }
+}
+
 pub struct GitConfig {
     pub email: String,
     pub signing_key: Option<String>,
@@ -622,61 +666,53 @@ fn diff_for_file_between_trees(
     Ok(FileDiff::NoTextChanges { path: path.clone() })
 }
 
-pub(crate) fn block_has_changed_lines_in_diff(
-    block: &Block,
-    hunks: &[DiffHunk],
-) -> BlockDiffChangeKind {
-    analyze_block_diff_hunks_for_side(block, hunks, DiffBlockSide::Head)
-}
-
-pub(crate) fn block_has_changed_lines_in_diff_for_side(
-    block: &Block,
-    hunks: &[DiffHunk],
+fn push_indexed_changed_lines_for_hunk(
+    changed_lines: &mut Vec<IndexedChangedDiffLine>,
+    hunk: &DiffHunk,
     side: DiffBlockSide,
-) -> BlockDiffChangeKind {
-    analyze_block_diff_hunks_for_side(block, hunks, side)
-}
+) {
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
 
-fn analyze_block_diff_hunks_for_side(
-    block: &Block,
-    hunks: &[DiffHunk],
-    side: DiffBlockSide,
-) -> BlockDiffChangeKind {
-    let start = usize_to_u32_saturating(block.start_line).saturating_add(1); // 1-based for diff
-    let end_exclusive = usize_to_u32_saturating(block.end_line).saturating_add(1);
-
-    let changed_lines = hunks
-        .iter()
-        .flat_map(positioned_hunk_lines)
-        .filter(|line| {
-            let anchor_line = match side {
-                DiffBlockSide::Base => line.old_line,
-                DiffBlockSide::Head => Some(line.new_line.unwrap_or(line.anchor_new_line)),
-            };
-            anchor_line.is_some_and(|line_number| {
-                line_number >= start
-                    && line_number < end_exclusive
-                    && line.kind != DiffLineKind::Context
-            })
-        })
-        .map(|line| DiffLine {
-            kind: line.kind,
-            old_line: line.old_line,
-            new_line: line.new_line,
-            text: line.text,
-            is_focus: true,
-        })
-        .collect::<Vec<_>>();
-
-    if changed_lines.is_empty() {
-        return BlockDiffChangeKind::NoTextChanges;
-    }
-
-    let changed_line_refs = changed_lines.iter().collect::<Vec<_>>();
-    if all_changed_lines_are_nonreviewable(&changed_line_refs) {
-        BlockDiffChangeKind::OnlyNonreviewableChurn
-    } else {
-        BlockDiffChangeKind::ReviewableChanges
+    for line in &hunk.lines {
+        match line.kind {
+            DiffLineKind::Context => {
+                old_line = old_line.saturating_add(1);
+                new_line = new_line.saturating_add(1);
+            }
+            DiffLineKind::Added => {
+                if matches!(side, DiffBlockSide::Head) {
+                    changed_lines.push(IndexedChangedDiffLine {
+                        anchor_line: new_line,
+                        line: DiffLine {
+                            kind: DiffLineKind::Added,
+                            old_line: None,
+                            new_line: Some(new_line),
+                            text: line.display_text().to_string(),
+                            is_focus: true,
+                        },
+                    });
+                }
+                new_line = new_line.saturating_add(1);
+            }
+            DiffLineKind::Removed => {
+                let anchor_line = match side {
+                    DiffBlockSide::Base => old_line,
+                    DiffBlockSide::Head => new_line,
+                };
+                changed_lines.push(IndexedChangedDiffLine {
+                    anchor_line,
+                    line: DiffLine {
+                        kind: DiffLineKind::Removed,
+                        old_line: Some(old_line),
+                        new_line: None,
+                        text: line.display_text().to_string(),
+                        is_focus: true,
+                    },
+                });
+                old_line = old_line.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -1013,59 +1049,6 @@ struct HunkHeader {
     after_start: u32,
 }
 
-#[derive(Debug, Clone)]
-struct PositionedDiffLine {
-    kind: DiffLineKind,
-    old_line: Option<u32>,
-    new_line: Option<u32>,
-    anchor_new_line: u32,
-    text: String,
-}
-
-fn positioned_hunk_lines(hunk: &DiffHunk) -> Vec<PositionedDiffLine> {
-    let mut old_line = hunk.old_start;
-    let mut new_line = hunk.new_start;
-    let mut lines = Vec::new();
-
-    for line in &hunk.lines {
-        match line.kind {
-            DiffLineKind::Context => {
-                lines.push(PositionedDiffLine {
-                    kind: DiffLineKind::Context,
-                    old_line: Some(old_line),
-                    new_line: Some(new_line),
-                    anchor_new_line: new_line,
-                    text: line.display_text().to_string(),
-                });
-                old_line = old_line.saturating_add(1);
-                new_line = new_line.saturating_add(1);
-            }
-            DiffLineKind::Added => {
-                lines.push(PositionedDiffLine {
-                    kind: DiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(new_line),
-                    anchor_new_line: new_line,
-                    text: line.display_text().to_string(),
-                });
-                new_line = new_line.saturating_add(1);
-            }
-            DiffLineKind::Removed => {
-                lines.push(PositionedDiffLine {
-                    kind: DiffLineKind::Removed,
-                    old_line: Some(old_line),
-                    new_line: None,
-                    anchor_new_line: new_line,
-                    text: line.display_text().to_string(),
-                });
-                old_line = old_line.saturating_add(1);
-            }
-        }
-    }
-
-    lines
-}
-
 fn split_blocks(content: &str, language: Language) -> Vec<Block> {
     block_splitter::split(content, language).into_review_blocks()
 }
@@ -1082,6 +1065,13 @@ mod tests {
         let line = line.trim_end_matches('\n');
         DiffHunkLine::from_unified_line(line)
             .unwrap_or_else(|| panic!("expected valid unified diff line: {line:?}"))
+    }
+
+    fn block_has_changed_lines_in_diff(
+        block: &crate::block::Block,
+        hunks: &[DiffHunk],
+    ) -> BlockDiffChangeKind {
+        DiffChangedLineIndex::from_hunks(hunks, DiffBlockSide::Head).change_kind_for_block(block)
     }
 
     #[test]
@@ -1216,6 +1206,39 @@ mod tests {
             block_has_changed_lines_in_diff(&block, &[hunk]),
             BlockDiffChangeKind::ReviewableChanges,
             "overlapping hunks with removed lines must still count as reviewable changes"
+        );
+    }
+
+    #[test]
+    fn diff_changed_line_index_matches_block_change_detection() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: TreeHash::default(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: None,
+            start_line: 10, // 0-based, so line 11
+            end_line: 11,
+        };
+        let hunks = vec![DiffHunk {
+            file_path: RepoPath::root(),
+            old_start: 11,
+            new_start: 11,
+            lines: vec![unified("-    value\n"), unified("+value\n")],
+        }];
+
+        let head_index = DiffChangedLineIndex::from_hunks(&hunks, DiffBlockSide::Head);
+        assert_eq!(
+            head_index.change_kind_for_block(&block),
+            BlockDiffChangeKind::OnlyNonreviewableChurn
+        );
+
+        let base_index = DiffChangedLineIndex::from_hunks(&hunks, DiffBlockSide::Base);
+        assert_eq!(
+            base_index.change_kind_for_block(&block),
+            BlockDiffChangeKind::ReviewableChanges
         );
     }
 
