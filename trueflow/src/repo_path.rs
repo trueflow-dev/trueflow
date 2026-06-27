@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -6,9 +6,7 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct RepoPath(String);
@@ -124,6 +122,15 @@ impl From<RepoPath> for String {
     }
 }
 
+impl<'de> Deserialize<'de> for RepoPath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
 impl TryFrom<String> for RepoPath {
     type Error = anyhow::Error;
 
@@ -195,20 +202,23 @@ mod tests {
     }
 
     #[test]
+    fn repo_path_deserialization_rejects_invalid_segments() {
+        assert!(serde_json::from_str::<RepoPath>(r#""../outside.rs""#).is_err());
+        assert!(serde_json::from_str::<RepoPath>(r#""/tmp/file.rs""#).is_err());
+        assert!(serde_json::from_str::<RepoPath>(r#""src//file.rs""#).is_err());
+    }
+
+    #[test]
     fn repo_path_is_under_matches_exact_and_descendants() {
         let prefix = RepoPath::new("src/generated").unwrap();
         assert!(RepoPath::new("src/generated").unwrap().is_under(&prefix));
-        assert!(
-            RepoPath::new("src/generated/out.rs")
-                .unwrap()
-                .is_under(&prefix)
-        );
+        assert!(RepoPath::new("src/generated/out.rs")
+            .unwrap()
+            .is_under(&prefix));
         assert!(!RepoPath::new("src/generate.rs").unwrap().is_under(&prefix));
-        assert!(
-            RepoPath::new("anything.rs")
-                .unwrap()
-                .is_under(&RepoPath::root())
-        );
+        assert!(RepoPath::new("anything.rs")
+            .unwrap()
+            .is_under(&RepoPath::root()));
     }
 
     #[test]

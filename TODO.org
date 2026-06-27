@@ -40,12 +40,16 @@
      accessors.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib coverage::tests`.
-** DEF_TODO [High] Validate RepoPath during serde deserialization
+** DONE DEF_TODO [High] Validate RepoPath during serde deserialization
    - `trueflow/src/repo_path.rs` validates constructor input but derives
      `Deserialize` directly into the private string field.
    - Repro: `serde_json::from_str::<RepoPath>("\"../outside.rs\"")` currently
      accepts a path normal construction rejects, allowing invalid persisted
      review records and scan cache entries.
+   - Fixed by replacing derived `Deserialize` with a custom implementation that
+     routes persisted strings through `RepoPath::new`.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib repo_path::tests`.
 ** DEF_TODO [High] Reject scan cache entries whose payload path differs from the cache key
    - `trueflow/src/scanner.rs` indexes cached entries by `CachedFileEntry.path`
      and stamp, then blindly appends the embedded `FileState` from the cached
