@@ -114,13 +114,30 @@ struct FeedbackEntryKey {
     end_line: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FeedbackVerdictKey {
+    target: ReviewTargetRef,
+    path_hint: Option<RepoPath>,
+    line_hint: Option<u32>,
+}
+
+impl FeedbackVerdictKey {
+    fn from_record(record: &Record) -> Self {
+        Self {
+            target: record.target.clone(),
+            path_hint: record.path_hint.clone(),
+            line_hint: record.line_hint,
+        }
+    }
+}
+
 pub fn collect_feedback_entries(
     records: &[Record],
     since_filter: &FeedbackSinceFilter,
     query: &FeedbackQuery,
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<FeedbackEntry>> {
-    let latest_verdicts = latest_verdicts_by_target(records);
+    let latest_verdicts = latest_verdicts_by_verdict_key(records);
     let filtered_records = records
         .iter()
         .filter(|record| record_matches_since(record, since_filter))
@@ -145,7 +162,7 @@ pub fn collect_feedback_entries(
         }
 
         let latest_verdict = latest_verdicts
-            .get(&record.target)
+            .get(&FeedbackVerdictKey::from_record(record))
             .map(String::as_str)
             .unwrap_or("unreviewed");
         if !query.include_approved && latest_verdict == "approved" {
@@ -302,19 +319,19 @@ pub fn resolve_allowed_revisions(
     Ok(Some(allowed))
 }
 
-fn latest_verdicts_by_target(records: &[Record]) -> HashMap<ReviewTargetRef, String> {
-    let mut latest = HashMap::<ReviewTargetRef, (i64, usize, String)>::new();
+fn latest_verdicts_by_verdict_key(records: &[Record]) -> HashMap<FeedbackVerdictKey, String> {
+    let mut latest = HashMap::<FeedbackVerdictKey, (i64, usize, String)>::new();
     for (index, record) in records.iter().enumerate() {
-        let should_replace =
-            latest
-                .get(&record.target)
-                .is_none_or(|(timestamp, existing_index, _)| {
-                    record.timestamp > *timestamp
-                        || (record.timestamp == *timestamp && index > *existing_index)
-                });
+        let key = FeedbackVerdictKey::from_record(record);
+        let should_replace = latest
+            .get(&key)
+            .is_none_or(|(timestamp, existing_index, _)| {
+                record.timestamp > *timestamp
+                    || (record.timestamp == *timestamp && index > *existing_index)
+            });
         if should_replace {
             latest.insert(
-                record.target.clone(),
+                key,
                 (record.timestamp, index, record.verdict.as_str().to_string()),
             );
         }
@@ -743,6 +760,48 @@ mod tests {
         .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
 
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn collect_feedback_entries_keeps_same_hash_comment_when_other_file_is_approved() {
+        let shared_hash = TreeHash::from_content("fn duplicate() {}\n");
+        let mut comment = build_record("comment", "aaaaaaa", "src/a.rs", 10, Verdict::Comment);
+        comment.target = ReviewTargetRef::Block {
+            hash: shared_hash.clone(),
+        };
+        let mut approved = build_record("approved", "aaaaaaa", "src/b.rs", 20, Verdict::Approved);
+        approved.target = ReviewTargetRef::Block { hash: shared_hash };
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                (
+                    "comment".to_string(),
+                    resolved_context("src/a.rs", "fn duplicate() {}\n"),
+                ),
+                (
+                    "approved".to_string(),
+                    resolved_context("src/b.rs", "fn duplicate() {}\n"),
+                ),
+            ]),
+        };
+        let query = FeedbackQuery {
+            filters: BlockFilters::default(),
+            explicit_selection: None,
+            changed_selection: None,
+            allowed_revisions: None,
+            include_approved: false,
+        };
+
+        let entries = collect_feedback_entries(
+            &[comment.clone(), approved],
+            &FeedbackSinceFilter::All,
+            &query,
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_path, "src/a.rs");
+        assert_eq!(entries[0].reviews[0].id, comment.id);
     }
 
     #[test]
