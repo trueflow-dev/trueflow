@@ -325,9 +325,7 @@ where
         match target {
             ResolvedReviewTarget::DirtyWorktree => {
                 changed_target_requested = true;
-                if let Ok(dirty) = dirty_files() {
-                    changed.extend(dirty);
-                }
+                changed.extend(dirty_files()?);
             }
             ResolvedReviewTarget::MainDiff => {
                 changed_target_requested = true;
@@ -765,6 +763,21 @@ mod tests {
         let selection = resolved.path_selection();
         assert_eq!(selection, ReviewPathSelection::Empty);
         assert!(!selection.includes(&other));
+    }
+
+    #[test]
+    fn dirty_target_propagates_dirty_file_errors() {
+        let err = resolve_targets_with(
+            &[ReviewTarget::DirtyWorktree],
+            |revision| CommitId::new(revision.as_str()),
+            || Err(anyhow::anyhow!("dirty file query failed")),
+            || Ok(HashSet::new()),
+            |_revision| Ok(HashSet::new()),
+            |_start, _end| Ok(HashSet::new()),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("dirty file query failed"));
     }
 
     #[test]
