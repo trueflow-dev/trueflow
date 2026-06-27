@@ -150,12 +150,17 @@
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib split_type_like_review_units_preserves_full_class_content`
      and
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib split_module_like_preserves_full_table_content`.
-** DEF_TODO [Medium] Stop Clojure namespace sub-splitting from classifying later clauses as imports
+** DONE DEF_TODO [Medium] Stop Clojure namespace sub-splitting from classifying later clauses as imports
    - `split_container_like_block` extends the last collected Clojure semantic
      span to the end of the form.
    - Repro: `(ns demo.core (:require [clojure.string :as str]) (:gen-class))`
      makes the `:require` Import span include `(:gen-class)` and the closing
      paren, so import filters can hide non-import namespace configuration.
+   - Fixed by no longer extending the final semantic span to the enclosing form
+     end; trailing namespace clauses are emitted separately through the existing
+     non-child chunk path.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib languages::clojure::tests`.
 ** DEF_TODO [High] Require review coverage for structural container headers
    - Go/C++/Zig/Haskell structural-child splitters emit semantic children but no
      header/preamble/trailer review unit, while `is_subblock_covered` treats all

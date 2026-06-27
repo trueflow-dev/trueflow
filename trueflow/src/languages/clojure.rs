@@ -144,7 +144,7 @@ fn split_container_like_block(block: &Block) -> Result<Vec<Block>> {
         return sub_splitter::split_code_review_units(block);
     };
 
-    let mut spans = match block.kind {
+    let spans = match block.kind {
         BlockKind::Module => collect_ns_clause_spans(form, &block.content),
         BlockKind::Interface => collect_protocol_method_spans(form, &block.content),
         BlockKind::Struct | BlockKind::Type => {
@@ -154,10 +154,6 @@ fn split_container_like_block(block: &Block) -> Result<Vec<Block>> {
     };
     if spans.is_empty() {
         return sub_splitter::split_code_review_units(block);
-    }
-
-    if let Some(last) = spans.last_mut() {
-        last.end_byte = form.end_byte();
     }
 
     let mut blocks = Vec::new();
@@ -606,6 +602,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![BlockKind::FunctionSignature]
         );
+    }
+
+    #[test]
+    fn test_ns_sub_split_does_not_fold_non_import_tail_into_import_clause() {
+        let source = "(ns demo.core\n  (:require [clojure.string :as str])\n  (:gen-class))\n";
+        let block = Block {
+            hash: TreeHash::from_content(source),
+            content: source.to_string(),
+            kind: BlockKind::Module,
+            tags: Vec::new(),
+            complexity: None,
+            start_line: 1,
+            end_line: 3,
+        };
+
+        let blocks = split_container_like_block(&block).unwrap();
+        let import = blocks
+            .iter()
+            .find(|block| block.kind == BlockKind::Import)
+            .expect("expected import block");
+
+        assert!(import.content.contains(":require"));
+        assert!(!import.content.contains(":gen-class"));
     }
 
     #[test]
