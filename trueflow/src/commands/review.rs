@@ -1353,8 +1353,10 @@ mod tests {
     fn structural_child_coverage_does_not_cover_container_header() {
         let source = "type User struct {\n\tName string\n\tAge int\n}\n";
         let container = Block::new(source.to_string(), BlockKind::Struct, 1, 4);
-        let children =
-            sub_splitter::split_result(&container, Language::Go).expect("expected split result");
+        let children = match sub_splitter::split_result(&container, Language::Go) {
+            Ok(children) => children,
+            Err(error) => panic!("expected split result: {error:#}"),
+        };
         assert_eq!(
             children.semantics,
             sub_splitter::SubSplitSemantics::StructuralChildren

@@ -300,6 +300,26 @@ struct PullRequestFeedbackOutcome {
     submission: Option<PullRequestFeedbackSubmission>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PullRequestFeedbackRunOptions<'a> {
+    filters: FeedbackRecordFilterParams<'a>,
+    dry_run: bool,
+    open: bool,
+    submit: bool,
+}
+
+#[cfg(test)]
+impl PullRequestFeedbackRunOptions<'_> {
+    fn unfiltered(dry_run: bool, open: bool, submit: bool) -> Self {
+        Self {
+            filters: FeedbackRecordFilterParams::unfiltered(),
+            dry_run,
+            open,
+            submit,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PullRequestFeedbackDelivery {
     CreatePendingReview,
@@ -328,10 +348,12 @@ fn run_pull_request_feedback(
         &repo_root,
         &prepared,
         &client,
-        filters,
-        dry_run,
-        open,
-        submit,
+        PullRequestFeedbackRunOptions {
+            filters,
+            dry_run,
+            open,
+            submit,
+        },
         open_url_in_browser,
     )?;
     print_pull_request_feedback_outcome(&prepared.metadata.pr, &outcome, dry_run);
@@ -356,10 +378,7 @@ where
         repo_root,
         prepared,
         client,
-        FeedbackRecordFilterParams::unfiltered(),
-        dry_run,
-        open,
-        submit,
+        PullRequestFeedbackRunOptions::unfiltered(dry_run, open, submit),
         open_url,
     )
 }
@@ -368,10 +387,7 @@ fn run_prepared_pull_request_feedback_with_filters<C, O>(
     repo_root: &Path,
     prepared: &PreparedPullRequestReview,
     client: &C,
-    filters: FeedbackRecordFilterParams<'_>,
-    dry_run: bool,
-    open: bool,
-    submit: bool,
+    options: PullRequestFeedbackRunOptions<'_>,
     mut open_url: O,
 ) -> Result<PullRequestFeedbackOutcome>
 where
@@ -389,14 +405,14 @@ where
         ledger.save(&ledger_path)?;
     }
 
-    if submit {
+    if options.submit {
         return run_prepared_pull_request_feedback_submission(
             &mut ledger,
             ledger_path.as_path(),
             &prepared.metadata,
             client,
-            dry_run,
-            open,
+            options.dry_run,
+            options.open,
             open_url,
         );
     }
@@ -407,7 +423,7 @@ where
         repo_root,
         &prepared.metadata,
         database.records(),
-        filters,
+        options.filters,
     )?;
     let excluded_ids =
         ledger.excluded_record_ids_for_head(&prepared.metadata.pr, &prepared.metadata.head_sha);
@@ -424,7 +440,7 @@ where
         )?)
     };
 
-    if dry_run || plan.staged_record_ids.is_empty() {
+    if options.dry_run || plan.staged_record_ids.is_empty() {
         return Ok(PullRequestFeedbackOutcome {
             plan,
             delivery,
@@ -472,7 +488,9 @@ where
     };
     ledger.save(&ledger_path)?;
 
-    if open && let Err(error) = open_url(&review_url) {
+    if options.open
+        && let Err(error) = open_url(&review_url)
+    {
         eprintln!("warning: failed to open pending review URL {review_url}: {error:#}");
     }
 
@@ -1994,20 +2012,22 @@ mod tests {
 
         let since = FeedbackSinceExpr::new("2")?;
         let client = FeedbackTestGitHubClient::new(Vec::new());
-        let prepared = prepared_review(metadata.clone());
+        let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback_with_filters(
             &repo_root,
             &prepared,
             &client,
-            FeedbackRecordFilterParams {
-                since: Some(&since),
-                include_approved: true,
-                only: &[],
-                exclude: &[],
+            PullRequestFeedbackRunOptions {
+                filters: FeedbackRecordFilterParams {
+                    since: Some(&since),
+                    include_approved: true,
+                    only: &[],
+                    exclude: &[],
+                },
+                dry_run: true,
+                open: false,
+                submit: false,
             },
-            true,
-            false,
-            false,
             |_| Ok(()),
         )?;
 
@@ -2032,20 +2052,22 @@ mod tests {
         ))?;
 
         let client = FeedbackTestGitHubClient::new(Vec::new());
-        let prepared = prepared_review(metadata.clone());
+        let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback_with_filters(
             &repo_root,
             &prepared,
             &client,
-            FeedbackRecordFilterParams {
-                since: None,
-                include_approved: true,
-                only: &[],
-                exclude: &[BlockKind::Code],
+            PullRequestFeedbackRunOptions {
+                filters: FeedbackRecordFilterParams {
+                    since: None,
+                    include_approved: true,
+                    only: &[],
+                    exclude: &[BlockKind::Code],
+                },
+                dry_run: true,
+                open: false,
+                submit: false,
             },
-            true,
-            false,
-            false,
             |_| Ok(()),
         )?;
 
@@ -2075,20 +2097,22 @@ mod tests {
         store.append(&approval)?;
 
         let client = FeedbackTestGitHubClient::new(Vec::new());
-        let prepared = prepared_review(metadata.clone());
+        let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback_with_filters(
             &repo_root,
             &prepared,
             &client,
-            FeedbackRecordFilterParams {
-                since: None,
-                include_approved: false,
-                only: &[],
-                exclude: &[],
+            PullRequestFeedbackRunOptions {
+                filters: FeedbackRecordFilterParams {
+                    since: None,
+                    include_approved: false,
+                    only: &[],
+                    exclude: &[],
+                },
+                dry_run: true,
+                open: false,
+                submit: false,
             },
-            true,
-            false,
-            false,
             |_| Ok(()),
         )?;
 

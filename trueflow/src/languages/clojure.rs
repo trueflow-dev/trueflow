@@ -618,10 +618,9 @@ mod tests {
         };
 
         let blocks = split_container_like_block(&block).unwrap();
-        let import = blocks
-            .iter()
-            .find(|block| block.kind == BlockKind::Import)
-            .expect("expected import block");
+        let Some(import) = blocks.iter().find(|block| block.kind == BlockKind::Import) else {
+            panic!("expected import block");
+        };
 
         assert!(import.content.contains(":require"));
         assert!(!import.content.contains(":gen-class"));

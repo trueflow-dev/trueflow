@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use trueflow::commands::review::{ReviewRequest, ReviewTarget};
 use trueflow_test_support::TestRepo;
 
@@ -35,7 +35,7 @@ pub fn gamma() {
         .iter()
         .flat_map(|file| file.blocks.iter())
         .find(|block| block.content.contains("beta"))
-        .expect("Should find beta block")
+        .context("Should find beta block")?
         .hash
         .to_string();
     assert!(
