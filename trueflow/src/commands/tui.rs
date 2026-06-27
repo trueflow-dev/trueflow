@@ -5700,7 +5700,12 @@ fn load_file_contents_for_scope(
     path: &RepoPath,
 ) -> Option<String> {
     match scope {
-        ScopePreset::All | ScopePreset::MainDiff => std::fs::read_to_string(path.as_str()).ok(),
+        ScopePreset::All | ScopePreset::MainDiff => {
+            let path = repo_root
+                .map(|repo_root| repo_root.join(path.as_str()))
+                .unwrap_or_else(|| PathBuf::from(path.as_str()));
+            std::fs::read_to_string(path).ok()
+        }
         ScopePreset::Commit { id, .. } => load_file_contents_from_revision(repo_root, id, path),
         ScopePreset::RevisionRange { end, .. } => {
             load_file_contents_from_revision(repo_root, end, path)
@@ -13559,6 +13564,28 @@ mod diff_scope_tests {
                 .iter()
                 .any(|line| line.contains("historical target")),
             "expected rendered diff to use historical file content: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn load_workdir_scope_file_contents_uses_repo_root() {
+        let repo_root = temp_git_repo("tui_workdir_scope_file_contents_repo_root");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
+        fs::write(&file_path, "pub fn from_repo_root() {}\n")
+            .unwrap_or_else(|error| panic!("failed to write fixture file: {error}"));
+
+        let contents = load_file_contents_for_scope(
+            &ScopePreset::MainDiff,
+            Some(&repo_root),
+            &RepoPath::new("src/lib.rs").unwrap(),
+        );
+
+        assert_eq!(
+            contents.as_deref(),
+            Some("pub fn from_repo_root() {}\n"),
+            "workdir-backed TUI source rendering should not depend on process cwd"
         );
     }
 
