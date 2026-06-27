@@ -2,7 +2,7 @@ use crate::block::BlockKind;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::feedback_export::{
-    FeedbackEntry, FeedbackQuery, RepoFeedbackContextResolver, build_feedback_cursor,
+    FeedbackEntry, FeedbackQuery, RepoFeedbackContextResolver, build_feedback_cursor_after_export,
     collect_feedback_entries, feedback_cursor_path, resolve_allowed_revisions,
     resolve_since_filter, write_feedback_cursor,
 };
@@ -185,9 +185,11 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
             .iter()
             .flat_map(|entry| entry.reviews.iter().cloned())
             .collect::<Vec<_>>();
-        build_feedback_cursor(&exported_records).map(|cursor| FeedbackCursorUpdate {
-            path: feedback_cursor_path(&store),
-            cursor,
+        build_feedback_cursor_after_export(&since_filter, &exported_records).map(|cursor| {
+            FeedbackCursorUpdate {
+                path: feedback_cursor_path(&store),
+                cursor,
+            }
         })
     } else {
         None

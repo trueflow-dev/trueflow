@@ -281,6 +281,38 @@ pub fn build_feedback_cursor(records: &[Record]) -> Option<FeedbackCursor> {
     })
 }
 
+pub fn build_feedback_cursor_after_export(
+    since_filter: &FeedbackSinceFilter,
+    exported_records: &[Record],
+) -> Option<FeedbackCursor> {
+    let exported_cursor = build_feedback_cursor(exported_records);
+    let FeedbackSinceFilter::Cursor(previous) = since_filter else {
+        return exported_cursor;
+    };
+
+    let Some(exported_cursor) = exported_cursor else {
+        return Some(previous.clone());
+    };
+
+    if exported_cursor.timestamp < previous.timestamp {
+        return Some(previous.clone());
+    }
+
+    if exported_cursor.timestamp > previous.timestamp {
+        return Some(exported_cursor);
+    }
+
+    let mut record_ids_at_timestamp = previous.record_ids_at_timestamp.clone();
+    record_ids_at_timestamp.extend(exported_cursor.record_ids_at_timestamp);
+    record_ids_at_timestamp.sort();
+    record_ids_at_timestamp.dedup();
+
+    Some(FeedbackCursor {
+        timestamp: previous.timestamp,
+        record_ids_at_timestamp,
+    })
+}
+
 pub fn feedback_cursor_path(store: &FileStore) -> PathBuf {
     store.trueflow_dir().join(FEEDBACK_CURSOR_FILE)
 }
