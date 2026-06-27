@@ -1685,6 +1685,20 @@ fn keybind_action_for_key_code(
     }
 }
 
+fn keybind_action_for_key_event(
+    keybinds: &TuiKeybindsConfig,
+    key_event: &KeyEvent,
+) -> Option<KeybindAction> {
+    if matches!(key_event.code, KeyCode::Char(_))
+        && key_event
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    keybind_action_for_key_code(keybinds, key_event.code)
+}
+
 fn load_scope_options() -> Result<Vec<ScopeOption>> {
     let commits = vcs::recent_commits(8).unwrap_or_default();
     let workdir_prefix = workdir_prefix_from_git_root();
@@ -1899,7 +1913,7 @@ fn run_scope_selector(
         };
         let key_code = key_event.code;
 
-        if let Some(action) = keybind_action_for_key_code(keybinds, key_code) {
+        if let Some(action) = keybind_action_for_key_event(keybinds, &key_event) {
             if key_event.kind == KeyEventKind::Repeat && !keybind_action_accepts_repeat(action) {
                 continue;
             }
@@ -2043,7 +2057,7 @@ fn run_app(
                     continue;
                 }
 
-                if let Some(action) = keybind_action_for_key_code(&state.keybinds, key_code) {
+                if let Some(action) = keybind_action_for_key_event(&state.keybinds, &key_event) {
                     if key_event.kind == KeyEventKind::Repeat
                         && !keybind_action_accepts_repeat(action)
                     {
@@ -8224,6 +8238,19 @@ mod diff_scope_tests {
         assert_eq!(
             keybind_action_for_key_code(&keybinds, KeyCode::Up),
             Some(KeybindAction::Up)
+        );
+    }
+
+    #[test]
+    fn keybind_action_ignores_control_modified_character_bindings() {
+        let keybinds = crate::config::TuiKeybindsConfig::default();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let shift_child = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT);
+
+        assert_eq!(keybind_action_for_key_event(&keybinds, &ctrl_c), None);
+        assert_eq!(
+            keybind_action_for_key_event(&keybinds, &shift_child),
+            Some(KeybindAction::Child)
         );
     }
 

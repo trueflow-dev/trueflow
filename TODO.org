@@ -126,11 +126,16 @@
      after all cleanup writes have been attempted.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::tui_terminal::tests`.
-** DEF_TODO [Medium] Ignore or explicitly handle modified normal-mode TUI keypresses
+** DONE DEF_TODO [Medium] Ignore or explicitly handle modified normal-mode TUI keypresses
    - Normal-mode key handling matches only `KeyCode`, so Ctrl-C is treated like
      plain `c` and opens the note overlay under the default keybinds.
    - Repro: send `KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)` in
      a vt100/test-support normal review scenario; it dispatches `KeybindAction::Note`.
+   - Fixed by routing normal-mode keybinds through `KeyEvent` and ignoring
+     character bindings with Control/Alt/Super modifiers while preserving Shift
+     for uppercase bindings.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --features tui-test-support --lib keybind_action_ignores_control_modified_character_bindings`.
 ** DEF_TODO [High] Preserve full Dart and Lua review-unit content in sub-splits
    - Dart type-like and Lua module-like splitters register `ReviewUnits` but
      emit only member/table-field spans, dropping class/module headers, braces,
