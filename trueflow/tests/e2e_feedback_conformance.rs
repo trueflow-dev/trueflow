@@ -18,7 +18,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
     let scenario = FeedbackScenario::new("feedback_since_conformance")?;
     scenario.write("src/lib.rs", "pub fn core() {}\n")?;
     scenario.commit_all("Initial")?;
-    scenario.review_block_with_overrides(
+    scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "comment",
         &ReviewRecordOverrides {
@@ -27,7 +27,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
             ..Default::default()
         },
     )?;
-    scenario.review_block_with_overrides(
+    scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "comment",
         &ReviewRecordOverrides {
@@ -36,7 +36,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
             ..Default::default()
         },
     )?;
-    scenario.review_block_with_overrides(
+    scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "comment",
         &ReviewRecordOverrides {
@@ -83,7 +83,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
     let relative_scenario = FeedbackScenario::new("feedback_since_relative_conformance")?;
     relative_scenario.write("src/lib.rs", "pub fn core() {}\n")?;
     relative_scenario.commit_all("Initial")?;
-    relative_scenario.review_block_with_overrides(
+    relative_scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "comment",
         &ReviewRecordOverrides {
@@ -92,7 +92,7 @@ fn feedback_since_conformance_cases() -> Result<()> {
             ..Default::default()
         },
     )?;
-    relative_scenario.review_block_with_overrides(
+    relative_scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "comment",
         &ReviewRecordOverrides {
@@ -121,7 +121,7 @@ fn feedback_since_last_cursor_conformance_cases() -> Result<()> {
     let scenario = FeedbackScenario::new("feedback_since_last_conformance")?;
     scenario.write("src/lib.rs", "pub fn core() {}\n")?;
     scenario.commit_all("Initial")?;
-    scenario.review_block_with_overrides(
+    scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "comment",
         &ReviewRecordOverrides {
@@ -165,7 +165,7 @@ fn feedback_since_last_cursor_conformance_cases() -> Result<()> {
             verdict,
         }) = case.before_export
         {
-            scenario.review_block_with_overrides(
+            scenario.review_block_in_process_with_overrides(
                 "src/lib.rs",
                 verdict,
                 &ReviewRecordOverrides {
@@ -176,7 +176,7 @@ fn feedback_since_last_cursor_conformance_cases() -> Result<()> {
             )?;
         }
 
-        let entries = scenario.feedback_json(&["--since", "last"])?;
+        let entries = scenario.feedback_json_in_process(&["--since", "last"])?;
         let actual_ids = review_ids(&entries)?;
         let mut expected_ids = case
             .expected_review_ids
@@ -202,7 +202,7 @@ fn feedback_revision_range_conformance_cases() -> Result<()> {
 
     scenario.write("src/lib.rs", "pub fn in_range() {}\n")?;
     let in_range_revision = scenario.commit_all("B")?;
-    scenario.review_block_with_overrides(
+    scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "rejected",
         &ReviewRecordOverrides {
@@ -214,7 +214,7 @@ fn feedback_revision_range_conformance_cases() -> Result<()> {
 
     scenario.write("docs/guide.md", "docs changed\n")?;
     let unchanged_file_revision = scenario.commit_all("C")?;
-    scenario.review_block_with_overrides(
+    scenario.review_block_in_process_with_overrides(
         "src/lib.rs",
         "comment",
         &ReviewRecordOverrides {
@@ -280,7 +280,7 @@ struct CursorCase {
 
 fn assert_feedback_case(scenario: &FeedbackScenario, case: &FeedbackCase) -> Result<()> {
     let args = case.args.iter().map(String::as_str).collect::<Vec<_>>();
-    let entries = scenario.feedback_json(&args)?;
+    let entries = scenario.feedback_json_in_process(&args)?;
     let actual_ids = review_ids(&entries)?;
     let actual_files = file_paths(&entries)?;
     let mut expected_ids = case
