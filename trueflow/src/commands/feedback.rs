@@ -181,7 +181,11 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
         collect_feedback_entries(database.records(), &since_filter, &query, &mut resolver)?;
 
     let cursor_update = if matches!(since_mode, ParsedFeedbackSince::Last) {
-        build_feedback_cursor(database.records()).map(|cursor| FeedbackCursorUpdate {
+        let exported_records = entries
+            .iter()
+            .flat_map(|entry| entry.reviews.iter().cloned())
+            .collect::<Vec<_>>();
+        build_feedback_cursor(&exported_records).map(|cursor| FeedbackCursorUpdate {
             path: feedback_cursor_path(&store),
             cursor,
         })

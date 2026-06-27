@@ -376,6 +376,69 @@ fn test_feedback_since_last_uses_cursor_file() -> Result<()> {
 }
 
 #[test]
+fn test_feedback_since_last_cursor_ignores_filtered_out_records() -> Result<()> {
+    let repo = TestRepo::new("feedback_since_last_filtered_cursor")?;
+    repo.write("src/a.rs", "pub fn a() {}\n")?;
+    repo.write("src/b.rs", "pub fn b() {}\n")?;
+    repo.commit_all("Add libs")?;
+
+    let scan = repo.scan_without_cache()?;
+    let block_for = |path: &str| -> Result<&trueflow::block::Block> {
+        scan.files
+            .iter()
+            .find(|file| file.path.as_str() == path)
+            .and_then(|file| file.blocks.first())
+            .with_context(|| format!("expected block for {path}"))
+    };
+    let a_block = block_for("src/a.rs")?;
+    let b_block = block_for("src/b.rs")?;
+
+    let a_review = build_review_record(
+        a_block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("a-review"),
+            verdict: Some("comment"),
+            timestamp: Some(1000),
+            path_hint: Some("src/a.rs"),
+            line_hint: Some(u32::try_from(a_block.start_line)?),
+            ..Default::default()
+        },
+    );
+    let b_review = build_review_record(
+        b_block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("b-review"),
+            verdict: Some("comment"),
+            timestamp: Some(2000),
+            path_hint: Some("src/b.rs"),
+            line_hint: Some(u32::try_from(b_block.start_line)?),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[a_review, b_review])?;
+
+    let first_output = repo.run(&[
+        "feedback",
+        "--format",
+        "json",
+        "--since",
+        "last",
+        "--target",
+        "file:src/a.rs",
+    ])?;
+    let first_entries = json_array(&first_output)?;
+    assert_eq!(first_entries.len(), 1);
+    assert_eq!(first_entries[0]["file"].as_str(), Some("src/a.rs"));
+
+    let second_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    let second_entries = json_array(&second_output)?;
+    assert_eq!(second_entries.len(), 1);
+    assert_eq!(second_entries[0]["file"].as_str(), Some("src/b.rs"));
+
+    Ok(())
+}
+
+#[test]
 fn test_feedback_uses_config_default_since_when_omitted() -> Result<()> {
     let repo = TestRepo::new("feedback_default_since_config")?;
     repo.write("src/lib.rs", "pub fn core() {}\n")?;
@@ -1161,7 +1224,10 @@ fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> 
 #[test]
 fn test_block_rejection_overrides_file_approval_in_review() -> Result<()> {
     let repo = TestRepo::new("review_block_rejection_overrides_file_approval")?;
-    repo.write("src/lib.rs", "fn needs_review() { println!(\"check me\"); }\n")?;
+    repo.write(
+        "src/lib.rs",
+        "fn needs_review() { println!(\"check me\"); }\n",
+    )?;
     repo.commit_all("Add review target")?;
 
     let scan = repo.scan_without_cache()?;
@@ -1195,7 +1261,10 @@ fn test_block_rejection_overrides_file_approval_in_review() -> Result<()> {
             ..Default::default()
         },
     );
-    write_reviews_jsonl(&repo.path.join(".trueflow"), &[approved_file, rejected_block])?;
+    write_reviews_jsonl(
+        &repo.path.join(".trueflow"),
+        &[approved_file, rejected_block],
+    )?;
 
     let summary = review_all(&repo)?;
     let blocks = summary

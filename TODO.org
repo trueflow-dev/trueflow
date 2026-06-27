@@ -74,12 +74,16 @@
      the GitHub review plan.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::feedback::tests::pull_request_feedback`.
-** DEF_TODO [High] Do not advance the feedback `last` cursor past filtered-out records
+** DONE DEF_TODO [High] Do not advance the feedback `last` cursor past filtered-out records
    - `collect_local_feedback` builds the cursor from all database records, not
      the exported records.
    - Repro: export `feedback --since last --target file:src/a.rs` with newer
      feedback in `src/b.rs`; the cursor advances past the unseen `src/b.rs`
      record and later `--since last` exports skip it forever.
+   - Fixed by building the `last` cursor from the records actually exported in
+     feedback entries, not every record in the review database.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --features tui-test-support --test bug_regressions feedback_since_last`.
 ** DEF_TODO [High] Suppress PR feedback records whose target was later approved
    - Local feedback uses latest-verdict suppression, but
      `build_pull_request_feedback_plan` stages any noted anchored record without
