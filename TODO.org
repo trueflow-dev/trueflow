@@ -50,13 +50,18 @@
      routes persisted strings through `RepoPath::new`.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib repo_path::tests`.
-** DEF_TODO [High] Reject scan cache entries whose payload path differs from the cache key
+** DONE DEF_TODO [High] Reject scan cache entries whose payload path differs from the cache key
    - `trueflow/src/scanner.rs` indexes cached entries by `CachedFileEntry.path`
      and stamp, then blindly appends the embedded `FileState` from the cached
      outcome.
    - Repro: a cache entry keyed as `src/lib.rs` with the correct file stamp but
      an included `file_state.path` of `other.rs` will be reused and poison the
      scanned file set instead of being rejected or rescanned.
+   - Fixed by validating loaded cache entries for duplicate keys and for
+     `Included.file_state.path == CachedFileEntry.path`; invalid cache content
+     now falls back to rescan through the existing cache-error path.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib scanner::tests::scan_cache`.
 ** DEF_TODO [High] Make PR feedback honor accepted filters
    - `trueflow/src/commands/feedback.rs` accepts `--since`, `--only`,
      `--exclude`, and `--include-approved`, but the `--pr` path returns before

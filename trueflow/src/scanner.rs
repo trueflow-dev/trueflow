@@ -3,7 +3,7 @@ use crate::block::FileState;
 use crate::block_splitter;
 use crate::hashing::hash_str;
 use crate::repo_path::RepoPath;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use dirs::home_dir;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, WalkBuilder};
@@ -529,8 +529,31 @@ fn load_cache_entry(root: &Path, options: &ScanOptions) -> Result<Option<CacheEn
     if entry.options_fingerprint != scan_options_fingerprint(options) {
         return Ok(None);
     }
+    validate_cache_entry(&entry)?;
 
     Ok(Some(entry))
+}
+
+fn validate_cache_entry(entry: &CacheEntry) -> Result<()> {
+    let mut seen_paths = HashSet::new();
+    for file in &entry.files {
+        if !seen_paths.insert(&file.path) {
+            return Err(anyhow!(
+                "scan cache contains duplicate entry for {}",
+                file.path
+            ));
+        }
+        if let CachedFileOutcome::Included { file_state, .. } = &file.outcome
+            && file_state.path != file.path
+        {
+            return Err(anyhow!(
+                "scan cache entry for {} contains file state for {}",
+                file.path,
+                file_state.path
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn index_cached_files(entry: CacheEntry) -> HashMap<RepoPath, CachedFileEntry> {
@@ -863,6 +886,7 @@ fn process_file(repo_path_base: &Path, path: &Path) -> Result<ProcessedFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::Block;
     use crate::test_git::temp_test_dir;
     use std::process::Command;
     use std::time::Duration;
@@ -1049,6 +1073,67 @@ mod tests {
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["src/keep.rs"]
+        );
+    }
+
+    #[test]
+    fn scan_cache_rejects_included_file_state_with_mismatched_path() {
+        let repo = temp_test_dir("scanner_cache_mismatched_payload_path");
+        let cache_dir = temp_test_dir("scanner_cache_mismatched_payload_path_store");
+        fs::create_dir_all(repo.join("src")).unwrap_or_else(|error| panic!("create src: {error}"));
+        let path = repo.join("src/lib.rs");
+        fs::write(&path, "fn keep() {}\n")
+            .unwrap_or_else(|error| panic!("write lib file: {error}"));
+        let metadata = fs::metadata(&path).unwrap_or_else(|error| panic!("metadata: {error}"));
+        let options = ScanOptions {
+            cache_dir: Some(cache_dir),
+            ..ScanOptions::default()
+        };
+        let cache_path = RepoPath::new("src/lib.rs").unwrap();
+        let mismatched_file_state = FileState::from_text(
+            RepoPath::new("other.rs").unwrap(),
+            Language::Rust,
+            b"fn other() {}\n",
+            vec![Block::new(
+                "fn other() {}\n".to_string(),
+                crate::block::BlockKind::Function,
+                1,
+                2,
+            )],
+        );
+        write_cache(
+            &repo,
+            &options,
+            vec![CachedFileEntry {
+                path: cache_path,
+                stamp: FileStamp {
+                    modified_at: system_time_to_epoch(
+                        metadata
+                            .modified()
+                            .unwrap_or_else(|error| panic!("modified time: {error}")),
+                    ),
+                    size: metadata.len(),
+                },
+                outcome: CachedFileOutcome::Included {
+                    file_state: mismatched_file_state,
+                    diagnostics: Vec::new(),
+                },
+            }],
+        )
+        .unwrap_or_else(|error| panic!("write mismatched cache: {error}"));
+
+        let result = scan_directory(&repo, &options)
+            .unwrap_or_else(|error| panic!("scan with mismatched cache: {error}"));
+
+        assert_eq!(result.cache.read, ScanCacheReadStatus::Error);
+        assert_eq!(result.cache.rescanned_files, 1);
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs"]
         );
     }
 
