@@ -416,7 +416,7 @@ struct IgnoreMatcher {
 
 impl IgnoreMatcher {
     fn new(root: &Path, repo_path_base: &Path, options: &ScanOptions) -> Result<Self> {
-        let mut builder = GitignoreBuilder::new(root);
+        let mut builder = GitignoreBuilder::new(repo_path_base);
         builder.allow_unclosed_class(false);
         for pattern in &options.ignore_globs {
             builder.add_line(None, pattern)?;
@@ -446,7 +446,7 @@ impl IgnoreMatcher {
         let is_dir = entry
             .file_type()
             .is_some_and(|file_type| file_type.is_dir());
-        let relative = entry
+        let relative_to_walk_root = entry
             .path()
             .strip_prefix(&self.walk_root)
             .unwrap_or(entry.path());
@@ -461,8 +461,12 @@ impl IgnoreMatcher {
             return true;
         }
 
+        let relative_to_repo = entry
+            .path()
+            .strip_prefix(&self.repo_path_base)
+            .unwrap_or(relative_to_walk_root);
         self.glob_matcher
-            .matched_path_or_any_parents(relative, is_dir)
+            .matched_path_or_any_parents(relative_to_repo, is_dir)
             .is_ignore()
     }
 }
@@ -1109,6 +1113,37 @@ mod tests {
             .map(|file| file.path)
             .collect::<Vec<_>>();
         assert_eq!(paths, vec![RepoPath::new("src/nested/lib.rs").unwrap()]);
+    }
+
+    #[test]
+    fn scan_directory_matches_ignore_globs_against_repo_paths_from_subdir_roots() {
+        let repo_root = std::env::temp_dir().join("trueflow_tests").join(format!(
+            "scanner_subdir_ignore_glob_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(repo_root.join("src")).unwrap();
+        fs::write(repo_root.join("src/lib.rs"), "fn demo() {}\n").unwrap();
+        fs::write(repo_root.join("src/generated.snap"), "generated snapshot\n").unwrap();
+
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let options = ScanOptions {
+            ignore_globs: vec!["src/*.snap".to_string()],
+            ..ScanOptions::default()
+        };
+        let scan = scan_directory(repo_root.join("src"), &options)
+            .unwrap_or_else(|error| panic!("scan from subdir root: {error}"));
+        let paths = scan
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![RepoPath::new("src/lib.rs").unwrap()]);
     }
 
     #[test]
