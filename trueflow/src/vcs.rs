@@ -149,6 +149,7 @@ impl DiffChangedLineIndex {
         for hunk in hunks {
             push_indexed_changed_lines_for_hunk(&mut changed_lines, hunk, side);
         }
+        changed_lines.sort_by_key(|line| line.anchor_line);
         Self { changed_lines }
     }
 
@@ -1246,6 +1247,41 @@ mod tests {
         let base_index = DiffChangedLineIndex::from_hunks(&hunks, DiffBlockSide::Base);
         assert_eq!(
             base_index.change_kind_for_block(&block),
+            BlockDiffChangeKind::ReviewableChanges
+        );
+    }
+
+    #[test]
+    fn diff_changed_line_index_handles_unsorted_hunks() {
+        use crate::block::{Block, BlockKind};
+
+        let block = Block {
+            hash: TreeHash::default(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: None,
+            start_line: 10, // 0-based, so lines 11-20
+            end_line: 20,
+        };
+        let hunk_after = DiffHunk {
+            file_path: RepoPath::root(),
+            old_start: 25,
+            new_start: 25,
+            lines: vec![unified("+line25\n")],
+        };
+        let hunk_inside = DiffHunk {
+            file_path: RepoPath::root(),
+            old_start: 12,
+            new_start: 12,
+            lines: vec![unified("+line12\n")],
+        };
+
+        let index =
+            DiffChangedLineIndex::from_hunks(&[hunk_after, hunk_inside], DiffBlockSide::Head);
+
+        assert_eq!(
+            index.change_kind_for_block(&block),
             BlockDiffChangeKind::ReviewableChanges
         );
     }
