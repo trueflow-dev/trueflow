@@ -68,6 +68,7 @@ pub struct RepoFeedbackContextResolver<'a> {
     default_snapshot: FeedbackSnapshot,
     scan_options: &'a ScanOptions,
     workdir_prefix: Option<&'a str>,
+    repo_root: Option<PathBuf>,
     snapshot_files: HashMap<FeedbackSnapshot, Vec<FileState>>,
 }
 
@@ -77,16 +78,45 @@ impl<'a> RepoFeedbackContextResolver<'a> {
         scan_options: &'a ScanOptions,
         workdir_prefix: Option<&'a str>,
     ) -> Result<Self> {
+        Self::new_with_repo_root(content_source, scan_options, workdir_prefix, None)
+    }
+
+    pub fn new_for_repo_root(
+        content_source: &ReviewContentSource,
+        scan_options: &'a ScanOptions,
+        workdir_prefix: Option<&'a str>,
+        repo_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::new_with_repo_root(
+            content_source,
+            scan_options,
+            workdir_prefix,
+            Some(repo_root.as_ref().to_path_buf()),
+        )
+    }
+
+    fn new_with_repo_root(
+        content_source: &ReviewContentSource,
+        scan_options: &'a ScanOptions,
+        workdir_prefix: Option<&'a str>,
+        repo_root: Option<PathBuf>,
+    ) -> Result<Self> {
         let default_snapshot = snapshot_from_content_source(content_source);
         let mut snapshot_files = HashMap::new();
         snapshot_files.insert(
             default_snapshot.clone(),
-            load_snapshot_files_strict(&default_snapshot, scan_options, workdir_prefix)?,
+            load_snapshot_files_strict(
+                &default_snapshot,
+                scan_options,
+                workdir_prefix,
+                repo_root.as_deref(),
+            )?,
         );
         Ok(Self {
             default_snapshot,
             scan_options,
             workdir_prefix,
+            repo_root,
             snapshot_files,
         })
     }
@@ -100,6 +130,7 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
             &mut self.snapshot_files,
             self.scan_options,
             self.workdir_prefix,
+            self.repo_root.as_deref(),
         )
     }
 }
@@ -411,14 +442,15 @@ fn resolve_feedback_context(
     snapshot_files: &mut HashMap<FeedbackSnapshot, Vec<FileState>>,
     scan_options: &ScanOptions,
     workdir_prefix: Option<&str>,
+    repo_root: Option<&Path>,
 ) -> Result<ResolvedFeedbackContext> {
     let snapshots = candidate_snapshots_for_record(record, default_snapshot);
     for snapshot in &snapshots {
         if !snapshot_files.contains_key(snapshot) {
             let files = if snapshot == default_snapshot {
-                load_snapshot_files_strict(snapshot, scan_options, workdir_prefix)?
+                load_snapshot_files_strict(snapshot, scan_options, workdir_prefix, repo_root)?
             } else {
-                load_snapshot_files_best_effort(snapshot, scan_options, workdir_prefix)
+                load_snapshot_files_best_effort(snapshot, scan_options, workdir_prefix, repo_root)
             };
             snapshot_files.insert(snapshot.clone(), files);
         }
@@ -509,11 +541,20 @@ fn load_snapshot_files_strict(
     snapshot: &FeedbackSnapshot,
     scan_options: &ScanOptions,
     workdir_prefix: Option<&str>,
+    repo_root: Option<&Path>,
 ) -> Result<Vec<FileState>> {
     match snapshot {
-        FeedbackSnapshot::Workdir => Ok(scanner::scan_directory(".", scan_options)?.files),
+        FeedbackSnapshot::Workdir => Ok(scanner::scan_directory(
+            repo_root.unwrap_or_else(|| Path::new(".")),
+            scan_options,
+        )?
+        .files),
         FeedbackSnapshot::Revision(revision) => {
-            let repo = vcs::repo_from_workdir()?;
+            let repo = if let Some(repo_root) = repo_root {
+                gix::discover(repo_root)?
+            } else {
+                vcs::repo_from_workdir()?
+            };
             vcs::file_states_in_revision(&repo, revision, workdir_prefix)
         }
     }
@@ -523,8 +564,10 @@ fn load_snapshot_files_best_effort(
     snapshot: &FeedbackSnapshot,
     scan_options: &ScanOptions,
     workdir_prefix: Option<&str>,
+    repo_root: Option<&Path>,
 ) -> Vec<FileState> {
-    load_snapshot_files_strict(snapshot, scan_options, workdir_prefix).unwrap_or_default()
+    load_snapshot_files_strict(snapshot, scan_options, workdir_prefix, repo_root)
+        .unwrap_or_default()
 }
 
 fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(String, Block)> {

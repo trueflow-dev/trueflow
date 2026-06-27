@@ -18,8 +18,8 @@ use crate::store::{
     SourceCommentAnchor,
 };
 use crate::targets::{
-    ResolvedTargets, ReviewPathSelection, ReviewTarget, extract_pull_request_target,
-    resolve_targets, workdir_prefix_from_git_root,
+    ResolvedTargets, ReviewContentSource, ReviewPathSelection, ReviewTarget,
+    extract_pull_request_target, resolve_targets, workdir_prefix_from_git_root,
 };
 use crate::vcs;
 use anyhow::{Result, anyhow};
@@ -59,6 +59,26 @@ pub struct FeedbackCollectionParams<'a> {
     pub exclude: &'a [BlockKind],
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FeedbackRecordFilterParams<'a> {
+    since: Option<&'a FeedbackSinceExpr>,
+    include_approved: bool,
+    only: &'a [BlockKind],
+    exclude: &'a [BlockKind],
+}
+
+#[cfg(test)]
+impl FeedbackRecordFilterParams<'_> {
+    fn unfiltered() -> Self {
+        Self {
+            since: None,
+            include_approved: true,
+            only: &[],
+            exclude: &[],
+        }
+    }
+}
+
 struct FeedbackCommandResult {
     entries: Vec<FeedbackEntry>,
     cursor_update: Option<FeedbackCursorUpdate>,
@@ -85,7 +105,18 @@ pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()>
 
     validate_feedback_command_args(targets, pr)?;
     if let Some(pr) = pr {
-        return run_pull_request_feedback(pr, dry_run, open, submit);
+        return run_pull_request_feedback(
+            pr,
+            FeedbackRecordFilterParams {
+                since,
+                include_approved,
+                only,
+                exclude,
+            },
+            dry_run,
+            open,
+            submit,
+        );
     }
 
     let result = collect_local_feedback(FeedbackCollectionParams {
@@ -278,6 +309,7 @@ enum PullRequestFeedbackSubmission {
 
 fn run_pull_request_feedback(
     pr: &PullRequestRef,
+    filters: FeedbackRecordFilterParams<'_>,
     dry_run: bool,
     open: bool,
     submit: bool,
@@ -286,10 +318,11 @@ fn run_pull_request_feedback(
         .ok_or_else(|| anyhow!("git repository required for pull request feedback"))?;
     let client = GhGitHubClient;
     let prepared = prepare_pull_request_review(&repo_root, pr, &client)?;
-    let outcome = run_prepared_pull_request_feedback(
+    let outcome = run_prepared_pull_request_feedback_with_filters(
         &repo_root,
         &prepared,
         &client,
+        filters,
         dry_run,
         open,
         submit,
@@ -299,10 +332,37 @@ fn run_pull_request_feedback(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_prepared_pull_request_feedback<C, O>(
     repo_root: &Path,
     prepared: &PreparedPullRequestReview,
     client: &C,
+    dry_run: bool,
+    open: bool,
+    submit: bool,
+    open_url: O,
+) -> Result<PullRequestFeedbackOutcome>
+where
+    C: GitHubClient,
+    O: FnMut(&str) -> Result<()>,
+{
+    run_prepared_pull_request_feedback_with_filters(
+        repo_root,
+        prepared,
+        client,
+        FeedbackRecordFilterParams::unfiltered(),
+        dry_run,
+        open,
+        submit,
+        open_url,
+    )
+}
+
+fn run_prepared_pull_request_feedback_with_filters<C, O>(
+    repo_root: &Path,
+    prepared: &PreparedPullRequestReview,
+    client: &C,
+    filters: FeedbackRecordFilterParams<'_>,
     dry_run: bool,
     open: bool,
     submit: bool,
@@ -336,14 +396,17 @@ where
     }
 
     let database = store.load_database()?;
-    let excluded_ids =
-        ledger.excluded_record_ids_for_head(&prepared.metadata.pr, &prepared.metadata.head_sha);
-    let plan = build_pull_request_feedback_plan(
-        &repo,
+    let records = filter_pull_request_feedback_records(
+        &store,
+        repo_root,
         &prepared.metadata,
         database.records(),
-        &excluded_ids,
+        filters,
     )?;
+    let excluded_ids =
+        ledger.excluded_record_ids_for_head(&prepared.metadata.pr, &prepared.metadata.head_sha);
+    let plan =
+        build_pull_request_feedback_plan(&repo, &prepared.metadata, &records, &excluded_ids)?;
 
     let delivery = if plan.staged_record_ids.is_empty() {
         None
@@ -413,6 +476,50 @@ where
         review_url: Some(review_url),
         submission: None,
     })
+}
+
+fn filter_pull_request_feedback_records(
+    store: &FileStore,
+    repo_root: &Path,
+    metadata: &PullRequestMetadata,
+    records: &[Record],
+    filters: FeedbackRecordFilterParams<'_>,
+) -> Result<Vec<Record>> {
+    let config = load_config()?;
+    let block_filters = config
+        .feedback
+        .filters
+        .resolve_filters(filters.only, filters.exclude);
+    let scan_options = config.scan.resolve_options();
+    let effective_since = filters.since.unwrap_or(&config.feedback.default_since);
+    let since_filter = resolve_since_filter(store, effective_since.resolve()?)?;
+    let allowed_revisions = Some(
+        metadata
+            .commits
+            .iter()
+            .map(|commit| commit.sha.as_str().to_string())
+            .collect::<HashSet<_>>(),
+    );
+    let query = FeedbackQuery {
+        filters: block_filters,
+        explicit_selection: None,
+        changed_selection: None,
+        allowed_revisions,
+        include_approved: filters.include_approved,
+    };
+    let content_source = ReviewContentSource::Revision(metadata.head_sha.clone());
+    let mut resolver = RepoFeedbackContextResolver::new_for_repo_root(
+        &content_source,
+        &scan_options,
+        None,
+        repo_root,
+    )?;
+    let entries = collect_feedback_entries(records, &since_filter, &query, &mut resolver)?;
+
+    Ok(entries
+        .into_iter()
+        .flat_map(|entry| entry.reviews)
+        .collect())
 }
 
 fn run_prepared_pull_request_feedback_submission<C, O>(
@@ -1855,6 +1962,89 @@ mod tests {
             .is_empty()
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_filters_records_by_since() -> Result<()> {
+        let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_pr_since")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let mut old_record = review_record(
+            "old-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("old note"),
+        );
+        old_record.timestamp = 1;
+        let mut new_record = review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        );
+        new_record.timestamp = 2;
+        store.append(&old_record)?;
+        store.append(&new_record)?;
+
+        let since = FeedbackSinceExpr::new("2")?;
+        let client = FeedbackTestGitHubClient::new(Vec::new());
+        let prepared = prepared_review(metadata.clone());
+        let outcome = run_prepared_pull_request_feedback_with_filters(
+            &repo_root,
+            &prepared,
+            &client,
+            FeedbackRecordFilterParams {
+                since: Some(&since),
+                include_approved: true,
+                only: &[],
+                exclude: &[],
+            },
+            true,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert_eq!(
+            outcome.plan.staged_record_ids,
+            vec!["new-record".to_string()]
+        );
+        assert_eq!(outcome.plan.draft.comments.len(), 1);
+        assert_eq!(outcome.plan.draft.comments[0].body, "new note");
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_honors_block_kind_filters() -> Result<()> {
+        let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_pr_block_filter")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "function-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("function note"),
+        ))?;
+
+        let client = FeedbackTestGitHubClient::new(Vec::new());
+        let prepared = prepared_review(metadata.clone());
+        let outcome = run_prepared_pull_request_feedback_with_filters(
+            &repo_root,
+            &prepared,
+            &client,
+            FeedbackRecordFilterParams {
+                since: None,
+                include_approved: true,
+                only: &[],
+                exclude: &[BlockKind::Code],
+            },
+            true,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert!(outcome.plan.staged_record_ids.is_empty());
+        assert!(outcome.plan.draft.comments.is_empty());
         Ok(())
     }
 

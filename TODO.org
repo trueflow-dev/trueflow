@@ -62,13 +62,18 @@
      now falls back to rescan through the existing cache-error path.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib scanner::tests::scan_cache`.
-** DEF_TODO [High] Make PR feedback honor accepted filters
+** DONE DEF_TODO [High] Make PR feedback honor accepted filters
    - `trueflow/src/commands/feedback.rs` accepts `--since`, `--only`,
      `--exclude`, and `--include-approved`, but the `--pr` path returns before
      passing those filters into `run_pull_request_feedback`.
    - Repro: create old and new anchored PR feedback records, run
      `feedback --pr pr:11 --since <after-old> --dry-run`; the old filtered-out
      record is still staged for GitHub.
+   - Fixed by threading PR feedback through the same since, block-kind, and
+     include-approved record filtering used by local feedback before building
+     the GitHub review plan.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::feedback::tests::pull_request_feedback`.
 ** DEF_TODO [High] Do not advance the feedback `last` cursor past filtered-out records
    - `collect_local_feedback` builds the cursor from all database records, not
      the exported records.
