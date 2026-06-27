@@ -28,13 +28,18 @@
      decide visibility so direct child verdicts override inherited file approval.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --features tui-test-support --test bug_regressions test_block_rejection_overrides_file_approval_in_review`.
-** DEF_TODO [High] Count only approving identities for ApprovedOnly multi-person coverage
+** DONE DEF_TODO [High] Count only approving identities for ApprovedOnly multi-person coverage
    - `trueflow/src/coverage.rs` counts all identities for a check when enforcing
      `CoveragePolicy::two_person_review()`, regardless of whether those records
      approved or rejected/commented.
    - Repro: Alice rejects/comments a block, Bob later approves it; latest verdict
      is approved and two identities are counted even though only one person
      approved.
+   - Fixed by making `is_well_reviewed` count distinct identities through the
+     policy verdict requirement while preserving the public raw identity count
+     accessors.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib coverage::tests`.
 ** DEF_TODO [High] Validate RepoPath during serde deserialization
    - `trueflow/src/repo_path.rs` validates constructor input but derives
      `Deserialize` directly into the private string field.

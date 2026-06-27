@@ -358,16 +358,54 @@ impl<'a> NodeCoverage<'a> {
         identities.len()
     }
 
+    fn direct_distinct_identity_count_matching(
+        &self,
+        check: &ReviewCheck,
+        verdict_requirement: VerdictRequirement,
+    ) -> usize {
+        distinct_identity_count_matching(
+            self.index
+                .direct_record_indices_for_node(self.node_id)
+                .into_iter()
+                .map(|index| &self.index.database.records()[index]),
+            check,
+            verdict_requirement,
+        )
+    }
+
+    fn effective_distinct_identity_count_matching(
+        &self,
+        check: &ReviewCheck,
+        verdict_requirement: VerdictRequirement,
+    ) -> usize {
+        let mut identities = HashSet::new();
+        for ancestor_id in self.index.tree.ancestors(self.node_id) {
+            for record_index in self.index.direct_record_indices_for_node(ancestor_id) {
+                let record = &self.index.database.records()[record_index];
+                if record_matches_review_requirement(record, check, verdict_requirement) {
+                    identities.insert(identity_key(&record.identity));
+                }
+            }
+        }
+        identities.len()
+    }
+
     pub fn is_well_reviewed(&self, policy: &CoveragePolicy) -> bool {
         policy.required_checks.iter().all(|check| {
             let (verdict, identity_count) = match policy.scope {
                 CoverageScope::Direct => (
                     self.direct_latest_verdict_for(check),
-                    self.direct_distinct_identity_count(check),
+                    self.direct_distinct_identity_count_matching(
+                        check,
+                        policy.verdict_requirement,
+                    ),
                 ),
                 CoverageScope::Effective => (
                     self.effective_latest_verdict_for(check),
-                    self.effective_distinct_identity_count(check),
+                    self.effective_distinct_identity_count_matching(
+                        check,
+                        policy.verdict_requirement,
+                    ),
                 ),
             };
 
@@ -487,16 +525,46 @@ impl<'a> BlockCoverage<'a> {
             .len()
     }
 
+    fn direct_distinct_identity_count_matching(
+        &self,
+        check: &ReviewCheck,
+        verdict_requirement: VerdictRequirement,
+    ) -> usize {
+        distinct_identity_count_matching(
+            self.direct_records().into_iter(),
+            check,
+            verdict_requirement,
+        )
+    }
+
+    fn effective_distinct_identity_count_matching(
+        &self,
+        check: &ReviewCheck,
+        verdict_requirement: VerdictRequirement,
+    ) -> usize {
+        distinct_identity_count_matching(
+            self.effective_records().into_iter(),
+            check,
+            verdict_requirement,
+        )
+    }
+
     pub fn is_well_reviewed(&self, policy: &CoveragePolicy) -> bool {
         policy.required_checks.iter().all(|check| {
             let (verdict, identity_count) = match policy.scope {
                 CoverageScope::Direct => (
                     self.direct_latest_verdict_for(check),
-                    self.direct_distinct_identity_count(check),
+                    self.direct_distinct_identity_count_matching(
+                        check,
+                        policy.verdict_requirement,
+                    ),
                 ),
                 CoverageScope::Effective => (
                     self.effective_latest_verdict_for(check),
-                    self.effective_distinct_identity_count(check),
+                    self.effective_distinct_identity_count_matching(
+                        check,
+                        policy.verdict_requirement,
+                    ),
                 ),
             };
 
@@ -926,6 +994,30 @@ fn identity_key(identity: &Identity) -> String {
     }
 }
 
+fn distinct_identity_count_matching<'a>(
+    records: impl Iterator<Item = &'a Record>,
+    check: &ReviewCheck,
+    verdict_requirement: VerdictRequirement,
+) -> usize {
+    records
+        .filter(|record| record_matches_review_requirement(record, check, verdict_requirement))
+        .map(|record| identity_key(&record.identity))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn record_matches_review_requirement(
+    record: &Record,
+    check: &ReviewCheck,
+    verdict_requirement: VerdictRequirement,
+) -> bool {
+    &record.check == check
+        && match verdict_requirement {
+            VerdictRequirement::Any => true,
+            VerdictRequirement::ApprovedOnly => record.verdict == Verdict::Approved,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,6 +1168,40 @@ mod tests {
         );
         assert!(
             coverage
+                .node(function_id)
+                .is_well_reviewed(&CoveragePolicy::two_person_review())
+        );
+    }
+
+    #[test]
+    fn approved_only_two_person_policy_ignores_non_approving_identities() {
+        let (tree, _, function_id, _, _) = build_function_tree();
+        let function_hash = tree.node(function_id).hash.clone();
+        let mut rejected = approved_block_record(
+            "1",
+            function_hash.clone(),
+            "src/lib.rs",
+            1,
+            "alice@example.com",
+            1,
+        );
+        rejected.verdict = Verdict::Rejected;
+        let records = vec![
+            rejected,
+            approved_block_record("2", function_hash, "src/lib.rs", 1, "bob@example.com", 2),
+        ];
+        let database = ReviewDatabase::from_records(records);
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+
+        assert_eq!(
+            coverage
+                .node(function_id)
+                .direct_distinct_identity_count(&ReviewCheck::review()),
+            2
+        );
+        assert!(
+            !coverage
                 .node(function_id)
                 .is_well_reviewed(&CoveragePolicy::two_person_review())
         );
