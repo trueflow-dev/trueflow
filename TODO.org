@@ -115,12 +115,17 @@
      after alternate screen, mouse capture, and bracketed paste were enabled.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::tui_terminal::tests`.
-** DEF_TODO [High] Best-effort leave alternate screen even if keyboard-pop fails
+** DONE DEF_TODO [High] Best-effort leave alternate screen even if keyboard-pop fails
    - `leave_tui_mode` returns immediately if `PopKeyboardEnhancementFlags`
      fails, so `LeaveAlternateScreen` is never attempted.
    - Repro: a writer that fails on the pop sequence records disable mouse/paste
      bytes but no leave-alternate-screen bytes, and `Drop` retries the same
      failing path.
+   - Fixed by making `leave_tui_mode` attempt mouse/paste cleanup, keyboard-pop,
+     and alternate-screen leave independently, returning the first error only
+     after all cleanup writes have been attempted.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::tui_terminal::tests`.
 ** DEF_TODO [Medium] Ignore or explicitly handle modified normal-mode TUI keypresses
    - Normal-mode key handling matches only `KeyCode`, so Ctrl-C is treated like
      plain `c` and opens the note overlay under the default keybinds.

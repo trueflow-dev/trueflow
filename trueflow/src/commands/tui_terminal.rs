@@ -143,12 +143,23 @@ pub(crate) fn leave_tui_mode<W: io::Write>(
     writer: &mut W,
     capabilities: TerminalCapabilities,
 ) -> Result<()> {
-    execute!(writer, DisableMouseCapture, DisableBracketedPaste)?;
-    if capabilities.keyboard_enhancement_supported() {
-        execute!(writer, PopKeyboardEnhancementFlags)?;
+    let mut first_error = None;
+    if let Err(error) = execute!(writer, DisableMouseCapture, DisableBracketedPaste) {
+        first_error.get_or_insert_with(|| error.into());
     }
-    execute!(writer, LeaveAlternateScreen)?;
-    Ok(())
+    if capabilities.keyboard_enhancement_supported()
+        && let Err(error) = execute!(writer, PopKeyboardEnhancementFlags)
+    {
+        first_error.get_or_insert_with(|| error.into());
+    }
+    if let Err(error) = execute!(writer, LeaveAlternateScreen) {
+        first_error.get_or_insert_with(|| error.into());
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_tty_preflight(stdin_is_tty: bool, stdout_is_tty: bool) -> Result<()> {
@@ -605,6 +616,52 @@ mod tests {
         assert!(!status.tui_mode_enabled());
     }
 
+
+    #[test]
+    fn leave_tui_mode_attempts_alternate_screen_leave_when_keyboard_pop_fails() {
+        struct FailOnceAfterBaseLeave {
+            output: Vec<u8>,
+            failed: bool,
+        }
+
+        impl io::Write for FailOnceAfterBaseLeave {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let base_modes_left = self
+                    .output
+                    .windows(b"\x1b[?2004l".len())
+                    .any(|part| part == b"\x1b[?2004l");
+                if !self.failed && base_modes_left {
+                    self.failed = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "keyboard enhancement pop failed",
+                    ));
+                }
+                self.output.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = FailOnceAfterBaseLeave {
+            output: Vec::new(),
+            failed: false,
+        };
+        let error = leave_tui_mode(
+            &mut writer,
+            TerminalCapabilities::with_keyboard_enhancement_supported(true),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("keyboard enhancement pop failed"));
+        let rendered = String::from_utf8(writer.output)
+            .unwrap_or_else(|error| panic!("invalid ansi bytes: {error}"));
+        assert!(rendered.contains("\u{1b}[?2004l"));
+        assert!(rendered.contains("\u{1b}[?1049l"));
+    }
     #[test]
     fn terminal_session_status_marks_restored_explicitly() {
         let mut status = TerminalSessionStatus::active();
