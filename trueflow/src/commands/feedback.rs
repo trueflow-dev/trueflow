@@ -2053,6 +2053,49 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_feedback_suppresses_records_approved_later() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_pr_later_approved")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let mut comment = review_record(
+            "same-target",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("stale note"),
+        );
+        comment.timestamp = 1;
+        let mut approval = review_record("same-target", &metadata.head_sha, None, None);
+        approval.verdict = crate::store::Verdict::Approved;
+        approval.timestamp = 2;
+        approval.path_hint = Some(crate::repo_path::RepoPath::new("src/lib.rs")?);
+        approval.line_hint = Some(0);
+        store.append(&comment)?;
+        store.append(&approval)?;
+
+        let client = FeedbackTestGitHubClient::new(Vec::new());
+        let prepared = prepared_review(metadata.clone());
+        let outcome = run_prepared_pull_request_feedback_with_filters(
+            &repo_root,
+            &prepared,
+            &client,
+            FeedbackRecordFilterParams {
+                since: None,
+                include_approved: false,
+                only: &[],
+                exclude: &[],
+            },
+            true,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert!(outcome.plan.staged_record_ids.is_empty());
+        assert!(outcome.plan.draft.comments.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn pull_request_feedback_records_successful_appends_before_later_append_failure() -> Result<()>
     {
         let (repo_root, metadata) =

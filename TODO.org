@@ -84,13 +84,17 @@
      feedback entries, not every record in the review database.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --features tui-test-support --test bug_regressions feedback_since_last`.
-** DEF_TODO [High] Suppress PR feedback records whose target was later approved
+** DONE DEF_TODO [High] Suppress PR feedback records whose target was later approved
    - Local feedback uses latest-verdict suppression, but
      `build_pull_request_feedback_plan` stages any noted anchored record without
      checking whether a later approved record resolved the same target.
    - Repro: store a comment record with an anchor, then a later approved record
      for the same target; `feedback --pr --dry-run` still stages the stale
      comment.
+   - Fixed by the PR feedback filter path now using `collect_feedback_entries`,
+     which applies latest-verdict suppression unless `--include-approved` is set.
+   - Verified by
+     `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --lib commands::feedback::tests::pull_request_feedback`.
 ** DEF_TODO [Medium] Make relative feedback durations reject timestamp underflow
    - `trueflow/src/feedback_since.rs` checks multiplication overflow but then
      computes `now.timestamp() - seconds` directly.
