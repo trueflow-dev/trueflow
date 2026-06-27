@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -212,13 +212,17 @@ mod tests {
     fn repo_path_is_under_matches_exact_and_descendants() {
         let prefix = RepoPath::new("src/generated").unwrap();
         assert!(RepoPath::new("src/generated").unwrap().is_under(&prefix));
-        assert!(RepoPath::new("src/generated/out.rs")
-            .unwrap()
-            .is_under(&prefix));
+        assert!(
+            RepoPath::new("src/generated/out.rs")
+                .unwrap()
+                .is_under(&prefix)
+        );
         assert!(!RepoPath::new("src/generate.rs").unwrap().is_under(&prefix));
-        assert!(RepoPath::new("anything.rs")
-            .unwrap()
-            .is_under(&RepoPath::root()));
+        assert!(
+            RepoPath::new("anything.rs")
+                .unwrap()
+                .is_under(&RepoPath::root())
+        );
     }
 
     #[test]

@@ -395,10 +395,7 @@ impl<'a> NodeCoverage<'a> {
             let (verdict, identity_count) = match policy.scope {
                 CoverageScope::Direct => (
                     self.direct_latest_verdict_for(check),
-                    self.direct_distinct_identity_count_matching(
-                        check,
-                        policy.verdict_requirement,
-                    ),
+                    self.direct_distinct_identity_count_matching(check, policy.verdict_requirement),
                 ),
                 CoverageScope::Effective => (
                     self.effective_latest_verdict_for(check),
@@ -554,10 +551,7 @@ impl<'a> BlockCoverage<'a> {
             let (verdict, identity_count) = match policy.scope {
                 CoverageScope::Direct => (
                     self.direct_latest_verdict_for(check),
-                    self.direct_distinct_identity_count_matching(
-                        check,
-                        policy.verdict_requirement,
-                    ),
+                    self.direct_distinct_identity_count_matching(check, policy.verdict_requirement),
                 ),
                 CoverageScope::Effective => (
                     self.effective_latest_verdict_for(check),

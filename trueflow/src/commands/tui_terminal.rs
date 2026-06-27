@@ -616,7 +616,6 @@ mod tests {
         assert!(!status.tui_mode_enabled());
     }
 
-
     #[test]
     fn leave_tui_mode_attempts_alternate_screen_leave_when_keyboard_pop_fails() {
         struct FailOnceAfterBaseLeave {
@@ -656,7 +655,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("keyboard enhancement pop failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("keyboard enhancement pop failed")
+        );
         let rendered = String::from_utf8(writer.output)
             .unwrap_or_else(|error| panic!("invalid ansi bytes: {error}"));
         assert!(rendered.contains("\u{1b}[?2004l"));
