@@ -14,6 +14,7 @@ const CONFIG_FILE_NAME: &str = "trueflow.toml";
 const GLOBAL_CONFIG_FILE_NAME: &str = ".trueflow.toml";
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrueflowConfig {
     #[serde(default)]
     pub review: BlockFilterConfig,
@@ -28,6 +29,7 @@ pub struct TrueflowConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TuiConfig {
     #[serde(default = "default_confirm_batch_sub_blocks")]
     pub confirm_batch_sub_blocks: BatchConfirmPolicy,
@@ -61,6 +63,7 @@ pub struct TuiKeybindsConfig {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TuiKeybindsConfigRepr {
     #[serde(
         default = "default_tui_keybind_scroll_up",
@@ -193,6 +196,7 @@ fn validate_tui_keybinds(config: &TuiKeybindsConfig) -> std::result::Result<(), 
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AiConfig {
     #[serde(default = "default_ai_enabled")]
     pub enabled: bool,
@@ -218,6 +222,7 @@ pub enum AiProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanConfig {
     #[serde(default = "default_scan_use_cache")]
     pub use_cache: bool,
@@ -233,12 +238,42 @@ pub struct ScanConfig {
     pub ignore_path_prefixes: Vec<RepoPath>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FeedbackConfig {
-    #[serde(flatten)]
     pub filters: BlockFilterConfig,
-    #[serde(default = "default_feedback_since")]
     pub default_since: FeedbackSinceExpr,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedbackConfigRepr {
+    #[serde(default, deserialize_with = "deserialize_block_kinds")]
+    only: Vec<BlockKind>,
+    #[serde(default, deserialize_with = "deserialize_block_kinds")]
+    exclude: Vec<BlockKind>,
+    #[serde(default = "default_feedback_since")]
+    default_since: FeedbackSinceExpr,
+}
+
+impl From<FeedbackConfigRepr> for FeedbackConfig {
+    fn from(repr: FeedbackConfigRepr) -> Self {
+        Self {
+            filters: BlockFilterConfig {
+                only: repr.only,
+                exclude: repr.exclude,
+            },
+            default_since: repr.default_since,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FeedbackConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self::from(FeedbackConfigRepr::deserialize(deserializer)?))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +362,7 @@ pub struct TuiSpeedReadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TuiSpeedReadConfigRepr {
     #[serde(default = "default_tui_speed_read_enabled")]
     enabled: bool,
@@ -651,6 +687,7 @@ fn default_feedback_since() -> FeedbackSinceExpr {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockFilterConfig {
     #[serde(default, deserialize_with = "deserialize_block_kinds")]
     pub only: Vec<BlockKind>,
@@ -1554,6 +1591,61 @@ ignore_path_prefixes = ["vendor", "generated"]
         assert!(
             err.to_string().contains("invalid scan ignore glob"),
             "unexpected scan config error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_top_level_and_nested_keys() {
+        let top_level_err = toml::from_str::<TrueflowConfig>(
+            r#"
+[not_a_section]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            top_level_err.to_string().contains("unknown field"),
+            "unexpected top-level config error: {top_level_err}"
+        );
+
+        let nested_err = toml::from_str::<TrueflowConfig>(
+            r#"
+[scan]
+ignore_path_prefix = ["vendor"]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            nested_err.to_string().contains("unknown field"),
+            "unexpected nested config error: {nested_err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_unknown_keys_in_merged_config_files() {
+        let root = temp_config_dir("unknown_merged_keys");
+        let home = root.join("home");
+        let workdir = root.join("repo");
+        write_config(
+            &home.join(".trueflow.toml"),
+            r#"
+[ai]
+enabled = true
+"#,
+        );
+        write_config(
+            &workdir.join("trueflow.toml"),
+            r#"
+[ai]
+enabld = false
+"#,
+        );
+
+        let err = load_from_start_dir(&workdir, Some(&home)).unwrap_err();
+        let error_chain = format!("{err:?}");
+        assert!(
+            error_chain.contains("unknown field"),
+            "unexpected merged config error: {error_chain}"
         );
     }
 
