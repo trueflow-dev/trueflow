@@ -1212,12 +1212,12 @@ fn mapped_head_range_for_base_block(
     base_block: &Block,
     hunks: &[vcs::DiffHunk],
 ) -> std::ops::Range<u32> {
-    let start = map_base_line_to_head_anchor(
-        u32::try_from(base_block.start_line.saturating_add(1)).unwrap_or(u32::MAX),
-        hunks,
-    );
-    let end_inclusive = u32::try_from(base_block.end_line).unwrap_or(u32::MAX);
-    let end_anchor = map_base_line_to_head_anchor(end_inclusive.max(start), hunks);
+    let old_start = u32::try_from(base_block.start_line.saturating_add(1)).unwrap_or(u32::MAX);
+    let old_end_inclusive = u32::try_from(base_block.end_line)
+        .unwrap_or(u32::MAX)
+        .max(old_start);
+    let start = map_base_line_to_head_anchor(old_start, hunks);
+    let end_anchor = map_base_line_to_head_anchor(old_end_inclusive, hunks);
     start..end_anchor.saturating_add(1)
 }
 
@@ -1792,6 +1792,63 @@ mod tests {
             }),
             "expected deleted code paragraph review unit: {sides:?}"
         );
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_does_not_extend_single_line_mapping_after_insertion() {
+        let base = make_diff_block("base", BlockKind::CodeParagraph, 9, 10, "target\n");
+        let shifted_target = make_diff_block(
+            "head-target",
+            BlockKind::CodeParagraph,
+            10,
+            11,
+            "target changed\n",
+        );
+        let adjacent = make_diff_block(
+            "head-adjacent",
+            BlockKind::CodeParagraph,
+            11,
+            12,
+            "adjacent changed\n",
+        );
+
+        let blocks = collect_diff_review_blocks_for_file(
+            std::slice::from_ref(&base),
+            &[shifted_target.clone(), adjacent.clone()],
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::added("inserted\n"),
+                    vcs::DiffHunkLine::context("line1\n"),
+                    vcs::DiffHunkLine::context("line2\n"),
+                    vcs::DiffHunkLine::context("line3\n"),
+                    vcs::DiffHunkLine::context("line4\n"),
+                    vcs::DiffHunkLine::context("line5\n"),
+                    vcs::DiffHunkLine::context("line6\n"),
+                    vcs::DiffHunkLine::context("line7\n"),
+                    vcs::DiffHunkLine::context("line8\n"),
+                    vcs::DiffHunkLine::context("line9\n"),
+                    vcs::DiffHunkLine::removed("target\n"),
+                    vcs::DiffHunkLine::added("target changed\n"),
+                    vcs::DiffHunkLine::removed("adjacent\n"),
+                    vcs::DiffHunkLine::added("adjacent changed\n"),
+                ],
+            }],
+        );
+
+        let sides = diff_review_blocks(&blocks);
+        assert_eq!(sides.len(), 2);
+        assert_eq!(
+            sides[0].head.as_ref().map(|block| block.hash.as_str()),
+            Some(shifted_target.hash.as_str())
+        );
+        assert_eq!(
+            sides[1].head.as_ref().map(|block| block.hash.as_str()),
+            Some(adjacent.hash.as_str())
+        );
+        assert!(sides[1].base.is_none());
     }
 
     #[test]
