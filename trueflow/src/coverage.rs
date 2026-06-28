@@ -901,7 +901,7 @@ fn preferred_record_index_for_check<F>(
 where
     F: Fn(usize) -> Option<BindingRelation>,
 {
-    let mut best: Option<(u8, i64, usize)> = None;
+    let mut best: Option<(i64, usize)> = None;
 
     for record_index in record_indices {
         let record = &records[*record_index];
@@ -909,19 +909,16 @@ where
             continue;
         }
 
-        let relation = relation_for_record(*record_index);
-        let candidate = (
-            binding_relation_priority(relation.as_ref()),
-            record.timestamp,
-            *record_index,
-        );
+        if relation_for_record(*record_index).is_none() {
+            continue;
+        }
+
+        let candidate = (record.timestamp, *record_index);
 
         match best {
-            Some((best_priority, best_timestamp, best_index)) => {
-                if candidate.0 < best_priority
-                    || (candidate.0 == best_priority
-                        && (candidate.1 > best_timestamp
-                            || (candidate.1 == best_timestamp && candidate.2 > best_index)))
+            Some((best_timestamp, best_index)) => {
+                if candidate.0 > best_timestamp
+                    || (candidate.0 == best_timestamp && candidate.1 > best_index)
                 {
                     best = Some(candidate);
                 }
@@ -930,16 +927,7 @@ where
         }
     }
 
-    best.map(|(_, _, record_index)| record_index)
-}
-
-fn binding_relation_priority(relation: Option<&BindingRelation>) -> u8 {
-    match relation {
-        Some(BindingRelation::Exact) => 0,
-        Some(BindingRelation::PathScoped) | Some(BindingRelation::TargetNode) => 1,
-        Some(BindingRelation::HashOnly) => 2,
-        None => 3,
-    }
+    best.map(|(_, record_index)| record_index)
 }
 
 fn record_match_relation_for_block(
@@ -1164,6 +1152,28 @@ mod tests {
             coverage
                 .node(function_id)
                 .is_well_reviewed(&CoveragePolicy::two_person_review())
+        );
+    }
+
+    #[test]
+    fn newer_hash_only_block_record_overrides_older_exact_record() {
+        let (tree, _, function_id, _, function_hash) = build_function_tree();
+        let mut rejected =
+            approved_hash_only_block_record("2", function_hash.clone(), "alice@example.com", 2);
+        rejected.verdict = Verdict::Rejected;
+        let records = vec![
+            approved_block_record("1", function_hash, "src/lib.rs", 1, "alice@example.com", 1),
+            rejected,
+        ];
+        let database = ReviewDatabase::from_records(records);
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+
+        assert_eq!(
+            coverage
+                .node(function_id)
+                .direct_latest_verdict_for(&ReviewCheck::review()),
+            Some(&Verdict::Rejected)
         );
     }
 
