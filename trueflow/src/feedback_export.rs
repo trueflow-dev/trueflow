@@ -145,30 +145,13 @@ struct FeedbackEntryKey {
     end_line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FeedbackVerdictKey {
-    target: ReviewTargetRef,
-    path_hint: Option<RepoPath>,
-    line_hint: Option<u32>,
-}
-
-impl FeedbackVerdictKey {
-    fn from_record(record: &Record) -> Self {
-        Self {
-            target: record.target.clone(),
-            path_hint: record.path_hint.clone(),
-            line_hint: record.line_hint,
-        }
-    }
-}
-
 pub fn collect_feedback_entries(
     records: &[Record],
     since_filter: &FeedbackSinceFilter,
     query: &FeedbackQuery,
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<FeedbackEntry>> {
-    let latest_verdicts = latest_verdicts_by_verdict_key(records);
+    let latest_verdicts = latest_verdicts_by_entry_key(records, resolver)?;
     let filtered_records = records
         .iter()
         .filter(|record| record_matches_since(record, since_filter))
@@ -178,11 +161,7 @@ pub fn collect_feedback_entries(
     let mut grouped = HashMap::<FeedbackEntryKey, FeedbackEntry>::new();
     for record in filtered_records {
         let context = resolver.resolve_context(record)?;
-        let file_path = context
-            .file_path
-            .clone()
-            .or_else(|| record.path_hint.as_ref().map(RepoPath::to_string))
-            .unwrap_or_else(|| "<unknown>".to_string());
+        let (file_path, block, key) = feedback_entry_parts(record, &context);
 
         if !path_matches_feedback_selections(
             &file_path,
@@ -193,17 +172,12 @@ pub fn collect_feedback_entries(
         }
 
         let latest_verdict = latest_verdicts
-            .get(&FeedbackVerdictKey::from_record(record))
+            .get(&key)
             .map(String::as_str)
             .unwrap_or("unreviewed");
         if !query.include_approved && latest_verdict == "approved" {
             continue;
         }
-
-        let block = context
-            .block
-            .clone()
-            .unwrap_or_else(|| unresolved_block_for_record(record));
         if !query.filters.allows_block(block.kind) {
             continue;
         }
@@ -216,14 +190,6 @@ pub fn collect_feedback_entries(
             continue;
         }
 
-        let key = FeedbackEntryKey {
-            snapshot: context.snapshot,
-            target: record.target.clone(),
-            file_path: file_path.clone(),
-            block_hash: block.hash.clone(),
-            start_line: block.start_line,
-            end_line: block.end_line,
-        };
         let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
             file_path,
             block,
@@ -249,6 +215,31 @@ pub fn collect_feedback_entries(
     });
 
     Ok(entries)
+}
+
+fn feedback_entry_parts(
+    record: &Record,
+    context: &ResolvedFeedbackContext,
+) -> (String, Block, FeedbackEntryKey) {
+    let file_path = context
+        .file_path
+        .clone()
+        .or_else(|| record.path_hint.as_ref().map(RepoPath::to_string))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let block = context
+        .block
+        .clone()
+        .unwrap_or_else(|| unresolved_block_for_record(record));
+    let key = FeedbackEntryKey {
+        snapshot: context.snapshot.clone(),
+        target: record.target.clone(),
+        file_path: file_path.clone(),
+        block_hash: block.hash.clone(),
+        start_line: block.start_line,
+        end_line: block.end_line,
+    };
+
+    (file_path, block, key)
 }
 
 pub fn resolve_since_filter(
@@ -382,10 +373,14 @@ pub fn resolve_allowed_revisions(
     Ok(Some(allowed))
 }
 
-fn latest_verdicts_by_verdict_key(records: &[Record]) -> HashMap<FeedbackVerdictKey, String> {
-    let mut latest = HashMap::<FeedbackVerdictKey, (i64, usize, String)>::new();
+fn latest_verdicts_by_entry_key(
+    records: &[Record],
+    resolver: &mut impl FeedbackContextResolver,
+) -> Result<HashMap<FeedbackEntryKey, String>> {
+    let mut latest = HashMap::<FeedbackEntryKey, (i64, usize, String)>::new();
     for (index, record) in records.iter().enumerate() {
-        let key = FeedbackVerdictKey::from_record(record);
+        let context = resolver.resolve_context(record)?;
+        let (_, _, key) = feedback_entry_parts(record, &context);
         let should_replace = latest
             .get(&key)
             .is_none_or(|(timestamp, existing_index, _)| {
@@ -399,10 +394,10 @@ fn latest_verdicts_by_verdict_key(records: &[Record]) -> HashMap<FeedbackVerdict
             );
         }
     }
-    latest
+    Ok(latest
         .into_iter()
         .map(|(target, (_, _, verdict))| (target, verdict))
-        .collect()
+        .collect())
 }
 
 fn resolve_revision_id(repo: &gix::Repository, revision: &str) -> Result<String> {
@@ -816,6 +811,38 @@ mod tests {
                     "later".to_string(),
                     resolved_context("src/lib.rs", "pub fn core() {}\n"),
                 ),
+            ]),
+        };
+        let query = FeedbackQuery {
+            filters: BlockFilters::default(),
+            explicit_selection: None,
+            changed_selection: None,
+            allowed_revisions: None,
+            include_approved: false,
+        };
+
+        let entries = collect_feedback_entries(
+            &[earlier, later],
+            &FeedbackSinceFilter::All,
+            &query,
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn collect_feedback_entries_excludes_approved_target_across_hint_precision() {
+        let mut earlier = build_record("earlier", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        earlier.line_hint = Some(0);
+        let mut later = build_record("later", "aaaaaaa", "src/lib.rs", 20, Verdict::Approved);
+        later.line_hint = None;
+        let context = resolved_context("src/lib.rs", "pub fn core() {}\n");
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                ("earlier".to_string(), context.clone()),
+                ("later".to_string(), context),
             ]),
         };
         let query = FeedbackQuery {
