@@ -134,6 +134,7 @@ pub(crate) enum DiffBlockSide {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DiffChangedLineIndex {
+    side: DiffBlockSide,
     changed_lines: Vec<IndexedChangedDiffLine>,
 }
 
@@ -150,7 +151,10 @@ impl DiffChangedLineIndex {
             push_indexed_changed_lines_for_hunk(&mut changed_lines, hunk, side);
         }
         changed_lines.sort_by_key(|line| line.anchor_line);
-        Self { changed_lines }
+        Self {
+            side,
+            changed_lines,
+        }
     }
 
     pub(crate) fn change_kind_for_block(&self, block: &Block) -> BlockDiffChangeKind {
@@ -162,10 +166,30 @@ impl DiffChangedLineIndex {
         let end_changed_line = self.changed_lines[first_changed_line..]
             .partition_point(|line| line.anchor_line < end_exclusive)
             + first_changed_line;
-        let changed_lines = &self.changed_lines[first_changed_line..end_changed_line];
+        let mut changed_lines = &self.changed_lines[first_changed_line..end_changed_line];
+        let mut had_nonreviewable_churn_at_block_start = false;
+
+        if self.side == DiffBlockSide::Head {
+            let block_start_end =
+                changed_lines.partition_point(|line| line.anchor_line == start);
+            let changed_lines_at_block_start = &changed_lines[..block_start_end];
+            if !changed_lines_at_block_start
+                .iter()
+                .any(|line| line.line.kind == DiffLineKind::Added)
+            {
+                had_nonreviewable_churn_at_block_start = changed_lines_at_block_start
+                    .iter()
+                    .any(|line| is_trivial_whitespace_only_change(&line.line));
+                changed_lines = &changed_lines[block_start_end..];
+            }
+        }
 
         if changed_lines.is_empty() {
-            return BlockDiffChangeKind::NoTextChanges;
+            return if had_nonreviewable_churn_at_block_start {
+                BlockDiffChangeKind::OnlyNonreviewableChurn
+            } else {
+                BlockDiffChangeKind::NoTextChanges
+            };
         }
 
         if all_changed_lines_are_nonreviewable(changed_lines) {
@@ -174,6 +198,7 @@ impl DiffChangedLineIndex {
             BlockDiffChangeKind::ReviewableChanges
         }
     }
+
 }
 
 pub struct GitConfig {
@@ -1215,6 +1240,38 @@ mod tests {
             block_has_changed_lines_in_diff(&block, &[hunk]),
             BlockDiffChangeKind::ReviewableChanges,
             "overlapping hunks with removed lines must still count as reviewable changes"
+        );
+    }
+
+    #[test]
+    fn head_changed_line_index_does_not_attribute_deletion_to_following_block() {
+        use crate::block::{Block, BlockKind};
+
+        let following_head_block = Block {
+            hash: TreeHash::default(),
+            content: String::new(),
+            kind: BlockKind::Code,
+            tags: vec![],
+            complexity: None,
+            start_line: 10, // 0-based, so lines 11-12
+            end_line: 12,
+        };
+        let hunk = DiffHunk {
+            file_path: RepoPath::root(),
+            old_start: 11,
+            new_start: 11,
+            lines: vec![
+                unified("-deleted before following block\n"),
+                unified(" following line 1\n"),
+                unified(" following line 2\n"),
+            ],
+        };
+
+        let head_index = DiffChangedLineIndex::from_hunks(&[hunk], DiffBlockSide::Head);
+
+        assert_eq!(
+            head_index.change_kind_for_block(&following_head_block),
+            BlockDiffChangeKind::NoTextChanges
         );
     }
 
