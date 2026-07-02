@@ -403,13 +403,13 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
         };
 
         let node_content = &content[block_start..end_byte];
-        blocks.push(create_block(
+        blocks.push(create_block_with_complexity(
             node_content,
             map_kind_for_node(lang, child, content),
             content,
             block_start,
             end_byte,
-            lang,
+            complexity::calculate_from_node(child, lang, content),
         ));
 
         if let Some(registration) = registration {
@@ -1804,8 +1804,25 @@ fn create_block(
     end_byte: usize,
     lang: Language,
 ) -> Block {
+    create_block_with_complexity(
+        text,
+        kind,
+        full_source,
+        start_byte,
+        end_byte,
+        complexity::calculate(text, lang),
+    )
+}
+
+fn create_block_with_complexity(
+    text: &str,
+    kind: BlockKind,
+    full_source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    complexity: Option<u32>,
+) -> Block {
     let hash = TreeHash::from_content(text);
-    let complexity = complexity::calculate(text, lang);
 
     // Line mapping (byte -> line index)
     // Reusing the logic from previous implementation

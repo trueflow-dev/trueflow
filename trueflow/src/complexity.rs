@@ -2,10 +2,7 @@ use crate::analysis::Language;
 use tree_sitter::{Node, Parser};
 
 pub fn calculate(content: &str, lang: Language) -> Option<u32> {
-    if matches!(
-        lang,
-        Language::Unknown | Language::Text | Language::Markdown
-    ) {
+    if !supports_complexity(lang) {
         return None;
     }
 
@@ -40,6 +37,17 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
     parser
         .parse(content, None)
         .map(|tree| calculate_node(tree.root_node(), 0, lang, content))
+}
+
+pub(crate) fn calculate_from_node(node: Node<'_>, lang: Language, source: &str) -> Option<u32> {
+    supports_complexity(lang).then(|| calculate_node(node, 0, lang, source))
+}
+
+fn supports_complexity(lang: Language) -> bool {
+    !matches!(
+        lang,
+        Language::Unknown | Language::Text | Language::Markdown
+    )
 }
 
 fn calculate_node(node: Node<'_>, nesting: u32, lang: Language, source: &str) -> u32 {
@@ -499,5 +507,24 @@ int process(const std::vector<int>& values, bool ready) {
         // Total: 4
         let score = calculate(code, Language::Cpp);
         assert_eq!(score, Some(4));
+    }
+    #[test]
+    fn test_calculate_from_node_matches_reparsed_rust_function() {
+        let code = "#[inline]\nfn foo() { if true { for x in 0..10 { if x > 3 {} } } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let function = tree
+            .root_node()
+            .named_children(&mut tree.root_node().walk())
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+
+        assert_eq!(
+            calculate_from_node(function, Language::Rust, code),
+            calculate(function.utf8_text(code.as_bytes()).unwrap(), Language::Rust)
+        );
     }
 }
