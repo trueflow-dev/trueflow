@@ -25,7 +25,7 @@ That one command will:
 
 - run `tofu init`, `tofu fmt -check`, `tofu validate`, and `tofu apply`
 - upload `website/`
-- package the Apple Silicon macOS binary artifact on Apple Silicon macOS
+- package the Apple Silicon macOS binary artifact, either by building on Apple Silicon macOS or by packaging a supplied macOS binary
 - upload `/download/` artifacts from the versioned artifact directory
 
 For the common fast path after infra is already up:
@@ -57,18 +57,26 @@ during startup, so the dev shell intentionally relies on your existing ambient
 
 ## Release artifact packaging and upload
 
-To package and upload the current Apple Silicon macOS binary separately:
+To package and upload the current Apple Silicon macOS binary separately on
+Apple Silicon macOS:
 
 ```sh
 ./scripts/package-macos-release.sh
-./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.0
+./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.1
+```
+
+To package a macOS binary built on another machine:
+
+```sh
+./scripts/package-macos-release.sh --binary path/to/aarch64-apple-darwin/trueflow
+./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.1
 ```
 
 To package and smoke-test a native Linux x86_64 musl release on Linux x86_64:
 
 ```sh
 ./scripts/package-linux-release.sh
-./scripts/smoke-test-release.sh .trueflow/release-artifacts/v0.1.0/trueflow-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+./scripts/smoke-test-release.sh .trueflow/release-artifacts/v0.1.1/trueflow-v0.1.1-x86_64-unknown-linux-musl.tar.gz
 ```
 
 That Linux release flow uses `nix build .#release` as the build source of truth.

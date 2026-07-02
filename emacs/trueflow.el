@@ -5,7 +5,7 @@
 ;; Author: Architecture Team <team@example.com>
 ;; Keywords: tools, vc, git
 ;; Package-Requires: ((emacs "26.1") (magit-section "3.0.0") (transient "0.3.0"))
-;; Version: 0.1.0
+;; Version: 0.1.1
 
 ;;; Commentary:
 

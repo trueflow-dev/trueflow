@@ -3586,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "trueflow"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3651,7 +3651,7 @@ dependencies = [
 
 [[package]]
 name = "trueflow-test-support"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossterm",

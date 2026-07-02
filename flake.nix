@@ -40,7 +40,7 @@
         }:
           rustPlatform.buildRustPackage ({
             pname = "trueflow";
-            version = "0.1.0";
+            version = "0.1.1";
             src = ./trueflow;
             cargoLock = { lockFile = ./trueflow/Cargo.lock; };
 

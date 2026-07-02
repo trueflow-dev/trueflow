@@ -14,6 +14,7 @@ SKIP_WEBSITE=0
 SKIP_PACKAGE=0
 SKIP_DOWNLOADS=0
 AUTO_APPROVE=0
+MACOS_BINARY=""
 
 usage() {
   cat <<'EOF'
@@ -29,7 +30,8 @@ Run the full public-site deployment flow for trueflow.dev:
 Options:
   --version vX.Y.Z     Override the release version (default: read from Cargo.toml).
   --output-dir DIR     Base directory for versioned release artifacts (default: .trueflow/release-artifacts).
-  --skip-build         Reuse the existing release binary when packaging.
+  --skip-build         Reuse the existing native macOS release binary when packaging.
+  --macos-binary PATH  Package this supplied aarch64-apple-darwin binary instead of building locally.
   --skip-infra-apply   Skip tofu apply after init/fmt/validate.
   --skip-website       Skip syncing website/.
   --skip-package       Skip packaging the macOS release artifact.
@@ -64,6 +66,11 @@ while [ $# -gt 0 ]; do
       ;;
     --skip-build)
       SKIP_BUILD=1
+      ;;
+    --macos-binary)
+      shift
+      [ $# -gt 0 ] || die "--macos-binary requires a value"
+      MACOS_BINARY=$1
       ;;
     --skip-infra-apply)
       SKIP_INFRA_APPLY=1
@@ -123,12 +130,13 @@ else
 fi
 
 if [ "$SKIP_PACKAGE" -eq 0 ]; then
-  printf '==> packaging macOS release artifact\n'
-  if [ "$SKIP_BUILD" -eq 1 ]; then
-    "$REPO_ROOT/scripts/package-macos-release.sh" --version "$VERSION" --output-dir "$OUTPUT_BASE" --skip-build
-  else
-    "$REPO_ROOT/scripts/package-macos-release.sh" --version "$VERSION" --output-dir "$OUTPUT_BASE"
+  set -- --version "$VERSION" --output-dir "$OUTPUT_BASE"
+  if [ -n "$MACOS_BINARY" ]; then
+    set -- "$@" --binary "$MACOS_BINARY"
+  elif [ "$SKIP_BUILD" -eq 1 ]; then
+    set -- "$@" --skip-build
   fi
+  "$REPO_ROOT/scripts/package-macos-release.sh" "$@"
 else
   printf '==> skipping macOS packaging\n'
 fi

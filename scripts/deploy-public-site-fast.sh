@@ -22,7 +22,8 @@ All other flags are forwarded through.
 Examples:
   ./scripts/deploy-public-site-fast.sh
   ./scripts/deploy-public-site-fast.sh --skip-build
-  ./scripts/deploy-public-site-fast.sh --version v0.1.0
+  ./scripts/deploy-public-site-fast.sh --version v0.1.1
+  ./scripts/deploy-public-site-fast.sh --macos-binary path/to/aarch64-apple-darwin/trueflow
 EOF
 }
 

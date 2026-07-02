@@ -320,22 +320,22 @@ fn website_install_page_explains_script_and_manual_downloads() -> Result<()> {
     );
     assert_contains(
         &html,
-        "curl -fsSL https://trueflow.dev/install.sh | sh -s -- --version v0.1.0",
+        "curl -fsSL https://trueflow.dev/install.sh | sh -s -- --version v0.1.1",
         "install page pinned version command",
     );
     assert_contains(
         &html,
-        "/download/trueflow-v0.1.0-aarch64-apple-darwin.tar.gz",
+        "/download/trueflow-v0.1.1-aarch64-apple-darwin.tar.gz",
         "install page macos artifact link",
     );
     assert_contains(
         &html,
-        "/download/trueflow-v0.1.0-x86_64-unknown-linux-musl.tar.gz",
+        "/download/trueflow-v0.1.1-x86_64-unknown-linux-musl.tar.gz",
         "install page linux artifact link",
     );
     assert_contains(
         &html,
-        "/download/trueflow-v0.1.0-SHA256SUMS.txt",
+        "/download/trueflow-v0.1.1-SHA256SUMS.txt",
         "install page checksum link",
     );
     assert_contains(
@@ -455,7 +455,7 @@ fn website_install_script_targets_same_domain_and_macos_arm64() -> Result<()> {
     );
     assert_contains(
         &script,
-        "DEFAULT_VERSION=\"v0.1.0\"",
+        "DEFAULT_VERSION=\"v0.1.1\"",
         "installer default version",
     );
     assert_contains(
@@ -664,6 +664,16 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
     );
     assert_contains(
         &package_macos_release,
+        "--binary PATH",
+        "macos packaging accepts supplied binary",
+    );
+    assert_contains(
+        &package_macos_release,
+        "packaging supplied macOS binary",
+        "macos packaging supplied binary path",
+    );
+    assert_contains(
+        &package_macos_release,
         "cargo build --release --locked",
         "macos packaging build command",
     );
@@ -723,6 +733,16 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
         "one-shot deploy auto approve flag",
     );
     assert_contains(
+        &deploy_public_site,
+        "--macos-binary PATH",
+        "one-shot deploy accepts supplied macos binary",
+    );
+    assert_contains(
+        &deploy_public_site,
+        "--binary \"$MACOS_BINARY\"",
+        "one-shot deploy forwards supplied macos binary",
+    );
+    assert_contains(
         &deploy_public_site_fast,
         "--skip-infra-apply",
         "fast deploy skips infra apply",
@@ -741,6 +761,16 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
         &deploy_downloads,
         "TRUEFLOW_INFRA_CLI",
         "deploy downloads infra cli override",
+    );
+    assert_contains(
+        &deploy_downloads,
+        "REQUIRED_TARGETS=\"aarch64-apple-darwin x86_64-unknown-linux-musl\"",
+        "download deploy requires every published target",
+    );
+    assert_contains(
+        &deploy_downloads,
+        "missing required release artifact",
+        "download deploy fails before partial destructive sync",
     );
     assert_contains(
         &gitignore,
