@@ -24,8 +24,10 @@ use crate::targets::{
 use crate::vcs;
 use anyhow::{Result, anyhow};
 use clap::ValueEnum;
+use serde::ser::{SerializeSeq, Serializer as _};
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1542,8 +1544,7 @@ fn is_contiguous(lines: &[u32]) -> bool {
 fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Result<()> {
     match format {
         FeedbackFormat::Json => {
-            let export_list = feedback_entries_to_json_values(entries);
-            println!("{}", serde_json::to_string_pretty(&export_list)?);
+            print_feedback_json(entries)?;
         }
         FeedbackFormat::Xml => {
             println!("<trueflow_feedback>");
@@ -1578,18 +1579,32 @@ fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Resul
     Ok(())
 }
 
+fn print_feedback_json(entries: Vec<FeedbackEntry>) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    {
+        let mut serializer = serde_json::Serializer::pretty(&mut stdout);
+        let mut sequence = serializer.serialize_seq(Some(entries.len()))?;
+        for entry in entries {
+            sequence.serialize_element(&feedback_entry_to_json_value(entry))?;
+        }
+        sequence.end()?;
+    }
+    writeln!(stdout)?;
+    Ok(())
+}
+
 fn feedback_entries_to_json_values(entries: Vec<FeedbackEntry>) -> Vec<serde_json::Value> {
-    entries
-        .into_iter()
-        .map(|entry| {
-            serde_json::json!({
-                "file": entry.file_path,
-                "block": entry.block,
-                "reviews": entry.reviews,
-                "latest_verdict": entry.latest_verdict,
-            })
-        })
-        .collect()
+    entries.into_iter().map(feedback_entry_to_json_value).collect()
+}
+
+fn feedback_entry_to_json_value(entry: FeedbackEntry) -> serde_json::Value {
+    serde_json::json!({
+        "file": entry.file_path,
+        "block": entry.block,
+        "reviews": entry.reviews,
+        "latest_verdict": entry.latest_verdict,
+    })
 }
 
 fn print_block_xml(block: &crate::block::Block, reviews: &[crate::store::Record]) {

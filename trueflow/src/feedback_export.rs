@@ -472,8 +472,10 @@ fn resolve_feedback_context(
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
 ) -> Result<ResolvedFeedbackContext> {
-    let snapshots = candidate_snapshots_for_record(record, default_snapshot);
-    for snapshot in &snapshots {
+    for snapshot in candidate_snapshots_for_record(record, default_snapshot)
+        .iter()
+        .flatten()
+    {
         if let Some(path_hint) = record.path_hint.as_ref() {
             let resolved = {
                 let cache = snapshot_file_cache_for_path(
@@ -577,18 +579,22 @@ fn scoped_unresolved_block_for_record(record: &Record) -> Option<Block> {
 fn candidate_snapshots_for_record(
     record: &Record,
     default_snapshot: &FeedbackSnapshot,
-) -> Vec<FeedbackSnapshot> {
-    let mut snapshots = Vec::new();
-    if let RepoRef::Vcs { revision, .. } = &record.repo_ref {
-        snapshots.push(FeedbackSnapshot::Revision(revision.as_str().to_string()));
-    }
-    if !snapshots.contains(default_snapshot) {
-        snapshots.push(default_snapshot.clone());
-    }
-    if !snapshots.contains(&FeedbackSnapshot::Workdir) {
-        snapshots.push(FeedbackSnapshot::Workdir);
-    }
-    snapshots
+) -> [Option<FeedbackSnapshot>; 3] {
+    let record_snapshot = match &record.repo_ref {
+        RepoRef::Vcs { revision, .. } => {
+            Some(FeedbackSnapshot::Revision(revision.as_str().to_string()))
+        }
+        RepoRef::Unknown => None,
+    };
+    let default_snapshot = (record_snapshot.as_ref() != Some(default_snapshot))
+        .then(|| default_snapshot.clone());
+    let workdir_snapshot = (!matches!(
+        record_snapshot.as_ref(),
+        Some(FeedbackSnapshot::Workdir)
+    ) && !matches!(default_snapshot.as_ref(), Some(FeedbackSnapshot::Workdir)))
+    .then_some(FeedbackSnapshot::Workdir);
+
+    [record_snapshot, default_snapshot, workdir_snapshot]
 }
 
 fn load_snapshot_files_strict(
@@ -730,19 +736,14 @@ fn complete_snapshot_file_cache<'a>(
 
 fn merge_snapshot_files(cache: &mut SnapshotFileCache, files: Vec<FileState>) {
     for file in files {
-        if let Some(existing) = cache
+        match cache
             .files
-            .iter_mut()
-            .find(|existing| existing.path == file.path)
+            .binary_search_by(|existing| existing.path.cmp(&file.path))
         {
-            *existing = file;
-        } else {
-            cache.files.push(file);
+            Ok(index) => cache.files[index] = file,
+            Err(index) => cache.files.insert(index, file),
         }
     }
-    cache
-        .files
-        .sort_by(|left, right| left.path.cmp(&right.path));
 }
 
 fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(String, Block)> {
@@ -1286,6 +1287,72 @@ mod tests {
     }
 
     #[test]
+    fn candidate_snapshots_keep_record_default_workdir_order_without_duplicates() {
+        let record = build_record("record", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+
+        assert_eq!(
+            candidate_snapshots_for_record(
+                &record,
+                &FeedbackSnapshot::Revision("aaaaaaa".to_string()),
+            )
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+            vec![
+                FeedbackSnapshot::Revision("aaaaaaa".to_string()),
+                FeedbackSnapshot::Workdir,
+            ]
+        );
+        assert_eq!(
+            candidate_snapshots_for_record(&record, &FeedbackSnapshot::Workdir)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![
+                FeedbackSnapshot::Revision("aaaaaaa".to_string()),
+                FeedbackSnapshot::Workdir,
+            ]
+        );
+
+        let mut workdir_record = record;
+        workdir_record.repo_ref = RepoRef::Unknown;
+        assert_eq!(
+            candidate_snapshots_for_record(&workdir_record, &FeedbackSnapshot::Workdir)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![FeedbackSnapshot::Workdir]
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_files_replaces_paths_and_preserves_sorted_order() {
+        let mut cache = SnapshotFileCache::default();
+        merge_snapshot_files(
+            &mut cache,
+            vec![
+                test_file_state("src/c.rs", b"fn c() {}\n"),
+                test_file_state("src/a.rs", b"fn a() {}\n"),
+                test_file_state("src/b.rs", b"fn old_b() {}\n"),
+            ],
+        );
+        let replacement = test_file_state("src/b.rs", b"fn new_b() {}\n");
+        let replacement_hash = replacement.tree_hash.clone();
+
+        merge_snapshot_files(&mut cache, vec![replacement]);
+
+        assert_eq!(
+            cache
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
+        assert_eq!(cache.files[1].tree_hash, replacement_hash);
+    }
+
+    #[test]
     fn repo_resolver_uses_path_hint_without_full_workdir_scan() {
         let repo = trueflow_test_support::temp_test_dir("feedback_resolver_targeted");
         write_rust_file(&repo, "src/target.rs", "fn target() {}\n");
@@ -1375,6 +1442,15 @@ mod tests {
             .unwrap_or_else(|| panic!("expected cursor"));
         assert_eq!(cursor.timestamp, 1234);
         assert!(cursor.record_ids_at_timestamp.is_empty());
+    }
+
+    fn test_file_state(path: &str, content: &[u8]) -> FileState {
+        FileState::from_text(
+            RepoPath::new(path).unwrap_or_else(|error| panic!("valid repo path: {error}")),
+            crate::analysis::Language::Rust,
+            content,
+            Vec::new(),
+        )
     }
 
     fn write_rust_file(root: &Path, path: &str, content: &str) {
