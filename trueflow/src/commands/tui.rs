@@ -827,6 +827,7 @@ struct AppState {
 
 const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
 const DISPLAY_TAB_WIDTH: usize = 8;
+const CONTENT_GUTTER_SPACING: &str = "       ";
 
 struct ReviewStateBuildOptions {
     confirm_batch: BatchConfirmPolicy,
@@ -1547,10 +1548,10 @@ fn build_review_state(
         .copied()
         .collect::<HashSet<_>>();
 
-    let root_children = tree.node(tree.root()).children.clone();
+    let initial_root_cursor = tree.node(tree.root()).children.first().copied();
     let review_order = ReviewOrder::from_tree(&tree, &unreviewed_block_nodes);
     let mut navigator = ReviewNavigator::new(tree, unreviewed_block_nodes)?;
-    let mut root_cursor = root_children.first().copied();
+    let mut root_cursor = initial_root_cursor;
     let mut focus_block = None;
     let mut pending_focus_scroll = false;
     if let Some(initial_block) = review_order.first_reviewable_block() {
@@ -2226,17 +2227,12 @@ fn refresh_ai_suggestion_state(state: &mut AppState) -> bool {
 }
 
 fn poll_ai_suggestion_result(state: &mut AppState) -> bool {
-    let Some(poll_result) = state
-        .ai
-        .pending
-        .as_ref()
-        .map(|pending| (pending.key.clone(), pending.receiver.try_recv()))
-    else {
+    let Some(pending) = state.ai.pending.as_ref() else {
         return false;
     };
 
-    match poll_result {
-        (_, Ok(result)) => {
+    match pending.receiver.try_recv() {
+        Ok(result) => {
             state.ai.pending = None;
             match result.result {
                 Ok(suggestion) => {
@@ -2260,8 +2256,9 @@ fn poll_ai_suggestion_result(state: &mut AppState) -> bool {
             }
             true
         }
-        (_, Err(mpsc::TryRecvError::Empty)) => false,
-        (key, Err(mpsc::TryRecvError::Disconnected)) => {
+        Err(mpsc::TryRecvError::Empty) => false,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            let key = pending.key.clone();
             state.ai.pending = None;
             state.ai.status = TuiAiStatus::Error {
                 key,
@@ -3380,28 +3377,57 @@ fn max_scroll_offset(state: &AppState) -> u16 {
 }
 
 fn node_contains_block(tree: &Tree, node_id: TreeNodeId, block_id: TreeNodeId) -> bool {
-    tree.ancestors(block_id).contains(&node_id)
+    let mut current = Some(block_id);
+    while let Some(current_id) = current {
+        if current_id == node_id {
+            return true;
+        }
+        current = tree.parent(current_id);
+    }
+    false
 }
 
 fn first_focusable_descendant_block(state: &AppState, node_id: TreeNodeId) -> Option<TreeNodeId> {
     let tree = &state.navigator.tree;
-    let mut block_ids = state.navigator.visible_descendant_block_ids(node_id);
-    block_ids.sort_by(|a, b| {
-        let a_node = tree.node(*a);
-        let b_node = tree.node(*b);
-        let a_start = a_node
-            .block
-            .as_ref()
-            .map(|block| block.start_line)
-            .unwrap_or(usize::MAX);
-        let b_start = b_node
-            .block
-            .as_ref()
-            .map(|block| block.start_line)
-            .unwrap_or(usize::MAX);
-        (a_node.path.as_str(), a_start).cmp(&(b_node.path.as_str(), b_start))
-    });
-    block_ids.into_iter().next()
+    let mut stack = vec![node_id];
+    let mut best = None;
+
+    while let Some(candidate_id) = stack.pop() {
+        if !state.navigator.is_visible(candidate_id) {
+            continue;
+        }
+
+        let candidate = tree.node(candidate_id);
+        if state.navigator.is_visible_block(candidate_id) {
+            let candidate_start = candidate
+                .block
+                .as_ref()
+                .map(|block| block.start_line)
+                .unwrap_or(usize::MAX);
+            let is_better = match best {
+                Some(best_id) => {
+                    let best_node = tree.node(best_id);
+                    let best_start = best_node
+                        .block
+                        .as_ref()
+                        .map(|block| block.start_line)
+                        .unwrap_or(usize::MAX);
+                    (candidate.path.as_str(), candidate_start)
+                        < (best_node.path.as_str(), best_start)
+                }
+                None => true,
+            };
+            if is_better {
+                best = Some(candidate_id);
+            }
+        }
+
+        for child in candidate.children.iter().rev() {
+            stack.push(*child);
+        }
+    }
+
+    best
 }
 
 fn focus_block_for_node(
@@ -3522,15 +3548,19 @@ fn root_listing_prefix_line_count(state: &AppState) -> usize {
     line_count.saturating_add(1)
 }
 
-fn root_selected_line_index(state: &AppState, root_children: &[TreeNodeId]) -> Option<usize> {
+fn root_selected_line_index(
+    state: &AppState,
+    root_children: &[TreeNodeId],
+    prefix_line_count: usize,
+) -> Option<usize> {
     let selected_index = state
         .root_cursor
         .and_then(|id| root_children.iter().position(|&child| child == id))?;
-    Some(root_listing_prefix_line_count(state).saturating_add(selected_index))
+    Some(prefix_line_count.saturating_add(selected_index))
 }
 
-fn root_total_line_count(state: &AppState, root_children: &[TreeNodeId]) -> usize {
-    root_listing_prefix_line_count(state).saturating_add(root_children.len().max(1))
+fn root_total_line_count(prefix_line_count: usize, root_children: &[TreeNodeId]) -> usize {
+    prefix_line_count.saturating_add(root_children.len().max(1))
 }
 
 fn scroll_offset_to_keep_line_visible(
@@ -3556,10 +3586,13 @@ fn scroll_offset_to_keep_line_visible(
     usize_to_u16_saturating(next_top.min(max_scroll))
 }
 
-fn ensure_root_cursor_visible(state: &mut AppState) {
-    let root_children = visible_root_children(state);
-    let Some(selected_line_index) = root_selected_line_index(state, &root_children) else {
-        if root_total_line_count(state, &root_children) <= usize::from(state.viewport_height) {
+fn ensure_root_cursor_visible(state: &mut AppState, root_children: &[TreeNodeId]) {
+    let prefix_line_count = root_listing_prefix_line_count(state);
+    let total_line_count = root_total_line_count(prefix_line_count, root_children);
+    let Some(selected_line_index) =
+        root_selected_line_index(state, root_children, prefix_line_count)
+    else {
+        if total_line_count <= usize::from(state.viewport_height) {
             state.scroll_offset = 0;
         }
         return;
@@ -3569,7 +3602,7 @@ fn ensure_root_cursor_visible(state: &mut AppState) {
         state.scroll_offset,
         state.viewport_height,
         selected_line_index,
-        root_total_line_count(state, &root_children),
+        total_line_count,
     );
 }
 
@@ -3592,7 +3625,7 @@ fn move_root_cursor(state: &mut AppState, offset: isize) {
         .unwrap_or(if offset.is_negative() { 0 } else { last_index })
         .min(last_index);
     state.root_cursor = root_children.get(next).copied();
-    ensure_root_cursor_visible(state);
+    ensure_root_cursor_visible(state, &root_children);
 }
 
 fn handle_action(
@@ -4278,17 +4311,18 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
 
     let header_lines = build_header_lines(node, state, palette);
     let mode_banner_line = build_mode_banner_line(state, palette);
-    let ai_hint_text = state.ai.hint_line_text();
     let ai_hint_width = focus_code_width(area);
-    let ai_hint_lines = ai_hint_text
-        .as_deref()
-        .map(|text| ai_hint_wrapped_line_count(text, ai_hint_width))
-        .unwrap_or_default();
+    let ai_hint_lines = state
+        .ai
+        .hint_line_text()
+        .map(|text| build_ai_hint_lines_from_text(&text, palette, ai_hint_width));
+    let ai_hint_line_count =
+        usize_to_u16_saturating(ai_hint_lines.as_ref().map_or(0, Vec::len));
 
     let focus_layout = compute_focus_layout(
         area,
         usize_to_u16_saturating(header_lines.len()),
-        ai_hint_lines,
+        ai_hint_line_count,
     );
     let ui_mode = current_ui_mode(state);
     let actions_lines = build_action_lines(
@@ -4411,15 +4445,11 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         focus_layout.mode,
     );
 
-    if let Some(ai_hint_text) = ai_hint_text {
+    if let Some(ai_hint_lines) = ai_hint_lines {
         frame.render_widget(
-            Paragraph::new(build_ai_hint_lines_from_text(
-                &ai_hint_text,
-                palette,
-                focus_layout.ai_hint.width,
-            ))
-            .alignment(Alignment::Center)
-            .style(Style::default().bg(palette.bg)),
+            Paragraph::new(ai_hint_lines)
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(palette.bg)),
             focus_layout.ai_hint,
         );
     }
@@ -4473,13 +4503,19 @@ fn wrapped_display_row_prefixes(lines: &[Line<'static>], width: u16) -> Vec<usiz
     display_row_prefixes.push(total_rows);
 
     for line in lines {
-        let line_text = line.to_string();
-        let line_width = UnicodeWidthStr::width(line_text.as_str()).max(1);
+        let line_width = line_display_width(line).max(1);
         total_rows = total_rows.saturating_add(line_width.div_ceil(wrap_width));
         display_row_prefixes.push(total_rows);
     }
 
     display_row_prefixes
+}
+
+fn line_display_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 fn visible_comment_capture_for_content(
@@ -5048,9 +5084,6 @@ fn styled_ai_hint_line(text: String, palette: &UiPalette) -> Line<'static> {
     ))
 }
 
-fn ai_hint_wrapped_line_count(text: &str, width: u16) -> u16 {
-    usize_to_u16_saturating(word_wrapped_text_to_width(text, usize::from(width.max(1))).len())
-}
 
 fn word_wrapped_text_to_width(text: &str, width: usize) -> Vec<String> {
     text.split('\n')
@@ -5286,19 +5319,24 @@ fn pack_action_phrases(width: u16, phrases: &[String]) -> Vec<String> {
     let max_width = usize::from(width.max(1));
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut current_width = 0usize;
 
     for phrase in phrases {
+        let phrase_width = UnicodeWidthStr::width(phrase.as_str());
         if current.is_empty() {
             current.push_str(phrase);
+            current_width = phrase_width;
             continue;
         }
 
-        let candidate = format!("{current} {phrase}");
-        if UnicodeWidthStr::width(candidate.as_str()) <= max_width {
-            current = candidate;
+        if current_width.saturating_add(1).saturating_add(phrase_width) <= max_width {
+            current.push(' ');
+            current.push_str(phrase);
+            current_width = current_width.saturating_add(1).saturating_add(phrase_width);
         } else {
-            lines.push(current);
-            current = phrase.clone();
+            lines.push(std::mem::take(&mut current));
+            current.push_str(phrase);
+            current_width = phrase_width;
         }
     }
 
@@ -5518,7 +5556,7 @@ fn render_right_aligned_line(frame: &mut Frame, area: Rect, line: &Line<'_>) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let text_width = UnicodeWidthStr::width(line.to_string().as_str());
+    let text_width = line_display_width(line);
     let text_width = u16::try_from(text_width).unwrap_or(u16::MAX);
     let mut x = area.x.saturating_add(area.width.saturating_sub(text_width));
     let y = area.y;
@@ -6303,15 +6341,15 @@ fn wrap_contextual_diff_row(
     code_width: u16,
     line_numbers: TuiDiffLineNumbers,
 ) -> Vec<Line<'static>> {
-    let diff_line = vcs::DiffLine {
-        kind: row.kind,
-        old_line: row.old_line,
-        new_line: row.new_line,
-        text: row.text.clone(),
-        is_focus: false,
-    };
-
-    wrap_diff_overlay_row(&diff_line, style, code_width, line_numbers)
+    wrap_diff_overlay_parts(
+        row.kind,
+        row.old_line,
+        row.new_line,
+        &row.text,
+        style,
+        code_width,
+        line_numbers,
+    )
 }
 
 fn wrap_diff_overlay_row(
@@ -6320,11 +6358,31 @@ fn wrap_diff_overlay_row(
     code_width: u16,
     line_numbers: TuiDiffLineNumbers,
 ) -> Vec<Line<'static>> {
+    wrap_diff_overlay_parts(
+        line.kind,
+        line.old_line,
+        line.new_line,
+        &line.text,
+        style,
+        code_width,
+        line_numbers,
+    )
+}
+
+fn wrap_diff_overlay_parts(
+    kind: vcs::DiffLineKind,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    text: &str,
+    style: Style,
+    code_width: u16,
+    line_numbers: TuiDiffLineNumbers,
+) -> Vec<Line<'static>> {
     let available_width = usize::from(code_width.max(1));
     let format = diff_overlay_format_for_width(code_width, line_numbers);
-    let prefix = diff_overlay_prefix(line, format, available_width);
+    let prefix = diff_overlay_prefix(kind, old_line, new_line, format, available_width);
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let text = expand_tabs_for_display(&line.text);
+    let text = expand_tabs_for_display(text);
 
     if prefix_width >= available_width {
         let mut lines = vec![Line::from(Span::styled(prefix, style))];
@@ -6373,15 +6431,17 @@ fn diff_overlay_format_for_width(
 }
 
 fn diff_overlay_prefix(
-    line: &vcs::DiffLine,
+    kind: vcs::DiffLineKind,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
     format: DiffOverlayFormat,
     available_width: usize,
 ) -> String {
-    let marker = diff_overlay_marker(line.kind);
+    let marker = diff_overlay_marker(kind);
     match format {
         DiffOverlayFormat::Full if available_width > FULL_DIFF_OVERLAY_GUTTER_WIDTH => {
-            let old_col = format_diff_line_number(line.old_line);
-            let new_col = format_diff_line_number(line.new_line);
+            let old_col = format_diff_line_number(old_line);
+            let new_col = format_diff_line_number(new_line);
             format!("{old_col} {new_col} {marker} ")
         }
         DiffOverlayFormat::Full | DiffOverlayFormat::Compact => {
@@ -6433,6 +6493,40 @@ fn wrap_text_to_width(text: &str, width: usize) -> Vec<String> {
     }
 
     wrapped
+}
+
+fn wrapped_text_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    if text.is_empty() {
+        return 1;
+    }
+
+    let mut rows = 0usize;
+    let mut current_width = 0usize;
+    let mut current_has_chars = false;
+
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width.saturating_add(ch_width) > width {
+            rows = rows.saturating_add(1);
+            current_width = 0;
+        }
+
+        current_width = current_width.saturating_add(ch_width);
+        current_has_chars = true;
+
+        if current_width >= width {
+            rows = rows.saturating_add(1);
+            current_width = 0;
+            current_has_chars = false;
+        }
+    }
+
+    if current_has_chars || rows == 0 {
+        rows = rows.saturating_add(1);
+    }
+
+    rows
 }
 
 fn focus_row_range_for_wrapped_contextual_diff_rows(
@@ -6550,17 +6644,13 @@ fn build_diff_context_content(
                 rows.iter()
                     .zip(rendered.row_ranges.iter())
                     .map(|(row, display_row_range)| {
-                        let diff_line = vcs::DiffLine {
-                            kind: row.kind,
-                            old_line: row.old_line,
-                            new_line: row.new_line,
-                            text: row.text.clone(),
-                            is_focus: false,
-                        };
                         CommentContextRow {
                             scope_line_index: row.anchor_index,
-                            text: format_diff_overlay_row_for_width(
-                                &diff_line,
+                            text: format_diff_overlay_parts(
+                                row.kind,
+                                row.old_line,
+                                row.new_line,
+                                &row.text,
                                 state.diff_line_numbers,
                                 code_width,
                             ),
@@ -6697,11 +6787,32 @@ fn format_diff_overlay_row_for_width(
     line_numbers: TuiDiffLineNumbers,
     code_width: u16,
 ) -> String {
+    format_diff_overlay_parts(
+        line.kind,
+        line.old_line,
+        line.new_line,
+        &line.text,
+        line_numbers,
+        code_width,
+    )
+}
+
+fn format_diff_overlay_parts(
+    kind: vcs::DiffLineKind,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    text: &str,
+    line_numbers: TuiDiffLineNumbers,
+    code_width: u16,
+) -> String {
     let available_width = usize::from(code_width.max(1));
     let format = diff_overlay_format_for_width(code_width, line_numbers);
-    let prefix = diff_overlay_prefix(line, format, available_width);
-    let text = expand_tabs_for_display(&line.text);
-    format!("{prefix}{text}")
+    let prefix = diff_overlay_prefix(kind, old_line, new_line, format, available_width);
+    let text = expand_tabs_for_display(text);
+    let mut row = String::with_capacity(prefix.len().saturating_add(text.len()));
+    row.push_str(&prefix);
+    row.push_str(&text);
+    row
 }
 
 #[cfg(test)]
@@ -6913,12 +7024,9 @@ fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> L
 }
 
 fn format_directory_line(entry: &str, palette: &UiPalette) -> Line<'static> {
-    let gutter_left = 4;
-    let gutter_right = 2;
-    let gutter_spacing = " ".repeat(gutter_left + gutter_right + 1);
     Line::from(vec![
         Span::styled(
-            gutter_spacing,
+            CONTENT_GUTTER_SPACING,
             Style::default().fg(palette.context).bg(palette.code_bg),
         ),
         Span::styled(
@@ -6934,20 +7042,17 @@ fn format_context_line(
     palette: &UiPalette,
     language: Option<&Language>,
 ) -> Line<'static> {
-    let gutter_left = 4;
-    let gutter_right = 2;
-    let gutter_spacing = " ".repeat(gutter_left + gutter_right + 1);
-    let tokens = highlighted_tokens_for_line(highlighted_line_cache, line, language);
+    let tokens = cached_highlighted_tokens_for_line(highlighted_line_cache, line, language);
     let mut spans = Vec::with_capacity(tokens.len() + 1);
     spans.push(Span::styled(
-        gutter_spacing,
+        CONTENT_GUTTER_SPACING,
         Style::default().fg(palette.context).bg(palette.code_bg),
     ));
     for token in tokens {
         let style = style_for_token(token.kind, palette)
             .fg(palette.context)
             .bg(palette.code_bg);
-        spans.push(Span::styled(token.text, style));
+        spans.push(Span::styled(token.text.clone(), style));
     }
     Line::from(spans)
 }
@@ -7045,7 +7150,10 @@ fn editing_input_lines(content: &str, overlay_width: u16) -> u16 {
 }
 
 fn wrapped_editor_line_count(text: &str, wrap_width: usize) -> usize {
-    cell_wrapped_editor_lines(text, wrap_width.max(1)).len()
+    let wrap_width = wrap_width.max(1);
+    text.split('\n')
+        .map(|line| wrapped_text_line_count(line, wrap_width))
+        .sum()
 }
 
 fn cell_wrapped_editor_lines(text: &str, wrap_width: usize) -> Vec<String> {
@@ -15058,32 +15166,38 @@ fn format_code_line(
     palette: &UiPalette,
     language: Option<&Language>,
 ) -> Line<'static> {
-    let tokens = highlighted_tokens_for_line(highlighted_line_cache, line, language);
+    let tokens = cached_highlighted_tokens_for_line(highlighted_line_cache, line, language);
     let mut spans = Vec::with_capacity(tokens.len());
     for token in tokens {
         spans.push(Span::styled(
-            token.text,
+            token.text.clone(),
             style_for_token(token.kind, palette).bg(palette.code_bg),
         ));
     }
     Line::from(spans)
 }
 
-fn highlighted_tokens_for_line(
-    cache: &mut HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
+fn cached_highlighted_tokens_for_line<'a>(
+    cache: &'a mut HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     line: &str,
     language: Option<&Language>,
-) -> Vec<HighlightToken> {
+) -> &'a [HighlightToken] {
     let display_line = expand_tabs_for_display(line);
     let key = HighlightLineCacheKey {
         line: display_line.clone(),
         language: language.copied(),
     };
-    if let Some(tokens) = cache.get(&key) {
-        return tokens.clone();
-    }
+    cache
+        .entry(key)
+        .or_insert_with(|| highlight_line(&display_line, language))
+        .as_slice()
+}
 
-    let tokens = highlight_line(&display_line, language);
-    cache.insert(key, tokens.clone());
-    tokens
+#[cfg(test)]
+fn highlighted_tokens_for_line(
+    cache: &mut HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
+    line: &str,
+    language: Option<&Language>,
+) -> Vec<HighlightToken> {
+    cached_highlighted_tokens_for_line(cache, line, language).to_vec()
 }

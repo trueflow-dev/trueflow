@@ -35,6 +35,10 @@ impl ReviewNavigator {
         self.visible_nodes.contains(&id)
     }
 
+    pub fn is_visible_block(&self, id: TreeNodeId) -> bool {
+        self.visible_block_nodes.contains(&id)
+    }
+
     pub fn set_current(&mut self, id: TreeNodeId) {
         if self.is_visible(id) {
             self.current = id;
@@ -136,8 +140,8 @@ impl ReviewNavigator {
     }
 
     pub fn visible_descendant_block_ids(&self, root: TreeNodeId) -> Vec<TreeNodeId> {
+        let mut blocks = Vec::with_capacity(self.count_visible_descendant_blocks(root));
         let mut stack = vec![root];
-        let mut blocks = Vec::new();
         while let Some(node_id) = stack.pop() {
             if !self.is_visible(node_id) {
                 continue;
@@ -153,25 +157,59 @@ impl ReviewNavigator {
         blocks
     }
 
+    pub fn visible_descendant_block_id_set(&self, root: TreeNodeId) -> HashSet<TreeNodeId> {
+        let mut blocks = HashSet::with_capacity(self.count_visible_descendant_blocks(root));
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
+            if !self.is_visible(node_id) {
+                continue;
+            }
+            let node = self.tree.node(node_id);
+            if self.visible_block_nodes.contains(&node_id) {
+                blocks.insert(node_id);
+            }
+            for child in node.children.iter().rev() {
+                stack.push(*child);
+            }
+        }
+        blocks
+    }
+
     pub fn count_visible_descendant_blocks(&self, root: TreeNodeId) -> usize {
-        self.visible_descendant_block_ids(root).len()
+        self.visible_block_descendant_counts
+            .get(&root)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn sibling_at_offset(&self, node_id: TreeNodeId, offset: isize) -> Option<TreeNodeId> {
         let parent = self.tree.parent(node_id)?;
-        let siblings: Vec<TreeNodeId> = self
-            .tree
-            .node(parent)
-            .children
-            .iter()
-            .copied()
-            .filter(|child| self.is_visible(*child))
-            .collect();
-        let index = siblings
-            .iter()
-            .position(|&id| id == node_id)?
-            .checked_add_signed(offset)?;
-        siblings.get(index).copied()
+        let siblings = &self.tree.node(parent).children;
+        let mut visible_index = 0usize;
+        let mut current_index = None;
+        for &child in siblings {
+            if !self.is_visible(child) {
+                continue;
+            }
+            if child == node_id {
+                current_index = Some(visible_index);
+                break;
+            }
+            visible_index += 1;
+        }
+
+        let target_index = current_index?.checked_add_signed(offset)?;
+        let mut visible_index = 0usize;
+        for &child in siblings {
+            if !self.is_visible(child) {
+                continue;
+            }
+            if visible_index == target_index {
+                return Some(child);
+            }
+            visible_index += 1;
+        }
+        None
     }
 }
 
@@ -376,6 +414,26 @@ mod tests {
             navigator.visible_descendant_block_ids(fixture.lib_file),
             vec![fixture.block_a, fixture.block_b]
         );
+    }
+
+    #[test]
+    fn visible_descendant_block_helpers_use_current_visibility() {
+        let fixture = build_fixture();
+        let unreviewed = HashSet::from([fixture.block_a, fixture.block_b, fixture.block_docs]);
+        let mut navigator =
+            ReviewNavigator::new(fixture.tree, unreviewed).unwrap_or_else(|error| {
+                panic!("failed to create navigator: {error}");
+            });
+
+        assert_eq!(navigator.count_visible_descendant_blocks(fixture.root), 3);
+        assert_eq!(navigator.count_visible_descendant_blocks(fixture.lib_file), 2);
+        assert_eq!(
+            navigator.visible_descendant_block_id_set(fixture.lib_file),
+            HashSet::from([fixture.block_a, fixture.block_b])
+        );
+
+        assert!(navigator.remove_visible_block(fixture.block_docs));
+        assert_eq!(navigator.count_visible_descendant_blocks(fixture.root), 2);
     }
 
     #[test]

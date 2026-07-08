@@ -27,10 +27,7 @@ pub fn next_review_target(
     match node.kind {
         TreeNodeKind::Block => {
             if navigator.tree.is_container_block(node_id) {
-                let subtree_blocks = navigator
-                    .visible_descendant_block_ids(node_id)
-                    .into_iter()
-                    .collect::<HashSet<_>>();
+                let subtree_blocks = navigator.visible_descendant_block_id_set(node_id);
                 review_order.next_remaining_after(
                     ReviewAnchor::Subtree(&subtree_blocks),
                     remaining_reviewable,
@@ -41,10 +38,7 @@ pub fn next_review_target(
             }
         }
         _ => {
-            let subtree_blocks = navigator
-                .visible_descendant_block_ids(node_id)
-                .into_iter()
-                .collect::<HashSet<_>>();
+            let subtree_blocks = navigator.visible_descendant_block_id_set(node_id);
             review_order
                 .next_remaining_after(ReviewAnchor::Subtree(&subtree_blocks), remaining_reviewable)
         }
