@@ -2,7 +2,7 @@ use crate::block::BlockKind;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::feedback_export::{
-    FeedbackEntry, FeedbackQuery, RepoFeedbackContextResolver, build_feedback_cursor_after_export,
+    FeedbackCursor, FeedbackEntry, FeedbackQuery, FeedbackSinceFilter, RepoFeedbackContextResolver,
     collect_feedback_entries, feedback_cursor_path, resolve_allowed_revisions,
     resolve_since_filter, write_feedback_cursor,
 };
@@ -19,11 +19,12 @@ use crate::store::{
 };
 use crate::targets::{
     ResolvedTargets, ReviewContentSource, ReviewPathSelection, ReviewTarget,
-    extract_pull_request_target, resolve_targets, workdir_prefix_from_git_root,
+    extract_pull_request_target, resolve_targets_with, workdir_prefix_from_git_root,
 };
 use crate::vcs;
 use anyhow::{Result, anyhow};
 use clap::ValueEnum;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -103,7 +104,6 @@ pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()>
         exclude,
     } = params;
 
-    validate_feedback_command_args(targets, pr)?;
     if let Some(pr) = pr {
         return run_pull_request_feedback(
             pr,
@@ -155,7 +155,7 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
     let filters = config.feedback.filters.resolve_filters(only, exclude);
     let scan_options = config.scan.resolve_options();
     let effective_since = since.unwrap_or(&config.feedback.default_since);
-    let resolved_targets = resolve_targets(targets)?;
+    let resolved_targets = resolve_local_feedback_targets(targets)?;
 
     let store = crate::store::FileStore::new()?;
     let database = store.load_database()?;
@@ -181,11 +181,7 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
         collect_feedback_entries(database.records(), &since_filter, &query, &mut resolver)?;
 
     let cursor_update = if matches!(since_mode, ParsedFeedbackSince::Last) {
-        let exported_records = entries
-            .iter()
-            .flat_map(|entry| entry.reviews.iter().cloned())
-            .collect::<Vec<_>>();
-        build_feedback_cursor_after_export(&since_filter, &exported_records).map(|cursor| {
+        build_feedback_cursor_after_entries_export(&since_filter, &entries).map(|cursor| {
             FeedbackCursorUpdate {
                 path: feedback_cursor_path(&store),
                 cursor,
@@ -198,6 +194,70 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
     Ok(FeedbackCommandResult {
         entries,
         cursor_update,
+    })
+}
+
+fn build_feedback_cursor_after_entries_export(
+    since_filter: &FeedbackSinceFilter,
+    entries: &[FeedbackEntry],
+) -> Option<FeedbackCursor> {
+    let exported_cursor = build_feedback_cursor_from_entries(entries);
+    let FeedbackSinceFilter::Cursor(previous) = since_filter else {
+        return exported_cursor;
+    };
+
+    let Some(exported_cursor) = exported_cursor else {
+        return Some(previous.clone());
+    };
+
+    if exported_cursor.timestamp < previous.timestamp {
+        return Some(previous.clone());
+    }
+
+    if exported_cursor.timestamp > previous.timestamp {
+        return Some(exported_cursor);
+    }
+
+    let mut record_ids_at_timestamp = previous.record_ids_at_timestamp.clone();
+    record_ids_at_timestamp.extend(exported_cursor.record_ids_at_timestamp);
+    record_ids_at_timestamp.sort();
+    record_ids_at_timestamp.dedup();
+
+    Some(FeedbackCursor {
+        timestamp: previous.timestamp,
+        record_ids_at_timestamp,
+    })
+}
+
+fn build_feedback_cursor_from_entries(entries: &[FeedbackEntry]) -> Option<FeedbackCursor> {
+    let mut timestamp = None;
+    let mut record_ids_at_timestamp = Vec::new();
+
+    for record in entries.iter().flat_map(|entry| entry.reviews.iter()) {
+        match timestamp {
+            None => {
+                timestamp = Some(record.timestamp);
+                record_ids_at_timestamp.push(record.id.clone());
+            }
+            Some(current) if record.timestamp > current => {
+                timestamp = Some(record.timestamp);
+                record_ids_at_timestamp.clear();
+                record_ids_at_timestamp.push(record.id.clone());
+            }
+            Some(current) if record.timestamp == current => {
+                record_ids_at_timestamp.push(record.id.clone());
+            }
+            Some(_) => {}
+        }
+    }
+
+    let timestamp = timestamp?;
+    record_ids_at_timestamp.sort();
+    record_ids_at_timestamp.dedup();
+
+    Some(FeedbackCursor {
+        timestamp,
+        record_ids_at_timestamp,
     })
 }
 
@@ -223,6 +283,36 @@ fn validate_feedback_command_args(
     }
 
     Ok(())
+}
+
+fn resolve_local_feedback_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargets> {
+    resolve_local_feedback_targets_with(
+        targets,
+        |revision| vcs::resolve_commit_id_from_workdir(revision.as_str()),
+        vcs::dirty_files_from_workdir,
+        vcs::files_changed_main_to_head,
+    )
+}
+
+fn resolve_local_feedback_targets_with<ResolveFn, DirtyFn, MainFn>(
+    targets: &[ReviewTarget],
+    resolve_revision: ResolveFn,
+    dirty_files: DirtyFn,
+    main_diff_files: MainFn,
+) -> Result<ResolvedTargets>
+where
+    ResolveFn: Fn(&crate::targets::RevisionExpr) -> Result<CommitId>,
+    DirtyFn: Fn() -> Result<HashSet<crate::repo_path::RepoPath>>,
+    MainFn: Fn() -> Result<HashSet<crate::repo_path::RepoPath>>,
+{
+    resolve_targets_with(
+        targets,
+        resolve_revision,
+        dirty_files,
+        main_diff_files,
+        |_revision| Ok(HashSet::new()),
+        |_start, _end| Ok(HashSet::new()),
+    )
 }
 
 fn feedback_changed_selection(
@@ -1113,8 +1203,12 @@ fn head_diff_contains_right_side_range(
     if hunks.is_empty() {
         return Ok(false);
     }
-    let visible_lines = visible_head_diff_lines(&hunks);
-    Ok((first_line..=last_line).all(|line| visible_lines.contains(&line)))
+    Ok(diff_contains_visible_range_for_side(
+        &hunks,
+        GitHubCommentSide::Right,
+        first_line,
+        last_line,
+    ))
 }
 
 fn head_diff_contains_left_side_range(
@@ -1133,56 +1227,70 @@ fn head_diff_contains_left_side_range(
     if hunks.is_empty() {
         return Ok(false);
     }
-    let visible_lines = visible_base_diff_lines(&hunks);
-    Ok((first_line..=last_line).all(|line| visible_lines.contains(&line)))
+    Ok(diff_contains_visible_range_for_side(
+        &hunks,
+        GitHubCommentSide::Left,
+        first_line,
+        last_line,
+    ))
 }
 
-fn visible_head_diff_lines(hunks: &[crate::vcs::DiffHunk]) -> HashSet<u32> {
-    visible_diff_lines_for_side(hunks, GitHubCommentSide::Right)
-}
-
-fn visible_base_diff_lines(hunks: &[crate::vcs::DiffHunk]) -> HashSet<u32> {
-    visible_diff_lines_for_side(hunks, GitHubCommentSide::Left)
-}
-
-fn visible_diff_lines_for_side(
+fn diff_contains_visible_range_for_side(
     hunks: &[crate::vcs::DiffHunk],
     side: GitHubCommentSide,
-) -> HashSet<u32> {
-    let mut lines = HashSet::new();
+    first_line: u32,
+    last_line: u32,
+) -> bool {
+    if first_line > last_line {
+        return false;
+    }
+
+    let mut next_required = first_line;
     for hunk in hunks {
         let mut old_line = hunk.old_start;
         let mut new_line = hunk.new_start;
         for line in &hunk.lines {
+            let visible_line = match line.kind {
+                crate::vcs::DiffLineKind::Context => Some(match side {
+                    GitHubCommentSide::Left => old_line,
+                    GitHubCommentSide::Right => new_line,
+                }),
+                crate::vcs::DiffLineKind::Added => {
+                    (side == GitHubCommentSide::Right).then_some(new_line)
+                }
+                crate::vcs::DiffLineKind::Removed => {
+                    (side == GitHubCommentSide::Left).then_some(old_line)
+                }
+            };
+
+            if let Some(visible_line) = visible_line {
+                if visible_line > next_required {
+                    return false;
+                }
+                if visible_line == next_required {
+                    if next_required == last_line {
+                        return true;
+                    }
+                    next_required = next_required.saturating_add(1);
+                }
+            }
+
             match line.kind {
                 crate::vcs::DiffLineKind::Context => {
-                    match side {
-                        GitHubCommentSide::Left => {
-                            lines.insert(old_line);
-                        }
-                        GitHubCommentSide::Right => {
-                            lines.insert(new_line);
-                        }
-                    }
                     old_line = old_line.saturating_add(1);
                     new_line = new_line.saturating_add(1);
                 }
                 crate::vcs::DiffLineKind::Added => {
-                    if side == GitHubCommentSide::Right {
-                        lines.insert(new_line);
-                    }
                     new_line = new_line.saturating_add(1);
                 }
                 crate::vcs::DiffLineKind::Removed => {
-                    if side == GitHubCommentSide::Left {
-                        lines.insert(old_line);
-                    }
                     old_line = old_line.saturating_add(1);
                 }
             }
         }
     }
-    lines
+
+    false
 }
 
 fn pure_rename_target(
@@ -1442,15 +1550,21 @@ fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Resul
 
             let mut current_file_path: Option<String> = None;
             for entry in entries {
-                if current_file_path.as_deref() != Some(entry.file_path.as_str()) {
+                let FeedbackEntry {
+                    file_path,
+                    block,
+                    reviews,
+                    ..
+                } = entry;
+                if current_file_path.as_deref() != Some(file_path.as_str()) {
                     if current_file_path.is_some() {
                         println!("  </file>");
                     }
-                    println!("  <file path=\"{}\">", escape_xml(&entry.file_path));
-                    current_file_path = Some(entry.file_path.clone());
+                    println!("  <file path=\"{}\">", escape_xml(&file_path));
+                    current_file_path = Some(file_path);
                 }
 
-                print_block_xml(&entry.block, &entry.reviews);
+                print_block_xml(&block, &reviews);
             }
 
             if current_file_path.is_some() {
@@ -1488,8 +1602,11 @@ fn print_block_xml(block: &crate::block::Block, reviews: &[crate::store::Record]
     );
 
     println!("      <context><![CDATA[");
-    let safe_content = block.content.replace("]]>", "]]]]><![CDATA[>");
-    println!("{safe_content}");
+    if block.content.contains("]]>") {
+        println!("{}", block.content.replace("]]>", "]]]]><![CDATA[>"));
+    } else {
+        println!("{}", block.content);
+    }
     println!("]]></context>");
 
     println!("      <reviews>");
@@ -1511,12 +1628,25 @@ fn print_block_xml(block: &crate::block::Block, reviews: &[crate::store::Record]
     println!("    </block>");
 }
 
-fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn escape_xml(s: &str) -> Cow<'_, str> {
+    let Some(first_escape) = s.find(['&', '<', '>', '"', '\'']) else {
+        return Cow::Borrowed(s);
+    };
+
+    let mut escaped = String::with_capacity(s.len() + 8);
+    escaped.push_str(&s[..first_escape]);
+    for ch in s[first_escape..].chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+
+    Cow::Owned(escaped)
 }
 
 #[cfg(test)]
@@ -1534,6 +1664,15 @@ mod tests {
         assert_eq!(
             FeedbackFormat::value_variants(),
             &[FeedbackFormat::Xml, FeedbackFormat::Json]
+        );
+    }
+
+    #[test]
+    fn escape_xml_escapes_only_when_needed() {
+        assert_eq!(escape_xml("plain text").as_ref(), "plain text");
+        assert_eq!(
+            escape_xml("a&b<c>d\"e'f").as_ref(),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
         );
     }
 
@@ -1596,6 +1735,108 @@ mod tests {
             )
             .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_local_feedback_targets_skips_revision_range_changed_paths() -> Result<()> {
+        let start = CommitId::new("aaaaaaa")?;
+        let end = CommitId::new("bbbbbbb")?;
+        let resolved_revision_exprs = RefCell::new(Vec::new());
+        let target =
+            ReviewTarget::RevisionRange(crate::targets::RevisionRangeExpr::new("start", "end")?);
+        let targets = [target];
+
+        let resolved_targets = resolve_local_feedback_targets_with(
+            &targets,
+            |revision| {
+                resolved_revision_exprs
+                    .borrow_mut()
+                    .push(revision.as_str().to_string());
+                match revision.as_str() {
+                    "start" => Ok(start.clone()),
+                    "end" => Ok(end.clone()),
+                    other => Err(anyhow!("unexpected revision expression {other}")),
+                }
+            },
+            || -> Result<HashSet<crate::repo_path::RepoPath>> {
+                Err(anyhow!("dirty files should not be resolved"))
+            },
+            || -> Result<HashSet<crate::repo_path::RepoPath>> {
+                Err(anyhow!("main diff files should not be resolved"))
+            },
+        )?;
+
+        assert_eq!(resolved_revision_exprs.into_inner(), vec!["start", "end"]);
+        assert_eq!(
+            resolved_targets.content_source,
+            crate::targets::ReviewContentSource::Revision(end.clone())
+        );
+        assert_eq!(
+            resolved_targets.diff_selection,
+            crate::targets::ReviewDiffSelection::Targets(vec![
+                crate::targets::ReviewDiffTarget::RevisionRange(crate::targets::CommitRange {
+                    start,
+                    end,
+                })
+            ])
+        );
+        assert!(feedback_changed_selection(&targets, &resolved_targets).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn build_feedback_cursor_after_entries_export_merges_last_cursor() -> Result<()> {
+        let revision = CommitId::new("abcdef1")?;
+        let mut older = review_record("older", &revision, None, None);
+        older.timestamp = 9;
+        let mut duplicate_previous = review_record("previous", &revision, None, None);
+        duplicate_previous.timestamp = 10;
+        let mut current = review_record("current", &revision, None, None);
+        current.timestamp = 10;
+        let entry = FeedbackEntry {
+            file_path: "src/lib.rs".to_string(),
+            block: crate::block::Block::new(
+                "fn value() {}\n".to_string(),
+                BlockKind::Function,
+                0,
+                1,
+            ),
+            reviews: vec![older, duplicate_previous, current],
+            latest_verdict: "comment".to_string(),
+        };
+        let previous = FeedbackCursor {
+            timestamp: 10,
+            record_ids_at_timestamp: vec!["previous".to_string()],
+        };
+
+        let cursor = build_feedback_cursor_after_entries_export(
+            &FeedbackSinceFilter::Cursor(previous),
+            &[entry],
+        )
+        .ok_or_else(|| anyhow!("expected cursor"))?;
+
+        assert_eq!(cursor.timestamp, 10);
+        assert_eq!(
+            cursor.record_ids_at_timestamp,
+            vec!["current".to_string(), "previous".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_feedback_cursor_after_entries_export_keeps_last_cursor_when_empty() -> Result<()> {
+        let previous = FeedbackCursor {
+            timestamp: 10,
+            record_ids_at_timestamp: vec!["previous".to_string()],
+        };
+
+        let cursor =
+            build_feedback_cursor_after_entries_export(&FeedbackSinceFilter::Cursor(previous), &[])
+                .ok_or_else(|| anyhow!("last cursor should be preserved"))?;
+
+        assert_eq!(cursor.timestamp, 10);
+        assert_eq!(cursor.record_ids_at_timestamp, vec!["previous".to_string()]);
         Ok(())
     }
 

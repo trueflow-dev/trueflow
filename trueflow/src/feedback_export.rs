@@ -69,7 +69,14 @@ pub struct RepoFeedbackContextResolver<'a> {
     scan_options: &'a ScanOptions,
     workdir_prefix: Option<&'a str>,
     repo_root: Option<PathBuf>,
-    snapshot_files: HashMap<FeedbackSnapshot, Vec<FileState>>,
+    snapshot_files: HashMap<FeedbackSnapshot, SnapshotFileCache>,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotFileCache {
+    files: Vec<FileState>,
+    complete: bool,
+    attempted_paths: HashSet<RepoPath>,
 }
 
 impl<'a> RepoFeedbackContextResolver<'a> {
@@ -102,16 +109,7 @@ impl<'a> RepoFeedbackContextResolver<'a> {
         repo_root: Option<PathBuf>,
     ) -> Result<Self> {
         let default_snapshot = snapshot_from_content_source(content_source);
-        let mut snapshot_files = HashMap::new();
-        snapshot_files.insert(
-            default_snapshot.clone(),
-            load_snapshot_files_strict(
-                &default_snapshot,
-                scan_options,
-                workdir_prefix,
-                repo_root.as_deref(),
-            )?,
-        );
+        let snapshot_files = HashMap::new();
         Ok(Self {
             default_snapshot,
             scan_options,
@@ -145,26 +143,70 @@ struct FeedbackEntryKey {
     end_line: usize,
 }
 
+struct ResolvedFeedbackRecord<'a> {
+    index: usize,
+    record: &'a Record,
+    file_path: String,
+    block: Block,
+    key: FeedbackEntryKey,
+}
+
+fn resolve_feedback_records<'a>(
+    records: &'a [Record],
+    resolver: &mut impl FeedbackContextResolver,
+) -> Result<Vec<ResolvedFeedbackRecord<'a>>> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let context = resolver.resolve_context(record)?;
+            let (file_path, block, key) = feedback_entry_parts(record, &context);
+            Ok(ResolvedFeedbackRecord {
+                index,
+                record,
+                file_path,
+                block,
+                key,
+            })
+        })
+        .collect()
+}
+
 pub fn collect_feedback_entries(
     records: &[Record],
     since_filter: &FeedbackSinceFilter,
     query: &FeedbackQuery,
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<FeedbackEntry>> {
-    let latest_verdicts = latest_verdicts_by_entry_key(records, resolver)?;
-    let filtered_records = records
-        .iter()
-        .filter(|record| record_matches_since(record, since_filter))
-        .filter(|record| record_matches_allowed_revisions(record, query.allowed_revisions.as_ref()))
-        .collect::<Vec<_>>();
+    let resolved_records = resolve_feedback_records(records, resolver)?;
+    let latest_verdicts = latest_verdicts_by_entry_key(&resolved_records);
+    let cursor_record_ids_at_timestamp = match since_filter {
+        FeedbackSinceFilter::Cursor(cursor) => Some(
+            cursor
+                .record_ids_at_timestamp
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+        ),
+        _ => None,
+    };
 
     let mut grouped = HashMap::<FeedbackEntryKey, FeedbackEntry>::new();
-    for record in filtered_records {
-        let context = resolver.resolve_context(record)?;
-        let (file_path, block, key) = feedback_entry_parts(record, &context);
+    for resolved in resolved_records {
+        let record = resolved.record;
+        if !record_matches_since(
+            record,
+            since_filter,
+            cursor_record_ids_at_timestamp.as_ref(),
+        ) || !record_matches_allowed_revisions(record, query.allowed_revisions.as_ref())
+        {
+            continue;
+        }
+        let file_path = &resolved.file_path;
+        let block = &resolved.block;
 
         if !path_matches_feedback_selections(
-            &file_path,
+            file_path.as_str(),
             query.explicit_selection.as_ref(),
             query.changed_selection.as_ref(),
         ) {
@@ -172,8 +214,8 @@ pub fn collect_feedback_entries(
         }
 
         let latest_verdict = latest_verdicts
-            .get(&key)
-            .map(String::as_str)
+            .get(&resolved.key)
+            .copied()
             .unwrap_or("unreviewed");
         if !query.include_approved && latest_verdict == "approved" {
             continue;
@@ -181,15 +223,22 @@ pub fn collect_feedback_entries(
         if !query.filters.allows_block(block.kind) {
             continue;
         }
-        if should_skip_whitespace_only_by_default(&block, &query.filters) {
+        if should_skip_whitespace_only_by_default(block, &query.filters) {
             continue;
         }
         if file_path != "<unknown>"
-            && should_skip_imports_by_default(&file_path, &block, &query.filters)
+            && should_skip_imports_by_default(file_path.as_str(), block, &query.filters)
         {
             continue;
         }
 
+        let ResolvedFeedbackRecord {
+            record,
+            file_path,
+            block,
+            key,
+            ..
+        } = resolved;
         let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
             file_path,
             block,
@@ -254,53 +303,6 @@ pub fn resolve_since_filter(
         ParsedFeedbackSince::Last => read_feedback_cursor(feedback_cursor_path(store).as_path())?
             .map(FeedbackSinceFilter::Cursor)
             .unwrap_or(FeedbackSinceFilter::All),
-    })
-}
-
-pub fn build_feedback_cursor(records: &[Record]) -> Option<FeedbackCursor> {
-    let timestamp = records.iter().map(|record| record.timestamp).max()?;
-    let mut record_ids_at_timestamp = records
-        .iter()
-        .filter(|record| record.timestamp == timestamp)
-        .map(|record| record.id.clone())
-        .collect::<Vec<_>>();
-    record_ids_at_timestamp.sort();
-    record_ids_at_timestamp.dedup();
-    Some(FeedbackCursor {
-        timestamp,
-        record_ids_at_timestamp,
-    })
-}
-
-pub fn build_feedback_cursor_after_export(
-    since_filter: &FeedbackSinceFilter,
-    exported_records: &[Record],
-) -> Option<FeedbackCursor> {
-    let exported_cursor = build_feedback_cursor(exported_records);
-    let FeedbackSinceFilter::Cursor(previous) = since_filter else {
-        return exported_cursor;
-    };
-
-    let Some(exported_cursor) = exported_cursor else {
-        return Some(previous.clone());
-    };
-
-    if exported_cursor.timestamp < previous.timestamp {
-        return Some(previous.clone());
-    }
-
-    if exported_cursor.timestamp > previous.timestamp {
-        return Some(exported_cursor);
-    }
-
-    let mut record_ids_at_timestamp = previous.record_ids_at_timestamp.clone();
-    record_ids_at_timestamp.extend(exported_cursor.record_ids_at_timestamp);
-    record_ids_at_timestamp.sort();
-    record_ids_at_timestamp.dedup();
-
-    Some(FeedbackCursor {
-        timestamp: previous.timestamp,
-        record_ids_at_timestamp,
     })
 }
 
@@ -374,30 +376,29 @@ pub fn resolve_allowed_revisions(
 }
 
 fn latest_verdicts_by_entry_key(
-    records: &[Record],
-    resolver: &mut impl FeedbackContextResolver,
-) -> Result<HashMap<FeedbackEntryKey, String>> {
-    let mut latest = HashMap::<FeedbackEntryKey, (i64, usize, String)>::new();
-    for (index, record) in records.iter().enumerate() {
-        let context = resolver.resolve_context(record)?;
-        let (_, _, key) = feedback_entry_parts(record, &context);
-        let should_replace = latest
-            .get(&key)
-            .is_none_or(|(timestamp, existing_index, _)| {
-                record.timestamp > *timestamp
-                    || (record.timestamp == *timestamp && index > *existing_index)
-            });
+    records: &[ResolvedFeedbackRecord<'_>],
+) -> HashMap<FeedbackEntryKey, &'static str> {
+    let mut latest = HashMap::<FeedbackEntryKey, (i64, usize, &'static str)>::new();
+    for resolved in records {
+        let record = resolved.record;
+        let should_replace =
+            latest
+                .get(&resolved.key)
+                .is_none_or(|(timestamp, existing_index, _)| {
+                    record.timestamp > *timestamp
+                        || (record.timestamp == *timestamp && resolved.index > *existing_index)
+                });
         if should_replace {
             latest.insert(
-                key,
-                (record.timestamp, index, record.verdict.as_str().to_string()),
+                resolved.key.clone(),
+                (record.timestamp, resolved.index, record.verdict.as_str()),
             );
         }
     }
-    Ok(latest
+    latest
         .into_iter()
         .map(|(target, (_, _, verdict))| (target, verdict))
-        .collect())
+        .collect()
 }
 
 fn resolve_revision_id(repo: &gix::Repository, revision: &str) -> Result<String> {
@@ -466,26 +467,52 @@ fn snapshot_from_content_source(content_source: &ReviewContentSource) -> Feedbac
 fn resolve_feedback_context(
     record: &Record,
     default_snapshot: &FeedbackSnapshot,
-    snapshot_files: &mut HashMap<FeedbackSnapshot, Vec<FileState>>,
+    snapshot_files: &mut HashMap<FeedbackSnapshot, SnapshotFileCache>,
     scan_options: &ScanOptions,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
 ) -> Result<ResolvedFeedbackContext> {
     let snapshots = candidate_snapshots_for_record(record, default_snapshot);
     for snapshot in &snapshots {
-        if !snapshot_files.contains_key(snapshot) {
-            let files = if snapshot == default_snapshot {
-                load_snapshot_files_strict(snapshot, scan_options, workdir_prefix, repo_root)?
-            } else {
-                load_snapshot_files_best_effort(snapshot, scan_options, workdir_prefix, repo_root)
+        if let Some(path_hint) = record.path_hint.as_ref() {
+            let resolved = {
+                let cache = snapshot_file_cache_for_path(
+                    snapshot_files,
+                    snapshot,
+                    path_hint,
+                    scan_options,
+                    workdir_prefix,
+                    repo_root,
+                    snapshot == default_snapshot,
+                )?;
+                resolve_record_in_files(record, &cache.files)
             };
-            snapshot_files.insert(snapshot.clone(), files);
+            if let Some((file_path, block)) = resolved {
+                let block = scoped_block_for_record(record, &block).unwrap_or(block);
+                return Ok(ResolvedFeedbackContext {
+                    snapshot: snapshot.clone(),
+                    file_path: Some(file_path),
+                    block: Some(block),
+                });
+            }
+
+            if snapshot_files
+                .get(snapshot)
+                .is_some_and(|cache| cache.complete)
+            {
+                continue;
+            }
         }
 
-        let files = snapshot_files
-            .get(snapshot)
-            .unwrap_or_else(|| panic!("snapshot cache should contain {snapshot:?}"));
-        if let Some((file_path, block)) = resolve_record_in_files(record, files) {
+        let cache = complete_snapshot_file_cache(
+            snapshot_files,
+            snapshot,
+            scan_options,
+            workdir_prefix,
+            repo_root,
+            snapshot == default_snapshot,
+        )?;
+        if let Some((file_path, block)) = resolve_record_in_files(record, &cache.files) {
             let block = scoped_block_for_record(record, &block).unwrap_or(block);
             return Ok(ResolvedFeedbackContext {
                 snapshot: snapshot.clone(),
@@ -587,6 +614,35 @@ fn load_snapshot_files_strict(
     }
 }
 
+fn load_snapshot_files_for_paths_strict(
+    snapshot: &FeedbackSnapshot,
+    paths: &HashSet<RepoPath>,
+    scan_options: &ScanOptions,
+    workdir_prefix: Option<&str>,
+    repo_root: Option<&Path>,
+) -> Result<Vec<FileState>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match snapshot {
+        FeedbackSnapshot::Workdir => Ok(scanner::scan_paths(
+            repo_root.unwrap_or_else(|| Path::new(".")),
+            paths,
+            scan_options,
+        )?
+        .files),
+        FeedbackSnapshot::Revision(revision) => {
+            let repo = if let Some(repo_root) = repo_root {
+                gix::discover(repo_root)?
+            } else {
+                vcs::repo_from_workdir()?
+            };
+            vcs::file_states_for_paths_in_revision(&repo, revision, paths, workdir_prefix)
+        }
+    }
+}
+
 fn load_snapshot_files_best_effort(
     snapshot: &FeedbackSnapshot,
     scan_options: &ScanOptions,
@@ -595,6 +651,98 @@ fn load_snapshot_files_best_effort(
 ) -> Vec<FileState> {
     load_snapshot_files_strict(snapshot, scan_options, workdir_prefix, repo_root)
         .unwrap_or_default()
+}
+
+fn load_snapshot_files_for_paths_best_effort(
+    snapshot: &FeedbackSnapshot,
+    paths: &HashSet<RepoPath>,
+    scan_options: &ScanOptions,
+    workdir_prefix: Option<&str>,
+    repo_root: Option<&Path>,
+) -> Vec<FileState> {
+    load_snapshot_files_for_paths_strict(snapshot, paths, scan_options, workdir_prefix, repo_root)
+        .unwrap_or_default()
+}
+
+fn snapshot_file_cache_for_path<'a>(
+    snapshot_files: &'a mut HashMap<FeedbackSnapshot, SnapshotFileCache>,
+    snapshot: &FeedbackSnapshot,
+    path: &RepoPath,
+    scan_options: &ScanOptions,
+    workdir_prefix: Option<&str>,
+    repo_root: Option<&Path>,
+    strict: bool,
+) -> Result<&'a SnapshotFileCache> {
+    let cache = snapshot_files.entry(snapshot.clone()).or_default();
+    if cache.complete || cache.attempted_paths.contains(path) {
+        return Ok(cache);
+    }
+
+    let paths = HashSet::from([path.clone()]);
+    let files = if strict {
+        load_snapshot_files_for_paths_strict(
+            snapshot,
+            &paths,
+            scan_options,
+            workdir_prefix,
+            repo_root,
+        )?
+    } else {
+        load_snapshot_files_for_paths_best_effort(
+            snapshot,
+            &paths,
+            scan_options,
+            workdir_prefix,
+            repo_root,
+        )
+    };
+    merge_snapshot_files(cache, files);
+    cache.attempted_paths.insert(path.clone());
+    Ok(cache)
+}
+
+fn complete_snapshot_file_cache<'a>(
+    snapshot_files: &'a mut HashMap<FeedbackSnapshot, SnapshotFileCache>,
+    snapshot: &FeedbackSnapshot,
+    scan_options: &ScanOptions,
+    workdir_prefix: Option<&str>,
+    repo_root: Option<&Path>,
+    strict: bool,
+) -> Result<&'a SnapshotFileCache> {
+    let already_complete = snapshot_files
+        .get(snapshot)
+        .is_some_and(|cache| cache.complete);
+    if !already_complete {
+        let files = if strict {
+            load_snapshot_files_strict(snapshot, scan_options, workdir_prefix, repo_root)?
+        } else {
+            load_snapshot_files_best_effort(snapshot, scan_options, workdir_prefix, repo_root)
+        };
+        let cache = snapshot_files.entry(snapshot.clone()).or_default();
+        cache.files = files;
+        cache.complete = true;
+    }
+
+    Ok(snapshot_files
+        .get(snapshot)
+        .unwrap_or_else(|| panic!("snapshot cache should contain {snapshot:?}")))
+}
+
+fn merge_snapshot_files(cache: &mut SnapshotFileCache, files: Vec<FileState>) {
+    for file in files {
+        if let Some(existing) = cache
+            .files
+            .iter_mut()
+            .find(|existing| existing.path == file.path)
+        {
+            *existing = file;
+        } else {
+            cache.files.push(file);
+        }
+    }
+    cache
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
 }
 
 fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(String, Block)> {
@@ -612,13 +760,23 @@ fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(Stri
                     .map(|block| (file.path.as_str().to_string(), block.clone()))
             })
         }
-        ReviewTargetRef::File { hash } => files.iter().find_map(|file| {
-            if file.tree_hash != *hash {
-                return None;
+        ReviewTargetRef::File { hash } => {
+            if let Some(path_hint) = record.path_hint.as_ref()
+                && let Some(file) = files.iter().find(|file| file.path == *path_hint)
+                && file.tree_hash == *hash
+                && let Some(block) = best_block_for_file(file, record.line_hint)
+            {
+                return Some((file.path.as_str().to_string(), block.clone()));
             }
-            best_block_for_file(file, record.line_hint)
-                .map(|block| (file.path.as_str().to_string(), block.clone()))
-        }),
+
+            files.iter().find_map(|file| {
+                if file.tree_hash != *hash {
+                    return None;
+                }
+                best_block_for_file(file, record.line_hint)
+                    .map(|block| (file.path.as_str().to_string(), block.clone()))
+            })
+        }
         ReviewTargetRef::Tree { .. } => {
             if let Some(path_hint) = record.path_hint.as_ref() {
                 if let Some(file) = files.iter().find(|file| file.path == *path_hint) {
@@ -725,17 +883,26 @@ fn unresolved_block_for_record(record: &Record) -> Block {
     }
 }
 
-fn record_matches_since(record: &Record, since_filter: &FeedbackSinceFilter) -> bool {
+fn record_matches_since(
+    record: &Record,
+    since_filter: &FeedbackSinceFilter,
+    cursor_record_ids_at_timestamp: Option<&HashSet<&str>>,
+) -> bool {
     match since_filter {
         FeedbackSinceFilter::All => true,
         FeedbackSinceFilter::TimestampInclusive(timestamp) => record.timestamp >= *timestamp,
         FeedbackSinceFilter::Cursor(cursor) => {
             record.timestamp > cursor.timestamp
                 || (record.timestamp == cursor.timestamp
-                    && !cursor
-                        .record_ids_at_timestamp
-                        .iter()
-                        .any(|id| id == &record.id))
+                    && !cursor_record_ids_at_timestamp.map_or_else(
+                        || {
+                            cursor
+                                .record_ids_at_timestamp
+                                .iter()
+                                .any(|id| id == &record.id)
+                        },
+                        |record_ids| record_ids.contains(record.id.as_str()),
+                    ))
         }
     }
 }
@@ -990,6 +1157,110 @@ mod tests {
     }
 
     #[test]
+    fn collect_feedback_entries_filters_cursor_ids_once_per_export() {
+        let previous = build_record(
+            "previous",
+            "aaaaaaa",
+            "src/previous.rs",
+            10,
+            Verdict::Comment,
+        );
+        let keep_same_timestamp =
+            build_record("keep", "aaaaaaa", "src/keep.rs", 10, Verdict::Comment);
+        let keep_newer = build_record("newer", "aaaaaaa", "src/newer.rs", 11, Verdict::Comment);
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                (
+                    "previous".to_string(),
+                    resolved_context("src/previous.rs", "pub fn previous() {}\n"),
+                ),
+                (
+                    "keep".to_string(),
+                    resolved_context("src/keep.rs", "pub fn keep() {}\n"),
+                ),
+                (
+                    "newer".to_string(),
+                    resolved_context("src/newer.rs", "pub fn newer() {}\n"),
+                ),
+            ]),
+        };
+        let query = FeedbackQuery {
+            filters: BlockFilters::default(),
+            explicit_selection: None,
+            changed_selection: None,
+            allowed_revisions: None,
+            include_approved: true,
+        };
+        let since_filter = FeedbackSinceFilter::Cursor(FeedbackCursor {
+            timestamp: 10,
+            record_ids_at_timestamp: vec!["previous".to_string()],
+        });
+
+        let entries = collect_feedback_entries(
+            &[previous, keep_same_timestamp, keep_newer],
+            &since_filter,
+            &query,
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert_eq!(
+            entries
+                .iter()
+                .flat_map(|entry| entry.reviews.iter())
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep", "newer"]
+        );
+    }
+
+    #[test]
+    fn collect_feedback_entries_resolves_each_record_once() {
+        struct CountingResolver {
+            contexts: HashMap<String, ResolvedFeedbackContext>,
+            calls: Vec<String>,
+        }
+
+        impl FeedbackContextResolver for CountingResolver {
+            fn resolve_context(&mut self, record: &Record) -> Result<ResolvedFeedbackContext> {
+                self.calls.push(record.id.clone());
+                self.contexts
+                    .get(&record.id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing fake context for {}", record.id))
+            }
+        }
+
+        let earlier = build_record("earlier", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        let later = build_record("later", "aaaaaaa", "src/lib.rs", 20, Verdict::Comment);
+        let context = resolved_context("src/lib.rs", "pub fn core() {}\n");
+        let mut resolver = CountingResolver {
+            contexts: HashMap::from_iter([
+                ("earlier".to_string(), context.clone()),
+                ("later".to_string(), context),
+            ]),
+            calls: Vec::new(),
+        };
+        let query = FeedbackQuery {
+            filters: BlockFilters::default(),
+            explicit_selection: None,
+            changed_selection: None,
+            allowed_revisions: None,
+            include_approved: true,
+        };
+
+        collect_feedback_entries(
+            &[earlier, later],
+            &FeedbackSinceFilter::All,
+            &query,
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert_eq!(resolver.calls, vec!["earlier", "later"]);
+    }
+
+    #[test]
     fn resolve_record_in_files_uses_line_hint_for_duplicate_block_hashes() {
         let first = Block::new("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2);
         let second = Block::new(
@@ -1015,18 +1286,80 @@ mod tests {
     }
 
     #[test]
-    fn build_feedback_cursor_tracks_all_ids_at_latest_timestamp() {
-        let records = vec![
-            build_record("a", "aaaaaaa", "src/a.rs", 10, Verdict::Comment),
-            build_record("b", "bbbbbbb", "src/b.rs", 20, Verdict::Comment),
-            build_record("c", "ccccccc", "src/c.rs", 20, Verdict::Comment),
-        ];
+    fn repo_resolver_uses_path_hint_without_full_workdir_scan() {
+        let repo = trueflow_test_support::temp_test_dir("feedback_resolver_targeted");
+        write_rust_file(&repo, "src/target.rs", "fn target() {}\n");
+        write_rust_file(&repo, "src/unrelated.rs", "fn unrelated() {}\n");
+        let hash = first_scanned_block_hash(&repo, "src/target.rs");
+        let mut record = build_record("target", "aaaaaaa", "src/target.rs", 10, Verdict::Comment);
+        record.repo_ref = RepoRef::Unknown;
+        record.target = ReviewTargetRef::Block { hash };
 
-        let cursor = build_feedback_cursor(&records)
-            .unwrap_or_else(|| panic!("expected cursor for non-empty records"));
+        let scan_options = ScanOptions::default();
+        let mut resolver = RepoFeedbackContextResolver::new_for_repo_root(
+            &ReviewContentSource::Workdir,
+            &scan_options,
+            None,
+            &repo,
+        )
+        .unwrap_or_else(|error| panic!("resolver construction should be lazy: {error}"));
 
-        assert_eq!(cursor.timestamp, 20);
-        assert_eq!(cursor.record_ids_at_timestamp, vec!["b", "c"]);
+        let context = resolver
+            .resolve_context(&record)
+            .unwrap_or_else(|error| panic!("context should resolve: {error}"));
+
+        assert_eq!(context.file_path.as_deref(), Some("src/target.rs"));
+        let cache = resolver
+            .snapshot_files
+            .get(&FeedbackSnapshot::Workdir)
+            .unwrap_or_else(|| panic!("workdir cache should be present"));
+        assert!(!cache.complete);
+        assert_eq!(cache.files.len(), 1);
+        assert_eq!(cache.files[0].path.as_str(), "src/target.rs");
+        assert!(
+            cache
+                .attempted_paths
+                .contains(&RepoPath::new("src/target.rs").unwrap())
+        );
+    }
+
+    #[test]
+    fn repo_resolver_falls_back_to_full_scan_when_path_hint_misses() {
+        let repo = trueflow_test_support::temp_test_dir("feedback_resolver_fallback");
+        write_rust_file(&repo, "src/target.rs", "fn target() {}\n");
+        write_rust_file(&repo, "src/unrelated.rs", "fn unrelated() {}\n");
+        let hash = first_scanned_block_hash(&repo, "src/target.rs");
+        let mut record = build_record("target", "aaaaaaa", "src/moved.rs", 10, Verdict::Comment);
+        record.repo_ref = RepoRef::Unknown;
+        record.target = ReviewTargetRef::Block { hash };
+
+        let scan_options = ScanOptions::default();
+        let mut resolver = RepoFeedbackContextResolver::new_for_repo_root(
+            &ReviewContentSource::Workdir,
+            &scan_options,
+            None,
+            &repo,
+        )
+        .unwrap_or_else(|error| panic!("resolver construction should be lazy: {error}"));
+
+        let context = resolver
+            .resolve_context(&record)
+            .unwrap_or_else(|error| panic!("context should resolve after fallback: {error}"));
+
+        assert_eq!(context.file_path.as_deref(), Some("src/target.rs"));
+        let cache = resolver
+            .snapshot_files
+            .get(&FeedbackSnapshot::Workdir)
+            .unwrap_or_else(|| panic!("workdir cache should be present"));
+        assert!(cache.complete);
+        assert_eq!(
+            cache
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/target.rs", "src/unrelated.rs"]
+        );
     }
 
     #[test]
@@ -1042,6 +1375,33 @@ mod tests {
             .unwrap_or_else(|| panic!("expected cursor"));
         assert_eq!(cursor.timestamp, 1234);
         assert!(cursor.record_ids_at_timestamp.is_empty());
+    }
+
+    fn write_rust_file(root: &Path, path: &str, content: &str) {
+        let full_path = root.join(path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)
+                .unwrap_or_else(|error| panic!("failed to create test parent: {error}"));
+        }
+        fs::write(&full_path, content)
+            .unwrap_or_else(|error| panic!("failed to write test file: {error}"));
+    }
+
+    fn first_scanned_block_hash(root: &Path, path: &str) -> TreeHash {
+        let repo_path = RepoPath::new(path).unwrap_or_else(|error| panic!("valid path: {error}"));
+        let paths = HashSet::from_iter([repo_path.clone()]);
+        let files = scanner::scan_paths(root, &paths, &ScanOptions::default())
+            .unwrap_or_else(|error| panic!("test scan should succeed: {error}"))
+            .files;
+        let file = files
+            .iter()
+            .find(|file| file.path == repo_path)
+            .unwrap_or_else(|| panic!("test scan should include {path}"));
+        file.blocks
+            .first()
+            .unwrap_or_else(|| panic!("test scan should find a block in {path}"))
+            .hash
+            .clone()
     }
 
     fn build_record(

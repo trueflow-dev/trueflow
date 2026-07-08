@@ -879,6 +879,13 @@ pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Ve
 
 pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<RepoPath>> {
     let repo = repo_from_workdir()?;
+    files_changed_in_revision_in_repo(&repo, revision)
+}
+
+pub fn files_changed_in_revision_in_repo(
+    repo: &gix::Repository,
+    revision: &str,
+) -> Result<HashSet<RepoPath>> {
     let object = repo.rev_parse_single(revision)?;
     let commit = object
         .object()?
@@ -890,11 +897,19 @@ pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<RepoPath>> {
     } else {
         repo.empty_tree()
     };
-    collect_changed_paths(&repo, Some(&parent_tree), Some(&commit_tree))
+    collect_changed_paths(repo, Some(&parent_tree), Some(&commit_tree))
 }
 
 pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<RepoPath>> {
     let repo = repo_from_workdir()?;
+    files_changed_in_range_in_repo(&repo, start, end)
+}
+
+pub fn files_changed_in_range_in_repo(
+    repo: &gix::Repository,
+    start: &str,
+    end: &str,
+) -> Result<HashSet<RepoPath>> {
     let start_obj = repo.rev_parse_single(start)?;
     let end_obj = repo.rev_parse_single(end)?;
     let start_commit = start_obj
@@ -907,7 +922,7 @@ pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<RepoPath
         .context("end revision must resolve to a commit")?;
     let start_tree = start_commit.tree()?;
     let end_tree = end_commit.tree()?;
-    collect_changed_paths(&repo, Some(&start_tree), Some(&end_tree))
+    collect_changed_paths(repo, Some(&start_tree), Some(&end_tree))
 }
 
 fn file_diff_from_change(

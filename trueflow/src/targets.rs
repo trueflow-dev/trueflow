@@ -4,7 +4,8 @@ use crate::repo_path::RepoPath;
 use crate::store::CommitId;
 use crate::vcs;
 use anyhow::{Result, anyhow};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -287,14 +288,42 @@ impl ResolvedTargets {
 }
 
 pub fn resolve_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargets> {
+    let repo_cache = RefCell::new(None);
     resolve_targets_with(
         targets,
-        |revision| vcs::resolve_commit_id_from_workdir(revision.as_str()),
-        vcs::dirty_files_from_workdir,
-        vcs::files_changed_main_to_head,
-        vcs::files_changed_in_revision,
-        vcs::files_changed_in_range,
+        |revision| {
+            with_workdir_repo(&repo_cache, |repo| {
+                vcs::resolve_commit_id_in_repo(repo, revision.as_str())
+            })
+        },
+        || with_workdir_repo(&repo_cache, vcs::dirty_files),
+        || with_workdir_repo(&repo_cache, vcs::files_changed_main_to_head_in_repo),
+        |revision| {
+            with_workdir_repo(&repo_cache, |repo| {
+                vcs::files_changed_in_revision_in_repo(repo, revision)
+            })
+        },
+        |start, end| {
+            with_workdir_repo(&repo_cache, |repo| {
+                vcs::files_changed_in_range_in_repo(repo, start, end)
+            })
+        },
     )
+}
+
+fn with_workdir_repo<T>(
+    repo_cache: &RefCell<Option<gix::Repository>>,
+    action: impl FnOnce(&gix::Repository) -> Result<T>,
+) -> Result<T> {
+    if repo_cache.borrow().is_none() {
+        *repo_cache.borrow_mut() = Some(vcs::repo_from_workdir()?);
+    }
+
+    let repo = repo_cache.borrow();
+    let Some(repo) = repo.as_ref() else {
+        return Err(anyhow!("workdir repository cache was not initialized"));
+    };
+    action(repo)
 }
 
 pub(crate) fn resolve_targets_with<ResolveFn, DirtyFn, MainFn, RevisionFn, RangeFn>(
@@ -420,27 +449,55 @@ fn resolve_target_exprs<ResolveFn>(
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
 {
-    targets
-        .iter()
-        .map(|target| match target {
-            ReviewTarget::DirtyWorktree => Ok(ResolvedReviewTarget::DirtyWorktree),
-            ReviewTarget::MainDiff => Ok(ResolvedReviewTarget::MainDiff),
-            ReviewTarget::File(path) => Ok(ResolvedReviewTarget::File(path.clone())),
-            ReviewTarget::Dir(path) => Ok(ResolvedReviewTarget::Dir(path.clone())),
-            ReviewTarget::Revision(revision) => {
-                Ok(ResolvedReviewTarget::Revision(resolve_revision(revision)?))
-            }
+    let mut revision_cache = HashMap::<RevisionExpr, CommitId>::new();
+    let mut resolved = Vec::with_capacity(targets.len());
+
+    for target in targets {
+        let target = match target {
+            ReviewTarget::DirtyWorktree => ResolvedReviewTarget::DirtyWorktree,
+            ReviewTarget::MainDiff => ResolvedReviewTarget::MainDiff,
+            ReviewTarget::File(path) => ResolvedReviewTarget::File(path.clone()),
+            ReviewTarget::Dir(path) => ResolvedReviewTarget::Dir(path.clone()),
+            ReviewTarget::Revision(revision) => ResolvedReviewTarget::Revision(
+                resolve_revision_expr(revision, resolve_revision, &mut revision_cache)?,
+            ),
             ReviewTarget::RevisionRange(range) => {
-                Ok(ResolvedReviewTarget::RevisionRange(CommitRange {
-                    start: resolve_revision(&range.start)?,
-                    end: resolve_revision(&range.end)?,
-                }))
+                ResolvedReviewTarget::RevisionRange(CommitRange {
+                    start: resolve_revision_expr(
+                        &range.start,
+                        resolve_revision,
+                        &mut revision_cache,
+                    )?,
+                    end: resolve_revision_expr(&range.end, resolve_revision, &mut revision_cache)?,
+                })
             }
-            ReviewTarget::PullRequest(_) => Err(anyhow!(
-                "Pull request targets require command-specific handling"
-            )),
-        })
-        .collect()
+            ReviewTarget::PullRequest(_) => {
+                return Err(anyhow!(
+                    "Pull request targets require command-specific handling"
+                ));
+            }
+        };
+        resolved.push(target);
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_revision_expr<ResolveFn>(
+    revision: &RevisionExpr,
+    resolve_revision: &ResolveFn,
+    revision_cache: &mut HashMap<RevisionExpr, CommitId>,
+) -> Result<CommitId>
+where
+    ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
+{
+    if let Some(commit) = revision_cache.get(revision) {
+        return Ok(commit.clone());
+    }
+
+    let commit = resolve_revision(revision)?;
+    revision_cache.insert(revision.clone(), commit.clone());
+    Ok(commit)
 }
 
 fn resolve_content_source(targets: &[ResolvedReviewTarget]) -> Result<ReviewContentSource> {
@@ -512,6 +569,7 @@ mod tests {
     use crate::github::PullRequestRef;
     use crate::repo_path::RepoPath;
     use crate::store::CommitId;
+    use std::cell::Cell;
     use std::collections::HashSet;
 
     #[test]
@@ -721,6 +779,38 @@ mod tests {
             resolved.diff_selection,
             ReviewDiffSelection::Targets(_)
         ));
+    }
+
+    #[test]
+    fn resolve_targets_reuses_duplicate_revision_resolution() {
+        let calls = Cell::new(0);
+        let revision = RevisionExpr::new("abc1234").unwrap();
+        let targets = vec![
+            ReviewTarget::Revision(revision.clone()),
+            ReviewTarget::RevisionRange(RevisionRangeExpr {
+                start: revision.clone(),
+                end: revision,
+            }),
+        ];
+
+        let resolved = resolve_targets_with(
+            &targets,
+            |revision| {
+                calls.set(calls.get() + 1);
+                CommitId::new(revision.as_str())
+            },
+            || Ok(HashSet::new()),
+            || Ok(HashSet::new()),
+            |_revision| Ok(HashSet::new()),
+            |_start, _end| Ok(HashSet::new()),
+        )
+        .unwrap_or_else(|error| panic!("expected resolved targets: {error}"));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            resolved.content_source,
+            ReviewContentSource::Revision(CommitId::new("abc1234").unwrap())
+        );
     }
 
     #[test]

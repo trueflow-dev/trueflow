@@ -104,13 +104,20 @@ fn resolve_feedback_since(raw: &str, now: DateTime<Utc>) -> Result<ResolvedFeedb
 fn parse_relative_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<Option<i64>> {
     let trimmed = raw.trim();
     let trimmed = trimmed
-        .strip_suffix("ago")
-        .map(str::trim_end)
+        .get(trimmed.len().saturating_sub(3)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case("ago"))
+        .map(|_| trimmed[..trimmed.len() - 3].trim_end())
         .unwrap_or(trimmed);
-    let compact = trimmed
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect::<String>();
+    let compact_storage;
+    let compact = if trimmed.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        compact_storage = trimmed
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect::<String>();
+        compact_storage.as_str()
+    } else {
+        trimmed
+    };
     if compact.is_empty() {
         return Ok(None);
     }
@@ -125,14 +132,9 @@ fn parse_relative_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<Optio
     let amount = compact[..split_at]
         .parse::<i64>()
         .map_err(|error| anyhow!("invalid relative duration amount in '{raw}': {error}"))?;
-    let unit = compact[split_at..].to_ascii_lowercase();
-    let scale = match unit.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => 1,
-        "m" | "min" | "mins" | "minute" | "minutes" => 60,
-        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
-        "d" | "day" | "days" => 60 * 60 * 24,
-        "w" | "wk" | "wks" | "week" | "weeks" => 60 * 60 * 24 * 7,
-        _ => return Ok(None),
+    let scale = match relative_duration_scale(&compact[split_at..]) {
+        Some(scale) => scale,
+        None => return Ok(None),
     };
 
     let seconds = amount
@@ -143,6 +145,45 @@ fn parse_relative_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<Optio
         .checked_sub(seconds)
         .ok_or_else(|| anyhow!("relative duration is too large in '{raw}'"))?;
     Ok(Some(timestamp))
+}
+
+fn relative_duration_scale(unit: &str) -> Option<i64> {
+    if unit.eq_ignore_ascii_case("s")
+        || unit.eq_ignore_ascii_case("sec")
+        || unit.eq_ignore_ascii_case("secs")
+        || unit.eq_ignore_ascii_case("second")
+        || unit.eq_ignore_ascii_case("seconds")
+    {
+        Some(1)
+    } else if unit.eq_ignore_ascii_case("m")
+        || unit.eq_ignore_ascii_case("min")
+        || unit.eq_ignore_ascii_case("mins")
+        || unit.eq_ignore_ascii_case("minute")
+        || unit.eq_ignore_ascii_case("minutes")
+    {
+        Some(60)
+    } else if unit.eq_ignore_ascii_case("h")
+        || unit.eq_ignore_ascii_case("hr")
+        || unit.eq_ignore_ascii_case("hrs")
+        || unit.eq_ignore_ascii_case("hour")
+        || unit.eq_ignore_ascii_case("hours")
+    {
+        Some(60 * 60)
+    } else if unit.eq_ignore_ascii_case("d")
+        || unit.eq_ignore_ascii_case("day")
+        || unit.eq_ignore_ascii_case("days")
+    {
+        Some(60 * 60 * 24)
+    } else if unit.eq_ignore_ascii_case("w")
+        || unit.eq_ignore_ascii_case("wk")
+        || unit.eq_ignore_ascii_case("wks")
+        || unit.eq_ignore_ascii_case("week")
+        || unit.eq_ignore_ascii_case("weeks")
+    {
+        Some(60 * 60 * 24 * 7)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +214,19 @@ mod tests {
         assert_eq!(
             parsed,
             ResolvedFeedbackSince::Timestamp(now.timestamp() - 2 * 60 * 60 * 24)
+        );
+    }
+
+    #[test]
+    fn feedback_since_expr_accepts_spaced_case_insensitive_relative_units() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 6, 12, 0, 0).unwrap();
+        let parsed = FeedbackSinceExpr::new("1 H AGO")
+            .unwrap_or_else(|error| panic!("relative duration should parse: {error}"))
+            .resolve_at(now)
+            .unwrap_or_else(|error| panic!("relative duration should resolve: {error}"));
+        assert_eq!(
+            parsed,
+            ResolvedFeedbackSince::Timestamp(now.timestamp() - 60 * 60)
         );
     }
 

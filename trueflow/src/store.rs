@@ -7,7 +7,7 @@ use tracing::warn;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -1002,18 +1002,15 @@ impl JsonlStoreBackend {
     }
 
     fn read_history(&self) -> Result<Vec<Record>> {
-        if !self.db_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let file = fs::File::open(&self.db_path)?;
+        let mut file = match fs::File::open(&self.db_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
         file.lock_shared()?;
 
         let mut content = String::new();
-        for line in BufReader::new(file).lines() {
-            content.push_str(&line?);
-            content.push('\n');
-        }
+        file.read_to_string(&mut content)?;
 
         let report = parse_records_jsonl_report_impl(&content);
         if report.skipped_legacy_diff_target_records > 0 {
