@@ -426,7 +426,10 @@ mod tests {
             });
 
         assert_eq!(navigator.count_visible_descendant_blocks(fixture.root), 3);
-        assert_eq!(navigator.count_visible_descendant_blocks(fixture.lib_file), 2);
+        assert_eq!(
+            navigator.count_visible_descendant_blocks(fixture.lib_file),
+            2
+        );
         assert_eq!(
             navigator.visible_descendant_block_id_set(fixture.lib_file),
             HashSet::from([fixture.block_a, fixture.block_b])

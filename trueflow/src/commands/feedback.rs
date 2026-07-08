@@ -138,7 +138,7 @@ pub fn collect_feedback_json_values(
     params: FeedbackCollectionParams<'_>,
 ) -> Result<Vec<serde_json::Value>> {
     let result = collect_local_feedback(params)?;
-    let values = feedback_entries_to_json_values(result.entries);
+    let values = feedback_entries_to_json_values(&result.entries);
     write_feedback_cursor_update(result.cursor_update)?;
     Ok(values)
 }
@@ -1544,7 +1544,7 @@ fn is_contiguous(lines: &[u32]) -> bool {
 fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Result<()> {
     match format {
         FeedbackFormat::Json => {
-            print_feedback_json(entries)?;
+            print_feedback_json(&entries)?;
         }
         FeedbackFormat::Xml => {
             println!("<trueflow_feedback>");
@@ -1579,7 +1579,7 @@ fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Resul
     Ok(())
 }
 
-fn print_feedback_json(entries: Vec<FeedbackEntry>) -> Result<()> {
+fn print_feedback_json(entries: &[FeedbackEntry]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     {
@@ -1594,11 +1594,11 @@ fn print_feedback_json(entries: Vec<FeedbackEntry>) -> Result<()> {
     Ok(())
 }
 
-fn feedback_entries_to_json_values(entries: Vec<FeedbackEntry>) -> Vec<serde_json::Value> {
-    entries.into_iter().map(feedback_entry_to_json_value).collect()
+fn feedback_entries_to_json_values(entries: &[FeedbackEntry]) -> Vec<serde_json::Value> {
+    entries.iter().map(feedback_entry_to_json_value).collect()
 }
 
-fn feedback_entry_to_json_value(entry: FeedbackEntry) -> serde_json::Value {
+fn feedback_entry_to_json_value(entry: &FeedbackEntry) -> serde_json::Value {
     serde_json::json!({
         "file": entry.file_path,
         "block": entry.block,

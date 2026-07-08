@@ -586,12 +586,10 @@ fn candidate_snapshots_for_record(
         }
         RepoRef::Unknown => None,
     };
-    let default_snapshot = (record_snapshot.as_ref() != Some(default_snapshot))
-        .then(|| default_snapshot.clone());
-    let workdir_snapshot = (!matches!(
-        record_snapshot.as_ref(),
-        Some(FeedbackSnapshot::Workdir)
-    ) && !matches!(default_snapshot.as_ref(), Some(FeedbackSnapshot::Workdir)))
+    let default_snapshot =
+        (record_snapshot.as_ref() != Some(default_snapshot)).then(|| default_snapshot.clone());
+    let workdir_snapshot = (!matches!(record_snapshot.as_ref(), Some(FeedbackSnapshot::Workdir))
+        && !matches!(default_snapshot.as_ref(), Some(FeedbackSnapshot::Workdir)))
     .then_some(FeedbackSnapshot::Workdir);
 
     [record_snapshot, default_snapshot, workdir_snapshot]

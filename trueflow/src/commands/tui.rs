@@ -4316,8 +4316,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         .ai
         .hint_line_text()
         .map(|text| build_ai_hint_lines_from_text(&text, palette, ai_hint_width));
-    let ai_hint_line_count =
-        usize_to_u16_saturating(ai_hint_lines.as_ref().map_or(0, Vec::len));
+    let ai_hint_line_count = usize_to_u16_saturating(ai_hint_lines.as_ref().map_or(0, Vec::len));
 
     let focus_layout = compute_focus_layout(
         area,
@@ -5083,7 +5082,6 @@ fn styled_ai_hint_line(text: String, palette: &UiPalette) -> Line<'static> {
             .add_modifier(Modifier::BOLD),
     ))
 }
-
 
 fn word_wrapped_text_to_width(text: &str, width: usize) -> Vec<String> {
     text.split('\n')
@@ -6643,26 +6641,24 @@ fn build_diff_context_content(
             let comment_rows = Some(
                 rows.iter()
                     .zip(rendered.row_ranges.iter())
-                    .map(|(row, display_row_range)| {
-                        CommentContextRow {
-                            scope_line_index: row.anchor_index,
-                            text: format_diff_overlay_parts(
-                                row.kind,
-                                row.old_line,
-                                row.new_line,
-                                &row.text,
-                                state.diff_line_numbers,
-                                code_width,
-                            ),
-                            display_row_range: display_row_range.clone(),
-                            anchor: CommentAnchorRowCapture::DiffRow {
-                                row: DiffCommentAnchorRow {
-                                    kind: comment_anchor_diff_line_kind(row.kind),
-                                    old_line: row.old_line,
-                                    new_line: row.new_line,
-                                },
+                    .map(|(row, display_row_range)| CommentContextRow {
+                        scope_line_index: row.anchor_index,
+                        text: format_diff_overlay_parts(
+                            row.kind,
+                            row.old_line,
+                            row.new_line,
+                            &row.text,
+                            state.diff_line_numbers,
+                            code_width,
+                        ),
+                        display_row_range: display_row_range.clone(),
+                        anchor: CommentAnchorRowCapture::DiffRow {
+                            row: DiffCommentAnchorRow {
+                                kind: comment_anchor_diff_line_kind(row.kind),
+                                old_line: row.old_line,
+                                new_line: row.new_line,
                             },
-                        }
+                        },
                     })
                     .collect::<Vec<_>>(),
             );

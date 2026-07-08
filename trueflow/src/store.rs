@@ -533,7 +533,6 @@ impl BlockLocator {
             (None, _) => Self::Hash(hash.clone()),
         }
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

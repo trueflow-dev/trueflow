@@ -445,8 +445,7 @@ fn file_states_for_paths_in_tree(
         let candidates =
             path_utils::tree_path_candidates_for_repo_path(requested_path.as_str(), workdir_prefix);
         for candidate in candidates {
-            if let Some(file_state) =
-                file_state_for_path_in_tree(tree, &candidate, requested_path)?
+            if let Some(file_state) = file_state_for_path_in_tree(tree, &candidate, requested_path)?
             {
                 files.push(file_state);
                 break;
