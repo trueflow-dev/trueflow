@@ -245,22 +245,22 @@ pub fn scan_paths<P: AsRef<Path>>(
         load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics).unwrap_or_default();
     let cached_entry_count = (cache.read == ScanCacheReadStatus::Hit).then_some(cache_files.len());
     let mut files = Vec::new();
-    let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
+    let mut ordered_paths = paths.iter().collect::<Vec<_>>();
     ordered_paths.sort();
     let ignore_matcher = DirectScanPathIgnoreMatcher::new(&repo_path_base, options)?;
 
     for path in ordered_paths {
-        if path.is_root() || ignore_matcher.matches(&path) {
-            cache_files.remove(&path);
+        if path.is_root() || ignore_matcher.matches(path) {
+            cache_files.remove(path);
             continue;
         }
         let full_path = repo_path_base.join(path.as_str());
         let Ok(metadata) = fs::metadata(&full_path) else {
-            cache_files.remove(&path);
+            cache_files.remove(path);
             continue;
         };
         if !metadata.is_file() {
-            cache_files.remove(&path);
+            cache_files.remove(path);
             continue;
         }
         let modified = match metadata.modified() {
@@ -275,7 +275,7 @@ pub fn scan_paths<P: AsRef<Path>>(
             }
         };
         let input = ScanInput {
-            path,
+            path: path.clone(),
             full_path,
             stamp: FileStamp {
                 modified_at: system_time_to_epoch(modified),

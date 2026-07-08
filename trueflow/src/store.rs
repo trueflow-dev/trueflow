@@ -534,35 +534,6 @@ impl BlockLocator {
         }
     }
 
-    fn candidates(
-        hash: &TreeHash,
-        path: &RepoPath,
-        start_line: usize,
-        workdir_prefix: Option<&str>,
-    ) -> Vec<Self> {
-        let paths = block_path_candidates(path, workdir_prefix);
-        let mut candidates = Vec::new();
-
-        if let Ok(start_line) = u32::try_from(start_line) {
-            for path in &paths {
-                candidates.push(Self::Exact {
-                    hash: hash.clone(),
-                    path: path.clone(),
-                    start_line,
-                });
-            }
-        }
-
-        for path in &paths {
-            candidates.push(Self::Path {
-                hash: hash.clone(),
-                path: path.clone(),
-            });
-        }
-
-        candidates.push(Self::Hash(hash.clone()));
-        candidates
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -580,19 +551,6 @@ impl PathTargetLocator {
             },
             None => Self::Hash(hash.clone()),
         }
-    }
-
-    fn candidates(hash: &TreeHash, path: &RepoPath, workdir_prefix: Option<&str>) -> Vec<Self> {
-        let paths = block_path_candidates(path, workdir_prefix);
-        let mut candidates = paths
-            .into_iter()
-            .map(|path| Self::Path {
-                hash: hash.clone(),
-                path,
-            })
-            .collect::<Vec<_>>();
-        candidates.push(Self::Hash(hash.clone()));
-        candidates
     }
 
     fn hash(&self) -> &TreeHash {
@@ -630,9 +588,7 @@ impl ApprovedTargets {
         path: &RepoPath,
         workdir_prefix: Option<&str>,
     ) -> bool {
-        PathTargetLocator::candidates(hash, path, workdir_prefix)
-            .into_iter()
-            .any(|candidate| self.file_targets.contains(&candidate))
+        contains_path_locator(&self.file_targets, hash, path, workdir_prefix)
     }
 
     pub fn contains_tree(
@@ -641,9 +597,7 @@ impl ApprovedTargets {
         path: &RepoPath,
         workdir_prefix: Option<&str>,
     ) -> bool {
-        PathTargetLocator::candidates(hash, path, workdir_prefix)
-            .into_iter()
-            .any(|candidate| self.tree_targets.contains(&candidate))
+        contains_path_locator(&self.tree_targets, hash, path, workdir_prefix)
     }
 
     pub fn contains_block(
@@ -653,9 +607,7 @@ impl ApprovedTargets {
         start_line: usize,
         workdir_prefix: Option<&str>,
     ) -> bool {
-        BlockLocator::candidates(hash, path, start_line, workdir_prefix)
-            .into_iter()
-            .any(|candidate| self.block_targets.contains(&candidate))
+        contains_block_locator(&self.block_targets, hash, path, start_line, workdir_prefix)
     }
 }
 
@@ -765,12 +717,7 @@ impl ReviewIndex {
         start_line: usize,
         workdir_prefix: Option<&str>,
     ) -> Option<&Verdict> {
-        for candidate in BlockLocator::candidates(hash, path, start_line, workdir_prefix) {
-            if let Some(verdict) = self.block_verdicts.get(&candidate) {
-                return Some(verdict);
-            }
-        }
-        None
+        find_block_verdict(&self.block_verdicts, hash, path, start_line, workdir_prefix)
     }
 
     pub fn approved_targets(&self) -> ApprovedTargets {
@@ -818,8 +765,90 @@ fn update_latest_verdict<K: Eq + std::hash::Hash>(
     }
 }
 
+fn contains_path_locator(
+    targets: &HashSet<PathTargetLocator>,
+    hash: &TreeHash,
+    path: &RepoPath,
+    workdir_prefix: Option<&str>,
+) -> bool {
+    for path in block_path_candidates(path, workdir_prefix) {
+        if targets.contains(&PathTargetLocator::Path {
+            hash: hash.clone(),
+            path,
+        }) {
+            return true;
+        }
+    }
+    targets.contains(&PathTargetLocator::Hash(hash.clone()))
+}
+
+fn contains_block_locator(
+    targets: &HashSet<BlockLocator>,
+    hash: &TreeHash,
+    path: &RepoPath,
+    start_line: usize,
+    workdir_prefix: Option<&str>,
+) -> bool {
+    let paths = block_path_candidates(path, workdir_prefix);
+    if let Ok(start_line) = u32::try_from(start_line) {
+        for path in &paths {
+            if targets.contains(&BlockLocator::Exact {
+                hash: hash.clone(),
+                path: path.clone(),
+                start_line,
+            }) {
+                return true;
+            }
+        }
+    }
+
+    for path in paths {
+        if targets.contains(&BlockLocator::Path {
+            hash: hash.clone(),
+            path,
+        }) {
+            return true;
+        }
+    }
+    targets.contains(&BlockLocator::Hash(hash.clone()))
+}
+
+#[cfg(test)]
+fn find_block_verdict<'a>(
+    entries: &'a HashMap<BlockLocator, Verdict>,
+    hash: &TreeHash,
+    path: &RepoPath,
+    start_line: usize,
+    workdir_prefix: Option<&str>,
+) -> Option<&'a Verdict> {
+    let paths = block_path_candidates(path, workdir_prefix);
+    if let Ok(start_line) = u32::try_from(start_line) {
+        for path in &paths {
+            let candidate = BlockLocator::Exact {
+                hash: hash.clone(),
+                path: path.clone(),
+                start_line,
+            };
+            if let Some(verdict) = entries.get(&candidate) {
+                return Some(verdict);
+            }
+        }
+    }
+
+    for path in paths {
+        let candidate = BlockLocator::Path {
+            hash: hash.clone(),
+            path,
+        };
+        if let Some(verdict) = entries.get(&candidate) {
+            return Some(verdict);
+        }
+    }
+    entries.get(&BlockLocator::Hash(hash.clone()))
+}
+
 fn block_path_candidates(path: &RepoPath, workdir_prefix: Option<&str>) -> Vec<RepoPath> {
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(2);
     for candidate in path_utils::repo_path_candidates(path.as_str(), workdir_prefix, None) {
         let Ok(candidate) = RepoPath::new(candidate) else {
             continue;

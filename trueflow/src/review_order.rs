@@ -39,7 +39,7 @@ pub struct ReviewOrder {
 
 impl ReviewOrder {
     pub fn from_tree(tree: &Tree, unreviewed_block_nodes: &HashSet<TreeNodeId>) -> Self {
-        let mut ordered = Vec::new();
+        let mut ordered = Vec::with_capacity(unreviewed_block_nodes.len());
         let mut items: Vec<_> = unreviewed_block_nodes
             .iter()
             .copied()

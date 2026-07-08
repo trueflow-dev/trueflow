@@ -158,17 +158,16 @@ impl DiffChangedLineIndex {
         let first_changed_line = self
             .changed_lines
             .partition_point(|line| line.anchor_line < start);
-        let changed_line_refs = self.changed_lines[first_changed_line..]
-            .iter()
-            .take_while(|line| line.anchor_line < end_exclusive)
-            .map(|line| &line.line)
-            .collect::<Vec<_>>();
+        let end_changed_line = self.changed_lines[first_changed_line..]
+            .partition_point(|line| line.anchor_line < end_exclusive)
+            + first_changed_line;
+        let changed_lines = &self.changed_lines[first_changed_line..end_changed_line];
 
-        if changed_line_refs.is_empty() {
+        if changed_lines.is_empty() {
             return BlockDiffChangeKind::NoTextChanges;
         }
 
-        if all_changed_lines_are_nonreviewable(&changed_line_refs) {
+        if all_changed_lines_are_nonreviewable(changed_lines) {
             BlockDiffChangeKind::OnlyNonreviewableChurn
         } else {
             BlockDiffChangeKind::ReviewableChanges
@@ -438,7 +437,7 @@ fn file_states_for_paths_in_tree(
     paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
 ) -> Result<Vec<FileState>> {
-    let mut ordered_paths = paths.iter().cloned().collect::<Vec<_>>();
+    let mut ordered_paths = paths.iter().collect::<Vec<_>>();
     ordered_paths.sort();
 
     let mut files = Vec::new();
@@ -447,7 +446,7 @@ fn file_states_for_paths_in_tree(
             path_utils::tree_path_candidates_for_repo_path(requested_path.as_str(), workdir_prefix);
         for candidate in candidates {
             if let Some(file_state) =
-                file_state_for_path_in_tree(tree, &candidate, &requested_path)?
+                file_state_for_path_in_tree(tree, &candidate, requested_path)?
             {
                 files.push(file_state);
                 break;
@@ -716,10 +715,10 @@ fn push_indexed_changed_lines_for_hunk(
     }
 }
 
-fn all_changed_lines_are_nonreviewable(changed_lines: &[&DiffLine]) -> bool {
+fn all_changed_lines_are_nonreviewable(changed_lines: &[IndexedChangedDiffLine]) -> bool {
     let mut index = 0;
     while index < changed_lines.len() {
-        let line = changed_lines[index];
+        let line = &changed_lines[index].line;
         if is_trivial_closing_brace_addition(line) || is_trivial_whitespace_only_change(line) {
             index += 1;
             continue;
@@ -736,7 +735,9 @@ fn all_changed_lines_are_nonreviewable(changed_lines: &[&DiffLine]) -> bool {
     true
 }
 
-fn trivial_formatting_only_replacement_run(changed_lines: &[&DiffLine]) -> Option<usize> {
+fn trivial_formatting_only_replacement_run(
+    changed_lines: &[IndexedChangedDiffLine],
+) -> Option<usize> {
     trivial_formatting_only_replacement_run_for_order(
         changed_lines,
         DiffLineKind::Removed,
@@ -752,48 +753,41 @@ fn trivial_formatting_only_replacement_run(changed_lines: &[&DiffLine]) -> Optio
 }
 
 fn trivial_formatting_only_replacement_run_for_order(
-    changed_lines: &[&DiffLine],
+    changed_lines: &[IndexedChangedDiffLine],
     first_kind: DiffLineKind,
     second_kind: DiffLineKind,
 ) -> Option<usize> {
-    let mut first_run = Vec::new();
-    let mut second_run = Vec::new();
-    let mut index = 0;
-
-    while let Some(line) = changed_lines.get(index).copied() {
-        if line.kind != first_kind {
-            break;
-        }
-        first_run.push(line);
-        index += 1;
+    let mut first_len = 0;
+    while changed_lines
+        .get(first_len)
+        .is_some_and(|line| line.line.kind == first_kind)
+    {
+        first_len += 1;
     }
 
-    while let Some(line) = changed_lines.get(index).copied() {
-        if line.kind != second_kind {
-            break;
-        }
-        second_run.push(line);
-        index += 1;
+    let mut second_len = 0;
+    while changed_lines
+        .get(first_len + second_len)
+        .is_some_and(|line| line.line.kind == second_kind)
+    {
+        second_len += 1;
     }
 
-    if first_run.is_empty() || second_run.is_empty() {
+    if first_len == 0 || first_len != second_len {
         return None;
     }
 
-    let first_trimmed = first_run
-        .iter()
-        .map(|line| line.text.trim())
-        .collect::<Vec<_>>();
-    let second_trimmed = second_run
-        .iter()
-        .map(|line| line.text.trim())
-        .collect::<Vec<_>>();
-
-    if first_trimmed == second_trimmed && first_trimmed.iter().any(|line| !line.is_empty()) {
-        Some(index)
-    } else {
-        None
+    let mut saw_nonempty_line = false;
+    for index in 0..first_len {
+        let first_trimmed = changed_lines[index].line.text.trim();
+        let second_trimmed = changed_lines[first_len + index].line.text.trim();
+        if first_trimmed != second_trimmed {
+            return None;
+        }
+        saw_nonempty_line |= !first_trimmed.is_empty();
     }
+
+    saw_nonempty_line.then_some(first_len + second_len)
 }
 
 fn is_trivial_closing_brace_addition(line: &DiffLine) -> bool {
