@@ -9,14 +9,15 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 const DEFAULT_IGNORE_NAMES: &[&str] =
     &[".git", ".trueflow", "target", "node_modules", "mutants.out"];
-const SCAN_CACHE_FORMAT_VERSION: u32 = 2;
+const SCAN_CACHE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanCacheMode {
@@ -149,10 +150,10 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
             .and_then(|entries| entries.get(&scan_input.path))
             .filter(|entry| entry.stamp == scan_input.stamp);
 
-        let cache_file = match reused_entry {
+        let attempt = match reused_entry {
             Some(entry) => {
                 cache.reused_files += 1;
-                entry.clone()
+                ScanAttempt::Cache(entry.clone())
             }
             None => {
                 cache.rescanned_files += 1;
@@ -160,8 +161,15 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
             }
         };
 
-        append_cached_outcome(&cache_file.outcome, &mut files, &mut diagnostics);
-        cache_files.push(cache_file);
+        match attempt {
+            ScanAttempt::Cache(cache_file) => {
+                append_cached_outcome(&cache_file.outcome, &mut files, &mut diagnostics);
+                cache_files.push(cache_file);
+            }
+            ScanAttempt::Reject {
+                diagnostics: rejection_diagnostics,
+            } => diagnostics.extend(rejection_diagnostics),
+        }
     }
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -254,48 +262,56 @@ pub fn scan_paths<P: AsRef<Path>>(
             cache_files.remove(path);
             continue;
         }
-        let full_path = repo_path_base.join(path.as_str());
-        let Ok(metadata) = fs::metadata(&full_path) else {
-            cache_files.remove(path);
-            continue;
-        };
-        if !metadata.is_file() {
-            cache_files.remove(path);
-            continue;
-        }
-        let modified = match metadata.modified() {
-            Ok(modified) => modified,
+
+        let input = match admit_scan_path(&repo_path_base, path) {
+            Ok(ScanPathAdmission::Regular { full_path, stamp }) => ScanInput {
+                path: path.clone(),
+                full_path,
+                stamp,
+            },
+            Ok(ScanPathAdmission::Link { component }) => {
+                cache_files.remove(path);
+                diagnostics.push(symbolic_link_diagnostic(path, &component));
+                continue;
+            }
+            Ok(ScanPathAdmission::MissingOrNonFile) => {
+                cache_files.remove(path);
+                continue;
+            }
             Err(err) => {
-                let err = anyhow::Error::from(err);
-                let diagnostic =
-                    diagnostic_for_process_file_error(&repo_path_base, &full_path, &err);
+                cache_files.remove(path);
+                let diagnostic = diagnostic_for_process_file_error(
+                    &repo_path_base,
+                    &repo_path_base.join(path.as_str()),
+                    &err,
+                );
                 log_process_file_error(&diagnostic, &err);
                 diagnostics.push(diagnostic);
                 continue;
             }
         };
-        let input = ScanInput {
-            path: path.clone(),
-            full_path,
-            stamp: FileStamp {
-                modified_at: system_time_to_epoch(modified),
-                size: metadata.len(),
-            },
-        };
+
         let cached_file = cache_files.remove(&input.path);
         let reused_entry = cached_file.filter(|entry| entry.stamp == input.stamp);
-        let cache_file = match reused_entry {
+        let attempt = match reused_entry {
             Some(entry) => {
                 cache.reused_files += 1;
-                entry
+                ScanAttempt::Cache(entry)
             }
             None => {
                 cache.rescanned_files += 1;
                 scan_file(&repo_path_base, &input)
             }
         };
-        append_cached_outcome(&cache_file.outcome, &mut files, &mut diagnostics);
-        cache_files.insert(input.path, cache_file);
+        match attempt {
+            ScanAttempt::Cache(cache_file) => {
+                append_cached_outcome(&cache_file.outcome, &mut files, &mut diagnostics);
+                cache_files.insert(input.path, cache_file);
+            }
+            ScanAttempt::Reject {
+                diagnostics: rejection_diagnostics,
+            } => diagnostics.extend(rejection_diagnostics),
+        }
     }
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -401,7 +417,8 @@ fn build_walker(root: &Path, repo_path_base: &Path, options: &ScanOptions) -> Re
         .git_exclude(true)
         .git_global(true)
         .parents(true)
-        .require_git(false);
+        .require_git(false)
+        .follow_links(false);
     builder.filter_entry(move |entry| !matcher.matches(entry));
     Ok(builder.build())
 }
@@ -504,11 +521,38 @@ struct FileStamp {
     size: u64,
 }
 
+fn file_stamp(metadata: &fs::Metadata) -> Result<FileStamp> {
+    Ok(FileStamp {
+        modified_at: system_time_to_epoch(metadata.modified()?),
+        size: metadata.len(),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct ScanInput {
     path: RepoPath,
     full_path: PathBuf,
     stamp: FileStamp,
+}
+
+/// These pathname observations exclude stable links and detect ordinary drift that they see.
+/// They do not provide adversarial race containment between separate filesystem operations.
+#[derive(Debug)]
+enum ScanPathAdmission {
+    Regular {
+        full_path: PathBuf,
+        stamp: FileStamp,
+    },
+    Link {
+        component: RepoPath,
+    },
+    MissingOrNonFile,
+}
+
+#[derive(Debug)]
+enum ScanAttempt {
+    Cache(CachedFileEntry),
+    Reject { diagnostics: Vec<ScanDiagnostic> },
 }
 
 fn load_cache_entry(root: &Path, options: &ScanOptions) -> Result<Option<CacheEntry>> {
@@ -683,45 +727,79 @@ fn collect_scan_inventory(
         }
 
         let path = normalize_cache_key(repo_path_base, entry.path())?;
-        let metadata = match fs::metadata(entry.path()) {
-            Ok(metadata) => metadata,
+        match admit_scan_path(repo_path_base, &path) {
+            Ok(ScanPathAdmission::Regular { full_path, stamp }) => {
+                inputs.push(ScanInput {
+                    path,
+                    full_path,
+                    stamp,
+                });
+            }
+            Ok(ScanPathAdmission::Link { component }) => {
+                diagnostics.push(symbolic_link_diagnostic(&path, &component));
+            }
+            Ok(ScanPathAdmission::MissingOrNonFile) => {
+                diagnostics.push(changed_during_scan_diagnostic(&path));
+            }
             Err(err) => {
-                let err = anyhow::Error::from(err);
                 let diagnostic =
                     diagnostic_for_process_file_error(repo_path_base, entry.path(), &err);
                 log_process_file_error(&diagnostic, &err);
                 diagnostics.push(diagnostic);
-                continue;
             }
-        };
-        let modified = match metadata.modified() {
-            Ok(modified) => modified,
-            Err(err) => {
-                let err = anyhow::Error::from(err);
-                let diagnostic =
-                    diagnostic_for_process_file_error(repo_path_base, entry.path(), &err);
-                log_process_file_error(&diagnostic, &err);
-                diagnostics.push(diagnostic);
-                continue;
-            }
-        };
-
-        inputs.push(ScanInput {
-            path,
-            full_path: entry.into_path(),
-            stamp: FileStamp {
-                modified_at: system_time_to_epoch(modified),
-                size: metadata.len(),
-            },
-        });
+        }
     }
 
     inputs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(inputs)
 }
 
-fn scan_file(repo_path_base: &Path, input: &ScanInput) -> CachedFileEntry {
-    let outcome = match process_file(repo_path_base, &input.full_path) {
+fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
+    let admission = match admit_scan_path(repo_path_base, &input.path) {
+        Ok(admission) => admission,
+        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+    };
+    if let Some(rejection) = rejected_admission(input, admission) {
+        return rejection;
+    }
+
+    let mut file = match File::open(&input.full_path) {
+        Ok(file) => file,
+        Err(err) => return cacheable_scan_error(repo_path_base, input, err.into()),
+    };
+    match handle_matches_input(&file, input) {
+        Ok(true) => {}
+        Ok(false) => return rejected_changed_scan(input),
+        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+    }
+
+    let admission = match admit_scan_path(repo_path_base, &input.path) {
+        Ok(admission) => admission,
+        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+    };
+    if let Some(rejection) = rejected_admission(input, admission) {
+        return rejection;
+    }
+
+    let mut bytes = Vec::new();
+    if let Err(err) = file.read_to_end(&mut bytes) {
+        return cacheable_scan_error(repo_path_base, input, err.into());
+    }
+
+    match handle_matches_input(&file, input) {
+        Ok(true) => {}
+        Ok(false) => return rejected_changed_scan(input),
+        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+    }
+    let admission = match admit_scan_path(repo_path_base, &input.path) {
+        Ok(admission) => admission,
+        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+    };
+    if let Some(rejection) = rejected_admission(input, admission) {
+        return rejection;
+    }
+
+    let outcome = match process_file(&input.path, &bytes) {
         Ok(file_scan) => CachedFileOutcome::Included {
             file_state: file_scan.file_state,
             diagnostics: file_scan.diagnostics,
@@ -736,10 +814,99 @@ fn scan_file(repo_path_base: &Path, input: &ScanInput) -> CachedFileEntry {
         }
     };
 
-    CachedFileEntry {
+    ScanAttempt::Cache(CachedFileEntry {
         path: input.path.clone(),
         stamp: input.stamp,
         outcome,
+    })
+}
+
+fn admit_scan_path(repo_path_base: &Path, path: &RepoPath) -> Result<ScanPathAdmission> {
+    let components = path.as_str().split('/').collect::<Vec<_>>();
+    let mut full_path = repo_path_base.to_path_buf();
+
+    for (index, component) in components.iter().enumerate() {
+        full_path.push(component);
+        let metadata = match fs::symlink_metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ScanPathAdmission::MissingOrNonFile);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(ScanPathAdmission::Link {
+                component: RepoPath::new(components[..=index].join("/"))?,
+            });
+        }
+
+        let is_final_component = index + 1 == components.len();
+        if is_final_component {
+            return if metadata.file_type().is_file() {
+                Ok(ScanPathAdmission::Regular {
+                    full_path,
+                    stamp: file_stamp(&metadata)?,
+                })
+            } else {
+                Ok(ScanPathAdmission::MissingOrNonFile)
+            };
+        }
+        if !metadata.file_type().is_dir() {
+            return Ok(ScanPathAdmission::MissingOrNonFile);
+        }
+    }
+
+    Ok(ScanPathAdmission::MissingOrNonFile)
+}
+
+fn rejected_admission(input: &ScanInput, admission: ScanPathAdmission) -> Option<ScanAttempt> {
+    match admission {
+        ScanPathAdmission::Regular { stamp, .. } if stamp == input.stamp => None,
+        ScanPathAdmission::Regular { .. } | ScanPathAdmission::MissingOrNonFile => {
+            Some(rejected_changed_scan(input))
+        }
+        ScanPathAdmission::Link { component } => Some(ScanAttempt::Reject {
+            diagnostics: vec![symbolic_link_diagnostic(&input.path, &component)],
+        }),
+    }
+}
+
+fn handle_matches_input(file: &File, input: &ScanInput) -> Result<bool> {
+    let metadata = file.metadata()?;
+    Ok(metadata.file_type().is_file() && file_stamp(&metadata)? == input.stamp)
+}
+
+fn cacheable_scan_error(
+    repo_path_base: &Path,
+    input: &ScanInput,
+    err: anyhow::Error,
+) -> ScanAttempt {
+    let diagnostic = diagnostic_for_process_file_error(repo_path_base, &input.full_path, &err);
+    log_process_file_error(&diagnostic, &err);
+    ScanAttempt::Cache(CachedFileEntry {
+        path: input.path.clone(),
+        stamp: input.stamp,
+        outcome: CachedFileOutcome::Skipped {
+            diagnostics: vec![diagnostic],
+        },
+    })
+}
+
+fn rejected_scan_error(
+    repo_path_base: &Path,
+    input: &ScanInput,
+    err: anyhow::Error,
+) -> ScanAttempt {
+    let diagnostic = diagnostic_for_process_file_error(repo_path_base, &input.full_path, &err);
+    log_process_file_error(&diagnostic, &err);
+    ScanAttempt::Reject {
+        diagnostics: vec![diagnostic],
+    }
+}
+
+fn rejected_changed_scan(input: &ScanInput) -> ScanAttempt {
+    ScanAttempt::Reject {
+        diagnostics: vec![changed_during_scan_diagnostic(&input.path)],
     }
 }
 
@@ -837,27 +1004,34 @@ fn diagnostic_for_process_file_error(
     ScanDiagnostic::new(path, reason)
 }
 
+fn symbolic_link_diagnostic(path: &RepoPath, component: &RepoPath) -> ScanDiagnostic {
+    ScanDiagnostic::new(
+        Some(path.clone()),
+        format!("skipped symbolic link at {component}"),
+    )
+}
+
+fn changed_during_scan_diagnostic(path: &RepoPath) -> ScanDiagnostic {
+    ScanDiagnostic::new(Some(path.clone()), "skipped file changed during scan")
+}
+
 #[derive(Debug, Clone)]
 struct ProcessedFile {
     file_state: FileState,
     diagnostics: Vec<ScanDiagnostic>,
 }
 
-fn process_file(repo_path_base: &Path, path: &Path) -> Result<ProcessedFile> {
-    let file_type = analysis::analyze_file(path);
-    let relative_path = path.strip_prefix(repo_path_base).unwrap_or(path);
-    let normalized_path = RepoPath::from_relative_path(relative_path)?;
+fn process_file(normalized_path: &RepoPath, bytes: &[u8]) -> Result<ProcessedFile> {
+    let file_type = analysis::analyze_file(Path::new(normalized_path.as_str()), bytes);
 
     if matches!(file_type, FileType::Binary) {
         return Ok(ProcessedFile {
-            file_state: FileState::from_binary(normalized_path, &fs::read(path)?),
+            file_state: FileState::from_binary(normalized_path.clone(), bytes),
             diagnostics: Vec::new(),
         });
     }
 
-    let bytes = fs::read(path)?;
-    let content = std::str::from_utf8(&bytes)?;
-
+    let content = std::str::from_utf8(bytes)?;
     let language = match file_type {
         FileType::Code(code_file) => code_file.language,
         FileType::Text => Language::Text,
@@ -874,9 +1048,9 @@ fn process_file(repo_path_base: &Path, path: &Path) -> Result<ProcessedFile> {
 
     Ok(ProcessedFile {
         file_state: FileState::from_text(
-            normalized_path,
+            normalized_path.clone(),
             language,
-            &bytes,
+            bytes,
             split_result.into_review_blocks(),
         ),
         diagnostics,
@@ -1339,5 +1513,337 @@ mod tests {
         ]);
 
         assert_eq!(scan_options_fingerprint(&a), scan_options_fingerprint(&b));
+    }
+
+    #[cfg(unix)]
+    fn symlink_external_file(link_path: &Path, contents: &str) -> PathBuf {
+        use std::os::unix::fs::symlink;
+
+        let outside = temp_test_dir("scanner_external_symlink");
+        fs::create_dir_all(&outside)
+            .unwrap_or_else(|error| panic!("create external directory: {error}"));
+        let target = outside.join("sentinel.rs");
+        fs::write(&target, contents).unwrap_or_else(|error| panic!("write sentinel: {error}"));
+        if let Some(parent) = link_path.parent() {
+            fs::create_dir_all(parent)
+                .unwrap_or_else(|error| panic!("create link parent: {error}"));
+        }
+        symlink(&target, link_path).unwrap_or_else(|error| panic!("create symlink: {error}"));
+        outside
+    }
+
+    #[cfg(unix)]
+    fn scanner_cache_options(cache_dir: PathBuf) -> ScanOptions {
+        ScanOptions {
+            cache_dir: Some(cache_dir),
+            ..ScanOptions::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_paths_rejects_external_symlink_and_evicts_cache() {
+        const SENTINEL: &str = "TRUEFLOW_OUTSIDE_SYMLINK_SENTINEL_17";
+
+        let repo = temp_test_dir("scanner_targeted_symlink");
+        let cache_dir = temp_test_dir("scanner_targeted_symlink_cache");
+        let path = RepoPath::new("src/link.rs").unwrap();
+        let full_path = repo.join(path.as_str());
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        fs::write(&full_path, "pub fn local() {}\n").unwrap();
+        let options = scanner_cache_options(cache_dir);
+        let paths = HashSet::from([path.clone()]);
+
+        let warmed = scan_paths(&repo, &paths, &options).unwrap();
+        assert_eq!(warmed.cache.read, ScanCacheReadStatus::Miss);
+        assert_eq!(warmed.cache.write, ScanCacheWriteStatus::Wrote);
+        assert_eq!(warmed.cache.rescanned_files, 1);
+        assert!(
+            load_cache_entry(&repo, &options)
+                .unwrap()
+                .unwrap()
+                .files
+                .iter()
+                .any(|entry| entry.path == path)
+        );
+
+        fs::remove_file(&full_path).unwrap();
+        let _outside =
+            symlink_external_file(&full_path, &format!("pub fn {SENTINEL}_escaped() {{}}\n"));
+        let rejected = scan_paths(&repo, &paths, &options).unwrap();
+
+        assert!(rejected.files.is_empty());
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.as_ref() == Some(&path)
+                    && diagnostic.reason.contains("symbolic link"))
+        );
+        assert_eq!(rejected.cache.read, ScanCacheReadStatus::Hit);
+        assert_eq!(rejected.cache.write, ScanCacheWriteStatus::Wrote);
+        assert_eq!(rejected.cache.reused_files, 0);
+        assert_eq!(rejected.cache.rescanned_files, 0);
+        let cached = load_cache_entry(&repo, &options).unwrap().unwrap();
+        assert!(!cached.files.iter().any(|entry| entry.path == path));
+        let serialized = fs::read_to_string(cache_path(&repo, &options).unwrap()).unwrap();
+        assert!(!serialized.contains(SENTINEL));
+        assert!(!serialized.contains("src/link.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_prunes_cached_path_replaced_by_symlink() {
+        const SENTINEL: &str = "TRUEFLOW_OUTSIDE_SYMLINK_SENTINEL_17";
+
+        let repo = temp_test_dir("scanner_directory_symlink");
+        let cache_dir = temp_test_dir("scanner_directory_symlink_cache");
+        let real_path = RepoPath::new("src/real.rs").unwrap();
+        let link_path = RepoPath::new("src/link.rs").unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join(real_path.as_str()), "pub fn real() {}\n").unwrap();
+        let link_full_path = repo.join(link_path.as_str());
+        fs::write(&link_full_path, "pub fn local() {}\n").unwrap();
+        let options = scanner_cache_options(cache_dir);
+
+        let warmed = scan_directory(&repo, &options).unwrap();
+        assert_eq!(warmed.cache.rescanned_files, 2);
+        fs::remove_file(&link_full_path).unwrap();
+        let _outside = symlink_external_file(
+            &link_full_path,
+            &format!("pub fn {SENTINEL}_escaped() {{}}\n"),
+        );
+
+        let pruned = scan_directory(&repo, &options).unwrap();
+        assert_eq!(pruned.cache.read, ScanCacheReadStatus::Hit);
+        assert_eq!(pruned.cache.write, ScanCacheWriteStatus::Wrote);
+        assert_eq!(pruned.cache.reused_files, 1);
+        assert_eq!(pruned.cache.rescanned_files, 0);
+        assert_eq!(
+            pruned
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .collect::<Vec<_>>(),
+            vec![&real_path]
+        );
+        let cached = load_cache_entry(&repo, &options).unwrap().unwrap();
+        assert_eq!(cached.files.len(), 1);
+        assert_eq!(cached.files[0].path, real_path);
+        assert!(!cached.files.iter().any(|entry| entry.path == link_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_paths_rejects_file_beneath_symlinked_directory() {
+        const SENTINEL: &str = "TRUEFLOW_OUTSIDE_SYMLINK_SENTINEL_17";
+        use std::os::unix::fs::symlink;
+
+        let repo = temp_test_dir("scanner_ancestor_symlink");
+        let cache_dir = temp_test_dir("scanner_ancestor_symlink_cache");
+        let outside = temp_test_dir("scanner_ancestor_symlink_outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("secret.rs"),
+            format!("pub fn {SENTINEL}_escaped() {{}}\n"),
+        )
+        .unwrap();
+        symlink(&outside, repo.join("linked")).unwrap();
+        let path = RepoPath::new("linked/secret.rs").unwrap();
+        let options = scanner_cache_options(cache_dir);
+        let result = scan_paths(&repo, &HashSet::from([path.clone()]), &options).unwrap();
+
+        assert!(result.files.is_empty());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.as_ref() == Some(&path)
+                    && diagnostic.reason.contains("symbolic link"))
+        );
+        assert!(
+            load_cache_entry(&repo, &options)
+                .unwrap()
+                .unwrap()
+                .files
+                .is_empty()
+        );
+        assert!(!serde_json::to_string(&result).unwrap().contains(SENTINEL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_paths_rejects_broken_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let repo = temp_test_dir("scanner_broken_symlink");
+        let cache_dir = temp_test_dir("scanner_broken_symlink_cache");
+        let path = RepoPath::new("src/link.rs").unwrap();
+        let full_path = repo.join(path.as_str());
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        symlink(
+            "/trueflow-missing-symlink-target-for-scanner-test",
+            &full_path,
+        )
+        .unwrap();
+        let options = scanner_cache_options(cache_dir);
+
+        let result = scan_paths(&repo, &HashSet::from([path.clone()]), &options).unwrap();
+        assert!(result.files.is_empty());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.as_ref() == Some(&path)
+                    && diagnostic.reason.contains("symbolic link"))
+        );
+        assert!(
+            load_cache_entry(&repo, &options)
+                .unwrap()
+                .unwrap()
+                .files
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_file_discards_path_replaced_by_symlink_after_inventory() {
+        const SENTINEL: &str = "TRUEFLOW_OUTSIDE_SYMLINK_SENTINEL_17";
+
+        let repo = temp_test_dir("scanner_read_drift_symlink");
+        let path = RepoPath::new("src/link.rs").unwrap();
+        let full_path = repo.join(path.as_str());
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        fs::write(&full_path, "pub fn local() {}\n").unwrap();
+        let input = match admit_scan_path(&repo, &path).unwrap() {
+            ScanPathAdmission::Regular { full_path, stamp } => ScanInput {
+                path: path.clone(),
+                full_path,
+                stamp,
+            },
+            admission => panic!("expected regular admission, got {admission:?}"),
+        };
+
+        fs::remove_file(&full_path).unwrap();
+        let _outside =
+            symlink_external_file(&full_path, &format!("pub fn {SENTINEL}_escaped() {{}}\n"));
+        let attempt = scan_file(&repo, &input);
+
+        match attempt {
+            ScanAttempt::Reject { diagnostics } => assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.path.as_ref() == Some(&path)
+                    && diagnostic.reason.contains("symbolic link")
+            })),
+            ScanAttempt::Cache(entry) => {
+                panic!("replaced symlink must not be cacheable: {entry:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn scan_cache_rejects_immediately_previous_format_entry_with_followed_link_bytes() {
+        const PRE_FIX_SCAN_CACHE_FORMAT_VERSION: u32 = 2;
+        const POISON: &[u8] = b"pub fn evil() {}\n";
+        const SAFE: &[u8] = b"pub fn safe() {}\n";
+        assert_eq!(POISON.len(), SAFE.len());
+        assert_eq!(
+            PRE_FIX_SCAN_CACHE_FORMAT_VERSION,
+            SCAN_CACHE_FORMAT_VERSION - 1
+        );
+
+        let repo = temp_test_dir("scanner_prefixed_cache");
+        let cache_dir = temp_test_dir("scanner_prefixed_cache_store");
+        let path = RepoPath::new("src/link.rs").unwrap();
+        let full_path = repo.join(path.as_str());
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        fs::write(&full_path, SAFE).unwrap();
+        let options = ScanOptions {
+            cache_dir: Some(cache_dir),
+            ..ScanOptions::default()
+        };
+        let metadata = fs::symlink_metadata(&full_path).unwrap();
+        let poisoned_file_state = FileState::from_text(
+            path.clone(),
+            Language::Rust,
+            POISON,
+            vec![Block::new(
+                String::from_utf8(POISON.to_vec()).unwrap(),
+                crate::block::BlockKind::Function,
+                1,
+                2,
+            )],
+        );
+        let cache_entry = CacheEntry {
+            format_version: PRE_FIX_SCAN_CACHE_FORMAT_VERSION,
+            root_hash: cache_root_hash(&repo),
+            options_fingerprint: scan_options_fingerprint(&options),
+            files: vec![CachedFileEntry {
+                path: path.clone(),
+                stamp: file_stamp(&metadata).unwrap(),
+                outcome: CachedFileOutcome::Included {
+                    file_state: poisoned_file_state,
+                    diagnostics: Vec::new(),
+                },
+            }],
+        };
+        let cache_file = cache_path(&repo, &options).unwrap();
+        fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        fs::write(&cache_file, serde_json::to_string(&cache_entry).unwrap()).unwrap();
+
+        let result = scan_paths(&repo, &HashSet::from([path.clone()]), &options).unwrap();
+        assert_eq!(result.cache.read, ScanCacheReadStatus::Miss);
+        assert_eq!(result.cache.rescanned_files, 1);
+        assert_eq!(result.cache.write, ScanCacheWriteStatus::Wrote);
+        let serialized_result = serde_json::to_string(&result).unwrap();
+        assert!(!serialized_result.contains("evil"));
+        assert!(serialized_result.contains("safe"));
+        let rewritten = fs::read_to_string(cache_file).unwrap();
+        assert!(!rewritten.contains("evil"));
+        assert!(rewritten.contains("safe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_paths_rejects_windows_external_symlink() {
+        use std::os::windows::fs::symlink_file;
+
+        let repo = temp_test_dir("scanner_windows_symlink");
+        let outside = temp_test_dir("scanner_windows_symlink_outside");
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("sentinel.rs");
+        let path = RepoPath::new("src/link.rs").unwrap();
+        let link_path = repo.join(path.as_str());
+        fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        fs::write(&target, "pub fn sentinel() {}\n").unwrap();
+        match symlink_file(&target, &link_path) {
+            Ok(()) => {}
+            // Windows symlink creation may need Developer Mode or elevated privilege.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create Windows symlink: {error}"),
+        }
+
+        let result = scan_paths(
+            &repo,
+            &HashSet::from([path.clone()]),
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(result.files.is_empty());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.as_ref() == Some(&path)
+                    && diagnostic.reason.contains("symbolic link"))
+        );
     }
 }

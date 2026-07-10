@@ -1800,3 +1800,113 @@ fn review_dirty_staged_only_rename_emits_destination_once() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(unix)]
+const EXTERNAL_SYMLINK_SENTINEL: &str = "TRUEFLOW_OUTSIDE_SYMLINK_SENTINEL_17";
+
+#[cfg(unix)]
+fn create_external_symlink(repo: &TestRepo) -> Result<TestRepo> {
+    use std::os::unix::fs::symlink;
+
+    let outside = TestRepo::new("external_symlink_sentinel")?;
+    outside.write(
+        "secret.rs",
+        &format!(
+            "pub fn {EXTERNAL_SYMLINK_SENTINEL}_escaped() {{ println!(\"{EXTERNAL_SYMLINK_SENTINEL}\"); }}\n"
+        ),
+    )?;
+    symlink(
+        outside.path.join("secret.rs"),
+        repo.path.join("src/link.rs"),
+    )?;
+    Ok(outside)
+}
+
+#[cfg(unix)]
+fn assert_external_symlink_is_not_reviewed(output: std::process::Output) -> Result<()> {
+    assert!(
+        output.status.success(),
+        "review should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let files = json_array(&stdout)?;
+    assert!(
+        !files
+            .iter()
+            .any(|file| file["path"].as_str() == Some("src/link.rs")),
+        "review must omit selected symlink: {stdout}"
+    );
+    assert!(
+        !stdout.contains(EXTERNAL_SYMLINK_SENTINEL),
+        "review must not expose external sentinel: {stdout}"
+    );
+    assert!(
+        stderr.contains("src/link.rs") && stderr.contains("symbolic link"),
+        "targeted symlink rejection should name its path and reason: {stderr}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn review_main_rejects_stable_external_symlink_sentinel() -> Result<()> {
+    let repo = TestRepo::new("review_main_external_symlink")?;
+    repo.write("src/base.rs", "pub fn base() {}\n")?;
+    repo.commit_all("Base")?;
+    repo.git(&["checkout", "-B", "main"])?;
+    repo.git(&["checkout", "-B", "feature"])?;
+    let _outside = create_external_symlink(&repo)?;
+    repo.add("src/link.rs")?;
+    repo.commit("Add external link")?;
+
+    assert_external_symlink_is_not_reviewed(
+        repo.run_raw(&["review", "--target", "main", "--json"])?,
+    )?;
+
+    let full = repo.run_raw(&["review", "--all", "--json"])?;
+    assert!(full.status.success(), "full review should succeed");
+    let stdout = String::from_utf8(full.stdout)?;
+    let files = json_array(&stdout)?;
+    assert!(
+        !files
+            .iter()
+            .any(|file| file["path"].as_str() == Some("src/link.rs")),
+        "full review must omit symlink: {stdout}"
+    );
+    assert!(
+        !stdout.contains(EXTERNAL_SYMLINK_SENTINEL),
+        "full review must not expose external sentinel: {stdout}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn review_dirty_rejects_stable_external_symlink_sentinel() -> Result<()> {
+    let repo = TestRepo::new("review_dirty_external_symlink")?;
+    repo.write("src/base.rs", "pub fn base() {}\n")?;
+    repo.commit_all("Base")?;
+    let _outside = create_external_symlink(&repo)?;
+
+    assert_external_symlink_is_not_reviewed(
+        repo.run_raw(&["review", "--target", "dirty", "--json"])?,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn review_file_target_rejects_stable_external_symlink_sentinel() -> Result<()> {
+    let repo = TestRepo::new("review_file_external_symlink")?;
+    repo.write("src/base.rs", "pub fn base() {}\n")?;
+    repo.commit_all("Base")?;
+    let _outside = create_external_symlink(&repo)?;
+
+    assert_external_symlink_is_not_reviewed(repo.run_raw(&[
+        "review",
+        "--target",
+        "file:src/link.rs",
+        "--json",
+    ])?)
+}

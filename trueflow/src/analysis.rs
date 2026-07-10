@@ -107,7 +107,7 @@ pub enum FileType {
     Text,
 }
 
-pub fn analyze_file(path: &Path) -> FileType {
+pub fn analyze_file(path: &Path, bytes: &[u8]) -> FileType {
     // 1. Check for extension-based Code/Markup
     if let Some(ext) = path.extension().and_then(|s| s.to_str())
         && let Some(language) = Language::from_extension(ext)
@@ -122,27 +122,15 @@ pub fn analyze_file(path: &Path) -> FileType {
         return FileType::Code(CodeFile { language });
     }
 
-    // 3. Check for Binary (Heuristic: Read first 8kb, look for NULL)
-    // We only want to read a small chunk, not the whole file if it's huge.
-    // However, in `scanner.rs` we read the whole file anyway to hash it.
-    // So we can pass the content if available, but `scanner.rs` calls us before chunking.
-    // Let's just read the header here.
-
-    if let Ok(mut file) = std::fs::File::open(path) {
-        use std::io::Read;
-        let mut buffer = [0; 8 * 1024];
-        if let Ok(n) = file.read(&mut buffer) {
-            let slice = &buffer[..n];
-            if slice.contains(&0) {
-                return FileType::Binary;
-            }
-            if let Some(language) = language_from_shebang(slice) {
-                return FileType::Code(CodeFile { language });
-            }
-        }
+    // 3. Inspect only the header for binary and shebang detection.
+    let header = &bytes[..bytes.len().min(8 * 1024)];
+    if header.contains(&0) {
+        return FileType::Binary;
+    }
+    if let Some(language) = language_from_shebang(header) {
+        return FileType::Code(CodeFile { language });
     }
 
-    // Default to Text
     FileType::Text
 }
 
@@ -172,66 +160,17 @@ fn language_from_shebang(header: &[u8]) -> Option<Language> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TempPath {
-        path: PathBuf,
-    }
-
-    impl TempPath {
-        fn new(path: PathBuf) -> Self {
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempPath {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
-            let mut current = self.path.parent();
-            while let Some(dir) = current {
-                if !dir.starts_with(std::env::temp_dir()) {
-                    break;
-                }
-                if fs::remove_dir(dir).is_err() {
-                    break;
-                }
-                current = dir.parent();
-            }
-        }
-    }
-
-    fn write_temp_file(name: &str, contents: &[u8]) -> TempPath {
-        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let unique_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "trueflow-analysis-tests-{}-{timestamp}-{unique_id}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("create temp directory: {error}"));
-        let path = dir.join(name);
-        fs::write(&path, contents).unwrap_or_else(|error| panic!("write temp file: {error}"));
-        TempPath::new(path)
-    }
+    use std::path::Path;
 
     #[test]
     fn analyze_file_detects_binary_nul_after_first_kilobyte() {
         let mut contents = vec![b'a'; 1500];
         contents[1200] = 0;
-        let file = write_temp_file("payload", &contents);
 
-        assert!(matches!(analyze_file(file.path()), FileType::Binary));
+        assert!(matches!(
+            analyze_file(Path::new("payload"), &contents),
+            FileType::Binary
+        ));
     }
 
     #[test]
@@ -305,10 +244,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_justfile_without_extension() {
-        let file = write_temp_file("Justfile", b"default:\n    echo hello\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("Justfile"), b"default:\n    echo hello\n"),
             FileType::Code(CodeFile {
                 language: Language::Just
             })
@@ -317,10 +254,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_shell_shebang_without_extension() {
-        let file = write_temp_file("script", b"#!/usr/bin/env bash\necho hello\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("script"), b"#!/usr/bin/env bash\necho hello\n"),
             FileType::Code(CodeFile {
                 language: Language::Shell
             })
@@ -329,10 +264,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_java_by_extension() {
-        let file = write_temp_file("Main.java", b"class Main {}\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("Main.java"), b"class Main {}\n"),
             FileType::Code(CodeFile {
                 language: Language::Java
             })
@@ -341,10 +274,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_kotlin_by_extension() {
-        let file = write_temp_file("Main.kt", b"class Main\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("Main.kt"), b"class Main\n"),
             FileType::Code(CodeFile {
                 language: Language::Kotlin
             })
@@ -353,10 +284,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_kotlin_script_by_extension() {
-        let file = write_temp_file("build.main.kts", b"val answer = 42\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("build.main.kts"), b"val answer = 42\n"),
             FileType::Code(CodeFile {
                 language: Language::Kotlin
             })
@@ -365,10 +294,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_csharp_by_extension() {
-        let file = write_temp_file("Program.cs", b"class Program {}\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("Program.cs"), b"class Program {}\n"),
             FileType::Code(CodeFile {
                 language: Language::CSharp
             })
@@ -377,10 +304,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_ruby_by_extension() {
-        let file = write_temp_file("app.rb", b"class App\nend\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("app.rb"), b"class App\nend\n"),
             FileType::Code(CodeFile {
                 language: Language::Ruby
             })
@@ -389,10 +314,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_php_by_extension() {
-        let file = write_temp_file("index.php", b"<?php\nfunction main() {}\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("index.php"), b"<?php\nfunction main() {}\n"),
             FileType::Code(CodeFile {
                 language: Language::Php
             })
@@ -401,10 +324,8 @@ mod tests {
 
     #[test]
     fn analyze_file_detects_c_by_extension() {
-        let file = write_temp_file("main.c", b"int main(void) { return 0; }\n");
-
         assert!(matches!(
-            analyze_file(file.path()),
+            analyze_file(Path::new("main.c"), b"int main(void) { return 0; }\n"),
             FileType::Code(CodeFile {
                 language: Language::C
             })

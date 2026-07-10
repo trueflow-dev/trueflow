@@ -8,7 +8,7 @@ use crate::block_splitter;
 pub fn fuzzy_find_block(path: &Path, fuzzy_ident: &str) -> Result<Block> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
-    let file_type = crate::analysis::analyze_file(path);
+    let file_type = crate::analysis::analyze_file(path, content.as_bytes());
 
     let language = match file_type {
         crate::analysis::FileType::Code(code_file) => code_file.language,

@@ -213,3 +213,30 @@ fn dirty_files_deduplicates_index_and_worktree_path() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn main_diff_selects_symlink_path_without_reading_it() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let repo = TestRepo::new("main_diff_symlink_selection")?;
+    repo.write("src/base.rs", "pub fn base() {}\n")?;
+    repo.commit_all("Base")?;
+    repo.git(&["checkout", "-B", "main"])?;
+    repo.git(&["checkout", "-B", "feature"])?;
+    symlink(
+        "/trueflow-symlink-selection-target-that-does-not-need-to-exist",
+        repo.path.join("src/link.rs"),
+    )?;
+    repo.add("src/link.rs")?;
+    repo.commit("Add link")?;
+
+    let git_repo = gix::open(&repo.path)?;
+    let changed = trueflow::vcs::files_changed_main_to_head_in_repo(&git_repo)?;
+
+    assert_eq!(
+        changed,
+        HashSet::from([ChangedPath::identity(RepoPath::new("src/link.rs")?)]),
+    );
+    Ok(())
+}
