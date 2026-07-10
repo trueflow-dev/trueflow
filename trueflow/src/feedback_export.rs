@@ -82,10 +82,17 @@ pub enum FeedbackSnapshot {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResolvedFeedbackBlock {
+    pub unscoped: Block,
+    pub presentation: FeedbackBlockView,
+    pub presentation_is_scoped: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResolvedFeedbackContext {
     pub snapshot: FeedbackSnapshot,
     pub file_path: Option<String>,
-    pub block: Option<Block>,
+    pub block: Option<ResolvedFeedbackBlock>,
 }
 
 pub trait FeedbackContextResolver {
@@ -162,13 +169,79 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FeedbackEntryKey {
+struct FeedbackPresentationEntryKey {
     snapshot: FeedbackSnapshot,
     target: ReviewTargetRef,
     file_path: String,
     block_hash: TreeHash,
     start_line: usize,
     end_line: usize,
+    discriminator: FeedbackPresentationDiscriminator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FeedbackPresentationDiscriminator {
+    Unscoped,
+    Scoped {
+        start_line: u32,
+        end_line: u32,
+        context: String,
+        anchor: Option<FeedbackCommentAnchorKey>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FeedbackCommentAnchorKey {
+    Source {
+        revision: String,
+        path: String,
+        start_line: u32,
+        end_line: u32,
+    },
+    Diff {
+        revision: String,
+        path: String,
+        rows: Vec<FeedbackDiffAnchorRowKey>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FeedbackDiffAnchorRowKey {
+    kind: FeedbackDiffAnchorRowKind,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FeedbackDiffAnchorRowKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FeedbackVerdictKey {
+    snapshot: FeedbackSnapshot,
+    locator: FeedbackVerdictLocator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FeedbackVerdictLocator {
+    Block {
+        target_hash: TreeHash,
+        file_path: String,
+        block_hash: TreeHash,
+        start_line: usize,
+        end_line: usize,
+    },
+    File {
+        target_hash: TreeHash,
+        path: Option<String>,
+    },
+    Tree {
+        target_hash: TreeHash,
+        path: Option<String>,
+    },
 }
 
 struct ResolvedFeedbackRecord<'a> {
@@ -176,7 +249,8 @@ struct ResolvedFeedbackRecord<'a> {
     record: &'a Record,
     file_path: String,
     block: FeedbackBlockView,
-    key: FeedbackEntryKey,
+    entry_key: FeedbackPresentationEntryKey,
+    verdict_key: FeedbackVerdictKey,
 }
 
 fn resolve_feedback_records<'a>(
@@ -188,13 +262,14 @@ fn resolve_feedback_records<'a>(
         .enumerate()
         .map(|(index, record)| {
             let context = resolver.resolve_context(record)?;
-            let (file_path, block, key) = feedback_entry_parts(record, &context);
+            let (file_path, block, entry_key, verdict_key) = feedback_entry_parts(record, &context);
             Ok(ResolvedFeedbackRecord {
                 index,
                 record,
                 file_path,
                 block,
-                key,
+                entry_key,
+                verdict_key,
             })
         })
         .collect()
@@ -207,7 +282,7 @@ pub fn collect_feedback_entries(
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<FeedbackEntry>> {
     let resolved_records = resolve_feedback_records(records, resolver)?;
-    let latest_verdicts = latest_verdicts_by_entry_key(&resolved_records);
+    let latest_verdicts = latest_verdicts_by_verdict_key(&resolved_records);
     let cursor_record_ids_at_timestamp = match since_filter {
         FeedbackSinceFilter::Cursor(cursor) => Some(
             cursor
@@ -219,7 +294,7 @@ pub fn collect_feedback_entries(
         _ => None,
     };
 
-    let mut grouped = HashMap::<FeedbackEntryKey, FeedbackEntry>::new();
+    let mut grouped = HashMap::<FeedbackPresentationEntryKey, FeedbackEntry>::new();
     for resolved in resolved_records {
         let record = resolved.record;
         if !record_matches_since(
@@ -242,7 +317,7 @@ pub fn collect_feedback_entries(
         }
 
         let latest_verdict = latest_verdicts
-            .get(&resolved.key)
+            .get(&resolved.verdict_key)
             .copied()
             .unwrap_or("unreviewed");
         if !query.include_approved && latest_verdict == "approved" {
@@ -264,10 +339,10 @@ pub fn collect_feedback_entries(
             record,
             file_path,
             block,
-            key,
+            entry_key,
             ..
         } = resolved;
-        let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
+        let entry = grouped.entry(entry_key).or_insert_with(|| FeedbackEntry {
             file_path,
             block,
             reviews: Vec::new(),
@@ -297,33 +372,137 @@ pub fn collect_feedback_entries(
 fn feedback_entry_parts(
     record: &Record,
     context: &ResolvedFeedbackContext,
-) -> (String, FeedbackBlockView, FeedbackEntryKey) {
+) -> (
+    String,
+    FeedbackBlockView,
+    FeedbackPresentationEntryKey,
+    FeedbackVerdictKey,
+) {
     let file_path = context
         .file_path
         .clone()
         .or_else(|| record.path_hint.as_ref().map(RepoPath::to_string))
         .unwrap_or_else(|| "<unknown>".to_string());
-    let block = context
-        .block
-        .as_ref()
-        .and_then(|block| scoped_feedback_block_for_record(record, block))
-        .or_else(|| {
-            context
-                .block
-                .as_ref()
-                .map(FeedbackBlockView::from_canonical_block)
-        })
-        .unwrap_or_else(|| unresolved_feedback_block_for_record(record));
-    let key = FeedbackEntryKey {
+    let (block, presentation_is_scoped) = match context.block.as_ref() {
+        Some(block) => (block.presentation.clone(), block.presentation_is_scoped),
+        None => match scoped_unresolved_feedback_block_for_record(record) {
+            Some(block) => (block, true),
+            None => (unresolved_unscoped_feedback_block_for_record(record), false),
+        },
+    };
+    let entry_key = FeedbackPresentationEntryKey {
         snapshot: context.snapshot.clone(),
         target: record.target.clone(),
         file_path: file_path.clone(),
         block_hash: block.hash.clone(),
         start_line: block.start_line,
         end_line: block.end_line,
+        discriminator: feedback_presentation_discriminator(record, presentation_is_scoped),
+    };
+    let verdict_key = feedback_verdict_key(record, context, &file_path);
+
+    (file_path, block, entry_key, verdict_key)
+}
+
+fn feedback_presentation_discriminator(
+    record: &Record,
+    presentation_is_scoped: bool,
+) -> FeedbackPresentationDiscriminator {
+    let (Some(scope), Some(context)) = (
+        record.comment_scope.as_ref(),
+        record.comment_context.as_ref(),
+    ) else {
+        return FeedbackPresentationDiscriminator::Unscoped;
+    };
+    if !presentation_is_scoped {
+        return FeedbackPresentationDiscriminator::Unscoped;
+    }
+
+    FeedbackPresentationDiscriminator::Scoped {
+        start_line: scope.start_line,
+        end_line: scope.end_line,
+        context: context.clone(),
+        anchor: feedback_comment_anchor_key(record),
+    }
+}
+
+fn feedback_comment_anchor_key(record: &Record) -> Option<FeedbackCommentAnchorKey> {
+    match record.comment_anchor.as_ref()? {
+        crate::store::CommentAnchor::Source(anchor) => Some(FeedbackCommentAnchorKey::Source {
+            revision: anchor.revision.as_str().to_string(),
+            path: anchor.path.as_str().to_string(),
+            start_line: anchor.start_line,
+            end_line: anchor.end_line,
+        }),
+        crate::store::CommentAnchor::Diff(anchor) => Some(FeedbackCommentAnchorKey::Diff {
+            revision: anchor.revision.as_str().to_string(),
+            path: anchor.path.as_str().to_string(),
+            rows: anchor
+                .rows
+                .iter()
+                .map(|row| FeedbackDiffAnchorRowKey {
+                    kind: match row.kind {
+                        crate::store::CommentAnchorDiffLineKind::Context => {
+                            FeedbackDiffAnchorRowKind::Context
+                        }
+                        crate::store::CommentAnchorDiffLineKind::Added => {
+                            FeedbackDiffAnchorRowKind::Added
+                        }
+                        crate::store::CommentAnchorDiffLineKind::Removed => {
+                            FeedbackDiffAnchorRowKind::Removed
+                        }
+                    },
+                    old_line: row.old_line,
+                    new_line: row.new_line,
+                })
+                .collect(),
+        }),
+    }
+}
+
+fn feedback_verdict_key(
+    record: &Record,
+    context: &ResolvedFeedbackContext,
+    canonical_file_path: &str,
+) -> FeedbackVerdictKey {
+    let locator = match &record.target {
+        ReviewTargetRef::Block { hash } => {
+            let (block_hash, start_line, end_line) = context
+                .block
+                .as_ref()
+                .map(|block| {
+                    (
+                        block.unscoped.hash.clone(),
+                        block.unscoped.start_line,
+                        block.unscoped.end_line,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    let (start_line, end_line) = unresolved_block_line_range(record);
+                    (feedback_target_hash(record), start_line, end_line)
+                });
+            FeedbackVerdictLocator::Block {
+                target_hash: hash.clone(),
+                file_path: canonical_file_path.to_string(),
+                block_hash,
+                start_line,
+                end_line,
+            }
+        }
+        ReviewTargetRef::File { hash } => FeedbackVerdictLocator::File {
+            target_hash: hash.clone(),
+            path: record.path_hint.as_ref().map(RepoPath::to_string),
+        },
+        ReviewTargetRef::Tree { hash } => FeedbackVerdictLocator::Tree {
+            target_hash: hash.clone(),
+            path: record.path_hint.as_ref().map(RepoPath::to_string),
+        },
     };
 
-    (file_path, block, key)
+    FeedbackVerdictKey {
+        snapshot: context.snapshot.clone(),
+        locator,
+    }
 }
 
 pub fn resolve_since_filter(
@@ -410,22 +589,22 @@ pub fn resolve_allowed_revisions(
     Ok(Some(allowed))
 }
 
-fn latest_verdicts_by_entry_key(
+fn latest_verdicts_by_verdict_key(
     records: &[ResolvedFeedbackRecord<'_>],
-) -> HashMap<FeedbackEntryKey, &'static str> {
-    let mut latest = HashMap::<FeedbackEntryKey, (i64, usize, &'static str)>::new();
+) -> HashMap<FeedbackVerdictKey, &'static str> {
+    let mut latest = HashMap::<FeedbackVerdictKey, (i64, usize, &'static str)>::new();
     for resolved in records {
         let record = resolved.record;
         let should_replace =
             latest
-                .get(&resolved.key)
+                .get(&resolved.verdict_key)
                 .is_none_or(|(timestamp, existing_index, _)| {
                     record.timestamp > *timestamp
                         || (record.timestamp == *timestamp && resolved.index > *existing_index)
                 });
         if should_replace {
             latest.insert(
-                resolved.key.clone(),
+                resolved.verdict_key.clone(),
                 (record.timestamp, resolved.index, record.verdict.as_str()),
             );
         }
@@ -528,7 +707,7 @@ fn resolve_feedback_context(
                 return Ok(ResolvedFeedbackContext {
                     snapshot: snapshot.clone(),
                     file_path: Some(file_path),
-                    block: Some(block),
+                    block: Some(resolved_feedback_block_for_record(record, block)),
                 });
             }
 
@@ -552,7 +731,7 @@ fn resolve_feedback_context(
             return Ok(ResolvedFeedbackContext {
                 snapshot: snapshot.clone(),
                 file_path: Some(file_path),
-                block: Some(block),
+                block: Some(resolved_feedback_block_for_record(record, block)),
             });
         }
     }
@@ -583,6 +762,21 @@ fn scoped_feedback_block_for_record(record: &Record, block: &Block) -> Option<Fe
         end_line,
         byte_span: None,
     })
+}
+
+fn resolved_feedback_block_for_record(record: &Record, unscoped: Block) -> ResolvedFeedbackBlock {
+    match scoped_feedback_block_for_record(record, &unscoped) {
+        Some(presentation) => ResolvedFeedbackBlock {
+            unscoped,
+            presentation,
+            presentation_is_scoped: true,
+        },
+        None => ResolvedFeedbackBlock {
+            presentation: FeedbackBlockView::from_canonical_block(&unscoped),
+            unscoped,
+            presentation_is_scoped: false,
+        },
+    }
 }
 
 fn scoped_unresolved_feedback_block_for_record(record: &Record) -> Option<FeedbackBlockView> {
@@ -889,13 +1083,8 @@ fn path_matches_feedback_selections(
     true
 }
 
-fn unresolved_feedback_block_for_record(record: &Record) -> FeedbackBlockView {
-    if let Some(block) = scoped_unresolved_feedback_block_for_record(record) {
-        return block;
-    }
-
-    let start_line = record.line_hint.unwrap_or(0) as usize;
-    let end_line = start_line.saturating_add(1);
+fn unresolved_unscoped_feedback_block_for_record(record: &Record) -> FeedbackBlockView {
+    let (start_line, end_line) = unresolved_block_line_range(record);
     FeedbackBlockView {
         hash: feedback_target_hash(record),
         content: "[unresolved historical context]".to_string(),
@@ -906,6 +1095,14 @@ fn unresolved_feedback_block_for_record(record: &Record) -> FeedbackBlockView {
         end_line,
         byte_span: None,
     }
+}
+
+fn unresolved_block_line_range(record: &Record) -> (usize, usize) {
+    let start_line = record
+        .line_hint
+        .and_then(|line| usize::try_from(line).ok())
+        .unwrap_or(0);
+    (start_line, start_line.saturating_add(1))
 }
 
 fn feedback_target_hash(record: &Record) -> TreeHash {
@@ -972,10 +1169,18 @@ mod tests {
 
     impl FeedbackContextResolver for FakeResolver {
         fn resolve_context(&mut self, record: &Record) -> Result<ResolvedFeedbackContext> {
-            self.contexts
+            let mut context = self
+                .contexts
                 .get(&record.id)
                 .cloned()
-                .ok_or_else(|| anyhow!("missing fake context for {}", record.id))
+                .ok_or_else(|| anyhow!("missing fake context for {}", record.id))?;
+            if let Some(block) = context.block.as_ref() {
+                context.block = Some(resolved_feedback_block_for_record(
+                    record,
+                    block.unscoped.clone(),
+                ));
+            }
+            Ok(context)
         }
     }
 
@@ -1052,6 +1257,105 @@ mod tests {
     }
 
     #[test]
+    fn collect_feedback_entries_excludes_scoped_comment_after_later_full_block_approval() {
+        let mut comment = build_record("comment", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        comment.comment_scope = Some(crate::store::CommentScope {
+            start_line: 11,
+            end_line: 12,
+        });
+        comment.comment_context = Some("    work();\n".to_string());
+        let approval = build_record("approval", "aaaaaaa", "src/lib.rs", 20, Verdict::Approved);
+        let canonical = resolved_context_with_span(
+            "src/lib.rs",
+            "fn core() {\n    work();\n}\n",
+            LineSpan::new(10, 13),
+        );
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                ("comment".to_string(), canonical.clone()),
+                ("approval".to_string(), canonical),
+            ]),
+        };
+
+        let entries = collect_feedback_entries(
+            &[comment, approval],
+            &FeedbackSinceFilter::All,
+            &unapproved_feedback_query(),
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn collect_feedback_entries_keeps_distinct_same_scope_diff_comments_for_one_target() {
+        let mut removed = build_record("removed", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        removed.comment_scope = Some(crate::store::CommentScope {
+            start_line: 11,
+            end_line: 12,
+        });
+        removed.comment_context = Some("-before\n".to_string());
+        removed.comment_anchor = Some(crate::store::CommentAnchor::Diff(
+            crate::store::DiffCommentAnchor {
+                revision: crate::store::CommitId::new("aaaaaaa")
+                    .unwrap_or_else(|error| panic!("valid test revision: {error}")),
+                path: RepoPath::new("src/lib.rs")
+                    .unwrap_or_else(|error| panic!("valid repo path: {error}")),
+                rows: vec![crate::store::DiffCommentAnchorRow {
+                    kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                    old_line: Some(11),
+                    new_line: None,
+                }],
+            },
+        ));
+        let mut added = build_record("added", "aaaaaaa", "src/lib.rs", 20, Verdict::Comment);
+        added.comment_scope = removed.comment_scope.clone();
+        added.comment_context = Some("+after\n".to_string());
+        added.comment_anchor = Some(crate::store::CommentAnchor::Diff(
+            crate::store::DiffCommentAnchor {
+                revision: crate::store::CommitId::new("aaaaaaa")
+                    .unwrap_or_else(|error| panic!("valid test revision: {error}")),
+                path: RepoPath::new("src/lib.rs")
+                    .unwrap_or_else(|error| panic!("valid repo path: {error}")),
+                rows: vec![crate::store::DiffCommentAnchorRow {
+                    kind: crate::store::CommentAnchorDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(11),
+                }],
+            },
+        ));
+        let canonical = resolved_context_with_span(
+            "src/lib.rs",
+            "fn core() {\n    work();\n}\n",
+            LineSpan::new(10, 13),
+        );
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                ("removed".to_string(), canonical.clone()),
+                ("added".to_string(), canonical),
+            ]),
+        };
+
+        let mut entries = collect_feedback_entries(
+            &[removed, added],
+            &FeedbackSinceFilter::All,
+            &unapproved_feedback_query(),
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+        entries.sort_by(|left, right| left.block.content.cmp(&right.block.content));
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].block.content, "+after\n");
+        assert_eq!(entries[0].reviews.len(), 1);
+        assert_eq!(entries[0].reviews[0].id, "added");
+        assert_eq!(entries[1].block.content, "-before\n");
+        assert_eq!(entries[1].reviews.len(), 1);
+        assert_eq!(entries[1].reviews[0].id, "removed");
+    }
+
+    #[test]
     fn collect_feedback_entries_excludes_approved_target_across_hint_precision() {
         let mut earlier = build_record("earlier", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
         earlier.line_hint = Some(0);
@@ -1076,6 +1380,97 @@ mod tests {
             &[earlier, later],
             &FeedbackSinceFilter::All,
             &query,
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn collect_feedback_entries_keeps_scoped_comment_when_same_hash_in_other_path_is_approved() {
+        let shared_hash = TreeHash::from_content("fn duplicate() {}\n");
+        let mut comment = build_record("comment", "aaaaaaa", "src/a.rs", 10, Verdict::Comment);
+        comment.target = ReviewTargetRef::Block {
+            hash: shared_hash.clone(),
+        };
+        comment.comment_scope = Some(crate::store::CommentScope {
+            start_line: 1,
+            end_line: 2,
+        });
+        comment.comment_context = Some("fn duplicate() {}\n".to_string());
+        let mut approval = build_record("approval", "aaaaaaa", "src/b.rs", 20, Verdict::Approved);
+        approval.target = ReviewTargetRef::Block { hash: shared_hash };
+        let canonical = "fn duplicate() {}\n";
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                (
+                    "comment".to_string(),
+                    resolved_context_with_span("src/a.rs", canonical, LineSpan::new(0, 2)),
+                ),
+                (
+                    "approval".to_string(),
+                    resolved_context_with_span("src/b.rs", canonical, LineSpan::new(0, 2)),
+                ),
+            ]),
+        };
+
+        let entries = collect_feedback_entries(
+            &[comment, approval],
+            &FeedbackSinceFilter::All,
+            &unapproved_feedback_query(),
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_path, "src/a.rs");
+        assert_eq!(entries[0].block.content, canonical);
+        assert_eq!(entries[0].reviews.len(), 1);
+        assert_eq!(entries[0].reviews[0].id, "comment");
+    }
+
+    #[test]
+    fn collect_feedback_entries_excludes_paged_file_comment_after_later_file_approval() {
+        let file_hash = TreeHash::from_content("file target");
+        let mut comment = build_record("comment", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        comment.target = ReviewTargetRef::File {
+            hash: file_hash.clone(),
+        };
+        comment.line_hint = Some(11);
+        comment.comment_scope = Some(crate::store::CommentScope {
+            start_line: 11,
+            end_line: 12,
+        });
+        comment.comment_context = Some("fn second() {}\n".to_string());
+        let mut approval = build_record("approval", "aaaaaaa", "src/lib.rs", 20, Verdict::Approved);
+        approval.target = ReviewTargetRef::File { hash: file_hash };
+        approval.line_hint = None;
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                (
+                    "comment".to_string(),
+                    resolved_context_with_span(
+                        "src/lib.rs",
+                        "fn second() {}\n",
+                        LineSpan::new(10, 12),
+                    ),
+                ),
+                (
+                    "approval".to_string(),
+                    resolved_context_with_span(
+                        "src/lib.rs",
+                        "fn first() {}\n",
+                        LineSpan::new(0, 2),
+                    ),
+                ),
+            ]),
+        };
+
+        let entries = collect_feedback_entries(
+            &[comment, approval],
+            &FeedbackSinceFilter::All,
+            &unapproved_feedback_query(),
             &mut resolver,
         )
         .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
@@ -1580,12 +1975,47 @@ mod tests {
         ResolvedFeedbackContext {
             snapshot: FeedbackSnapshot::Workdir,
             file_path: Some(path.to_string()),
-            block: Some(Block::new(
+            block: Some(fully_presented_feedback_block(Block::new(
                 content.to_string(),
                 BlockKind::Code,
                 LineSpan::new(0, 1),
                 ByteSpan::new(0, content.len()),
-            )),
+            ))),
+        }
+    }
+
+    fn resolved_context_with_span(
+        path: &str,
+        content: &str,
+        line_span: LineSpan,
+    ) -> ResolvedFeedbackContext {
+        ResolvedFeedbackContext {
+            snapshot: FeedbackSnapshot::Workdir,
+            file_path: Some(path.to_string()),
+            block: Some(fully_presented_feedback_block(Block::new(
+                content.to_string(),
+                BlockKind::Code,
+                line_span,
+                ByteSpan::new(0, content.len()),
+            ))),
+        }
+    }
+
+    fn fully_presented_feedback_block(unscoped: Block) -> ResolvedFeedbackBlock {
+        ResolvedFeedbackBlock {
+            presentation: FeedbackBlockView::from_canonical_block(&unscoped),
+            unscoped,
+            presentation_is_scoped: false,
+        }
+    }
+
+    fn unapproved_feedback_query() -> FeedbackQuery {
+        FeedbackQuery {
+            filters: BlockFilters::default(),
+            explicit_selection: None,
+            changed_selection: None,
+            allowed_revisions: None,
+            include_approved: false,
         }
     }
 

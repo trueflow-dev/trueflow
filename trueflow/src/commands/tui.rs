@@ -813,7 +813,7 @@ struct AppState {
     content_height: u16,
     viewport_height: u16,
     code_rect: Rect,
-    visible_comment_capture: Option<VisibleCommentCapture>,
+    rendered_comment_capture: Option<RenderedCommentCapture>,
     view_mode: ViewMode,
     block_diff_focus_mode: vcs::BlockDiffFocusMode,
     diff_line_numbers: TuiDiffLineNumbers,
@@ -1097,9 +1097,19 @@ struct CommentContextRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VisibleCommentCapture {
-    scope: crate::store::CommentScope,
-    context: String,
+enum CommentPresentation {
+    FullBlock,
+    Scoped {
+        scope: crate::store::CommentScope,
+        context: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedCommentCapture {
+    node_id: TreeNodeId,
+    presentation: CommentPresentation,
+    anchor: CommentAnchorSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1602,7 +1612,7 @@ fn build_review_state(
         content_height: 0,
         viewport_height: 0,
         code_rect: Rect::default(),
-        visible_comment_capture: None,
+        rendered_comment_capture: None,
         view_mode: options.initial_view_mode,
         block_diff_focus_mode: options.block_diff_focus_mode,
         diff_line_numbers: options.diff_line_numbers,
@@ -3829,26 +3839,37 @@ fn mark_params_for_action(
         Some(node.path.clone())
     };
 
-    let scoped_comment = (matches!(verdict, Verdict::Comment)
-        && node_id == state.navigator.current_id())
-    .then(|| state.visible_comment_capture.clone())
-    .flatten();
+    let comment_capture =
+        if matches!(verdict, Verdict::Comment) && node_id == state.navigator.current_id() {
+            state
+                .rendered_comment_capture
+                .as_ref()
+                .filter(|capture| capture.node_id == node_id)
+                .cloned()
+        } else {
+            None
+        };
+    let (comment_scope, comment_context) =
+        comment_capture
+            .as_ref()
+            .map_or((None, None), |capture| match &capture.presentation {
+                CommentPresentation::FullBlock => (None, None),
+                CommentPresentation::Scoped { scope, context } => {
+                    (Some(scope.clone()), Some(context.clone()))
+                }
+            });
     let line_hint = node
         .block
         .as_ref()
         .map(|block| usize_to_u32_saturating(block.start_line))
-        .or_else(|| {
-            scoped_comment
-                .as_ref()
-                .map(|capture| capture.scope.start_line)
-        });
-
-    let comment_anchor =
-        if matches!(verdict, Verdict::Comment) && node_id == state.navigator.current_id() {
-            comment_anchor_for_current_action(state, node_id, path_hint.as_ref())?
-        } else {
-            None
-        };
+        .or_else(|| comment_scope.as_ref().map(|scope| scope.start_line));
+    let comment_anchor = comment_capture
+        .as_ref()
+        .map(|capture| {
+            decorate_comment_anchor_for_action(state, &capture.anchor, path_hint.as_ref())
+        })
+        .transpose()?
+        .flatten();
 
     Ok(mark::MarkParams {
         fingerprint,
@@ -3858,39 +3879,21 @@ fn mark_params_for_action(
         note,
         path: path_hint,
         line: line_hint,
-        comment_scope: scoped_comment.as_ref().map(|capture| capture.scope.clone()),
-        comment_context: scoped_comment.map(|capture| capture.context),
+        comment_scope,
+        comment_context,
         comment_anchor,
     })
 }
 
-fn comment_anchor_for_current_action(
-    state: &mut AppState,
-    node_id: TreeNodeId,
+fn decorate_comment_anchor_for_action(
+    state: &AppState,
+    selection: &CommentAnchorSelection,
     path_hint: Option<&RepoPath>,
 ) -> Result<Option<CommentAnchor>> {
     let Some(path) = path_hint.cloned() else {
         return Ok(None);
     };
     let Some(revision) = review_scope_revision(state)? else {
-        return Ok(None);
-    };
-
-    let node = state.navigator.tree.node(node_id);
-    let snapshot = ContentNodeSnapshot::from_node(node);
-    let content = build_content_lines(
-        state,
-        &snapshot,
-        &UiPalette::default(),
-        state.code_rect.height.max(1),
-        state.code_rect.width.max(1),
-    );
-    let Some(selection) = comment_anchor_selection_for_content(
-        &content,
-        state.scroll_offset,
-        state.viewport_height,
-        state.content_height,
-    ) else {
         return Ok(None);
     };
 
@@ -3901,13 +3904,13 @@ fn comment_anchor_for_current_action(
         } => CommentAnchor::Source(SourceCommentAnchor {
             revision,
             path,
-            start_line,
-            end_line,
+            start_line: *start_line,
+            end_line: *end_line,
         }),
         CommentAnchorSelection::Diff { rows } => CommentAnchor::Diff(DiffCommentAnchor {
             revision,
             path,
-            rows,
+            rows: rows.clone(),
         }),
     }))
 }
@@ -4381,7 +4384,8 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     state.scroll_offset = state
         .scroll_offset
         .min(state.content_height.saturating_sub(state.viewport_height));
-    state.visible_comment_capture = visible_comment_capture_for_content(
+    state.rendered_comment_capture = rendered_comment_capture_for_content(
+        node_snapshot.id,
         &content,
         state.scroll_offset,
         state.viewport_height,
@@ -4518,60 +4522,43 @@ fn line_display_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
-fn visible_comment_capture_for_content(
+fn rendered_comment_capture_for_content(
+    node_id: TreeNodeId,
     content: &BuiltContent,
     scroll_offset: u16,
     viewport_height: u16,
     content_height: u16,
-) -> Option<VisibleCommentCapture> {
-    if content_height <= viewport_height {
-        return None;
-    }
+) -> Option<RenderedCommentCapture> {
+    let selected_rows =
+        selected_comment_rows(content, scroll_offset, viewport_height, content_height)?;
+    let presentation = if content_height > viewport_height {
+        let (start_line, end_line) = selected_scope_lines(&selected_rows)?;
+        CommentPresentation::Scoped {
+            scope: crate::store::CommentScope {
+                start_line,
+                end_line,
+            },
+            context: selected_rows
+                .iter()
+                .map(|row| row.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    } else {
+        CommentPresentation::FullBlock
+    };
 
-    let selected_rows = selected_comment_rows(
-        content,
-        scroll_offset,
-        viewport_height,
-        content_height,
-        CommentRowSelectionMode::VisibleOnly,
-    )?;
-    let (start_line, end_line) = selected_scope_lines(&selected_rows)?;
-
-    Some(VisibleCommentCapture {
-        scope: crate::store::CommentScope {
-            start_line,
-            end_line,
-        },
-        context: selected_rows
-            .iter()
-            .map(|row| row.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n"),
+    Some(RenderedCommentCapture {
+        node_id,
+        presentation,
+        anchor: comment_anchor_selection_for_rows(&selected_rows)?,
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommentRowSelectionMode {
-    VisibleOnly,
-    VisibleOrAll,
-}
-
-fn comment_anchor_selection_for_content(
-    content: &BuiltContent,
-    scroll_offset: u16,
-    viewport_height: u16,
-    content_height: u16,
+fn comment_anchor_selection_for_rows(
+    selected_rows: &[CommentContextRow],
 ) -> Option<CommentAnchorSelection> {
-    let selected_rows = selected_comment_rows(
-        content,
-        scroll_offset,
-        viewport_height,
-        content_height,
-        CommentRowSelectionMode::VisibleOrAll,
-    )?;
-
-    let source_scope = selected_source_scope(&selected_rows);
-    if let Some((start_line, end_line)) = source_scope {
+    if let Some((start_line, end_line)) = selected_source_scope(selected_rows) {
         return Some(CommentAnchorSelection::Source {
             start_line,
             end_line,
@@ -4593,26 +4580,20 @@ fn selected_comment_rows(
     scroll_offset: u16,
     viewport_height: u16,
     content_height: u16,
-    mode: CommentRowSelectionMode,
 ) -> Option<Vec<CommentContextRow>> {
     let comment_rows = content.comment_rows.as_ref()?;
-    let selected_range = if matches!(mode, CommentRowSelectionMode::VisibleOrAll)
-        && content_height <= viewport_height
-    {
-        0..usize::from(content_height)
-    } else {
-        let visible_start = usize::from(scroll_offset);
-        let visible_end = visible_start
-            .saturating_add(usize::from(viewport_height))
-            .min(usize::from(content_height));
-        visible_start..visible_end
-    };
+    if content_height <= viewport_height {
+        return (!comment_rows.is_empty()).then(|| comment_rows.clone());
+    }
 
+    let visible_start = usize::from(scroll_offset);
+    let visible_end = visible_start
+        .saturating_add(usize::from(viewport_height))
+        .min(usize::from(content_height));
     let selected_rows = comment_rows
         .iter()
         .filter(|row| {
-            row.display_row_range.start < selected_range.end
-                && row.display_row_range.end > selected_range.start
+            row.display_row_range.start < visible_end && row.display_row_range.end > visible_start
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -7627,7 +7608,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
-            visible_comment_capture: None,
+            rendered_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -7700,7 +7681,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
-            visible_comment_capture: None,
+            rendered_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -7847,7 +7828,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
-            visible_comment_capture: None,
+            rendered_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -7973,7 +7954,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
-            visible_comment_capture: None,
+            rendered_comment_capture: None,
             view_mode: ViewMode::Source,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -8057,7 +8038,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
-            visible_comment_capture: None,
+            rendered_comment_capture: None,
             view_mode: ViewMode::Diff,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -8169,7 +8150,7 @@ mod diff_scope_tests {
             content_height: 0,
             viewport_height: 0,
             code_rect: Rect::default(),
-            visible_comment_capture: None,
+            rendered_comment_capture: None,
             view_mode: ViewMode::Source,
             block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
             diff_line_numbers: TuiDiffLineNumbers::Disabled,
@@ -11309,7 +11290,301 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn visible_comment_capture_for_source_content_uses_scrolled_logical_lines() {
+    fn rendered_comment_capture_source_uses_scrollbar_adjusted_boundary_rows() {
+        let file_path = temp_test_file_path("tui_scrollbar_boundary_source");
+        let file_content = "first\nabcdefgh\nlast\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 3);
+        state.review_scope = ScopePreset::Commit {
+            id: "1111111111111111111111111111111111111111".to_string(),
+            summary: String::new(),
+        };
+        state.view_mode = ViewMode::Source;
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 2,
+        };
+        let snapshot = ContentNodeSnapshot::from_node(state.navigator.tree.node(block_id));
+        let full_width_content =
+            build_block_lines(&mut state, &snapshot, &UiPalette::default(), 2, 8);
+        assert_eq!(full_width_content.total_lines, 3);
+        let content = build_block_lines(&mut state, &snapshot, &UiPalette::default(), 2, 7);
+        assert_eq!(content.total_lines, 4);
+        state.content_height = usize_to_u16_saturating(content.total_lines);
+        state.viewport_height = 2;
+        state.scroll_offset = 2;
+        state.rendered_comment_capture = rendered_comment_capture_for_content(
+            block_id,
+            &content,
+            state.scroll_offset,
+            state.viewport_height,
+            state.content_height,
+        );
+
+        let expected_fingerprint =
+            fingerprint_and_target_kind_for_node(state.navigator.tree.node(block_id)).0;
+        let params = mark_params_for_action(
+            &mut state,
+            block_id,
+            Verdict::Comment,
+            Some("note".to_string()),
+        )
+        .unwrap_or_else(|error| panic!("expected source comment params: {error}"));
+
+        assert_eq!(params.fingerprint, expected_fingerprint);
+        assert_eq!(
+            params.comment_scope,
+            Some(crate::store::CommentScope {
+                start_line: 1,
+                end_line: 3,
+            })
+        );
+        assert_eq!(params.comment_context.as_deref(), Some("abcdefgh\nlast"));
+        assert_eq!(
+            params.comment_anchor,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                start_line: 1,
+                end_line: 3,
+            }))
+        );
+    }
+
+    #[test]
+    fn rendered_comment_capture_diff_uses_scrollbar_adjusted_boundary_rows() {
+        let file_path = temp_test_file_path("tui_scrollbar_boundary_diff");
+        let file_content = "pre\nnew\npost\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 3);
+        state.review_scope = ScopePreset::Commit {
+            id: "2222222222222222222222222222222222222222".to_string(),
+            summary: String::new(),
+        };
+        state.view_mode = ViewMode::Diff;
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 2,
+        };
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::context("pre\n"),
+                        vcs::DiffHunkLine::removed("abcdefgh\n"),
+                        vcs::DiffHunkLine::added("new\n"),
+                        vcs::DiffHunkLine::context("post\n"),
+                    ],
+                }],
+            },
+        );
+        let snapshot = ContentNodeSnapshot::from_node(state.navigator.tree.node(block_id));
+        let full_width_content =
+            build_block_lines(&mut state, &snapshot, &UiPalette::default(), 2, 10);
+        assert_eq!(full_width_content.total_lines, 4);
+        let content = build_block_lines(&mut state, &snapshot, &UiPalette::default(), 2, 9);
+        assert_eq!(content.total_lines, 5);
+        state.content_height = usize_to_u16_saturating(content.total_lines);
+        state.viewport_height = 2;
+        state.scroll_offset = 2;
+        state.rendered_comment_capture = rendered_comment_capture_for_content(
+            block_id,
+            &content,
+            state.scroll_offset,
+            state.viewport_height,
+            state.content_height,
+        );
+
+        let expected_fingerprint =
+            fingerprint_and_target_kind_for_node(state.navigator.tree.node(block_id)).0;
+        let params = mark_params_for_action(
+            &mut state,
+            block_id,
+            Verdict::Comment,
+            Some("note".to_string()),
+        )
+        .unwrap_or_else(|error| panic!("expected diff comment params: {error}"));
+
+        assert_eq!(params.fingerprint, expected_fingerprint);
+        assert_eq!(
+            params.comment_scope,
+            Some(crate::store::CommentScope {
+                start_line: 1,
+                end_line: 2,
+            })
+        );
+        assert_eq!(params.comment_context.as_deref(), Some("- abcdefgh\n+ new"));
+        assert_eq!(
+            params.comment_anchor,
+            Some(CommentAnchor::Diff(DiffCommentAnchor {
+                revision: CommitId::new("2222222222222222222222222222222222222222").unwrap(),
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                rows: vec![
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(2),
+                        new_line: None,
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(2),
+                    },
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn rendered_comment_capture_source_no_scroll_anchors_full_target() {
+        let file_path = temp_test_file_path("tui_no_scroll_source");
+        let file_content = "first\nabcdefgh\nlast\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 3);
+        state.review_scope = ScopePreset::Commit {
+            id: "1111111111111111111111111111111111111111".to_string(),
+            summary: String::new(),
+        };
+        state.view_mode = ViewMode::Source;
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        };
+        let snapshot = ContentNodeSnapshot::from_node(state.navigator.tree.node(block_id));
+        let content = build_block_lines(&mut state, &snapshot, &UiPalette::default(), 4, 8);
+        assert_eq!(content.total_lines, 3);
+        state.content_height = usize_to_u16_saturating(content.total_lines);
+        state.viewport_height = 4;
+        state.rendered_comment_capture = rendered_comment_capture_for_content(
+            block_id,
+            &content,
+            state.scroll_offset,
+            state.viewport_height,
+            state.content_height,
+        );
+
+        let params = mark_params_for_action(
+            &mut state,
+            block_id,
+            Verdict::Comment,
+            Some("note".to_string()),
+        )
+        .unwrap_or_else(|error| panic!("expected source comment params: {error}"));
+
+        assert!(params.comment_scope.is_none());
+        assert!(params.comment_context.is_none());
+        assert_eq!(
+            params.comment_anchor,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                start_line: 0,
+                end_line: 3,
+            }))
+        );
+    }
+
+    #[test]
+    fn rendered_comment_capture_diff_no_scroll_anchors_full_target() {
+        let file_path = temp_test_file_path("tui_no_scroll_diff");
+        let file_content = "pre\nnew\npost\n";
+        let (mut state, _file_id, block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 3);
+        state.review_scope = ScopePreset::Commit {
+            id: "2222222222222222222222222222222222222222".to_string(),
+            summary: String::new(),
+        };
+        state.view_mode = ViewMode::Diff;
+        state.code_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 5,
+        };
+        state.file_diff_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            vcs::FileDiff::Text {
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
+                hunks: vec![vcs::DiffHunk {
+                    file_path: RepoPath::new("src/lib.rs").unwrap(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        vcs::DiffHunkLine::context("pre\n"),
+                        vcs::DiffHunkLine::removed("abcdefgh\n"),
+                        vcs::DiffHunkLine::added("new\n"),
+                        vcs::DiffHunkLine::context("post\n"),
+                    ],
+                }],
+            },
+        );
+        let snapshot = ContentNodeSnapshot::from_node(state.navigator.tree.node(block_id));
+        let content = build_block_lines(&mut state, &snapshot, &UiPalette::default(), 5, 10);
+        assert_eq!(content.total_lines, 4);
+        state.content_height = usize_to_u16_saturating(content.total_lines);
+        state.viewport_height = 5;
+        state.rendered_comment_capture = rendered_comment_capture_for_content(
+            block_id,
+            &content,
+            state.scroll_offset,
+            state.viewport_height,
+            state.content_height,
+        );
+
+        let params = mark_params_for_action(
+            &mut state,
+            block_id,
+            Verdict::Comment,
+            Some("note".to_string()),
+        )
+        .unwrap_or_else(|error| panic!("expected diff comment params: {error}"));
+
+        assert!(params.comment_scope.is_none());
+        assert!(params.comment_context.is_none());
+        assert_eq!(
+            params.comment_anchor,
+            Some(CommentAnchor::Diff(DiffCommentAnchor {
+                revision: CommitId::new("2222222222222222222222222222222222222222").unwrap(),
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                rows: vec![
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Context,
+                        old_line: Some(1),
+                        new_line: Some(1),
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(2),
+                        new_line: None,
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(2),
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Context,
+                        old_line: Some(3),
+                        new_line: Some(3),
+                    },
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn rendered_comment_capture_for_source_content_uses_scrolled_logical_lines() {
         let file_path = temp_test_file_path("tui_comment_scope_source");
         let file_lines = (1..=12)
             .map(|index| format!("scope_line_{index:02}"))
@@ -11322,21 +11597,33 @@ mod diff_scope_tests {
             0,
             file_lines.len(),
         );
-        let node = state.navigator.tree.node(block_id);
-        let snapshot = ContentNodeSnapshot::from_node(node);
-        let palette = UiPalette::default();
+        let snapshot = ContentNodeSnapshot::from_node(state.navigator.tree.node(block_id));
+        let content = build_block_lines(&mut state, &snapshot, &UiPalette::default(), 6, 40);
+        let capture = rendered_comment_capture_for_content(block_id, &content, 3, 4, 12)
+            .unwrap_or_else(|| panic!("expected rendered comment capture"));
 
-        let content = build_block_lines(&mut state, &snapshot, &palette, 6, 40);
-        let capture = visible_comment_capture_for_content(&content, 3, 4, 12)
-            .unwrap_or_else(|| panic!("expected visible comment capture"));
-
-        assert_eq!(capture.scope.start_line, 3);
-        assert_eq!(capture.scope.end_line, 7);
-        assert_eq!(capture.context, file_lines[3..7].join("\n"));
+        assert_eq!(capture.node_id, block_id);
+        assert_eq!(
+            capture.presentation,
+            CommentPresentation::Scoped {
+                scope: crate::store::CommentScope {
+                    start_line: 3,
+                    end_line: 7,
+                },
+                context: file_lines[3..7].join("\n"),
+            }
+        );
+        assert_eq!(
+            capture.anchor,
+            CommentAnchorSelection::Source {
+                start_line: 3,
+                end_line: 7,
+            }
+        );
     }
 
     #[test]
-    fn visible_comment_capture_for_diff_content_uses_scrolled_diff_rows() {
+    fn rendered_comment_capture_for_diff_content_uses_scrolled_diff_rows() {
         let file_path = temp_test_file_path("tui_comment_scope_diff");
         let file_lines = (1..=8)
             .map(|index| format!("diff_line_{index:02}"))
@@ -11365,17 +11652,11 @@ mod diff_scope_tests {
                 }],
             },
         );
-        let node = state.navigator.tree.node(block_id);
-        let snapshot = ContentNodeSnapshot::from_node(node);
-        let palette = UiPalette::default();
-
-        let content = build_block_lines(&mut state, &snapshot, &palette, 6, 80);
-        let capture = visible_comment_capture_for_content(&content, 2, 3, 8)
-            .unwrap_or_else(|| panic!("expected visible comment capture"));
-
-        assert_eq!(capture.scope.start_line, 2);
-        assert_eq!(capture.scope.end_line, 5);
-        let expected = (3..=5)
+        let snapshot = ContentNodeSnapshot::from_node(state.navigator.tree.node(block_id));
+        let content = build_block_lines(&mut state, &snapshot, &UiPalette::default(), 6, 80);
+        let capture = rendered_comment_capture_for_content(block_id, &content, 2, 3, 8)
+            .unwrap_or_else(|| panic!("expected rendered comment capture"));
+        let expected_context = (3..=5)
             .map(|index| {
                 format_diff_overlay_row(
                     &vcs::DiffLine {
@@ -11390,7 +11671,40 @@ mod diff_scope_tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(capture.context, expected);
+
+        assert_eq!(capture.node_id, block_id);
+        assert_eq!(
+            capture.presentation,
+            CommentPresentation::Scoped {
+                scope: crate::store::CommentScope {
+                    start_line: 2,
+                    end_line: 5,
+                },
+                context: expected_context,
+            }
+        );
+        assert_eq!(
+            capture.anchor,
+            CommentAnchorSelection::Diff {
+                rows: vec![
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Context,
+                        old_line: Some(3),
+                        new_line: Some(3),
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Context,
+                        old_line: Some(4),
+                        new_line: Some(4),
+                    },
+                    DiffCommentAnchorRow {
+                        kind: CommentAnchorDiffLineKind::Context,
+                        old_line: Some(5),
+                        new_line: Some(5),
+                    },
+                ],
+            }
+        );
     }
 
     #[test]
@@ -11416,6 +11730,13 @@ mod diff_scope_tests {
         let content = build_block_lines(&mut state, &snapshot, &palette, 20, 80);
         state.content_height = usize_to_u16_saturating(content.total_lines);
         state.viewport_height = 20;
+        state.rendered_comment_capture = rendered_comment_capture_for_content(
+            block_id,
+            &content,
+            state.scroll_offset,
+            state.viewport_height,
+            state.content_height,
+        );
 
         let params = mark_params_for_action(
             &mut state,
@@ -11529,6 +11850,13 @@ mod diff_scope_tests {
         let content = build_block_lines(&mut state, &snapshot, &palette, 20, 80);
         state.content_height = usize_to_u16_saturating(content.total_lines);
         state.viewport_height = 20;
+        state.rendered_comment_capture = rendered_comment_capture_for_content(
+            block_id,
+            &content,
+            state.scroll_offset,
+            state.viewport_height,
+            state.content_height,
+        );
 
         let params = mark_params_for_action(
             &mut state,
@@ -11589,6 +11917,13 @@ mod diff_scope_tests {
         let content = build_block_lines(&mut state, &snapshot, &palette, 20, 80);
         state.content_height = usize_to_u16_saturating(content.total_lines);
         state.viewport_height = 20;
+        state.rendered_comment_capture = rendered_comment_capture_for_content(
+            block_id,
+            &content,
+            state.scroll_offset,
+            state.viewport_height,
+            state.content_height,
+        );
 
         let params = mark_params_for_action(
             &mut state,
