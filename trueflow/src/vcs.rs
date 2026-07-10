@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
 use gix::status::UntrackedFiles;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -98,19 +98,107 @@ pub(crate) enum FileDiffUnavailableReason {
     External,
 }
 
+/// A confirmed tree change's old-tree lookup and new-tree display locations.
+///
+/// `location` is always the destination/current path. `source_location` differs
+/// only for rewrites emitted by gix.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChangedPath {
+    pub source_location: RepoPath,
+    pub location: RepoPath,
+}
+
+impl ChangedPath {
+    pub fn identity(location: RepoPath) -> Self {
+        Self {
+            source_location: location.clone(),
+            location,
+        }
+    }
+
+    fn from_change(change: &gix::diff::tree_with_rewrites::ChangeRef<'_>) -> Result<Self> {
+        Ok(Self {
+            source_location: RepoPath::new(change.source_location().to_str_lossy().as_ref())?,
+            location: RepoPath::new(change.location().to_str_lossy().as_ref())?,
+        })
+    }
+
+    fn from_change_with_location(
+        change: &gix::diff::tree_with_rewrites::ChangeRef<'_>,
+        location: RepoPath,
+    ) -> Result<Self> {
+        Ok(Self {
+            source_location: RepoPath::new(change.source_location().to_str_lossy().as_ref())?,
+            location,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SelectedFileDiffs {
+    by_destination: HashMap<RepoPath, FileDiff>,
+}
+
+impl SelectedFileDiffs {
+    pub(crate) fn take(&mut self, destination: &RepoPath) -> FileDiff {
+        self.by_destination
+            .remove(destination)
+            .unwrap_or_else(|| FileDiff::NoTextChanges {
+                changed_path: ChangedPath::identity(destination.clone()),
+            })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILE_DIFF_TREE_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FILE_DIFF_INSPECTED_CHANGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_file_diff_test_counters() {
+    FILE_DIFF_TREE_TRAVERSALS.with(|counter| counter.set(0));
+    FILE_DIFF_INSPECTED_CHANGES.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn file_diff_test_counters() -> (usize, usize) {
+    (
+        FILE_DIFF_TREE_TRAVERSALS.with(std::cell::Cell::get),
+        FILE_DIFF_INSPECTED_CHANGES.with(std::cell::Cell::get),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileDiff {
     Text {
-        path: RepoPath,
+        changed_path: ChangedPath,
         hunks: Vec<DiffHunk>,
     },
     NoTextChanges {
-        path: RepoPath,
+        changed_path: ChangedPath,
     },
     Unavailable {
-        path: RepoPath,
+        changed_path: ChangedPath,
         reason: FileDiffUnavailableReason,
     },
+}
+
+impl FileDiff {
+    pub(crate) fn changed_path(&self) -> &ChangedPath {
+        match self {
+            Self::Text { changed_path, .. }
+            | Self::NoTextChanges { changed_path }
+            | Self::Unavailable { changed_path, .. } => changed_path,
+        }
+    }
+
+    pub(crate) fn into_hunks(self) -> Vec<DiffHunk> {
+        match self {
+            Self::Text { hunks, .. } => hunks,
+            Self::NoTextChanges { .. } | Self::Unavailable { .. } => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -615,15 +703,20 @@ fn file_state_from_blob(
 }
 
 pub fn diff_hunks_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<DiffHunk>> {
-    Ok(match diff_for_file(repo, path)? {
-        FileDiff::Text { hunks, .. } => hunks,
-        FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => Vec::new(),
-    })
+    Ok(diff_for_file(repo, path)?.into_hunks())
 }
 
 pub(crate) fn diff_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<FileDiff> {
+    let mut diffs = file_diffs_for_main_to_head(repo, std::slice::from_ref(path))?;
+    Ok(diffs.take(path))
+}
+
+pub(crate) fn file_diffs_for_main_to_head(
+    repo: &gix::Repository,
+    selected_destinations: &[RepoPath],
+) -> Result<SelectedFileDiffs> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
-    diff_for_file_between_trees(repo, &base_tree, &head_tree, path)
+    diffs_for_paths_between_trees(repo, &base_tree, &head_tree, selected_destinations)
 }
 
 pub fn diff_hunks_for_file_in_revision(
@@ -631,10 +724,7 @@ pub fn diff_hunks_for_file_in_revision(
     revision: &str,
     path: &RepoPath,
 ) -> Result<Vec<DiffHunk>> {
-    Ok(match diff_for_file_in_revision(repo, revision, path)? {
-        FileDiff::Text { hunks, .. } => hunks,
-        FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => Vec::new(),
-    })
+    Ok(diff_for_file_in_revision(repo, revision, path)?.into_hunks())
 }
 
 pub(crate) fn diff_for_file_in_revision(
@@ -642,6 +732,15 @@ pub(crate) fn diff_for_file_in_revision(
     revision: &str,
     path: &RepoPath,
 ) -> Result<FileDiff> {
+    let mut diffs = file_diffs_for_revision(repo, revision, std::slice::from_ref(path))?;
+    Ok(diffs.take(path))
+}
+
+pub(crate) fn file_diffs_for_revision(
+    repo: &gix::Repository,
+    revision: &str,
+    selected_destinations: &[RepoPath],
+) -> Result<SelectedFileDiffs> {
     let object = repo.rev_parse_single(revision)?;
     let commit = object
         .object()?
@@ -653,7 +752,7 @@ pub(crate) fn diff_for_file_in_revision(
     } else {
         repo.empty_tree()
     };
-    diff_for_file_between_trees(repo, &base_tree, &head_tree, path)
+    diffs_for_paths_between_trees(repo, &base_tree, &head_tree, selected_destinations)
 }
 
 pub fn diff_hunks_for_file_in_range(
@@ -662,10 +761,7 @@ pub fn diff_hunks_for_file_in_range(
     end: &str,
     path: &RepoPath,
 ) -> Result<Vec<DiffHunk>> {
-    Ok(match diff_for_file_in_range(repo, start, end, path)? {
-        FileDiff::Text { hunks, .. } => hunks,
-        FileDiff::NoTextChanges { .. } | FileDiff::Unavailable { .. } => Vec::new(),
-    })
+    Ok(diff_for_file_in_range(repo, start, end, path)?.into_hunks())
 }
 
 pub(crate) fn diff_for_file_in_range(
@@ -674,6 +770,16 @@ pub(crate) fn diff_for_file_in_range(
     end: &str,
     path: &RepoPath,
 ) -> Result<FileDiff> {
+    let mut diffs = file_diffs_for_range(repo, start, end, std::slice::from_ref(path))?;
+    Ok(diffs.take(path))
+}
+
+pub(crate) fn file_diffs_for_range(
+    repo: &gix::Repository,
+    start: &str,
+    end: &str,
+    selected_destinations: &[RepoPath],
+) -> Result<SelectedFileDiffs> {
     let start_obj = repo.rev_parse_single(start)?;
     let end_obj = repo.rev_parse_single(end)?;
     let start_commit = start_obj
@@ -686,32 +792,91 @@ pub(crate) fn diff_for_file_in_range(
         .context("end revision must resolve to a commit")?;
     let start_tree = start_commit.tree()?;
     let end_tree = end_commit.tree()?;
-    diff_for_file_between_trees(repo, &start_tree, &end_tree, path)
+    diffs_for_paths_between_trees(repo, &start_tree, &end_tree, selected_destinations)
 }
 
-fn diff_for_file_between_trees(
+fn diffs_for_paths_between_trees(
     repo: &gix::Repository,
     base_tree: &gix::Tree<'_>,
     head_tree: &gix::Tree<'_>,
-    path: &RepoPath,
-) -> Result<FileDiff> {
+    selected_destinations: &[RepoPath],
+) -> Result<SelectedFileDiffs> {
+    if selected_destinations.is_empty() {
+        return Ok(SelectedFileDiffs::default());
+    }
     let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
+    diffs_for_paths_between_trees_with_cache(
+        repo,
+        base_tree,
+        head_tree,
+        selected_destinations,
+        &mut diff_cache,
+    )
+}
 
+fn diffs_for_paths_between_trees_with_cache(
+    repo: &gix::Repository,
+    base_tree: &gix::Tree<'_>,
+    head_tree: &gix::Tree<'_>,
+    selected_destinations: &[RepoPath],
+    diff_cache: &mut gix::diff::blob::Platform,
+) -> Result<SelectedFileDiffs> {
+    if selected_destinations.is_empty() {
+        return Ok(SelectedFileDiffs::default());
+    }
+
+    let selected_by_location = selected_destinations
+        .iter()
+        .map(|path| (path.as_str(), path))
+        .collect::<HashMap<_, _>>();
+    let mut selected_diffs = SelectedFileDiffs {
+        by_destination: HashMap::with_capacity(selected_by_location.len()),
+    };
+
+    #[cfg(test)]
+    FILE_DIFF_TREE_TRAVERSALS.with(|counter| counter.set(counter.get() + 1));
     let changes = repo.diff_tree_to_tree(Some(base_tree), Some(head_tree), None)?;
     for change in changes {
         let change_ref = change.to_ref();
-        let location = change_ref.location();
-        if location.to_str_lossy() != path.as_str() {
+        if !is_blob_change(&change_ref) {
+            continue;
+        }
+        #[cfg(test)]
+        FILE_DIFF_INSPECTED_CHANGES.with(|counter| counter.set(counter.get() + 1));
+
+        let Some(destination) =
+            selected_destination_for_location(change_ref.location(), &selected_by_location)
+        else {
+            continue;
+        };
+        if selected_diffs.by_destination.contains_key(destination) {
             continue;
         }
 
+        let changed_path =
+            ChangedPath::from_change_with_location(&change_ref, destination.clone())?;
         diff_cache.set_resource_by_change(change_ref, &repo.objects)?;
-        let file_diff = file_diff_from_change(&mut diff_cache, path.clone())?;
+        let file_diff = file_diff_from_change(diff_cache, changed_path)?;
         diff_cache.clear_resource_cache_keep_allocation();
-        return Ok(file_diff);
+        selected_diffs
+            .by_destination
+            .insert(destination.clone(), file_diff);
     }
 
-    Ok(FileDiff::NoTextChanges { path: path.clone() })
+    Ok(selected_diffs)
+}
+
+fn selected_destination_for_location<'a>(
+    location: &gix::bstr::BStr,
+    selected_by_location: &HashMap<&str, &'a RepoPath>,
+) -> Option<&'a RepoPath> {
+    match std::str::from_utf8(location.as_ref()) {
+        Ok(location) => selected_by_location.get(location).copied(),
+        Err(_) => {
+            let location = location.to_str_lossy();
+            selected_by_location.get(location.as_ref()).copied()
+        }
+    }
 }
 
 fn push_indexed_changed_lines_for_hunk(
@@ -870,12 +1035,12 @@ fn is_trivial_whitespace_only_change(line: &DiffLine) -> bool {
     matches!(line.kind, DiffLineKind::Added | DiffLineKind::Removed) && line.text.trim().is_empty()
 }
 
-pub fn files_changed_main_to_head() -> Result<HashSet<RepoPath>> {
+pub fn files_changed_main_to_head() -> Result<HashSet<ChangedPath>> {
     let repo = repo_from_workdir()?;
     files_changed_main_to_head_in_repo(&repo)
 }
 
-pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<HashSet<RepoPath>> {
+pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<HashSet<ChangedPath>> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
     collect_changed_paths(repo, Some(&base_tree), Some(&head_tree))
 }
@@ -920,7 +1085,7 @@ pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Ve
     Ok(commits)
 }
 
-pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<RepoPath>> {
+pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<ChangedPath>> {
     let repo = repo_from_workdir()?;
     files_changed_in_revision_in_repo(&repo, revision)
 }
@@ -928,7 +1093,7 @@ pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<RepoPath>> {
 pub fn files_changed_in_revision_in_repo(
     repo: &gix::Repository,
     revision: &str,
-) -> Result<HashSet<RepoPath>> {
+) -> Result<HashSet<ChangedPath>> {
     let object = repo.rev_parse_single(revision)?;
     let commit = object
         .object()?
@@ -943,7 +1108,7 @@ pub fn files_changed_in_revision_in_repo(
     collect_changed_paths(repo, Some(&parent_tree), Some(&commit_tree))
 }
 
-pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<RepoPath>> {
+pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<ChangedPath>> {
     let repo = repo_from_workdir()?;
     files_changed_in_range_in_repo(&repo, start, end)
 }
@@ -952,7 +1117,7 @@ pub fn files_changed_in_range_in_repo(
     repo: &gix::Repository,
     start: &str,
     end: &str,
-) -> Result<HashSet<RepoPath>> {
+) -> Result<HashSet<ChangedPath>> {
     let start_obj = repo.rev_parse_single(start)?;
     let end_obj = repo.rev_parse_single(end)?;
     let start_commit = start_obj
@@ -970,19 +1135,19 @@ pub fn files_changed_in_range_in_repo(
 
 fn file_diff_from_change(
     diff_cache: &mut gix::diff::blob::Platform,
-    path: RepoPath,
+    changed_path: ChangedPath,
 ) -> Result<FileDiff> {
     let prep = diff_cache.prepare_diff()?;
     match prep.operation {
         gix::diff::blob::platform::prepare_diff::Operation::SourceOrDestinationIsBinary => {
             Ok(FileDiff::Unavailable {
-                path,
+                changed_path,
                 reason: FileDiffUnavailableReason::Binary,
             })
         }
         gix::diff::blob::platform::prepare_diff::Operation::ExternalCommand { .. } => {
             Ok(FileDiff::Unavailable {
-                path,
+                changed_path,
                 reason: FileDiffUnavailableReason::External,
             })
         }
@@ -995,11 +1160,14 @@ fn file_diff_from_change(
             );
             let unified = gix::diff::blob::diff(algorithm, &input, sink)?;
             let mut hunks = Vec::new();
-            collect_hunks(&mut hunks, &path, &unified)?;
+            collect_hunks(&mut hunks, &changed_path.location, &unified)?;
             if hunks.is_empty() {
-                Ok(FileDiff::NoTextChanges { path })
+                Ok(FileDiff::NoTextChanges { changed_path })
             } else {
-                Ok(FileDiff::Text { path, hunks })
+                Ok(FileDiff::Text {
+                    changed_path,
+                    hunks,
+                })
             }
         }
     }
@@ -1030,19 +1198,15 @@ fn collect_changed_paths(
     repo: &gix::Repository,
     base_tree: Option<&gix::Tree<'_>>,
     head_tree: Option<&gix::Tree<'_>>,
-) -> Result<HashSet<RepoPath>> {
+) -> Result<HashSet<ChangedPath>> {
     let changes = repo.diff_tree_to_tree(base_tree, head_tree, None)?;
     let mut paths = HashSet::new();
     for change in changes {
         let change_ref = change.to_ref();
-        let location = change_ref.location();
-        if location.is_empty() {
+        if change_ref.location().is_empty() || !is_blob_change(&change_ref) {
             continue;
         }
-        if !is_blob_change(&change_ref) {
-            continue;
-        }
-        paths.insert(RepoPath::new(location.to_str_lossy().as_ref())?);
+        paths.insert(ChangedPath::from_change(&change_ref)?);
     }
     Ok(paths)
 }
@@ -1130,6 +1294,128 @@ mod tests {
         hunks: &[DiffHunk],
     ) -> BlockDiffChangeKind {
         DiffChangedLineIndex::from_hunks(hunks, DiffBlockSide::Head).change_kind_for_block(block)
+    }
+
+    #[test]
+    fn selected_destination_lookup_preserves_lossy_non_utf8_locations() {
+        let selected_path = RepoPath::new("src/\u{fffd}.rs").unwrap();
+        let selected_by_location = HashMap::from([(selected_path.as_str(), &selected_path)]);
+
+        let found = selected_destination_for_location(
+            gix::bstr::BStr::new(b"src/\xff.rs"),
+            &selected_by_location,
+        );
+
+        assert_eq!(found, Some(&selected_path));
+    }
+
+    #[test]
+    fn diffs_for_paths_between_trees_preserve_changed_paths_and_file_diff_states() {
+        use crate::test_git::{run_git, temp_git_repo};
+        use std::fs;
+
+        let repo_path = temp_git_repo("batch_file_diffs");
+        run_git(&repo_path, &["config", "diff.renames", "true"]);
+        fs::create_dir_all(repo_path.join("src")).unwrap();
+        fs::write(
+            repo_path.join("src/text.rs"),
+            "pub fn text() { println!(\"before\"); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_path.join("src/old.rs"),
+            "pub fn retained_alpha() {}\npub fn retained_beta() {}\npub fn retained_gamma() {}\n",
+        )
+        .unwrap();
+        fs::write(repo_path.join("src/binary.bin"), [0_u8, 255, 1]).unwrap();
+        fs::write(
+            repo_path.join("src/external.external"),
+            "pub fn external() { println!(\"before\"); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_path.join(".gitattributes"),
+            "*.external diff=external\n",
+        )
+        .unwrap();
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "base"]);
+        run_git(&repo_path, &["branch", "-M", "main"]);
+        run_git(&repo_path, &["checkout", "-b", "feature"]);
+        run_git(&repo_path, &["config", "diff.external.command", "cat"]);
+
+        fs::write(
+            repo_path.join("src/text.rs"),
+            "pub fn text() { println!(\"after\"); }\n",
+        )
+        .unwrap();
+        run_git(&repo_path, &["mv", "src/old.rs", "src/new.rs"]);
+        fs::write(repo_path.join("src/binary.bin"), [0_u8, 255, 2]).unwrap();
+        fs::write(
+            repo_path.join("src/external.external"),
+            "pub fn external() { println!(\"after\"); }\n",
+        )
+        .unwrap();
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "feature changes"]);
+
+        let repo = gix::open(&repo_path).unwrap();
+        let (base_tree, head_tree) = main_and_head_trees(&repo).unwrap();
+        let selected = [
+            RepoPath::new("src/text.rs").unwrap(),
+            RepoPath::new("src/new.rs").unwrap(),
+            RepoPath::new("src/binary.bin").unwrap(),
+            RepoPath::new("src/external.external").unwrap(),
+        ];
+        let mut cache = repo.diff_resource_cache_for_tree_diff().unwrap();
+        cache.options.skip_internal_diff_if_external_is_configured = true;
+        let mut diffs = diffs_for_paths_between_trees_with_cache(
+            &repo, &base_tree, &head_tree, &selected, &mut cache,
+        )
+        .unwrap();
+
+        let text = diffs.take(&selected[0]);
+        assert!(matches!(text, FileDiff::Text { .. }));
+        assert_eq!(
+            text.changed_path(),
+            &ChangedPath::identity(selected[0].clone())
+        );
+
+        let renamed = diffs.take(&selected[1]);
+        assert!(matches!(renamed, FileDiff::NoTextChanges { .. }));
+        assert_eq!(
+            renamed.changed_path(),
+            &ChangedPath {
+                source_location: RepoPath::new("src/old.rs").unwrap(),
+                location: selected[1].clone(),
+            }
+        );
+
+        let binary = diffs.take(&selected[2]);
+        assert!(matches!(
+            binary,
+            FileDiff::Unavailable {
+                reason: FileDiffUnavailableReason::Binary,
+                ..
+            }
+        ));
+        assert_eq!(
+            binary.changed_path(),
+            &ChangedPath::identity(selected[2].clone())
+        );
+
+        let external = diffs.take(&selected[3]);
+        assert!(matches!(
+            external,
+            FileDiff::Unavailable {
+                reason: FileDiffUnavailableReason::External,
+                ..
+            }
+        ));
+        assert_eq!(
+            external.changed_path(),
+            &ChangedPath::identity(selected[3].clone())
+        );
     }
 
     #[test]

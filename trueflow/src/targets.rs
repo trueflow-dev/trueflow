@@ -2,7 +2,7 @@ use crate::github::PullRequestRef;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::CommitId;
-use crate::vcs;
+use crate::vcs::{self, ChangedPath};
 use anyhow::{Result, anyhow};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -137,13 +137,13 @@ pub enum ReviewContentSource {
 pub enum ReviewPathSelection {
     All,
     Empty,
-    /// Explicit files plus one or more directory prefixes. A file matches when
-    /// it satisfies the explicit file/dir selection and, when `changed` is
-    /// present, also appears in that changed-path set.
+    /// Explicit files plus one or more directory prefixes. A changed pair is
+    /// eligible when its destination is requested and either endpoint matches
+    /// the explicit scope; callers still receive only the destination.
     Scoped {
         files: HashSet<RepoPath>,
         dirs: Vec<RepoPath>,
-        changed: Option<HashSet<RepoPath>>,
+        changed: Option<HashSet<ChangedPath>>,
     },
 }
 
@@ -156,24 +156,32 @@ impl ReviewPathSelection {
                 files,
                 dirs,
                 changed,
-            } => {
-                let explicit_match = if files.is_empty() && dirs.is_empty() {
-                    true
-                } else {
-                    path_matches_specific_selection(files, file_path)
-                        || path_matches_dir_selection(dirs, file_path)
-                };
-
-                if !explicit_match {
-                    return false;
+            } => match changed {
+                Some(changed_paths) => changed_paths.iter().any(|changed_path| {
+                    changed_path.location == *file_path
+                        && (files.is_empty() && dirs.is_empty()
+                            || path_matches_explicit_selection(
+                                files,
+                                dirs,
+                                &changed_path.source_location,
+                            )
+                            || path_matches_explicit_selection(files, dirs, &changed_path.location))
+                }),
+                None => {
+                    files.is_empty() && dirs.is_empty()
+                        || path_matches_explicit_selection(files, dirs, file_path)
                 }
-
-                changed.as_ref().is_none_or(|changed_paths| {
-                    path_matches_specific_selection(changed_paths, file_path)
-                })
-            }
+            },
         }
     }
+}
+
+fn path_matches_explicit_selection(
+    files: &HashSet<RepoPath>,
+    dirs: &[RepoPath],
+    file_path: &RepoPath,
+) -> bool {
+    path_matches_specific_selection(files, file_path) || path_matches_dir_selection(dirs, file_path)
 }
 
 fn path_matches_specific_selection(targets: &HashSet<RepoPath>, file_path: &RepoPath) -> bool {
@@ -222,7 +230,7 @@ pub struct ResolvedTargets {
     pub diff_selection: ReviewDiffSelection,
     files: HashSet<RepoPath>,
     dirs: Vec<RepoPath>,
-    changed: HashSet<RepoPath>,
+    changed: HashSet<ChangedPath>,
     changed_target_requested: bool,
 }
 
@@ -232,7 +240,7 @@ impl ResolvedTargets {
         diff_selection: ReviewDiffSelection,
         files: HashSet<RepoPath>,
         dirs: Vec<RepoPath>,
-        changed: HashSet<RepoPath>,
+        changed: HashSet<ChangedPath>,
     ) -> Self {
         Self {
             content_source,
@@ -337,9 +345,9 @@ pub(crate) fn resolve_targets_with<ResolveFn, DirtyFn, MainFn, RevisionFn, Range
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<RepoPath>>,
-    MainFn: Fn() -> Result<HashSet<RepoPath>>,
-    RevisionFn: Fn(&str) -> Result<HashSet<RepoPath>>,
-    RangeFn: Fn(&str, &str) -> Result<HashSet<RepoPath>>,
+    MainFn: Fn() -> Result<HashSet<ChangedPath>>,
+    RevisionFn: Fn(&str) -> Result<HashSet<ChangedPath>>,
+    RangeFn: Fn(&str, &str) -> Result<HashSet<ChangedPath>>,
 {
     reject_mixed_content_source_targets(targets)?;
     let resolved_targets = resolve_target_exprs(targets, &resolve_revision)?;
@@ -354,7 +362,7 @@ where
         match target {
             ResolvedReviewTarget::DirtyWorktree => {
                 changed_target_requested = true;
-                changed.extend(dirty_files()?);
+                changed.extend(dirty_files()?.into_iter().map(ChangedPath::identity));
             }
             ResolvedReviewTarget::MainDiff => {
                 changed_target_requested = true;
@@ -569,6 +577,7 @@ mod tests {
     use crate::github::PullRequestRef;
     use crate::repo_path::RepoPath;
     use crate::store::CommitId;
+    use crate::vcs::ChangedPath;
     use std::cell::Cell;
     use std::collections::HashSet;
 
@@ -691,9 +700,9 @@ mod tests {
         let selection = ReviewPathSelection::Scoped {
             files: HashSet::new(),
             dirs: vec![RepoPath::new("website").unwrap()],
-            changed: Some(HashSet::from(
-                [RepoPath::new("website/index.html").unwrap()],
-            )),
+            changed: Some(HashSet::from([ChangedPath::identity(
+                RepoPath::new("website/index.html").unwrap(),
+            )])),
         };
         assert!(selection.includes(&RepoPath::new("website/index.html").unwrap()));
         assert!(!selection.includes(&RepoPath::new("website/other.html").unwrap()));
@@ -705,12 +714,48 @@ mod tests {
         let selection = ReviewPathSelection::Scoped {
             files: HashSet::new(),
             dirs: vec![RepoPath::new("src/nested").unwrap()],
-            changed: Some(HashSet::from(
-                [RepoPath::new("src/nested/keep.rs").unwrap()],
-            )),
+            changed: Some(HashSet::from([ChangedPath::identity(
+                RepoPath::new("src/nested/keep.rs").unwrap(),
+            )])),
         };
         assert!(selection.includes(&RepoPath::new("src/nested/keep.rs").unwrap()));
         assert!(!selection.includes(&RepoPath::new("src/other.rs").unwrap()));
+    }
+
+    #[test]
+    fn scoped_selection_matches_rename_when_either_endpoint_is_selected() {
+        let outside_to_inside = ChangedPath {
+            source_location: RepoPath::new("archive/old.rs").unwrap(),
+            location: RepoPath::new("src/scoped/new.rs").unwrap(),
+        };
+        let inside_to_outside = ChangedPath {
+            source_location: RepoPath::new("src/scoped/old.rs").unwrap(),
+            location: RepoPath::new("archive/new.rs").unwrap(),
+        };
+        let unrelated = ChangedPath {
+            source_location: RepoPath::new("docs/old.rs").unwrap(),
+            location: RepoPath::new("archive/docs-new.rs").unwrap(),
+        };
+        let selection = ReviewPathSelection::Scoped {
+            files: HashSet::new(),
+            dirs: vec![RepoPath::new("src/scoped").unwrap()],
+            changed: Some(HashSet::from([
+                outside_to_inside.clone(),
+                inside_to_outside.clone(),
+                unrelated.clone(),
+            ])),
+        };
+
+        assert!(selection.includes(&outside_to_inside.location));
+        assert!(selection.includes(&inside_to_outside.location));
+        assert!(!selection.includes(&unrelated.location));
+
+        let explicit_source_selection = ReviewPathSelection::Scoped {
+            files: HashSet::from([inside_to_outside.source_location.clone()]),
+            dirs: Vec::new(),
+            changed: Some(HashSet::from([inside_to_outside.clone()])),
+        };
+        assert!(explicit_source_selection.includes(&inside_to_outside.location));
     }
 
     #[test]
@@ -828,7 +873,7 @@ mod tests {
             || Ok(HashSet::new()),
             || Ok(HashSet::new()),
             |_revision| Ok(HashSet::new()),
-            |_start, _end| Ok(HashSet::from([other.clone()])),
+            |_start, _end| Ok(HashSet::from([ChangedPath::identity(other.clone())])),
         )
         .unwrap_or_else(|error| panic!("expected resolved targets: {error}"));
 
@@ -899,7 +944,7 @@ mod tests {
             ReviewDiffSelection::None,
             HashSet::new(),
             Vec::new(),
-            HashSet::from([changed.clone()]),
+            HashSet::from([ChangedPath::identity(changed.clone())]),
         );
 
         let selection = resolved.path_selection();
@@ -917,7 +962,7 @@ mod tests {
             ReviewDiffSelection::None,
             HashSet::from([file.clone()]),
             vec![dir.clone()],
-            HashSet::from([changed_path.clone()]),
+            HashSet::from([ChangedPath::identity(changed_path.clone())]),
         );
 
         match resolved
@@ -947,7 +992,10 @@ mod tests {
             } => {
                 assert!(files.is_empty());
                 assert!(dirs.is_empty());
-                assert_eq!(changed, Some(HashSet::from([changed_path])));
+                assert_eq!(
+                    changed,
+                    Some(HashSet::from([ChangedPath::identity(changed_path)]))
+                );
             }
             other => panic!("expected Scoped, got {other:?}"),
         }

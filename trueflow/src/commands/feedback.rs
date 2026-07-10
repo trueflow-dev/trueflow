@@ -305,7 +305,7 @@ fn resolve_local_feedback_targets_with<ResolveFn, DirtyFn, MainFn>(
 where
     ResolveFn: Fn(&crate::targets::RevisionExpr) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<crate::repo_path::RepoPath>>,
-    MainFn: Fn() -> Result<HashSet<crate::repo_path::RepoPath>>,
+    MainFn: Fn() -> Result<HashSet<crate::vcs::ChangedPath>>,
 {
     resolve_targets_with(
         targets,
@@ -1714,7 +1714,7 @@ mod tests {
             ]),
             HashSet::new(),
             Vec::new(),
-            HashSet::from([changed.clone()]),
+            HashSet::from([crate::vcs::ChangedPath::identity(changed.clone())]),
         );
 
         let selection = feedback_changed_selection(&[ReviewTarget::MainDiff], &resolved_targets)
@@ -1738,7 +1738,7 @@ mod tests {
             ]),
             HashSet::new(),
             Vec::new(),
-            HashSet::from([changed]),
+            HashSet::from([crate::vcs::ChangedPath::identity(changed)]),
         );
 
         assert!(
@@ -1777,7 +1777,7 @@ mod tests {
             || -> Result<HashSet<crate::repo_path::RepoPath>> {
                 Err(anyhow!("dirty files should not be resolved"))
             },
-            || -> Result<HashSet<crate::repo_path::RepoPath>> {
+            || -> Result<HashSet<crate::vcs::ChangedPath>> {
                 Err(anyhow!("main diff files should not be resolved"))
             },
         )?;

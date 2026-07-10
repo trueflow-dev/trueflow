@@ -40,11 +40,69 @@ fn first_file_block_hash(file: &Value) -> Result<String> {
         .context("hash")
         .map(ToString::to_string)
 }
+fn assert_destination_only_output(
+    files: &[Value],
+    source_path: &str,
+    destination_path: &str,
+    removed_marker: &str,
+) -> Result<()> {
+    assert_eq!(
+        files.len(),
+        1,
+        "expected only the renamed destination in review output: {files:?}"
+    );
+    assert!(
+        !files
+            .iter()
+            .any(|file| file["path"].as_str() == Some(source_path)),
+        "source path {source_path} must not appear separately: {files:?}"
+    );
+
+    let destination = review_file_by_path(files, destination_path)?;
+    let contents = file_block_contents(destination)?;
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains(removed_marker)),
+        "expected destination {destination_path} to include removed source marker \
+         {removed_marker:?}: {contents:?}"
+    );
+
+    Ok(())
+}
 
 const LIB_ADD: &str = include_str!("fixtures/diff_lib_add.rs");
 const LIB_ADD_SUB: &str = include_str!("fixtures/diff_lib_add_sub.rs");
-const RENAME_NEW: &str = include_str!("fixtures/diff_rename_new.rs");
-const RENAME_OLD: &str = "pub fn alpha() {}\n";
+
+const RENAME_BASE: &str = r#"pub fn retained_alpha() {
+    println!("shared alpha");
+}
+
+pub fn retained_beta() {
+    println!("shared beta");
+}
+
+pub fn retained_gamma() {
+    println!("shared gamma");
+}
+
+pub fn removed_during_rename() {
+    println!("removed during rename");
+}
+"#;
+
+const RENAME_WITH_DELETION: &str = r#"pub fn retained_alpha() {
+    println!("shared alpha");
+}
+
+pub fn retained_beta() {
+    println!("shared beta");
+}
+
+pub fn retained_gamma() {
+    println!("shared gamma");
+}
+"#;
 
 fn checkout_branch(repo: &TestRepo, branch: &str) -> Result<()> {
     repo.git(&["checkout", "-b", branch])
@@ -328,25 +386,297 @@ fn test_review_since_rejects_unknown_revision() -> Result<()> {
 }
 
 #[test]
-fn test_main_review_handles_renamed_file() -> Result<()> {
-    let repo = TestRepo::new("diff_rename")?;
-    repo.write("src/old.rs", RENAME_OLD)?;
-    repo.commit_all("Add alpha")?;
+fn test_rename_aware_diff_keeps_deleted_function_under_destination() -> Result<()> {
+    let repo = TestRepo::new("diff_rename_deleted_function")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    repo.write("src/old.rs", RENAME_BASE)?;
+    repo.commit_all("Add rename source")?;
 
-    checkout_branch(&repo, "feature/rename")?;
-
+    checkout_branch(&repo, "feature/rename-with-deletion")?;
     repo.git(&["mv", "src/old.rs", "src/new.rs"])?;
-    repo.write("src/new.rs", RENAME_NEW)?;
-    repo.commit_all("Rename and expand")?;
+    repo.write("src/new.rs", RENAME_WITH_DELETION)?;
+    repo.commit_all("Rename and remove function")?;
 
-    let changes = get_main_review_json(&repo)?;
-    assert!(!changes.is_empty());
-    assert!(changes.iter().any(|change| {
-        change["path"]
-            .as_str()
-            .map(|path| path == "src/new.rs")
-            .unwrap_or(false)
-    }));
+    let files = get_main_review_json(&repo)?;
+
+    assert_destination_only_output(&files, "src/old.rs", "src/new.rs", "removed during rename")?;
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_aware_diff_includes_rename_into_directory_scope() -> Result<()> {
+    let repo = TestRepo::new("diff_rename_into_directory_scope")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    repo.write(
+        "archive/old.rs",
+        r#"pub fn retained_alpha() {
+    println!("shared alpha");
+}
+
+pub fn retained_beta() {
+    println!("shared beta");
+}
+
+pub fn retained_gamma() {
+    println!("shared gamma");
+}
+
+pub fn removed_after_entering_scope() {
+    println!("removed after entering scope");
+}
+"#,
+    )?;
+    repo.commit_all("Add rename source outside scope")?;
+    let base = head_revision(&repo)?;
+
+    checkout_branch(&repo, "feature/rename-into-directory")?;
+    fs::create_dir_all(repo.path.join("src/scoped"))?;
+    repo.git(&["mv", "archive/old.rs", "src/scoped/new.rs"])?;
+    repo.write(
+        "src/scoped/new.rs",
+        r#"pub fn retained_alpha() {
+    println!("shared alpha");
+}
+
+pub fn retained_beta() {
+    println!("shared beta");
+}
+
+pub fn retained_gamma() {
+    println!("shared gamma");
+}
+"#,
+    )?;
+    repo.commit_all("Rename into scope and remove function")?;
+
+    let output = repo.run(&[
+        "review",
+        "--target",
+        "dir:src/scoped",
+        "--target",
+        &format!("rev:{base}..HEAD"),
+        "--json",
+    ])?;
+    let files = json_array(&output)?;
+
+    assert_destination_only_output(
+        &files,
+        "archive/old.rs",
+        "src/scoped/new.rs",
+        "removed after entering scope",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_aware_diff_includes_rename_out_of_directory_scope() -> Result<()> {
+    let repo = TestRepo::new("diff_rename_out_of_directory_scope")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    repo.write(
+        "src/scoped/old.rs",
+        r#"pub fn retained_alpha() {
+    println!("shared alpha");
+}
+
+pub fn retained_beta() {
+    println!("shared beta");
+}
+
+pub fn retained_gamma() {
+    println!("shared gamma");
+}
+
+pub fn removed_after_leaving_scope() {
+    println!("removed after leaving scope");
+}
+"#,
+    )?;
+    repo.commit_all("Add rename source inside scope")?;
+
+    checkout_branch(&repo, "feature/rename-out-of-directory")?;
+    fs::create_dir_all(repo.path.join("archive"))?;
+    repo.git(&["mv", "src/scoped/old.rs", "archive/new.rs"])?;
+    repo.write(
+        "archive/new.rs",
+        r#"pub fn retained_alpha() {
+    println!("shared alpha");
+}
+
+pub fn retained_beta() {
+    println!("shared beta");
+}
+
+pub fn retained_gamma() {
+    println!("shared gamma");
+}
+"#,
+    )?;
+    repo.commit_all("Rename out of scope and remove function")?;
+    let rename_revision = head_revision(&repo)?;
+
+    let output = repo.run(&[
+        "review",
+        "--target",
+        "dir:src/scoped",
+        "--target",
+        &format!("rev:{rename_revision}"),
+        "--json",
+    ])?;
+    let files = json_array(&output)?;
+
+    assert_destination_only_output(
+        &files,
+        "src/scoped/old.rs",
+        "archive/new.rs",
+        "removed after leaving scope",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_aware_diff_ignores_pure_rename_churn() -> Result<()> {
+    let repo = TestRepo::new("diff_pure_rename")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    repo.write(
+        "src/old.rs",
+        r#"pub fn unchanged_alpha() {
+    println!("same alpha");
+}
+
+pub fn unchanged_beta() {
+    println!("same beta");
+}
+
+pub fn unchanged_gamma() {
+    println!("same gamma");
+}
+"#,
+    )?;
+    repo.commit_all("Add pure rename source")?;
+
+    checkout_branch(&repo, "feature/pure-rename")?;
+    repo.git(&["mv", "src/old.rs", "src/new.rs"])?;
+    repo.commit_all("Rename without content changes")?;
+
+    let files = get_main_review_json(&repo)?;
+
+    assert!(
+        files.is_empty(),
+        "pure rename should not produce semantic review output: {files:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_aware_diff_preserves_ordinary_add_delete() -> Result<()> {
+    let repo = TestRepo::new("diff_ordinary_add_delete")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    repo.write(
+        "src/deleted.rs",
+        r#"pub fn deleted_only() {
+    println!("ordinary deleted marker");
+}
+"#,
+    )?;
+    repo.commit_all("Add deletion candidate")?;
+
+    checkout_branch(&repo, "feature/ordinary-add-delete")?;
+    fs::remove_file(repo.path.join("src/deleted.rs"))?;
+    repo.write(
+        "src/added.rs",
+        r#"pub fn added_only() {
+    println!("ordinary added marker");
+}
+"#,
+    )?;
+    repo.commit_all("Delete and add unrelated files")?;
+
+    let files = get_main_review_json(&repo)?;
+    assert_eq!(
+        files.len(),
+        2,
+        "expected independent add and delete: {files:?}"
+    );
+
+    let deleted = review_file_by_path(&files, "src/deleted.rs")?;
+    assert!(
+        file_block_contents(deleted)?
+            .iter()
+            .any(|content| content.contains("ordinary deleted marker")),
+        "expected base-side deleted content under its original path"
+    );
+
+    let added = review_file_by_path(&files, "src/added.rs")?;
+    assert!(
+        file_block_contents(added)?
+            .iter()
+            .any(|content| content.contains("ordinary added marker")),
+        "expected head-side added content under its added path"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_batched_main_diff_preserves_mixed_file_states_and_output() -> Result<()> {
+    let repo = TestRepo::new("diff_batched_mixed_states")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    repo.write(
+        "src/modified.rs",
+        "pub fn modified() { println!(\"before modification\"); }\n",
+    )?;
+    repo.write(
+        "src/deleted.rs",
+        "pub fn deleted() { println!(\"deleted marker\"); }\n",
+    )?;
+    repo.write("src/old.rs", RENAME_BASE)?;
+    fs::write(repo.path.join("src/binary.bin"), [0_u8, 255, 1])?;
+    repo.commit_all("Base mixed file states")?;
+
+    checkout_branch(&repo, "feature/mixed-file-states")?;
+    repo.write(
+        "src/modified.rs",
+        "pub fn modified() { println!(\"after modification\"); }\n",
+    )?;
+    repo.write(
+        "src/added.rs",
+        "pub fn added() { println!(\"added marker\"); }\n",
+    )?;
+    fs::remove_file(repo.path.join("src/deleted.rs"))?;
+    repo.git(&["mv", "src/old.rs", "src/new.rs"])?;
+    repo.write("src/new.rs", RENAME_WITH_DELETION)?;
+    fs::write(repo.path.join("src/binary.bin"), [0_u8, 255, 2])?;
+    repo.commit_all("Apply mixed file changes")?;
+
+    let files = get_main_review_json(&repo)?;
+    assert_eq!(files.len(), 4, "expected text changes only: {files:?}");
+    assert!(review_file_by_path(&files, "src/old.rs").is_err());
+    assert!(review_file_by_path(&files, "src/binary.bin").is_err());
+    assert!(
+        file_block_contents(review_file_by_path(&files, "src/modified.rs")?)?
+            .iter()
+            .any(|content| content.contains("after modification"))
+    );
+    assert!(
+        file_block_contents(review_file_by_path(&files, "src/added.rs")?)?
+            .iter()
+            .any(|content| content.contains("added marker"))
+    );
+    assert!(
+        file_block_contents(review_file_by_path(&files, "src/deleted.rs")?)?
+            .iter()
+            .any(|content| content.contains("deleted marker"))
+    );
+    assert!(
+        file_block_contents(review_file_by_path(&files, "src/new.rs")?)?
+            .iter()
+            .any(|content| content.contains("removed during rename")),
+        "renamed destination must retain its source-side removed block"
+    );
 
     Ok(())
 }

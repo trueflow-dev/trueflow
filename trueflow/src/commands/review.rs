@@ -346,16 +346,9 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
 
         let language = file.language;
-        let file_diff_hunks = if let (Some(repo), Some(diff_targets)) =
-            (review_repo.as_ref(), query.diff_selection.targets())
-        {
-            Some(diff_hunks_for_file_targets(repo, diff_targets, &file.path)?)
-        } else {
-            None
-        };
-        let file_changed_lines = file_diff_hunks
-            .as_deref()
-            .map(|hunks| vcs::DiffChangedLineIndex::from_hunks(hunks, vcs::DiffBlockSide::Head));
+        // Diff-scoped requests returned above through the target-first batch
+        // path, so this ordinary scan never computes a per-file tree diff.
+        let file_changed_lines: Option<vcs::DiffChangedLineIndex> = None;
         let mut reviewable_blocks = Vec::new();
         for block in file.blocks {
             if !query.filters.allows_block(block.kind) {
@@ -565,8 +558,8 @@ fn preselected_paths_for_review(path_selection: &ReviewPathSelection) -> Option<
         } => Some(
             changed
                 .iter()
-                .filter(|path| path_selection.includes(path))
-                .cloned()
+                .filter(|path| path_selection.includes(&path.location))
+                .map(|path| path.location.clone())
                 .collect(),
         ),
         ReviewPathSelection::Scoped {
@@ -594,6 +587,43 @@ fn empty_collected_review() -> CollectedReview {
     }
 }
 
+struct TargetDiffBatch<'a> {
+    target: &'a ReviewDiffTarget,
+    diffs: vcs::SelectedFileDiffs,
+}
+
+struct TargetFileDiffInput {
+    base: Option<crate::block::FileState>,
+    file_diff: vcs::FileDiff,
+}
+
+fn collect_target_diff_batches<'a>(
+    repo: &gix::Repository,
+    diff_targets: &'a [ReviewDiffTarget],
+    selected_destinations: &[RepoPath],
+) -> Result<Vec<TargetDiffBatch<'a>>> {
+    diff_targets
+        .iter()
+        .map(|target| {
+            let diffs = match target {
+                ReviewDiffTarget::MainDiff => {
+                    vcs::file_diffs_for_main_to_head(repo, selected_destinations)?
+                }
+                ReviewDiffTarget::Revision(revision) => {
+                    vcs::file_diffs_for_revision(repo, revision.as_str(), selected_destinations)?
+                }
+                ReviewDiffTarget::RevisionRange(range) => vcs::file_diffs_for_range(
+                    repo,
+                    range.start.as_str(),
+                    range.end.as_str(),
+                    selected_destinations,
+                )?,
+            };
+            Ok(TargetDiffBatch { target, diffs })
+        })
+        .collect()
+}
+
 fn collect_diff_review_files(
     query: &ResolvedReviewQuery,
     repo: &gix::Repository,
@@ -606,26 +636,54 @@ fn collect_diff_review_files(
         .collect::<HashMap<_, _>>();
     let mut selected_paths = selected_review_paths(&query.path_selection, &head_files_by_path);
     selected_paths.sort();
+    let mut target_batches = collect_target_diff_batches(repo, diff_targets, &selected_paths)?;
 
     let mut review_files = Vec::new();
-    for path in selected_paths {
-        let display_path = path.clone();
-        let repo_relative_path = path.clone();
-        let head_file = head_files_by_path.remove(&path);
-        let base_files = base_file_states_for_diff_targets(
-            repo,
-            diff_targets,
-            &display_path,
-            &repo_relative_path,
-        )?;
-        let hunks = diff_hunks_for_file_targets(repo, diff_targets, &display_path)?;
+    for display_path in selected_paths {
+        let head_file = head_files_by_path.remove(&display_path);
+        let mut target_inputs = Vec::with_capacity(target_batches.len());
+        for target_batch in &mut target_batches {
+            let file_diff = target_batch.diffs.take(&display_path);
+            let base = match target_batch.target {
+                ReviewDiffTarget::MainDiff => vcs::file_state_for_path_in_main_base(
+                    repo,
+                    &file_diff.changed_path().source_location,
+                    &file_diff.changed_path().location,
+                )?,
+                ReviewDiffTarget::Revision(revision) => vcs::file_state_for_path_in_revision_base(
+                    repo,
+                    revision.as_str(),
+                    &file_diff.changed_path().source_location,
+                    &file_diff.changed_path().location,
+                )?,
+                ReviewDiffTarget::RevisionRange(range) => vcs::file_state_for_path_in_revision(
+                    repo,
+                    range.start.as_str(),
+                    &file_diff.changed_path().source_location,
+                    &file_diff.changed_path().location,
+                )?,
+            };
+            target_inputs.push(TargetFileDiffInput { base, file_diff });
+        }
 
+        let has_base = target_inputs.iter().any(|input| input.base.is_some());
         let mut base_blocks = dedupe_blocks(
-            base_files
+            target_inputs
                 .iter()
+                .filter_map(|input| input.base.as_ref())
                 .flat_map(|file| file.blocks.clone())
                 .collect::<Vec<_>>(),
         );
+        let base_language = target_inputs
+            .iter()
+            .find_map(|input| input.base.as_ref().map(|file| file.language));
+        let base_file_hash = target_inputs
+            .iter()
+            .find_map(|input| input.base.as_ref().map(|file| file.tree_hash.clone()));
+        let hunks = target_inputs
+            .into_iter()
+            .flat_map(|input| input.file_diff.into_hunks())
+            .collect::<Vec<_>>();
         let mut head_blocks = head_file
             .as_ref()
             .map(|file| file.blocks.clone())
@@ -653,17 +711,15 @@ fn collect_diff_review_files(
         let language = head_file
             .as_ref()
             .map(|file| file.language)
-            .or_else(|| base_files.first().map(|file| file.language))
+            .or(base_language)
             .unwrap_or(Language::Unknown);
         let file_hash = head_file
             .as_ref()
             .map(|file| file.tree_hash.clone())
-            .or_else(|| base_files.first().map(|file| file.tree_hash.clone()))
+            .or(base_file_hash)
             .unwrap_or_default();
 
-        let Some(change_kind) =
-            classify_file_change_kind(!base_files.is_empty(), head_file.is_some())
-        else {
+        let Some(change_kind) = classify_file_change_kind(has_base, head_file.is_some()) else {
             continue;
         };
 
@@ -694,8 +750,8 @@ fn selected_review_paths(
             let candidate_paths = if let Some(changed_paths) = changed {
                 files
                     .iter()
-                    .chain(changed_paths.iter())
                     .cloned()
+                    .chain(changed_paths.iter().map(|changed| changed.location.clone()))
                     .collect::<HashSet<_>>()
             } else if dirs.is_empty() {
                 files.iter().cloned().collect::<HashSet<_>>()
@@ -712,38 +768,6 @@ fn selected_review_paths(
             selected
         }
     }
-}
-
-fn base_file_states_for_diff_targets(
-    repo: &gix::Repository,
-    diff_targets: &[ReviewDiffTarget],
-    display_path: &RepoPath,
-    repo_relative_path: &RepoPath,
-) -> Result<Vec<crate::block::FileState>> {
-    let mut files = Vec::new();
-    for target in diff_targets {
-        let file = match target {
-            ReviewDiffTarget::MainDiff => {
-                vcs::file_state_for_path_in_main_base(repo, repo_relative_path, display_path)?
-            }
-            ReviewDiffTarget::Revision(revision) => vcs::file_state_for_path_in_revision_base(
-                repo,
-                revision.as_str(),
-                repo_relative_path,
-                display_path,
-            )?,
-            ReviewDiffTarget::RevisionRange(range) => vcs::file_state_for_path_in_revision(
-                repo,
-                range.start.as_str(),
-                repo_relative_path,
-                display_path,
-            )?,
-        };
-        if let Some(file) = file {
-            files.push(file);
-        }
-    }
-    Ok(files)
 }
 
 fn dedupe_blocks(blocks: Vec<Block>) -> Vec<Block> {
@@ -867,32 +891,6 @@ fn diff_block_label(block: &Block) -> String {
 pub fn collect_review_summary(query: &ResolvedReviewQuery) -> Result<ReviewSummary> {
     let collected = collect_review(query)?;
     Ok(collected.summary)
-}
-
-fn diff_hunks_for_file_targets(
-    repo: &gix::Repository,
-    targets: &[ReviewDiffTarget],
-    file_path: &RepoPath,
-) -> Result<Vec<vcs::DiffHunk>> {
-    let mut hunks = Vec::new();
-
-    for target in targets {
-        let target_hunks = match target {
-            ReviewDiffTarget::MainDiff => vcs::diff_hunks_for_file(repo, file_path)?,
-            ReviewDiffTarget::Revision(revision) => {
-                vcs::diff_hunks_for_file_in_revision(repo, revision.as_str(), file_path)?
-            }
-            ReviewDiffTarget::RevisionRange(range) => vcs::diff_hunks_for_file_in_range(
-                repo,
-                range.start.as_str(),
-                range.end.as_str(),
-                file_path,
-            )?,
-        };
-        hunks.extend(target_hunks);
-    }
-
-    Ok(hunks)
 }
 
 pub fn collect_main_diff_summary() -> Result<ReviewSummary> {
@@ -1277,7 +1275,7 @@ fn line_range_overlap(a: &std::ops::Range<u32>, b: &std::ops::Range<u32>) -> u32
 mod tests {
     use super::*;
     use crate::hashing::TreeHash;
-    use crate::store::{Record, ReviewDatabase};
+    use crate::store::{CommitId, Record, ReviewDatabase};
     use crate::test_git::{CurrentDirGuard, run_git, temp_git_repo};
     use std::fs;
     use std::path::Path;
@@ -1917,5 +1915,142 @@ mod tests {
                 .is_some_and(|block| block.content.contains("mod common;"))
         );
         assert!(sides.head.is_none());
+    }
+
+    #[test]
+    fn collect_diff_review_files_traverses_and_inspects_once_per_diff_target() {
+        let repo_root = temp_git_repo("review_target_first_batch");
+        let source_dir = repo_root.join("src");
+        fs::create_dir_all(&source_dir).unwrap();
+        for index in 0..128 {
+            fs::write(
+                source_dir.join(format!("file_{index:03}.rs")),
+                format!("pub fn file_{index:03}() {{ println!(\"before\"); }}\n"),
+            )
+            .unwrap();
+        }
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "base"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        run_git(&repo_root, &["switch", "-c", "feature"]);
+        for index in 0..128 {
+            fs::write(
+                source_dir.join(format!("file_{index:03}.rs")),
+                format!("pub fn file_{index:03}() {{ println!(\"after\"); }}\n"),
+            )
+            .unwrap();
+        }
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "change all files"]);
+
+        let _guard = CurrentDirGuard::push(&repo_root);
+        let query = resolve_review_request(
+            ReviewRequest::Targets(vec![ReviewTarget::MainDiff, ReviewTarget::MainDiff]),
+            BlockFilters::default(),
+            ScanOptions::default(),
+        )
+        .unwrap();
+        vcs::reset_file_diff_test_counters();
+
+        let collected = collect_review(&query).unwrap();
+        let paths = collected
+            .summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 128);
+        assert_eq!(paths.first(), Some(&"src/file_000.rs"));
+        assert_eq!(paths.last(), Some(&"src/file_127.rs"));
+        assert_eq!(vcs::file_diff_test_counters(), (2, 256));
+    }
+
+    #[test]
+    fn target_diff_batches_preserve_order_duplicates_and_sources() {
+        use crate::test_git::run_git_stdout;
+
+        let repo_root = temp_git_repo("review_target_batch_order");
+        let source_dir = repo_root.join("src");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("old_a.rs"),
+            "pub fn retained_alpha() {}\npub fn retained_beta() {}\npub fn retained_gamma() {}\npub fn replaced_a() {}\n",
+        )
+        .unwrap();
+        run_git(&repo_root, &["config", "diff.renames", "true"]);
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "base"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        run_git(&repo_root, &["switch", "-c", "feature"]);
+
+        run_git(&repo_root, &["mv", "src/old_a.rs", "src/dest.rs"]);
+        fs::write(
+            source_dir.join("dest.rs"),
+            "pub fn retained_alpha() {}\npub fn retained_beta() {}\npub fn retained_gamma() {}\npub fn first_marker() {}\n",
+        )
+        .unwrap();
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "first rename"]);
+        let first = run_git_stdout(&repo_root, &["rev-parse", "HEAD"]);
+
+        fs::remove_file(source_dir.join("dest.rs")).unwrap();
+        fs::write(
+            source_dir.join("old_b.rs"),
+            "pub fn retained_alpha() {}\npub fn retained_beta() {}\npub fn retained_gamma() {}\npub fn replaced_b() {}\n",
+        )
+        .unwrap();
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "prepare second rename"]);
+        run_git(&repo_root, &["mv", "src/old_b.rs", "src/dest.rs"]);
+        fs::write(
+            source_dir.join("dest.rs"),
+            "pub fn retained_alpha() {}\npub fn retained_beta() {}\npub fn retained_gamma() {}\npub fn second_marker() {}\n",
+        )
+        .unwrap();
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "second rename"]);
+        let second = run_git_stdout(&repo_root, &["rev-parse", "HEAD"]);
+
+        let repo = gix::open(&repo_root).unwrap();
+        let first_target = ReviewDiffTarget::Revision(CommitId::new(first.trim()).unwrap());
+        let second_target = ReviewDiffTarget::Revision(CommitId::new(second.trim()).unwrap());
+        let targets = vec![
+            first_target.clone(),
+            second_target.clone(),
+            first_target.clone(),
+        ];
+        let destination = RepoPath::new("src/dest.rs").unwrap();
+        let mut batches =
+            collect_target_diff_batches(&repo, &targets, std::slice::from_ref(&destination))
+                .unwrap();
+        let diffs = batches
+            .iter_mut()
+            .map(|batch| batch.diffs.take(&destination))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            diffs
+                .iter()
+                .map(|diff| diff.changed_path().source_location.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/old_a.rs", "src/old_b.rs", "src/old_a.rs"]
+        );
+        assert_eq!(
+            diffs
+                .into_iter()
+                .map(|diff| {
+                    diff.into_hunks()
+                        .into_iter()
+                        .flat_map(|hunk| hunk.lines)
+                        .find(|line| matches!(line.kind, vcs::DiffLineKind::Added))
+                        .map(|line| line.text)
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                Some("pub fn first_marker() {}\n".to_string()),
+                Some("pub fn second_marker() {}\n".to_string()),
+                Some("pub fn first_marker() {}\n".to_string()),
+            ]
+        );
     }
 }

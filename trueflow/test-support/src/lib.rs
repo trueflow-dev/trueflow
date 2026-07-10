@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use trueflow::block::BlockKind;
-use trueflow::commands::review::{ReviewRequest, ReviewSummary};
+use trueflow::commands::review::{ReviewRequest, ReviewSummary, ReviewTarget};
 use trueflow::scanner::{ScanCacheMode, ScanOptions, ScanResult};
 use trueflow::store::{Record, ReviewTargetRef};
 use uuid::Uuid;
@@ -139,8 +139,45 @@ impl ReviewBenchRepo {
         Ok(Self { path })
     }
 
+    pub fn generated_main_diff(name: &str, file_count: usize) -> Result<Self> {
+        let path = temp_dir("trueflow_review_bench", name);
+        fs::create_dir_all(path.join("src"))?;
+        init_git_with_identity(&path, "bench@example.com", "Bench User")?;
+
+        for index in 0..file_count {
+            fs::write(
+                path.join(format!("src/generated_{index:03}.rs")),
+                format!("pub fn generated_{index:03}() {{ println!(\"before\"); }}\n"),
+            )?;
+        }
+        run_git(&path, &["add", "."])?;
+        run_git(&path, &["commit", "-m", "base"])?;
+        run_git(&path, &["branch", "-M", "main"])?;
+        run_git(&path, &["switch", "-c", "feature"])?;
+
+        for index in 0..file_count {
+            fs::write(
+                path.join(format!("src/generated_{index:03}.rs")),
+                format!("pub fn generated_{index:03}() {{ println!(\"after\"); }}\n"),
+            )?;
+        }
+        run_git(&path, &["add", "."])?;
+        run_git(&path, &["commit", "-m", "modify generated files"])?;
+
+        Ok(Self { path })
+    }
+
     pub fn full_review_summary(&self) -> Result<trueflow::commands::review::ReviewSummary> {
         run_full_review(&self.path)
+    }
+
+    pub fn main_diff_review_summary(&self) -> Result<ReviewSummary> {
+        run_review_summary(
+            &self.path,
+            ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
+            &[],
+            &[],
+        )
     }
 }
 

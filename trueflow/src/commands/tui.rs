@@ -1761,7 +1761,7 @@ fn filter_commits_for_prefix<F>(
     mut changed_paths_for_revision: F,
 ) -> Vec<vcs::CommitInfo>
 where
-    F: FnMut(&str) -> Result<HashSet<RepoPath>>,
+    F: FnMut(&str) -> Result<HashSet<vcs::ChangedPath>>,
 {
     let Some(prefix) = workdir_prefix
         .map(path_utils::normalize_path_str)
@@ -1774,9 +1774,10 @@ where
         .into_iter()
         .filter(|commit| {
             match changed_paths_for_revision(commit.id.as_str()) {
-                Ok(paths) => paths
-                    .iter()
-                    .any(|path| path_utils::path_matches_workdir_prefix(path.as_str(), &prefix)),
+                Ok(paths) => paths.iter().any(|path| {
+                    path_utils::path_matches_workdir_prefix(path.source_location.as_str(), &prefix)
+                        || path_utils::path_matches_workdir_prefix(path.location.as_str(), &prefix)
+                }),
                 // If we can't resolve changed paths, keep the option instead of hiding it.
                 Err(_) => true,
             }
@@ -6833,8 +6834,9 @@ where
 {
     cache.entry(path.to_path_buf()).or_insert_with(|| {
         load_file_diff().unwrap_or_else(|_| vcs::FileDiff::NoTextChanges {
-            path: RepoPath::new(path.to_string_lossy().as_ref())
-                .unwrap_or_else(|_| RepoPath::root()),
+            changed_path: vcs::ChangedPath::identity(
+                RepoPath::new(path.to_string_lossy().as_ref()).unwrap_or_else(|_| RepoPath::root()),
+            ),
         })
     })
 }
@@ -8246,8 +8248,12 @@ mod diff_scope_tests {
 
         let filtered = filter_commits_for_prefix(commits, Some("trueflow"), |revision| {
             let paths = match revision {
-                "aaaaaaa" => HashSet::from([RepoPath::new("trueflow/src/lib.rs").unwrap()]),
-                "bbbbbbb" => HashSet::from([RepoPath::new("README.md").unwrap()]),
+                "aaaaaaa" => HashSet::from([vcs::ChangedPath::identity(
+                    RepoPath::new("trueflow/src/lib.rs").unwrap(),
+                )]),
+                "bbbbbbb" => HashSet::from([vcs::ChangedPath::identity(
+                    RepoPath::new("README.md").unwrap(),
+                )]),
                 _ => HashSet::new(),
             };
             Ok(paths)
@@ -11077,7 +11083,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -11085,47 +11091,47 @@ mod diff_scope_tests {
                     lines: vec![
                         vcs::DiffHunkLine::context(
                             "line1
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line2
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line3
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line4
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line5
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line6
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line7
-",
+            ",
                         ),
                         vcs::DiffHunkLine::removed(
                             "line8
-",
+            ",
                         ),
                         vcs::DiffHunkLine::added(
                             "line8 changed
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line9
-",
+            ",
                         ),
                         vcs::DiffHunkLine::context(
                             "line10
-",
+            ",
                         ),
                     ],
                 }],
@@ -11213,7 +11219,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -11320,7 +11326,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -11536,7 +11542,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -11609,7 +11615,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -11682,7 +11688,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -11734,7 +11740,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::NoTextChanges {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
             },
         );
         let node = state.navigator.tree.node(file_id);
@@ -11767,7 +11773,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::NoTextChanges {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
             },
         );
         let node = state.navigator.tree.node(file_id);
@@ -11814,7 +11820,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/README.md"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/README.md").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/README.md").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/README.md").unwrap(),
                     old_start: 3,
@@ -11874,7 +11880,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::NoTextChanges {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
             },
         );
         let node = state.navigator.tree.node(block_id);
@@ -11918,7 +11924,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -11987,7 +11993,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -12035,7 +12041,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -12103,7 +12109,7 @@ mod diff_scope_tests {
         state.file_diff_cache.insert(
             PathBuf::from("src/lib.rs"),
             vcs::FileDiff::Text {
-                path: RepoPath::new("src/lib.rs").unwrap(),
+                changed_path: vcs::ChangedPath::identity(RepoPath::new("src/lib.rs").unwrap()),
                 hunks: vec![vcs::DiffHunk {
                     file_path: RepoPath::new("src/lib.rs").unwrap(),
                     old_start: 1,
@@ -13882,7 +13888,9 @@ mod diff_scope_tests {
             HashMap::from([(
                 PathBuf::from("pkg/src/lib.rs"),
                 vcs::FileDiff::Text {
-                    path: RepoPath::new("pkg/src/lib.rs").unwrap(),
+                    changed_path: vcs::ChangedPath::identity(
+                        RepoPath::new("pkg/src/lib.rs").unwrap(),
+                    ),
                     hunks,
                 },
             )]),

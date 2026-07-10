@@ -1,4 +1,4 @@
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::Duration;
 use trueflow::analysis::Language;
@@ -64,6 +64,41 @@ fn bench_full_review(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_batch_diff_review(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_diff_review");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+
+    for file_count in [100_usize, 200, 400] {
+        let repo = ReviewBenchRepo::generated_main_diff(
+            &format!("batch_diff_review_{file_count}"),
+            file_count,
+        )
+        .unwrap_or_else(|error| panic!("failed to prepare batch diff fixture: {error}"));
+        let warm_summary = repo
+            .main_diff_review_summary()
+            .unwrap_or_else(|error| panic!("failed to warm batch diff fixture: {error}"));
+        assert_eq!(warm_summary.files.len(), file_count);
+        assert_eq!(warm_summary.total_blocks, file_count);
+
+        group.throughput(Throughput::Elements(file_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("main_diff", file_count),
+            &repo,
+            |b, repo| {
+                b.iter(|| {
+                    let summary = repo.main_diff_review_summary().unwrap_or_else(|error| {
+                        panic!("batch diff review benchmark failed: {error}")
+                    });
+                    black_box((summary.files.len(), summary.total_blocks));
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_deep_nesting(c: &mut Criterion) {
     let content = deeply_nested_rust_function(4_000);
     let mut group = c.benchmark_group("deep_nesting");
@@ -87,5 +122,10 @@ fn bench_deep_nesting(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_full_review, bench_deep_nesting);
+criterion_group!(
+    benches,
+    bench_full_review,
+    bench_batch_diff_review,
+    bench_deep_nesting
+);
 criterion_main!(benches);

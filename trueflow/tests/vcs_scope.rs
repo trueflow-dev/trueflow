@@ -1,14 +1,14 @@
 use anyhow::Result;
 
-use trueflow_test_support::{TestRepo, run_git_output};
 use std::collections::HashSet;
+use trueflow_test_support::{TestRepo, run_git_output};
 
 use trueflow::repo_path::RepoPath;
+use trueflow::vcs::ChangedPath;
 
 fn repo_paths(paths: &[&str]) -> Result<HashSet<RepoPath>> {
     paths.iter().map(|&path| RepoPath::new(path)).collect()
 }
-
 
 #[test]
 fn test_recent_commits_in_repo_returns_head_first() -> Result<()> {
@@ -42,9 +42,44 @@ fn test_files_changed_main_to_head_in_repo() -> Result<()> {
     let changed = trueflow::vcs::files_changed_main_to_head_in_repo(&git_repo)?;
 
     assert!(
-        changed.contains("src/lib.rs"),
+        changed.contains(&ChangedPath::identity(RepoPath::new("src/lib.rs")?)),
         "expected diff to include src/lib.rs"
     );
+    Ok(())
+}
+
+#[test]
+fn test_files_changed_main_to_head_preserves_rename_source_and_destination() -> Result<()> {
+    let repo = TestRepo::new("main_diff_rename_pair")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    repo.write(
+        "src/old.rs",
+        r#"pub fn retained_alpha() {
+    println!("shared alpha");
+}
+
+pub fn retained_beta() {
+    println!("shared beta");
+}
+
+pub fn retained_gamma() {
+    println!("shared gamma");
+}
+"#,
+    )?;
+    repo.commit_all("Add rename source")?;
+    repo.git(&["checkout", "-B", "main"])?;
+    repo.git(&["checkout", "-B", "feature"])?;
+    repo.git(&["mv", "src/old.rs", "src/new.rs"])?;
+    repo.commit_all("Rename source")?;
+
+    let git_repo = gix::open(&repo.path)?;
+    let changed = trueflow::vcs::files_changed_main_to_head_in_repo(&git_repo)?;
+
+    assert_eq!(changed.len(), 1, "expected exactly one renamed path pair");
+    let pair = changed.iter().next().expect("renamed path pair");
+    assert_eq!(pair.source_location, RepoPath::new("src/old.rs")?);
+    assert_eq!(pair.location, RepoPath::new("src/new.rs")?);
 
     Ok(())
 }

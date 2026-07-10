@@ -1098,7 +1098,9 @@ mod tests {
             changed_selection: Some(ReviewPathSelection::Scoped {
                 files: HashSet::new(),
                 dirs: Vec::new(),
-                changed: Some(HashSet::from_iter([RepoPath::new("src/keep.rs").unwrap()])),
+                changed: Some(HashSet::from_iter([crate::vcs::ChangedPath::identity(
+                    RepoPath::new("src/keep.rs").unwrap(),
+                )])),
             }),
             allowed_revisions: None,
             include_approved: true,

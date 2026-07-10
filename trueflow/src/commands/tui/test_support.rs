@@ -249,7 +249,9 @@ where
         self.state.file_diff_cache.insert(
             PathBuf::from(&repo_path),
             vcs::FileDiff::Text {
-                path: crate::repo_path::RepoPath::new(&repo_path)?,
+                changed_path: vcs::ChangedPath::identity(crate::repo_path::RepoPath::new(
+                    &repo_path,
+                )?),
                 hunks,
             },
         );
