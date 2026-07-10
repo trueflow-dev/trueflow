@@ -1753,3 +1753,50 @@ fn test_feedback_xml_escapes_cdata_end() -> Result<()> {
     assert!(output.contains("]]]]><![CDATA[>"));
     Ok(())
 }
+
+#[test]
+fn review_dirty_staged_only_modification_is_not_empty() -> Result<()> {
+    let repo = TestRepo::new("review_dirty_staged_modification")?;
+    repo.write("src/lib.rs", "pub fn value() -> i32 { 1 }\n")?;
+    repo.commit_all("Initial commit")?;
+
+    repo.write("src/lib.rs", "pub fn value() -> i32 { 2 }\n")?;
+    repo.add("src/lib.rs")?;
+
+    let files = json_array(&repo.run(&["review", "--target", "dirty", "--json"])?)?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"].as_str().context("path")?, "src/lib.rs");
+
+    Ok(())
+}
+
+#[test]
+fn review_dirty_staged_only_addition_is_not_empty() -> Result<()> {
+    let repo = TestRepo::new("review_dirty_staged_addition")?;
+    repo.write("src/base.rs", "pub fn base() {}\n")?;
+    repo.commit_all("Create HEAD")?;
+
+    repo.write("src/added.rs", "pub fn added() {}\n")?;
+    repo.add("src/added.rs")?;
+
+    let files = json_array(&repo.run(&["review", "--target", "dirty", "--json"])?)?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"].as_str().context("path")?, "src/added.rs");
+
+    Ok(())
+}
+
+#[test]
+fn review_dirty_staged_only_rename_emits_destination_once() -> Result<()> {
+    let repo = TestRepo::new("review_dirty_staged_rename")?;
+    repo.write("src/old.rs", "pub fn renamed() {}\n")?;
+    repo.commit_all("Initial commit")?;
+
+    repo.git(&["mv", "src/old.rs", "src/new.rs"])?;
+
+    let files = json_array(&repo.run(&["review", "--target", "dirty", "--json"])?)?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"].as_str().context("path")?, "src/new.rs");
+
+    Ok(())
+}

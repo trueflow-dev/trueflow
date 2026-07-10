@@ -43,6 +43,36 @@ fn test_mark_uncommitted_state() -> Result<()> {
 }
 
 #[test]
+fn mark_staged_only_change_is_uncommitted() -> Result<()> {
+    let repo = TestRepo::new("staged_only_uncommitted_state")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.commit_all("Initial commit")?;
+
+    repo.write("src/main.rs", "fn main() { println!(\"staged\"); }\n")?;
+    repo.add("src/main.rs")?;
+
+    let output = repo.run(&["review", "--all", "--json"])?;
+    let hash = first_block_hash(&output)?;
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &hash,
+        "--verdict",
+        "approved",
+        "--path",
+        "src/main.rs",
+        "--quiet",
+    ])?;
+
+    let db_path = repo.path.join(".trueflow").join("reviews.jsonl");
+    let records = read_review_records(&db_path)?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].block_state, BlockState::Uncommitted);
+
+    Ok(())
+}
+
+#[test]
 fn test_mark_committed_state_normalizes_subdir_relative_path_hint() -> Result<()> {
     let repo = TestRepo::new("committed_state_subdir_hint")?;
 

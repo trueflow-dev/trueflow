@@ -1,6 +1,14 @@
 use anyhow::Result;
 
 use trueflow_test_support::{TestRepo, run_git_output};
+use std::collections::HashSet;
+
+use trueflow::repo_path::RepoPath;
+
+fn repo_paths(paths: &[&str]) -> Result<HashSet<RepoPath>> {
+    paths.iter().map(|&path| RepoPath::new(path)).collect()
+}
+
 
 #[test]
 fn test_recent_commits_in_repo_returns_head_first() -> Result<()> {
@@ -78,6 +86,95 @@ fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
         }),
         "selected revision diff should not include later HEAD changes"
     );
+
+    Ok(())
+}
+
+#[test]
+fn dirty_files_reports_staged_only_modification() -> Result<()> {
+    let repo = TestRepo::new("dirty_staged_modification")?;
+    repo.write("src/modified.rs", "pub fn value() -> i32 { 1 }\n")?;
+    repo.commit_all("Add tracked file")?;
+
+    repo.write("src/modified.rs", "pub fn value() -> i32 { 2 }\n")?;
+    repo.add("src/modified.rs")?;
+
+    let git_repo = gix::open(&repo.path)?;
+    assert_eq!(
+        trueflow::vcs::dirty_files(&git_repo)?,
+        repo_paths(&["src/modified.rs"])?
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dirty_files_reports_staged_only_addition() -> Result<()> {
+    let repo = TestRepo::new("dirty_staged_addition")?;
+    repo.write("src/base.rs", "pub fn base() {}\n")?;
+    repo.commit_all("Create HEAD")?;
+
+    repo.write("src/added.rs", "pub fn added() {}\n")?;
+    repo.add("src/added.rs")?;
+
+    let git_repo = gix::open(&repo.path)?;
+    assert_eq!(
+        trueflow::vcs::dirty_files(&git_repo)?,
+        repo_paths(&["src/added.rs"])?
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dirty_files_reports_staged_only_deletion() -> Result<()> {
+    let repo = TestRepo::new("dirty_staged_deletion")?;
+    repo.write("src/deleted.rs", "pub fn deleted() {}\n")?;
+    repo.commit_all("Add tracked file")?;
+
+    std::fs::remove_file(repo.path.join("src/deleted.rs"))?;
+    repo.git(&["add", "-A"])?;
+
+    let git_repo = gix::open(&repo.path)?;
+    assert_eq!(
+        trueflow::vcs::dirty_files(&git_repo)?,
+        repo_paths(&["src/deleted.rs"])?
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dirty_files_reports_both_sides_of_staged_rename() -> Result<()> {
+    let repo = TestRepo::new("dirty_staged_rename")?;
+    repo.write("src/old.rs", "pub fn renamed() {}\n")?;
+    repo.commit_all("Add tracked file")?;
+
+    repo.git(&["mv", "src/old.rs", "src/new.rs"])?;
+
+    let git_repo = gix::open(&repo.path)?;
+    assert_eq!(
+        trueflow::vcs::dirty_files(&git_repo)?,
+        repo_paths(&["src/old.rs", "src/new.rs"])?
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dirty_files_deduplicates_index_and_worktree_path() -> Result<()> {
+    let repo = TestRepo::new("dirty_staged_and_unstaged_modification")?;
+    repo.write("src/modified.rs", "pub fn value() -> i32 { 1 }\n")?;
+    repo.commit_all("Add tracked file")?;
+
+    repo.write("src/modified.rs", "pub fn value() -> i32 { 2 }\n")?;
+    repo.add("src/modified.rs")?;
+    repo.write("src/modified.rs", "pub fn value() -> i32 { 3 }\n")?;
+
+    let git_repo = gix::open(&repo.path)?;
+    let dirty = trueflow::vcs::dirty_files(&git_repo)?;
+    assert_eq!(dirty.len(), 1);
+    assert_eq!(dirty, repo_paths(&["src/modified.rs"])?);
 
     Ok(())
 }

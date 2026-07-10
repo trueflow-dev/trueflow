@@ -198,7 +198,6 @@ impl DiffChangedLineIndex {
             BlockDiffChangeKind::ReviewableChanges
         }
     }
-
 }
 
 pub struct GitConfig {
@@ -272,16 +271,41 @@ pub fn dirty_files(repo: &gix::Repository) -> Result<HashSet<RepoPath>> {
     let iter = repo
         .status(gix::progress::Discard)?
         .untracked_files(UntrackedFiles::Files)
-        .into_index_worktree_iter(Vec::new())?;
+        .into_iter(Vec::new())?;
     for entry in iter {
-        let item = entry?;
-        let summary = item.summary();
-        if summary.is_none() {
-            continue;
+        match entry? {
+            gix::status::Item::IndexWorktree(item) => {
+                if item.summary().is_some() {
+                    insert_repo_path(&mut dirty, item.rela_path())?;
+                }
+            }
+            gix::status::Item::TreeIndex(change) => {
+                insert_tree_index_change_paths(&mut dirty, change)?;
+            }
         }
-        dirty.insert(RepoPath::new(item.rela_path().to_str_lossy().as_ref())?);
     }
     Ok(dirty)
+}
+
+fn insert_tree_index_change_paths(
+    dirty: &mut HashSet<RepoPath>,
+    change: gix::diff::index::Change,
+) -> Result<()> {
+    insert_repo_path(dirty, change.location())?;
+    if let gix::diff::index::ChangeRef::Rewrite {
+        source_location,
+        copy: false,
+        ..
+    } = change
+    {
+        insert_repo_path(dirty, source_location.as_ref())?;
+    }
+    Ok(())
+}
+
+fn insert_repo_path(dirty: &mut HashSet<RepoPath>, path: &gix::bstr::BStr) -> Result<()> {
+    dirty.insert(RepoPath::new(path.to_str_lossy().as_ref())?);
+    Ok(())
 }
 
 pub fn block_state_for_path(
@@ -1106,6 +1130,44 @@ mod tests {
         hunks: &[DiffHunk],
     ) -> BlockDiffChangeKind {
         DiffChangedLineIndex::from_hunks(hunks, DiffBlockSide::Head).change_kind_for_block(block)
+    }
+
+    #[test]
+    fn tree_index_rewrite_paths_distinguish_rename_from_copy() {
+        use std::borrow::Cow;
+
+        fn rewrite(copy: bool) -> gix::diff::index::Change {
+            gix::diff::index::ChangeRef::Rewrite {
+                source_location: Cow::Borrowed(gix::bstr::BStr::new(b"src/old.rs")),
+                source_index: 0,
+                source_entry_mode: gix::index::entry::Mode::FILE,
+                source_id: Cow::Owned(gix::ObjectId::null(gix::hash::Kind::Sha1)),
+                location: Cow::Borrowed(gix::bstr::BStr::new(b"src/new.rs")),
+                index: 0,
+                entry_mode: gix::index::entry::Mode::FILE,
+                id: Cow::Owned(gix::ObjectId::null(gix::hash::Kind::Sha1)),
+                copy,
+            }
+        }
+
+        let mut rename_paths = HashSet::new();
+        insert_tree_index_change_paths(&mut rename_paths, rewrite(false)).unwrap();
+        assert_eq!(
+            rename_paths,
+            [
+                RepoPath::new("src/old.rs").unwrap(),
+                RepoPath::new("src/new.rs").unwrap(),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let mut copy_paths = HashSet::new();
+        insert_tree_index_change_paths(&mut copy_paths, rewrite(true)).unwrap();
+        assert_eq!(
+            copy_paths,
+            [RepoPath::new("src/new.rs").unwrap()].into_iter().collect()
+        );
     }
 
     #[test]
