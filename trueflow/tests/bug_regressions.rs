@@ -32,6 +32,24 @@ fn first_scan_block_hash_in_process(repo: &TestRepo) -> Result<String> {
     let block = file.blocks.first().context("Expected block in output")?;
     Ok(block.hash.to_string())
 }
+fn feedback_review_ids(entries: &[Value]) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for entry in entries {
+        for review in entry["reviews"]
+            .as_array()
+            .context("reviews should be array")?
+        {
+            ids.push(
+                review["id"]
+                    .as_str()
+                    .context("review id should be string")?
+                    .to_string(),
+            );
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
 
 fn scan_with_cache_dir(repo: &TestRepo, cache_dir: &Path) -> Result<ScanResult> {
     scan_directory(
@@ -544,7 +562,7 @@ fn test_feedback_since_last_uses_cursor_file() -> Result<()> {
 }
 
 #[test]
-fn test_feedback_since_last_cursor_ignores_filtered_out_records() -> Result<()> {
+fn test_feedback_since_last_cursor_keeps_older_filtered_gap() -> Result<()> {
     let repo = TestRepo::new("feedback_since_last_filtered_cursor")?;
     repo.write("src/a.rs", "pub fn a() {}\n")?;
     repo.write("src/b.rs", "pub fn b() {}\n")?;
@@ -566,7 +584,7 @@ fn test_feedback_since_last_cursor_ignores_filtered_out_records() -> Result<()> 
         ReviewRecordOverrides {
             id: Some("a-review"),
             verdict: Some("comment"),
-            timestamp: Some(1000),
+            timestamp: Some(2000),
             path_hint: Some("src/a.rs"),
             line_hint: Some(u32::try_from(a_block.start_line)?),
             ..Default::default()
@@ -576,6 +594,71 @@ fn test_feedback_since_last_cursor_ignores_filtered_out_records() -> Result<()> 
         b_block.hash.as_str(),
         ReviewRecordOverrides {
             id: Some("b-review"),
+            verdict: Some("comment"),
+            timestamp: Some(1000),
+            path_hint: Some("src/b.rs"),
+            line_hint: Some(u32::try_from(b_block.start_line)?),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[a_review, b_review])?;
+
+    let first_output = repo.run(&[
+        "feedback",
+        "--format",
+        "json",
+        "--since",
+        "last",
+        "--target",
+        "file:src/a.rs",
+    ])?;
+    let first_entries = json_array(&first_output)?;
+    assert_eq!(feedback_review_ids(&first_entries)?, vec!["a-review"]);
+
+    let second_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    let second_entries = json_array(&second_output)?;
+    assert_eq!(feedback_review_ids(&second_entries)?, vec!["b-review"]);
+    let third_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&third_output)?)?,
+        Vec::<String>::new()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_feedback_since_last_cursor_keeps_same_second_filtered_id() -> Result<()> {
+    let repo = TestRepo::new("feedback_since_last_same_second_cursor")?;
+    repo.write("src/a.rs", "pub fn a() {}\n")?;
+    repo.write("src/b.rs", "pub fn b() {}\n")?;
+    repo.commit_all("Add libs")?;
+
+    let scan = repo.scan_without_cache()?;
+    let block_for = |path: &str| -> Result<&trueflow::block::Block> {
+        scan.files
+            .iter()
+            .find(|file| file.path.as_str() == path)
+            .and_then(|file| file.blocks.first())
+            .with_context(|| format!("expected block for {path}"))
+    };
+    let a_block = block_for("src/a.rs")?;
+    let b_block = block_for("src/b.rs")?;
+    let a_review = build_review_record(
+        a_block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("same-second-a"),
+            verdict: Some("comment"),
+            timestamp: Some(2000),
+            path_hint: Some("src/a.rs"),
+            line_hint: Some(u32::try_from(a_block.start_line)?),
+            ..Default::default()
+        },
+    );
+    let b_review = build_review_record(
+        b_block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("same-second-b"),
             verdict: Some("comment"),
             timestamp: Some(2000),
             path_hint: Some("src/b.rs"),
@@ -594,15 +677,190 @@ fn test_feedback_since_last_cursor_ignores_filtered_out_records() -> Result<()> 
         "--target",
         "file:src/a.rs",
     ])?;
-    let first_entries = json_array(&first_output)?;
-    assert_eq!(first_entries.len(), 1);
-    assert_eq!(first_entries[0]["file"].as_str(), Some("src/a.rs"));
+    assert_eq!(
+        feedback_review_ids(&json_array(&first_output)?)?,
+        vec!["same-second-a"]
+    );
 
     let second_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
-    let second_entries = json_array(&second_output)?;
-    assert_eq!(second_entries.len(), 1);
-    assert_eq!(second_entries[0]["file"].as_str(), Some("src/b.rs"));
+    assert_eq!(
+        feedback_review_ids(&json_array(&second_output)?)?,
+        vec!["same-second-b"]
+    );
 
+    let third_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&third_output)?)?,
+        Vec::<String>::new()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_feedback_since_last_cursor_drains_alternating_target_gaps() -> Result<()> {
+    let repo = TestRepo::new("feedback_since_last_alternating_cursor")?;
+    repo.write("src/a.rs", "pub fn a() {}\n")?;
+    repo.write("src/b.rs", "pub fn b() {}\n")?;
+    repo.write("src/c.rs", "pub fn c() {}\n")?;
+    repo.commit_all("Add libs")?;
+
+    let scan = repo.scan_without_cache()?;
+    let block_for = |path: &str| -> Result<&trueflow::block::Block> {
+        scan.files
+            .iter()
+            .find(|file| file.path.as_str() == path)
+            .and_then(|file| file.blocks.first())
+            .with_context(|| format!("expected block for {path}"))
+    };
+    let a_block = block_for("src/a.rs")?;
+    let b_block = block_for("src/b.rs")?;
+    let c_block = block_for("src/c.rs")?;
+    let a_review = build_review_record(
+        a_block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("alternating-a"),
+            verdict: Some("comment"),
+            timestamp: Some(3000),
+            path_hint: Some("src/a.rs"),
+            line_hint: Some(u32::try_from(a_block.start_line)?),
+            ..Default::default()
+        },
+    );
+    let b_review = build_review_record(
+        b_block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("alternating-b"),
+            verdict: Some("comment"),
+            timestamp: Some(2000),
+            path_hint: Some("src/b.rs"),
+            line_hint: Some(u32::try_from(b_block.start_line)?),
+            ..Default::default()
+        },
+    );
+    let c_review = build_review_record(
+        c_block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("alternating-c"),
+            verdict: Some("comment"),
+            timestamp: Some(1000),
+            path_hint: Some("src/c.rs"),
+            line_hint: Some(u32::try_from(c_block.start_line)?),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(
+        &repo.path.join(".trueflow"),
+        &[a_review, b_review, c_review],
+    )?;
+
+    let a_output = repo.run(&[
+        "feedback",
+        "--format",
+        "json",
+        "--since",
+        "last",
+        "--target",
+        "file:src/a.rs",
+    ])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&a_output)?)?,
+        vec!["alternating-a"]
+    );
+
+    let b_output = repo.run(&[
+        "feedback",
+        "--format",
+        "json",
+        "--since",
+        "last",
+        "--target",
+        "file:src/b.rs",
+    ])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&b_output)?)?,
+        vec!["alternating-b"]
+    );
+
+    let repeated_a_output = repo.run(&[
+        "feedback",
+        "--format",
+        "json",
+        "--since",
+        "last",
+        "--target",
+        "file:src/a.rs",
+    ])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&repeated_a_output)?)?,
+        Vec::<String>::new()
+    );
+
+    let broad_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&broad_output)?)?,
+        vec!["alternating-c"]
+    );
+
+    let final_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&final_output)?)?,
+        Vec::<String>::new()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_feedback_since_last_cursor_serializes_concurrent_commands() -> Result<()> {
+    let repo = TestRepo::new("feedback_since_last_concurrent_cursor")?;
+    repo.write("src/lib.rs", "pub fn core() {}\n")?;
+    repo.commit_all("Add lib")?;
+
+    let hash = first_scan_block_hash_in_process(&repo)?;
+    let record = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            id: Some("concurrent-review"),
+            verdict: Some("comment"),
+            timestamp: Some(2000),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[record])?;
+
+    let barrier = std::sync::Barrier::new(3);
+    let (first_output, second_output) = std::thread::scope(|scope| -> Result<(String, String)> {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            repo.run(&["feedback", "--format", "json", "--since", "last"])
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            repo.run(&["feedback", "--format", "json", "--since", "last"])
+        });
+        barrier.wait();
+
+        let first_output = first.join().map_err(|error| {
+            anyhow::anyhow!("first concurrent feedback command panicked: {error:?}")
+        })??;
+        let second_output = second.join().map_err(|error| {
+            anyhow::anyhow!("second concurrent feedback command panicked: {error:?}")
+        })??;
+        Ok((first_output, second_output))
+    })?;
+
+    let mut exported_ids = feedback_review_ids(&json_array(&first_output)?)?;
+    exported_ids.extend(feedback_review_ids(&json_array(&second_output)?)?);
+    exported_ids.sort();
+    assert_eq!(exported_ids, vec!["concurrent-review"]);
+
+    let cursor = fs::read_to_string(repo.path.join(".trueflow/feedback.cursor"))?;
+    let _: Value = serde_json::from_str(&cursor).context("cursor must remain valid JSON")?;
+
+    let final_output = repo.run(&["feedback", "--format", "json", "--since", "last"])?;
+    assert_eq!(
+        feedback_review_ids(&json_array(&final_output)?)?,
+        Vec::<String>::new()
+    );
     Ok(())
 }
 

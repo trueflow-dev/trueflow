@@ -9,12 +9,19 @@ use crate::targets::{
 };
 use crate::vcs;
 use anyhow::{Result, anyhow};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 const FEEDBACK_CURSOR_FILE: &str = "feedback.cursor";
+const FEEDBACK_CURSOR_SCHEMA_VERSION: u32 = 1;
+const FEEDBACK_CURSOR_DIGEST_DOMAIN: &[u8] = b"trueflow.feedback.cursor.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedbackSinceFilter {
@@ -24,9 +31,19 @@ pub enum FeedbackSinceFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeedbackCursor {
-    pub timestamp: i64,
-    pub record_ids_at_timestamp: Vec<String>,
+    pub version: u32,
+    pub checkpoint: FeedbackCursorCheckpoint,
+    pub pending_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackCursorCheckpoint {
+    pub record_count: u64,
+    pub last_record_id: Option<String>,
+    pub record_ids_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -281,26 +298,21 @@ pub fn collect_feedback_entries(
     query: &FeedbackQuery,
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<FeedbackEntry>> {
-    let resolved_records = resolve_feedback_records(records, resolver)?;
-    let latest_verdicts = latest_verdicts_by_verdict_key(&resolved_records);
-    let cursor_record_ids_at_timestamp = match since_filter {
-        FeedbackSinceFilter::Cursor(cursor) => Some(
-            cursor
-                .record_ids_at_timestamp
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>(),
-        ),
+    let validated_cursor = match since_filter {
+        FeedbackSinceFilter::Cursor(cursor) => Some(validate_feedback_cursor(cursor, records)?),
         _ => None,
     };
+    let resolved_records = resolve_feedback_records(records, resolver)?;
+    let latest_verdicts = latest_verdicts_by_verdict_key(&resolved_records);
 
     let mut grouped = HashMap::<FeedbackPresentationEntryKey, FeedbackEntry>::new();
     for resolved in resolved_records {
         let record = resolved.record;
         if !record_matches_since(
             record,
+            resolved.index,
             since_filter,
-            cursor_record_ids_at_timestamp.as_ref(),
+            validated_cursor.as_ref(),
         ) || !record_matches_allowed_revisions(record, query.allowed_revisions.as_ref())
         {
             continue;
@@ -524,40 +536,382 @@ pub fn feedback_cursor_path(store: &FileStore) -> PathBuf {
     store.trueflow_dir().join(FEEDBACK_CURSOR_FILE)
 }
 
+#[derive(Debug)]
+struct ValidatedFeedbackCursor {
+    checkpoint_len: usize,
+    pending_record_ids: HashSet<String>,
+}
+
+pub(crate) struct FeedbackCursorReadGuard {
+    lock_file: File,
+    cursor: Option<FeedbackCursor>,
+}
+
+impl FeedbackCursorReadGuard {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let lock_file = open_feedback_cursor_lock(path)?;
+        lock_file.lock_shared()?;
+        let cursor = read_feedback_cursor_unlocked(path)?;
+        Ok(Self { lock_file, cursor })
+    }
+
+    pub(crate) fn cursor(&self) -> Option<&FeedbackCursor> {
+        self.cursor.as_ref()
+    }
+}
+
+impl Drop for FeedbackCursorReadGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+pub(crate) struct FeedbackCursorUpdateGuard {
+    path: PathBuf,
+    lock_file: File,
+    cursor: Option<FeedbackCursor>,
+}
+
+impl FeedbackCursorUpdateGuard {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let lock_file = open_feedback_cursor_lock(path)?;
+        lock_file.lock_exclusive()?;
+        let cursor = read_feedback_cursor_unlocked(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            lock_file,
+            cursor,
+        })
+    }
+
+    pub(crate) fn cursor(&self) -> Option<&FeedbackCursor> {
+        self.cursor.as_ref()
+    }
+
+    pub(crate) fn commit(
+        self,
+        records: &[Record],
+        exported_record_ids: &HashSet<String>,
+    ) -> Result<()> {
+        let current = read_feedback_cursor_unlocked(&self.path)?;
+        let next = advance_feedback_cursor(current.as_ref(), records, exported_record_ids)?;
+        write_feedback_cursor_atomically(&self.path, &next)
+    }
+}
+
+impl Drop for FeedbackCursorUpdateGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+pub(crate) fn feedback_since_filter_for_cursor(
+    cursor: Option<&FeedbackCursor>,
+    records: &[Record],
+) -> Result<FeedbackSinceFilter> {
+    match cursor {
+        Some(cursor) => {
+            validate_feedback_cursor(cursor, records)?;
+            Ok(FeedbackSinceFilter::Cursor(cursor.clone()))
+        }
+        None => {
+            logical_record_indices(records)?;
+            Ok(FeedbackSinceFilter::All)
+        }
+    }
+}
+
 pub fn read_feedback_cursor(path: &Path) -> Result<Option<FeedbackCursor>> {
+    let guard = FeedbackCursorReadGuard::acquire(path)?;
+    Ok(guard.cursor().cloned())
+}
+
+pub(crate) fn feedback_cursor_lock_path(cursor_path: &Path) -> PathBuf {
+    let file_name = cursor_path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(FEEDBACK_CURSOR_FILE));
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    cursor_path.with_file_name(lock_name)
+}
+
+pub(crate) fn advance_feedback_cursor(
+    previous: Option<&FeedbackCursor>,
+    records: &[Record],
+    exported_record_ids: &HashSet<String>,
+) -> Result<FeedbackCursor> {
+    let (checkpoint_len, mut pending_record_ids) = match previous {
+        Some(cursor) => {
+            let validated = validate_feedback_cursor(cursor, records)?;
+            (validated.checkpoint_len, validated.pending_record_ids)
+        }
+        None => {
+            logical_record_indices(records)?;
+            (0, HashSet::new())
+        }
+    };
+    let record_indices = logical_record_indices(records)?;
+
+    for exported_id in exported_record_ids {
+        let index = record_indices.get(exported_id.as_str()).ok_or_else(|| {
+            anyhow!(
+                "Cannot advance feedback cursor: exported record ID {exported_id:?} is absent from the transaction snapshot"
+            )
+        })?;
+        if *index < checkpoint_len && !pending_record_ids.contains(exported_id) {
+            return Err(anyhow!(
+                "Cannot advance feedback cursor: exported record ID {exported_id:?} was already delivered"
+            ));
+        }
+    }
+
+    pending_record_ids.extend(
+        records[checkpoint_len..]
+            .iter()
+            .map(|record| record.id.clone()),
+    );
+    pending_record_ids.retain(|id| !exported_record_ids.contains(id));
+    let mut pending_record_ids = pending_record_ids.into_iter().collect::<Vec<_>>();
+    pending_record_ids.sort_unstable();
+
+    Ok(FeedbackCursor {
+        version: FEEDBACK_CURSOR_SCHEMA_VERSION,
+        checkpoint: feedback_cursor_checkpoint(records)?,
+        pending_record_ids,
+    })
+}
+
+fn open_feedback_cursor_lock(path: &Path) -> Result<File> {
+    let parent = feedback_cursor_parent(path);
+    fs::create_dir_all(parent)?;
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(feedback_cursor_lock_path(path))?)
+}
+
+fn feedback_cursor_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn read_feedback_cursor_unlocked(path: &Path) -> Result<Option<FeedbackCursor>> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Err(anyhow!(
+            "Invalid feedback cursor at {}: cursor file is empty",
+            path.display()
+        ));
     }
-
-    if let Ok(timestamp) = trimmed.parse::<i64>() {
-        return Ok(Some(FeedbackCursor {
-            timestamp,
-            record_ids_at_timestamp: Vec::new(),
-        }));
-    }
-
     let cursor = serde_json::from_str::<FeedbackCursor>(trimmed).map_err(|error| {
         anyhow!(
-            "Invalid feedback cursor at {}: expected unix timestamp or JSON cursor ({error})",
+            "Invalid feedback cursor at {}: expected feedback cursor schema v{FEEDBACK_CURSOR_SCHEMA_VERSION} ({error})",
             path.display()
         )
     })?;
+    validate_feedback_cursor_shape(&cursor)?;
     Ok(Some(cursor))
 }
 
-pub fn write_feedback_cursor(path: &Path, cursor: &FeedbackCursor) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn validate_feedback_cursor_shape(cursor: &FeedbackCursor) -> Result<()> {
+    if cursor.version != FEEDBACK_CURSOR_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "Unsupported feedback cursor version {}; expected {}",
+            cursor.version,
+            FEEDBACK_CURSOR_SCHEMA_VERSION
+        ));
     }
-    fs::write(path, format!("{}\n", serde_json::to_string(cursor)?))?;
+    match (
+        cursor.checkpoint.record_count,
+        cursor.checkpoint.last_record_id.as_ref(),
+    ) {
+        (0, Some(_)) => {
+            return Err(anyhow!(
+                "Invalid feedback cursor checkpoint: empty checkpoint must not contain a tail record ID"
+            ));
+        }
+        (count, None) if count > 0 => {
+            return Err(anyhow!(
+                "Invalid feedback cursor checkpoint: non-empty checkpoint must contain a tail record ID"
+            ));
+        }
+        _ => {}
+    }
+    if cursor
+        .pending_record_ids
+        .windows(2)
+        .any(|ids| ids[0] >= ids[1])
+    {
+        return Err(anyhow!(
+            "Invalid feedback cursor: pending record IDs must be sorted and unique"
+        ));
+    }
     Ok(())
+}
+
+fn validate_feedback_cursor(
+    cursor: &FeedbackCursor,
+    records: &[Record],
+) -> Result<ValidatedFeedbackCursor> {
+    validate_feedback_cursor_shape(cursor)?;
+    logical_record_indices(records)?;
+    let checkpoint_len = usize::try_from(cursor.checkpoint.record_count).map_err(|_error| {
+        anyhow!(
+            "Invalid feedback cursor checkpoint: record count {} does not fit this platform",
+            cursor.checkpoint.record_count
+        )
+    })?;
+    if checkpoint_len > records.len() {
+        return Err(anyhow!(
+            "Invalid feedback cursor checkpoint: record count {} exceeds the current database length {}",
+            checkpoint_len,
+            records.len()
+        ));
+    }
+    let prefix = &records[..checkpoint_len];
+    let expected_last_record_id = prefix.last().map(|record| record.id.as_str());
+    if cursor.checkpoint.last_record_id.as_deref() != expected_last_record_id {
+        return Err(anyhow!(
+            "Invalid feedback cursor checkpoint: tail record ID does not match the database prefix"
+        ));
+    }
+    let expected_digest = feedback_cursor_prefix_digest(prefix)?;
+    if cursor.checkpoint.record_ids_sha256 != expected_digest {
+        return Err(anyhow!(
+            "Invalid feedback cursor checkpoint: record ID digest does not match the database prefix"
+        ));
+    }
+
+    let prefix_ids = prefix
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut pending_record_ids = HashSet::with_capacity(cursor.pending_record_ids.len());
+    for pending_id in &cursor.pending_record_ids {
+        if !prefix_ids.contains(pending_id.as_str()) {
+            return Err(anyhow!(
+                "Invalid feedback cursor: pending record ID {pending_id:?} is outside the checkpoint prefix"
+            ));
+        }
+        if !pending_record_ids.insert(pending_id.clone()) {
+            return Err(anyhow!(
+                "Invalid feedback cursor: duplicate pending record ID {pending_id:?}"
+            ));
+        }
+    }
+    Ok(ValidatedFeedbackCursor {
+        checkpoint_len,
+        pending_record_ids,
+    })
+}
+
+fn logical_record_indices(records: &[Record]) -> Result<HashMap<&str, usize>> {
+    let mut record_indices = HashMap::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        if record_indices.insert(record.id.as_str(), index).is_some() {
+            return Err(anyhow!(
+                "Invalid review database: duplicate feedback record ID {:?}",
+                record.id
+            ));
+        }
+    }
+    Ok(record_indices)
+}
+
+fn feedback_cursor_checkpoint(records: &[Record]) -> Result<FeedbackCursorCheckpoint> {
+    let record_count = u64::try_from(records.len()).map_err(|_error| {
+        anyhow!(
+            "Cannot advance feedback cursor: database length {} exceeds cursor capacity",
+            records.len()
+        )
+    })?;
+    Ok(FeedbackCursorCheckpoint {
+        record_count,
+        last_record_id: records.last().map(|record| record.id.clone()),
+        record_ids_sha256: feedback_cursor_prefix_digest(records)?,
+    })
+}
+
+fn feedback_cursor_prefix_digest(records: &[Record]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(FEEDBACK_CURSOR_DIGEST_DOMAIN);
+    for record in records {
+        let length = u64::try_from(record.id.len()).map_err(|_error| {
+            anyhow!(
+                "Cannot hash feedback cursor record ID {:?}: byte length exceeds cursor capacity",
+                record.id
+            )
+        })?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(record.id.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_feedback_cursor_atomically(path: &Path, cursor: &FeedbackCursor) -> Result<()> {
+    write_feedback_cursor_atomically_with(path, cursor, |_| Ok(()))
+}
+
+fn write_feedback_cursor_atomically_with<F>(
+    path: &Path,
+    cursor: &FeedbackCursor,
+    before_rename: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let mut serialized = serde_json::to_vec(cursor)?;
+    serialized.push(b'\n');
+    let parent = feedback_cursor_parent(path);
+    fs::create_dir_all(parent)?;
+    let (temporary_path, mut temporary) = create_feedback_cursor_temporary_file(path)?;
+    let mut renamed = false;
+    let result = (|| -> Result<()> {
+        temporary.write_all(&serialized)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        before_rename(&temporary_path)?;
+        fs::rename(&temporary_path, path)?;
+        renamed = true;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() && !renamed {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn create_feedback_cursor_temporary_file(path: &Path) -> Result<(PathBuf, File)> {
+    let parent = feedback_cursor_parent(path);
+    let cursor_name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(FEEDBACK_CURSOR_FILE))
+        .to_string_lossy();
+    for _ in 0..16 {
+        let temporary_path = parent.join(format!(".{cursor_name}.{}.tmp", Uuid::new_v4()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(anyhow!(
+        "Could not create a unique temporary feedback cursor beside {}",
+        path.display()
+    ))
 }
 
 pub fn resolve_allowed_revisions(
@@ -1133,25 +1487,16 @@ fn should_skip_feedback_imports_by_default(
 
 fn record_matches_since(
     record: &Record,
+    index: usize,
     since_filter: &FeedbackSinceFilter,
-    cursor_record_ids_at_timestamp: Option<&HashSet<&str>>,
+    validated_cursor: Option<&ValidatedFeedbackCursor>,
 ) -> bool {
     match since_filter {
         FeedbackSinceFilter::All => true,
         FeedbackSinceFilter::TimestampInclusive(timestamp) => record.timestamp >= *timestamp,
-        FeedbackSinceFilter::Cursor(cursor) => {
-            record.timestamp > cursor.timestamp
-                || (record.timestamp == cursor.timestamp
-                    && !cursor_record_ids_at_timestamp.map_or_else(
-                        || {
-                            cursor
-                                .record_ids_at_timestamp
-                                .iter()
-                                .any(|id| id == &record.id)
-                        },
-                        |record_ids| record_ids.contains(record.id.as_str()),
-                    ))
-        }
+        FeedbackSinceFilter::Cursor(_) => validated_cursor.is_some_and(|cursor| {
+            index >= cursor.checkpoint_len || cursor.pending_record_ids.contains(&record.id)
+        }),
     }
 }
 
@@ -1162,6 +1507,11 @@ mod tests {
     use crate::hashing::TreeHash;
     use crate::store::{BlockState, Identity, ReviewCheck, VcsSystem, Verdict};
     use std::iter::FromIterator;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::thread;
 
     struct FakeResolver {
         contexts: HashMap<String, ResolvedFeedbackContext>,
@@ -1606,61 +1956,96 @@ mod tests {
     }
 
     #[test]
-    fn collect_feedback_entries_filters_cursor_ids_once_per_export() {
-        let previous = build_record(
-            "previous",
+    fn feedback_cursor_keeps_filtered_lower_timestamp_gap() {
+        let newer_selected = build_record(
+            "newer-selected",
             "aaaaaaa",
-            "src/previous.rs",
-            10,
+            "src/a.rs",
+            2_000,
             Verdict::Comment,
         );
-        let keep_same_timestamp =
-            build_record("keep", "aaaaaaa", "src/keep.rs", 10, Verdict::Comment);
-        let keep_newer = build_record("newer", "aaaaaaa", "src/newer.rs", 11, Verdict::Comment);
-        let mut resolver = FakeResolver {
-            contexts: HashMap::from_iter([
-                (
-                    "previous".to_string(),
-                    resolved_context("src/previous.rs", "pub fn previous() {}\n"),
-                ),
-                (
-                    "keep".to_string(),
-                    resolved_context("src/keep.rs", "pub fn keep() {}\n"),
-                ),
-                (
-                    "newer".to_string(),
-                    resolved_context("src/newer.rs", "pub fn newer() {}\n"),
-                ),
-            ]),
-        };
-        let query = FeedbackQuery {
-            filters: BlockFilters::default(),
-            explicit_selection: None,
-            changed_selection: None,
-            allowed_revisions: None,
-            include_approved: true,
-        };
-        let since_filter = FeedbackSinceFilter::Cursor(FeedbackCursor {
-            timestamp: 10,
-            record_ids_at_timestamp: vec!["previous".to_string()],
-        });
+        let older_filtered = build_record(
+            "older-filtered",
+            "aaaaaaa",
+            "src/b.rs",
+            1_000,
+            Verdict::Comment,
+        );
+        let records = vec![newer_selected, older_filtered];
+        let cursor = advance_feedback_cursor(
+            None,
+            &records,
+            &HashSet::from_iter(["newer-selected".to_string()]),
+        )
+        .unwrap_or_else(|error| panic!("cursor advance should succeed: {error}"));
+
+        assert_eq!(cursor.pending_record_ids, vec!["older-filtered"]);
 
         let entries = collect_feedback_entries(
-            &[previous, keep_same_timestamp, keep_newer],
-            &since_filter,
-            &query,
-            &mut resolver,
+            &records,
+            &FeedbackSinceFilter::Cursor(cursor),
+            &unfiltered_feedback_query(),
+            &mut fake_resolver_for(&records),
         )
         .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+        assert_eq!(feedback_entry_ids(&entries), vec!["older-filtered"]);
+    }
 
-        assert_eq!(
-            entries
-                .iter()
-                .flat_map(|entry| entry.reviews.iter())
-                .map(|record| record.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["keep", "newer"]
-        );
+    #[test]
+    fn feedback_cursor_keeps_same_second_ids_independent() {
+        let first = build_record("first", "aaaaaaa", "src/a.rs", 1_000, Verdict::Comment);
+        let second = build_record("second", "aaaaaaa", "src/b.rs", 1_000, Verdict::Comment);
+        let records = vec![first, second];
+        let cursor =
+            advance_feedback_cursor(None, &records, &HashSet::from_iter(["first".to_string()]))
+                .unwrap_or_else(|error| panic!("first cursor advance should succeed: {error}"));
+
+        let entries = collect_feedback_entries(
+            &records,
+            &FeedbackSinceFilter::Cursor(cursor.clone()),
+            &unfiltered_feedback_query(),
+            &mut fake_resolver_for(&records),
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+        assert_eq!(feedback_entry_ids(&entries), vec!["second"]);
+
+        let drained = advance_feedback_cursor(
+            Some(&cursor),
+            &records,
+            &HashSet::from_iter(["second".to_string()]),
+        )
+        .unwrap_or_else(|error| panic!("second cursor advance should succeed: {error}"));
+        let entries = collect_feedback_entries(
+            &records,
+            &FeedbackSinceFilter::Cursor(drained),
+            &unfiltered_feedback_query(),
+            &mut fake_resolver_for(&records),
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn feedback_cursor_keeps_backdated_appended_record() {
+        let initial = build_record("initial", "aaaaaaa", "src/a.rs", 2_000, Verdict::Comment);
+        let appended = build_record("appended", "aaaaaaa", "src/b.rs", 1_000, Verdict::Comment);
+        let first_snapshot = vec![initial.clone()];
+        let cursor = advance_feedback_cursor(
+            None,
+            &first_snapshot,
+            &HashSet::from_iter(["initial".to_string()]),
+        )
+        .unwrap_or_else(|error| panic!("initial cursor advance should succeed: {error}"));
+        let records = vec![initial, appended];
+
+        let entries = collect_feedback_entries(
+            &records,
+            &FeedbackSinceFilter::Cursor(cursor),
+            &unfiltered_feedback_query(),
+            &mut fake_resolver_for(&records),
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+        assert_eq!(feedback_entry_ids(&entries), vec!["appended"]);
     }
 
     #[test]
@@ -1883,18 +2268,281 @@ mod tests {
     }
 
     #[test]
-    fn read_feedback_cursor_supports_legacy_timestamp_format() {
-        let dir = trueflow_test_support::temp_test_dir("feedback_cursor_legacy");
+    fn feedback_cursor_rejects_legacy_corrupt_and_unsupported_files() {
+        let dir = trueflow_test_support::temp_test_dir("feedback_cursor_rejection");
         let path = dir.join("feedback.cursor");
         fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("failed to create dir: {error}"));
-        fs::write(&path, "1234\n")
-            .unwrap_or_else(|error| panic!("failed to write cursor: {error}"));
+
+        for content in [
+            "1234\n",
+            "{\"timestamp\":1234,\"record_ids_at_timestamp\":[]}\n",
+            "\n",
+            "{\n",
+            "{\"version\":2,\"checkpoint\":{\"record_count\":0,\"last_record_id\":null,\"record_ids_sha256\":\"x\"},\"pending_record_ids\":[]}\n",
+            "{\"version\":1,\"checkpoint\":{\"record_count\":0,\"last_record_id\":null,\"record_ids_sha256\":\"x\"},\"pending_record_ids\":[],\"unexpected\":true}\n",
+            "{\"version\":1,\"checkpoint\":{\"record_count\":1,\"last_record_id\":null,\"record_ids_sha256\":\"x\"},\"pending_record_ids\":[]}\n",
+        ] {
+            fs::write(&path, content)
+                .unwrap_or_else(|error| panic!("failed to write cursor fixture: {error}"));
+            assert!(
+                read_feedback_cursor(&path).is_err(),
+                "cursor should reject {content:?}"
+            );
+        }
+
+        fs::remove_file(&path).unwrap_or_else(|error| panic!("failed to remove cursor: {error}"));
+        assert!(
+            read_feedback_cursor(&path)
+                .unwrap_or_else(|error| panic!("missing cursor should be accepted: {error}"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn feedback_cursor_rejects_inconsistent_and_outside_pending_ids() {
+        let record = build_record("known", "aaaaaaa", "src/a.rs", 1, Verdict::Comment);
+        let records = vec![record];
+        let mut inconsistent = feedback_cursor_for_records(&records);
+        inconsistent.checkpoint.last_record_id = None;
+        assert!(
+            feedback_since_filter_for_cursor(Some(&inconsistent), &records).is_err(),
+            "a non-empty checkpoint without a tail ID must fail"
+        );
+
+        let mut outside_pending = feedback_cursor_for_records(&records);
+        outside_pending.pending_record_ids = vec!["unknown".to_string()];
+        assert!(
+            feedback_since_filter_for_cursor(Some(&outside_pending), &records).is_err(),
+            "pending IDs must occur in the checkpoint prefix"
+        );
+    }
+
+    #[test]
+    fn feedback_cursor_rejects_unsorted_or_duplicate_pending_ids() {
+        let records = vec![
+            build_record("first", "aaaaaaa", "src/a.rs", 1, Verdict::Comment),
+            build_record("second", "aaaaaaa", "src/b.rs", 2, Verdict::Comment),
+        ];
+        let mut unsorted = feedback_cursor_for_records(&records);
+        unsorted.pending_record_ids.reverse();
+        assert!(
+            feedback_since_filter_for_cursor(Some(&unsorted), &records).is_err(),
+            "pending IDs must have deterministic sorted serialization"
+        );
+
+        let mut duplicate = feedback_cursor_for_records(&records);
+        duplicate.pending_record_ids = vec!["first".to_string(), "first".to_string()];
+        assert!(
+            feedback_since_filter_for_cursor(Some(&duplicate), &records).is_err(),
+            "pending IDs must be unique"
+        );
+    }
+
+    #[test]
+    fn feedback_cursor_rejects_prefix_mismatch() {
+        let original = build_record("original", "aaaaaaa", "src/a.rs", 1, Verdict::Comment);
+        let replaced = build_record("replaced", "aaaaaaa", "src/a.rs", 1, Verdict::Comment);
+        let cursor = feedback_cursor_for_records(&[original]);
+
+        assert!(
+            feedback_since_filter_for_cursor(Some(&cursor), &[replaced]).is_err(),
+            "a cursor checkpoint must match the exact logical record prefix"
+        );
+    }
+
+    #[test]
+    fn feedback_cursor_no_exported_entries_and_final_drain() {
+        let first = build_record("first", "aaaaaaa", "src/a.rs", 2, Verdict::Comment);
+        let second = build_record("second", "aaaaaaa", "src/b.rs", 1, Verdict::Comment);
+        let records = vec![first, second];
+        let pending = advance_feedback_cursor(None, &records, &HashSet::new())
+            .unwrap_or_else(|error| panic!("empty export should advance cursor: {error}"));
+        assert_eq!(pending.pending_record_ids, vec!["first", "second"]);
+
+        let partially_drained = advance_feedback_cursor(
+            Some(&pending),
+            &records,
+            &HashSet::from_iter(["first".to_string()]),
+        )
+        .unwrap_or_else(|error| panic!("partial drain should succeed: {error}"));
+        assert_eq!(partially_drained.pending_record_ids, vec!["second"]);
+
+        let drained = advance_feedback_cursor(
+            Some(&partially_drained),
+            &records,
+            &HashSet::from_iter(["second".to_string()]),
+        )
+        .unwrap_or_else(|error| panic!("final drain should succeed: {error}"));
+        assert!(drained.pending_record_ids.is_empty());
+    }
+
+    #[test]
+    fn feedback_cursor_pre_rename_failure_preserves_complete_old_bytes() {
+        let dir = trueflow_test_support::temp_test_dir("feedback_cursor_pre_rename_failure");
+        let path = dir.join("feedback.cursor");
+        let old_records = vec![build_record(
+            "old",
+            "aaaaaaa",
+            "src/a.rs",
+            1,
+            Verdict::Comment,
+        )];
+        let old = feedback_cursor_for_records(&old_records);
+        write_feedback_cursor_atomically(&path, &old)
+            .unwrap_or_else(|error| panic!("initial cursor write should succeed: {error}"));
+        let old_bytes = fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read initial cursor bytes: {error}"));
+
+        let new_records = vec![
+            old_records[0].clone(),
+            build_record("new", "aaaaaaa", "src/b.rs", 2, Verdict::Comment),
+        ];
+        let new = feedback_cursor_for_records(&new_records);
+        let result = write_feedback_cursor_atomically_with(&path, &new, |_| {
+            Err(anyhow!("injected pre-rename failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&path).unwrap_or_else(|error| panic!("failed to re-read cursor: {error}")),
+            old_bytes
+        );
+        assert_eq!(
+            read_feedback_cursor(&path)
+                .unwrap_or_else(|error| panic!("old cursor must still parse: {error}")),
+            Some(old)
+        );
+        let directory_entries = fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("failed to inspect cursor directory: {error}"))
+            .map(|entry| entry.unwrap_or_else(|error| panic!("failed to read entry: {error}")))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            directory_entries.iter().all(|name| !name.ends_with(".tmp")),
+            "failed atomic writes must not leave a temporary cursor candidate"
+        );
+    }
+
+    #[test]
+    fn feedback_cursor_reader_writer_concurrency_observes_complete_states() {
+        let dir = trueflow_test_support::temp_test_dir("feedback_cursor_reader_writer");
+        let path = dir.join("feedback.cursor");
+        let records = vec![
+            build_record("first", "aaaaaaa", "src/a.rs", 1, Verdict::Comment),
+            build_record("second", "aaaaaaa", "src/b.rs", 2, Verdict::Comment),
+        ];
+        FeedbackCursorUpdateGuard::acquire(&path)
+            .unwrap_or_else(|error| panic!("initial writer lock should succeed: {error}"))
+            .commit(&records, &HashSet::from_iter(["first".to_string()]))
+            .unwrap_or_else(|error| panic!("initial commit should succeed: {error}"));
+        let old = read_feedback_cursor(&path)
+            .unwrap_or_else(|error| panic!("old cursor should parse: {error}"))
+            .unwrap_or_else(|| panic!("old cursor should exist"));
+        let new = advance_feedback_cursor(
+            Some(&old),
+            &records,
+            &HashSet::from_iter(["second".to_string()]),
+        )
+        .unwrap_or_else(|error| panic!("expected new cursor should build: {error}"));
+
+        let start = Arc::new(Barrier::new(2));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_path = path.clone();
+        let reader_start = Arc::clone(&start);
+        let reader_reads = Arc::clone(&reads);
+        let reader_done = Arc::clone(&done);
+        let reader_old = old;
+        let reader_new = new;
+        let reader = thread::spawn(move || {
+            reader_start.wait();
+            while !reader_done.load(Ordering::Acquire) {
+                let observed = read_feedback_cursor(&reader_path).unwrap_or_else(|error| {
+                    panic!("reader must see complete cursor state: {error}")
+                });
+                assert!(
+                    observed == Some(reader_old.clone()) || observed == Some(reader_new.clone())
+                );
+                reader_reads.fetch_add(1, Ordering::Release);
+                thread::yield_now();
+            }
+        });
+
+        start.wait();
+        FeedbackCursorUpdateGuard::acquire(&path)
+            .unwrap_or_else(|error| panic!("writer lock should succeed: {error}"))
+            .commit(&records, &HashSet::from_iter(["second".to_string()]))
+            .unwrap_or_else(|error| panic!("writer commit should succeed: {error}"));
+        done.store(true, Ordering::Release);
+        reader
+            .join()
+            .unwrap_or_else(|_| panic!("reader thread must not panic"));
+        assert!(reads.load(Ordering::Acquire) > 0);
+    }
+
+    #[test]
+    fn feedback_cursor_writer_monotonic_merge() {
+        let dir = trueflow_test_support::temp_test_dir("feedback_cursor_monotonic_merge");
+        let path = dir.join("feedback.cursor");
+        let records = vec![
+            build_record("first", "aaaaaaa", "src/a.rs", 2, Verdict::Comment),
+            build_record("second", "aaaaaaa", "src/b.rs", 1, Verdict::Comment),
+        ];
+
+        FeedbackCursorUpdateGuard::acquire(&path)
+            .unwrap_or_else(|error| panic!("first writer lock should succeed: {error}"))
+            .commit(&records, &HashSet::from_iter(["first".to_string()]))
+            .unwrap_or_else(|error| panic!("first writer commit should succeed: {error}"));
+        FeedbackCursorUpdateGuard::acquire(&path)
+            .unwrap_or_else(|error| panic!("second writer lock should succeed: {error}"))
+            .commit(&records, &HashSet::from_iter(["second".to_string()]))
+            .unwrap_or_else(|error| panic!("second writer commit should merge: {error}"));
 
         let cursor = read_feedback_cursor(&path)
-            .unwrap_or_else(|error| panic!("legacy cursor should parse: {error}"))
-            .unwrap_or_else(|| panic!("expected cursor"));
-        assert_eq!(cursor.timestamp, 1234);
-        assert!(cursor.record_ids_at_timestamp.is_empty());
+            .unwrap_or_else(|error| panic!("merged cursor should parse: {error}"))
+            .unwrap_or_else(|| panic!("merged cursor should exist"));
+        assert_eq!(cursor.checkpoint.record_count, 2);
+        assert!(cursor.pending_record_ids.is_empty());
+    }
+
+    fn feedback_cursor_for_records(records: &[Record]) -> FeedbackCursor {
+        advance_feedback_cursor(None, records, &HashSet::new())
+            .unwrap_or_else(|error| panic!("cursor fixture should build: {error}"))
+    }
+
+    fn fake_resolver_for(records: &[Record]) -> FakeResolver {
+        let contexts = records
+            .iter()
+            .map(|record| {
+                let path = record
+                    .path_hint
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("cursor fixture record needs a path"))
+                    .to_string();
+                (
+                    record.id.clone(),
+                    resolved_context(&path, "pub fn feedback() {}\n"),
+                )
+            })
+            .collect();
+        FakeResolver { contexts }
+    }
+
+    fn feedback_entry_ids(entries: &[FeedbackEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .flat_map(|entry| entry.reviews.iter().map(|record| record.id.clone()))
+            .collect()
+    }
+
+    fn unfiltered_feedback_query() -> FeedbackQuery {
+        FeedbackQuery {
+            filters: BlockFilters::default(),
+            explicit_selection: None,
+            changed_selection: None,
+            allowed_revisions: None,
+            include_approved: true,
+        }
     }
 
     fn test_file_state(path: &str, content: &[u8]) -> FileState {

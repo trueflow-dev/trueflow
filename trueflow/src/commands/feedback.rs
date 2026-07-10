@@ -2,9 +2,10 @@ use crate::block::BlockKind;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::feedback_export::{
-    FeedbackBlockView, FeedbackCursor, FeedbackEntry, FeedbackQuery, FeedbackSinceFilter,
-    RepoFeedbackContextResolver, collect_feedback_entries, feedback_cursor_path,
-    resolve_allowed_revisions, resolve_since_filter, write_feedback_cursor,
+    FeedbackBlockView, FeedbackCursorReadGuard, FeedbackCursorUpdateGuard, FeedbackEntry,
+    FeedbackQuery, FeedbackSinceFilter, RepoFeedbackContextResolver, collect_feedback_entries,
+    feedback_cursor_path, feedback_since_filter_for_cursor, resolve_allowed_revisions,
+    resolve_since_filter,
 };
 use crate::feedback_since::{FeedbackSinceExpr, ResolvedFeedbackSince as ParsedFeedbackSince};
 use crate::github::{
@@ -14,8 +15,8 @@ use crate::github::{
 };
 use crate::github_delivery::{GITHUB_DELIVERY_LEDGER_FILE, GitHubDeliveryLedger};
 use crate::store::{
-    CommentAnchor, CommitId, DiffCommentAnchor, FileStore, Record, RepoRef, ReviewStore,
-    SourceCommentAnchor,
+    CommentAnchor, CommitId, DiffCommentAnchor, FileStore, Record, RepoRef, ReviewDatabase,
+    ReviewStore, SourceCommentAnchor,
 };
 use crate::targets::{
     ResolvedTargets, ReviewContentSource, ReviewPathSelection, ReviewTarget,
@@ -28,7 +29,7 @@ use serde::ser::{SerializeSeq, Serializer as _};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 const TRUEFLOW_PENDING_REVIEW_MARKER: &str = "<!-- trueflow:pending-review -->";
@@ -88,8 +89,15 @@ struct FeedbackCommandResult {
 }
 
 struct FeedbackCursorUpdate {
-    path: PathBuf,
-    cursor: crate::feedback_export::FeedbackCursor,
+    guard: FeedbackCursorUpdateGuard,
+    database: ReviewDatabase,
+    exported_record_ids: HashSet<String>,
+}
+
+struct PullRequestFeedbackSnapshot {
+    database: ReviewDatabase,
+    since_filter: FeedbackSinceFilter,
+    _cursor_guard: Option<FeedbackCursorReadGuard>,
 }
 
 pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()> {
@@ -158,11 +166,19 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
     let scan_options = config.scan.resolve_options();
     let effective_since = since.unwrap_or(&config.feedback.default_since);
     let resolved_targets = resolve_local_feedback_targets(targets)?;
-
     let store = crate::store::FileStore::new()?;
-    let database = store.load_database()?;
     let since_mode = effective_since.resolve()?;
-    let since_filter = resolve_since_filter(&store, since_mode)?;
+    let cursor_update_guard = match since_mode {
+        ParsedFeedbackSince::Last => Some(FeedbackCursorUpdateGuard::acquire(
+            feedback_cursor_path(&store).as_path(),
+        )?),
+        ParsedFeedbackSince::All | ParsedFeedbackSince::Timestamp(_) => None,
+    };
+    let database = store.load_database()?;
+    let since_filter = match cursor_update_guard.as_ref() {
+        Some(guard) => feedback_since_filter_for_cursor(guard.cursor(), database.records())?,
+        None => resolve_since_filter(&store, since_mode)?,
+    };
     let explicit_selection = resolved_targets.explicit_selection();
     let changed_selection = feedback_changed_selection(targets, &resolved_targets);
     let allowed_revisions = resolve_allowed_revisions(&resolved_targets.diff_selection)?;
@@ -182,16 +198,11 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
     let entries =
         collect_feedback_entries(database.records(), &since_filter, &query, &mut resolver)?;
 
-    let cursor_update = if matches!(since_mode, ParsedFeedbackSince::Last) {
-        build_feedback_cursor_after_entries_export(&since_filter, &entries).map(|cursor| {
-            FeedbackCursorUpdate {
-                path: feedback_cursor_path(&store),
-                cursor,
-            }
-        })
-    } else {
-        None
-    };
+    let cursor_update = cursor_update_guard.map(|guard| FeedbackCursorUpdate {
+        guard,
+        database,
+        exported_record_ids: exported_feedback_record_ids(&entries),
+    });
 
     Ok(FeedbackCommandResult {
         entries,
@@ -199,73 +210,22 @@ fn collect_local_feedback(params: FeedbackCollectionParams<'_>) -> Result<Feedba
     })
 }
 
-fn build_feedback_cursor_after_entries_export(
-    since_filter: &FeedbackSinceFilter,
-    entries: &[FeedbackEntry],
-) -> Option<FeedbackCursor> {
-    let exported_cursor = build_feedback_cursor_from_entries(entries);
-    let FeedbackSinceFilter::Cursor(previous) = since_filter else {
-        return exported_cursor;
-    };
-
-    let Some(exported_cursor) = exported_cursor else {
-        return Some(previous.clone());
-    };
-
-    if exported_cursor.timestamp < previous.timestamp {
-        return Some(previous.clone());
-    }
-
-    if exported_cursor.timestamp > previous.timestamp {
-        return Some(exported_cursor);
-    }
-
-    let mut record_ids_at_timestamp = previous.record_ids_at_timestamp.clone();
-    record_ids_at_timestamp.extend(exported_cursor.record_ids_at_timestamp);
-    record_ids_at_timestamp.sort();
-    record_ids_at_timestamp.dedup();
-
-    Some(FeedbackCursor {
-        timestamp: previous.timestamp,
-        record_ids_at_timestamp,
-    })
-}
-
-fn build_feedback_cursor_from_entries(entries: &[FeedbackEntry]) -> Option<FeedbackCursor> {
-    let mut timestamp = None;
-    let mut record_ids_at_timestamp = Vec::new();
-
-    for record in entries.iter().flat_map(|entry| entry.reviews.iter()) {
-        match timestamp {
-            None => {
-                timestamp = Some(record.timestamp);
-                record_ids_at_timestamp.push(record.id.clone());
-            }
-            Some(current) if record.timestamp > current => {
-                timestamp = Some(record.timestamp);
-                record_ids_at_timestamp.clear();
-                record_ids_at_timestamp.push(record.id.clone());
-            }
-            Some(current) if record.timestamp == current => {
-                record_ids_at_timestamp.push(record.id.clone());
-            }
-            Some(_) => {}
-        }
-    }
-
-    let timestamp = timestamp?;
-    record_ids_at_timestamp.sort();
-    record_ids_at_timestamp.dedup();
-
-    Some(FeedbackCursor {
-        timestamp,
-        record_ids_at_timestamp,
-    })
+fn exported_feedback_record_ids(entries: &[FeedbackEntry]) -> HashSet<String> {
+    entries
+        .iter()
+        .flat_map(|entry| entry.reviews.iter())
+        .map(|record| record.id.clone())
+        .collect()
 }
 
 fn write_feedback_cursor_update(update: Option<FeedbackCursorUpdate>) -> Result<()> {
-    if let Some(update) = update {
-        write_feedback_cursor(update.path.as_path(), &update.cursor)?;
+    if let Some(FeedbackCursorUpdate {
+        guard,
+        database,
+        exported_record_ids,
+    }) = update
+    {
+        guard.commit(database.records(), &exported_record_ids)?;
     }
     Ok(())
 }
@@ -509,14 +469,25 @@ where
         );
     }
 
-    let database = store.load_database()?;
-    let records = filter_pull_request_feedback_records(
-        &store,
-        repo_root,
-        &prepared.metadata,
-        database.records(),
-        options.filters,
-    )?;
+    let config = load_config()?;
+    let effective_since = options
+        .filters
+        .since
+        .unwrap_or(&config.feedback.default_since);
+    let records = {
+        let snapshot =
+            load_pull_request_feedback_snapshot_with(&store, effective_since.resolve()?, || {
+                store.load_database()
+            })?;
+        filter_pull_request_feedback_records(
+            &config,
+            repo_root,
+            &prepared.metadata,
+            snapshot.database.records(),
+            &snapshot.since_filter,
+            options.filters,
+        )?
+    };
     let excluded_ids =
         ledger.excluded_record_ids_for_head(&prepared.metadata.pr, &prepared.metadata.head_sha);
     let plan =
@@ -594,21 +565,45 @@ where
     })
 }
 
-fn filter_pull_request_feedback_records(
+fn load_pull_request_feedback_snapshot_with<LoadDatabase>(
     store: &FileStore,
+    since: ParsedFeedbackSince,
+    load_database: LoadDatabase,
+) -> Result<PullRequestFeedbackSnapshot>
+where
+    LoadDatabase: FnOnce() -> Result<ReviewDatabase>,
+{
+    let cursor_path = feedback_cursor_path(store);
+    let cursor_guard = match since {
+        ParsedFeedbackSince::Last => Some(FeedbackCursorReadGuard::acquire(cursor_path.as_path())?),
+        ParsedFeedbackSince::All | ParsedFeedbackSince::Timestamp(_) => None,
+    };
+    let database = load_database()?;
+    let since_filter = match cursor_guard.as_ref() {
+        Some(guard) => feedback_since_filter_for_cursor(guard.cursor(), database.records())?,
+        None => resolve_since_filter(store, since)?,
+    };
+
+    Ok(PullRequestFeedbackSnapshot {
+        database,
+        since_filter,
+        _cursor_guard: cursor_guard,
+    })
+}
+
+fn filter_pull_request_feedback_records(
+    config: &crate::config::TrueflowConfig,
     repo_root: &Path,
     metadata: &PullRequestMetadata,
     records: &[Record],
+    since_filter: &FeedbackSinceFilter,
     filters: FeedbackRecordFilterParams<'_>,
 ) -> Result<Vec<Record>> {
-    let config = load_config()?;
     let block_filters = config
         .feedback
         .filters
         .resolve_filters(filters.only, filters.exclude);
     let scan_options = config.scan.resolve_options();
-    let effective_since = filters.since.unwrap_or(&config.feedback.default_since);
-    let since_filter = resolve_since_filter(store, effective_since.resolve()?)?;
     let allowed_revisions = Some(
         metadata
             .commits
@@ -630,7 +625,7 @@ fn filter_pull_request_feedback_records(
         None,
         repo_root,
     )?;
-    let entries = collect_feedback_entries(records, &since_filter, &query, &mut resolver)?;
+    let entries = collect_feedback_entries(records, since_filter, &query, &mut resolver)?;
 
     Ok(entries
         .into_iter()
@@ -1811,42 +1806,52 @@ mod tests {
     }
 
     #[test]
-    fn build_feedback_cursor_after_entries_export_merges_last_cursor() -> Result<()> {
-        let revision = CommitId::new("abcdef1")?;
-        let mut older = review_record("older", &revision, None, None);
-        older.timestamp = 9;
-        let mut duplicate_previous = review_record("previous", &revision, None, None);
-        duplicate_previous.timestamp = 10;
-        let mut current = review_record("current", &revision, None, None);
-        current.timestamp = 10;
-        let block = crate::block::Block::new(
-            "fn value() {}\n".to_string(),
-            BlockKind::Function,
-            crate::block::LineSpan::new(0, 1),
-            crate::block::ByteSpan::new(0, "fn value() {}\n".len()),
-        );
-        let entry = FeedbackEntry {
-            file_path: "src/lib.rs".to_string(),
-            block: FeedbackBlockView::from_canonical_block(&block),
-            reviews: vec![older, duplicate_previous, current],
-            latest_verdict: "comment".to_string(),
-        };
-        let previous = FeedbackCursor {
-            timestamp: 10,
-            record_ids_at_timestamp: vec!["previous".to_string()],
+    fn feedback_cursor_pr_snapshot_acquires_guard_before_database_load() -> Result<()> {
+        use fs2::FileExt as _;
+
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_pr_cursor_snapshot_guard")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let cursor_path = feedback_cursor_path(&store);
+        let since = FeedbackSinceExpr::new("last")?;
+        let writer_lock = || {
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(crate::feedback_export::feedback_cursor_lock_path(
+                    cursor_path.as_path(),
+                ))
         };
 
-        let cursor = build_feedback_cursor_after_entries_export(
-            &FeedbackSinceFilter::Cursor(previous),
-            &[entry],
-        )
-        .ok_or_else(|| anyhow!("expected cursor"))?;
+        let snapshot = load_pull_request_feedback_snapshot_with(&store, since.resolve()?, || {
+            let writer = writer_lock()?;
+            assert!(
+                writer.try_lock_exclusive().is_err(),
+                "the shared cursor guard must be acquired before loading the database"
+            );
+            store.load_database()
+        })?;
 
-        assert_eq!(cursor.timestamp, 10);
-        assert_eq!(
-            cursor.record_ids_at_timestamp,
-            vec!["current".to_string(), "previous".to_string()]
+        let config = load_config()?;
+        let _records = filter_pull_request_feedback_records(
+            &config,
+            &repo_root,
+            &metadata,
+            snapshot.database.records(),
+            &snapshot.since_filter,
+            FeedbackRecordFilterParams::unfiltered(),
+        )?;
+        let writer = writer_lock()?;
+        assert!(
+            writer.try_lock_exclusive().is_err(),
+            "the shared cursor guard must remain held through filtering"
         );
+
+        drop(snapshot);
+        writer.try_lock_exclusive()?;
+        writer.unlock()?;
         Ok(())
     }
 
@@ -1922,22 +1927,6 @@ mod tests {
         assert!(value["block"].get("start_byte").is_none());
         assert!(value["block"].get("end_byte").is_none());
         assert!(!block_xml_open_tag(&entry.block).contains("end_byte="));
-    }
-
-    #[test]
-    fn build_feedback_cursor_after_entries_export_keeps_last_cursor_when_empty() -> Result<()> {
-        let previous = FeedbackCursor {
-            timestamp: 10,
-            record_ids_at_timestamp: vec!["previous".to_string()],
-        };
-
-        let cursor =
-            build_feedback_cursor_after_entries_export(&FeedbackSinceFilter::Cursor(previous), &[])
-                .ok_or_else(|| anyhow!("last cursor should be preserved"))?;
-
-        assert_eq!(cursor.timestamp, 10);
-        assert_eq!(cursor.record_ids_at_timestamp, vec!["previous".to_string()]);
-        Ok(())
     }
 
     #[test]
