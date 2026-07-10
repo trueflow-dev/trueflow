@@ -25,6 +25,7 @@ use crate::targets::{
 use crate::vcs;
 use anyhow::{Result, anyhow};
 use clap::ValueEnum;
+use gix::object::tree::EntryKind;
 use serde::ser::{SerializeSeq, Serializer as _};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -312,6 +313,7 @@ struct SkippedPullRequestRecord {
 enum PullRequestFeedbackSkipReason {
     MissingCommentAnchor,
     MissingPullRequestCommit,
+    InvalidSourceAnchorRange,
     RangeDeletedByLaterCommit,
     AmbiguousLineTranslation,
     NotPresentInPrHeadDiff,
@@ -325,6 +327,9 @@ impl std::fmt::Display for PullRequestFeedbackSkipReason {
             Self::MissingCommentAnchor => "missing comment anchor",
             Self::MissingPullRequestCommit => {
                 "anchor revision is not in the pull request commit set"
+            }
+            Self::InvalidSourceAnchorRange => {
+                "source anchor range is outside the anchored source file"
             }
             Self::RangeDeletedByLaterCommit => "anchored range was deleted by a later commit",
             Self::AmbiguousLineTranslation => {
@@ -1030,25 +1035,73 @@ struct TranslatedSourceAnchor {
     last_line: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InclusiveSourceLineRange {
+    first_line: u32,
+    last_line: u32,
+}
+
+fn validate_source_anchor_zero_based_half_open_range(
+    anchor: &SourceCommentAnchor,
+    source_blob_line_count: usize,
+) -> std::result::Result<InclusiveSourceLineRange, PullRequestFeedbackSkipReason> {
+    if anchor.start_line >= anchor.end_line {
+        return Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange);
+    }
+    let Ok(end_line) = usize::try_from(anchor.end_line) else {
+        return Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange);
+    };
+    if end_line > source_blob_line_count {
+        return Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange);
+    }
+    let Some(first_line) = anchor.start_line.checked_add(1) else {
+        return Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange);
+    };
+    Ok(InclusiveSourceLineRange {
+        first_line,
+        last_line: anchor.end_line,
+    })
+}
+
+fn translate_inclusive_source_line_range_to_next(
+    range: InclusiveSourceLineRange,
+    hunks: &[crate::vcs::DiffHunk],
+) -> std::result::Result<InclusiveSourceLineRange, PullRequestFeedbackSkipReason> {
+    let mut first_mapped: Option<u32> = None;
+    let mut previous_mapped: Option<u32> = None;
+
+    for old_line in range.first_line..=range.last_line {
+        let Some(mapped_line) = translate_old_line_to_new_line_strict(old_line, hunks)? else {
+            return Err(PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit);
+        };
+        if let Some(previous_line) = previous_mapped {
+            let Some(expected_line) = previous_line.checked_add(1) else {
+                return Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation);
+            };
+            if mapped_line != expected_line {
+                return Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation);
+            }
+        } else {
+            first_mapped = Some(mapped_line);
+        }
+        previous_mapped = Some(mapped_line);
+    }
+
+    match (first_mapped, previous_mapped) {
+        (Some(first_line), Some(last_line)) => Ok(InclusiveSourceLineRange {
+            first_line,
+            last_line,
+        }),
+        (None, None) => Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation),
+        _ => Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation),
+    }
+}
+
 fn translate_source_anchor_to_head(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
     anchor: &SourceCommentAnchor,
 ) -> Result<std::result::Result<TranslatedSourceAnchor, PullRequestFeedbackSkipReason>> {
-    if anchor.end_line <= anchor.start_line {
-        return Ok(Err(
-            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
-        ));
-    }
-    if !path_exists_in_revision(repo, &anchor.revision, &anchor.path)? {
-        return Ok(Err(
-            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
-        ));
-    }
-
-    let mut path = anchor.path.clone();
-    let mut mapped_lines =
-        (anchor.start_line.saturating_add(1)..=anchor.end_line).collect::<Vec<_>>();
     let Some(start_index) = metadata
         .commits
         .iter()
@@ -1056,6 +1109,19 @@ fn translate_source_anchor_to_head(
     else {
         return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
     };
+    let Some(source_blob_line_count) =
+        source_blob_line_count_in_revision(repo, &anchor.revision, &anchor.path)?
+    else {
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+        ));
+    };
+    let mut mapped_range =
+        match validate_source_anchor_zero_based_half_open_range(anchor, source_blob_line_count) {
+            Ok(range) => range,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let mut path = anchor.path.clone();
 
     for pair in metadata.commits[start_index..].windows(2) {
         let current = &pair[0].sha;
@@ -1072,65 +1138,64 @@ fn translate_source_anchor_to_head(
         if hunks.is_empty() {
             continue;
         }
-        let Some(next_lines) = mapped_lines
-            .into_iter()
-            .map(|line| translate_old_line_to_new_line_strict(line, &hunks))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Ok(Err(
-                PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
-            ));
+        mapped_range = match translate_inclusive_source_line_range_to_next(mapped_range, &hunks) {
+            Ok(range) => range,
+            Err(reason) => return Ok(Err(reason)),
         };
-        mapped_lines = next_lines;
-        if !is_contiguous(&mapped_lines) {
-            return Ok(Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation));
-        }
     }
 
-    Ok(mapped_lines
-        .first()
-        .zip(mapped_lines.last())
-        .map(|(first, last)| TranslatedSourceAnchor {
-            path,
-            first_line: *first,
-            last_line: *last,
-        })
-        .ok_or(PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit))
+    Ok(Ok(TranslatedSourceAnchor {
+        path,
+        first_line: mapped_range.first_line,
+        last_line: mapped_range.last_line,
+    }))
 }
 
 fn translate_old_line_to_new_line_strict(
     old_line: u32,
     hunks: &[crate::vcs::DiffHunk],
-) -> Option<u32> {
+) -> std::result::Result<Option<u32>, PullRequestFeedbackSkipReason> {
     let mut old_cursor = 1u32;
     let mut new_cursor = 1u32;
 
     for hunk in hunks {
         while old_cursor < hunk.old_start {
             if old_line == old_cursor {
-                return Some(new_cursor);
+                return Ok(Some(new_cursor));
             }
-            old_cursor = old_cursor.saturating_add(1);
-            new_cursor = new_cursor.saturating_add(1);
+            old_cursor = old_cursor
+                .checked_add(1)
+                .ok_or(PullRequestFeedbackSkipReason::AmbiguousLineTranslation)?;
+            new_cursor = new_cursor
+                .checked_add(1)
+                .ok_or(PullRequestFeedbackSkipReason::AmbiguousLineTranslation)?;
         }
 
         for line in &hunk.lines {
             match line.kind {
                 crate::vcs::DiffLineKind::Context => {
                     if old_line == old_cursor {
-                        return Some(new_cursor);
+                        return Ok(Some(new_cursor));
                     }
-                    old_cursor = old_cursor.saturating_add(1);
-                    new_cursor = new_cursor.saturating_add(1);
+                    old_cursor = old_cursor
+                        .checked_add(1)
+                        .ok_or(PullRequestFeedbackSkipReason::AmbiguousLineTranslation)?;
+                    new_cursor = new_cursor
+                        .checked_add(1)
+                        .ok_or(PullRequestFeedbackSkipReason::AmbiguousLineTranslation)?;
                 }
                 crate::vcs::DiffLineKind::Removed => {
                     if old_line == old_cursor {
-                        return None;
+                        return Ok(None);
                     }
-                    old_cursor = old_cursor.saturating_add(1);
+                    old_cursor = old_cursor
+                        .checked_add(1)
+                        .ok_or(PullRequestFeedbackSkipReason::AmbiguousLineTranslation)?;
                 }
                 crate::vcs::DiffLineKind::Added => {
-                    new_cursor = new_cursor.saturating_add(1);
+                    new_cursor = new_cursor
+                        .checked_add(1)
+                        .ok_or(PullRequestFeedbackSkipReason::AmbiguousLineTranslation)?;
                 }
             }
         }
@@ -1138,7 +1203,12 @@ fn translate_old_line_to_new_line_strict(
 
     let delta = i64::from(new_cursor) - i64::from(old_cursor);
     let mapped = i64::from(old_line) + delta;
-    u32::try_from(mapped.max(1).min(i64::from(u32::MAX))).ok()
+    if mapped < 1 {
+        return Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation);
+    }
+    u32::try_from(mapped)
+        .map(Some)
+        .map_err(|_error| PullRequestFeedbackSkipReason::AmbiguousLineTranslation)
 }
 
 fn translate_new_line_to_old_line_strict(
@@ -1391,6 +1461,42 @@ fn path_exists_in_revision(
     Ok(tree
         .lookup_entry_by_path(Path::new(path.as_str()))?
         .is_some())
+}
+
+fn source_blob_line_count_in_revision(
+    repo: &gix::Repository,
+    revision: &CommitId,
+    path: &crate::repo_path::RepoPath,
+) -> Result<Option<usize>> {
+    let object = repo.rev_parse_single(revision.as_str())?;
+    let commit = object.object()?.peel_to_commit()?;
+    let tree = commit.tree()?;
+    let Some(entry) = tree.lookup_entry_by_path(Path::new(path.as_str()))? else {
+        return Ok(None);
+    };
+    if entry.mode().kind() == EntryKind::Tree {
+        return Ok(None);
+    }
+    let blob = entry.object()?.try_into_blob()?;
+    Ok(Some(source_blob_logical_line_count(&blob.data)?))
+}
+
+fn source_blob_logical_line_count(source: &[u8]) -> Result<usize> {
+    let newline_count =
+        source
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .try_fold(0usize, |count, _| {
+                count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("source blob line count exceeds usize"))
+            })?;
+    if source.last() == Some(&b'\n') || source.is_empty() {
+        return Ok(newline_count);
+    }
+    newline_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("source blob line count exceeds usize"))
 }
 
 fn pull_request_contains_revision(metadata: &PullRequestMetadata, revision: &CommitId) -> bool {
@@ -1955,6 +2061,271 @@ mod tests {
         assert_eq!(comment.side, GitHubCommentSide::Right);
         assert_eq!(comment.start_line, None);
         assert_eq!(comment.body, "nit: rename value");
+        Ok(())
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_skips_source_anchor_outside_anchored_blob() -> Result<()> {
+        let (repo_root, metadata) = pull_request_fixture_with_file_contents(
+            "feedback_plan_source_anchor_outside_blob",
+            "before\n",
+            "after\n",
+        )?;
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "outside-source-anchor",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 2)?),
+            Some("invalid source range"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert!(plan.draft.comments.is_empty());
+        assert!(plan.staged_record_ids.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![SkippedPullRequestRecord {
+                record_id: "outside-source-anchor".to_string(),
+                reason: PullRequestFeedbackSkipReason::InvalidSourceAnchorRange,
+            }]
+        );
+        let outcome = PullRequestFeedbackOutcome {
+            plan,
+            delivery: None,
+            review_url: None,
+            submission: None,
+        };
+        assert!(
+            pull_request_feedback_outcome_lines(&metadata.pr, &outcome, true)
+                .iter()
+                .any(|line| line
+                    == "Skipped record outside-source-anchor: source anchor range is outside the anchored source file")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_anchor_range_validation_rejects_empty_inverted_and_past_end_ranges() -> Result<()> {
+        let (repo_root, metadata) = pull_request_fixture_with_file_contents(
+            "feedback_plan_source_anchor_invalid_shapes",
+            "before\n",
+            "after\n",
+        )?;
+        let repo = gix::discover(&repo_root)?;
+
+        for (record_id, start_line, end_line) in [
+            ("empty-source-anchor", 1, 1),
+            ("inverted-source-anchor", 2, 1),
+            ("past-end-source-anchor", 0, 2),
+        ] {
+            let record = review_record(
+                record_id,
+                &metadata.head_sha,
+                Some(source_anchor(&metadata, start_line, end_line)?),
+                Some("invalid source range"),
+            );
+
+            let plan =
+                build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+            assert!(plan.draft.comments.is_empty());
+            assert!(plan.staged_record_ids.is_empty());
+            assert_eq!(
+                plan.skipped,
+                vec![SkippedPullRequestRecord {
+                    record_id: record_id.to_string(),
+                    reason: PullRequestFeedbackSkipReason::InvalidSourceAnchorRange,
+                }]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_anchor_range_validation_counts_terminated_and_unterminated_lines() {
+        assert_eq!(source_blob_logical_line_count(b"").unwrap(), 0);
+        assert_eq!(source_blob_logical_line_count(b"one").unwrap(), 1);
+        assert_eq!(source_blob_logical_line_count(b"one\n").unwrap(), 1);
+        assert_eq!(source_blob_logical_line_count(b"one\ntwo\n").unwrap(), 2);
+        assert_eq!(source_blob_logical_line_count(b"one\ntwo").unwrap(), 2);
+
+        let revision = CommitId::new("aaaaaaaa").unwrap();
+        let anchor = |start_line, end_line| SourceCommentAnchor {
+            revision: revision.clone(),
+            path: crate::repo_path::RepoPath::new("src/lib.rs").unwrap(),
+            start_line,
+            end_line,
+        };
+
+        assert_eq!(
+            validate_source_anchor_zero_based_half_open_range(&anchor(0, 1), 1),
+            Ok(InclusiveSourceLineRange {
+                first_line: 1,
+                last_line: 1,
+            })
+        );
+        assert_eq!(
+            validate_source_anchor_zero_based_half_open_range(&anchor(0, 3), 3),
+            Ok(InclusiveSourceLineRange {
+                first_line: 1,
+                last_line: 3,
+            })
+        );
+        assert_eq!(
+            validate_source_anchor_zero_based_half_open_range(&anchor(1, 3), 3),
+            Ok(InclusiveSourceLineRange {
+                first_line: 2,
+                last_line: 3,
+            })
+        );
+        for invalid_anchor in [anchor(0, 1), anchor(1, 1), anchor(2, 1), anchor(0, 4)] {
+            assert_eq!(
+                validate_source_anchor_zero_based_half_open_range(&invalid_anchor, 0),
+                Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange)
+            );
+        }
+    }
+
+    #[test]
+    fn source_anchor_range_validation_rejects_persisted_u32_max_without_expansion() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_plan_source_anchor_u32_max")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let mut record = review_record(
+            "max-source-anchor",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("invalid source range"),
+        );
+        record.comment_anchor = Some(CommentAnchor::Source(SourceCommentAnchor {
+            revision: metadata.head_sha,
+            path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+            start_line: 0,
+            end_line: u32::MAX,
+        }));
+        store.append(&record)?;
+
+        let database = store.load_database()?;
+        let CommentAnchor::Source(anchor) = database.records()[0]
+            .comment_anchor
+            .as_ref()
+            .ok_or_else(|| anyhow!("persisted source anchor must be present"))?
+        else {
+            panic!("persisted anchor must remain a source anchor");
+        };
+        assert_eq!(anchor.end_line, u32::MAX);
+
+        let repo = gix::discover(&repo_root)?;
+        let source_blob_line_count =
+            source_blob_line_count_in_revision(&repo, &anchor.revision, &anchor.path)?
+                .ok_or_else(|| anyhow!("fixture source blob must exist"))?;
+        assert_eq!(
+            validate_source_anchor_zero_based_half_open_range(anchor, source_blob_line_count),
+            Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn translate_source_anchor_to_head_maps_multiline_range_after_insertion() -> Result<()> {
+        let repo_root = temp_git_repo("feedback_plan_source_anchor_multiline_shift");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        fs::write(&file_path, "seed\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "alpha\nbravo\ncharlie\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Add anchored lines"]);
+        let anchor_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "intro\nalpha\nbravo\ncharlie\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(
+            &repo_root,
+            &["commit", "-m", "Insert before anchored lines"],
+        );
+        let head_sha = commit_id_at_head(&repo_root)?;
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha.clone(),
+            vec![
+                (anchor_sha.clone(), "Add anchored lines"),
+                (head_sha, "Insert before anchored lines"),
+            ],
+        );
+        let repo = gix::discover(&repo_root)?;
+        let anchor = SourceCommentAnchor {
+            revision: anchor_sha,
+            path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+            start_line: 1,
+            end_line: 3,
+        };
+
+        let translated = match translate_source_anchor_to_head(&repo, &metadata, &anchor)? {
+            Ok(translated) => translated,
+            Err(reason) => return Err(anyhow!("expected contiguous source lines: {reason}")),
+        };
+        assert_eq!(translated.first_line, 3);
+        assert_eq!(translated.last_line, 4);
+
+        let record = review_record(
+            "multiline-source-anchor",
+            &metadata.head_sha,
+            Some(CommentAnchor::Source(anchor)),
+            Some("multiline note"),
+        );
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+        assert_eq!(plan.draft.comments.len(), 1);
+        assert_eq!(plan.draft.comments[0].start_line, Some(3));
+        assert_eq!(plan.draft.comments[0].line, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn translate_source_anchor_to_head_reports_valid_line_deleted_later() -> Result<()> {
+        let repo_root = temp_git_repo("feedback_plan_source_anchor_deleted");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        fs::write(&file_path, "seed\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "alpha\nbravo\ncharlie\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Add anchored line"]);
+        let anchor_sha = commit_id_at_head(&repo_root)?;
+
+        fs::write(&file_path, "alpha\ncharlie\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Delete anchored line"]);
+        let head_sha = commit_id_at_head(&repo_root)?;
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha.clone(),
+            vec![
+                (anchor_sha.clone(), "Add anchored line"),
+                (head_sha, "Delete anchored line"),
+            ],
+        );
+        let repo = gix::discover(&repo_root)?;
+        let anchor = SourceCommentAnchor {
+            revision: anchor_sha,
+            path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+            start_line: 1,
+            end_line: 2,
+        };
+
+        assert_eq!(
+            translate_source_anchor_to_head(&repo, &metadata, &anchor)?,
+            Err(PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit)
+        );
         Ok(())
     }
 
