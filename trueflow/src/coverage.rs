@@ -1,7 +1,9 @@
+use crate::block::{Block, ByteSpan};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::{Identity, Record, ReviewCheck, ReviewDatabase, ReviewTargetRef, Verdict};
-use crate::tree::{Tree, TreeNodeId, TreeNodeKind};
+use crate::sub_splitter::{self, SubSplitSemantics};
+use crate::tree::{Tree, TreeNode, TreeNodeId, TreeNodeKind};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -22,11 +24,52 @@ pub enum BindingRelation {
 pub enum CoverageDiagnostic {
     AmbiguousRecord {
         record_id: String,
-        candidate_nodes: Vec<TreeNodeId>,
+        candidates: Vec<CoverageCandidate>,
     },
     UnresolvedRecord {
         record_id: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoverageCandidate {
+    Block {
+        path: RepoPath,
+        hash: crate::store::TreeHash,
+        start_line: usize,
+        end_line: usize,
+        start_byte: usize,
+        end_byte: usize,
+    },
+    TreeNode {
+        node_id: TreeNodeId,
+        path: RepoPath,
+        hash: crate::store::TreeHash,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CoverageUnitId {
+    Node(TreeNodeId),
+    Generated(CoverageBlockLocator),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CoverageBlockLocator {
+    path: RepoPath,
+    hash: crate::store::TreeHash,
+    byte_span: ByteSpan,
+}
+
+impl CoverageBlockLocator {
+    fn new(path: &RepoPath, block: &Block) -> Self {
+        Self {
+            path: path.clone(),
+            hash: block.hash.clone(),
+            byte_span: block.byte_span(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +127,9 @@ impl CoveragePolicy {
 pub struct CoverageIndex<'a> {
     tree: &'a Tree,
     database: &'a ReviewDatabase,
-    workdir_prefix: Option<String>,
     diagnostics: Vec<CoverageDiagnostic>,
-    node_facts: HashMap<TreeNodeId, NodeCoverageFacts>,
+    unit_facts: HashMap<CoverageUnitId, CoverageFacts>,
+    block_units: HashMap<CoverageBlockLocator, CoverageUnitId>,
     record_bindings: HashMap<String, RecordBinding>,
 }
 
@@ -96,57 +139,52 @@ impl<'a> CoverageIndex<'a> {
         database: &'a ReviewDatabase,
         options: &CoverageBuildOptions,
     ) -> anyhow::Result<Self> {
-        let lookups = TreeCoverageLookups::from_tree(tree);
+        let lookups = CoverageLookups::from_tree(tree);
         let mut coverage = Self {
             tree,
             database,
-            workdir_prefix: options.workdir_prefix.clone(),
             diagnostics: Vec::new(),
-            node_facts: HashMap::new(),
+            unit_facts: HashMap::new(),
+            block_units: lookups.block_units.clone(),
             record_bindings: HashMap::new(),
         };
 
         for (record_index, record) in database.records().iter().enumerate() {
             match lookups.bind_record(record, options.workdir_prefix.as_deref()) {
                 Ok(binding) => {
-                    coverage
-                        .node_facts
-                        .entry(binding.node_id)
-                        .or_default()
-                        .linked_record_indices
-                        .push(record_index);
-                    coverage
-                        .node_facts
-                        .entry(binding.node_id)
-                        .or_default()
-                        .direct_record_indices
-                        .push(record_index);
+                    let facts = coverage
+                        .unit_facts
+                        .entry(binding.unit_id.clone())
+                        .or_default();
+                    facts.linked_record_indices.push(record_index);
+                    facts.direct_record_indices.push(record_index);
                     coverage.record_bindings.insert(record.id.clone(), binding);
                 }
-                Err(CoverageDiagnostic::AmbiguousRecord {
+                Err(RecordBindingFailure::Ambiguous {
                     record_id,
-                    candidate_nodes,
+                    candidates,
                 }) => {
-                    for node_id in &candidate_nodes {
+                    for unit_id in &candidates {
                         coverage
-                            .node_facts
-                            .entry(*node_id)
+                            .unit_facts
+                            .entry(unit_id.clone())
                             .or_default()
                             .linked_record_indices
                             .push(record_index);
                     }
                     coverage
                         .diagnostics
-                        .push(CoverageDiagnostic::AmbiguousRecord {
-                            record_id,
-                            candidate_nodes,
-                        });
+                        .push(lookups.ambiguous_diagnostic(record_id, candidates));
                 }
-                Err(diagnostic) => coverage.diagnostics.push(diagnostic),
+                Err(RecordBindingFailure::Unresolved { record_id }) => {
+                    coverage
+                        .diagnostics
+                        .push(CoverageDiagnostic::UnresolvedRecord { record_id });
+                }
             }
         }
 
-        for facts in coverage.node_facts.values_mut() {
+        for facts in coverage.unit_facts.values_mut() {
             facts.finalize(database.records());
         }
 
@@ -170,32 +208,27 @@ impl<'a> CoverageIndex<'a> {
         }
     }
 
-    pub fn block(&'a self, path: &RepoPath, block: &crate::block::Block) -> BlockCoverage<'a> {
+    pub fn block(&'a self, path: &RepoPath, block: &Block) -> BlockCoverage<'a> {
         let resolved_node_id = self.tree.find_block_node(path.as_str(), block);
         let container_node_id = resolved_node_id
             .or_else(|| self.smallest_covering_block_node(path, block))
             .or_else(|| self.tree.find_by_path(path.as_str()));
-
-        let (direct_record_indices, linked_record_indices) = if let Some(node_id) = resolved_node_id
-        {
-            (
-                self.direct_record_indices_for_node(node_id),
-                self.linked_record_indices_for_node(node_id),
-            )
-        } else {
-            let direct = self.matching_record_indices_for_block(path, block);
-            (direct.clone(), direct)
-        };
+        let locator = CoverageBlockLocator::new(path, block);
+        let facts = self
+            .block_units
+            .get(&locator)
+            .and_then(|unit_id| self.unit_facts.get(unit_id));
 
         BlockCoverage {
             index: self,
             resolved_node_id,
             container_node_id,
-            path: path.clone(),
-            block_hash: block.hash.clone(),
-            block_start_line: block.start_line,
-            direct_record_indices,
-            linked_record_indices,
+            direct_record_indices: facts
+                .map(|facts| facts.direct_record_indices.clone())
+                .unwrap_or_default(),
+            linked_record_indices: facts
+                .map(|facts| facts.linked_record_indices.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -211,47 +244,28 @@ impl<'a> CoverageIndex<'a> {
     }
 
     fn direct_record_indices_for_node(&self, node_id: TreeNodeId) -> Vec<usize> {
-        self.node_facts
-            .get(&node_id)
+        self.direct_record_indices_for_unit(&CoverageUnitId::Node(node_id))
+    }
+
+    fn linked_record_indices_for_node(&self, node_id: TreeNodeId) -> Vec<usize> {
+        self.linked_record_indices_for_unit(&CoverageUnitId::Node(node_id))
+    }
+
+    fn direct_record_indices_for_unit(&self, unit_id: &CoverageUnitId) -> Vec<usize> {
+        self.unit_facts
+            .get(unit_id)
             .map(|facts| facts.direct_record_indices.clone())
             .unwrap_or_default()
     }
 
-    fn linked_record_indices_for_node(&self, node_id: TreeNodeId) -> Vec<usize> {
-        self.node_facts
-            .get(&node_id)
+    fn linked_record_indices_for_unit(&self, unit_id: &CoverageUnitId) -> Vec<usize> {
+        self.unit_facts
+            .get(unit_id)
             .map(|facts| facts.linked_record_indices.clone())
             .unwrap_or_default()
     }
 
-    fn matching_record_indices_for_block(
-        &self,
-        path: &RepoPath,
-        block: &crate::block::Block,
-    ) -> Vec<usize> {
-        let path_candidates = collect_path_candidates(path, self.workdir_prefix.as_deref());
-        let Ok(start_line) = u32::try_from(block.start_line) else {
-            return Vec::new();
-        };
-
-        let matched = self
-            .database
-            .records()
-            .iter()
-            .enumerate()
-            .filter_map(|(record_index, record)| {
-                record_match_relation_for_block(record, &block.hash, start_line, &path_candidates)
-                    .map(|_| record_index)
-            })
-            .collect::<Vec<_>>();
-        sort_record_indices(matched, self.database.records())
-    }
-
-    fn smallest_covering_block_node(
-        &self,
-        path: &RepoPath,
-        block: &crate::block::Block,
-    ) -> Option<TreeNodeId> {
+    fn smallest_covering_block_node(&self, path: &RepoPath, block: &Block) -> Option<TreeNodeId> {
         self.tree
             .nodes()
             .iter()
@@ -339,8 +353,8 @@ impl<'a> NodeCoverage<'a> {
 
     pub fn direct_distinct_identity_count(&self, check: &ReviewCheck) -> usize {
         self.index
-            .node_facts
-            .get(&self.node_id)
+            .unit_facts
+            .get(&CoverageUnitId::Node(self.node_id))
             .and_then(|facts| facts.direct_identities_by_check.get(check))
             .map_or(0, HashSet::len)
     }
@@ -348,7 +362,11 @@ impl<'a> NodeCoverage<'a> {
     pub fn effective_distinct_identity_count(&self, check: &ReviewCheck) -> usize {
         let mut identities = HashSet::new();
         for ancestor_id in self.index.tree.ancestors(self.node_id) {
-            let Some(facts) = self.index.node_facts.get(&ancestor_id) else {
+            let Some(facts) = self
+                .index
+                .unit_facts
+                .get(&CoverageUnitId::Node(ancestor_id))
+            else {
                 continue;
             };
             let Some(check_identities) = facts.direct_identities_by_check.get(check) else {
@@ -424,9 +442,6 @@ pub struct BlockCoverage<'a> {
     index: &'a CoverageIndex<'a>,
     resolved_node_id: Option<TreeNodeId>,
     container_node_id: Option<TreeNodeId>,
-    path: RepoPath,
-    block_hash: crate::store::TreeHash,
-    block_start_line: usize,
     direct_record_indices: Vec<usize>,
     linked_record_indices: Vec<usize>,
 }
@@ -437,9 +452,6 @@ impl<'a> BlockCoverage<'a> {
     }
 
     pub fn direct_records(&self) -> Vec<&'a Record> {
-        if let Some(node_id) = self.resolved_node_id {
-            return self.index.node(node_id).direct_records();
-        }
         self.direct_record_indices
             .iter()
             .map(|index| &self.index.database.records()[*index])
@@ -454,13 +466,9 @@ impl<'a> BlockCoverage<'a> {
     }
 
     pub fn effective_records(&self) -> Vec<&'a Record> {
-        if let Some(node_id) = self.resolved_node_id {
-            return self.index.node(node_id).effective_records();
-        }
-
         let mut record_indices = self.direct_record_indices.clone();
-        if let Some(container_node_id) = self.container_node_id {
-            for ancestor_id in self.index.tree.ancestors(container_node_id) {
+        if let Some(node_id) = self.resolved_node_id.or(self.container_node_id) {
+            for ancestor_id in self.index.tree.ancestors(node_id) {
                 record_indices.extend(self.index.direct_record_indices_for_node(ancestor_id));
             }
         }
@@ -472,25 +480,11 @@ impl<'a> BlockCoverage<'a> {
     }
 
     pub fn direct_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
-        if let Some(node_id) = self.resolved_node_id {
-            return self.index.node(node_id).direct_latest_verdict_for(check);
-        }
-
-        let path_candidates =
-            collect_path_candidates(&self.path, self.index.workdir_prefix.as_deref());
-        let start_line = u32::try_from(self.block_start_line).ok()?;
         let record_index = preferred_record_index_for_check(
             self.index.database.records(),
             &self.direct_record_indices,
             check,
-            |record_index| {
-                record_match_relation_for_block(
-                    &self.index.database.records()[record_index],
-                    &self.block_hash,
-                    start_line,
-                    &path_candidates,
-                )
-            },
+            |record_index| self.index.binding_relation_for_record_index(record_index),
         )?;
         Some(&self.index.database.records()[record_index].verdict)
     }
@@ -608,18 +602,29 @@ impl<'a> SubtreeCoverage<'a> {
 
 #[derive(Debug, Clone)]
 struct RecordBinding {
-    node_id: TreeNodeId,
+    unit_id: CoverageUnitId,
     relation: BindingRelation,
 }
 
+#[derive(Debug)]
+enum RecordBindingFailure {
+    Ambiguous {
+        record_id: String,
+        candidates: Vec<CoverageUnitId>,
+    },
+    Unresolved {
+        record_id: String,
+    },
+}
+
 #[derive(Debug, Default)]
-struct NodeCoverageFacts {
+struct CoverageFacts {
     linked_record_indices: Vec<usize>,
     direct_record_indices: Vec<usize>,
     direct_identities_by_check: HashMap<ReviewCheck, HashSet<String>>,
 }
 
-impl NodeCoverageFacts {
+impl CoverageFacts {
     fn finalize(&mut self, records: &[Record]) {
         self.linked_record_indices =
             sort_record_indices(self.linked_record_indices.clone(), records);
@@ -637,69 +642,138 @@ impl NodeCoverageFacts {
 }
 
 #[derive(Debug, Default)]
-struct TreeCoverageLookups {
-    block_exact: HashMap<(RepoPath, crate::store::TreeHash, u32), Vec<TreeNodeId>>,
-    block_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<TreeNodeId>>,
-    block_by_hash: HashMap<crate::store::TreeHash, Vec<TreeNodeId>>,
-    file_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<TreeNodeId>>,
-    file_by_hash: HashMap<crate::store::TreeHash, Vec<TreeNodeId>>,
-    tree_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<TreeNodeId>>,
-    tree_by_hash: HashMap<crate::store::TreeHash, Vec<TreeNodeId>>,
+struct CoverageLookups {
+    block_units: HashMap<CoverageBlockLocator, CoverageUnitId>,
+    block_exact: HashMap<(RepoPath, crate::store::TreeHash, u32), Vec<CoverageUnitId>>,
+    block_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<CoverageUnitId>>,
+    block_by_hash: HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
+    file_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<CoverageUnitId>>,
+    file_by_hash: HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
+    tree_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<CoverageUnitId>>,
+    tree_by_hash: HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
+    candidate_descriptions: HashMap<CoverageUnitId, CoverageCandidate>,
 }
 
-impl TreeCoverageLookups {
+impl CoverageLookups {
     fn from_tree(tree: &Tree) -> Self {
         let mut lookups = Self::default();
 
         for node in tree.nodes() {
             match node.kind {
-                TreeNodeKind::Block => {
-                    let Some(block) = node.block.as_ref() else {
-                        continue;
-                    };
-                    push_lookup(
-                        &mut lookups.block_exact,
-                        (
-                            node.path.clone(),
-                            node.hash.clone(),
-                            u32::try_from(block.start_line).unwrap_or(u32::MAX),
-                        ),
-                        node.id,
-                    );
-                    push_lookup(
-                        &mut lookups.block_by_path_hash,
-                        (node.path.clone(), node.hash.clone()),
-                        node.id,
-                    );
-                    push_lookup(&mut lookups.block_by_hash, node.hash.clone(), node.id);
-                }
+                TreeNodeKind::Block => lookups.register_tree_block(node),
                 TreeNodeKind::File => {
+                    let unit_id = lookups.register_tree_node(node);
                     push_lookup(
                         &mut lookups.file_by_path_hash,
                         (node.path.clone(), node.hash.clone()),
-                        node.id,
+                        unit_id.clone(),
                     );
-                    push_lookup(&mut lookups.file_by_hash, node.hash.clone(), node.id);
+                    push_lookup(&mut lookups.file_by_hash, node.hash.clone(), unit_id);
                 }
                 TreeNodeKind::Root | TreeNodeKind::Directory => {
+                    let unit_id = lookups.register_tree_node(node);
                     push_lookup(
                         &mut lookups.tree_by_path_hash,
                         (node.path.clone(), node.hash.clone()),
-                        node.id,
+                        unit_id.clone(),
                     );
-                    push_lookup(&mut lookups.tree_by_hash, node.hash.clone(), node.id);
+                    push_lookup(&mut lookups.tree_by_hash, node.hash.clone(), unit_id);
                 }
+            }
+        }
+
+        for node in tree.nodes() {
+            let Some(block) = node.block.as_ref() else {
+                continue;
+            };
+            let Some(language) = node.language else {
+                continue;
+            };
+            let Ok(split) = sub_splitter::split_result(block, language) else {
+                continue;
+            };
+            if split.semantics != SubSplitSemantics::ReviewUnits {
+                continue;
+            }
+            for generated_block in split.blocks {
+                lookups.register_generated_block(node.path.clone(), &generated_block);
             }
         }
 
         lookups
     }
 
+    fn register_tree_node(&mut self, node: &TreeNode) -> CoverageUnitId {
+        let unit_id = CoverageUnitId::Node(node.id);
+        self.candidate_descriptions
+            .entry(unit_id.clone())
+            .or_insert_with(|| CoverageCandidate::TreeNode {
+                node_id: node.id,
+                path: node.path.clone(),
+                hash: node.hash.clone(),
+            });
+        unit_id
+    }
+
+    fn register_tree_block(&mut self, node: &TreeNode) {
+        let Some(block) = node.block.as_ref() else {
+            return;
+        };
+        self.register_block_candidate(node.path.clone(), block, Some(node.id));
+    }
+
+    fn register_generated_block(&mut self, path: RepoPath, block: &Block) {
+        self.register_block_candidate(path, block, None);
+    }
+
+    fn register_block_candidate(
+        &mut self,
+        path: RepoPath,
+        block: &Block,
+        tree_node_id: Option<TreeNodeId>,
+    ) {
+        let locator = CoverageBlockLocator::new(&path, block);
+        if self.block_units.contains_key(&locator) {
+            return;
+        }
+
+        let unit_id = match tree_node_id {
+            Some(node_id) => CoverageUnitId::Node(node_id),
+            None => CoverageUnitId::Generated(locator.clone()),
+        };
+        self.block_units.insert(locator, unit_id.clone());
+        self.candidate_descriptions.insert(
+            unit_id.clone(),
+            CoverageCandidate::Block {
+                path: path.clone(),
+                hash: block.hash.clone(),
+                start_line: block.start_line,
+                end_line: block.end_line,
+                start_byte: block.start_byte,
+                end_byte: block.end_byte,
+            },
+        );
+
+        if let Ok(start_line) = u32::try_from(block.start_line) {
+            push_lookup(
+                &mut self.block_exact,
+                (path.clone(), block.hash.clone(), start_line),
+                unit_id.clone(),
+            );
+        }
+        push_lookup(
+            &mut self.block_by_path_hash,
+            (path, block.hash.clone()),
+            unit_id.clone(),
+        );
+        push_lookup(&mut self.block_by_hash, block.hash.clone(), unit_id);
+    }
+
     fn bind_record(
         &self,
         record: &Record,
         workdir_prefix: Option<&str>,
-    ) -> Result<RecordBinding, CoverageDiagnostic> {
+    ) -> Result<RecordBinding, RecordBindingFailure> {
         match &record.target {
             ReviewTargetRef::Block { hash } => self.bind_block_record(record, hash, workdir_prefix),
             ReviewTargetRef::File { hash } => self.bind_path_target_record(
@@ -724,67 +798,68 @@ impl TreeCoverageLookups {
         record: &Record,
         hash: &crate::store::TreeHash,
         workdir_prefix: Option<&str>,
-    ) -> Result<RecordBinding, CoverageDiagnostic> {
+    ) -> Result<RecordBinding, RecordBindingFailure> {
         if let (Some(path_hint), Some(line_hint)) = (&record.path_hint, record.line_hint) {
-            let exact_candidates = collect_path_candidates(path_hint, workdir_prefix)
-                .into_iter()
-                .flat_map(|path| {
-                    self.block_exact
-                        .get(&(path, hash.clone(), line_hint))
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                })
-                .collect::<Vec<_>>();
-            match unique_node_candidates(exact_candidates).as_slice() {
-                [node_id] => {
+            let candidates = unique_unit_candidates(
+                collect_path_candidates(path_hint, workdir_prefix)
+                    .into_iter()
+                    .flat_map(|path| {
+                        self.block_exact
+                            .get(&(path, hash.clone(), line_hint))
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                    })
+                    .collect(),
+            );
+            match candidates.as_slice() {
+                [unit_id] => {
                     return Ok(RecordBinding {
-                        node_id: *node_id,
+                        unit_id: unit_id.clone(),
                         relation: BindingRelation::Exact,
                     });
                 }
                 [] => {}
-                candidates => return Err(ambiguous_record(record, candidates.to_vec())),
+                _ => return Err(self.ambiguous_failure(record, candidates)),
             }
         }
 
         if let Some(path_hint) = &record.path_hint {
-            let path_scoped_candidates = collect_path_candidates(path_hint, workdir_prefix)
-                .into_iter()
-                .flat_map(|path| {
-                    self.block_by_path_hash
-                        .get(&(path, hash.clone()))
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                })
-                .collect::<Vec<_>>();
-            match unique_node_candidates(path_scoped_candidates).as_slice() {
-                [node_id] => {
+            let candidates = unique_unit_candidates(
+                collect_path_candidates(path_hint, workdir_prefix)
+                    .into_iter()
+                    .flat_map(|path| {
+                        self.block_by_path_hash
+                            .get(&(path, hash.clone()))
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                    })
+                    .collect(),
+            );
+            match candidates.as_slice() {
+                [unit_id] => {
                     return Ok(RecordBinding {
-                        node_id: *node_id,
+                        unit_id: unit_id.clone(),
                         relation: BindingRelation::PathScoped,
                     });
                 }
                 [] => {}
-                candidates => return Err(ambiguous_record(record, candidates.to_vec())),
+                _ => return Err(self.ambiguous_failure(record, candidates)),
             }
         }
 
-        match self
-            .block_by_hash
-            .get(hash)
-            .cloned()
-            .map(unique_node_candidates)
-            .unwrap_or_default()
-            .as_slice()
-        {
-            [node_id] => Ok(RecordBinding {
-                node_id: *node_id,
+        let candidates =
+            unique_unit_candidates(self.block_by_hash.get(hash).cloned().unwrap_or_default());
+        match candidates.as_slice() {
+            [unit_id] => Ok(RecordBinding {
+                unit_id: unit_id.clone(),
                 relation: BindingRelation::HashOnly,
             }),
-            [] => Err(unresolved_record(record)),
-            candidates => Err(ambiguous_record(record, candidates.to_vec())),
+            [] => Err(RecordBindingFailure::Unresolved {
+                record_id: record.id.clone(),
+            }),
+            _ => Err(self.ambiguous_failure(record, candidates)),
         }
     }
 
@@ -793,54 +868,86 @@ impl TreeCoverageLookups {
         record: &Record,
         hash: &crate::store::TreeHash,
         workdir_prefix: Option<&str>,
-        by_path_hash: &HashMap<(RepoPath, crate::store::TreeHash), Vec<TreeNodeId>>,
-        by_hash: &HashMap<crate::store::TreeHash, Vec<TreeNodeId>>,
-    ) -> Result<RecordBinding, CoverageDiagnostic> {
+        by_path_hash: &HashMap<(RepoPath, crate::store::TreeHash), Vec<CoverageUnitId>>,
+        by_hash: &HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
+    ) -> Result<RecordBinding, RecordBindingFailure> {
         if let Some(path_hint) = &record.path_hint {
-            let candidates = collect_path_candidates(path_hint, workdir_prefix)
-                .into_iter()
-                .flat_map(|path| {
-                    by_path_hash
-                        .get(&(path, hash.clone()))
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                })
-                .collect::<Vec<_>>();
-            match unique_node_candidates(candidates).as_slice() {
-                [node_id] => {
+            let candidates = unique_unit_candidates(
+                collect_path_candidates(path_hint, workdir_prefix)
+                    .into_iter()
+                    .flat_map(|path| {
+                        by_path_hash
+                            .get(&(path, hash.clone()))
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                    })
+                    .collect(),
+            );
+            match candidates.as_slice() {
+                [unit_id] => {
                     return Ok(RecordBinding {
-                        node_id: *node_id,
+                        unit_id: unit_id.clone(),
                         relation: BindingRelation::TargetNode,
                     });
                 }
                 [] => {}
-                candidates => return Err(ambiguous_record(record, candidates.to_vec())),
+                _ => return Err(self.ambiguous_failure(record, candidates)),
             }
         }
 
-        match by_hash
-            .get(hash)
-            .cloned()
-            .map(unique_node_candidates)
-            .unwrap_or_default()
-            .as_slice()
-        {
-            [node_id] => Ok(RecordBinding {
-                node_id: *node_id,
+        let candidates = unique_unit_candidates(by_hash.get(hash).cloned().unwrap_or_default());
+        match candidates.as_slice() {
+            [unit_id] => Ok(RecordBinding {
+                unit_id: unit_id.clone(),
                 relation: BindingRelation::HashOnly,
             }),
-            [] => Err(unresolved_record(record)),
-            candidates => Err(ambiguous_record(record, candidates.to_vec())),
+            [] => Err(RecordBindingFailure::Unresolved {
+                record_id: record.id.clone(),
+            }),
+            _ => Err(self.ambiguous_failure(record, candidates)),
+        }
+    }
+
+    fn ambiguous_failure(
+        &self,
+        record: &Record,
+        candidates: Vec<CoverageUnitId>,
+    ) -> RecordBindingFailure {
+        RecordBindingFailure::Ambiguous {
+            record_id: record.id.clone(),
+            candidates,
+        }
+    }
+
+    fn ambiguous_diagnostic(
+        &self,
+        record_id: String,
+        candidate_unit_ids: Vec<CoverageUnitId>,
+    ) -> CoverageDiagnostic {
+        let candidates = candidate_unit_ids
+            .into_iter()
+            .map(|unit_id| {
+                self.candidate_descriptions
+                    .get(&unit_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!("coverage candidate missing description for {unit_id:?}")
+                    })
+            })
+            .collect();
+        CoverageDiagnostic::AmbiguousRecord {
+            record_id,
+            candidates,
         }
     }
 }
 
-fn push_lookup<K>(entries: &mut HashMap<K, Vec<TreeNodeId>>, key: K, node_id: TreeNodeId)
+fn push_lookup<K>(entries: &mut HashMap<K, Vec<CoverageUnitId>>, key: K, unit_id: CoverageUnitId)
 where
     K: Eq + std::hash::Hash,
 {
-    entries.entry(key).or_default().push(node_id);
+    entries.entry(key).or_default().push(unit_id);
 }
 
 fn sort_record_indices(mut record_indices: Vec<usize>, records: &[Record]) -> Vec<usize> {
@@ -883,14 +990,12 @@ fn collect_path_candidates(path_hint: &RepoPath, workdir_prefix: Option<&str>) -
     candidates
 }
 
-fn unique_node_candidates(node_ids: Vec<TreeNodeId>) -> Vec<TreeNodeId> {
-    let mut unique = Vec::new();
-    for node_id in node_ids {
-        if !unique.contains(&node_id) {
-            unique.push(node_id);
-        }
-    }
-    unique
+fn unique_unit_candidates(unit_ids: Vec<CoverageUnitId>) -> Vec<CoverageUnitId> {
+    let mut seen = HashSet::new();
+    unit_ids
+        .into_iter()
+        .filter(|unit_id| seen.insert(unit_id.clone()))
+        .collect()
 }
 
 fn preferred_record_index_for_check<F>(
@@ -929,46 +1034,6 @@ where
     }
 
     best.map(|(_, record_index)| record_index)
-}
-
-fn record_match_relation_for_block(
-    record: &Record,
-    hash: &crate::store::TreeHash,
-    start_line: u32,
-    candidate_paths: &[RepoPath],
-) -> Option<BindingRelation> {
-    let ReviewTargetRef::Block { hash: record_hash } = &record.target else {
-        return None;
-    };
-    if record_hash != hash {
-        return None;
-    }
-
-    match (&record.path_hint, record.line_hint) {
-        (Some(path_hint), Some(line_hint))
-            if line_hint == start_line && candidate_paths.iter().any(|path| path == path_hint) =>
-        {
-            Some(BindingRelation::Exact)
-        }
-        (Some(path_hint), None) if candidate_paths.iter().any(|path| path == path_hint) => {
-            Some(BindingRelation::PathScoped)
-        }
-        (None, _) => Some(BindingRelation::HashOnly),
-        _ => None,
-    }
-}
-
-fn ambiguous_record(record: &Record, candidate_nodes: Vec<TreeNodeId>) -> CoverageDiagnostic {
-    CoverageDiagnostic::AmbiguousRecord {
-        record_id: record.id.clone(),
-        candidate_nodes,
-    }
-}
-
-fn unresolved_record(record: &Record) -> CoverageDiagnostic {
-    CoverageDiagnostic::UnresolvedRecord {
-        record_id: record.id.clone(),
-    }
 }
 
 fn identity_key(identity: &Identity) -> String {
@@ -1266,6 +1331,127 @@ mod tests {
                 .direct_latest_verdict_for(&ReviewCheck::review()),
             None
         );
+    }
+
+    #[test]
+    fn generated_review_unit_binding_keeps_same_line_byte_distinct_candidates() {
+        let mut source = String::from("Twin. Twin. Tail.\n");
+        for line in 0..50 {
+            source.push_str(&format!("Tail {line}.\n"));
+        }
+        let parent = Block::from_file_range(
+            &source,
+            BlockKind::Paragraph,
+            ByteSpan::new(0, source.len()),
+        )
+        .unwrap_or_else(|error| panic!("markdown parent should be source-backed: {error}"));
+        let split = crate::sub_splitter::split_result(&parent, Language::Markdown)
+            .unwrap_or_else(|error| panic!("markdown parent should split: {error}"));
+        assert_eq!(
+            split.semantics,
+            crate::sub_splitter::SubSplitSemantics::ReviewUnits
+        );
+        let twins = split
+            .blocks
+            .into_iter()
+            .filter(|block| block.content == "Twin. ")
+            .collect::<Vec<_>>();
+        assert_eq!(twins.len(), 2);
+        assert_eq!(twins[0].hash, twins[1].hash);
+        assert_eq!(twins[0].start_line, twins[1].start_line);
+        assert_ne!(twins[0].byte_span(), twins[1].byte_span());
+        assert!(!twins[0].byte_span().overlaps(&twins[1].byte_span()));
+
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "README.md".to_string(),
+            "README.md".to_string(),
+            "file-hash".to_string(),
+            Language::Markdown,
+        );
+        builder.add_block(
+            file,
+            "paragraph".to_string(),
+            "README.md".to_string(),
+            parent,
+            Language::Markdown,
+        );
+        let tree = builder.finalize();
+        let path = RepoPath::new("README.md").unwrap();
+
+        let records = vec![
+            approved_hash_only_block_record("hash-only", twins[0].hash.clone(), "a@example.com", 1),
+            TestRecord::approved(
+                "path-only",
+                ReviewTargetRef::Block {
+                    hash: twins[0].hash.clone(),
+                },
+                "b@example.com",
+                2,
+            )
+            .with_path_hint("README.md"),
+            approved_block_record(
+                "persisted-exact",
+                twins[0].hash.clone(),
+                "README.md",
+                u32::try_from(twins[0].start_line).unwrap(),
+                "c@example.com",
+                3,
+            ),
+        ];
+        let database = ReviewDatabase::from_records(records);
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+
+        for record_id in ["hash-only", "path-only", "persisted-exact"] {
+            assert_eq!(coverage.binding_relation_for_record(record_id), None);
+            let candidates = coverage
+                .diagnostics()
+                .iter()
+                .find_map(|diagnostic| match diagnostic {
+                    CoverageDiagnostic::AmbiguousRecord {
+                        record_id: diagnostic_record_id,
+                        candidates,
+                    } if diagnostic_record_id == record_id => Some(candidates),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{record_id} should be ambiguous"));
+            assert_eq!(candidates.len(), 2);
+            let byte_spans = candidates
+                .iter()
+                .map(|candidate| match candidate {
+                    CoverageCandidate::Block {
+                        path: candidate_path,
+                        hash,
+                        start_line,
+                        end_line,
+                        start_byte,
+                        end_byte,
+                    } => {
+                        assert_eq!(candidate_path, &path);
+                        assert_eq!(hash, &twins[0].hash);
+                        assert_eq!(*start_line, twins[0].start_line);
+                        assert_eq!(*end_line, twins[0].end_line);
+                        ByteSpan::new(*start_byte, *end_byte)
+                    }
+                    CoverageCandidate::TreeNode { .. } => {
+                        panic!("generated ambiguity should describe block candidates")
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(byte_spans, vec![twins[0].byte_span(), twins[1].byte_span()]);
+        }
+        for twin in &twins {
+            let block_coverage = coverage.block(&path, twin);
+            assert!(block_coverage.direct_records().is_empty());
+            assert_eq!(block_coverage.linked_records().len(), 3);
+            assert_eq!(
+                block_coverage.direct_latest_verdict_for(&ReviewCheck::review()),
+                None
+            );
+        }
     }
 
     #[test]

@@ -153,6 +153,13 @@ struct DiffReviewContext<'a> {
     review_check: &'a ReviewCheck,
 }
 
+struct DiffReviewPresentation {
+    unreviewed_files: Vec<UnreviewedFile>,
+    total_blocks: usize,
+    unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
+    commented_block_nodes: HashSet<tree::TreeNodeId>,
+}
+
 pub fn parse_review_request(
     all: bool,
     values: &[ReviewTarget],
@@ -449,8 +456,12 @@ fn collect_diff_scoped_review(
     files: Vec<crate::block::FileState>,
     diagnostics: Vec<ReviewDiagnostic>,
 ) -> Result<CollectedReview> {
-    let review_files =
-        collect_diff_review_files(query, diff_context.repo, files, diff_context.diff_targets)?;
+    let review_files = collect_diff_review_files(
+        &query.path_selection,
+        diff_context.repo,
+        files,
+        diff_context.diff_targets,
+    )?;
     let (tree, diff_block_sides, file_change_kinds, block_change_kinds) =
         build_tree_from_diff_review_files(&review_files)?;
     let coverage = CoverageIndex::build(
@@ -460,7 +471,41 @@ fn collect_diff_scoped_review(
             workdir_prefix: diff_context.workdir_prefix.map(ToOwned::to_owned),
         },
     )?;
+    let DiffReviewPresentation {
+        unreviewed_files,
+        total_blocks,
+        unreviewed_block_nodes,
+        commented_block_nodes,
+    } = collect_diff_review_presentation(
+        query,
+        &review_files,
+        &tree,
+        &coverage,
+        diff_context.review_check,
+    );
 
+    Ok(CollectedReview {
+        summary: ReviewSummary {
+            files: unreviewed_files,
+            total_blocks,
+            diagnostics,
+        },
+        tree,
+        unreviewed_block_nodes,
+        commented_block_nodes,
+        diff_block_sides,
+        file_change_kinds,
+        block_change_kinds,
+    })
+}
+
+fn collect_diff_review_presentation(
+    query: &ResolvedReviewQuery,
+    review_files: &[DiffReviewFile],
+    tree: &tree::Tree,
+    coverage: &CoverageIndex<'_>,
+    review_check: &ReviewCheck,
+) -> DiffReviewPresentation {
     let mut unreviewed_files = Vec::new();
     let mut total_blocks = 0usize;
     let mut unreviewed_block_nodes = HashSet::new();
@@ -468,9 +513,15 @@ fn collect_diff_scoped_review(
 
     for file in review_files {
         let mut unreviewed_blocks = Vec::new();
-        for review_block in file.blocks {
+        for review_block in &file.blocks {
             let display_block = review_block.display_block().clone();
+            if !query.filters.allows_block(display_block.kind) {
+                continue;
+            }
             if should_skip_whitespace_only_by_default(&display_block, &query.filters) {
+                continue;
+            }
+            if should_skip_imports_by_default(file.path.as_str(), &display_block, &query.filters) {
                 continue;
             }
             let Some(node_id) = tree.find_block_node(&file.path, &display_block) else {
@@ -485,21 +536,20 @@ fn collect_diff_scoped_review(
             }
             total_blocks += 1;
             let block_coverage = coverage.block(&file.path, &display_block);
-            let effective_verdict =
-                block_coverage.effective_latest_verdict_for(diff_context.review_check);
+            let effective_verdict = block_coverage.effective_latest_verdict_for(review_check);
             if effective_verdict == Some(&Verdict::Approved) {
                 continue;
             }
 
             if block_coverage
-                .direct_latest_verdict_for(diff_context.review_check)
+                .direct_latest_verdict_for(review_check)
                 .is_none()
                 && is_subblock_covered(
                     &display_block,
                     file.language,
                     query,
-                    &coverage,
-                    diff_context.review_check,
+                    coverage,
+                    review_check,
                     &file.path,
                 )
             {
@@ -515,7 +565,7 @@ fn collect_diff_scoped_review(
 
         if !unreviewed_blocks.is_empty() {
             unreviewed_files.push(UnreviewedFile {
-                path: file.path,
+                path: file.path.clone(),
                 language: file.language,
                 blocks: unreviewed_blocks,
             });
@@ -533,25 +583,17 @@ fn collect_diff_scoped_review(
             )
         });
     }
-
     unreviewed_files.sort_by(|a, b| {
         let rank_fn = |file: &UnreviewedFile| file.blocks.first().map_or(100, kind_rank);
         (rank_fn(a), &a.path).cmp(&(rank_fn(b), &b.path))
     });
 
-    Ok(CollectedReview {
-        summary: ReviewSummary {
-            files: unreviewed_files,
-            total_blocks,
-            diagnostics,
-        },
-        tree,
+    DiffReviewPresentation {
+        unreviewed_files,
+        total_blocks,
         unreviewed_block_nodes,
         commented_block_nodes,
-        diff_block_sides,
-        file_change_kinds,
-        block_change_kinds,
-    })
+    }
 }
 
 fn preselected_paths_for_review(path_selection: &ReviewPathSelection) -> Option<HashSet<RepoPath>> {
@@ -632,7 +674,7 @@ fn collect_target_diff_batches<'a>(
 }
 
 fn collect_diff_review_files(
-    query: &ResolvedReviewQuery,
+    path_selection: &ReviewPathSelection,
     repo: &gix::Repository,
     files: Vec<crate::block::FileState>,
     diff_targets: &[ReviewDiffTarget],
@@ -641,7 +683,7 @@ fn collect_diff_review_files(
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
-    let mut selected_paths = selected_review_paths(&query.path_selection, &head_files_by_path);
+    let mut selected_paths = selected_review_paths(path_selection, &head_files_by_path);
     selected_paths.sort();
     let mut target_batches = collect_target_diff_batches(repo, diff_targets, &selected_paths)?;
 
@@ -694,19 +736,7 @@ fn collect_diff_review_files(
             )
         });
 
-        let blocks = collect_diff_review_blocks_for_target_inputs(&target_inputs, &head_blocks)
-            .into_iter()
-            .filter(|review_block| {
-                let display_block = review_block.display_block();
-                query.filters.allows_block(display_block.kind)
-                    && !should_skip_whitespace_only_by_default(display_block, &query.filters)
-                    && !should_skip_imports_by_default(
-                        display_path.as_str(),
-                        display_block,
-                        &query.filters,
-                    )
-            })
-            .collect::<Vec<_>>();
+        let blocks = collect_diff_review_blocks_for_target_inputs(&target_inputs, &head_blocks);
         if blocks.is_empty() {
             continue;
         }
@@ -1742,6 +1772,28 @@ mod tests {
         .unwrap()
     }
 
+    fn approved_hash_only_record_for_block(block: &Block) -> Record {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "version": crate::store::CURRENT_VERSION,
+            "target": { "kind": "block", "hash": block.hash.as_str() },
+            "check": "review",
+            "verdict": "approved",
+            "identity": { "type": "email", "email": "a@example.com" },
+            "repo_ref": { "type": "vcs", "system": "git", "revision": "deadbeef" },
+            "block_state": "committed",
+            "timestamp": 1,
+            "path_hint": null,
+            "line_hint": null,
+            "note": null,
+            "comment_scope": null,
+            "comment_context": null,
+            "comment_anchor": null,
+            "attestations": null
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn structural_child_coverage_does_not_cover_container_header() {
         let source = "type User struct {\n\tName string\n\tAge int\n}\n";
@@ -1804,6 +1856,196 @@ mod tests {
             ),
             "approved structural children must not cover omitted container header"
         );
+    }
+
+    #[test]
+    fn diff_coverage_candidate_universe_precedes_display_filters() {
+        let visible_content = std::iter::once("Shared review unit.\n".to_string())
+            .chain((1..=50).map(|index| format!("Visible review unit {index}.\n")))
+            .collect::<String>();
+        let hidden_content = std::iter::once("Shared review unit.\n".to_string())
+            .chain((1..=50).map(|index| format!("Hidden review unit {index}.\n")))
+            .collect::<String>();
+        let source = format!("{visible_content}{hidden_content}");
+        let visible_parent = Block::from_file_range(
+            &source,
+            BlockKind::Paragraph,
+            ByteSpan::new(0, visible_content.len()),
+        )
+        .unwrap_or_else(|error| panic!("visible parent should be source-backed: {error:#}"));
+        let hidden_parent = Block::from_file_range(
+            &source,
+            BlockKind::Import,
+            ByteSpan::new(visible_content.len(), source.len()),
+        )
+        .unwrap_or_else(|error| panic!("hidden parent should be source-backed: {error:#}"));
+        let visible_units = sub_splitter::split_result(&visible_parent, Language::Text)
+            .unwrap_or_else(|error| panic!("visible parent should split: {error:#}"));
+        let hidden_units = sub_splitter::split_result(&hidden_parent, Language::Text)
+            .unwrap_or_else(|error| panic!("hidden parent should split: {error:#}"));
+        assert_eq!(
+            visible_units.semantics,
+            sub_splitter::SubSplitSemantics::ReviewUnits
+        );
+        assert_eq!(
+            hidden_units.semantics,
+            sub_splitter::SubSplitSemantics::ReviewUnits
+        );
+        assert!(visible_units.blocks.len() > 50);
+        assert!(hidden_units.blocks.len() > 50);
+        let visible_shared = &visible_units.blocks[0];
+        let hidden_shared = &hidden_units.blocks[0];
+        assert_eq!(visible_shared.hash, hidden_shared.hash);
+        assert_ne!(visible_shared.byte_span(), hidden_shared.byte_span());
+
+        let mut records = visible_units
+            .blocks
+            .iter()
+            .skip(1)
+            .chain(hidden_units.blocks.iter().skip(1))
+            .map(|unit| approved_record_for_block(unit, "notes.txt"))
+            .collect::<Vec<_>>();
+        records.push(approved_hash_only_record_for_block(visible_shared));
+        let database = ReviewDatabase::from_records(records);
+        let review_files = vec![DiffReviewFile {
+            path: RepoPath::new("notes.txt").unwrap(),
+            language: Language::Text,
+            file_hash: TreeHash::new("notes-tree"),
+            change_kind: FileChangeKind::Changed,
+            blocks: vec![
+                DiffReviewBlock {
+                    sides: DiffBlockSides {
+                        base: Some(visible_parent.clone()),
+                        head: Some(visible_parent.clone()),
+                    },
+                    change_kind: BlockChangeKind::Changed,
+                },
+                DiffReviewBlock {
+                    sides: DiffBlockSides {
+                        base: Some(hidden_parent.clone()),
+                        head: Some(hidden_parent.clone()),
+                    },
+                    change_kind: BlockChangeKind::Changed,
+                },
+            ],
+        }];
+        let (tree, _, _, _) = build_tree_from_diff_review_files(&review_files)
+            .unwrap_or_else(|error| panic!("complete changed diff tree should build: {error:#}"));
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let review_check = ReviewCheck::review();
+        let file_path = RepoPath::new("notes.txt").unwrap();
+        let modes = [
+            (
+                "only",
+                BlockFilters::from_lists(&[BlockKind::Paragraph], &[]),
+            ),
+            (
+                "exclude",
+                BlockFilters::from_lists(&[], &[BlockKind::Import]),
+            ),
+            ("default", BlockFilters::default()),
+        ];
+
+        for (mode, filters) in modes {
+            let query = ResolvedReviewQuery {
+                filters,
+                scan_options: ScanOptions::default(),
+                content_source: ReviewContentSource::Workdir,
+                path_selection: ReviewPathSelection::All,
+                diff_selection: ReviewDiffSelection::None,
+            };
+            assert!(
+                query.filters.allows_block(visible_parent.kind)
+                    && !should_skip_whitespace_only_by_default(&visible_parent, &query.filters)
+                    && !should_skip_imports_by_default(
+                        file_path.as_str(),
+                        &visible_parent,
+                        &query.filters,
+                    ),
+                "{mode} must retain the visible changed parent"
+            );
+            assert!(
+                !query.filters.allows_block(hidden_parent.kind)
+                    || should_skip_whitespace_only_by_default(&hidden_parent, &query.filters)
+                    || should_skip_imports_by_default(
+                        file_path.as_str(),
+                        &hidden_parent,
+                        &query.filters,
+                    ),
+                "{mode} must hide the second changed parent from presentation"
+            );
+            assert_eq!(
+                coverage
+                    .block(&file_path, visible_shared)
+                    .direct_latest_verdict_for(&review_check),
+                None,
+                "{mode} must leave the visible shared generated unit unapproved"
+            );
+            assert_eq!(
+                coverage
+                    .block(&file_path, hidden_shared)
+                    .direct_latest_verdict_for(&review_check),
+                None,
+                "{mode} must retain the hidden shared generated unit as an ambiguous candidate"
+            );
+            assert!(
+                !is_subblock_covered(
+                    &visible_parent,
+                    Language::Text,
+                    &query,
+                    &coverage,
+                    &review_check,
+                    &file_path,
+                ),
+                "{mode} must not clear the visible parent from the shared coarse approval"
+            );
+            let presentation = collect_diff_review_presentation(
+                &query,
+                &review_files,
+                &tree,
+                &coverage,
+                &review_check,
+            );
+            let visible_node = tree
+                .find_block_node(file_path.as_str(), &visible_parent)
+                .unwrap_or_else(|| panic!("{mode} visible parent should remain in the diff tree"));
+            let hidden_node = tree
+                .find_block_node(file_path.as_str(), &hidden_parent)
+                .unwrap_or_else(|| panic!("{mode} hidden parent should remain in the diff tree"));
+            assert_eq!(
+                presentation.total_blocks, 1,
+                "{mode} must count only the visible changed parent"
+            );
+            assert_eq!(
+                presentation.unreviewed_files.len(),
+                1,
+                "{mode} must present the visible parent as unreviewed"
+            );
+            assert_eq!(
+                presentation.unreviewed_files[0].blocks.len(),
+                1,
+                "{mode} must not leak the hidden parent into the visible summary"
+            );
+            assert_eq!(
+                (
+                    presentation.unreviewed_files[0].blocks[0].hash.clone(),
+                    presentation.unreviewed_files[0].blocks[0].byte_span(),
+                ),
+                (visible_parent.hash.clone(), visible_parent.byte_span()),
+                "{mode} must present only the visible parent"
+            );
+            assert!(
+                presentation.unreviewed_block_nodes.contains(&visible_node)
+                    && !presentation.unreviewed_block_nodes.contains(&hidden_node)
+                    && presentation.unreviewed_block_nodes.len() == 1,
+                "{mode} must keep hidden diff nodes out of visible unreviewed state"
+            );
+            assert!(
+                presentation.commented_block_nodes.is_empty(),
+                "{mode} must keep hidden diff nodes out of visible comment state"
+            );
+        }
     }
 
     #[test]
