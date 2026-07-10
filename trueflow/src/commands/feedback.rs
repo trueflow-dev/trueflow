@@ -9,11 +9,21 @@ use crate::feedback_export::{
 };
 use crate::feedback_since::{FeedbackSinceExpr, ResolvedFeedbackSince as ParsedFeedbackSince};
 use crate::github::{
-    GhGitHubClient, GitHubClient, GitHubCommentSide, GitHubInlineComment, GitHubReviewDraft,
-    PostedPullRequestReview, PreparedPullRequestReview, PullRequestMetadata, PullRequestRef,
-    PullRequestReviewState, ResolvedPullRequestRef, prepare_pull_request_review,
+    GhGitHubClient, GitHubClient, GitHubCommentSide, GitHubDeliveryMarker, GitHubInlineComment,
+    GitHubPullRequestDeliverySnapshot, GitHubReviewDraft, PostedPullRequestReview,
+    PreparedPullRequestReview, PullRequestMetadata, PullRequestRef, PullRequestReviewState,
+    ResolvedPullRequestRef, materialize_pending_review_delivery_body,
+    materialize_review_thread_delivery_body, parse_trueflow_delivery_marker,
+    prepare_pull_request_review,
 };
-use crate::github_delivery::{GITHUB_DELIVERY_LEDGER_FILE, GitHubDeliveryLedger};
+#[cfg(test)]
+use crate::github_delivery::{GITHUB_DELIVERY_LEDGER_FILE, GITHUB_DELIVERY_LEDGER_LOCK_FILE};
+use crate::github_delivery::{
+    GitHubDeliveryComment, GitHubDeliveryCommentReceipt, GitHubDeliveryIntent,
+    GitHubDeliveryIntentStatus, GitHubDeliveryLedger, GitHubDeliveryLedgerSession,
+    GitHubDeliveryLedgerStore, GitHubDeliveryOperation, GitHubDeliveryOperationId,
+    GitHubDeliveryPendingReview, GitHubDeliveryPendingReviewReceipt, GitHubDeliveryTerminalReason,
+};
 use crate::store::{
     CommentAnchor, CommitId, DiffCommentAnchor, FileStore, Record, RepoRef, ReviewDatabase,
     ReviewStore, SourceCommentAnchor,
@@ -453,20 +463,35 @@ where
 {
     let repo = gix::discover(repo_root)?;
     let store = FileStore::for_root(repo_root)?;
-    let ledger_path = store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE);
-    let mut ledger = GitHubDeliveryLedger::load(&ledger_path)?;
-    let ledger_changed = ledger.sync_pending_reviews(&prepared.metadata.pr, |review_id| {
-        client.pull_request_review_status(&prepared.metadata.pr, review_id)
-    })?;
-    if ledger_changed {
-        ledger.save(&ledger_path)?;
+    let ledger_store = GitHubDeliveryLedgerStore::for_directory(store.trueflow_dir());
+    let mut ledger_session = ledger_store.lock()?;
+    let delivery_snapshot = client.pull_request_delivery_snapshot(&prepared.metadata.pr)?;
+    ensure_delivery_snapshot_matches_metadata(&delivery_snapshot, &prepared.metadata)?;
+
+    if !options.dry_run {
+        reconcile_active_delivery_operations(
+            &mut ledger_session,
+            &prepared.metadata,
+            &delivery_snapshot,
+        )?;
+        reconcile_pending_delivery_reviews(
+            &mut ledger_session,
+            &prepared.metadata.pr,
+            &delivery_snapshot,
+        )?;
+        resume_prepared_delivery_operations(
+            &mut ledger_session,
+            &prepared.metadata,
+            &delivery_snapshot,
+            client,
+        )?;
     }
 
     if options.submit {
         return run_prepared_pull_request_feedback_submission(
-            &mut ledger,
-            ledger_path.as_path(),
+            &mut ledger_session,
             &prepared.metadata,
+            &delivery_snapshot,
             client,
             options.dry_run,
             options.open,
@@ -493,8 +518,9 @@ where
             options.filters,
         )?
     };
-    let excluded_ids =
-        ledger.excluded_record_ids_for_head(&prepared.metadata.pr, &prepared.metadata.head_sha);
+    let excluded_ids = ledger_session
+        .ledger()
+        .excluded_record_ids_for_head(&prepared.metadata.pr, &prepared.metadata.head_sha);
     let plan =
         build_pull_request_feedback_plan(&repo, &prepared.metadata, &records, &excluded_ids)?;
 
@@ -502,9 +528,9 @@ where
         None
     } else {
         Some(select_pull_request_feedback_delivery(
-            &ledger,
+            ledger_session.ledger(),
             &prepared.metadata,
-            client,
+            &delivery_snapshot,
         )?)
     };
 
@@ -522,39 +548,18 @@ where
         .unwrap_or(PullRequestFeedbackDelivery::CreatePendingReview)
     {
         PullRequestFeedbackDelivery::CreatePendingReview => {
-            let review = client.create_pending_pull_request_review(
-                &prepared.metadata.pr,
-                &prepared.metadata.head_sha,
-                &plan.draft,
-            )?;
-            let review_url = review.html_url.clone();
-            ledger.record_pending_review(
-                &prepared.metadata.pr,
-                review,
-                &prepared.metadata.head_sha,
-                plan.staged_record_ids.clone(),
-            );
-            review_url
+            deliver_pending_review_create(&mut ledger_session, &prepared.metadata, &plan, client)?
         }
         PullRequestFeedbackDelivery::AppendToPendingReview { review } => {
-            for staged in &plan.staged_comments {
-                client.add_comment_to_pending_pull_request_review(
-                    &prepared.metadata.pr,
-                    &review,
-                    &staged.comment,
-                )?;
-                ledger.record_pending_review(
-                    &prepared.metadata.pr,
-                    review.clone(),
-                    &prepared.metadata.head_sha,
-                    vec![staged.record_id.clone()],
-                );
-                ledger.save(&ledger_path)?;
-            }
-            review.html_url
+            deliver_pending_review_appends(
+                &mut ledger_session,
+                &prepared.metadata,
+                &plan,
+                &review,
+                client,
+            )?
         }
     };
-    ledger.save(&ledger_path)?;
 
     if options.open
         && let Err(error) = open_url(&review_url)
@@ -568,6 +573,707 @@ where
         review_url: Some(review_url),
         submission: None,
     })
+}
+
+fn ensure_delivery_snapshot_matches_metadata(
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+    metadata: &PullRequestMetadata,
+) -> Result<()> {
+    if snapshot.pr != metadata.pr {
+        return Err(anyhow!(
+            "GitHub delivery snapshot was returned for {}, expected {}",
+            snapshot.pr,
+            metadata.pr
+        ));
+    }
+    if snapshot.head_sha != metadata.head_sha {
+        return Err(anyhow!(
+            "GitHub delivery snapshot head {} does not match local pull request head {}; refusing delivery",
+            snapshot.head_sha,
+            metadata.head_sha
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_active_delivery_operations(
+    session: &mut GitHubDeliveryLedgerSession,
+    metadata: &PullRequestMetadata,
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+) -> Result<()> {
+    let active_operations = session
+        .ledger()
+        .active_operations_for(&metadata.pr)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for operation in active_operations {
+        match operation.status {
+            GitHubDeliveryIntentStatus::Prepared
+                if operation.intent.head_sha() != &metadata.head_sha =>
+            {
+                session.ledger_mut().cancel_prepared(&operation.id)?;
+                session.save()?;
+            }
+            GitHubDeliveryIntentStatus::Prepared => {}
+            GitHubDeliveryIntentStatus::InFlight => {
+                reconcile_in_flight_delivery_operation(session, metadata, snapshot, &operation)?;
+                session.save()?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resume_prepared_delivery_operations<C>(
+    session: &mut GitHubDeliveryLedgerSession,
+    metadata: &PullRequestMetadata,
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+    client: &C,
+) -> Result<()>
+where
+    C: GitHubClient,
+{
+    let operations = session
+        .ledger()
+        .active_operations_for(&metadata.pr)
+        .filter(|operation| {
+            operation.status == GitHubDeliveryIntentStatus::Prepared
+                && operation.intent.head_sha() == &metadata.head_sha
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for operation in operations {
+        let may_dispatch = match &operation.intent {
+            GitHubDeliveryIntent::CreatePendingReview { .. } => {
+                find_trueflow_pending_review(session.ledger(), metadata, snapshot)?.is_none()
+            }
+            GitHubDeliveryIntent::AppendReviewThread {
+                review_id,
+                review_node_id,
+                ..
+            } => find_trueflow_pending_review(session.ledger(), metadata, snapshot)?.is_some_and(
+                |review| {
+                    review.id == *review_id && review.node_id.as_deref() == Some(review_node_id)
+                },
+            ),
+        };
+        if !may_dispatch {
+            session.ledger_mut().cancel_prepared(&operation.id)?;
+            session.save()?;
+            continue;
+        }
+        dispatch_prepared_delivery_operation(session, metadata, &operation, client)?;
+    }
+    Ok(())
+}
+
+fn dispatch_prepared_delivery_operation<C>(
+    session: &mut GitHubDeliveryLedgerSession,
+    metadata: &PullRequestMetadata,
+    operation: &GitHubDeliveryOperation,
+    client: &C,
+) -> Result<()>
+where
+    C: GitHubClient,
+{
+    session
+        .ledger_mut()
+        .transition_to_in_flight(&operation.id)?;
+    session.save()?;
+
+    match &operation.intent {
+        GitHubDeliveryIntent::CreatePendingReview {
+            review_body,
+            comments,
+            ..
+        } => {
+            let draft = GitHubReviewDraft {
+                body: review_body.clone(),
+                comments: comments
+                    .iter()
+                    .map(|comment| comment.comment.clone())
+                    .collect(),
+            };
+            let review = client.create_pending_pull_request_review(
+                &metadata.pr,
+                &metadata.head_sha,
+                &draft,
+            )?;
+            let review_node_id = review
+                .node_id
+                .clone()
+                .filter(|node_id| !node_id.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "GitHub created pending review {} without a GraphQL node ID; leaving delivery InFlight",
+                        review.id
+                    )
+                })?;
+            session.ledger_mut().accept_create(
+                &operation.id,
+                GitHubDeliveryPendingReviewReceipt {
+                    review_id: review.id,
+                    review_node_id,
+                    html_url: review.html_url,
+                    comments: comments
+                        .iter()
+                        .map(|comment| GitHubDeliveryCommentReceipt {
+                            record_id: comment.record_id.clone(),
+                            operation_id: comment.operation_id,
+                            thread_node_id: None,
+                            comment_node_id: None,
+                        })
+                        .collect(),
+                },
+            )?;
+            session.save()
+        }
+        GitHubDeliveryIntent::AppendReviewThread {
+            review_id,
+            review_node_id,
+            review_url,
+            comment,
+            ..
+        } => {
+            let review = PostedPullRequestReview {
+                id: *review_id,
+                html_url: review_url.clone(),
+                state: PullRequestReviewState::Pending,
+                body: String::new(),
+                node_id: Some(review_node_id.clone()),
+            };
+            let receipt = client.add_comment_to_pending_pull_request_review(
+                &metadata.pr,
+                &review,
+                &comment.comment,
+                &operation.id.to_string(),
+            )?;
+            if receipt.operation_id != operation.id.to_string() {
+                return Err(anyhow!(
+                    "GitHub returned review thread receipt for operation {}, expected {}; leaving delivery InFlight",
+                    receipt.operation_id,
+                    operation.id
+                ));
+            }
+            session.ledger_mut().accept_append(
+                &operation.id,
+                GitHubDeliveryCommentReceipt {
+                    record_id: comment.record_id.clone(),
+                    operation_id: operation.id,
+                    thread_node_id: Some(receipt.thread_id),
+                    comment_node_id: None,
+                },
+            )?;
+            session.save()
+        }
+    }
+}
+
+fn reconcile_in_flight_delivery_operation(
+    session: &mut GitHubDeliveryLedgerSession,
+    metadata: &PullRequestMetadata,
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+    operation: &GitHubDeliveryOperation,
+) -> Result<()> {
+    match &operation.intent {
+        GitHubDeliveryIntent::CreatePendingReview {
+            head_sha, comments, ..
+        } => {
+            let operation_id = operation.id.to_string();
+            let matching_reviews = snapshot
+                .reviews
+                .iter()
+                .filter(|review| {
+                    (review.state == PullRequestReviewState::Pending || review.state.is_terminal())
+                        && review.viewer_did_author
+                        && review.head_sha.as_ref() == Some(head_sha)
+                        && matches!(
+                            parse_trueflow_delivery_marker(&review.body),
+                            Ok(Some(GitHubDeliveryMarker::CreatePendingReview {
+                                operation_id: marker_operation_id,
+                                head_sha: marker_head_sha,
+                            })) if marker_operation_id == operation_id && marker_head_sha == *head_sha
+                        )
+                })
+                .collect::<Vec<_>>();
+            if matching_reviews.len() != 1 {
+                return Err(unreconciled_in_flight_error(operation));
+            }
+            let review = matching_reviews[0];
+            let Some(review_id) = review.database_id.filter(|id| *id != 0) else {
+                return Err(unreconciled_in_flight_error(operation));
+            };
+
+            let comments = comments
+                .iter()
+                .map(|comment| {
+                    remote_comment_receipt(snapshot, &review.node_id, comment)?
+                        .ok_or_else(|| unreconciled_in_flight_error(operation))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            session.ledger_mut().accept_create(
+                &operation.id,
+                GitHubDeliveryPendingReviewReceipt {
+                    review_id,
+                    review_node_id: review.node_id.clone(),
+                    html_url: review.html_url.clone(),
+                    comments,
+                },
+            )?;
+            if review.state.is_terminal() {
+                session.ledger_mut().tombstone_pending_review(
+                    &metadata.pr,
+                    review_id,
+                    GitHubDeliveryTerminalReason::Submitted,
+                )?;
+            }
+            Ok(())
+        }
+        GitHubDeliveryIntent::AppendReviewThread {
+            head_sha,
+            review_id,
+            review_node_id,
+            comment,
+            ..
+        } => {
+            let Some(review) = snapshot.reviews.iter().find(|review| {
+                review.node_id == *review_node_id
+                    && review.database_id == Some(*review_id)
+                    && (review.state == PullRequestReviewState::Pending
+                        || review.state.is_terminal())
+                    && review.viewer_did_author
+                    && review.head_sha.as_ref() == Some(head_sha)
+            }) else {
+                return Err(unreconciled_in_flight_error(operation));
+            };
+            let receipt = remote_comment_receipt(snapshot, review_node_id, comment)?
+                .ok_or_else(|| unreconciled_in_flight_error(operation))?;
+            session.ledger_mut().accept_append(&operation.id, receipt)?;
+            if review.state.is_terminal() {
+                session.ledger_mut().tombstone_pending_review(
+                    &metadata.pr,
+                    *review_id,
+                    GitHubDeliveryTerminalReason::Submitted,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn remote_comment_receipt(
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+    review_node_id: &str,
+    expected: &GitHubDeliveryComment,
+) -> Result<Option<GitHubDeliveryCommentReceipt>> {
+    let expected_operation_id = expected.operation_id.to_string();
+    let mut receipts = Vec::new();
+
+    for thread in &snapshot.threads {
+        if thread.review_node_id.as_deref() != Some(review_node_id)
+            || thread.path != expected.comment.path.as_str()
+            || thread.line != Some(expected.comment.line)
+            || thread.side != Some(expected.comment.side)
+            || thread.start_line != expected.comment.start_line
+            || thread.start_side != expected.comment.start_side
+        {
+            continue;
+        }
+
+        for comment in &thread.comments {
+            let marker = parse_trueflow_delivery_marker(&comment.body)?;
+            let Some(GitHubDeliveryMarker::ReviewThread { operation_id }) = marker else {
+                continue;
+            };
+            if operation_id != expected_operation_id {
+                continue;
+            }
+            if comment.reply_to_node_id.is_some()
+                || !comment.viewer_did_author
+                || comment.review_node_id.as_deref() != Some(review_node_id)
+                || comment.body != expected.comment.body
+            {
+                return Err(anyhow!(
+                    "GitHub delivery operation {} has a conflicting remote thread acknowledgement",
+                    expected.operation_id
+                ));
+            }
+            receipts.push(GitHubDeliveryCommentReceipt {
+                record_id: expected.record_id.clone(),
+                operation_id: expected.operation_id,
+                thread_node_id: Some(thread.node_id.clone()),
+                comment_node_id: Some(comment.node_id.clone()),
+            });
+        }
+    }
+
+    match receipts.len() {
+        0 => Ok(None),
+        1 => Ok(receipts.pop()),
+        count => Err(anyhow!(
+            "GitHub delivery operation {} has {count} matching remote thread acknowledgements",
+            expected.operation_id
+        )),
+    }
+}
+
+fn unreconciled_in_flight_error(operation: &GitHubDeliveryOperation) -> anyhow::Error {
+    anyhow!(
+        "delivery operation {} remains InFlight and the GitHub snapshot does not contain one exact trueflow-owned acknowledgement; refusing new delivery mutations",
+        operation.id
+    )
+}
+
+fn reconcile_pending_delivery_reviews(
+    session: &mut GitHubDeliveryLedgerSession,
+    pr: &ResolvedPullRequestRef,
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+) -> Result<()> {
+    let pending_review_ids = session
+        .ledger()
+        .pending_reviews()
+        .iter()
+        .filter(|review| review.pr == *pr)
+        .map(|review| review.review_id)
+        .collect::<Vec<_>>();
+
+    for review_id in pending_review_ids {
+        let remote_review = snapshot
+            .reviews
+            .iter()
+            .find(|review| review.database_id == Some(review_id));
+        let reason = match remote_review {
+            None => Some(GitHubDeliveryTerminalReason::Missing),
+            Some(review) if review.state.is_terminal() => {
+                Some(GitHubDeliveryTerminalReason::Submitted)
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            session
+                .ledger_mut()
+                .tombstone_pending_review(pr, review_id, reason)?;
+            session.save()?;
+        }
+    }
+    Ok(())
+}
+
+fn deliver_pending_review_create<C>(
+    session: &mut GitHubDeliveryLedgerSession,
+    metadata: &PullRequestMetadata,
+    plan: &PullRequestFeedbackPlan,
+    client: &C,
+) -> Result<String>
+where
+    C: GitHubClient,
+{
+    let operation_id = GitHubDeliveryOperationId::new();
+    let comments = plan
+        .staged_comments
+        .iter()
+        .map(materialize_delivery_comment)
+        .collect::<Result<Vec<_>>>()?;
+    let review_body = materialize_pending_review_delivery_body(
+        &plan.draft.body,
+        &operation_id.to_string(),
+        &metadata.head_sha,
+    )?;
+    let draft = GitHubReviewDraft {
+        body: review_body.clone(),
+        comments: comments
+            .iter()
+            .map(|comment| comment.comment.clone())
+            .collect(),
+    };
+    let operation = GitHubDeliveryOperation::prepared(
+        operation_id,
+        GitHubDeliveryIntent::CreatePendingReview {
+            pr: metadata.pr.clone(),
+            head_sha: metadata.head_sha.clone(),
+            review_body,
+            comments,
+        },
+    );
+
+    session.ledger_mut().prepare(operation.clone())?;
+    session.save()?;
+    session
+        .ledger_mut()
+        .transition_to_in_flight(&operation.id)?;
+    session.save()?;
+
+    let review =
+        client.create_pending_pull_request_review(&metadata.pr, &metadata.head_sha, &draft)?;
+    let review_node_id = review
+        .node_id
+        .clone()
+        .filter(|node_id| !node_id.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "GitHub created pending review {} without a GraphQL node ID; leaving delivery InFlight",
+                review.id
+            )
+        })?;
+    let comments = operation
+        .intent
+        .comments()
+        .iter()
+        .map(|comment| GitHubDeliveryCommentReceipt {
+            record_id: comment.record_id.clone(),
+            operation_id: comment.operation_id,
+            thread_node_id: None,
+            comment_node_id: None,
+        })
+        .collect();
+    session.ledger_mut().accept_create(
+        &operation.id,
+        GitHubDeliveryPendingReviewReceipt {
+            review_id: review.id,
+            review_node_id,
+            html_url: review.html_url.clone(),
+            comments,
+        },
+    )?;
+    session.save()?;
+    Ok(review.html_url)
+}
+
+fn deliver_pending_review_appends<C>(
+    session: &mut GitHubDeliveryLedgerSession,
+    metadata: &PullRequestMetadata,
+    plan: &PullRequestFeedbackPlan,
+    review: &PostedPullRequestReview,
+    client: &C,
+) -> Result<String>
+where
+    C: GitHubClient,
+{
+    let pending = session
+        .ledger()
+        .pending_reviews()
+        .iter()
+        .find(|pending| {
+            pending.pr == metadata.pr
+                && pending.head_sha == metadata.head_sha
+                && pending.review_id == review.id
+        })
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "pending review {} is not backed by a durable v2 delivery receipt",
+                review.id
+            )
+        })?;
+
+    for staged in &plan.staged_comments {
+        let operation_id = GitHubDeliveryOperationId::new();
+        let comment = materialize_delivery_comment_with_id(staged, operation_id)?;
+        let operation = GitHubDeliveryOperation::prepared(
+            operation_id,
+            GitHubDeliveryIntent::AppendReviewThread {
+                pr: metadata.pr.clone(),
+                head_sha: metadata.head_sha.clone(),
+                review_id: pending.review_id,
+                review_node_id: pending.review_node_id.clone(),
+                review_url: pending.html_url.clone(),
+                comment,
+            },
+        );
+        session.ledger_mut().prepare(operation.clone())?;
+        session.save()?;
+        session
+            .ledger_mut()
+            .transition_to_in_flight(&operation.id)?;
+        session.save()?;
+
+        let thread = client.add_comment_to_pending_pull_request_review(
+            &metadata.pr,
+            review,
+            &operation.intent.comments()[0].comment,
+            &operation.id.to_string(),
+        )?;
+        if thread.operation_id != operation.id.to_string() {
+            return Err(anyhow!(
+                "GitHub returned review thread receipt for operation {}, expected {}; leaving delivery InFlight",
+                thread.operation_id,
+                operation.id
+            ));
+        }
+        session.ledger_mut().accept_append(
+            &operation.id,
+            GitHubDeliveryCommentReceipt {
+                record_id: operation.intent.comments()[0].record_id.clone(),
+                operation_id: operation.id,
+                thread_node_id: Some(thread.thread_id),
+                comment_node_id: None,
+            },
+        )?;
+        session.save()?;
+    }
+    Ok(review.html_url.clone())
+}
+
+fn materialize_delivery_comment(
+    staged: &StagedPullRequestComment,
+) -> Result<GitHubDeliveryComment> {
+    materialize_delivery_comment_with_id(staged, GitHubDeliveryOperationId::new())
+}
+
+fn materialize_delivery_comment_with_id(
+    staged: &StagedPullRequestComment,
+    operation_id: GitHubDeliveryOperationId,
+) -> Result<GitHubDeliveryComment> {
+    let mut comment = staged.comment.clone();
+    comment.body =
+        materialize_review_thread_delivery_body(&comment.body, &operation_id.to_string())?;
+    Ok(GitHubDeliveryComment {
+        record_id: staged.record_id.clone(),
+        operation_id,
+        comment,
+    })
+}
+
+fn run_prepared_pull_request_feedback_submission<C, O>(
+    session: &mut GitHubDeliveryLedgerSession,
+    metadata: &PullRequestMetadata,
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+    client: &C,
+    dry_run: bool,
+    open: bool,
+    mut open_url: O,
+) -> Result<PullRequestFeedbackOutcome>
+where
+    C: GitHubClient,
+    O: FnMut(&str) -> Result<()>,
+{
+    let pr = &metadata.pr;
+    let Some(review) = find_trueflow_pending_review(session.ledger(), metadata, snapshot)? else {
+        return Ok(PullRequestFeedbackOutcome {
+            plan: empty_pull_request_feedback_plan(),
+            delivery: None,
+            review_url: None,
+            submission: Some(PullRequestFeedbackSubmission::NoPendingReview),
+        });
+    };
+
+    if dry_run {
+        return Ok(PullRequestFeedbackOutcome {
+            plan: empty_pull_request_feedback_plan(),
+            delivery: None,
+            review_url: None,
+            submission: Some(PullRequestFeedbackSubmission::Target { review }),
+        });
+    }
+
+    let submitted = client.submit_pending_pull_request_review(pr, review.id)?;
+    ensure_submitted_pull_request_review_state(&submitted)?;
+    let review_url = submitted.html_url.clone();
+    session.ledger_mut().tombstone_pending_review(
+        pr,
+        review.id,
+        GitHubDeliveryTerminalReason::Submitted,
+    )?;
+    session.save()?;
+
+    if open && let Err(error) = open_url(&review_url) {
+        eprintln!("warning: failed to open submitted review URL {review_url}: {error:#}");
+    }
+
+    Ok(PullRequestFeedbackOutcome {
+        plan: empty_pull_request_feedback_plan(),
+        delivery: None,
+        review_url: Some(review_url),
+        submission: Some(PullRequestFeedbackSubmission::Submitted { review: submitted }),
+    })
+}
+
+fn ensure_submitted_pull_request_review_state(review: &PostedPullRequestReview) -> Result<()> {
+    if review.state.is_terminal() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "GitHub returned non-terminal review state {:?} after submitting review {}; leaving local pending review state unchanged",
+        review.state,
+        review.id
+    ))
+}
+
+fn empty_pull_request_feedback_plan() -> PullRequestFeedbackPlan {
+    PullRequestFeedbackPlan {
+        draft: GitHubReviewDraft {
+            body: String::new(),
+            comments: Vec::new(),
+        },
+        staged_record_ids: Vec::new(),
+        staged_comments: Vec::new(),
+        skipped: Vec::new(),
+    }
+}
+
+fn select_pull_request_feedback_delivery(
+    ledger: &GitHubDeliveryLedger,
+    metadata: &PullRequestMetadata,
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+) -> Result<PullRequestFeedbackDelivery> {
+    if let Some(review) = find_trueflow_pending_review(ledger, metadata, snapshot)? {
+        return Ok(PullRequestFeedbackDelivery::AppendToPendingReview { review });
+    }
+
+    Ok(PullRequestFeedbackDelivery::CreatePendingReview)
+}
+
+fn find_trueflow_pending_review(
+    ledger: &GitHubDeliveryLedger,
+    metadata: &PullRequestMetadata,
+    snapshot: &GitHubPullRequestDeliverySnapshot,
+) -> Result<Option<PostedPullRequestReview>> {
+    for pending in ledger.pending_reviews().iter().rev() {
+        if pending.pr != metadata.pr || pending.head_sha != metadata.head_sha {
+            continue;
+        }
+        let Some(review) = snapshot
+            .reviews
+            .iter()
+            .find(|review| review.database_id == Some(pending.review_id))
+        else {
+            continue;
+        };
+        if review.node_id != pending.review_node_id
+            || review.state != PullRequestReviewState::Pending
+            || !review.viewer_did_author
+            || review.head_sha.as_ref() != Some(&metadata.head_sha)
+            || !review_matches_pending_receipt(review.body.as_str(), pending)
+        {
+            continue;
+        }
+        return Ok(Some(PostedPullRequestReview {
+            id: pending.review_id,
+            html_url: review.html_url.clone(),
+            state: review.state,
+            body: review.body.clone(),
+            node_id: Some(review.node_id.clone()),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn review_matches_pending_receipt(body: &str, pending: &GitHubDeliveryPendingReview) -> bool {
+    let Some(operation_id) = pending.create_operation_id else {
+        return false;
+    };
+    matches!(
+        parse_trueflow_delivery_marker(body),
+        Ok(Some(GitHubDeliveryMarker::CreatePendingReview {
+            operation_id: marker_operation_id,
+            head_sha,
+        })) if marker_operation_id == operation_id.to_string() && head_sha == pending.head_sha
+    )
 }
 
 fn load_pull_request_feedback_snapshot_with<LoadDatabase>(
@@ -636,126 +1342,6 @@ fn filter_pull_request_feedback_records(
         .into_iter()
         .flat_map(|entry| entry.reviews)
         .collect())
-}
-
-fn run_prepared_pull_request_feedback_submission<C, O>(
-    ledger: &mut GitHubDeliveryLedger,
-    ledger_path: &Path,
-    metadata: &PullRequestMetadata,
-    client: &C,
-    dry_run: bool,
-    open: bool,
-    mut open_url: O,
-) -> Result<PullRequestFeedbackOutcome>
-where
-    C: GitHubClient,
-    O: FnMut(&str) -> Result<()>,
-{
-    let pr = &metadata.pr;
-    let Some(review) = find_trueflow_pending_review(ledger, pr, &metadata.head_sha, client)? else {
-        return Ok(PullRequestFeedbackOutcome {
-            plan: empty_pull_request_feedback_plan(),
-            delivery: None,
-            review_url: None,
-            submission: Some(PullRequestFeedbackSubmission::NoPendingReview),
-        });
-    };
-
-    if dry_run {
-        return Ok(PullRequestFeedbackOutcome {
-            plan: empty_pull_request_feedback_plan(),
-            delivery: None,
-            review_url: None,
-            submission: Some(PullRequestFeedbackSubmission::Target { review }),
-        });
-    }
-
-    let submitted = client.submit_pending_pull_request_review(pr, review.id)?;
-    ensure_submitted_pull_request_review_state(&submitted)?;
-    let review_url = submitted.html_url.clone();
-    ledger.record_submitted_review(pr, review.id);
-    ledger.save(ledger_path)?;
-
-    if open && let Err(error) = open_url(&review_url) {
-        eprintln!("warning: failed to open submitted review URL {review_url}: {error:#}");
-    }
-
-    Ok(PullRequestFeedbackOutcome {
-        plan: empty_pull_request_feedback_plan(),
-        delivery: None,
-        review_url: Some(review_url),
-        submission: Some(PullRequestFeedbackSubmission::Submitted { review: submitted }),
-    })
-}
-
-fn ensure_submitted_pull_request_review_state(review: &PostedPullRequestReview) -> Result<()> {
-    if review.state.is_terminal() {
-        return Ok(());
-    }
-
-    Err(anyhow!(
-        "GitHub returned non-terminal review state {:?} after submitting review {}; leaving local pending review state unchanged",
-        review.state,
-        review.id
-    ))
-}
-
-fn empty_pull_request_feedback_plan() -> PullRequestFeedbackPlan {
-    PullRequestFeedbackPlan {
-        draft: GitHubReviewDraft {
-            body: String::new(),
-            comments: Vec::new(),
-        },
-        staged_record_ids: Vec::new(),
-        staged_comments: Vec::new(),
-        skipped: Vec::new(),
-    }
-}
-
-fn select_pull_request_feedback_delivery<C>(
-    ledger: &GitHubDeliveryLedger,
-    metadata: &PullRequestMetadata,
-    client: &C,
-) -> Result<PullRequestFeedbackDelivery>
-where
-    C: GitHubClient,
-{
-    if let Some(review) =
-        find_trueflow_pending_review(ledger, &metadata.pr, &metadata.head_sha, client)?
-    {
-        return Ok(PullRequestFeedbackDelivery::AppendToPendingReview { review });
-    }
-
-    Ok(PullRequestFeedbackDelivery::CreatePendingReview)
-}
-
-fn find_trueflow_pending_review<C>(
-    ledger: &GitHubDeliveryLedger,
-    pr: &ResolvedPullRequestRef,
-    head_sha: &CommitId,
-    client: &C,
-) -> Result<Option<PostedPullRequestReview>>
-where
-    C: GitHubClient,
-{
-    for pending in ledger.pending_reviews(pr).into_iter().rev() {
-        if pending.head_sha != *head_sha {
-            continue;
-        }
-        let Some(review) = client.pull_request_review_status(pr, pending.review_id)? else {
-            continue;
-        };
-        if review.state == PullRequestReviewState::Pending && review_body_is_trueflow_owned(&review)
-        {
-            return Ok(Some(review));
-        }
-    }
-
-    Ok(None)
-}
-
-fn review_body_is_trueflow_owned(review: &PostedPullRequestReview) -> bool {
-    review.body.contains(TRUEFLOW_PENDING_REVIEW_MARKER)
 }
 
 fn build_pull_request_feedback_plan(
@@ -2634,21 +3220,10 @@ mod tests {
         store.append(&old_record)?;
         store.append(&new_record)?;
 
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending.clone(),
-            &metadata.head_sha,
-            vec!["old-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(vec![pending]);
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending]);
         let prepared = prepared_review(metadata.clone());
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
@@ -2668,20 +3243,22 @@ mod tests {
         let appended = client.appended.borrow();
         assert_eq!(appended.len(), 1);
         assert_eq!(appended[0].0, 17);
-        assert_eq!(appended[0].1.body, "new note");
+        assert!(appended[0].1.body.starts_with("new note\n"));
+        assert!(matches!(
+            parse_trueflow_delivery_marker(&appended[0].1.body)?,
+            Some(GitHubDeliveryMarker::ReviewThread { .. })
+        ));
         assert_eq!(
             outcome.plan.staged_record_ids,
             vec!["new-record".to_string()]
         );
+        let ledger = delivery_ledger_snapshot(&store)?;
         assert!(
             build_pull_request_feedback_plan(
                 &repo,
                 &metadata,
                 &[old_record, new_record],
-                &GitHubDeliveryLedger::load(
-                    &store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE)
-                )?
-                .excluded_record_ids(&metadata.pr),
+                &ledger.excluded_record_ids(&metadata.pr),
             )?
             .staged_record_ids
             .is_empty()
@@ -2712,7 +3289,7 @@ mod tests {
         store.append(&new_record)?;
 
         let since = FeedbackSinceExpr::new("2")?;
-        let client = FeedbackTestGitHubClient::new(Vec::new());
+        let client = FeedbackTestGitHubClient::new(&metadata, Vec::new());
         let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback_with_filters(
             &repo_root,
@@ -2752,7 +3329,7 @@ mod tests {
             Some("function note"),
         ))?;
 
-        let client = FeedbackTestGitHubClient::new(Vec::new());
+        let client = FeedbackTestGitHubClient::new(&metadata, Vec::new());
         let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback_with_filters(
             &repo_root,
@@ -2797,7 +3374,7 @@ mod tests {
         store.append(&comment)?;
         store.append(&approval)?;
 
-        let client = FeedbackTestGitHubClient::new(Vec::new());
+        let client = FeedbackTestGitHubClient::new(&metadata, Vec::new());
         let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback_with_filters(
             &repo_root,
@@ -2841,22 +3418,11 @@ mod tests {
             Some("second note"),
         ))?;
 
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending.clone(),
-            &metadata.head_sha,
-            vec!["old-record".to_string()],
-        );
-        let ledger_path = store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE);
-        ledger.save(&ledger_path)?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(vec![pending]).with_append_failure_at(2);
+        let client =
+            FeedbackTestGitHubClient::new(&metadata, vec![pending]).with_append_failure_at(2);
         let prepared = prepared_review(metadata.clone());
         let error = run_prepared_pull_request_feedback(
             &repo_root,
@@ -2872,14 +3438,313 @@ mod tests {
         assert!(error.to_string().contains("injected append failure"));
         let appended = client.appended.borrow();
         assert_eq!(appended.len(), 1);
-        assert_eq!(appended[0].1.body, "first note");
+        assert!(appended[0].1.body.starts_with("first note\n"));
 
-        let ledger = GitHubDeliveryLedger::load(&ledger_path)?;
+        let ledger = delivery_ledger_snapshot(&store)?;
         let excluded = ledger.excluded_record_ids(&metadata.pr);
         assert!(excluded.contains("old-record"));
         assert!(excluded.contains("first-record"));
-        assert!(!excluded.contains("second-record"));
+        assert!(excluded.contains("second-record"));
+        assert!(ledger.active_operations().iter().any(|operation| {
+            operation.status == GitHubDeliveryIntentStatus::InFlight
+                && operation.intent.comments()[0].record_id == "second-record"
+        }));
 
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_persists_append_intent_and_holds_ledger_lock_during_dispatch()
+    -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_append_journal_lock")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending])
+            .with_delivery_state_probe(store.trueflow_dir().as_path())
+            .with_ledger_lock_probe(store.trueflow_dir().as_path());
+
+        run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert_eq!(*client.dispatch_observations.borrow(), 1);
+        assert_eq!(client.appended.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_persists_create_intent_before_dispatch() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_create_journal_state")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+        let client = FeedbackTestGitHubClient::new(&metadata, Vec::new())
+            .with_delivery_state_probe(store.trueflow_dir().as_path());
+
+        run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert_eq!(*client.dispatch_observations.borrow(), 1);
+        assert!(matches!(
+            parse_trueflow_delivery_marker(&client.created.borrow()[0].body)?,
+            Some(GitHubDeliveryMarker::CreatePendingReview { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_drops_cursor_guard_before_append_dispatch() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_cursor_before_append")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
+        let since = FeedbackSinceExpr::new("last")?;
+        let cursor_lock_path = crate::feedback_export::feedback_cursor_lock_path(
+            feedback_cursor_path(&store).as_path(),
+        );
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending])
+            .with_cursor_lock_probe(cursor_lock_path);
+
+        run_prepared_pull_request_feedback_with_filters(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            PullRequestFeedbackRunOptions {
+                filters: FeedbackRecordFilterParams {
+                    since: Some(&since),
+                    include_approved: true,
+                    only: &[],
+                    exclude: &[],
+                },
+                dry_run: false,
+                open: false,
+                submit: false,
+            },
+            |_| Ok(()),
+        )?;
+
+        assert_eq!(client.appended.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_fails_closed_for_unacknowledged_inflight_delivery() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_unknown_inflight")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
+        persist_in_flight_append(&store, &metadata, &pending, "stuck-record")?;
+        let client = FeedbackTestGitHubClient::new(&metadata, Vec::new());
+
+        let error = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("remains InFlight"));
+        assert!(client.created.borrow().is_empty());
+        assert!(client.appended.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_recovers_acknowledged_inflight_append_without_redispatch() -> Result<()>
+    {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_recover_inflight_append")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
+        persist_in_flight_append(&store, &metadata, &pending, "recovered-record")?;
+        let persisted = delivery_ledger_snapshot(&store)?;
+        let operation = persisted
+            .active_operations()
+            .first()
+            .ok_or_else(|| anyhow!("fixture must contain one InFlight append"))?;
+        let expected = operation.intent.comments()[0].clone();
+        let thread = crate::github::GitHubPullRequestReviewThreadSnapshot {
+            node_id: "PRT_recovered".to_string(),
+            review_node_id: pending.node_id.clone(),
+            path: expected.comment.path.as_str().to_string(),
+            line: Some(expected.comment.line),
+            side: Some(expected.comment.side),
+            start_line: expected.comment.start_line,
+            start_side: expected.comment.start_side,
+            comments: vec![
+                crate::github::GitHubPullRequestReviewThreadCommentSnapshot {
+                    node_id: "PRC_recovered".to_string(),
+                    body: expected.comment.body.clone(),
+                    state: crate::github::GitHubPullRequestReviewCommentState::Pending,
+                    review_node_id: pending.node_id.clone(),
+                    reply_to_node_id: None,
+                    viewer_did_author: true,
+                },
+            ],
+        };
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending])
+            .with_snapshot_threads(vec![thread]);
+
+        run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert!(client.created.borrow().is_empty());
+        assert!(client.appended.borrow().is_empty());
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert!(ledger.active_operations().is_empty());
+        assert!(
+            ledger
+                .pending_reviews()
+                .iter()
+                .flat_map(|review| review.comments.iter())
+                .any(|receipt| receipt.record_id == "recovered-record"
+                    && receipt.operation_id == expected.operation_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_recovers_acknowledged_inflight_create_without_redispatch() -> Result<()>
+    {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_recover_inflight_create")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let (operation, review) =
+            persist_in_flight_create(&store, &metadata, "recovered-create-record")?;
+        let expected = operation.intent.comments()[0].clone();
+        let thread = crate::github::GitHubPullRequestReviewThreadSnapshot {
+            node_id: "PRT_recovered_create".to_string(),
+            review_node_id: review.node_id.clone(),
+            path: expected.comment.path.as_str().to_string(),
+            line: Some(expected.comment.line),
+            side: Some(expected.comment.side),
+            start_line: expected.comment.start_line,
+            start_side: expected.comment.start_side,
+            comments: vec![
+                crate::github::GitHubPullRequestReviewThreadCommentSnapshot {
+                    node_id: "PRC_recovered_create".to_string(),
+                    body: expected.comment.body.clone(),
+                    state: crate::github::GitHubPullRequestReviewCommentState::Pending,
+                    review_node_id: review.node_id.clone(),
+                    reply_to_node_id: None,
+                    viewer_did_author: true,
+                },
+            ],
+        };
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![review])
+            .with_snapshot_threads(vec![thread]);
+
+        run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert!(client.created.borrow().is_empty());
+        assert!(client.appended.borrow().is_empty());
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert!(ledger.active_operations().is_empty());
+        assert!(ledger.pending_reviews().iter().any(|pending| {
+            pending.create_operation_id == Some(operation.id)
+                && pending.comments.iter().any(|receipt| {
+                    receipt.record_id == "recovered-create-record"
+                        && receipt.operation_id == expected.operation_id
+                })
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_resumes_current_head_prepared_append_with_same_operation_id()
+    -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_resume_prepared_append")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
+        let operation_id = persist_prepared_append(&store, &metadata, &pending, "prepared-record")?;
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending]);
+
+        run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata.clone()),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+
+        assert_eq!(client.appended.borrow().len(), 1);
+        assert_eq!(
+            parse_trueflow_delivery_marker(&client.appended.borrow()[0].1.body)?,
+            Some(GitHubDeliveryMarker::ReviewThread {
+                operation_id: operation_id.to_string(),
+            })
+        );
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert!(ledger.operation(&operation_id).is_none());
+        assert!(
+            ledger
+                .excluded_record_ids_for_head(&metadata.pr, &metadata.head_sha)
+                .contains("prepared-record")
+        );
         Ok(())
     }
 
@@ -2900,17 +3765,11 @@ mod tests {
             Some("new note"),
         ))?;
 
-        let edited = posted_review(17, PullRequestReviewState::Pending, "human edited body");
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            edited.clone(),
-            &metadata.head_sha,
-            vec!["old-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let mut edited =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
+        edited.body = "human edited body".to_string();
 
-        let client = FeedbackTestGitHubClient::new(vec![edited]);
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![edited]);
         let prepared = prepared_review(metadata.clone());
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
@@ -2928,8 +3787,7 @@ mod tests {
         );
         assert_eq!(client.created.borrow().len(), 1);
         assert!(client.appended.borrow().is_empty());
-        let ledger =
-            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let ledger = delivery_ledger_snapshot(&store)?;
         let excluded = ledger.excluded_record_ids(&metadata.pr);
         assert!(excluded.contains("old-record"));
         assert!(excluded.contains("new-record"));
@@ -2954,22 +3812,11 @@ mod tests {
             Some("new note"),
         ))?;
 
-        let stale_pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            stale_pending.clone(),
-            &metadata.base_sha,
-            vec!["old-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let stale_pending =
+            persist_pending_review(&store, &metadata, &metadata.base_sha, &["old-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(vec![stale_pending]);
-        let prepared = prepared_review(metadata.clone());
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![stale_pending]);
+        let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
             &prepared,
@@ -2992,7 +3839,8 @@ mod tests {
             .iter()
             .map(|comment| comment.body.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(comment_bodies, vec!["new note", "old note"]);
+        assert!(comment_bodies[0].starts_with("new note\n"));
+        assert!(comment_bodies[1].starts_with("old note\n"));
 
         Ok(())
     }
@@ -3009,45 +3857,11 @@ mod tests {
             Some("new note"),
         ))?;
 
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending.clone(),
-            &metadata.head_sha,
-            Vec::new(),
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
-
         let prepared = prepared_review(metadata.clone());
-        let append_outcome = run_prepared_pull_request_feedback(
-            &repo_root,
-            &prepared,
-            &FeedbackTestGitHubClient::new(vec![pending]),
-            true,
-            false,
-            false,
-            |_| Ok(()),
-        )?;
-        let append_lines = pull_request_feedback_outcome_lines(&metadata.pr, &append_outcome, true);
-        assert!(
-            append_lines
-                .iter()
-                .any(|line| line.contains("Would append"))
-        );
-
-        std::fs::write(
-            store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE),
-            "{\"version\":1,\"pull_requests\":[]}",
-        )?;
         let create_outcome = run_prepared_pull_request_feedback(
             &repo_root,
             &prepared,
-            &FeedbackTestGitHubClient::new(Vec::new()),
+            &FeedbackTestGitHubClient::new(&metadata, Vec::new()),
             true,
             false,
             false,
@@ -3060,6 +3874,23 @@ mod tests {
                 .any(|line| line.contains("Would create"))
         );
 
+        let pending = persist_pending_review(&store, &metadata, &metadata.head_sha, &[])?;
+        let append_outcome = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared,
+            &FeedbackTestGitHubClient::new(&metadata, vec![pending]),
+            true,
+            false,
+            false,
+            |_| Ok(()),
+        )?;
+        let append_lines = pull_request_feedback_outcome_lines(&metadata.pr, &append_outcome, true);
+        assert!(
+            append_lines
+                .iter()
+                .any(|line| line.contains("Would append"))
+        );
+
         Ok(())
     }
 
@@ -3067,21 +3898,10 @@ mod tests {
     fn pull_request_feedback_submit_transitions_staged_ids_to_delivered() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_submit_pending")?;
         let store = FileStore::for_root(&repo_root)?;
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending.clone(),
-            &metadata.head_sha,
-            vec!["staged-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["staged-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(vec![pending]);
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending]);
         let prepared = prepared_review(metadata.clone());
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
@@ -3100,9 +3920,8 @@ mod tests {
         assert_eq!(client.submitted.borrow().as_slice(), &[17]);
         assert!(client.created.borrow().is_empty());
         assert!(client.appended.borrow().is_empty());
-        let ledger =
-            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
-        assert!(ledger.pending_reviews(&metadata.pr).is_empty());
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert!(ledger.pending_reviews().is_empty());
         let excluded = ledger.excluded_record_ids(&metadata.pr);
         assert!(excluded.contains("staged-record"));
 
@@ -3114,21 +3933,10 @@ mod tests {
         let (repo_root, metadata) =
             single_commit_pull_request_fixture("feedback_submit_unknown_state")?;
         let store = FileStore::for_root(&repo_root)?;
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending.clone(),
-            &metadata.head_sha,
-            vec!["staged-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["staged-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(vec![pending])
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending])
             .with_submit_state(PullRequestReviewState::Unknown);
         let prepared = prepared_review(metadata.clone());
         let error = run_prepared_pull_request_feedback(
@@ -3148,9 +3956,8 @@ mod tests {
                 .contains("GitHub returned non-terminal review state")
         );
         assert_eq!(client.submitted.borrow().as_slice(), &[17]);
-        let ledger =
-            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
-        assert_eq!(ledger.pending_reviews(&metadata.pr).len(), 1);
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert_eq!(ledger.pending_reviews().len(), 1);
         let excluded = ledger.excluded_record_ids(&metadata.pr);
         assert!(excluded.contains("staged-record"));
 
@@ -3160,7 +3967,7 @@ mod tests {
     #[test]
     fn pull_request_feedback_submit_reports_no_pending_review() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_submit_none")?;
-        let client = FeedbackTestGitHubClient::new(Vec::new());
+        let client = FeedbackTestGitHubClient::new(&metadata, Vec::new());
         let prepared = prepared_review(metadata.clone());
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
@@ -3191,22 +3998,11 @@ mod tests {
     fn pull_request_feedback_submit_ignores_stale_ledger_review() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_submit_stale")?;
         let store = FileStore::for_root(&repo_root)?;
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending,
-            &metadata.head_sha,
-            vec!["staged-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let _pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["staged-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(Vec::new());
-        let prepared = prepared_review(metadata.clone());
+        let client = FeedbackTestGitHubClient::new(&metadata, Vec::new());
+        let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
             &prepared,
@@ -3222,9 +4018,8 @@ mod tests {
             Some(PullRequestFeedbackSubmission::NoPendingReview)
         );
         assert!(client.submitted.borrow().is_empty());
-        let ledger =
-            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
-        assert!(ledger.pending_reviews(&metadata.pr).is_empty());
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert!(ledger.pending_reviews().is_empty());
 
         Ok(())
     }
@@ -3234,22 +4029,11 @@ mod tests {
         let (repo_root, metadata) =
             single_commit_pull_request_fixture("feedback_submit_stale_head")?;
         let store = FileStore::for_root(&repo_root)?;
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending.clone(),
-            &metadata.base_sha,
-            vec!["staged-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.base_sha, &["staged-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(vec![pending]);
-        let prepared = prepared_review(metadata.clone());
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending]);
+        let prepared = prepared_review(metadata);
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
             &prepared,
@@ -3265,9 +4049,8 @@ mod tests {
             Some(PullRequestFeedbackSubmission::NoPendingReview)
         );
         assert!(client.submitted.borrow().is_empty());
-        let ledger =
-            GitHubDeliveryLedger::load(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
-        assert_eq!(ledger.pending_reviews(&metadata.pr).len(), 1);
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert_eq!(ledger.pending_reviews().len(), 1);
 
         Ok(())
     }
@@ -3276,21 +4059,10 @@ mod tests {
     fn pull_request_feedback_submit_dry_run_reports_target_review() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_submit_dry_run")?;
         let store = FileStore::for_root(&repo_root)?;
-        let pending = posted_review(
-            17,
-            PullRequestReviewState::Pending,
-            TRUEFLOW_PENDING_REVIEW_MARKER,
-        );
-        let mut ledger = GitHubDeliveryLedger::default();
-        ledger.record_pending_review(
-            &metadata.pr,
-            pending.clone(),
-            &metadata.head_sha,
-            vec!["staged-record".to_string()],
-        );
-        ledger.save(&store.trueflow_dir().join(GITHUB_DELIVERY_LEDGER_FILE))?;
+        let pending =
+            persist_pending_review(&store, &metadata, &metadata.head_sha, &["staged-record"])?;
 
-        let client = FeedbackTestGitHubClient::new(vec![pending]);
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![pending]);
         let prepared = prepared_review(metadata.clone());
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
@@ -3465,22 +4237,36 @@ mod tests {
 
     struct FeedbackTestGitHubClient {
         reviews: Vec<PostedPullRequestReview>,
+        snapshot_pr: ResolvedPullRequestRef,
+        snapshot_head: CommitId,
+        snapshot_threads: Vec<crate::github::GitHubPullRequestReviewThreadSnapshot>,
         created: RefCell<Vec<GitHubReviewDraft>>,
         appended: RefCell<Vec<(u64, GitHubInlineComment)>>,
         submitted: RefCell<Vec<u64>>,
+        dispatch_observations: RefCell<usize>,
         submit_state: PullRequestReviewState,
         append_failure_at: Option<usize>,
+        delivery_state_probe_directory: Option<std::path::PathBuf>,
+        ledger_lock_probe_directory: Option<std::path::PathBuf>,
+        cursor_lock_probe_path: Option<std::path::PathBuf>,
     }
 
     impl FeedbackTestGitHubClient {
-        fn new(reviews: Vec<PostedPullRequestReview>) -> Self {
+        fn new(metadata: &PullRequestMetadata, reviews: Vec<PostedPullRequestReview>) -> Self {
             Self {
                 reviews,
+                snapshot_pr: metadata.pr.clone(),
+                snapshot_head: metadata.head_sha.clone(),
+                snapshot_threads: Vec::new(),
                 created: RefCell::new(Vec::new()),
                 appended: RefCell::new(Vec::new()),
                 submitted: RefCell::new(Vec::new()),
+                dispatch_observations: RefCell::new(0),
                 submit_state: PullRequestReviewState::Commented,
                 append_failure_at: None,
+                delivery_state_probe_directory: None,
+                ledger_lock_probe_directory: None,
+                cursor_lock_probe_path: None,
             }
         }
 
@@ -3492,6 +4278,86 @@ mod tests {
         fn with_append_failure_at(mut self, append_failure_at: usize) -> Self {
             self.append_failure_at = Some(append_failure_at);
             self
+        }
+
+        fn with_delivery_state_probe(mut self, directory: &Path) -> Self {
+            self.delivery_state_probe_directory = Some(directory.to_path_buf());
+            self
+        }
+
+        fn with_ledger_lock_probe(mut self, directory: &Path) -> Self {
+            self.ledger_lock_probe_directory = Some(directory.to_path_buf());
+            self
+        }
+
+        fn with_cursor_lock_probe(mut self, lock_path: std::path::PathBuf) -> Self {
+            self.cursor_lock_probe_path = Some(lock_path);
+            self
+        }
+
+        fn with_snapshot_threads(
+            mut self,
+            snapshot_threads: Vec<crate::github::GitHubPullRequestReviewThreadSnapshot>,
+        ) -> Self {
+            self.snapshot_threads = snapshot_threads;
+            self
+        }
+
+        fn assert_dispatch_preconditions(&self, operation_id: &str) -> Result<()> {
+            if let Some(directory) = &self.ledger_lock_probe_directory {
+                use fs2::FileExt as _;
+
+                let lock = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(directory.join(GITHUB_DELIVERY_LEDGER_LOCK_FILE))?;
+                if lock.try_lock_exclusive().is_ok() {
+                    lock.unlock()?;
+                    anyhow::bail!(
+                        "GitHub delivery ledger lock was released before remote dispatch"
+                    );
+                }
+            }
+            if let Some(directory) = &self.delivery_state_probe_directory {
+                let raw = fs::read_to_string(directory.join(GITHUB_DELIVERY_LEDGER_FILE))?;
+                let ledger = serde_json::from_str::<GitHubDeliveryLedger>(&raw)?;
+                let Some(operation) = ledger
+                    .active_operations()
+                    .iter()
+                    .find(|operation| operation.id.to_string() == operation_id)
+                else {
+                    anyhow::bail!(
+                        "remote dispatch for {operation_id} occurred before its intent was persisted"
+                    );
+                };
+                if operation.status != GitHubDeliveryIntentStatus::InFlight {
+                    anyhow::bail!(
+                        "remote dispatch for {operation_id} observed {:?}, expected InFlight",
+                        operation.status
+                    );
+                }
+            }
+            *self.dispatch_observations.borrow_mut() += 1;
+            Ok(())
+        }
+
+        fn assert_cursor_guard_released(&self) -> Result<()> {
+            let Some(lock_path) = &self.cursor_lock_probe_path else {
+                return Ok(());
+            };
+            use fs2::FileExt as _;
+
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)?;
+            lock.try_lock_exclusive().map_err(|_error| {
+                anyhow!("feedback cursor guard remained held during remote call")
+            })?;
+            lock.unlock()?;
+            Ok(())
         }
     }
 
@@ -3509,12 +4375,17 @@ mod tests {
             _head_sha: &CommitId,
             draft: &GitHubReviewDraft,
         ) -> Result<PostedPullRequestReview> {
+            let Some(GitHubDeliveryMarker::CreatePendingReview { operation_id, .. }) =
+                parse_trueflow_delivery_marker(&draft.body)?
+            else {
+                anyhow::bail!("create dispatch did not receive a durable delivery marker");
+            };
+            self.assert_dispatch_preconditions(&operation_id)?;
+            self.assert_cursor_guard_released()?;
             self.created.borrow_mut().push(draft.clone());
-            Ok(posted_review(
-                99,
-                PullRequestReviewState::Pending,
-                TRUEFLOW_PENDING_REVIEW_MARKER,
-            ))
+            let mut review = posted_review(99, PullRequestReviewState::Pending, &draft.body);
+            review.body = draft.body.clone();
+            Ok(review)
         }
 
         fn add_comment_to_pending_pull_request_review(
@@ -3522,7 +4393,10 @@ mod tests {
             _pr: &ResolvedPullRequestRef,
             review: &PostedPullRequestReview,
             comment: &GitHubInlineComment,
-        ) -> Result<()> {
+            operation_id: &str,
+        ) -> Result<crate::github::PostedPullRequestReviewThread> {
+            self.assert_dispatch_preconditions(operation_id)?;
+            self.assert_cursor_guard_released()?;
             let append_index = self.appended.borrow().len() + 1;
             if self.append_failure_at == Some(append_index) {
                 anyhow::bail!("injected append failure at {append_index}");
@@ -3530,9 +4404,39 @@ mod tests {
             self.appended
                 .borrow_mut()
                 .push((review.id, comment.clone()));
-            Ok(())
+            Ok(crate::github::PostedPullRequestReviewThread {
+                operation_id: operation_id.to_string(),
+                thread_id: format!("THREAD_{append_index}"),
+            })
         }
 
+        fn pull_request_delivery_snapshot(
+            &self,
+            pr: &ResolvedPullRequestRef,
+        ) -> Result<crate::github::GitHubPullRequestDeliverySnapshot> {
+            if pr != &self.snapshot_pr {
+                anyhow::bail!("unexpected pull request snapshot request for {pr}");
+            }
+            self.assert_cursor_guard_released()?;
+            Ok(crate::github::GitHubPullRequestDeliverySnapshot {
+                pr: self.snapshot_pr.clone(),
+                head_sha: self.snapshot_head.clone(),
+                reviews: self
+                    .reviews
+                    .iter()
+                    .map(|review| crate::github::GitHubPullRequestReviewSnapshot {
+                        node_id: review.node_id.clone().unwrap_or_default(),
+                        database_id: Some(review.id),
+                        state: review.state,
+                        head_sha: Some(self.snapshot_head.clone()),
+                        body: review.body.clone(),
+                        html_url: review.html_url.clone(),
+                        viewer_did_author: true,
+                    })
+                    .collect(),
+                threads: self.snapshot_threads.clone(),
+            })
+        }
         fn submit_pending_pull_request_review(
             &self,
             _pr: &ResolvedPullRequestRef,
@@ -3557,6 +4461,221 @@ mod tests {
                 .find(|review| review.id == review_id)
                 .cloned())
         }
+    }
+
+    fn persist_pending_review(
+        store: &FileStore,
+        metadata: &PullRequestMetadata,
+        head_sha: &CommitId,
+        record_ids: &[&str],
+    ) -> Result<PostedPullRequestReview> {
+        let create_operation_id = GitHubDeliveryOperationId::new();
+        let body = materialize_pending_review_delivery_body(
+            TRUEFLOW_PENDING_REVIEW_MARKER,
+            &create_operation_id.to_string(),
+            head_sha,
+        )?;
+        let pending = posted_review(17, PullRequestReviewState::Pending, &body);
+        let ids = if record_ids.is_empty() {
+            vec!["__fixture_pending_record__"]
+        } else {
+            record_ids.to_vec()
+        };
+        let comments = ids
+            .into_iter()
+            .map(|record_id| {
+                Ok(GitHubDeliveryComment {
+                    record_id: record_id.to_string(),
+                    operation_id: GitHubDeliveryOperationId::new(),
+                    comment: GitHubInlineComment {
+                        path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                        line: 1,
+                        side: GitHubCommentSide::Right,
+                        start_line: None,
+                        start_side: None,
+                        body: "fixture comment".to_string(),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let receipts = comments
+            .iter()
+            .map(|comment| GitHubDeliveryCommentReceipt {
+                record_id: comment.record_id.clone(),
+                operation_id: comment.operation_id,
+                thread_node_id: None,
+                comment_node_id: None,
+            })
+            .collect();
+        let operation = GitHubDeliveryOperation::prepared(
+            create_operation_id,
+            GitHubDeliveryIntent::CreatePendingReview {
+                pr: metadata.pr.clone(),
+                head_sha: head_sha.clone(),
+                review_body: body,
+                comments,
+            },
+        );
+        let mut session = GitHubDeliveryLedgerStore::for_directory(store.trueflow_dir()).lock()?;
+        session.ledger_mut().prepare(operation.clone())?;
+        session
+            .ledger_mut()
+            .transition_to_in_flight(&operation.id)?;
+        session.ledger_mut().accept_create(
+            &operation.id,
+            GitHubDeliveryPendingReviewReceipt {
+                review_id: pending.id,
+                review_node_id: pending.node_id.clone().unwrap_or_default(),
+                html_url: pending.html_url.clone(),
+                comments: receipts,
+            },
+        )?;
+        session.save()?;
+        Ok(pending)
+    }
+
+    fn persist_in_flight_append(
+        store: &FileStore,
+        metadata: &PullRequestMetadata,
+        pending: &PostedPullRequestReview,
+        record_id: &str,
+    ) -> Result<()> {
+        let operation_id = GitHubDeliveryOperationId::new();
+        let comment = GitHubDeliveryComment {
+            record_id: record_id.to_string(),
+            operation_id,
+            comment: GitHubInlineComment {
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                line: 1,
+                side: GitHubCommentSide::Right,
+                start_line: None,
+                start_side: None,
+                body: materialize_review_thread_delivery_body(
+                    "in-flight fixture comment",
+                    &operation_id.to_string(),
+                )?,
+            },
+        };
+        let operation = GitHubDeliveryOperation::prepared(
+            operation_id,
+            GitHubDeliveryIntent::AppendReviewThread {
+                pr: metadata.pr.clone(),
+                head_sha: metadata.head_sha.clone(),
+                review_id: pending.id,
+                review_node_id: pending
+                    .node_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("fixture pending review must have a node ID"))?,
+                review_url: pending.html_url.clone(),
+                comment,
+            },
+        );
+        let mut session = GitHubDeliveryLedgerStore::for_directory(store.trueflow_dir()).lock()?;
+        session.ledger_mut().prepare(operation.clone())?;
+        session.save()?;
+        session
+            .ledger_mut()
+            .transition_to_in_flight(&operation.id)?;
+        session.save()
+    }
+
+    fn persist_in_flight_create(
+        store: &FileStore,
+        metadata: &PullRequestMetadata,
+        record_id: &str,
+    ) -> Result<(GitHubDeliveryOperation, PostedPullRequestReview)> {
+        let operation_id = GitHubDeliveryOperationId::new();
+        let comment_operation_id = GitHubDeliveryOperationId::new();
+        let comment = GitHubDeliveryComment {
+            record_id: record_id.to_string(),
+            operation_id: comment_operation_id,
+            comment: GitHubInlineComment {
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                line: 1,
+                side: GitHubCommentSide::Right,
+                start_line: None,
+                start_side: None,
+                body: materialize_review_thread_delivery_body(
+                    "in-flight create fixture comment",
+                    &comment_operation_id.to_string(),
+                )?,
+            },
+        };
+        let review_body = materialize_pending_review_delivery_body(
+            TRUEFLOW_PENDING_REVIEW_MARKER,
+            &operation_id.to_string(),
+            &metadata.head_sha,
+        )?;
+        let operation = GitHubDeliveryOperation::prepared(
+            operation_id,
+            GitHubDeliveryIntent::CreatePendingReview {
+                pr: metadata.pr.clone(),
+                head_sha: metadata.head_sha.clone(),
+                review_body: review_body.clone(),
+                comments: vec![comment],
+            },
+        );
+        let mut session = GitHubDeliveryLedgerStore::for_directory(store.trueflow_dir()).lock()?;
+        session.ledger_mut().prepare(operation.clone())?;
+        session.save()?;
+        session
+            .ledger_mut()
+            .transition_to_in_flight(&operation.id)?;
+        session.save()?;
+        let mut review = posted_review(31, PullRequestReviewState::Pending, &review_body);
+        review.body = review_body;
+        Ok((operation, review))
+    }
+
+    fn persist_prepared_append(
+        store: &FileStore,
+        metadata: &PullRequestMetadata,
+        pending: &PostedPullRequestReview,
+        record_id: &str,
+    ) -> Result<GitHubDeliveryOperationId> {
+        let operation_id = GitHubDeliveryOperationId::new();
+        let comment = GitHubDeliveryComment {
+            record_id: record_id.to_string(),
+            operation_id,
+            comment: GitHubInlineComment {
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                line: 1,
+                side: GitHubCommentSide::Right,
+                start_line: None,
+                start_side: None,
+                body: materialize_review_thread_delivery_body(
+                    "prepared fixture comment",
+                    &operation_id.to_string(),
+                )?,
+            },
+        };
+        let operation = GitHubDeliveryOperation::prepared(
+            operation_id,
+            GitHubDeliveryIntent::AppendReviewThread {
+                pr: metadata.pr.clone(),
+                head_sha: metadata.head_sha.clone(),
+                review_id: pending.id,
+                review_node_id: pending
+                    .node_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("fixture pending review must have a node ID"))?,
+                review_url: pending.html_url.clone(),
+                comment,
+            },
+        );
+        let mut session = GitHubDeliveryLedgerStore::for_directory(store.trueflow_dir()).lock()?;
+        session.ledger_mut().prepare(operation)?;
+        session.save()?;
+        Ok(operation_id)
+    }
+
+    fn delivery_ledger_snapshot(store: &FileStore) -> Result<GitHubDeliveryLedger> {
+        Ok(
+            GitHubDeliveryLedgerStore::for_directory(store.trueflow_dir())
+                .lock()?
+                .ledger()
+                .clone(),
+        )
     }
 
     fn posted_review(

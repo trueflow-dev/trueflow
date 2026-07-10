@@ -13,6 +13,143 @@ const PULL_REQUEST_REFERENCE_HELP: &str =
     "Use pr:11, pr:owner/repo/11, or https://host/owner/repo/pull/11";
 const PULL_REQUEST_REF_NAMESPACE: &str = "refs/trueflow/pr";
 const GH_MAX_PULL_REQUEST_COMMITS: usize = 100;
+pub const TRUEFLOW_PENDING_REVIEW_MARKER: &str = "<!-- trueflow:pending-review -->";
+const TRUEFLOW_DELIVERY_MARKER_OPEN: &str = "<!-- trueflow:delivery:";
+const TRUEFLOW_DELIVERY_MARKER_CLOSE: &str = "-->";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHubDeliveryMarker {
+    CreatePendingReview {
+        operation_id: String,
+        head_sha: CommitId,
+    },
+    ReviewThread {
+        operation_id: String,
+    },
+}
+
+pub fn materialize_pending_review_delivery_body(
+    body: &str,
+    operation_id: &str,
+    head_sha: &CommitId,
+) -> Result<String> {
+    let owned_body;
+    let body = if body.contains(TRUEFLOW_PENDING_REVIEW_MARKER) {
+        body
+    } else {
+        owned_body = format!("{body}\n{TRUEFLOW_PENDING_REVIEW_MARKER}");
+        &owned_body
+    };
+    append_trueflow_delivery_marker(
+        body,
+        &format!(
+            "v1 kind=create-pending-review operation={} head={}",
+            validated_delivery_operation_id(operation_id)?,
+            head_sha
+        ),
+    )
+}
+
+pub fn materialize_review_thread_delivery_body(body: &str, operation_id: &str) -> Result<String> {
+    append_trueflow_delivery_marker(
+        body,
+        &format!(
+            "v1 kind=review-thread operation={}",
+            validated_delivery_operation_id(operation_id)?
+        ),
+    )
+}
+
+pub fn parse_trueflow_delivery_marker(body: &str) -> Result<Option<GitHubDeliveryMarker>> {
+    let mut remaining = body;
+    let mut parsed_marker = None;
+
+    while let Some(marker_start) = remaining.find(TRUEFLOW_DELIVERY_MARKER_OPEN) {
+        let marker_body = &remaining[marker_start + TRUEFLOW_DELIVERY_MARKER_OPEN.len()..];
+        let marker_end = marker_body
+            .find(TRUEFLOW_DELIVERY_MARKER_CLOSE)
+            .ok_or_else(|| {
+                anyhow!("trueflow delivery marker is missing its closing comment delimiter")
+            })?;
+        let marker = parse_trueflow_delivery_marker_content(marker_body[..marker_end].trim())?;
+        if parsed_marker.replace(marker).is_some() {
+            return Err(anyhow!(
+                "trueflow delivery body contains multiple delivery markers"
+            ));
+        }
+        remaining = &marker_body[marker_end + TRUEFLOW_DELIVERY_MARKER_CLOSE.len()..];
+    }
+
+    Ok(parsed_marker)
+}
+
+fn append_trueflow_delivery_marker(body: &str, marker_content: &str) -> Result<String> {
+    if parse_trueflow_delivery_marker(body)?.is_some() {
+        return Err(anyhow!(
+            "trueflow delivery body already contains a delivery marker"
+        ));
+    }
+    Ok(format!(
+        "{body}\n<!-- trueflow:delivery:{marker_content} -->"
+    ))
+}
+
+fn validated_delivery_operation_id(operation_id: &str) -> Result<&str> {
+    if operation_id.is_empty()
+        || !operation_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err(anyhow!(
+            "trueflow delivery operation id must contain only ASCII letters, digits, or hyphens"
+        ));
+    }
+    Ok(operation_id)
+}
+
+fn parse_trueflow_delivery_marker_content(content: &str) -> Result<GitHubDeliveryMarker> {
+    let fields = content.split_ascii_whitespace().collect::<Vec<_>>();
+    let Some(version) = fields.first() else {
+        return Err(anyhow!("trueflow delivery marker is empty"));
+    };
+    if *version != "v1" {
+        return Err(anyhow!(
+            "unsupported trueflow delivery marker version {version:?}"
+        ));
+    }
+    let Some(kind) = fields.get(1).and_then(|field| field.strip_prefix("kind=")) else {
+        return Err(anyhow!("trueflow delivery marker is missing kind"));
+    };
+    let Some(operation_id) = fields
+        .get(2)
+        .and_then(|field| field.strip_prefix("operation="))
+    else {
+        return Err(anyhow!("trueflow delivery marker is missing operation"));
+    };
+    let operation_id = validated_delivery_operation_id(operation_id)?.to_string();
+
+    match kind {
+        "create-pending-review" if fields.len() == 4 => {
+            let Some(head_sha) = fields.get(3).and_then(|field| field.strip_prefix("head=")) else {
+                return Err(anyhow!(
+                    "trueflow pending-review delivery marker is missing head"
+                ));
+            };
+            Ok(GitHubDeliveryMarker::CreatePendingReview {
+                operation_id,
+                head_sha: CommitId::new(head_sha)
+                    .context("trueflow pending-review delivery marker has invalid head")?,
+            })
+        }
+        "review-thread" if fields.len() == 3 => {
+            Ok(GitHubDeliveryMarker::ReviewThread { operation_id })
+        }
+        "create-pending-review" | "review-thread" => Err(anyhow!(
+            "trueflow delivery marker has unexpected fields for {kind}"
+        )),
+        _ => Err(anyhow!("unknown trueflow delivery marker kind {kind:?}")),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PullRequestRef {
@@ -169,6 +306,134 @@ pub struct PostedPullRequestReview {
     pub body: String,
     pub node_id: Option<String>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedPullRequestReviewThread {
+    pub operation_id: String,
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPullRequestDeliverySnapshot {
+    pub pr: ResolvedPullRequestRef,
+    pub head_sha: CommitId,
+    pub reviews: Vec<GitHubPullRequestReviewSnapshot>,
+    pub threads: Vec<GitHubPullRequestReviewThreadSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPullRequestReviewSnapshot {
+    pub node_id: String,
+    pub database_id: Option<u64>,
+    pub state: PullRequestReviewState,
+    pub head_sha: Option<CommitId>,
+    pub body: String,
+    pub html_url: String,
+    pub viewer_did_author: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPullRequestReviewThreadSnapshot {
+    pub node_id: String,
+    pub review_node_id: Option<String>,
+    pub path: String,
+    pub line: Option<u32>,
+    pub side: Option<GitHubCommentSide>,
+    pub start_line: Option<u32>,
+    pub start_side: Option<GitHubCommentSide>,
+    pub comments: Vec<GitHubPullRequestReviewThreadCommentSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPullRequestReviewThreadCommentSnapshot {
+    pub node_id: String,
+    pub body: String,
+    pub state: GitHubPullRequestReviewCommentState,
+    pub review_node_id: Option<String>,
+    pub reply_to_node_id: Option<String>,
+    pub viewer_did_author: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubPullRequestReviewCommentState {
+    Pending,
+    Submitted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum PullRequestReviewThreadSubjectType {
+    Line,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddPullRequestReviewThreadInput<'a> {
+    pull_request_review_id: &'a str,
+    body: &'a str,
+    path: &'a str,
+    line: u32,
+    side: GitHubCommentSide,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_side: Option<GitHubCommentSide>,
+    subject_type: PullRequestReviewThreadSubjectType,
+    client_mutation_id: &'a str,
+}
+
+const ADD_PULL_REQUEST_REVIEW_THREAD_MUTATION: &str = r#"
+    mutation AddTrueflowPullRequestReviewThread($input: AddPullRequestReviewThreadInput!) {
+        addPullRequestReviewThread(input: $input) {
+            clientMutationId
+            thread { id }
+        }
+    }
+"#;
+
+fn build_add_pull_request_review_thread_request(
+    review_node_id: &str,
+    operation_id: &str,
+    comment: &GitHubInlineComment,
+) -> Result<String> {
+    if operation_id.trim().is_empty() {
+        return Err(anyhow!(
+            "GitHub pull request review thread operation id cannot be blank"
+        ));
+    }
+
+    match (comment.start_line, comment.start_side) {
+        (None, None) => {}
+        (Some(start_line), Some(_)) if start_line <= comment.line => {}
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "GitHub inline comment range starts after its ending line"
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "GitHub inline comment ranges must specify start_line and start_side together"
+            ));
+        }
+    }
+
+    let input = AddPullRequestReviewThreadInput {
+        pull_request_review_id: review_node_id,
+        body: &comment.body,
+        path: comment.path.as_str(),
+        line: comment.line,
+        side: comment.side,
+        start_line: comment.start_line,
+        start_side: comment.start_side,
+        subject_type: PullRequestReviewThreadSubjectType::Line,
+        client_mutation_id: operation_id,
+    };
+    serde_json::to_string(&serde_json::json!({
+        "query": ADD_PULL_REQUEST_REVIEW_THREAD_MUTATION,
+        "variables": { "input": input },
+    }))
+    .with_context(|| "failed to serialize GitHub pull request review thread request")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullRequestReviewState {
@@ -202,7 +467,12 @@ pub trait GitHubClient {
         pr: &ResolvedPullRequestRef,
         review: &PostedPullRequestReview,
         comment: &GitHubInlineComment,
-    ) -> Result<()>;
+        operation_id: &str,
+    ) -> Result<PostedPullRequestReviewThread>;
+    fn pull_request_delivery_snapshot(
+        &self,
+        pr: &ResolvedPullRequestRef,
+    ) -> Result<GitHubPullRequestDeliverySnapshot>;
     fn submit_pending_pull_request_review(
         &self,
         pr: &ResolvedPullRequestRef,
@@ -239,6 +509,23 @@ impl GitHubClient for GhGitHubClient {
         head_sha: &CommitId,
         draft: &GitHubReviewDraft,
     ) -> Result<PostedPullRequestReview> {
+        let marker = parse_trueflow_delivery_marker(&draft.body)?
+            .context("pending review draft did not include a trueflow delivery marker")?;
+        let GitHubDeliveryMarker::CreatePendingReview {
+            operation_id,
+            head_sha: marker_head_sha,
+        } = marker
+        else {
+            return Err(anyhow!(
+                "pending review draft included a review-thread delivery marker"
+            ));
+        };
+        if marker_head_sha != *head_sha {
+            return Err(anyhow!(
+                "pending review delivery marker head {marker_head_sha} did not match requested head {head_sha}"
+            ));
+        }
+
         let endpoint = format!("repos/{}/{}/pulls/{}/reviews", pr.owner, pr.repo, pr.number);
         let body = serde_json::to_string(&serde_json::json!({
             "body": draft.body,
@@ -246,7 +533,7 @@ impl GitHubClient for GhGitHubClient {
             "comments": draft.comments,
         }))?;
         let response = run_gh_api_with_body(&pr.host, "POST", &endpoint, &body)?;
-        parse_posted_pull_request_review(&response)
+        parse_created_pending_pull_request_review(&response, &operation_id, head_sha)
     }
 
     fn add_comment_to_pending_pull_request_review(
@@ -254,50 +541,41 @@ impl GitHubClient for GhGitHubClient {
         pr: &ResolvedPullRequestRef,
         review: &PostedPullRequestReview,
         comment: &GitHubInlineComment,
-    ) -> Result<()> {
+        operation_id: &str,
+    ) -> Result<PostedPullRequestReviewThread> {
         let review_node_id = review.node_id.as_ref().ok_or_else(|| {
             anyhow!(
                 "GitHub review {} did not include a GraphQL node id; cannot append comments",
                 review.id
             )
         })?;
-        let body = serde_json::to_string(&serde_json::json!({
-            "query": r#"
-                mutation AddTrueflowPullRequestReviewComment(
-                    $pullRequestReviewId: ID!,
-                    $body: String!,
-                    $path: String!,
-                    $line: Int!,
-                    $side: DiffSide!,
-                    $startLine: Int,
-                    $startSide: DiffSide
-                ) {
-                    addPullRequestReviewComment(input: {
-                        pullRequestReviewId: $pullRequestReviewId,
-                        body: $body,
-                        path: $path,
-                        line: $line,
-                        side: $side,
-                        startLine: $startLine,
-                        startSide: $startSide
-                    }) {
-                        comment { id }
-                    }
-                }
-            "#,
-            "variables": {
-                "pullRequestReviewId": review_node_id,
-                "body": comment.body.as_str(),
-                "path": comment.path.as_str(),
-                "line": comment.line,
-                "side": comment.side,
-                "startLine": comment.start_line,
-                "startSide": comment.start_side,
-            }
-        }))?;
+        let body =
+            build_add_pull_request_review_thread_request(review_node_id, operation_id, comment)?;
         let response = run_gh_api_with_body(&pr.host, "POST", "graphql", &body)?;
-        ensure_add_pull_request_review_comment_response_success(&response)?;
-        Ok(())
+        parse_add_pull_request_review_thread_response(&response, operation_id)
+    }
+    fn pull_request_delivery_snapshot(
+        &self,
+        pr: &ResolvedPullRequestRef,
+    ) -> Result<GitHubPullRequestDeliverySnapshot> {
+        let number = i32::try_from(pr.number).context("pull request number exceeds GraphQL Int")?;
+        let head_sha = fetch_pull_request_delivery_head(pr, number)?;
+        let reviews = fetch_pull_request_delivery_reviews(pr, number)?;
+        let mut threads = fetch_pull_request_delivery_threads(pr, number)?;
+        for thread in &mut threads {
+            thread.comments = fetch_pull_request_delivery_thread_comments(pr, &thread.node_id)?;
+            thread.review_node_id = Some(pull_request_delivery_thread_review_node_id(
+                &thread.node_id,
+                &thread.comments,
+            )?);
+        }
+
+        Ok(GitHubPullRequestDeliverySnapshot {
+            pr: pr.clone(),
+            head_sha,
+            reviews,
+            threads,
+        })
     }
 
     fn submit_pending_pull_request_review(
@@ -741,6 +1019,538 @@ fn run_gh_api_with_args<'a>(host: &str, args: impl IntoIterator<Item = &'a str>)
     String::from_utf8(output.stdout).with_context(|| "gh api output was not utf8".to_string())
 }
 
+const PULL_REQUEST_DELIVERY_HEAD_QUERY: &str = r#"
+    query TrueflowPullRequestDeliveryHead($owner: String!, $repo: String!, $number: Int!) {
+        repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+                headRefOid
+            }
+        }
+    }
+"#;
+const PULL_REQUEST_DELIVERY_REVIEWS_QUERY: &str = r#"
+    query TrueflowPullRequestDeliveryReviews(
+        $owner: String!, $repo: String!, $number: Int!, $after: String
+    ) {
+        repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+                reviews(first: 100, after: $after) {
+                    nodes {
+                        id
+                        fullDatabaseId
+                        url
+                        body
+                        state
+                        viewerDidAuthor
+                        commit { oid }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                }
+            }
+        }
+    }
+"#;
+const PULL_REQUEST_DELIVERY_THREADS_QUERY: &str = r#"
+    query TrueflowPullRequestDeliveryThreads(
+        $owner: String!, $repo: String!, $number: Int!, $after: String
+    ) {
+        repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+                reviewThreads(first: 100, after: $after) {
+                    nodes {
+                        id
+                        path
+                        line
+                        diffSide
+                        startLine
+                        startDiffSide
+                    }
+                    pageInfo { hasNextPage endCursor }
+                }
+            }
+        }
+    }
+"#;
+const PULL_REQUEST_DELIVERY_THREAD_COMMENTS_QUERY: &str = r#"
+    query TrueflowPullRequestDeliveryThreadComments($threadId: ID!, $after: String) {
+        node(id: $threadId) {
+            ... on PullRequestReviewThread {
+                comments(first: 100, after: $after) {
+                    nodes {
+                        id
+                        body
+                        state
+                        viewerDidAuthor
+                        pullRequestReview { id }
+                        replyTo { id }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                }
+            }
+        }
+    }
+"#;
+
+fn fetch_pull_request_delivery_head(pr: &ResolvedPullRequestRef, number: i32) -> Result<CommitId> {
+    let raw = run_github_graphql(
+        &pr.host,
+        PULL_REQUEST_DELIVERY_HEAD_QUERY,
+        &serde_json::json!({
+            "owner": pr.owner.as_str(),
+            "repo": pr.repo.as_str(),
+            "number": number,
+        }),
+    )?;
+    parse_pull_request_delivery_head_response(&raw)
+}
+
+fn fetch_pull_request_delivery_reviews(
+    pr: &ResolvedPullRequestRef,
+    number: i32,
+) -> Result<Vec<GitHubPullRequestReviewSnapshot>> {
+    let mut after = None;
+    let mut reviews = Vec::new();
+    loop {
+        let raw = run_github_graphql(
+            &pr.host,
+            PULL_REQUEST_DELIVERY_REVIEWS_QUERY,
+            &serde_json::json!({
+                "owner": pr.owner.as_str(),
+                "repo": pr.repo.as_str(),
+                "number": number,
+                "after": after,
+            }),
+        )?;
+        let (mut page, next) = parse_pull_request_delivery_reviews_page(&raw)?;
+        reviews.append(&mut page);
+        let Some(next) = next else {
+            return Ok(reviews);
+        };
+        after = Some(next);
+    }
+}
+
+fn fetch_pull_request_delivery_threads(
+    pr: &ResolvedPullRequestRef,
+    number: i32,
+) -> Result<Vec<GitHubPullRequestReviewThreadSnapshot>> {
+    let mut after = None;
+    let mut threads = Vec::new();
+    loop {
+        let raw = run_github_graphql(
+            &pr.host,
+            PULL_REQUEST_DELIVERY_THREADS_QUERY,
+            &serde_json::json!({
+                "owner": pr.owner.as_str(),
+                "repo": pr.repo.as_str(),
+                "number": number,
+                "after": after,
+            }),
+        )?;
+        let (mut page, next) = parse_pull_request_delivery_threads_page(&raw)?;
+        threads.append(&mut page);
+        let Some(next) = next else {
+            return Ok(threads);
+        };
+        after = Some(next);
+    }
+}
+
+fn fetch_pull_request_delivery_thread_comments(
+    pr: &ResolvedPullRequestRef,
+    thread_id: &str,
+) -> Result<Vec<GitHubPullRequestReviewThreadCommentSnapshot>> {
+    let mut after = None;
+    let mut comments = Vec::new();
+    loop {
+        let raw = run_github_graphql(
+            &pr.host,
+            PULL_REQUEST_DELIVERY_THREAD_COMMENTS_QUERY,
+            &serde_json::json!({
+                "threadId": thread_id,
+                "after": after,
+            }),
+        )?;
+        let (mut page, next) = parse_pull_request_delivery_thread_comments_page(&raw)?;
+        comments.append(&mut page);
+        let Some(next) = next else {
+            return Ok(comments);
+        };
+        after = Some(next);
+    }
+}
+
+fn run_github_graphql(host: &str, query: &str, variables: &serde_json::Value) -> Result<String> {
+    let body = serde_json::to_string(&serde_json::json!({
+        "query": query,
+        "variables": variables,
+    }))
+    .with_context(|| "failed to serialize GitHub GraphQL request")?;
+    run_gh_api_with_body(host, "POST", "graphql", &body)
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryHeadResponse {
+    data: Option<PullRequestDeliveryHeadData>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryHeadData {
+    repository: Option<PullRequestDeliveryHeadRepository>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryHeadRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<PullRequestDeliveryHead>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryHead {
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryReviewsResponse {
+    data: Option<PullRequestDeliveryReviewsData>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryReviewsData {
+    repository: Option<PullRequestDeliveryReviewsRepository>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryReviewsRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<PullRequestDeliveryReviewsPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryReviewsPullRequest {
+    reviews: PullRequestDeliveryConnection<RawPullRequestDeliveryReview>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryThreadsResponse {
+    data: Option<PullRequestDeliveryThreadsData>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryThreadsData {
+    repository: Option<PullRequestDeliveryThreadsRepository>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryThreadsRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<PullRequestDeliveryThreadsPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryThreadsPullRequest {
+    #[serde(rename = "reviewThreads")]
+    review_threads: PullRequestDeliveryConnection<RawPullRequestDeliveryThread>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryThreadCommentsResponse {
+    data: Option<PullRequestDeliveryThreadCommentsData>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryThreadCommentsData {
+    node: Option<PullRequestDeliveryThreadCommentsNode>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryThreadCommentsNode {
+    comments: PullRequestDeliveryConnection<RawPullRequestDeliveryThreadComment>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryConnection<T> {
+    nodes: Vec<T>,
+    #[serde(rename = "pageInfo")]
+    page_info: PullRequestDeliveryPageInfo,
+}
+
+#[derive(Deserialize)]
+struct PullRequestDeliveryPageInfo {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPullRequestDeliveryReview {
+    id: String,
+    #[serde(rename = "fullDatabaseId")]
+    database_id: Option<u64>,
+    url: String,
+    body: String,
+    state: String,
+    #[serde(rename = "viewerDidAuthor")]
+    viewer_did_author: bool,
+    commit: Option<RawPullRequestDeliveryCommit>,
+}
+
+#[derive(Deserialize)]
+struct RawPullRequestDeliveryCommit {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+struct RawPullRequestDeliveryThread {
+    id: String,
+    path: String,
+    line: Option<u32>,
+    #[serde(rename = "diffSide")]
+    side: Option<GitHubCommentSide>,
+    #[serde(rename = "startLine")]
+    start_line: Option<u32>,
+    #[serde(rename = "startDiffSide")]
+    start_side: Option<GitHubCommentSide>,
+}
+
+#[derive(Deserialize)]
+struct RawPullRequestDeliveryThreadComment {
+    id: String,
+    body: String,
+    state: String,
+    #[serde(rename = "viewerDidAuthor")]
+    viewer_did_author: bool,
+    #[serde(rename = "pullRequestReview")]
+    review: Option<RawPullRequestDeliveryNode>,
+    #[serde(rename = "replyTo")]
+    reply_to: Option<RawPullRequestDeliveryNode>,
+}
+
+#[derive(Deserialize)]
+struct RawPullRequestDeliveryNode {
+    id: String,
+}
+
+fn parse_pull_request_delivery_head_response(raw: &str) -> Result<CommitId> {
+    ensure_graphql_response_success(raw)?;
+    let response: PullRequestDeliveryHeadResponse = serde_json::from_str(raw)
+        .with_context(|| "failed to parse GitHub GraphQL delivery-head response JSON")?;
+    let head_ref_oid = response
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repository| repository.pull_request)
+        .map(|pull_request| pull_request.head_ref_oid)
+        .context("GitHub GraphQL delivery-head response did not include data.repository.pullRequest.headRefOid")?;
+    CommitId::new(&head_ref_oid)
+        .context("GitHub GraphQL delivery-head response included an invalid headRefOid")
+}
+
+fn parse_pull_request_delivery_reviews_page(
+    raw: &str,
+) -> Result<(Vec<GitHubPullRequestReviewSnapshot>, Option<String>)> {
+    ensure_graphql_response_success(raw)?;
+    let response: PullRequestDeliveryReviewsResponse = serde_json::from_str(raw)
+        .with_context(|| "failed to parse GitHub GraphQL delivery-reviews response JSON")?;
+    let connection = response
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repository| repository.pull_request)
+        .map(|pull_request| pull_request.reviews)
+        .context("GitHub GraphQL delivery-reviews response did not include data.repository.pullRequest.reviews")?;
+    let next = next_pull_request_delivery_page_cursor(connection.page_info, "reviews")?;
+    let reviews = connection
+        .nodes
+        .into_iter()
+        .map(snapshot_pull_request_delivery_review)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((reviews, next))
+}
+
+fn parse_pull_request_delivery_threads_page(
+    raw: &str,
+) -> Result<(Vec<GitHubPullRequestReviewThreadSnapshot>, Option<String>)> {
+    ensure_graphql_response_success(raw)?;
+    let response: PullRequestDeliveryThreadsResponse = serde_json::from_str(raw)
+        .with_context(|| "failed to parse GitHub GraphQL delivery-threads response JSON")?;
+    let connection = response
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repository| repository.pull_request)
+        .map(|pull_request| pull_request.review_threads)
+        .context("GitHub GraphQL delivery-threads response did not include data.repository.pullRequest.reviewThreads")?;
+    let next = next_pull_request_delivery_page_cursor(connection.page_info, "review threads")?;
+    let threads = connection
+        .nodes
+        .iter()
+        .map(snapshot_pull_request_delivery_thread)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((threads, next))
+}
+
+fn parse_pull_request_delivery_thread_comments_page(
+    raw: &str,
+) -> Result<(
+    Vec<GitHubPullRequestReviewThreadCommentSnapshot>,
+    Option<String>,
+)> {
+    ensure_graphql_response_success(raw)?;
+    let response: PullRequestDeliveryThreadCommentsResponse = serde_json::from_str(raw)
+        .with_context(|| "failed to parse GitHub GraphQL delivery-thread-comments response JSON")?;
+    let connection = response
+        .data
+        .and_then(|data| data.node)
+        .map(|thread| thread.comments)
+        .context(
+            "GitHub GraphQL delivery-thread-comments response did not include data.node.comments",
+        )?;
+    let next = next_pull_request_delivery_page_cursor(connection.page_info, "thread comments")?;
+    let comments = connection
+        .nodes
+        .into_iter()
+        .map(snapshot_pull_request_delivery_thread_comment)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((comments, next))
+}
+
+fn next_pull_request_delivery_page_cursor(
+    page_info: PullRequestDeliveryPageInfo,
+    connection: &str,
+) -> Result<Option<String>> {
+    if !page_info.has_next_page {
+        return Ok(None);
+    }
+    page_info
+        .end_cursor
+        .map(|cursor| cursor.trim().to_string())
+        .filter(|cursor| !cursor.is_empty())
+        .map(Some)
+        .context(format!(
+            "GitHub GraphQL {connection} page reported hasNextPage without a nonblank endCursor"
+        ))
+}
+
+fn snapshot_pull_request_delivery_review(
+    review: RawPullRequestDeliveryReview,
+) -> Result<GitHubPullRequestReviewSnapshot> {
+    Ok(GitHubPullRequestReviewSnapshot {
+        node_id: nonblank_pull_request_delivery_value(&review.id, "review id")?,
+        database_id: review.database_id,
+        state: parse_pull_request_review_state(Some(&review.state)),
+        head_sha: review
+            .commit
+            .map(|commit| {
+                CommitId::new(&commit.oid)
+                    .context("GitHub GraphQL delivery review included an invalid commit oid")
+            })
+            .transpose()?,
+        body: review.body,
+        html_url: nonblank_pull_request_delivery_value(&review.url, "review url")?,
+        viewer_did_author: review.viewer_did_author,
+    })
+}
+
+fn snapshot_pull_request_delivery_thread(
+    thread: &RawPullRequestDeliveryThread,
+) -> Result<GitHubPullRequestReviewThreadSnapshot> {
+    if thread.line.is_some() != thread.side.is_some() {
+        return Err(anyhow!(
+            "GitHub GraphQL delivery thread included only one of line or diff side"
+        ));
+    }
+    if thread.start_line.is_some() != thread.start_side.is_some() {
+        return Err(anyhow!(
+            "GitHub GraphQL delivery thread included only one of start line or start diff side"
+        ));
+    }
+    if let (Some(start_line), Some(line)) = (thread.start_line, thread.line)
+        && start_line > line
+    {
+        return Err(anyhow!(
+            "GitHub GraphQL delivery thread start line was after its ending line"
+        ));
+    }
+
+    Ok(GitHubPullRequestReviewThreadSnapshot {
+        node_id: nonblank_pull_request_delivery_value(&thread.id, "thread id")?,
+        review_node_id: None,
+        path: nonblank_pull_request_delivery_value(&thread.path, "thread path")?,
+        line: thread.line,
+        side: thread.side,
+        start_line: thread.start_line,
+        start_side: thread.start_side,
+        comments: Vec::new(),
+    })
+}
+
+fn snapshot_pull_request_delivery_thread_comment(
+    comment: RawPullRequestDeliveryThreadComment,
+) -> Result<GitHubPullRequestReviewThreadCommentSnapshot> {
+    Ok(GitHubPullRequestReviewThreadCommentSnapshot {
+        node_id: nonblank_pull_request_delivery_value(&comment.id, "thread comment id")?,
+        body: comment.body,
+        state: parse_pull_request_review_comment_state(&comment.state),
+        review_node_id: optional_nonblank_pull_request_delivery_value(
+            comment.review.map(|review| review.id),
+            "thread comment review id",
+        )?,
+        reply_to_node_id: optional_nonblank_pull_request_delivery_value(
+            comment.reply_to.map(|reply_to| reply_to.id),
+            "thread comment reply id",
+        )?,
+        viewer_did_author: comment.viewer_did_author,
+    })
+}
+
+fn pull_request_delivery_thread_review_node_id(
+    thread_id: &str,
+    comments: &[GitHubPullRequestReviewThreadCommentSnapshot],
+) -> Result<String> {
+    let mut roots = comments
+        .iter()
+        .filter(|comment| comment.reply_to_node_id.is_none());
+    let root = roots.next().ok_or_else(|| {
+        anyhow!("GitHub GraphQL delivery thread {thread_id} did not include a root comment")
+    })?;
+    if roots.next().is_some() {
+        return Err(anyhow!(
+            "GitHub GraphQL delivery thread {thread_id} included multiple root comments"
+        ));
+    }
+    root.review_node_id.clone().ok_or_else(|| {
+        anyhow!(
+            "GitHub GraphQL delivery thread {thread_id} root comment did not include a pull request review id"
+        )
+    })
+}
+
+fn nonblank_pull_request_delivery_value(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!(
+            "GitHub GraphQL delivery snapshot included a blank {field}"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_nonblank_pull_request_delivery_value(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>> {
+    value
+        .map(|value| nonblank_pull_request_delivery_value(&value, field))
+        .transpose()
+}
+
+fn parse_pull_request_review_comment_state(value: &str) -> GitHubPullRequestReviewCommentState {
+    match value {
+        "PENDING" => GitHubPullRequestReviewCommentState::Pending,
+        "SUBMITTED" => GitHubPullRequestReviewCommentState::Submitted,
+        _ => GitHubPullRequestReviewCommentState::Unknown,
+    }
+}
 fn ensure_graphql_response_success(raw: &str) -> Result<()> {
     let response: serde_json::Value = serde_json::from_str(raw)
         .with_context(|| "failed to parse GitHub GraphQL response JSON".to_string())?;
@@ -772,23 +1582,59 @@ fn ensure_graphql_response_success(raw: &str) -> Result<()> {
     ))
 }
 
-fn ensure_add_pull_request_review_comment_response_success(raw: &str) -> Result<()> {
-    ensure_graphql_response_success(raw)?;
+#[derive(Deserialize)]
+struct AddPullRequestReviewThreadGraphqlResponse {
+    data: Option<AddPullRequestReviewThreadGraphqlData>,
+}
 
-    let response: serde_json::Value = serde_json::from_str(raw)
+#[derive(Deserialize)]
+struct AddPullRequestReviewThreadGraphqlData {
+    #[serde(rename = "addPullRequestReviewThread")]
+    add_pull_request_review_thread: Option<AddPullRequestReviewThreadGraphqlPayload>,
+}
+
+#[derive(Deserialize)]
+struct AddPullRequestReviewThreadGraphqlPayload {
+    #[serde(rename = "clientMutationId")]
+    client_mutation_id: Option<String>,
+    thread: Option<AddPullRequestReviewThreadGraphqlThread>,
+}
+
+#[derive(Deserialize)]
+struct AddPullRequestReviewThreadGraphqlThread {
+    id: Option<String>,
+}
+
+fn parse_add_pull_request_review_thread_response(
+    raw: &str,
+    operation_id: &str,
+) -> Result<PostedPullRequestReviewThread> {
+    ensure_graphql_response_success(raw)?;
+    let response: AddPullRequestReviewThreadGraphqlResponse = serde_json::from_str(raw)
         .with_context(|| "failed to parse GitHub GraphQL response JSON".to_string())?;
-    let comment_id = response
-        .pointer("/data/addPullRequestReviewComment/comment/id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    if comment_id.is_empty() {
+    let payload = response
+        .data
+        .and_then(|data| data.add_pull_request_review_thread)
+        .context("GitHub GraphQL response did not include data.addPullRequestReviewThread")?;
+    let returned_operation_id = payload.client_mutation_id.context(
+        "GitHub GraphQL response did not include addPullRequestReviewThread.clientMutationId",
+    )?;
+    if returned_operation_id != operation_id {
         return Err(anyhow!(
-            "GitHub GraphQL response did not include addPullRequestReviewComment.comment.id"
+            "GitHub GraphQL response addPullRequestReviewThread.clientMutationId did not match the requested operation id"
         ));
     }
+    let thread_id = payload
+        .thread
+        .and_then(|thread| thread.id)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .context("GitHub GraphQL response did not include addPullRequestReviewThread.thread.id")?;
 
-    Ok(())
+    Ok(PostedPullRequestReviewThread {
+        operation_id: operation_id.to_string(),
+        thread_id,
+    })
 }
 
 fn parse_posted_pull_request_review(raw: &str) -> Result<PostedPullRequestReview> {
@@ -800,6 +1646,84 @@ fn parse_posted_pull_request_review(raw: &str) -> Result<PostedPullRequestReview
         state: parse_pull_request_review_state(review.state.as_deref()),
         body: review.body.unwrap_or_default(),
         node_id: review.node_id,
+    })
+}
+
+pub fn parse_created_pending_pull_request_review(
+    raw: &str,
+    expected_operation_id: &str,
+    expected_head_sha: &CommitId,
+) -> Result<PostedPullRequestReview> {
+    validated_delivery_operation_id(expected_operation_id)?;
+    let review: PullRequestReviewApiResponse = serde_json::from_str(raw)
+        .with_context(|| "failed to parse pull request review JSON".to_string())?;
+    if review.id == 0 {
+        return Err(anyhow!(
+            "GitHub created pending review acknowledgement included a zero database id"
+        ));
+    }
+    if review.state.as_deref() != Some("PENDING") {
+        return Err(anyhow!(
+            "GitHub created review {} was not PENDING",
+            review.id
+        ));
+    }
+    if review.html_url.trim().is_empty() {
+        return Err(anyhow!(
+            "GitHub created pending review acknowledgement included a blank URL"
+        ));
+    }
+    let node_id = review
+        .node_id
+        .map(|node_id| node_id.trim().to_string())
+        .filter(|node_id| !node_id.is_empty())
+        .context("GitHub created pending review acknowledgement included a blank node id")?;
+    let body = review
+        .body
+        .context("GitHub created pending review acknowledgement did not include a body")?;
+    if !body.contains(TRUEFLOW_PENDING_REVIEW_MARKER) {
+        return Err(anyhow!(
+            "GitHub created pending review acknowledgement did not include the trueflow pending-review marker"
+        ));
+    }
+    let marker = parse_trueflow_delivery_marker(&body)?.context(
+        "GitHub created pending review acknowledgement did not include a delivery marker",
+    )?;
+    let GitHubDeliveryMarker::CreatePendingReview {
+        operation_id,
+        head_sha,
+    } = marker
+    else {
+        return Err(anyhow!(
+            "GitHub created pending review acknowledgement contained a review-thread delivery marker"
+        ));
+    };
+    if operation_id != expected_operation_id {
+        return Err(anyhow!(
+            "GitHub created pending review acknowledgement delivery operation id did not match the request"
+        ));
+    }
+    if head_sha != *expected_head_sha {
+        return Err(anyhow!(
+            "GitHub created pending review acknowledgement delivery head did not match the request"
+        ));
+    }
+    if let Some(commit_id) = review.commit_id {
+        let commit_id = CommitId::new(&commit_id)
+            .context("GitHub created pending review acknowledgement had an invalid commit id")?;
+        if commit_id != *expected_head_sha {
+            return Err(anyhow!(
+                "GitHub created pending review acknowledgement commit id did not match the request head"
+            ));
+        }
+    }
+
+    Ok(PostedPullRequestReview {
+        id: review.id,
+        html_url: review.html_url,
+        state: PullRequestReviewState::Pending,
+        body,
+        node_id: Some(node_id),
     })
 }
 
@@ -1009,6 +1933,7 @@ struct PullRequestReviewApiResponse {
     state: Option<String>,
     body: Option<String>,
     node_id: Option<String>,
+    commit_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -1016,9 +1941,9 @@ mod tests {
     use super::{
         GH_MAX_PULL_REQUEST_COMMITS, GitHubReviewDraft, GitRemote, PostedPullRequestReview,
         PullRequestCommit, PullRequestMetadata, PullRequestRef, ResolvedPullRequestRef,
-        ensure_add_pull_request_review_comment_response_success, ensure_graphql_response_success,
-        fetch_pull_request_refs, parse_git_remotes_config, parse_pull_request_metadata,
-        prepare_pull_request_review_with, resolve_pull_request_ref, select_matching_remote,
+        ensure_graphql_response_success, fetch_pull_request_refs, parse_git_remotes_config,
+        parse_pull_request_metadata, prepare_pull_request_review_with, resolve_pull_request_ref,
+        select_matching_remote,
     };
     use crate::store::CommitId;
     use crate::test_git::{run_git, run_git_stdout, temp_git_repo};
@@ -1051,8 +1976,20 @@ mod tests {
             _pr: &ResolvedPullRequestRef,
             _review: &PostedPullRequestReview,
             _comment: &super::GitHubInlineComment,
-        ) -> Result<()> {
+            _operation_id: &str,
+        ) -> Result<super::PostedPullRequestReviewThread> {
             Err(anyhow!("not used in tests"))
+        }
+        fn pull_request_delivery_snapshot(
+            &self,
+            pr: &ResolvedPullRequestRef,
+        ) -> Result<super::GitHubPullRequestDeliverySnapshot> {
+            Ok(super::GitHubPullRequestDeliverySnapshot {
+                pr: pr.clone(),
+                head_sha: self.metadata.head_sha.clone(),
+                reviews: Vec::new(),
+                threads: Vec::new(),
+            })
         }
 
         fn submit_pending_pull_request_review(
@@ -1150,24 +2087,451 @@ mod tests {
                 .contains("failed to parse GitHub GraphQL response JSON")
         );
     }
-
-    #[test]
-    fn add_review_comment_graphql_response_accepts_comment_id() {
-        ensure_add_pull_request_review_comment_response_success(
-            r#"{"data":{"addPullRequestReviewComment":{"comment":{"id":"PRRC_123"}}}}"#,
-        )
-        .unwrap();
+    fn inline_comment(
+        line: u32,
+        side: super::GitHubCommentSide,
+        start_line: Option<u32>,
+        start_side: Option<super::GitHubCommentSide>,
+    ) -> super::GitHubInlineComment {
+        super::GitHubInlineComment {
+            path: crate::repo_path::RepoPath::new("src/lib.rs").unwrap(),
+            line,
+            side,
+            start_line,
+            start_side,
+            body: "Please revise this.".to_string(),
+        }
     }
 
     #[test]
-    fn add_review_comment_graphql_response_rejects_missing_comment_id() {
-        let err =
-            ensure_add_pull_request_review_comment_response_success(r#"{"data":{"ok":true}}"#)
-                .unwrap_err();
+    fn add_review_thread_serializes_single_line_input_without_range_start() {
+        let request = super::build_add_pull_request_review_thread_request(
+            "PRR_node",
+            "append-operation-1",
+            &inline_comment(11, super::GitHubCommentSide::Right, None, None),
+        )
+        .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
 
-        assert!(err.to_string().contains(
-            "GitHub GraphQL response did not include addPullRequestReviewComment.comment.id"
+        let query = request["query"].as_str().unwrap();
+        assert!(query.contains(
+            "mutation AddTrueflowPullRequestReviewThread($input: AddPullRequestReviewThreadInput!)"
         ));
+        assert!(query.contains("addPullRequestReviewThread(input: $input)"));
+        assert!(query.contains("clientMutationId"));
+        assert!(query.contains("thread { id }"));
+        assert_eq!(
+            request["variables"]["input"],
+            serde_json::json!({
+                "pullRequestReviewId": "PRR_node",
+                "body": "Please revise this.",
+                "path": "src/lib.rs",
+                "line": 11,
+                "side": "RIGHT",
+                "subjectType": "LINE",
+                "clientMutationId": "append-operation-1",
+            })
+        );
+        assert!(request["variables"]["input"].get("startLine").is_none());
+        assert!(request["variables"]["input"].get("startSide").is_none());
+    }
+
+    #[test]
+    fn add_review_thread_serializes_multiline_input_with_paired_start_and_sides() {
+        let request = super::build_add_pull_request_review_thread_request(
+            "PRR_node",
+            "append-operation-2",
+            &inline_comment(
+                14,
+                super::GitHubCommentSide::Left,
+                Some(9),
+                Some(super::GitHubCommentSide::Right),
+            ),
+        )
+        .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+        assert_eq!(
+            request["variables"]["input"],
+            serde_json::json!({
+                "pullRequestReviewId": "PRR_node",
+                "body": "Please revise this.",
+                "path": "src/lib.rs",
+                "line": 14,
+                "side": "LEFT",
+                "startLine": 9,
+                "startSide": "RIGHT",
+                "subjectType": "LINE",
+                "clientMutationId": "append-operation-2",
+            })
+        );
+    }
+
+    #[test]
+    fn add_review_thread_rejects_half_and_inverted_ranges_before_request_dispatch() {
+        let half_range = super::build_add_pull_request_review_thread_request(
+            "PRR_node",
+            "append-operation-3",
+            &inline_comment(11, super::GitHubCommentSide::Right, Some(9), None),
+        )
+        .unwrap_err();
+        assert!(
+            half_range
+                .to_string()
+                .contains("must specify start_line and start_side together")
+        );
+        let other_half_range = super::build_add_pull_request_review_thread_request(
+            "PRR_node",
+            "append-operation-3b",
+            &inline_comment(
+                11,
+                super::GitHubCommentSide::Right,
+                None,
+                Some(super::GitHubCommentSide::Right),
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            other_half_range
+                .to_string()
+                .contains("must specify start_line and start_side together")
+        );
+
+        let inverted_range = super::build_add_pull_request_review_thread_request(
+            "PRR_node",
+            "append-operation-4",
+            &inline_comment(
+                11,
+                super::GitHubCommentSide::Right,
+                Some(12),
+                Some(super::GitHubCommentSide::Right),
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            inverted_range
+                .to_string()
+                .contains("starts after its ending line")
+        );
+    }
+
+    #[test]
+    fn add_review_thread_response_returns_validated_receipt() {
+        let receipt = super::parse_add_pull_request_review_thread_response(
+            r#"{"data":{"addPullRequestReviewThread":{"clientMutationId":"append-operation-5","thread":{"id":"PRRT_123"}}}}"#,
+            "append-operation-5",
+        )
+        .unwrap();
+
+        assert_eq!(receipt.operation_id, "append-operation-5");
+        assert_eq!(receipt.thread_id, "PRRT_123");
+    }
+
+    #[test]
+    fn add_review_thread_response_rejects_unacknowledged_or_malformed_envelopes() {
+        for raw in [
+            r#"{"data":null,"errors":[{"message":"invalid input"}]}"#,
+            r#"{}"#,
+            r#"{"data":{"addPullRequestReviewThread":null}}"#,
+            r#"{"data":{"addPullRequestReviewThread":{"clientMutationId":"append-operation-6","thread":null}}}"#,
+            r#"{"data":{"addPullRequestReviewThread":{"clientMutationId":"append-operation-6","thread":{"id":"  "}}}}"#,
+            r#"{"data":{"addPullRequestReviewThread":{"clientMutationId":"other-operation","thread":{"id":"PRRT_123"}}}}"#,
+        ] {
+            assert!(
+                super::parse_add_pull_request_review_thread_response(raw, "append-operation-6")
+                    .is_err(),
+                "expected rejected GraphQL envelope: {raw}"
+            );
+        }
+    }
+    #[test]
+    fn strict_pending_create_receipt_requires_marked_pending_review() {
+        let head = CommitId::new("abcdef0123456789").unwrap();
+        let body = super::materialize_pending_review_delivery_body(
+            "Human-visible review body",
+            "create-operation-1",
+            &head,
+        )
+        .unwrap();
+        let raw = serde_json::json!({
+            "id": 41,
+            "html_url": "https://github.com/acme/widgets/pull/7#pullrequestreview-41",
+            "state": "PENDING",
+            "body": body,
+            "node_id": "PRR_41",
+            "commit_id": head.as_str(),
+        })
+        .to_string();
+
+        let receipt =
+            super::parse_created_pending_pull_request_review(&raw, "create-operation-1", &head)
+                .unwrap();
+
+        assert_eq!(receipt.id, 41);
+        assert_eq!(receipt.state, super::PullRequestReviewState::Pending);
+        assert_eq!(receipt.node_id.as_deref(), Some("PRR_41"));
+    }
+
+    #[test]
+    fn strict_pending_create_receipt_rejects_missing_or_mismatched_acknowledgement() {
+        let head = CommitId::new("abcdef0123456789").unwrap();
+        let marked_body = super::materialize_pending_review_delivery_body(
+            "Human-visible review body",
+            "create-operation-2",
+            &head,
+        )
+        .unwrap();
+
+        for raw in [
+            serde_json::json!({
+                "id": 0,
+                "html_url": "https://example.test/review",
+                "state": "PENDING",
+                "body": marked_body,
+                "node_id": "PRR_42",
+            }),
+            serde_json::json!({
+                "id": 42,
+                "html_url": " ",
+                "state": "PENDING",
+                "body": marked_body,
+                "node_id": "PRR_42",
+            }),
+            serde_json::json!({
+                "id": 42,
+                "html_url": "https://example.test/review",
+                "state": "COMMENTED",
+                "body": marked_body,
+                "node_id": "PRR_42",
+            }),
+            serde_json::json!({
+                "id": 42,
+                "html_url": "https://example.test/review",
+                "state": "PENDING",
+                "body": "Human-visible review body",
+                "node_id": "PRR_42",
+            }),
+            serde_json::json!({
+                "id": 42,
+                "html_url": "https://example.test/review",
+                "state": "PENDING",
+                "body": marked_body,
+                "node_id": "PRR_42",
+                "commit_id": "fedcba9876543210",
+            }),
+        ] {
+            assert!(
+                super::parse_created_pending_pull_request_review(
+                    &raw.to_string(),
+                    "create-operation-2",
+                    &head,
+                )
+                .is_err(),
+                "expected rejected create acknowledgement: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_marker_parser_rejects_ambiguous_or_malformed_marker() {
+        let malformed =
+            "<!-- trueflow:delivery:v1 kind=create-pending-review operation=create-operation-3 -->";
+        assert!(super::parse_trueflow_delivery_marker(malformed).is_err());
+
+        let head = CommitId::new("abcdef0123456789").unwrap();
+        let body = super::materialize_review_thread_delivery_body(
+            "Human-visible comment",
+            "comment-operation-3",
+        )
+        .unwrap();
+        assert!(matches!(
+            super::parse_trueflow_delivery_marker(&body).unwrap(),
+            Some(super::GitHubDeliveryMarker::ReviewThread { operation_id })
+                if operation_id == "comment-operation-3"
+        ));
+
+        let duplicated = format!(
+            "{}\n{}",
+            super::materialize_pending_review_delivery_body("Body", "create-operation-3", &head,)
+                .unwrap(),
+            super::materialize_review_thread_delivery_body("Comment", "comment-operation-3",)
+                .unwrap(),
+        );
+        assert!(super::parse_trueflow_delivery_marker(&duplicated).is_err());
+    }
+    #[test]
+    fn delivery_snapshot_parses_review_thread_and_every_comment_field() {
+        let reviews_raw = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": {
+                            "nodes": [{
+                                "id": "PRR_17",
+                                "fullDatabaseId": 17,
+                                "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-17",
+                                "body": "owned review",
+                                "state": "PENDING",
+                                "viewerDidAuthor": true,
+                                "commit": {"oid": "abcdef0123456789"}
+                            }],
+                            "pageInfo": {"hasNextPage": true, "endCursor": "review-cursor"}
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let (reviews, next_review_cursor) =
+            super::parse_pull_request_delivery_reviews_page(&reviews_raw).unwrap();
+        assert_eq!(next_review_cursor.as_deref(), Some("review-cursor"));
+        assert_eq!(reviews[0].node_id, "PRR_17");
+        assert_eq!(reviews[0].database_id, Some(17));
+        assert_eq!(
+            reviews[0].head_sha.as_ref().unwrap().as_str(),
+            "abcdef0123456789"
+        );
+        assert!(reviews[0].viewer_did_author);
+
+        let threads_raw = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [{
+                                "id": "PRRT_17",
+                                "path": "src/lib.rs",
+                                "line": 14,
+                                "diffSide": "RIGHT",
+                                "startLine": 9,
+                                "startDiffSide": "LEFT"
+                            }],
+                            "pageInfo": {"hasNextPage": false, "endCursor": null}
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let (threads, next_thread_cursor) =
+            super::parse_pull_request_delivery_threads_page(&threads_raw).unwrap();
+        assert_eq!(next_thread_cursor, None);
+        assert_eq!(threads[0].path, "src/lib.rs");
+        assert_eq!(threads[0].line, Some(14));
+        assert_eq!(threads[0].start_line, Some(9));
+        assert_eq!(threads[0].side, Some(super::GitHubCommentSide::Right));
+        assert_eq!(threads[0].start_side, Some(super::GitHubCommentSide::Left));
+
+        let comments_raw = serde_json::json!({
+            "data": {
+                "node": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "PRRC_root",
+                                "body": "root body",
+                                "state": "PENDING",
+                                "viewerDidAuthor": true,
+                                "pullRequestReview": {"id": "PRR_17"},
+                                "replyTo": null
+                            },
+                            {
+                                "id": "PRRC_reply",
+                                "body": "reply body",
+                                "state": "SUBMITTED",
+                                "viewerDidAuthor": false,
+                                "pullRequestReview": {"id": "PRR_18"},
+                                "replyTo": {"id": "PRRC_root"}
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }
+                }
+            }
+        })
+        .to_string();
+        let (comments, next_comment_cursor) =
+            super::parse_pull_request_delivery_thread_comments_page(&comments_raw).unwrap();
+        assert_eq!(next_comment_cursor, None);
+        assert_eq!(comments[0].review_node_id.as_deref(), Some("PRR_17"));
+        assert_eq!(comments[0].reply_to_node_id, None);
+        assert_eq!(
+            comments[1].state,
+            super::GitHubPullRequestReviewCommentState::Submitted
+        );
+        assert_eq!(comments[1].reply_to_node_id.as_deref(), Some("PRRC_root"));
+        assert_eq!(
+            super::pull_request_delivery_thread_review_node_id("PRRT_17", &comments).unwrap(),
+            "PRR_17"
+        );
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_incomplete_or_ambiguous_pages() {
+        let missing_cursor = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": true, "endCursor": null}
+                        }
+                    }
+                }
+            }
+        }"#;
+        assert!(super::parse_pull_request_delivery_reviews_page(missing_cursor).is_err());
+
+        let multiple_roots = vec![
+            super::GitHubPullRequestReviewThreadCommentSnapshot {
+                node_id: "PRRC_1".to_string(),
+                body: String::new(),
+                state: super::GitHubPullRequestReviewCommentState::Pending,
+                review_node_id: Some("PRR_1".to_string()),
+                reply_to_node_id: None,
+                viewer_did_author: true,
+            },
+            super::GitHubPullRequestReviewThreadCommentSnapshot {
+                node_id: "PRRC_2".to_string(),
+                body: String::new(),
+                state: super::GitHubPullRequestReviewCommentState::Pending,
+                review_node_id: Some("PRR_1".to_string()),
+                reply_to_node_id: None,
+                viewer_did_author: true,
+            },
+        ];
+        assert!(
+            super::pull_request_delivery_thread_review_node_id("PRRT_1", &multiple_roots).is_err()
+        );
+    }
+    #[test]
+    fn delivery_snapshot_requires_a_valid_pull_request_head() {
+        let valid = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": "abcdef0123456789"
+                    }
+                }
+            }
+        }"#;
+        assert_eq!(
+            super::parse_pull_request_delivery_head_response(valid)
+                .unwrap()
+                .as_str(),
+            "abcdef0123456789"
+        );
+
+        let invalid = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": "not-a-commit"
+                    }
+                }
+            }
+        }"#;
+        assert!(super::parse_pull_request_delivery_head_response(invalid).is_err());
     }
 
     #[test]
