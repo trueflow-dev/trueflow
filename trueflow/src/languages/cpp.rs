@@ -5,7 +5,7 @@ use super::{
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
 use crate::code_comments;
-use crate::hashing::TreeHash;
+
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -341,15 +341,15 @@ fn split_container_like(block: &Block) -> Result<Vec<Block>> {
             let Some(body) = container.child_by_field_name("body") else {
                 return crate::sub_splitter::split_code_review_units(block);
             };
-            collect_direct_child_blocks(block, body, false)
+            collect_direct_child_blocks(block, body, false)?
         }
         "class_specifier" | "struct_specifier" => {
             let Some(body) = container.child_by_field_name("body") else {
                 return crate::sub_splitter::split_code_review_units(block);
             };
-            collect_direct_child_blocks(block, body, true)
+            collect_direct_child_blocks(block, body, true)?
         }
-        "enum_specifier" => collect_enum_member_blocks(block, container),
+        "enum_specifier" => collect_enum_member_blocks(block, container)?,
         _ => Vec::new(),
     };
 
@@ -407,7 +407,11 @@ fn find_structural_container_descendant<'a>(node: Node<'a>) -> Option<Node<'a>> 
     None
 }
 
-fn collect_direct_child_blocks(parent: &Block, body: Node<'_>, in_container: bool) -> Vec<Block> {
+fn collect_direct_child_blocks(
+    parent: &Block,
+    body: Node<'_>,
+    in_container: bool,
+) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
@@ -426,14 +430,14 @@ fn collect_direct_child_blocks(parent: &Block, body: Node<'_>, in_container: boo
             &parent.content[child.start_byte()..child.end_byte()],
             child.start_byte(),
             kind,
-        ));
+        )?);
     }
-    blocks
+    Ok(blocks)
 }
 
-fn collect_enum_member_blocks(parent: &Block, enum_node: Node<'_>) -> Vec<Block> {
+fn collect_enum_member_blocks(parent: &Block, enum_node: Node<'_>) -> Result<Vec<Block>> {
     let Some(body) = first_named_child(enum_node) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut blocks = Vec::new();
@@ -447,9 +451,9 @@ fn collect_enum_member_blocks(parent: &Block, enum_node: Node<'_>) -> Vec<Block>
             &parent.content[child.start_byte()..child.end_byte()],
             child.start_byte(),
             BlockKind::Const,
-        ));
+        )?);
     }
-    blocks
+    Ok(blocks)
 }
 
 fn first_named_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
@@ -464,7 +468,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
         &content[..signature_end],
         0,
         BlockKind::FunctionSignature,
-    )];
+    )?];
 
     let rest = &content[signature_end..];
     let mut start = 0;
@@ -472,7 +476,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
         if start < gap.start() {
             let chunk = &rest[start..gap.start()];
             if !chunk.is_empty() {
-                push_review_chunk(block, &mut blocks, chunk, signature_end + start);
+                push_review_chunk(block, &mut blocks, chunk, signature_end + start)?;
             }
         }
 
@@ -481,21 +485,26 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
             &rest[gap.start()..gap.end()],
             signature_end + gap.start(),
             BlockKind::Gap,
-        ));
+        )?);
         start = gap.end();
     }
 
     if start < rest.len() {
         let chunk = &rest[start..];
         if !chunk.is_empty() {
-            push_review_chunk(block, &mut blocks, chunk, signature_end + start);
+            push_review_chunk(block, &mut blocks, chunk, signature_end + start)?;
         }
     }
 
     Ok(blocks)
 }
 
-fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start_offset: usize) {
+fn push_review_chunk(
+    parent: &Block,
+    blocks: &mut Vec<Block>,
+    chunk: &str,
+    start_offset: usize,
+) -> Result<()> {
     if let Some(comment_end) = leading_comment_prefix_len(chunk) {
         let comment = &chunk[..comment_end];
         blocks.push(create_sub_block_with_kind(
@@ -503,7 +512,7 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
             comment,
             start_offset,
             BlockKind::Comment,
-        ));
+        )?);
 
         let remainder = &chunk[comment_end..];
         if !remainder.trim().is_empty() {
@@ -512,9 +521,9 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
                 remainder,
                 start_offset + comment_end,
                 BlockKind::CodeParagraph,
-            ));
+            )?);
         }
-        return;
+        return Ok(());
     }
 
     let kind = classify_code_chunk(chunk);
@@ -524,8 +533,9 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
             chunk,
             start_offset,
             kind,
-        ));
+        )?);
     }
+    Ok(())
 }
 
 fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
@@ -581,21 +591,16 @@ fn create_sub_block_with_kind(
     content: &str,
     start_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = content.chars().filter(|&ch| ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + if content.ends_with('\n') { 0 } else { 1 };
-
-    Block {
-        hash: TreeHash::from_content(content),
-        content: content.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let end_offset = start_offset
+        .checked_add(content.len())
+        .context("C++ sub-split end offset overflow")?;
+    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+        .context("C++ sub-split range must be a valid parent UTF-8 slice")?;
+    assert_eq!(
+        block.content, content,
+        "C++ sub-split range must name content"
+    );
+    block.tags = parent.tags.clone();
+    Ok(block)
 }

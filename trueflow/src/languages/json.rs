@@ -3,9 +3,9 @@ use super::{
     default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::complexity;
-use crate::hashing::TreeHash;
+
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
@@ -37,28 +37,34 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
             0,
             content.len(),
             lang,
-        )]);
+        )?]);
     }
 
     let mut blocks = Vec::new();
     let mut last_end = 0usize;
 
     for value in values {
-        push_non_empty_gap(&mut blocks, content, last_end, value.start_byte(), lang);
-        blocks.extend(split_json_value_at_file_scope(value, content, lang));
+        push_non_empty_gap(&mut blocks, content, last_end, value.start_byte(), lang)?;
+        blocks.extend(split_json_value_at_file_scope(value, content, lang)?);
         last_end = value.end_byte();
     }
 
-    push_non_empty_gap(&mut blocks, content, last_end, content.len(), lang);
+    push_non_empty_gap(&mut blocks, content, last_end, content.len(), lang)?;
     Ok(blocks)
 }
 
-fn split_json_value_at_file_scope(value: Node<'_>, content: &str, lang: Language) -> Vec<Block> {
-    match value.kind() {
+fn split_json_value_at_file_scope(
+    value: Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Result<Vec<Block>> {
+    Ok(match value.kind() {
         "object" => {
-            split_object_children(value.start_byte(), value.end_byte(), value, content, lang)
+            split_object_children(value.start_byte(), value.end_byte(), value, content, lang)?
         }
-        "array" => split_array_children(value.start_byte(), value.end_byte(), value, content, lang),
+        "array" => {
+            split_array_children(value.start_byte(), value.end_byte(), value, content, lang)?
+        }
         _ => vec![create_file_block(
             &content[value.start_byte()..value.end_byte()],
             BlockKind::Content,
@@ -66,8 +72,8 @@ fn split_json_value_at_file_scope(value: Node<'_>, content: &str, lang: Language
             value.start_byte(),
             value.end_byte(),
             lang,
-        )],
-    }
+        )?],
+    })
 }
 
 fn split_object_children(
@@ -76,23 +82,23 @@ fn split_object_children(
     object: Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let pairs = object_pairs(object);
     if pairs.is_empty() {
-        return vec![create_file_block(
+        return Ok(vec![create_file_block(
             &content[range_start..range_end],
             BlockKind::Content,
             content,
             range_start,
             range_end,
             lang,
-        )];
+        )?]);
     }
 
     let mut blocks = Vec::new();
     let mut last_end = range_start;
     for pair in pairs {
-        push_non_empty_gap(&mut blocks, content, last_end, pair.start_byte(), lang);
+        push_non_empty_gap(&mut blocks, content, last_end, pair.start_byte(), lang)?;
         blocks.push(create_file_block(
             &content[pair.start_byte()..pair.end_byte()],
             classify_json_pair(pair),
@@ -100,12 +106,12 @@ fn split_object_children(
             pair.start_byte(),
             pair.end_byte(),
             lang,
-        ));
+        )?);
         last_end = pair.end_byte();
     }
 
-    push_non_empty_gap(&mut blocks, content, last_end, range_end, lang);
-    blocks
+    push_non_empty_gap(&mut blocks, content, last_end, range_end, lang)?;
+    Ok(blocks)
 }
 
 fn split_array_children(
@@ -114,23 +120,23 @@ fn split_array_children(
     array: Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let items = array_items(array);
     if items.is_empty() {
-        return vec![create_file_block(
+        return Ok(vec![create_file_block(
             &content[range_start..range_end],
             BlockKind::Content,
             content,
             range_start,
             range_end,
             lang,
-        )];
+        )?]);
     }
 
     let mut blocks = Vec::new();
     let mut last_end = range_start;
     for item in items {
-        push_non_empty_gap(&mut blocks, content, last_end, item.start_byte(), lang);
+        push_non_empty_gap(&mut blocks, content, last_end, item.start_byte(), lang)?;
         blocks.push(create_file_block(
             &content[item.start_byte()..item.end_byte()],
             classify_json_value_node(item),
@@ -138,12 +144,12 @@ fn split_array_children(
             item.start_byte(),
             item.end_byte(),
             lang,
-        ));
+        )?);
         last_end = item.end_byte();
     }
 
-    push_non_empty_gap(&mut blocks, content, last_end, range_end, lang);
-    blocks
+    push_non_empty_gap(&mut blocks, content, last_end, range_end, lang)?;
+    Ok(blocks)
 }
 
 fn root_json_values(root: Node<'_>) -> Vec<Node<'_>> {
@@ -214,7 +220,7 @@ fn split_composite_children(block: &Block) -> Result<Vec<Block>> {
             0,
             block.content.len(),
             BlockKind::Content,
-        )]);
+        )?]);
     };
 
     let mut child_spans = match composite.kind() {
@@ -230,7 +236,7 @@ fn split_composite_children(block: &Block) -> Result<Vec<Block>> {
             0,
             block.content.len(),
             BlockKind::Content,
-        )]);
+        )?]);
     }
 
     let mut blocks = Vec::new();
@@ -245,14 +251,14 @@ fn split_composite_children(block: &Block) -> Result<Vec<Block>> {
             last_end,
             start,
             is_json_structural_noise,
-        );
+        )?;
 
         let kind = if child.kind() == "pair" {
             classify_json_pair(child)
         } else {
             classify_json_value_node(child)
         };
-        blocks.push(create_sub_block(block, start, end, kind));
+        blocks.push(create_sub_block(block, start, end, kind)?);
         last_end = end;
     }
 
@@ -262,7 +268,7 @@ fn split_composite_children(block: &Block) -> Result<Vec<Block>> {
         last_end,
         block.content.len(),
         is_json_structural_noise,
-    );
+    )?;
 
     if blocks.is_empty() {
         Ok(vec![create_sub_block(
@@ -270,7 +276,7 @@ fn split_composite_children(block: &Block) -> Result<Vec<Block>> {
             0,
             block.content.len(),
             BlockKind::Content,
-        )])
+        )?])
     } else {
         Ok(blocks)
     }
@@ -297,14 +303,14 @@ fn push_non_empty_gap(
     start: usize,
     end: usize,
     lang: Language,
-) {
+) -> Result<()> {
     if end <= start {
-        return;
+        return Ok(());
     }
 
     let chunk = &content[start..end];
     if chunk.is_empty() || chunk.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
     blocks.push(create_file_block(
@@ -314,7 +320,8 @@ fn push_non_empty_gap(
         start,
         end,
         lang,
-    ));
+    )?);
+    Ok(())
 }
 
 fn push_container_interstitial(
@@ -323,14 +330,14 @@ fn push_container_interstitial(
     start: usize,
     end: usize,
     is_noise: fn(&str) -> bool,
-) {
+) -> Result<()> {
     if end <= start {
-        return;
+        return Ok(());
     }
 
     let chunk = &parent.content[start..end];
     if chunk.is_empty() {
-        return;
+        return Ok(());
     }
 
     let kind = if chunk.trim().is_empty() || is_noise(chunk) {
@@ -338,7 +345,8 @@ fn push_container_interstitial(
     } else {
         BlockKind::Preamble
     };
-    blocks.push(create_sub_block(parent, start, end, kind));
+    blocks.push(create_sub_block(parent, start, end, kind)?);
+    Ok(())
 }
 
 fn is_json_structural_noise(chunk: &str) -> bool {
@@ -364,17 +372,14 @@ fn create_file_block(
     start_byte: usize,
     end_byte: usize,
     lang: Language,
-) -> Block {
-    let (start_line, end_line) = byte_range_to_lines(full_source, start_byte, end_byte);
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: Vec::new(),
-        complexity: complexity::calculate(text, lang),
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    assert_eq!(
+        block.content, text,
+        "JSON top-level range must name content"
+    );
+    block.complexity = complexity::calculate(&block.content, lang);
+    Ok(block)
 }
 
 fn create_sub_block(
@@ -382,29 +387,9 @@ fn create_sub_block(
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let text = &parent.content[start_offset..end_offset];
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = text.chars().filter(|&ch| ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + usize::from(!text.ends_with('\n'));
-
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
-}
-
-fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let start_line = source[..start].chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = source[start..end].chars().filter(|&ch| ch == '\n').count();
-    let end_line = start_line + chunk_newlines + usize::from(!source[start..end].ends_with('\n'));
-    (start_line, end_line)
+) -> Result<Block> {
+    let mut block =
+        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    block.tags = parent.tags.clone();
+    Ok(block)
 }

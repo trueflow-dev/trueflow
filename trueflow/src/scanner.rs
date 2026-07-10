@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 const DEFAULT_IGNORE_NAMES: &[&str] =
     &[".git", ".trueflow", "target", "node_modules", "mutants.out"];
-const SCAN_CACHE_FORMAT_VERSION: u32 = 3;
+const SCAN_CACHE_FORMAT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanCacheMode {
@@ -757,7 +757,7 @@ fn collect_scan_inventory(
 fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
     let admission = match admit_scan_path(repo_path_base, &input.path) {
         Ok(admission) => admission,
-        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
     };
     if let Some(rejection) = rejected_admission(input, admission) {
         return rejection;
@@ -765,17 +765,20 @@ fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
 
     let mut file = match File::open(&input.full_path) {
         Ok(file) => file,
-        Err(err) => return cacheable_scan_error(repo_path_base, input, err.into()),
+        Err(err) => {
+            let err = anyhow::Error::from(err);
+            return cacheable_scan_error(repo_path_base, input, &err);
+        }
     };
     match handle_matches_input(&file, input) {
         Ok(true) => {}
         Ok(false) => return rejected_changed_scan(input),
-        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
     }
 
     let admission = match admit_scan_path(repo_path_base, &input.path) {
         Ok(admission) => admission,
-        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
     };
     if let Some(rejection) = rejected_admission(input, admission) {
         return rejection;
@@ -783,17 +786,18 @@ fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
 
     let mut bytes = Vec::new();
     if let Err(err) = file.read_to_end(&mut bytes) {
-        return cacheable_scan_error(repo_path_base, input, err.into());
+        let err = anyhow::Error::from(err);
+        return cacheable_scan_error(repo_path_base, input, &err);
     }
 
     match handle_matches_input(&file, input) {
         Ok(true) => {}
         Ok(false) => return rejected_changed_scan(input),
-        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
     }
     let admission = match admit_scan_path(repo_path_base, &input.path) {
         Ok(admission) => admission,
-        Err(err) => return rejected_scan_error(repo_path_base, input, err),
+        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
     };
     if let Some(rejection) = rejected_admission(input, admission) {
         return rejection;
@@ -879,10 +883,10 @@ fn handle_matches_input(file: &File, input: &ScanInput) -> Result<bool> {
 fn cacheable_scan_error(
     repo_path_base: &Path,
     input: &ScanInput,
-    err: anyhow::Error,
+    err: &anyhow::Error,
 ) -> ScanAttempt {
-    let diagnostic = diagnostic_for_process_file_error(repo_path_base, &input.full_path, &err);
-    log_process_file_error(&diagnostic, &err);
+    let diagnostic = diagnostic_for_process_file_error(repo_path_base, &input.full_path, err);
+    log_process_file_error(&diagnostic, err);
     ScanAttempt::Cache(CachedFileEntry {
         path: input.path.clone(),
         stamp: input.stamp,
@@ -895,10 +899,10 @@ fn cacheable_scan_error(
 fn rejected_scan_error(
     repo_path_base: &Path,
     input: &ScanInput,
-    err: anyhow::Error,
+    err: &anyhow::Error,
 ) -> ScanAttempt {
-    let diagnostic = diagnostic_for_process_file_error(repo_path_base, &input.full_path, &err);
-    log_process_file_error(&diagnostic, &err);
+    let diagnostic = diagnostic_for_process_file_error(repo_path_base, &input.full_path, err);
+    log_process_file_error(&diagnostic, err);
     ScanAttempt::Reject {
         diagnostics: vec![diagnostic],
     }
@@ -1051,7 +1055,7 @@ fn process_file(normalized_path: &RepoPath, bytes: &[u8]) -> Result<ProcessedFil
             normalized_path.clone(),
             language,
             bytes,
-            split_result.into_review_blocks(),
+            split_result.into_review_blocks(content),
         ),
         diagnostics,
     })
@@ -1060,7 +1064,7 @@ fn process_file(normalized_path: &RepoPath, bytes: &[u8]) -> Result<ProcessedFil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::Block;
+    use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::test_git::temp_test_dir;
     use std::process::Command;
     use std::time::Duration;
@@ -1268,12 +1272,14 @@ mod tests {
             RepoPath::new("other.rs").unwrap(),
             Language::Rust,
             b"fn other() {}\n",
-            vec![Block::new(
-                "fn other() {}\n".to_string(),
-                crate::block::BlockKind::Function,
-                1,
-                2,
-            )],
+            vec![
+                Block::from_file_range(
+                    "fn other() {}\n",
+                    BlockKind::Function,
+                    ByteSpan::new(0, "fn other() {}\n".len()),
+                )
+                .unwrap(),
+            ],
         );
         write_cache(
             &repo,
@@ -1744,14 +1750,10 @@ mod tests {
 
     #[test]
     fn scan_cache_rejects_immediately_previous_format_entry_with_followed_link_bytes() {
-        const PRE_FIX_SCAN_CACHE_FORMAT_VERSION: u32 = 2;
+        const PRE_FIX_SCAN_CACHE_FORMAT_VERSION: u32 = SCAN_CACHE_FORMAT_VERSION - 1;
         const POISON: &[u8] = b"pub fn evil() {}\n";
         const SAFE: &[u8] = b"pub fn safe() {}\n";
         assert_eq!(POISON.len(), SAFE.len());
-        assert_eq!(
-            PRE_FIX_SCAN_CACHE_FORMAT_VERSION,
-            SCAN_CACHE_FORMAT_VERSION - 1
-        );
 
         let repo = temp_test_dir("scanner_prefixed_cache");
         let cache_dir = temp_test_dir("scanner_prefixed_cache_store");
@@ -1768,12 +1770,14 @@ mod tests {
             path.clone(),
             Language::Rust,
             POISON,
-            vec![Block::new(
-                String::from_utf8(POISON.to_vec()).unwrap(),
-                crate::block::BlockKind::Function,
-                1,
-                2,
-            )],
+            vec![
+                Block::from_file_range(
+                    std::str::from_utf8(POISON).unwrap(),
+                    BlockKind::Function,
+                    ByteSpan::new(0, POISON.len()),
+                )
+                .unwrap(),
+            ],
         );
         let cache_entry = CacheEntry {
             format_version: PRE_FIX_SCAN_CACHE_FORMAT_VERSION,
@@ -1792,7 +1796,7 @@ mod tests {
         fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
         fs::write(&cache_file, serde_json::to_string(&cache_entry).unwrap()).unwrap();
 
-        let result = scan_paths(&repo, &HashSet::from([path.clone()]), &options).unwrap();
+        let result = scan_paths(&repo, &HashSet::from([path]), &options).unwrap();
         assert_eq!(result.cache.read, ScanCacheReadStatus::Miss);
         assert_eq!(result.cache.rescanned_files, 1);
         assert_eq!(result.cache.write, ScanCacheWriteStatus::Wrote);
@@ -1802,6 +1806,73 @@ mod tests {
         let rewritten = fs::read_to_string(cache_file).unwrap();
         assert!(!rewritten.contains("evil"));
         assert!(rewritten.contains("safe"));
+    }
+
+    #[test]
+    fn scan_cache_rejects_pre_source_integrity_format() {
+        const PRE_SOURCE_INTEGRITY_FORMAT_VERSION: u32 = SCAN_CACHE_FORMAT_VERSION - 1;
+        let source = "import os\nx = 1\n";
+        let stale_content = "import osx = 1";
+        let repo = temp_test_dir("scanner_pre_source_integrity_cache");
+        let cache_dir = temp_test_dir("scanner_pre_source_integrity_cache_store");
+        let path = RepoPath::new("src/example.py").unwrap();
+        let full_path = repo.join(path.as_str());
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        fs::write(&full_path, source).unwrap();
+        let options = ScanOptions {
+            cache_dir: Some(cache_dir),
+            ..ScanOptions::default()
+        };
+        let metadata = fs::metadata(&full_path).unwrap();
+        let stale_file_state = FileState::from_text(
+            path.clone(),
+            Language::Python,
+            source.as_bytes(),
+            vec![Block::new(
+                stale_content.to_string(),
+                BlockKind::Code,
+                LineSpan::new(0, 2),
+                ByteSpan::new(0, stale_content.len()),
+            )],
+        );
+        let stale_entry = CacheEntry {
+            format_version: PRE_SOURCE_INTEGRITY_FORMAT_VERSION,
+            root_hash: cache_root_hash(&repo),
+            options_fingerprint: scan_options_fingerprint(&options),
+            files: vec![CachedFileEntry {
+                path: path.clone(),
+                stamp: file_stamp(&metadata).unwrap(),
+                outcome: CachedFileOutcome::Included {
+                    file_state: stale_file_state,
+                    diagnostics: Vec::new(),
+                },
+            }],
+        };
+        let cache_file = cache_path(&repo, &options).unwrap();
+        fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        fs::write(&cache_file, serde_json::to_string(&stale_entry).unwrap()).unwrap();
+
+        let result = scan_paths(&repo, &HashSet::from([path]), &options).unwrap();
+        assert_eq!(result.cache.read, ScanCacheReadStatus::Miss);
+        assert_eq!(result.cache.reused_files, 0);
+        assert_eq!(result.cache.rescanned_files, 1);
+        assert_eq!(result.cache.write, ScanCacheWriteStatus::Wrote);
+        assert_eq!(result.files.len(), 1);
+        let block = &result.files[0].blocks[0];
+        assert_eq!(block.content, &source[0..15]);
+        assert_eq!((block.start_byte, block.end_byte), (0, 15));
+        assert_eq!(
+            block.hash,
+            crate::hashing::TreeHash::from_content(&source[0..15])
+        );
+
+        let rewritten = fs::read_to_string(cache_file).unwrap();
+        assert!(!rewritten.contains(stale_content));
+        let cache_entry = load_cache_entry(&repo, &options).unwrap();
+        let Some(cache_entry) = cache_entry else {
+            panic!("rescanned cache should be readable");
+        };
+        assert_eq!(cache_entry.format_version, SCAN_CACHE_FORMAT_VERSION);
     }
 
     #[cfg(windows)]

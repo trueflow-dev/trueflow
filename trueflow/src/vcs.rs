@@ -11,9 +11,6 @@ use gix::status::UntrackedFiles;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use crate::hashing::TreeHash;
-
 #[derive(Clone)]
 pub struct RepoSnapshot {
     pub repo_ref_revision: Option<CommitId>,
@@ -1314,7 +1311,7 @@ struct HunkHeader {
 }
 
 fn split_blocks(content: &str, language: Language) -> Vec<Block> {
-    block_splitter::split(content, language).into_review_blocks()
+    block_splitter::split(content, language).into_review_blocks(content)
 }
 
 fn usize_to_u32_saturating(value: usize) -> u32 {
@@ -1324,6 +1321,7 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockKind;
 
     fn unified(line: &str) -> DiffHunkLine {
         let line = line.trim_end_matches('\n');
@@ -1331,12 +1329,35 @@ mod tests {
             .unwrap_or_else(|| panic!("expected valid unified diff line: {line:?}"))
     }
 
+    /// Builds a line-range fixture from a hypothetical source with one newline
+    /// byte per preceding line, keeping byte and line coordinates coherent.
+    fn line_only_block(start_line: usize, end_line: usize) -> Block {
+        let content = "\n".repeat(end_line - start_line);
+        Block::new(
+            content,
+            BlockKind::Code,
+            crate::block::LineSpan::new(start_line, end_line),
+            crate::block::ByteSpan::new(start_line, end_line),
+        )
+    }
+
+    fn local_source_block(content: &str, start_line: usize, end_line: usize) -> Block {
+        Block::new(
+            content.to_string(),
+            BlockKind::Code,
+            crate::block::LineSpan::new(start_line, end_line),
+            crate::block::ByteSpan::new(0, content.len()),
+        )
+    }
+
     fn block_has_changed_lines_in_diff(
         block: &crate::block::Block,
         hunks: &[DiffHunk],
     ) -> BlockDiffChangeKind {
-        DiffChangedLineIndex::from_hunks(hunks)
-            .change_kind_for_block(DiffBlockOwnership::HeadOnly(block))
+        DiffChangedLineIndex::from_hunks(hunks).change_kind_for_block(DiffBlockOwnership::Matched {
+            base: block,
+            head: block,
+        })
     }
 
     #[test]
@@ -1528,17 +1549,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_reports_overlap_and_non_overlap() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 10, // 0-based, so lines 11-20
-            end_line: 20,
-        };
+        let block = line_only_block(10, 20);
 
         let hunk_inside = DiffHunk {
             file_path: RepoPath::root(),
@@ -1575,17 +1586,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_respects_exclusive_end_line() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 10, // 0-based, so lines 11-20
-            end_line: 20,   // exclusive
-        };
+        let block = line_only_block(10, 20);
 
         let hunk_at_exclusive_end = DiffHunk {
             file_path: RepoPath::root(),
@@ -1603,17 +1604,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_counts_removed_lines_from_overlapping_hunks() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 10, // 0-based, so lines 11-12
-            end_line: 12,
-        };
+        let block = line_only_block(10, 12);
 
         let hunk = DiffHunk {
             file_path: RepoPath::root(),
@@ -1636,26 +1627,8 @@ mod tests {
 
     #[test]
     fn head_changed_line_index_does_not_attribute_deletion_to_following_block() {
-        use crate::block::{Block, BlockKind};
-
-        let following_head_block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 10, // 0-based, so lines 11-12
-            end_line: 12,
-        };
-        let following_base_block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 11, // 0-based, so lines 12-13 before the deletion
-            end_line: 13,
-        };
+        let following_head_block = line_only_block(10, 12);
+        let following_base_block = line_only_block(11, 13);
         let hunk = DiffHunk {
             file_path: RepoPath::root(),
             old_start: 11,
@@ -1680,17 +1653,7 @@ mod tests {
 
     #[test]
     fn diff_changed_line_index_matches_block_change_detection() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 10, // 0-based, so line 11
-            end_line: 11,
-        };
+        let block = line_only_block(10, 11);
         let hunks = vec![DiffHunk {
             file_path: RepoPath::root(),
             old_start: 11,
@@ -1715,26 +1678,8 @@ mod tests {
 
     #[test]
     fn diff_changed_line_index_block_start_whitespace_replacement_is_nonreviewable() {
-        use crate::block::{Block, BlockKind};
-
-        let base = Block {
-            hash: TreeHash::default(),
-            content: "    value\n".to_string(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 0,
-            end_line: 1,
-        };
-        let head = Block {
-            hash: TreeHash::default(),
-            content: "value\n".to_string(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 0,
-            end_line: 1,
-        };
+        let base = local_source_block("    value\n", 0, 1);
+        let head = local_source_block("value\n", 0, 1);
         let index = DiffChangedLineIndex::from_hunks(&[DiffHunk {
             file_path: RepoPath::root(),
             old_start: 1,
@@ -1753,26 +1698,8 @@ mod tests {
 
     #[test]
     fn diff_changed_line_index_block_start_whitespace_only_changes_are_nonreviewable() {
-        use crate::block::{Block, BlockKind};
-
-        let base = Block {
-            hash: TreeHash::default(),
-            content: " \n".to_string(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 0,
-            end_line: 1,
-        };
-        let head = Block {
-            hash: TreeHash::default(),
-            content: "\t\n".to_string(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 0,
-            end_line: 1,
-        };
+        let base = local_source_block(" \n", 0, 1);
+        let head = local_source_block("\t\n", 0, 1);
         let index = DiffChangedLineIndex::from_hunks(&[DiffHunk {
             file_path: RepoPath::root(),
             old_start: 1,
@@ -1791,26 +1718,8 @@ mod tests {
 
     #[test]
     fn diff_changed_line_index_block_start_whitespace_mixed_with_removal_is_reviewable() {
-        use crate::block::{Block, BlockKind};
-
-        let base = Block {
-            hash: TreeHash::default(),
-            content: " \nremoved\n".to_string(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 0,
-            end_line: 2,
-        };
-        let head = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 0,
-            end_line: 1,
-        };
+        let base = local_source_block(" \nremoved\n", 0, 2);
+        let head = line_only_block(0, 1);
         let index = DiffChangedLineIndex::from_hunks(&[DiffHunk {
             file_path: RepoPath::root(),
             old_start: 1,
@@ -1829,17 +1738,7 @@ mod tests {
 
     #[test]
     fn diff_changed_line_index_handles_unsorted_hunks() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 10, // 0-based, so lines 11-20
-            end_line: 20,
-        };
+        let block = line_only_block(10, 20);
         let hunk_after = DiffHunk {
             file_path: RepoPath::root(),
             old_start: 25,
@@ -1883,17 +1782,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_closing_brace_only_additions() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2, // 0-based, lines 3..=5
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -1911,17 +1800,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_whitespace_only_additions() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -1939,17 +1818,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_whitespace_only_removals() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -1967,17 +1836,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_keeps_mixed_whitespace_and_real_changes() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -1995,17 +1854,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_indentation_only_replacements() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -2026,17 +1875,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_trailing_whitespace_only_replacements() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -2057,17 +1896,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_keeps_internal_spacing_replacements_reviewable() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -2088,17 +1917,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_crlf_to_lf_only_replacements() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -2119,17 +1938,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_missing_final_newline_only_replacements() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 5,
-        };
+        let block = line_only_block(2, 5);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),
@@ -2147,17 +1956,7 @@ mod tests {
 
     #[test]
     fn block_has_changed_lines_ignores_multiline_indentation_only_replacements() {
-        use crate::block::{Block, BlockKind};
-
-        let block = Block {
-            hash: TreeHash::default(),
-            content: String::new(),
-            kind: BlockKind::Code,
-            tags: vec![],
-            complexity: None,
-            start_line: 2,
-            end_line: 8,
-        };
+        let block = line_only_block(2, 8);
 
         let hunk = DiffHunk {
             file_path: RepoPath::new("src/lib.rs").unwrap(),

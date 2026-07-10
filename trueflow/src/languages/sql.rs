@@ -3,9 +3,9 @@ use super::{
     no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::complexity;
-use crate::hashing::TreeHash;
+
 use anyhow::Result;
 use tree_sitter::{Language as TsLanguage, Node};
 
@@ -56,7 +56,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
         }
 
         let start = pending_comment_start.take().unwrap_or(child.start_byte());
-        push_non_whitespace_gap(&mut blocks, content, last_end, start, lang);
+        push_non_whitespace_gap(&mut blocks, content, last_end, start, lang)?;
 
         let (end, next_index) =
             extend_with_statement_terminator(&children, index, child.end_byte());
@@ -67,7 +67,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
             start,
             end,
             lang,
-        ));
+        )?);
 
         last_end = end;
         pending_comment_end = 0;
@@ -75,7 +75,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
     }
 
     if let Some(start) = pending_comment_start {
-        push_non_whitespace_gap(&mut blocks, content, last_end, start, lang);
+        push_non_whitespace_gap(&mut blocks, content, last_end, start, lang)?;
         blocks.push(create_file_block(
             &content[start..pending_comment_end],
             BlockKind::Comment,
@@ -83,11 +83,11 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
             start,
             pending_comment_end,
             lang,
-        ));
+        )?);
         last_end = pending_comment_end;
     }
 
-    push_non_whitespace_gap(&mut blocks, content, last_end, content.len(), lang);
+    push_non_whitespace_gap(&mut blocks, content, last_end, content.len(), lang)?;
 
     Ok(blocks)
 }
@@ -273,9 +273,9 @@ fn push_non_whitespace_gap(
     start: usize,
     end: usize,
     lang: Language,
-) {
+) -> Result<()> {
     if start >= end {
-        return;
+        return Ok(());
     }
 
     let chunk = &content[start..end];
@@ -283,7 +283,7 @@ fn push_non_whitespace_gap(
         .trim_matches(|ch: char| ch.is_whitespace() || ch == ';')
         .is_empty()
     {
-        return;
+        return Ok(());
     }
 
     blocks.push(create_file_block(
@@ -293,7 +293,8 @@ fn push_non_whitespace_gap(
         start,
         end,
         lang,
-    ));
+    )?);
+    Ok(())
 }
 
 fn create_file_block(
@@ -303,24 +304,11 @@ fn create_file_block(
     start_byte: usize,
     end_byte: usize,
     lang: Language,
-) -> Block {
-    let (start_line, end_line) = byte_range_to_lines(full_source, start_byte, end_byte);
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: Vec::new(),
-        complexity: complexity::calculate(text, lang),
-        start_line,
-        end_line,
-    }
-}
-
-fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let start_line = source[..start].chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = source[start..end].chars().filter(|&ch| ch == '\n').count();
-    let end_line = start_line + chunk_newlines + usize::from(!source[start..end].ends_with('\n'));
-    (start_line, end_line)
+) -> Result<Block> {
+    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    assert_eq!(block.content, text, "SQL top-level range must name content");
+    block.complexity = complexity::calculate(&block.content, lang);
+    Ok(block)
 }
 
 #[cfg(test)]

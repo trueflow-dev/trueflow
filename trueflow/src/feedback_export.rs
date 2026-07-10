@@ -1,7 +1,6 @@
-use crate::block::{Block, BlockKind, FileState};
+use crate::block::{Block, BlockKind, ByteSpan, FileState};
 use crate::config::BlockFilters;
 use crate::feedback_since::ResolvedFeedbackSince as ParsedFeedbackSince;
-use crate::policy::{should_skip_imports_by_default, should_skip_whitespace_only_by_default};
 use crate::repo_path::RepoPath;
 use crate::scanner::{self, ScanOptions};
 use crate::store::{FileStore, Record, RepoRef, ReviewTargetRef, TreeHash};
@@ -30,10 +29,39 @@ pub struct FeedbackCursor {
     pub record_ids_at_timestamp: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FeedbackBlockView {
+    pub hash: TreeHash,
+    pub content: String,
+    pub kind: BlockKind,
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<u32>,
+    pub start_line: usize,
+    pub end_line: usize,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub byte_span: Option<ByteSpan>,
+}
+
+impl FeedbackBlockView {
+    pub fn from_canonical_block(block: &Block) -> Self {
+        Self {
+            hash: block.hash.clone(),
+            content: block.content.clone(),
+            kind: block.kind,
+            tags: block.tags.clone(),
+            complexity: block.complexity,
+            start_line: block.start_line,
+            end_line: block.end_line,
+            byte_span: Some(block.byte_span()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FeedbackEntry {
     pub file_path: String,
-    pub block: Block,
+    pub block: FeedbackBlockView,
     pub reviews: Vec<Record>,
     pub latest_verdict: String,
 }
@@ -147,7 +175,7 @@ struct ResolvedFeedbackRecord<'a> {
     index: usize,
     record: &'a Record,
     file_path: String,
-    block: Block,
+    block: FeedbackBlockView,
     key: FeedbackEntryKey,
 }
 
@@ -223,11 +251,11 @@ pub fn collect_feedback_entries(
         if !query.filters.allows_block(block.kind) {
             continue;
         }
-        if should_skip_whitespace_only_by_default(block, &query.filters) {
+        if should_skip_feedback_whitespace_only_by_default(block, &query.filters) {
             continue;
         }
         if file_path != "<unknown>"
-            && should_skip_imports_by_default(file_path.as_str(), block, &query.filters)
+            && should_skip_feedback_imports_by_default(file_path.as_str(), block, &query.filters)
         {
             continue;
         }
@@ -269,7 +297,7 @@ pub fn collect_feedback_entries(
 fn feedback_entry_parts(
     record: &Record,
     context: &ResolvedFeedbackContext,
-) -> (String, Block, FeedbackEntryKey) {
+) -> (String, FeedbackBlockView, FeedbackEntryKey) {
     let file_path = context
         .file_path
         .clone()
@@ -277,8 +305,15 @@ fn feedback_entry_parts(
         .unwrap_or_else(|| "<unknown>".to_string());
     let block = context
         .block
-        .clone()
-        .unwrap_or_else(|| unresolved_block_for_record(record));
+        .as_ref()
+        .and_then(|block| scoped_feedback_block_for_record(record, block))
+        .or_else(|| {
+            context
+                .block
+                .as_ref()
+                .map(FeedbackBlockView::from_canonical_block)
+        })
+        .unwrap_or_else(|| unresolved_feedback_block_for_record(record));
     let key = FeedbackEntryKey {
         snapshot: context.snapshot.clone(),
         target: record.target.clone(),
@@ -490,7 +525,6 @@ fn resolve_feedback_context(
                 resolve_record_in_files(record, &cache.files)
             };
             if let Some((file_path, block)) = resolved {
-                let block = scoped_block_for_record(record, &block).unwrap_or(block);
                 return Ok(ResolvedFeedbackContext {
                     snapshot: snapshot.clone(),
                     file_path: Some(file_path),
@@ -515,7 +549,6 @@ fn resolve_feedback_context(
             snapshot == default_snapshot,
         )?;
         if let Some((file_path, block)) = resolve_record_in_files(record, &cache.files) {
-            let block = scoped_block_for_record(record, &block).unwrap_or(block);
             return Ok(ResolvedFeedbackContext {
                 snapshot: snapshot.clone(),
                 file_path: Some(file_path),
@@ -527,11 +560,11 @@ fn resolve_feedback_context(
     Ok(ResolvedFeedbackContext {
         snapshot: default_snapshot.clone(),
         file_path: record.path_hint.as_ref().map(RepoPath::to_string),
-        block: scoped_unresolved_block_for_record(record),
+        block: None,
     })
 }
 
-fn scoped_block_for_record(record: &Record, block: &Block) -> Option<Block> {
+fn scoped_feedback_block_for_record(record: &Record, block: &Block) -> Option<FeedbackBlockView> {
     let scope = record.comment_scope.as_ref()?;
     let context = record.comment_context.as_ref()?;
     let start_line = usize::try_from(scope.start_line).unwrap_or(usize::MAX);
@@ -540,7 +573,7 @@ fn scoped_block_for_record(record: &Record, block: &Block) -> Option<Block> {
         return None;
     }
 
-    Some(Block {
+    Some(FeedbackBlockView {
         hash: block.hash.clone(),
         content: context.clone(),
         kind: block.kind,
@@ -548,24 +581,21 @@ fn scoped_block_for_record(record: &Record, block: &Block) -> Option<Block> {
         complexity: block.complexity,
         start_line,
         end_line,
+        byte_span: None,
     })
 }
 
-fn scoped_unresolved_block_for_record(record: &Record) -> Option<Block> {
+fn scoped_unresolved_feedback_block_for_record(record: &Record) -> Option<FeedbackBlockView> {
     let scope = record.comment_scope.as_ref()?;
     let context = record.comment_context.as_ref()?;
-    let hash = match &record.target {
-        ReviewTargetRef::Block { hash }
-        | ReviewTargetRef::File { hash }
-        | ReviewTargetRef::Tree { hash } => hash.clone(),
-    };
+    let hash = feedback_target_hash(record);
     let start_line = usize::try_from(scope.start_line).unwrap_or(usize::MAX);
     let end_line = usize::try_from(scope.end_line).unwrap_or(usize::MAX);
     if start_line >= end_line {
         return None;
     }
 
-    Some(Block {
+    Some(FeedbackBlockView {
         hash,
         content: context.clone(),
         kind: BlockKind::Code,
@@ -573,6 +603,7 @@ fn scoped_unresolved_block_for_record(record: &Record) -> Option<Block> {
         complexity: None,
         start_line,
         end_line,
+        byte_span: None,
     })
 }
 
@@ -858,28 +889,49 @@ fn path_matches_feedback_selections(
     true
 }
 
-fn unresolved_block_for_record(record: &Record) -> Block {
-    if let Some(block) = scoped_unresolved_block_for_record(record) {
+fn unresolved_feedback_block_for_record(record: &Record) -> FeedbackBlockView {
+    if let Some(block) = scoped_unresolved_feedback_block_for_record(record) {
         return block;
     }
 
-    let hash = match &record.target {
-        ReviewTargetRef::Block { hash }
-        | ReviewTargetRef::File { hash }
-        | ReviewTargetRef::Tree { hash } => hash.clone(),
-    };
     let start_line = record.line_hint.unwrap_or(0) as usize;
     let end_line = start_line.saturating_add(1);
-
-    Block {
-        hash,
+    FeedbackBlockView {
+        hash: feedback_target_hash(record),
         content: "[unresolved historical context]".to_string(),
         kind: BlockKind::Code,
         tags: Vec::new(),
         complexity: None,
         start_line,
         end_line,
+        byte_span: None,
     }
+}
+
+fn feedback_target_hash(record: &Record) -> TreeHash {
+    match &record.target {
+        ReviewTargetRef::Block { hash }
+        | ReviewTargetRef::File { hash }
+        | ReviewTargetRef::Tree { hash } => hash.clone(),
+    }
+}
+
+fn should_skip_feedback_whitespace_only_by_default(
+    block: &FeedbackBlockView,
+    filters: &BlockFilters,
+) -> bool {
+    block.content.trim().is_empty() && !filters.only_contains(block.kind)
+}
+
+fn should_skip_feedback_imports_by_default(
+    path: &str,
+    block: &FeedbackBlockView,
+    filters: &BlockFilters,
+) -> bool {
+    block.kind.is_import_like()
+        && !path.ends_with("/lib.rs")
+        && path != "lib.rs"
+        && !filters.only_contains(block.kind)
 }
 
 fn record_matches_since(
@@ -909,6 +961,7 @@ fn record_matches_since(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::LineSpan;
     use crate::hashing::TreeHash;
     use crate::store::{BlockState, Identity, ReviewCheck, VcsSystem, Verdict};
     use std::iter::FromIterator;
@@ -1263,12 +1316,17 @@ mod tests {
 
     #[test]
     fn resolve_record_in_files_uses_line_hint_for_duplicate_block_hashes() {
-        let first = Block::new("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2);
+        let first = Block::new(
+            "fn duplicate() {}\n".to_string(),
+            BlockKind::Function,
+            LineSpan::new(1, 2),
+            ByteSpan::new(0, "fn duplicate() {}\n".len()),
+        );
         let second = Block::new(
             "fn duplicate() {}\n".to_string(),
             BlockKind::Function,
-            10,
-            11,
+            LineSpan::new(10, 11),
+            ByteSpan::new(100, 100 + "fn duplicate() {}\n".len()),
         );
         let file = FileState::from_text(
             RepoPath::new("src/lib.rs").unwrap(),
@@ -1522,7 +1580,62 @@ mod tests {
         ResolvedFeedbackContext {
             snapshot: FeedbackSnapshot::Workdir,
             file_path: Some(path.to_string()),
-            block: Some(Block::new(content.to_string(), BlockKind::Code, 0, 1)),
+            block: Some(Block::new(
+                content.to_string(),
+                BlockKind::Code,
+                LineSpan::new(0, 1),
+                ByteSpan::new(0, content.len()),
+            )),
+        }
+    }
+
+    #[test]
+    fn canonical_feedback_view_serializes_its_source_span() {
+        let content = "fn canonical() {}\n";
+        let block = Block::new(
+            content.to_string(),
+            BlockKind::Function,
+            LineSpan::new(2, 3),
+            ByteSpan::new(17, 17 + content.len()),
+        );
+
+        let value = serde_json::to_value(FeedbackBlockView::from_canonical_block(&block))
+            .unwrap_or_else(|error| panic!("canonical feedback view should serialize: {error}"));
+
+        assert_eq!(value["start_byte"].as_u64(), Some(17));
+        assert_eq!(
+            value["end_byte"].as_u64(),
+            u64::try_from(17 + content.len()).ok()
+        );
+    }
+
+    #[test]
+    fn scoped_and_unresolved_feedback_views_omit_source_spans() {
+        let content = "fn canonical() {}\n";
+        let block = Block::new(
+            content.to_string(),
+            BlockKind::Function,
+            LineSpan::new(2, 3),
+            ByteSpan::new(17, 17 + content.len()),
+        );
+        let mut record = build_record("scoped", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        record.comment_scope = Some(crate::store::CommentScope {
+            start_line: 7,
+            end_line: 9,
+        });
+        record.comment_context = Some("rewritten feedback context\n".to_string());
+
+        let scoped = scoped_feedback_block_for_record(&record, &block)
+            .unwrap_or_else(|| panic!("expected scoped feedback view"));
+        let unresolved = scoped_unresolved_feedback_block_for_record(&record)
+            .unwrap_or_else(|| panic!("expected unresolved feedback view"));
+
+        for view in [scoped, unresolved] {
+            assert_eq!(view.byte_span, None);
+            let value = serde_json::to_value(view)
+                .unwrap_or_else(|error| panic!("detached feedback view should serialize: {error}"));
+            assert!(value.get("start_byte").is_none());
+            assert!(value.get("end_byte").is_none());
         }
     }
 }

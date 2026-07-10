@@ -27,20 +27,13 @@ fn is_lib_rs(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::config::BlockFilters;
-    use crate::hashing::TreeHash;
 
     fn block(kind: BlockKind, content: &str) -> Block {
-        Block {
-            hash: TreeHash::from_content(content),
-            content: content.to_string(),
-            kind,
-            tags: Vec::new(),
-            complexity: None,
-            start_line: 0,
-            end_line: 1,
-        }
+        let line_span = LineSpan::new(0, content.lines().count());
+        let byte_span = ByteSpan::new(0, content.len());
+        Block::new(content.to_string(), kind, line_span, byte_span)
     }
 
     #[test]

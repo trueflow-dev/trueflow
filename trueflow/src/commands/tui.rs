@@ -3283,8 +3283,8 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
 
 fn is_identity_subblock(parent: &crate::block::Block, child: &crate::block::Block) -> bool {
     child.kind == parent.kind
-        && child.start_line == parent.start_line
-        && child.end_line == parent.end_line
+        && child.line_span() == parent.line_span()
+        && child.byte_span() == parent.byte_span()
         && child.hash == parent.hash
 }
 
@@ -7561,6 +7561,33 @@ mod diff_scope_tests {
         }
     }
 
+    fn test_block(content: String, kind: BlockKind, start_line: usize, end_line: usize) -> Block {
+        let start_byte = start_line;
+        let end_byte = start_byte
+            .checked_add(content.len())
+            .unwrap_or_else(|| panic!("test block byte end overflow"));
+        Block::new(
+            content,
+            kind,
+            crate::block::LineSpan::new(start_line, end_line),
+            crate::block::ByteSpan::new(start_byte, end_byte),
+        )
+    }
+
+    #[test]
+    fn identity_subblock_requires_matching_byte_span() {
+        let parent = test_block("same".to_string(), BlockKind::Code, 0, 1);
+        let shifted_child = Block::new(
+            "same".to_string(),
+            BlockKind::Code,
+            crate::block::LineSpan::new(0, 1),
+            crate::block::ByteSpan::new(10, 14),
+        );
+
+        assert!(is_identity_subblock(&parent, &parent));
+        assert!(!is_identity_subblock(&parent, &shifted_child));
+    }
+
     fn build_test_state(
         review_scope: ScopePreset,
         file_diff_cache: HashMap<PathBuf, vcs::FileDiff>,
@@ -7627,7 +7654,7 @@ mod diff_scope_tests {
             "file-hash".to_string(),
             Language::Rust,
         );
-        let block = Block::new(content.to_string(), BlockKind::Paragraph, 0, 1);
+        let block = test_block(content.to_string(), BlockKind::Paragraph, 0, 1);
         let block_id = builder.add_block(
             file,
             "paragraph".to_string(),
@@ -7765,7 +7792,7 @@ mod diff_scope_tests {
             first_file,
             "first".to_string(),
             "a.rs".to_string(),
-            Block::new("fn a() {}".to_string(), BlockKind::Function, 0, 1),
+            test_block("fn a() {}".to_string(), BlockKind::Function, 0, 1),
             Language::Rust,
         );
         let second_file = builder.add_file(
@@ -7779,7 +7806,7 @@ mod diff_scope_tests {
             second_file,
             "second".to_string(),
             "b.rs".to_string(),
-            Block::new("fn b() {}".to_string(), BlockKind::Function, 0, 1),
+            test_block("fn b() {}".to_string(), BlockKind::Function, 0, 1),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -7886,7 +7913,7 @@ mod diff_scope_tests {
             "file-hash".to_string(),
             language,
         );
-        let block = Block::new(
+        let block = test_block(
             block_content.to_string(),
             block_kind,
             block_start_line,
@@ -7982,7 +8009,7 @@ mod diff_scope_tests {
                 file,
                 format!("function-{index}"),
                 "src/lib.rs".to_string(),
-                Block::new(
+                test_block(
                     format!("fn block_{index}() {{}}\n"),
                     BlockKind::Function,
                     index,
@@ -8067,7 +8094,7 @@ mod diff_scope_tests {
         build_state_with_markdown_blocks(
             repo_path,
             file_content,
-            vec![Block::new(
+            vec![test_block(
                 file_content.to_string(),
                 BlockKind::Section,
                 0,
@@ -8433,8 +8460,8 @@ mod diff_scope_tests {
                 path: RepoPath::new("src/lib.rs").unwrap(),
                 language: Language::Rust,
                 blocks: vec![
-                    Block::new("fn alpha() {}".to_string(), BlockKind::Function, 1, 2),
-                    Block::new("fn beta() {}".to_string(), BlockKind::Function, 3, 4),
+                    test_block("fn alpha() {}".to_string(), BlockKind::Function, 1, 2),
+                    test_block("fn beta() {}".to_string(), BlockKind::Function, 3, 4),
                 ],
             }],
             total_blocks: 5,
@@ -9598,7 +9625,7 @@ mod diff_scope_tests {
             "file-hash".to_string(),
             Language::Rust,
         );
-        let block = Block::new("fn helper() {}\n".to_string(), BlockKind::Function, 3, 4);
+        let block = test_block("fn helper() {}\n".to_string(), BlockKind::Function, 3, 4);
         let block_id = builder.add_block(
             file,
             "helper".to_string(),
@@ -12416,13 +12443,13 @@ mod diff_scope_tests {
         state.diff_block_sides.insert(
             block_id,
             DiffBlockSides {
-                base: Some(Block::new(
+                base: Some(test_block(
                     base_content.to_string(),
                     BlockKind::Function,
                     0,
                     3,
                 )),
-                head: Some(Block::new(
+                head: Some(test_block(
                     head_content.to_string(),
                     BlockKind::Function,
                     0,
@@ -12794,7 +12821,7 @@ mod diff_scope_tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            Block::new(
+            test_block(
                 "impl Thing {\n    fn do_it(&self) {}\n}\n".to_string(),
                 BlockKind::Impl,
                 0,
@@ -12806,7 +12833,7 @@ mod diff_scope_tests {
             impl_block,
             "method".to_string(),
             "src/lib.rs".to_string(),
-            Block::new(
+            test_block(
                 "fn do_it(&self) {}\n".to_string(),
                 BlockKind::Function,
                 1,
@@ -12833,7 +12860,7 @@ mod diff_scope_tests {
             "file-hash".to_string(),
             Language::Rust,
         );
-        let struct_block = Block::new(
+        let struct_block = test_block(
             "#[derive(Debug, Clone)]\nstruct Config {\n    name: String,\n}\n".to_string(),
             BlockKind::Struct,
             0,
@@ -12856,7 +12883,7 @@ mod diff_scope_tests {
             struct_id,
             "CodeParagraph".to_string(),
             "example_repos/all_languages/main.rs".to_string(),
-            Block::new(
+            test_block(
                 "name: String,\n".to_string(),
                 BlockKind::CodeParagraph,
                 2,
@@ -12911,7 +12938,7 @@ mod diff_scope_tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            Block::new(
+            test_block(
                 "impl Thing {\n    fn first(&self) {}\n    fn second(&self) {}\n}\n".to_string(),
                 BlockKind::Impl,
                 0,
@@ -12923,7 +12950,7 @@ mod diff_scope_tests {
             parent,
             "function".to_string(),
             "src/lib.rs".to_string(),
-            Block::new(
+            test_block(
                 "fn first(&self) {}\n".to_string(),
                 BlockKind::Function,
                 1,
@@ -12935,7 +12962,7 @@ mod diff_scope_tests {
             first,
             "CodeParagraph".to_string(),
             "src/lib.rs".to_string(),
-            Block::new(
+            test_block(
                 "self.value();\n".to_string(),
                 BlockKind::CodeParagraph,
                 1,
@@ -12947,7 +12974,7 @@ mod diff_scope_tests {
             parent,
             "function".to_string(),
             "src/lib.rs".to_string(),
-            Block::new(
+            test_block(
                 "fn second(&self) {}\n".to_string(),
                 BlockKind::Function,
                 2,
@@ -13797,6 +13824,8 @@ mod diff_scope_tests {
                 complexity: None,
                 start_line: 0,
                 end_line: 3,
+                start_byte: 0,
+                end_byte: "pub fn demo() {\n    println!(\"historical target\");\n}".len(),
             }),
             language: Some(Language::Rust),
         };
@@ -13909,6 +13938,8 @@ mod diff_scope_tests {
                 complexity: None,
                 start_line: 0,
                 end_line: 3,
+                start_byte: 0,
+                end_byte: "fn main() {\n    println!(\"Hello from commit scope\");\n}".len(),
             }),
             language: Some(Language::Rust),
         };
@@ -13945,7 +13976,7 @@ mod diff_scope_tests {
             file,
             "function".to_string(),
             "src/lib.rs".to_string(),
-            Block::new("fn run() {}".to_string(), BlockKind::Function, 0, 1),
+            test_block("fn run() {}".to_string(), BlockKind::Function, 0, 1),
             Language::Rust,
         );
         let tree = builder.finalize();

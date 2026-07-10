@@ -3,11 +3,11 @@ use super::{
     default_code_sub_split, default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::code_comments;
 use crate::complexity;
-use crate::hashing::TreeHash;
-use crate::text_split::split_by_paragraph_breaks;
+
+use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
@@ -72,7 +72,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
             && next.kind() == "function_body"
         {
             let start = pending_start.unwrap_or(child.start_byte());
-            push_non_empty_gap(&mut blocks, content, last_end, start, lang);
+            push_non_empty_gap(&mut blocks, content, last_end, start, lang)?;
 
             let end = next.end_byte();
             blocks.push(create_file_block(
@@ -83,8 +83,8 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
                 start,
                 end,
                 lang,
-            ));
-            blocks.extend(collect_test_invocation_blocks(next, content, lang));
+            )?);
+            blocks.extend(collect_test_invocation_blocks(next, content, lang)?);
 
             last_end = end;
             pending_start = None;
@@ -154,7 +154,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
         };
 
         if let Some(span) = span {
-            push_non_empty_gap(&mut blocks, content, last_end, span.start_byte, lang);
+            push_non_empty_gap(&mut blocks, content, last_end, span.start_byte, lang)?;
             blocks.push(create_file_block(
                 &content[span.start_byte..span.end_byte],
                 span.kind,
@@ -163,7 +163,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
                 span.start_byte,
                 span.end_byte,
                 lang,
-            ));
+            )?);
 
             if matches!(
                 kind,
@@ -173,7 +173,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
                     | "extension_type_declaration"
                     | "enum_declaration"
             ) {
-                blocks.extend(collect_type_member_blocks(child, content, lang));
+                blocks.extend(collect_type_member_blocks(child, content, lang)?);
             }
 
             last_end = span.end_byte;
@@ -187,7 +187,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
     if let Some(start) = pending_start {
         let end = pending_end.max(start);
         if end > start {
-            push_non_empty_gap(&mut blocks, content, last_end, start, lang);
+            push_non_empty_gap(&mut blocks, content, last_end, start, lang)?;
             blocks.push(create_file_block(
                 &content[start..end],
                 BlockKind::Comment,
@@ -196,17 +196,21 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
                 start,
                 end,
                 lang,
-            ));
+            )?);
             last_end = end;
         }
     }
 
-    push_non_empty_gap(&mut blocks, content, last_end, content.len(), lang);
+    push_non_empty_gap(&mut blocks, content, last_end, content.len(), lang)?;
 
     Ok(blocks)
 }
 
-fn collect_type_member_blocks(type_node: Node<'_>, content: &str, lang: Language) -> Vec<Block> {
+fn collect_type_member_blocks(
+    type_node: Node<'_>,
+    content: &str,
+    lang: Language,
+) -> Result<Vec<Block>> {
     collect_type_member_spans(type_node, content)
         .into_iter()
         .map(|span| {
@@ -280,7 +284,7 @@ fn collect_test_invocation_blocks(
     function_body: Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let mut spans = Vec::new();
     collect_test_invocation_spans(function_body, content, &mut spans);
     spans
@@ -375,14 +379,14 @@ fn push_non_empty_gap(
     start: usize,
     end: usize,
     lang: Language,
-) {
+) -> Result<()> {
     if end <= start {
-        return;
+        return Ok(());
     }
 
     let gap = &content[start..end];
     if gap.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
     blocks.push(create_file_block(
@@ -393,7 +397,8 @@ fn push_non_empty_gap(
         start,
         end,
         lang,
-    ));
+    )?);
+    Ok(())
 }
 
 fn map_type_declaration_kind(node: Node<'_>) -> BlockKind {
@@ -578,25 +583,50 @@ fn split_function_like_review_units(block: &Block) -> Result<Vec<Block>> {
         signature_end,
         BlockKind::FunctionSignature,
         Vec::new(),
-    )];
+    )?];
 
     let body = &block.content[signature_end..];
-    let mut tail_blocks = split_by_paragraph_breaks(body, |chunk, start, end, is_gap| {
-        let kind = if is_gap {
-            BlockKind::Gap
-        } else {
-            classify_review_chunk(chunk)
-        };
-        create_sub_block(
+    let mut start = 0usize;
+    for gap in paragraph_break_regex().find_iter(body) {
+        if start < gap.start() {
+            let chunk = &body[start..gap.start()];
+            if !chunk.is_empty() {
+                blocks.push(create_sub_block(
+                    block,
+                    chunk,
+                    signature_end + start,
+                    signature_end + gap.start(),
+                    classify_review_chunk(chunk),
+                    Vec::new(),
+                )?);
+            }
+        }
+
+        let gap_chunk = &body[gap.start()..gap.end()];
+        blocks.push(create_sub_block(
             block,
-            chunk,
-            signature_end + start,
-            signature_end + end,
-            kind,
+            gap_chunk,
+            signature_end + gap.start(),
+            signature_end + gap.end(),
+            BlockKind::Gap,
             Vec::new(),
-        )
-    });
-    blocks.append(&mut tail_blocks);
+        )?);
+        start = gap.end();
+    }
+
+    if start < body.len() {
+        let chunk = &body[start..];
+        if !chunk.is_empty() {
+            blocks.push(create_sub_block(
+                block,
+                chunk,
+                signature_end + start,
+                signature_end + body.len(),
+                classify_review_chunk(chunk),
+                Vec::new(),
+            )?);
+        }
+    }
 
     Ok(blocks)
 }
@@ -688,10 +718,13 @@ fn split_type_like_review_units(block: &Block) -> Result<Vec<Block>> {
         return crate::sub_splitter::split_code_review_units(block);
     }
 
-    Ok(review_unit_blocks_from_spans(block, spans))
+    review_unit_blocks_from_spans(block, spans)
 }
 
-fn review_unit_blocks_from_spans(block: &Block, mut spans: Vec<SemanticSpan>) -> Vec<Block> {
+fn review_unit_blocks_from_spans(
+    block: &Block,
+    mut spans: Vec<SemanticSpan>,
+) -> Result<Vec<Block>> {
     spans.sort_by_key(|span| (span.start_byte, span.end_byte));
     let mut blocks = Vec::new();
     let mut cursor = 0;
@@ -706,7 +739,7 @@ fn review_unit_blocks_from_spans(block: &Block, mut spans: Vec<SemanticSpan>) ->
                 span.start_byte,
                 classify_review_chunk(chunk),
                 Vec::new(),
-            ));
+            )?);
         }
         blocks.push(create_sub_block(
             block,
@@ -715,7 +748,7 @@ fn review_unit_blocks_from_spans(block: &Block, mut spans: Vec<SemanticSpan>) ->
             span.end_byte,
             span.kind,
             span.tags,
-        ));
+        )?);
         cursor = span.end_byte.max(cursor);
     }
 
@@ -728,10 +761,10 @@ fn review_unit_blocks_from_spans(block: &Block, mut spans: Vec<SemanticSpan>) ->
             block.content.len(),
             classify_review_chunk(chunk),
             Vec::new(),
-        ));
+        )?);
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
@@ -761,66 +794,39 @@ fn create_file_block(
     start_byte: usize,
     end_byte: usize,
     lang: Language,
-) -> Block {
-    let (start_line, end_line) = byte_range_to_lines(full_source, start_byte, end_byte);
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags,
-        complexity: complexity::calculate(text, lang),
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))
+        .context("Dart top-level range must be a valid UTF-8 source slice")?;
+    assert_eq!(
+        block.content, text,
+        "Dart top-level range must name content"
+    );
+    block.tags = tags;
+    block.complexity = complexity::calculate(&block.content, lang);
+    Ok(block)
 }
 
 fn create_sub_block(
     parent: &Block,
     text: &str,
     start_offset: usize,
-    _end_offset: usize,
+    end_offset: usize,
     kind: BlockKind,
     tags: Vec<String>,
-) -> Block {
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = text.chars().filter(|&ch| ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + if text.ends_with('\n') { 0 } else { 1 };
-
-    let mut combined_tags = parent.tags.clone();
+) -> Result<Block> {
+    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+        .context("Dart sub-split range must be a valid parent UTF-8 slice")?;
+    block.tags = parent.tags.clone();
+    assert_eq!(
+        block.content, text,
+        "Dart sub-split range must name content"
+    );
     for tag in tags {
-        if !combined_tags.iter().any(|existing| existing == &tag) {
-            combined_tags.push(tag);
+        if !block.tags.iter().any(|existing| existing == &tag) {
+            block.tags.push(tag);
         }
     }
-
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: combined_tags,
-        complexity: None,
-        start_line,
-        end_line,
-    }
-}
-
-fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let pre = &source[..start];
-    let start_line = pre.lines().count();
-    let start_line = if start > 0 && pre.ends_with('\n') {
-        start_line
-    } else {
-        start_line.saturating_sub(1)
-    };
-
-    let mid = &source[start..end];
-    let new_lines = mid.chars().filter(|&ch| ch == '\n').count();
-    let end_line = start_line + new_lines + if mid.ends_with('\n') { 0 } else { 1 };
-
-    (start_line, end_line)
+    Ok(block)
 }
 
 #[cfg(test)]
@@ -873,15 +879,9 @@ mod tests {
     fn split_type_like_review_units_preserves_full_class_content() {
         let source =
             "class Worker {\n  final String name;\n\n  Worker(this.name);\n\n  void run() {}\n}\n";
-        let block = Block {
-            hash: TreeHash::from_content(source),
-            content: source.to_string(),
-            kind: BlockKind::Class,
-            tags: Vec::new(),
-            complexity: None,
-            start_line: 1,
-            end_line: 7,
-        };
+        let block =
+            Block::from_file_range(source, BlockKind::Class, ByteSpan::new(0, source.len()))
+                .unwrap();
 
         let blocks = split_type_like_review_units(&block).unwrap();
         let rebuilt = blocks

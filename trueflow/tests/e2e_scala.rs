@@ -5,9 +5,8 @@ use std::path::PathBuf;
 use trueflow_test_support::*;
 
 use trueflow::analysis::Language;
-use trueflow::block::{Block, BlockKind};
+use trueflow::block::{Block, BlockKind, ByteSpan, LineSpan};
 use trueflow::block_splitter;
-use trueflow::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use trueflow::sub_splitter::{self, SubSplitSemantics};
 
 fn non_gap_kinds(blocks: &[Value]) -> Vec<&str> {
@@ -22,11 +21,6 @@ fn path_matches(file: &Value, expected: &str) -> bool {
     file["path"]
         .as_str()
         .is_some_and(|path| path.trim_start_matches("./") == expected)
-}
-
-fn expand_block_for_review_splitting(mut block: Block) -> Block {
-    block.end_line = block.start_line + MAX_REVIEW_UNIT_SPAN_LINES + 8;
-    block
 }
 
 #[test]
@@ -181,8 +175,7 @@ fn test_scala_type_sub_split_returns_structural_children_matching_top_level_memb
         })
         .collect::<Vec<_>>();
 
-    let result =
-        sub_splitter::split_result(&expand_block_for_review_splitting(worker), Language::Scala)?;
+    let result = sub_splitter::split_result_for_child_navigation(&worker, Language::Scala)?;
     assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
 
     let children: Vec<_> = result
@@ -234,14 +227,15 @@ fn test_scala_type_sub_split_returns_structural_children_matching_top_level_memb
 
 #[test]
 fn test_scala_type_sub_split_preserves_non_member_code_chunks() -> Result<()> {
-    let block = expand_block_for_review_splitting(Block::new(
-        "object Main {\n  println(\"boot\")\n  val answer = 1\n}\n".to_string(),
+    let content = "object Main {\n  println(\"boot\")\n  val answer = 1\n}\n";
+    let block = Block::new(
+        content.to_string(),
         BlockKind::Class,
-        0,
-        4,
-    ));
+        LineSpan::new(0, content.lines().count()),
+        ByteSpan::new(0, content.len()),
+    );
 
-    let result = sub_splitter::split_result(&block, Language::Scala)?;
+    let result = sub_splitter::split_result_for_child_navigation(&block, Language::Scala)?;
     assert_eq!(result.semantics, SubSplitSemantics::StructuralChildren);
     let kinds = result
         .blocks
@@ -277,19 +271,17 @@ fn test_scala_comment_prefixed_test_cases_still_split_by_signature() -> Result<(
     let content = "class WorkflowSuite extends AnyFunSuite {\n  // reviewer docs\n  test(\"works\") {\n    assert(1 == 1)\n  }\n}\n";
     let blocks = block_splitter::split(content, Language::Scala).blocks;
 
-    let test_case = expand_block_for_review_splitting(
-        blocks
-            .iter()
-            .find(|block| {
-                block.kind == BlockKind::Function
-                    && block.has_tag("test")
-                    && block.content.contains("test(\"works\")")
-            })
-            .cloned()
-            .context("expected comment-prefixed Scala test case block")?,
-    );
+    let test_case = blocks
+        .iter()
+        .find(|block| {
+            block.kind == BlockKind::Function
+                && block.has_tag("test")
+                && block.content.contains("test(\"works\")")
+        })
+        .cloned()
+        .context("expected comment-prefixed Scala test case block")?;
 
-    let result = sub_splitter::split_result(&test_case, Language::Scala)?;
+    let result = sub_splitter::split_result_for_child_navigation(&test_case, Language::Scala)?;
     assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
     let kinds = result
         .blocks
@@ -322,19 +314,17 @@ fn test_scala_field_style_test_cases_are_tagged_and_split() -> Result<()> {
     let content = "class WorkflowSuite extends AnyFunSuite {\n  helper.test(\"scoped case\") {\n    val value = 1\n    assert(value == 1)\n  }\n}\n";
     let blocks = block_splitter::split(content, Language::Scala).blocks;
 
-    let test_case = expand_block_for_review_splitting(
-        blocks
-            .iter()
-            .find(|block| {
-                block.kind == BlockKind::Function
-                    && block.has_tag("test")
-                    && block.content.contains("helper.test(\"scoped case\")")
-            })
-            .cloned()
-            .context("expected field-style Scala test case block")?,
-    );
+    let test_case = blocks
+        .iter()
+        .find(|block| {
+            block.kind == BlockKind::Function
+                && block.has_tag("test")
+                && block.content.contains("helper.test(\"scoped case\")")
+        })
+        .cloned()
+        .context("expected field-style Scala test case block")?;
 
-    let result = sub_splitter::split_result(&test_case, Language::Scala)?;
+    let result = sub_splitter::split_result_for_child_navigation(&test_case, Language::Scala)?;
     assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
     let kinds = result
         .blocks
@@ -355,20 +345,18 @@ fn test_scala_function_like_sub_split_returns_review_units() -> Result<()> {
     let content = std::fs::read_to_string(&file_path)?;
     let blocks = block_splitter::split(&content, Language::Scala).blocks;
 
-    let process = expand_block_for_review_splitting(
-        blocks
-            .iter()
-            .find(|block| {
-                block.kind == BlockKind::Method
-                    && block
-                        .content
-                        .contains("def process(values: List[Int]): Int =")
-            })
-            .cloned()
-            .context("expected Scala process method block")?,
-    );
+    let process = blocks
+        .iter()
+        .find(|block| {
+            block.kind == BlockKind::Method
+                && block
+                    .content
+                    .contains("def process(values: List[Int]): Int =")
+        })
+        .cloned()
+        .context("expected Scala process method block")?;
 
-    let result = sub_splitter::split_result(&process, Language::Scala)?;
+    let result = sub_splitter::split_result_for_child_navigation(&process, Language::Scala)?;
     assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
 
     let kinds = result

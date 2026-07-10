@@ -3,8 +3,8 @@ use super::{
     TopLevelRegistration, default_code_sub_split, no_attribute_nodes, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
-use crate::hashing::TreeHash;
+use crate::block::{Block, BlockKind, ByteSpan};
+
 use crate::sub_splitter;
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
@@ -371,12 +371,12 @@ fn split_function_like(block: &Block) -> Result<Vec<Block>> {
         0,
         signature_end,
         BlockKind::FunctionSignature,
-    )];
+    )?];
     blocks.extend(split_function_body_review_units(
         block,
         &block.content[signature_end..],
         signature_end,
-    ));
+    )?);
 
     Ok(blocks)
 }
@@ -421,7 +421,7 @@ fn split_module_like(block: &Block) -> Result<Vec<Block>> {
                 cursor,
                 field.start_byte(),
                 classify_review_chunk(chunk),
-            ));
+            )?);
         }
         blocks.push(create_sub_block(
             block,
@@ -429,7 +429,7 @@ fn split_module_like(block: &Block) -> Result<Vec<Block>> {
             field.start_byte(),
             field.end_byte(),
             kind,
-        ));
+        )?);
         cursor = field.end_byte().max(cursor);
     }
 
@@ -441,7 +441,7 @@ fn split_module_like(block: &Block) -> Result<Vec<Block>> {
             cursor,
             block.content.len(),
             classify_review_chunk(chunk),
-        ));
+        )?);
     }
 
     Ok(blocks)
@@ -504,7 +504,7 @@ fn split_function_body_review_units(
     parent: &Block,
     content: &str,
     base_offset: usize,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut start_offset = 0;
 
@@ -518,7 +518,7 @@ fn split_function_body_review_units(
                 base_offset,
                 start_offset,
                 end_offset,
-            );
+            )?;
         }
 
         blocks.push(create_sub_block(
@@ -527,7 +527,7 @@ fn split_function_body_review_units(
             base_offset + mat.start(),
             base_offset + mat.end(),
             BlockKind::Gap,
-        ));
+        )?);
 
         start_offset = mat.end();
     }
@@ -540,10 +540,10 @@ fn split_function_body_review_units(
             base_offset,
             start_offset,
             content.len(),
-        );
+        )?;
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn push_review_chunk(
@@ -553,11 +553,11 @@ fn push_review_chunk(
     base_offset: usize,
     start: usize,
     end: usize,
-) {
+) -> Result<()> {
     let chunk = &source[start..end];
     let kind = classify_review_chunk(chunk);
     if matches!(kind, BlockKind::Gap) {
-        return;
+        return Ok(());
     }
 
     if let Some(prefix_len) = leading_lua_comment_prefix_len(chunk)
@@ -569,7 +569,7 @@ fn push_review_chunk(
             base_offset + start,
             base_offset + start + prefix_len,
             BlockKind::Comment,
-        ));
+        )?);
 
         let rest = &chunk[prefix_len..];
         let rest_kind = classify_review_chunk(rest);
@@ -580,9 +580,9 @@ fn push_review_chunk(
                 base_offset + start + prefix_len,
                 base_offset + end,
                 rest_kind,
-            ));
+            )?);
         }
-        return;
+        return Ok(());
     }
 
     blocks.push(create_sub_block(
@@ -591,7 +591,8 @@ fn push_review_chunk(
         base_offset + start,
         base_offset + end,
         kind,
-    ));
+    )?);
+    Ok(())
 }
 
 fn leading_lua_comment_prefix_len(chunk: &str) -> Option<usize> {
@@ -677,27 +678,17 @@ fn create_sub_block(
     parent: &Block,
     content: &str,
     start_offset: usize,
-    _end_offset: usize,
+    end_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let offset_newlines = parent.content[..start_offset]
-        .chars()
-        .filter(|ch| *ch == '\n')
-        .count();
-    let chunk_newlines = content.chars().filter(|ch| *ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + if content.ends_with('\n') { 0 } else { 1 };
-
-    Block {
-        hash: TreeHash::from_content(content),
-        content: content.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block =
+        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    assert_eq!(
+        block.content, content,
+        "Lua sub-split range must name content"
+    );
+    block.tags = parent.tags.clone();
+    Ok(block)
 }
 
 #[cfg(test)]
@@ -708,15 +699,9 @@ mod tests {
     fn split_module_like_preserves_full_table_content() {
         let source =
             "local M = {\n  value = 1,\n\n  run = function()\n    return 2\n  end,\n}\nreturn M\n";
-        let block = Block {
-            hash: TreeHash::from_content(source),
-            content: source.to_string(),
-            kind: BlockKind::Module,
-            tags: Vec::new(),
-            complexity: None,
-            start_line: 1,
-            end_line: 8,
-        };
+        let block =
+            Block::from_file_range(source, BlockKind::Module, ByteSpan::new(0, source.len()))
+                .unwrap();
 
         let blocks = split_module_like(&block).unwrap();
         let rebuilt = blocks

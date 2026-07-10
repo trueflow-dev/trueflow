@@ -5,7 +5,7 @@ use super::{
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
 use crate::code_comments;
-use crate::hashing::TreeHash;
+
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -248,8 +248,8 @@ fn split_function_like_block(block: &Block) -> Result<Vec<Block>> {
         0,
         signature_end,
         BlockKind::FunctionSignature,
-    )];
-    blocks.extend(split_review_tail(block, signature_end));
+    )?];
+    blocks.extend(split_review_tail(block, signature_end)?);
     Ok(blocks)
 }
 
@@ -279,7 +279,7 @@ fn split_module_like_block(block: &Block) -> Result<Vec<Block>> {
     let mut current = 0;
     for nested in nested_blocks {
         if current < nested.start_byte {
-            push_non_child_chunk(block, current, nested.start_byte, &mut blocks);
+            push_non_child_chunk(block, current, nested.start_byte, &mut blocks)?;
         }
 
         blocks.push(create_sub_block(
@@ -287,12 +287,12 @@ fn split_module_like_block(block: &Block) -> Result<Vec<Block>> {
             nested.start_byte,
             nested.end_byte,
             nested.kind,
-        ));
+        )?);
         current = nested.end_byte;
     }
 
     if current < container.end_byte() {
-        push_non_child_chunk(block, current, container.end_byte(), &mut blocks);
+        push_non_child_chunk(block, current, container.end_byte(), &mut blocks)?;
     }
 
     if blocks.is_empty() {
@@ -302,18 +302,18 @@ fn split_module_like_block(block: &Block) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
+fn split_review_tail(parent: &Block, start_offset: usize) -> Result<Vec<Block>> {
     let rest = &parent.content[start_offset..];
     let re = paragraph_break_regex();
     let mut blocks = Vec::new();
 
-    let mut push_chunk = |chunk: &str, start: usize, end: usize, is_gap: bool| {
+    let mut push_chunk = |chunk: &str, start: usize, end: usize, is_gap: bool| -> Result<()> {
         let start = start_offset + start;
         let end = start_offset + end;
 
         if is_gap {
-            blocks.push(create_sub_block(parent, start, end, BlockKind::Gap));
-            return;
+            blocks.push(create_sub_block(parent, start, end, BlockKind::Gap)?);
+            return Ok(());
         }
 
         if let Some(comment_end) = leading_hash_comment_prefix_len(chunk) {
@@ -323,7 +323,7 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
                 start,
                 comment_end_abs,
                 BlockKind::Comment,
-            ));
+            )?);
 
             if !chunk[comment_end..].trim().is_empty() {
                 blocks.push(create_sub_block(
@@ -331,9 +331,9 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
                     comment_end_abs,
                     end,
                     BlockKind::CodeParagraph,
-                ));
+                )?);
             }
-            return;
+            return Ok(());
         }
 
         let kind = if code_comments::chunk_is_comment_only(chunk) {
@@ -341,7 +341,8 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
         } else {
             BlockKind::CodeParagraph
         };
-        blocks.push(create_sub_block(parent, start, end, kind));
+        blocks.push(create_sub_block(parent, start, end, kind)?);
+        Ok(())
     };
 
     let mut start = 0;
@@ -349,23 +350,23 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
         if start < mat.start() {
             let chunk = &rest[start..mat.start()];
             if !chunk.is_empty() {
-                push_chunk(chunk, start, mat.start(), false);
+                push_chunk(chunk, start, mat.start(), false)?;
             }
         }
 
         let gap = &rest[mat.start()..mat.end()];
-        push_chunk(gap, mat.start(), mat.end(), true);
+        push_chunk(gap, mat.start(), mat.end(), true)?;
         start = mat.end();
     }
 
     if start < rest.len() {
         let chunk = &rest[start..];
         if !chunk.is_empty() {
-            push_chunk(chunk, start, rest.len(), false);
+            push_chunk(chunk, start, rest.len(), false)?;
         }
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn leading_hash_comment_prefix_len(chunk: &str) -> Option<usize> {
@@ -390,9 +391,14 @@ fn leading_hash_comment_prefix_len(chunk: &str) -> Option<usize> {
     saw_comment.then_some(offset)
 }
 
-fn push_non_child_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<Block>) {
+fn push_non_child_chunk(
+    parent: &Block,
+    start: usize,
+    end: usize,
+    blocks: &mut Vec<Block>,
+) -> Result<()> {
     if start >= end {
-        return;
+        return Ok(());
     }
 
     let chunk = &parent.content[start..end];
@@ -404,7 +410,8 @@ fn push_non_child_chunk(parent: &Block, start: usize, end: usize, blocks: &mut V
         BlockKind::CodeParagraph
     };
 
-    blocks.push(create_sub_block(parent, start, end, kind));
+    blocks.push(create_sub_block(parent, start, end, kind)?);
+    Ok(())
 }
 
 fn is_within_exunit_case_module(node: Node<'_>, source: &str) -> bool {
@@ -514,22 +521,9 @@ fn create_sub_block(
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let content = &parent.content[start_offset..end_offset];
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&c| c == '\n').count();
-    let chunk_newlines = content.chars().filter(|&c| c == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + usize::from(!content.ends_with('\n'));
-
-    Block {
-        hash: TreeHash::from_content(content),
-        content: content.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+        .context("Elixir sub-split range must be a valid parent UTF-8 slice")?;
+    block.tags = parent.tags.clone();
+    Ok(block)
 }

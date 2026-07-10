@@ -258,19 +258,20 @@ impl<'a> CoverageIndex<'a> {
             .filter(|node| matches!(node.kind, TreeNodeKind::Block) && node.path == *path)
             .filter_map(|node| {
                 let candidate = node.block.as_ref()?;
-                let contains = candidate.start_line <= block.start_line
-                    && candidate.end_line >= block.end_line;
-                if contains {
+                let byte_span = candidate.byte_span();
+                if byte_span.contains(&block.byte_span()) {
                     Some((
                         node.id,
-                        candidate.end_line.saturating_sub(candidate.start_line),
+                        byte_span.len(),
+                        byte_span.start_byte,
+                        byte_span.end_byte,
                     ))
                 } else {
                     None
                 }
             })
-            .min_by_key(|(_, span)| *span)
-            .map(|(node_id, _)| node_id)
+            .min_by_key(|(_, len, start, end)| (*len, *start, *end))
+            .map(|(node_id, _, _, _)| node_id)
     }
 
     fn binding_relation_for_record_index(&self, record_index: usize) -> Option<BindingRelation> {
@@ -1004,13 +1005,36 @@ fn record_matches_review_requirement(
 mod tests {
     use super::*;
     use crate::analysis::Language;
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::hashing::{BytesHash, TreeHash};
     use crate::repo_path::RepoPath;
     use crate::store::{
         BlockState, CommitId, Identity, Record, RepoRef, ReviewTargetRef, VcsSystem,
     };
     use crate::tree::TreeBuilder;
+
+    fn test_block_at(
+        content: String,
+        kind: BlockKind,
+        start_line: usize,
+        end_line: usize,
+        start_byte: usize,
+    ) -> Block {
+        let end_byte = start_byte
+            .checked_add(content.len())
+            .unwrap_or_else(|| panic!("test block byte end overflow"));
+        Block::new(
+            content,
+            kind,
+            LineSpan::new(start_line, end_line),
+            ByteSpan::new(start_byte, end_byte),
+        )
+    }
+
+    fn test_block(content: String, kind: BlockKind, start_line: usize, end_line: usize) -> Block {
+        let start_byte = start_line;
+        test_block_at(content, kind, start_line, end_line, start_byte)
+    }
 
     #[test]
     fn block_coverage_distinguishes_direct_and_inherited_reviews() {
@@ -1271,6 +1295,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn block_coverage_resolves_identical_same_line_blocks_by_byte_span() {
+        let content = "const _: () = ();";
+        let first = test_block_at(content.to_string(), BlockKind::Const, 0, 1, 0);
+        let second = test_block_at(
+            content.to_string(),
+            BlockKind::Const,
+            0,
+            1,
+            content.len() + 1,
+        );
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file,
+            "first".to_string(),
+            "src/lib.rs".to_string(),
+            first,
+            Language::Rust,
+        );
+        let second_id = builder.add_block(
+            file,
+            "second".to_string(),
+            "src/lib.rs".to_string(),
+            second.clone(),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let database = ReviewDatabase::from_records(Vec::new());
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+
+        assert_eq!(
+            coverage
+                .block(&RepoPath::new("src/lib.rs").unwrap(), &second)
+                .resolved_node_id(),
+            Some(second_id)
+        );
+    }
+
+    #[test]
+    fn smallest_covering_block_uses_byte_containment_on_same_line() {
+        let source = "class Outer { class A {} class B {} }";
+        let outer =
+            Block::from_file_range(source, BlockKind::Class, ByteSpan::new(0, source.len()))
+                .unwrap_or_else(|error| panic!("outer source range should be valid: {error}"));
+        let sibling_start = source
+            .find("class B {}")
+            .unwrap_or_else(|| panic!("expected same-line sibling"));
+        let sibling = Block::from_file_range(
+            source,
+            BlockKind::Class,
+            ByteSpan::new(sibling_start, sibling_start + "class B {}".len()),
+        )
+        .unwrap_or_else(|error| panic!("sibling source range should be valid: {error}"));
+        let probe_start = source
+            .find("class A {}")
+            .unwrap_or_else(|| panic!("expected probe source"));
+        let probe = test_block_at("class C {}".to_string(), BlockKind::Code, 0, 1, probe_start);
+
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "Main.java".to_string(),
+            "src/Main.java".to_string(),
+            "file-hash".to_string(),
+            Language::Java,
+        );
+        let outer_id = builder.add_block(
+            file,
+            "outer".to_string(),
+            "src/Main.java".to_string(),
+            outer,
+            Language::Java,
+        );
+        builder.add_block(
+            file,
+            "sibling".to_string(),
+            "src/Main.java".to_string(),
+            sibling,
+            Language::Java,
+        );
+        let tree = builder.finalize();
+        let database = ReviewDatabase::from_records(Vec::new());
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+
+        assert_eq!(
+            coverage
+                .block(&RepoPath::new("src/Main.java").unwrap(), &probe)
+                .container_node_id,
+            Some(outer_id)
+        );
+    }
+
     fn build_function_tree() -> (Tree, TreeNodeId, TreeNodeId, TreeHash, TreeHash) {
         let mut builder = TreeBuilder::new();
         let root = builder.root();
@@ -1282,7 +1409,7 @@ mod tests {
             "file-hash".to_string(),
             Language::Rust,
         );
-        let function = Block::new("fn helper() {}\n".to_string(), BlockKind::Function, 1, 2);
+        let function = test_block("fn helper() {}\n".to_string(), BlockKind::Function, 1, 2);
         let function_hash = function.hash.clone();
         let function_id = builder.add_block(
             file_id,
@@ -1319,14 +1446,14 @@ mod tests {
             first_file,
             "fn duplicate".to_string(),
             "src/a.rs".to_string(),
-            Block::new("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2),
+            test_block("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2),
             Language::Rust,
         );
         let second_block = builder.add_block(
             second_file,
             "fn duplicate".to_string(),
             "src/b.rs".to_string(),
-            Block::new("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2),
+            test_block("fn duplicate() {}\n".to_string(), BlockKind::Function, 1, 2),
             Language::Rust,
         );
 
@@ -1335,8 +1462,8 @@ mod tests {
 
     fn build_duplicate_hash_tree() -> (Tree, TreeNodeId, TreeNodeId, TreeHash, TreeHash) {
         let shared_content = "fn dup() {}\n".to_string();
-        let first = Block::new(shared_content.clone(), BlockKind::Function, 1, 2);
-        let second = Block::new(shared_content, BlockKind::Function, 10, 11);
+        let first = test_block(shared_content.clone(), BlockKind::Function, 1, 2);
+        let second = test_block(shared_content, BlockKind::Function, 10, 11);
 
         let mut builder = TreeBuilder::new();
         let root = builder.root();
@@ -1380,14 +1507,14 @@ mod tests {
             BytesHash::new("bytes").to_string(),
             Language::Rust,
         );
-        let container = Block::new(
+        let container = test_block(
             "impl Worker {\n    fn start(&self) {}\n\n    fn stop(&self) {}\n}\n".to_string(),
             BlockKind::Impl,
             1,
             6,
         );
-        let first_method = Block::new("fn start(&self) {}\n".to_string(), BlockKind::Method, 2, 3);
-        let second_method = Block::new("fn stop(&self) {}\n".to_string(), BlockKind::Method, 4, 5);
+        let first_method = test_block("fn start(&self) {}\n".to_string(), BlockKind::Method, 2, 3);
+        let second_method = test_block("fn stop(&self) {}\n".to_string(), BlockKind::Method, 4, 5);
 
         let container_id = builder.add_block(
             file,

@@ -3,9 +3,9 @@ use super::{
     default_code_sub_split, default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::complexity;
-use crate::hashing::TreeHash;
+
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -55,7 +55,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
     let mut last_end = 0usize;
 
     for item in items {
-        push_top_level_interstitial(&mut blocks, content, last_end, item.span.start_byte, lang);
+        push_top_level_interstitial(&mut blocks, content, last_end, item.span.start_byte, lang)?;
         blocks.push(create_file_block(
             &content[item.span.start_byte..item.span.end_byte],
             item.span.kind,
@@ -64,11 +64,11 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
             item.span.start_byte,
             item.span.end_byte,
             lang,
-        ));
+        )?);
         last_end = item.span.end_byte;
     }
 
-    push_top_level_interstitial(&mut blocks, content, last_end, content.len(), lang);
+    push_top_level_interstitial(&mut blocks, content, last_end, content.len(), lang)?;
     Ok(blocks)
 }
 
@@ -435,8 +435,8 @@ fn split_function_like_review_units(block: &Block) -> Result<Vec<Block>> {
         0,
         header_kind,
         &[],
-    )];
-    blocks.extend(split_review_tail(block, signature_end));
+    )?];
+    blocks.extend(split_review_tail(block, signature_end)?);
     Ok(blocks)
 }
 
@@ -454,7 +454,7 @@ fn split_declaration_group_children(block: &Block) -> Result<Vec<Block>> {
         return crate::sub_splitter::split_code_review_units(block);
     }
 
-    Ok(spans
+    spans
         .into_iter()
         .map(|span| {
             create_sub_block(
@@ -465,7 +465,7 @@ fn split_declaration_group_children(block: &Block) -> Result<Vec<Block>> {
                 &span.tags,
             )
         })
-        .collect())
+        .collect()
 }
 
 fn collect_top_level_declaration_entries<'tree>(
@@ -490,7 +490,7 @@ fn collect_top_level_declaration_entries<'tree>(
     entries
 }
 
-fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
+fn split_review_tail(parent: &Block, start_offset: usize) -> Result<Vec<Block>> {
     let rest = &parent.content[start_offset..];
     let re = paragraph_break_regex();
     let mut blocks = Vec::new();
@@ -505,7 +505,7 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
                     start_offset + start,
                     start_offset + gap.start(),
                     &mut blocks,
-                );
+                )?;
             }
         }
 
@@ -515,7 +515,7 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
             start_offset + gap.start(),
             BlockKind::Gap,
             &[],
-        ));
+        )?);
         start = gap.end();
     }
 
@@ -527,16 +527,21 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Vec<Block> {
                 start_offset + start,
                 start_offset + rest.len(),
                 &mut blocks,
-            );
+            )?;
         }
     }
 
-    blocks
+    Ok(blocks)
 }
 
-fn push_review_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<Block>) {
+fn push_review_chunk(
+    parent: &Block,
+    start: usize,
+    end: usize,
+    blocks: &mut Vec<Block>,
+) -> Result<()> {
     if start >= end {
-        return;
+        return Ok(());
     }
 
     let chunk = &parent.content[start..end];
@@ -548,7 +553,7 @@ fn push_review_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<
             start,
             BlockKind::Comment,
             &[],
-        ));
+        )?);
 
         let remainder = &chunk[comment_end..];
         if !remainder.trim().is_empty() {
@@ -558,17 +563,18 @@ fn push_review_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<
                 start + comment_end,
                 BlockKind::CodeParagraph,
                 &[],
-            ));
+            )?);
         }
-        return;
+        return Ok(());
     }
 
     let kind = classify_review_chunk(chunk);
     if matches!(kind, BlockKind::Gap) {
-        return;
+        return Ok(());
     }
 
-    blocks.push(create_sub_block(parent, chunk, start, kind, &[]));
+    blocks.push(create_sub_block(parent, chunk, start, kind, &[])?);
+    Ok(())
 }
 
 fn classify_review_chunk(chunk: &str) -> BlockKind {
@@ -587,9 +593,9 @@ fn push_top_level_interstitial(
     start: usize,
     end: usize,
     lang: Language,
-) {
+) -> Result<()> {
     if end <= start {
-        return;
+        return Ok(());
     }
 
     let chunk = &content[start..end];
@@ -602,7 +608,7 @@ fn push_top_level_interstitial(
     };
 
     if matches!(kind, BlockKind::Gap) && chunk.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
     blocks.push(create_file_block(
@@ -613,7 +619,8 @@ fn push_top_level_interstitial(
         start,
         end,
         lang,
-    ));
+    )?);
+    Ok(())
 }
 
 fn chunk_is_haskell_comment_only(chunk: &str) -> bool {
@@ -826,17 +833,16 @@ fn create_file_block(
     start_byte: usize,
     end_byte: usize,
     lang: Language,
-) -> Block {
-    let (start_line, end_line) = byte_range_to_lines(full_source, start_byte, end_byte);
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags,
-        complexity: complexity::calculate(text, lang),
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))
+        .context("Haskell top-level range must be a valid UTF-8 source slice")?;
+    assert_eq!(
+        block.content, text,
+        "Haskell top-level range must name content"
+    );
+    block.tags = tags;
+    block.complexity = complexity::calculate(&block.content, lang);
+    Ok(block)
 }
 
 fn create_sub_block(
@@ -845,26 +851,19 @@ fn create_sub_block(
     start_offset: usize,
     kind: BlockKind,
     tags: &[String],
-) -> Block {
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = text.chars().filter(|&ch| ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + usize::from(!text.ends_with('\n'));
-
-    let mut combined_tags = parent.tags.clone();
-    extend_tags(&mut combined_tags, tags);
-
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: combined_tags,
-        complexity: None,
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let end_offset = start_offset
+        .checked_add(text.len())
+        .context("Haskell sub-split end offset overflow")?;
+    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+        .context("Haskell sub-split range must be a valid parent UTF-8 slice")?;
+    block.tags = parent.tags.clone();
+    assert_eq!(
+        block.content, text,
+        "Haskell sub-split range must name content"
+    );
+    extend_tags(&mut block.tags, tags);
+    Ok(block)
 }
 
 fn extend_tags(target: &mut Vec<String>, extra: &[String]) {
@@ -873,22 +872,6 @@ fn extend_tags(target: &mut Vec<String>, extra: &[String]) {
             target.push(tag.clone());
         }
     }
-}
-
-fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let pre = &source[..start];
-    let start_line = pre.lines().count();
-    let start_line = if start > 0 && pre.ends_with('\n') {
-        start_line
-    } else {
-        start_line.saturating_sub(1)
-    };
-
-    let mid = &source[start..end];
-    let new_lines = mid.chars().filter(|&ch| ch == '\n').count();
-    let end_line = start_line + new_lines + usize::from(!mid.ends_with('\n'));
-
-    (start_line, end_line)
 }
 
 #[cfg(test)]
@@ -1048,17 +1031,10 @@ mod tests {
 
     #[test]
     fn function_review_units_keep_inline_pragmas_with_the_header_block() {
-        let block = Block {
-            hash: TreeHash::from_content(
-                "render :: Int\n{-# INLINE render #-}\nrender = 1\n\nnext = 2\n",
-            ),
-            content: "render :: Int\n{-# INLINE render #-}\nrender = 1\n\nnext = 2\n".to_string(),
-            kind: BlockKind::Function,
-            tags: Vec::new(),
-            complexity: None,
-            start_line: 0,
-            end_line: 8,
-        };
+        let source = "render :: Int\n{-# INLINE render #-}\nrender = 1\n\nnext = 2\n";
+        let block =
+            Block::from_file_range(source, BlockKind::Function, ByteSpan::new(0, source.len()))
+                .unwrap();
 
         let split = split_function_like_review_units(&block)
             .unwrap_or_else(|error| panic!("split pragma-bearing function block: {error}"));
@@ -1076,15 +1052,10 @@ mod tests {
 
     #[test]
     fn function_review_units_without_type_signature_use_code_header() {
-        let block = Block {
-            hash: TreeHash::from_content("helper value =\n  value + 1\n\nhelperAgain = value\n"),
-            content: "helper value =\n  value + 1\n\nhelperAgain = value\n".to_string(),
-            kind: BlockKind::Function,
-            tags: Vec::new(),
-            complexity: None,
-            start_line: 0,
-            end_line: 8,
-        };
+        let source = "helper value =\n  value + 1\n\nhelperAgain = value\n";
+        let block =
+            Block::from_file_range(source, BlockKind::Function, ByteSpan::new(0, source.len()))
+                .unwrap();
 
         let split = split_function_like_review_units(&block)
             .unwrap_or_else(|error| panic!("split no-signature function block: {error}"));

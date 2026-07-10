@@ -144,3 +144,35 @@ fn test_inspect_coverage_reports_direct_and_effective_review_facts() -> Result<(
 
     Ok(())
 }
+
+#[test]
+fn test_inspect_split_reports_absolute_byte_spans() -> Result<()> {
+    let repo = TestRepo::new("inspect_absolute_byte_spans")?;
+    let body = (0..34)
+        .map(|index| format!("    let value_{index} = \"é\";\n"))
+        .collect::<String>();
+    let source = format!("fn main() {{\n{body}}}\n");
+    repo.write("src/main.rs", &source)?;
+
+    let blocks = scan_blocks(&repo)?;
+    let function = blocks[0]["blocks"]
+        .as_array()
+        .context("expected scanned blocks")?
+        .iter()
+        .find(|block| block["kind"].as_str() == Some("function"))
+        .context("expected function block")?;
+    let hash = function["hash"].as_str().context("function hash")?;
+    let output = repo.run(&["inspect", "--fingerprint", hash, "--split"])?;
+    let sub_blocks: Vec<Value> = serde_json::from_str(&output)?;
+    assert!(!sub_blocks.is_empty());
+
+    for block in sub_blocks {
+        let start_byte = usize::try_from(block["start_byte"].as_u64().context("start byte")?)?;
+        let end_byte = usize::try_from(block["end_byte"].as_u64().context("end byte")?)?;
+        assert!(source.is_char_boundary(start_byte));
+        assert!(source.is_char_boundary(end_byte));
+        assert_eq!(block["content"].as_str(), source.get(start_byte..end_byte));
+    }
+
+    Ok(())
+}

@@ -2,11 +2,15 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use trueflow::analysis::Language;
 use trueflow::block::BlockKind;
+use trueflow::block_splitter;
 use trueflow::commands::review::{ReviewRequest, ReviewTarget};
+use trueflow::hashing::TreeHash;
 use trueflow::scanner::{
     ScanCacheReadStatus, ScanCacheWriteStatus, ScanOptions, ScanResult, scan_directory,
 };
+use trueflow::sub_splitter;
 
 use trueflow_test_support::*;
 
@@ -44,21 +48,185 @@ fn scan_contains_path(scan: &ScanResult, path: &str) -> bool {
 }
 
 #[test]
-fn test_optimizer_import_merge_preserves_content() -> Result<()> {
-    let repo = TestRepo::new("optimizer_import")?;
-    repo.write("src/lib.rs", "use a;\n\nuse b;\nextern crate c;\n")?;
+fn test_optimizer_source_integrity_preserves_omitted_import_gap() -> Result<()> {
+    let source = "use std::fmt;\n\nuse std::io;\n";
+    let repo = TestRepo::new("optimizer_source_integrity_import_gap")?;
+    repo.write("src/lib.rs", source)?;
+
     let scan = repo.scan_without_cache()?;
-    let blocks = &scan
-        .files
-        .first()
-        .context("Expected file in output")?
-        .blocks;
+    let file = scan.files.first().context("Expected file in output")?;
+    let blocks = &file.blocks;
 
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].kind, BlockKind::Imports);
+    let block = &blocks[0];
+    assert_eq!(block.kind, BlockKind::Imports);
+    assert_eq!(block.content, &source[0..27]);
+    assert_eq!(block.hash, TreeHash::from_content(&source[0..27]));
+    assert_eq!((block.start_byte, block.end_byte), (0, 27));
+    assert_eq!((block.start_line, block.end_line), (0, 3));
+    Ok(())
+}
 
-    // Note: The optimizer preserves newlines between imports
-    assert_eq!(blocks[0].content, "use a;\nuse b;\nextern crate c;");
+#[test]
+fn test_optimizer_source_integrity_preserves_python_small_file_delimiter() -> Result<()> {
+    let source = "import os\nx = 1\n";
+    let raw = block_splitter::split(source, Language::Python);
+    assert_eq!(raw.blocks.len(), 2);
+    assert_eq!(raw.blocks[0].kind, BlockKind::Import);
+    assert_eq!(raw.blocks[0].content, "import os");
+    assert_eq!((raw.blocks[0].start_byte, raw.blocks[0].end_byte), (0, 9));
+    assert_eq!((raw.blocks[0].start_line, raw.blocks[0].end_line), (0, 1));
+    assert_eq!(raw.blocks[1].kind, BlockKind::Code);
+    assert_eq!(raw.blocks[1].content, "x = 1");
+    assert_eq!((raw.blocks[1].start_byte, raw.blocks[1].end_byte), (10, 15));
+    assert_eq!((raw.blocks[1].start_line, raw.blocks[1].end_line), (1, 2));
+    assert!(
+        raw.blocks
+            .iter()
+            .all(|block| !(block.start_byte <= 9 && 9 < block.end_byte)),
+        "raw blocks unexpectedly claimed the omitted newline"
+    );
+
+    let repo = TestRepo::new("optimizer_source_integrity_python_delimiter")?;
+    repo.write("src/example.py", source)?;
+    let scan = repo.scan_without_cache()?;
+    let file = scan.files.first().context("Expected file in output")?;
+    assert_eq!(file.blocks.len(), 1);
+    let block = &file.blocks[0];
+    assert_eq!(block.kind, BlockKind::Code);
+    assert_eq!(block.content, &source[0..15]);
+    assert_eq!(block.hash, TreeHash::from_content(&source[0..15]));
+    assert_eq!((block.start_byte, block.end_byte), (0, 15));
+    assert_eq!((block.start_line, block.end_line), (0, 2));
+    assert!(block.tags.is_empty());
+    assert_eq!(block.complexity, Some(0));
+    assert_eq!(
+        file.tree_hash,
+        TreeHash::from_child_hashes([&block.hash]),
+        "file tree hash must use the exact optimized block hash"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_optimizer_source_integrity_preserves_disjoint_metadata() -> Result<()> {
+    let source = "import os\ndef test_run():\n    if True:\n        return 1";
+    assert_eq!(source.len(), 55);
+    let repo = TestRepo::new("optimizer_source_integrity_metadata")?;
+    repo.write("src/example.py", source)?;
+
+    let scan = repo.scan_without_cache()?;
+    let file = scan.files.first().context("Expected file in output")?;
+    assert_eq!(file.blocks.len(), 1);
+    let block = &file.blocks[0];
+    assert_eq!(block.kind, BlockKind::Code);
+    assert_eq!(block.content, source);
+    assert_eq!(block.hash, TreeHash::from_content(source));
+    assert_eq!((block.start_byte, block.end_byte), (0, 55));
+    assert_eq!((block.start_line, block.end_line), (0, 4));
+    assert_eq!(block.tags, ["test"]);
+    assert_eq!(block.complexity, Some(1));
+    Ok(())
+}
+
+#[test]
+fn test_optimizer_source_integrity_rejects_nested_csharp_overlap() -> Result<()> {
+    let source =
+        "class Worker {\n    int Run() {\n        if (true) return 1;\n        return 0;\n    }\n}";
+    assert_eq!(source.len(), 84);
+    let raw = block_splitter::split(source, Language::CSharp);
+    assert_eq!(raw.blocks.len(), 2);
+    assert_eq!(raw.blocks[0].kind, BlockKind::Class);
+    assert_eq!((raw.blocks[0].start_byte, raw.blocks[0].end_byte), (0, 84));
+    assert_eq!((raw.blocks[0].start_line, raw.blocks[0].end_line), (0, 6));
+    assert_eq!(raw.blocks[0].complexity, Some(1));
+    assert_eq!(raw.blocks[1].kind, BlockKind::Method);
+    assert_eq!((raw.blocks[1].start_byte, raw.blocks[1].end_byte), (19, 82));
+    assert_eq!((raw.blocks[1].start_line, raw.blocks[1].end_line), (1, 5));
+    assert_eq!(raw.blocks[1].complexity, Some(1));
+
+    let repo = TestRepo::new("optimizer_source_integrity_csharp_overlap")?;
+    repo.write("src/Worker.cs", source)?;
+    let scan = repo.scan_without_cache()?;
+    let file = scan.files.first().context("Expected file in output")?;
+    assert_eq!(file.blocks.len(), 2);
+
+    for (actual, expected) in file.blocks.iter().zip(&raw.blocks) {
+        assert_eq!(actual.kind, expected.kind);
+        assert_eq!(
+            actual.content,
+            source
+                .get(actual.start_byte..actual.end_byte)
+                .context("block must name a source slice")?
+        );
+        assert_eq!(actual.hash, TreeHash::from_content(&actual.content));
+        assert_eq!(
+            (actual.start_byte, actual.end_byte),
+            (expected.start_byte, expected.end_byte)
+        );
+        assert_eq!(
+            (actual.start_line, actual.end_line),
+            (expected.start_line, expected.end_line)
+        );
+        assert!(actual.tags.is_empty());
+        assert_eq!(actual.complexity, Some(1));
+    }
+    assert_eq!(
+        file.tree_hash,
+        TreeHash::from_child_hashes(file.blocks.iter().map(|block| &block.hash))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_optimizer_source_integrity_preserves_long_module_composite_child_provenance() -> Result<()>
+{
+    let left = (0..17)
+        .map(|index| format!("mod left_{index};"))
+        .collect::<Vec<_>>();
+    let right = (0..17)
+        .map(|index| format!("mod right_{index};"))
+        .collect::<Vec<_>>();
+    let source = format!("{}\n\n{}", left.join("\n"), right.join("\n"));
+    assert_eq!(source.lines().count(), 35);
+    assert!(!source.ends_with('\n'));
+
+    let repo = TestRepo::new("optimizer_source_integrity_long_modules")?;
+    repo.write("src/lib.rs", &source)?;
+    let scan = repo.scan_without_cache()?;
+    let file = scan.files.first().context("Expected file in output")?;
+    assert_eq!(file.blocks.len(), 1);
+    let module = &file.blocks[0];
+    assert_eq!(module.kind, BlockKind::Modules);
+    assert_eq!((module.start_line, module.end_line), (0, 35));
+    assert_eq!((module.start_byte, module.end_byte), (0, source.len()));
+    assert_eq!(module.content, source);
+    assert_eq!(module.hash, TreeHash::from_content(&source));
+
+    for result in [
+        sub_splitter::split_result(module, Language::Rust)?,
+        sub_splitter::split_result_for_child_navigation(module, Language::Rust)?,
+    ] {
+        assert!(
+            result.blocks.len() > 1,
+            "large optimized module block must refine into multiple children"
+        );
+        let mut previous_end = module.start_byte;
+        for child in result.blocks {
+            assert!(source.is_char_boundary(child.start_byte));
+            assert!(source.is_char_boundary(child.end_byte));
+            assert!(module.start_byte <= child.start_byte);
+            assert!(child.end_byte <= module.end_byte);
+            assert!(previous_end <= child.start_byte);
+            assert_eq!(
+                child.content,
+                source
+                    .get(child.start_byte..child.end_byte)
+                    .context("child must name a source slice")?
+            );
+            previous_end = child.end_byte;
+        }
+    }
     Ok(())
 }
 

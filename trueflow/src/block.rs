@@ -232,10 +232,11 @@ impl FromStr for BlockKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
-    /// The content-addressable identity of this block
+    /// Content fingerprint for this source occurrence. It deliberately does not
+    /// include the path or source position.
     pub hash: TreeHash,
 
-    /// The actual text content
+    /// The exact UTF-8 source text named by `start_byte..end_byte`.
     pub content: String,
 
     /// Semantic type (Function, Struct, Comment, Chunk, etc.)
@@ -250,28 +251,155 @@ pub struct Block {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<u32>,
 
-    /// 0-indexed start line (inclusive)
+    /// 0-indexed start line (inclusive).
     pub start_line: usize,
 
-    /// 0-indexed end line (exclusive)
+    /// 0-indexed end line (exclusive).
     pub end_line: usize,
+
+    /// Absolute UTF-8 byte offset into the source file (inclusive).
+    pub start_byte: usize,
+
+    /// Absolute UTF-8 byte offset into the source file (exclusive).
+    pub end_byte: usize,
 }
 
 impl Block {
-    pub fn new(content: String, kind: BlockKind, start_line: usize, end_line: usize) -> Self {
+    /// Builds a block with explicit source coordinates. Prefer
+    /// `from_file_range` or `from_parent_range` whenever source text is
+    /// available so the content and line coordinates are proved.
+    pub fn new(content: String, kind: BlockKind, line_span: LineSpan, byte_span: ByteSpan) -> Self {
+        assert!(
+            line_span.start_line <= line_span.end_line,
+            "block line span must be ordered"
+        );
+        assert!(
+            byte_span.start_byte <= byte_span.end_byte,
+            "block byte span must be ordered"
+        );
+        assert_eq!(
+            content.len(),
+            byte_span.len(),
+            "block content byte length must equal its source span length"
+        );
+
         Self {
             hash: TreeHash::from_content(&content),
             content,
             kind,
             tags: Vec::new(),
             complexity: None,
-            start_line,
-            end_line,
+            start_line: line_span.start_line,
+            end_line: line_span.end_line,
+            start_byte: byte_span.start_byte,
+            end_byte: byte_span.end_byte,
         }
+    }
+
+    /// Constructs a block from an absolute byte range in its complete source.
+    ///
+    /// The range is checked for ordering, bounds, and UTF-8 boundaries before
+    /// content and line coordinates are derived from the same source slice.
+    pub(crate) fn from_file_range(
+        full_source: &str,
+        kind: BlockKind,
+        byte_span: ByteSpan,
+    ) -> anyhow::Result<Self> {
+        let content = full_source
+            .get(byte_span.start_byte..byte_span.end_byte)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid source byte range {}..{} for {} bytes",
+                    byte_span.start_byte,
+                    byte_span.end_byte,
+                    full_source.len()
+                )
+            })?;
+        let line_span = Self::line_span_from_file_range(full_source, byte_span)?;
+
+        Ok(Self::new(content.to_owned(), kind, line_span, byte_span))
+    }
+
+    /// Derives a line span from a checked absolute UTF-8 byte range without
+    /// allocating the corresponding source slice.
+    pub(crate) fn line_span_from_file_range(
+        full_source: &str,
+        byte_span: ByteSpan,
+    ) -> anyhow::Result<LineSpan> {
+        line_span_for_source_range(full_source, byte_span).ok_or_else(|| {
+            anyhow!(
+                "invalid source byte range {}..{} for {} bytes",
+                byte_span.start_byte,
+                byte_span.end_byte,
+                full_source.len()
+            )
+        })
+    }
+
+    /// Constructs a block from a range relative to an exact source-backed
+    /// parent, translating the stored coordinate to the original file.
+    pub(crate) fn from_parent_range(
+        parent: &Block,
+        kind: BlockKind,
+        relative_span: ByteSpan,
+    ) -> anyhow::Result<Self> {
+        if parent.content.len() != parent.byte_span().len() {
+            return Err(anyhow!(
+                "parent content byte length does not match its source span"
+            ));
+        }
+
+        let content = parent
+            .content
+            .get(relative_span.start_byte..relative_span.end_byte)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid parent-relative byte range {}..{} for {} bytes",
+                    relative_span.start_byte,
+                    relative_span.end_byte,
+                    parent.content.len()
+                )
+            })?;
+        let start_byte = parent
+            .start_byte
+            .checked_add(relative_span.start_byte)
+            .ok_or_else(|| anyhow!("parent-relative start byte overflow"))?;
+        let end_byte = parent
+            .start_byte
+            .checked_add(relative_span.end_byte)
+            .ok_or_else(|| anyhow!("parent-relative end byte overflow"))?;
+        let byte_span = ByteSpan::new(start_byte, end_byte);
+        if byte_span.end_byte > parent.end_byte {
+            return Err(anyhow!(
+                "parent-relative byte range {}..{} escapes parent {}..{}",
+                relative_span.start_byte,
+                relative_span.end_byte,
+                parent.start_byte,
+                parent.end_byte
+            ));
+        }
+
+        let relative_line_span = Self::line_span_from_file_range(&parent.content, relative_span)?;
+        let line_span = LineSpan::new(
+            parent
+                .start_line
+                .checked_add(relative_line_span.start_line)
+                .ok_or_else(|| anyhow!("parent-relative start line overflow"))?,
+            parent
+                .start_line
+                .checked_add(relative_line_span.end_line)
+                .ok_or_else(|| anyhow!("parent-relative end line overflow"))?,
+        );
+
+        Ok(Self::new(content.to_owned(), kind, line_span, byte_span))
     }
 
     pub fn line_span(&self) -> LineSpan {
         LineSpan::new(self.start_line, self.end_line)
+    }
+
+    pub fn byte_span(&self) -> ByteSpan {
+        ByteSpan::new(self.start_byte, self.end_byte)
     }
 
     pub fn has_tag(&self, tag: &str) -> bool {
@@ -281,6 +409,20 @@ impl Block {
     pub fn is_test(&self) -> bool {
         self.has_tag("test")
     }
+}
+
+fn line_span_for_source_range(source: &str, byte_span: ByteSpan) -> Option<LineSpan> {
+    let before = source.get(..byte_span.start_byte)?;
+    let content = source.get(byte_span.start_byte..byte_span.end_byte)?;
+    let start_line = before.chars().filter(|&ch| ch == '\n').count();
+    if content.is_empty() {
+        return Some(LineSpan::new(start_line, start_line));
+    }
+
+    let end_line = start_line
+        .checked_add(content.chars().filter(|&ch| ch == '\n').count())?
+        .checked_add(usize::from(!content.ends_with('\n')))?;
+    Some(LineSpan::new(start_line, end_line))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,7 +459,9 @@ impl LineSpan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
 pub struct ByteSpan {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -330,16 +474,25 @@ impl ByteSpan {
             end_byte,
         }
     }
-}
 
-#[cfg(test)]
-impl ByteSpan {
+    pub fn len(&self) -> usize {
+        self.end_byte.saturating_sub(self.start_byte)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start_byte == self.end_byte
+    }
+
     pub fn overlaps(&self, other: &ByteSpan) -> bool {
         self.start_byte < other.end_byte && self.end_byte > other.start_byte
     }
 
     pub fn contains(&self, other: &ByteSpan) -> bool {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
+    }
+
+    pub fn properly_contains(&self, other: &ByteSpan) -> bool {
+        self.contains(other) && self != other
     }
 }
 
@@ -365,7 +518,14 @@ impl FileState {
         mut blocks: Vec<Block>,
     ) -> Self {
         assert!(!path.is_root(), "FileState path must not be root");
-        blocks.sort_by_key(|block| (block.start_line, Reverse(block.end_line)));
+        blocks.sort_by_key(|block| {
+            (
+                block.start_byte,
+                Reverse(block.end_byte),
+                block.start_line,
+                Reverse(block.end_line),
+            )
+        });
         let tree_hash = if blocks.is_empty() {
             TreeHash::from_bytes_hash(&bytes_hash)
         } else {
@@ -483,12 +643,18 @@ mod tests {
     }
 
     #[test]
-    fn test_block_helpers_report_line_span_and_test_tag() {
-        let mut block = Block::new("fn test_thing() {}".to_string(), BlockKind::Function, 3, 7);
+    fn test_block_helpers_report_line_span_byte_span_and_test_tag() {
+        let mut block = Block::new(
+            "fn test_thing() {}".to_string(),
+            BlockKind::Function,
+            LineSpan::new(3, 4),
+            ByteSpan::new(40, 58),
+        );
         block.tags.push("test".to_string());
         block.tags.push("integration".to_string());
 
-        assert_eq!(block.line_span(), LineSpan::new(3, 7));
+        assert_eq!(block.line_span(), LineSpan::new(3, 4));
+        assert_eq!(block.byte_span(), ByteSpan::new(40, 58));
         assert!(block.has_tag("test"));
         assert!(block.has_tag("integration"));
         assert!(block.is_test());
@@ -512,32 +678,48 @@ mod tests {
     }
 
     #[test]
-    fn test_byte_span_overlap_logic() {
+    fn test_byte_span_boundary_logic() {
         let base = ByteSpan::new(0, 10);
         let overlap = ByteSpan::new(5, 12);
         let touch = ByteSpan::new(10, 12);
         let disjoint = ByteSpan::new(12, 15);
+        let empty = ByteSpan::new(5, 5);
 
+        assert_eq!(base.len(), 10);
         assert!(base.overlaps(&overlap));
         assert!(!base.overlaps(&touch));
         assert!(!base.overlaps(&disjoint));
+        assert!(empty.is_empty());
         assert!(base.contains(&ByteSpan::new(0, 10)));
         assert!(base.contains(&ByteSpan::new(2, 5)));
+        assert!(base.contains(&empty));
         assert!(!base.contains(&overlap));
+        assert!(base.properly_contains(&ByteSpan::new(2, 5)));
+        assert!(!base.properly_contains(&ByteSpan::new(0, 10)));
     }
 
     #[test]
     fn test_file_state_tracks_bytes_hash_and_tree_hash() {
         let path = crate::repo_path::RepoPath::new("src/lib.rs").unwrap();
         let blocks = vec![
-            Block::new("fn b() {}\n".to_string(), BlockKind::Function, 10, 11),
-            Block::new("fn a() {}\n".to_string(), BlockKind::Function, 1, 2),
+            Block::new(
+                "fn b() {}\n".to_string(),
+                BlockKind::Function,
+                LineSpan::new(1, 2),
+                ByteSpan::new(10, 20),
+            ),
+            Block::new(
+                "fn a() {}\n".to_string(),
+                BlockKind::Function,
+                LineSpan::new(0, 1),
+                ByteSpan::new(0, 10),
+            ),
         ];
         let file = FileState::from_text(path, Language::Rust, b"fn a() {}\nfn b() {}\n", blocks);
 
         assert_eq!(file.path.as_str(), "src/lib.rs");
-        assert_eq!(file.blocks[0].start_line, 1);
-        assert_eq!(file.blocks[1].start_line, 10);
+        assert_eq!(file.blocks[0].start_byte, 0);
+        assert_eq!(file.blocks[1].start_byte, 10);
         assert_eq!(
             file.tree_hash,
             crate::hashing::TreeHash::from_child_hashes(
@@ -548,10 +730,50 @@ mod tests {
     }
 
     #[test]
-    fn test_block_serialization_omits_unknown_complexity() {
-        let block = Block::new("fn a() {}".to_string(), BlockKind::Function, 0, 1);
+    fn test_source_range_constructors_validate_utf8_and_translate_parent_offsets() {
+        let source = "é\nfn outer() {\n    let β = 1;\n}\n";
+        let parent_start = source.find("fn outer").unwrap();
+        let parent = Block::from_file_range(
+            source,
+            BlockKind::Function,
+            ByteSpan::new(parent_start, source.len()),
+        )
+        .unwrap();
+        let child_start = parent.content.find("let β").unwrap();
+        let child_end = child_start + "let β = 1;".len();
+        let child = Block::from_parent_range(
+            &parent,
+            BlockKind::CodeParagraph,
+            ByteSpan::new(child_start, child_end),
+        )
+        .unwrap();
+
+        assert_eq!(&source[child.start_byte..child.end_byte], "let β = 1;");
+        assert_eq!(child.line_span(), LineSpan::new(2, 3));
+        assert_eq!(child.byte_span().start_byte, parent_start + child_start);
+        assert!(Block::from_file_range(source, BlockKind::Code, ByteSpan::new(1, 2)).is_err());
+        assert!(
+            Block::from_parent_range(
+                &parent,
+                BlockKind::Code,
+                ByteSpan::new(parent.content.len(), parent.content.len() + 1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_block_serialization_includes_required_byte_span() {
+        let block = Block::new(
+            "fn a() {}".to_string(),
+            BlockKind::Function,
+            LineSpan::new(0, 1),
+            ByteSpan::new(0, 9),
+        );
         let value = serde_json::to_value(&block).unwrap();
 
+        assert_eq!(value["start_byte"], 0);
+        assert_eq!(value["end_byte"], 9);
         assert!(value.get("complexity").is_none());
     }
 }

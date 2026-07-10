@@ -77,7 +77,10 @@ pub fn retained_gamma() {
     let changed = trueflow::vcs::files_changed_main_to_head_in_repo(&git_repo)?;
 
     assert_eq!(changed.len(), 1, "expected exactly one renamed path pair");
-    let pair = changed.iter().next().expect("renamed path pair");
+    let pair = changed
+        .iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("renamed path pair"))?;
     assert_eq!(pair.source_location, RepoPath::new("src/old.rs")?);
     assert_eq!(pair.location, RepoPath::new("src/new.rs")?);
 

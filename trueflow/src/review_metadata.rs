@@ -414,12 +414,14 @@ fn find_argument_list_start(text: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::analysis::Language;
-    use crate::block::Block;
+    use crate::block::{Block, ByteSpan, LineSpan};
     use crate::tree::TreeBuilder;
     use std::collections::HashSet;
 
-    fn block(content: &str, kind: BlockKind, start: usize, end: usize) -> Block {
-        Block::new(content.to_string(), kind, start, end)
+    fn block(content: &str, kind: BlockKind, start: usize) -> Block {
+        let line_span = LineSpan::new(start, start + content.lines().count());
+        let byte_span = ByteSpan::new(0, content.len());
+        Block::new(content.to_string(), kind, line_span, byte_span)
     }
 
     #[test]
@@ -438,14 +440,14 @@ mod tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            block("impl Foo {", BlockKind::Impl, 1, 40),
+            block("impl Foo {", BlockKind::Impl, 1),
             Language::Rust,
         );
         let method = builder.add_block(
             impl_block,
             "method".to_string(),
             "src/lib.rs".to_string(),
-            block("fn bar(&self, x: i32) -> i32 {", BlockKind::Method, 3, 10),
+            block("fn bar(&self, x: i32) -> i32 {", BlockKind::Method, 3),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -473,7 +475,7 @@ mod tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            block("impl Foo {", BlockKind::Impl, 1, 40),
+            block("impl Foo {", BlockKind::Impl, 1),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -505,7 +507,6 @@ mod tests {
                 "#[derive(Debug, Clone)]\nstruct Config {\n    name: String,\n}\n",
                 BlockKind::Struct,
                 1,
-                6,
             ),
             Language::Rust,
         );
@@ -524,7 +525,6 @@ mod tests {
             "struct #[derive(Debug, Clone)] Config {\n    name: String,\n}\n",
             BlockKind::Struct,
             1,
-            4,
         );
 
         assert_eq!(
@@ -549,7 +549,7 @@ mod tests {
             file,
             "function".to_string(),
             "src/lib.rs".to_string(),
-            block("fn build_state() {", BlockKind::Function, 1, 20),
+            block("fn build_state() {", BlockKind::Function, 1),
             Language::Rust,
         );
         let comment = builder.add_block(
@@ -560,7 +560,6 @@ mod tests {
                 "// this breadcrumb should not include comment text",
                 BlockKind::Comment,
                 2,
-                3,
             ),
             Language::Rust,
         );
@@ -593,7 +592,6 @@ mod tests {
                 "This paragraph should not be copied into breadcrumbs.",
                 BlockKind::Paragraph,
                 1,
-                3,
             ),
             Language::Markdown,
         );
@@ -633,21 +631,21 @@ mod tests {
             file,
             "function".to_string(),
             "src/lib.rs".to_string(),
-            block("fn f() {}", BlockKind::Function, 1, 2),
+            block("fn f() {}", BlockKind::Function, 1),
             Language::Rust,
         );
         let struct_block = builder.add_block(
             file,
             "struct".to_string(),
             "src/lib.rs".to_string(),
-            block("struct S {}", BlockKind::Struct, 5, 8),
+            block("struct S {}", BlockKind::Struct, 5),
             Language::Rust,
         );
         let enum_block = builder.add_block(
             file,
             "enum".to_string(),
             "src/lib.rs".to_string(),
-            block("enum E {}", BlockKind::Enum, 10, 14),
+            block("enum E {}", BlockKind::Enum, 10),
             Language::Rust,
         );
         let tree = builder.finalize();

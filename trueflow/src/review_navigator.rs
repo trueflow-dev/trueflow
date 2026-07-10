@@ -265,11 +265,14 @@ fn add_visible_block_path(
 mod tests {
     use super::*;
     use crate::analysis::Language;
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::tree::TreeBuilder;
 
-    fn test_block(kind: BlockKind, start: usize, end: usize) -> Block {
-        Block::new(format!("{kind:?}-{start}"), kind, start, end)
+    fn test_block(kind: BlockKind, start: usize) -> Block {
+        let content = format!("{kind:?}-{start}");
+        let line_span = LineSpan::new(start, start + content.lines().count());
+        let byte_span = ByteSpan::new(0, content.len());
+        Block::new(content, kind, line_span, byte_span)
     }
 
     struct TreeFixture {
@@ -307,21 +310,21 @@ mod tests {
             lib_file,
             "a".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 1, 3),
+            test_block(BlockKind::Function, 1),
             Language::Rust,
         );
         let block_b = builder.add_block(
             lib_file,
             "b".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 10, 12),
+            test_block(BlockKind::Function, 10),
             Language::Rust,
         );
         let block_docs = builder.add_block(
             readme_file,
             "p".to_string(),
             "docs/readme.md".to_string(),
-            test_block(BlockKind::Paragraph, 1, 2),
+            test_block(BlockKind::Paragraph, 1),
             Language::Markdown,
         );
 
@@ -504,14 +507,14 @@ mod tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Impl, 0, 4),
+            test_block(BlockKind::Impl, 0),
             Language::Rust,
         );
         let child = builder.add_block(
             parent,
             "method".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 1, 3),
+            test_block(BlockKind::Function, 1),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -576,14 +579,14 @@ mod tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Impl, 0, 4),
+            test_block(BlockKind::Impl, 0),
             Language::Rust,
         );
         let child = builder.add_block(
             parent,
             "method".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 1, 3),
+            test_block(BlockKind::Function, 1),
             Language::Rust,
         );
         let tree = builder.finalize();

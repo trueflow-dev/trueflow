@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::{Block, FileState};
+use crate::block::{Block, ByteSpan, FileState};
 use crate::hashing::{TreeHash, hash_str};
 use crate::repo_path::RepoPath;
 use crate::store::ApprovedTargets;
@@ -72,12 +72,17 @@ pub struct TreeNode {
     pub language: Option<Language>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BlockLookupKey {
+    hash: TreeHash,
+    byte_span: ByteSpan,
+}
+
 pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
     nodes_by_path: HashMap<RepoPath, TreeNodeId>,
-    block_nodes_by_path_hash_start:
-        HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>>,
+    block_nodes_by_path_key: HashMap<RepoPath, HashMap<BlockLookupKey, TreeNodeId>>,
 }
 
 impl Tree {
@@ -105,16 +110,20 @@ impl Tree {
                     .iter()
                     .filter_map(|child| values.remove(child))
                     .collect::<Vec<_>>();
-                values.insert(
-                    id,
-                    json!({
-                        "type": node.kind.label(),
-                        "name": node.name,
-                        "path": node.path,
-                        "hash": node.hash,
-                        "children": children,
-                    }),
-                );
+                let mut value = json!({
+                    "type": node.kind.label(),
+                    "name": node.name,
+                    "path": node.path,
+                    "hash": node.hash,
+                    "children": children,
+                });
+                if let Some(block) = node.block.as_ref() {
+                    value["start_line"] = json!(block.start_line);
+                    value["end_line"] = json!(block.end_line);
+                    value["start_byte"] = json!(block.start_byte);
+                    value["end_byte"] = json!(block.end_byte);
+                }
+                values.insert(id, value);
                 continue;
             }
 
@@ -147,13 +156,14 @@ impl Tree {
 
     pub fn find_block_node(&self, path: impl AsRef<str>, block: &Block) -> Option<TreeNodeId> {
         let path = RepoPath::new(path.as_ref()).ok()?;
-        self.block_nodes_by_path_hash_start
+        self.block_nodes_by_path_key
             .get(&path)?
-            .get(&block.hash)?
-            .get(&block.start_line)
+            .get(&BlockLookupKey {
+                hash: block.hash.clone(),
+                byte_span: block.byte_span(),
+            })
             .copied()
     }
-
     fn block_has_child_blocks(&self, id: TreeNodeId) -> bool {
         self.node(id)
             .children
@@ -207,7 +217,7 @@ impl Tree {
         );
 
         let hash = block.hash.clone();
-        let start_line = block.start_line;
+        let byte_span = block.byte_span();
         let id = TreeNodeId(self.nodes.len());
         self.nodes.push(TreeNode {
             id,
@@ -223,15 +233,16 @@ impl Tree {
         self.nodes[parent.0].children.push(id);
 
         let previous = self
-            .block_nodes_by_path_hash_start
+            .block_nodes_by_path_key
             .entry(path.clone())
             .or_default()
-            .entry(hash)
-            .or_default()
-            .insert(start_line, id);
+            .insert(BlockLookupKey { hash, byte_span }, id);
         assert!(
             previous.is_none(),
-            "duplicate block lookup key: path={path}, start_line={start_line}"
+            "duplicate block lookup key: path={path}, hash={}, start_byte={}, end_byte={}",
+            self.nodes[id.0].hash,
+            byte_span.start_byte,
+            byte_span.end_byte,
         );
 
         id
@@ -428,12 +439,12 @@ impl TreeBuilder {
             .unwrap_or_default();
         self.attach_children(self.root, root_children);
         self.compute_hashes(self.root);
-        let block_nodes_by_path_hash_start = build_block_lookup_indexes(&self.nodes);
+        let block_nodes_by_path_key = build_block_lookup_indexes(&self.nodes);
         Tree {
             nodes: self.nodes,
             root: self.root,
             nodes_by_path: self.nodes_by_path,
-            block_nodes_by_path_hash_start,
+            block_nodes_by_path_key,
         }
     }
 
@@ -504,9 +515,8 @@ impl TreeBuilder {
 
 fn build_block_lookup_indexes(
     nodes: &[TreeNode],
-) -> HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>> {
-    let mut by_path_hash_start: HashMap<RepoPath, HashMap<TreeHash, HashMap<usize, TreeNodeId>>> =
-        HashMap::new();
+) -> HashMap<RepoPath, HashMap<BlockLookupKey, TreeNodeId>> {
+    let mut by_path_key = HashMap::new();
 
     for node in nodes {
         if !matches!(node.kind, TreeNodeKind::Block) {
@@ -516,23 +526,28 @@ fn build_block_lookup_indexes(
         let Some(block) = node.block.as_ref() else {
             continue;
         };
-
-        let previous = by_path_hash_start
+        let byte_span = block.byte_span();
+        let previous = by_path_key
             .entry(node.path.clone())
-            .or_default()
-            .entry(node.hash.clone())
-            .or_default()
-            .insert(block.start_line, node.id);
+            .or_insert_with(HashMap::new)
+            .insert(
+                BlockLookupKey {
+                    hash: node.hash.clone(),
+                    byte_span,
+                },
+                node.id,
+            );
         assert!(
             previous.is_none(),
-            "duplicate block lookup key: path={}, hash={}, start_line={}",
+            "duplicate block lookup key: path={}, hash={}, start_byte={}, end_byte={}",
             node.path,
             node.hash,
-            block.start_line
+            byte_span.start_byte,
+            byte_span.end_byte,
         );
     }
 
-    by_path_hash_start
+    by_path_key
 }
 
 fn block_label(block: &Block) -> String {
@@ -567,32 +582,28 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
                     file.tree_hash.clone(),
                     file.language,
                 );
-                let mut container_stack: Vec<(TreeNodeId, usize, usize)> = Vec::new();
+                let mut container_stack: Vec<(TreeNodeId, ByteSpan)> = Vec::new();
                 for block in file.blocks.clone() {
-                    while let Some((_, _, end_line)) = container_stack.last()
-                        && block.start_line > *end_line
-                    {
-                        container_stack.pop();
+                    let byte_span = block.byte_span();
+                    while let Some((_, container_span)) = container_stack.last() {
+                        if byte_span.start_byte >= container_span.end_byte
+                            || !container_span.properly_contains(&byte_span)
+                        {
+                            container_stack.pop();
+                        } else {
+                            break;
+                        }
                     }
 
-                    let parent = container_stack
-                        .iter()
-                        .rev()
-                        .find(|(_, start, end)| {
-                            block.start_line >= *start && block.end_line <= *end
-                        })
-                        .map(|(id, _, _)| *id)
-                        .unwrap_or(file_id);
+                    let parent = container_stack.last().map(|(id, _)| *id).unwrap_or(file_id);
 
-                    let start_line = block.start_line;
-                    let end_line = block.end_line;
                     let kind = block.kind;
                     let name = block_label(&block);
                     let node_id =
                         builder.add_block(parent, name, next_path.clone(), block, file.language);
 
                     if kind.can_contain_review_children() {
-                        container_stack.push((node_id, start_line, end_line));
+                        container_stack.push((node_id, byte_span));
                     }
                 }
             } else {
@@ -611,16 +622,40 @@ pub fn build_tree_from_files(files: &[FileState]) -> Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::BlockKind;
+    use crate::block::{BlockKind, ByteSpan, LineSpan};
     use crate::hashing::BytesHash;
 
+    fn test_block(content: String, kind: BlockKind, start_line: usize, end_line: usize) -> Block {
+        let start_byte = start_line;
+        let end_byte = start_byte
+            .checked_add(content.len())
+            .unwrap_or_else(|| panic!("test block byte end overflow"));
+        Block::new(
+            content,
+            kind,
+            LineSpan::new(start_line, end_line),
+            ByteSpan::new(start_byte, end_byte),
+        )
+    }
+
     #[test]
-    fn find_block_node_distinguishes_duplicate_hashes_by_start_line() {
+    fn find_block_node_distinguishes_identical_hashes_on_same_line_by_byte_span() {
         let shared_content = "fn dup() {}".to_string();
-        let first = Block::new(shared_content.clone(), BlockKind::Function, 1, 2);
-        let second = Block::new(shared_content, BlockKind::Function, 10, 11);
+        let first = Block::new(
+            shared_content.clone(),
+            BlockKind::Function,
+            LineSpan::new(0, 1),
+            ByteSpan::new(0, "fn dup() {}".len()),
+        );
+        let second = Block::new(
+            shared_content,
+            BlockKind::Function,
+            LineSpan::new(0, 1),
+            ByteSpan::new("fn dup() {}".len() + 1, 2 * "fn dup() {}".len() + 1),
+        );
         assert_eq!(first.hash, second.hash);
-        assert_ne!(first.start_line, second.start_line);
+        assert_eq!(first.line_span(), second.line_span());
+        assert_ne!(first.byte_span(), second.byte_span());
 
         let files = vec![FileState::new(
             RepoPath::new("src/lib.rs").unwrap(),
@@ -638,15 +673,54 @@ mod tests {
     }
 
     #[test]
-    fn build_tree_nests_section_children_that_share_parent_start_line() {
-        let parent = Block::new(
-            "# Guide\nIntro.\n\n## Install\nSteps.\n".to_string(),
-            BlockKind::Section,
-            0,
-            5,
+    fn dynamic_insert_keeps_identical_same_line_blocks_distinct_by_byte_span() {
+        let content = "fn dup() {}";
+        let first = Block::new(
+            content.to_string(),
+            BlockKind::Function,
+            LineSpan::new(0, 1),
+            ByteSpan::new(0, content.len()),
         );
-        let intro = Block::new("# Guide\nIntro.\n\n".to_string(), BlockKind::Section, 0, 3);
-        let child = Block::new("## Install\nSteps.\n".to_string(), BlockKind::Section, 3, 5);
+        let second = Block::new(
+            content.to_string(),
+            BlockKind::Function,
+            LineSpan::new(0, 1),
+            ByteSpan::new(content.len() + 1, 2 * content.len() + 1),
+        );
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let mut tree = builder.finalize();
+
+        let ids = tree.insert_block_children(file, vec![first.clone(), second.clone()]);
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(tree.find_block_node("src/lib.rs", &first), Some(ids[0]));
+        assert_eq!(tree.find_block_node("src/lib.rs", &second), Some(ids[1]));
+    }
+
+    #[test]
+    fn build_tree_nests_section_children_that_share_parent_start_line() {
+        let source = "# Guide\nIntro.\n\n## Install\nSteps.\n";
+        let parent =
+            Block::from_file_range(source, BlockKind::Section, ByteSpan::new(0, source.len()))
+                .unwrap_or_else(|error| panic!("parent source range should be valid: {error}"));
+        let child_start = "# Guide\nIntro.\n\n".len();
+        let intro =
+            Block::from_file_range(source, BlockKind::Section, ByteSpan::new(0, child_start))
+                .unwrap_or_else(|error| panic!("intro source range should be valid: {error}"));
+        let child = Block::from_file_range(
+            source,
+            BlockKind::Section,
+            ByteSpan::new(child_start, source.len()),
+        )
+        .unwrap_or_else(|error| panic!("child source range should be valid: {error}"));
         let files = vec![FileState::new(
             RepoPath::new("README.md").unwrap(),
             Language::Markdown,
@@ -671,14 +745,28 @@ mod tests {
 
     #[test]
     fn build_tree_nests_swift_type_members_under_container_block() {
-        let container = Block::new(
-            "struct Worker {\n    func start() {}\n\n    func stop() {}\n}\n".to_string(),
-            BlockKind::Struct,
-            0,
-            5,
-        );
-        let first_method = Block::new("func start() {}\n".to_string(), BlockKind::Method, 1, 2);
-        let second_method = Block::new("func stop() {}\n".to_string(), BlockKind::Method, 3, 4);
+        let source = "struct Worker {\n    func start() {}\n\n    func stop() {}\n}\n";
+        let container =
+            Block::from_file_range(source, BlockKind::Struct, ByteSpan::new(0, source.len()))
+                .unwrap_or_else(|error| panic!("container source range should be valid: {error}"));
+        let first_start = source
+            .find("func start() {}\n")
+            .unwrap_or_else(|| panic!("expected first method"));
+        let second_start = source
+            .find("func stop() {}\n")
+            .unwrap_or_else(|| panic!("expected second method"));
+        let first_method = Block::from_file_range(
+            source,
+            BlockKind::Method,
+            ByteSpan::new(first_start, first_start + "func start() {}\n".len()),
+        )
+        .unwrap_or_else(|error| panic!("first method range should be valid: {error}"));
+        let second_method = Block::from_file_range(
+            source,
+            BlockKind::Method,
+            ByteSpan::new(second_start, second_start + "func stop() {}\n".len()),
+        )
+        .unwrap_or_else(|error| panic!("second method range should be valid: {error}"));
 
         let files = vec![FileState::new(
             RepoPath::new("Sources/App/Core.swift").unwrap(),
@@ -787,7 +875,7 @@ mod tests {
             dir,
             "function:L1-L2".to_string(),
             RepoPath::new("src/lib.rs").unwrap(),
-            Block::new("fn f() {}".to_string(), BlockKind::Function, 0, 1),
+            test_block("fn f() {}".to_string(), BlockKind::Function, 0, 1),
             Language::Rust,
         );
     }
@@ -795,7 +883,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplicate block lookup key")]
     fn build_tree_rejects_duplicate_block_lookup_keys() {
-        let block = Block::new("fn dup() {}".to_string(), BlockKind::Function, 1, 2);
+        let block = test_block("fn dup() {}".to_string(), BlockKind::Function, 1, 2);
         let files = vec![FileState::new(
             RepoPath::new("src/lib.rs").unwrap(),
             Language::Rust,

@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::coverage::{CoverageBuildOptions, CoverageIndex};
@@ -21,6 +21,7 @@ use crate::tree;
 use crate::vcs;
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
@@ -411,8 +412,15 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     }
 
     for file in &mut unreviewed_files {
-        file.blocks
-            .sort_by_key(|block| (kind_rank(block), block.start_line));
+        file.blocks.sort_by_key(|block| {
+            (
+                kind_rank(block),
+                block.start_byte,
+                block.end_byte,
+                block.start_line,
+                block.end_line,
+            )
+        });
     }
 
     unreviewed_files.sort_by(|a, b| {
@@ -515,8 +523,15 @@ fn collect_diff_scoped_review(
     }
 
     for file in &mut unreviewed_files {
-        file.blocks
-            .sort_by_key(|block| (kind_rank(block), block.start_line));
+        file.blocks.sort_by_key(|block| {
+            (
+                kind_rank(block),
+                block.start_byte,
+                block.end_byte,
+                block.start_line,
+                block.end_line,
+            )
+        });
     }
 
     unreviewed_files.sort_by(|a, b| {
@@ -669,7 +684,15 @@ fn collect_diff_review_files(
             .as_ref()
             .map(|file| file.blocks.clone())
             .unwrap_or_default();
-        head_blocks.sort_by_key(|block| (block.start_line, block.end_line, block.kind.as_str()));
+        head_blocks.sort_by_key(|block| {
+            (
+                block.start_byte,
+                Reverse(block.end_byte),
+                block.start_line,
+                Reverse(block.end_line),
+                block.kind.as_str(),
+            )
+        });
 
         let blocks = collect_diff_review_blocks_for_target_inputs(&target_inputs, &head_blocks)
             .into_iter()
@@ -800,39 +823,54 @@ fn build_tree_from_diff_review_files(files: &[DiffReviewFile]) -> Result<DiffRev
                     file.language,
                 );
                 file_change_kinds.insert(file_id, file.change_kind);
-                let mut container_stack: Vec<(tree::TreeNodeId, usize, usize)> = Vec::new();
-                for review_block in &file.blocks {
-                    let display_block = review_block.display_block().clone();
-                    while let Some((_, _, end_line)) = container_stack.last() {
-                        if display_block.start_line > *end_line {
-                            container_stack.pop();
-                        } else {
-                            break;
-                        }
-                    }
 
-                    let parent = container_stack
-                        .iter()
-                        .rev()
-                        .find(|(_, start, end)| {
-                            display_block.start_line >= *start && display_block.end_line <= *end
-                        })
-                        .map(|(id, _, _)| *id)
-                        .unwrap_or(file_id);
-                    let start_line = display_block.start_line;
-                    let end_line = display_block.end_line;
+                let (base_parents, head_parents) = diff_parent_maps(&file.blocks);
+                let parents = file
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| {
+                        if block.sides.head.is_some() {
+                            head_parents[index]
+                        } else {
+                            base_parents[index]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let depths = diff_parent_depths(&parents)?;
+                let mut insertion_order = (0..file.blocks.len()).collect::<Vec<_>>();
+                insertion_order.sort_by_key(|index| {
+                    let block = file.blocks[*index].display_block();
+                    (
+                        depths[*index],
+                        block.start_byte,
+                        Reverse(block.end_byte),
+                        *index,
+                    )
+                });
+
+                let mut node_ids = vec![None; file.blocks.len()];
+                for entry_index in insertion_order {
+                    let review_block = &file.blocks[entry_index];
+                    let parent = match parents[entry_index] {
+                        Some(parent_index) => node_ids[parent_index].ok_or_else(|| {
+                            anyhow!(
+                                "diff parent must be inserted before child: parent={parent_index}, child={entry_index}"
+                            )
+                        })?,
+                        None => file_id,
+                    };
+                    let display_block = review_block.display_block().clone();
                     let node_id = builder.add_block(
                         parent,
                         diff_block_label(&display_block),
                         next_path.clone(),
-                        display_block.clone(),
+                        display_block,
                         file.language,
                     );
+                    node_ids[entry_index] = Some(node_id);
                     diff_block_sides.insert(node_id, review_block.sides.clone());
                     block_change_kinds.insert(node_id, review_block.change_kind);
-                    if display_block.kind.can_contain_review_children() {
-                        container_stack.push((node_id, start_line, end_line));
-                    }
                 }
             } else {
                 let dir_id = *directories.entry(next_path.clone()).or_insert_with(|| {
@@ -850,6 +888,88 @@ fn build_tree_from_diff_review_files(files: &[DiffReviewFile]) -> Result<DiffRev
         file_change_kinds,
         block_change_kinds,
     ))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DiffCoordinateSide {
+    Base,
+    Head,
+}
+
+fn diff_parent_maps(blocks: &[DiffReviewBlock]) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    (
+        diff_parent_map_for_side(blocks, DiffCoordinateSide::Base),
+        diff_parent_map_for_side(blocks, DiffCoordinateSide::Head),
+    )
+}
+
+fn diff_parent_map_for_side(
+    blocks: &[DiffReviewBlock],
+    side: DiffCoordinateSide,
+) -> Vec<Option<usize>> {
+    let mut parents = vec![None; blocks.len()];
+    let mut ordered = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, review_block)| {
+            let block = match side {
+                DiffCoordinateSide::Base => review_block.sides.base.as_ref(),
+                DiffCoordinateSide::Head => review_block.sides.head.as_ref(),
+            }?;
+            Some((index, block))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(index, block)| {
+        (
+            block.start_byte,
+            Reverse(block.end_byte),
+            block.start_line,
+            Reverse(block.end_line),
+            *index,
+        )
+    });
+
+    let mut containers: Vec<(usize, ByteSpan)> = Vec::new();
+    for (index, block) in ordered {
+        let byte_span = block.byte_span();
+        while let Some((_, container_span)) = containers.last() {
+            if container_span.properly_contains(&byte_span) {
+                break;
+            }
+            containers.pop();
+        }
+
+        parents[index] = containers.last().map(|(parent, _)| *parent);
+        if block.kind.can_contain_review_children() {
+            containers.push((index, byte_span));
+        }
+    }
+
+    parents
+}
+
+fn diff_parent_depths(parents: &[Option<usize>]) -> Result<Vec<usize>> {
+    parents
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let mut depth = 0usize;
+            let mut seen = HashSet::new();
+            let mut current = parents[index];
+            while let Some(parent) = current {
+                if !seen.insert(parent) {
+                    return Err(anyhow!(
+                        "diff block parent relation must be acyclic: entry={index}, parent={parent}"
+                    ));
+                }
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("diff block parent depth overflow"))?;
+                current = parents[parent];
+            }
+            Ok(depth)
+        })
+        .collect()
 }
 
 fn diff_block_label(block: &Block) -> String {
@@ -1475,12 +1595,12 @@ fn dedupe_diff_review_blocks(blocks: Vec<DiffReviewBlock>) -> Vec<DiffReviewBloc
                 .sides
                 .base
                 .as_ref()
-                .map(|side| (side.hash.clone(), side.start_line, side.end_line)),
+                .map(|side| (side.hash.clone(), side.byte_span())),
             block
                 .sides
                 .head
                 .as_ref()
-                .map(|side| (side.hash.clone(), side.start_line, side.end_line)),
+                .map(|side| (side.hash.clone(), side.byte_span())),
         );
         if seen.insert(identity) {
             deduped.push(block);
@@ -1495,34 +1615,38 @@ fn sort_diff_review_blocks(blocks: &mut [DiffReviewBlock]) {
         let left_display = left.display_block();
         let right_display = right.display_block();
         (
+            left_display.start_byte,
+            Reverse(left_display.end_byte),
             left_display.start_line,
-            left_display.end_line,
+            Reverse(left_display.end_line),
             left_display.kind.default_review_priority(),
             left_display.hash.as_str(),
             left.sides
                 .base
                 .as_ref()
-                .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+                .map(|side| (side.hash.as_str(), side.start_byte, side.end_byte)),
             left.sides
                 .head
                 .as_ref()
-                .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+                .map(|side| (side.hash.as_str(), side.start_byte, side.end_byte)),
         )
             .cmp(&(
+                right_display.start_byte,
+                Reverse(right_display.end_byte),
                 right_display.start_line,
-                right_display.end_line,
+                Reverse(right_display.end_line),
                 right_display.kind.default_review_priority(),
                 right_display.hash.as_str(),
                 right
                     .sides
                     .base
                     .as_ref()
-                    .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+                    .map(|side| (side.hash.as_str(), side.start_byte, side.end_byte)),
                 right
                     .sides
                     .head
                     .as_ref()
-                    .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+                    .map(|side| (side.hash.as_str(), side.start_byte, side.end_byte)),
             ))
     });
 }
@@ -1542,6 +1666,7 @@ fn line_range_overlap(a: &std::ops::Range<u32>, b: &std::ops::Range<u32>) -> u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::ByteSpan;
     use crate::hashing::TreeHash;
     use crate::store::{CommitId, Record, ReviewDatabase};
     use crate::test_git::{CurrentDirGuard, run_git, temp_git_repo};
@@ -1557,6 +1682,8 @@ mod tests {
             complexity: None,
             start_line: 0,
             end_line: 1,
+            start_byte: 0,
+            end_byte: "content".len(),
         }
     }
 
@@ -1618,7 +1745,9 @@ mod tests {
     #[test]
     fn structural_child_coverage_does_not_cover_container_header() {
         let source = "type User struct {\n\tName string\n\tAge int\n}\n";
-        let container = Block::new(source.to_string(), BlockKind::Struct, 1, 4);
+        let container =
+            Block::from_file_range(source, BlockKind::Struct, ByteSpan::new(0, source.len()))
+                .unwrap_or_else(|error| panic!("container source range should be valid: {error}"));
         let children = match sub_splitter::split_result(&container, Language::Go) {
             Ok(children) => children,
             Err(error) => panic!("expected split result: {error:#}"),
@@ -1834,6 +1963,10 @@ mod tests {
         end_line: usize,
         content: &str,
     ) -> Block {
+        let start_byte = start_line;
+        let end_byte = start_byte
+            .checked_add(content.len())
+            .unwrap_or_else(|| panic!("diff fixture byte end overflow"));
         Block {
             hash: TreeHash::new(hash),
             content: content.to_string(),
@@ -1842,14 +1975,56 @@ mod tests {
             complexity: None,
             start_line,
             end_line,
+            start_byte,
+            end_byte,
         }
+    }
+
+    #[test]
+    fn diff_tree_parenting_uses_shared_side_byte_containment_for_deleted_child() {
+        let base_parent = make_diff_block("base-parent", BlockKind::Class, 0, 1, &"P".repeat(100));
+        let head_parent = make_diff_block("head-parent", BlockKind::Class, 2, 3, &"H".repeat(100));
+        let deleted_child = make_diff_block("deleted-child", BlockKind::Method, 0, 1, "child");
+        let file = DiffReviewFile {
+            path: RepoPath::new("src/Main.java").unwrap(),
+            language: Language::Java,
+            file_hash: TreeHash::new("file"),
+            change_kind: FileChangeKind::Changed,
+            blocks: vec![
+                DiffReviewBlock {
+                    sides: DiffBlockSides {
+                        base: Some(deleted_child.clone()),
+                        head: None,
+                    },
+                    change_kind: BlockChangeKind::Deleted,
+                },
+                DiffReviewBlock {
+                    sides: DiffBlockSides {
+                        base: Some(base_parent),
+                        head: Some(head_parent.clone()),
+                    },
+                    change_kind: BlockChangeKind::Changed,
+                },
+            ],
+        };
+
+        let (tree, _, _, _) = build_tree_from_diff_review_files(&[file])
+            .unwrap_or_else(|error| panic!("diff tree should build: {error}"));
+        let parent_id = tree
+            .find_block_node("src/Main.java", &head_parent)
+            .unwrap_or_else(|| panic!("expected changed parent display node"));
+        let child_id = tree
+            .find_block_node("src/Main.java", &deleted_child)
+            .unwrap_or_else(|| panic!("expected deleted child node"));
+
+        assert_eq!(tree.parent(child_id), Some(parent_id));
     }
 
     fn diff_review_blocks(blocks: &[DiffReviewBlock]) -> Vec<&DiffBlockSides> {
         blocks.iter().map(|block| &block.sides).collect()
     }
     fn rust_review_blocks(content: &str) -> Vec<Block> {
-        crate::block_splitter::split(content, Language::Rust).into_review_blocks()
+        crate::block_splitter::split(content, Language::Rust).into_review_blocks(content)
     }
     fn target_file_diff_input(
         source_path: &str,
@@ -2662,11 +2837,7 @@ mod tests {
         let repo = gix::open(&repo_root).unwrap();
         let first_target = ReviewDiffTarget::Revision(CommitId::new(first.trim()).unwrap());
         let second_target = ReviewDiffTarget::Revision(CommitId::new(second.trim()).unwrap());
-        let targets = vec![
-            first_target.clone(),
-            second_target.clone(),
-            first_target.clone(),
-        ];
+        let targets = vec![first_target.clone(), second_target, first_target];
         let destination = RepoPath::new("src/dest.rs").unwrap();
         let mut batches =
             collect_target_diff_batches(&repo, &targets, std::slice::from_ref(&destination))

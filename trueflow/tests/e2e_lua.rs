@@ -4,15 +4,9 @@ use std::path::PathBuf;
 use trueflow_test_support::*;
 
 use trueflow::analysis::Language;
-use trueflow::block::{Block, BlockKind};
+use trueflow::block::{Block, BlockKind, ByteSpan, LineSpan};
 use trueflow::block_splitter;
-use trueflow::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use trueflow::sub_splitter::{self, SubSplitSemantics};
-
-fn expand_block_for_review_splitting(mut block: Block) -> Block {
-    block.end_line = block.start_line + MAX_REVIEW_UNIT_SPAN_LINES + 8;
-    block
-}
 
 #[test]
 fn test_lua_fixture_scan_detects_language_and_structural_blocks() -> Result<()> {
@@ -116,20 +110,19 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
     let content = std::fs::read_to_string(&file_path)?;
     let blocks = block_splitter::split(&content, Language::Lua).blocks;
 
-    let assigned_function = expand_block_for_review_splitting(
-        blocks
-            .iter()
-            .find(|block| {
-                block.kind == BlockKind::Function
-                    && block
-                        .content
-                        .contains("local test_helper = function(values)")
-            })
-            .cloned()
-            .context("expected assigned Lua function block")?,
-    );
+    let assigned_function = blocks
+        .iter()
+        .find(|block| {
+            block.kind == BlockKind::Function
+                && block
+                    .content
+                    .contains("local test_helper = function(values)")
+        })
+        .cloned()
+        .context("expected assigned Lua function block")?;
 
-    let assigned_function_result = sub_splitter::split_result(&assigned_function, Language::Lua)?;
+    let assigned_function_result =
+        sub_splitter::split_result_for_child_navigation(&assigned_function, Language::Lua)?;
     assert_eq!(
         assigned_function_result.semantics,
         SubSplitSemantics::ReviewUnits
@@ -153,17 +146,16 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
         "expected assigned Lua function to split into code review units: {assigned_function_kinds:?}"
     );
 
-    let defaults_module = expand_block_for_review_splitting(
-        blocks
-            .iter()
-            .find(|block| {
-                block.kind == BlockKind::Module && block.content.contains("local Defaults = {")
-            })
-            .cloned()
-            .context("expected Defaults module block")?,
-    );
+    let defaults_module = blocks
+        .iter()
+        .find(|block| {
+            block.kind == BlockKind::Module && block.content.contains("local Defaults = {")
+        })
+        .cloned()
+        .context("expected Defaults module block")?;
 
-    let defaults_result = sub_splitter::split_result(&defaults_module, Language::Lua)?;
+    let defaults_result =
+        sub_splitter::split_result_for_child_navigation(&defaults_module, Language::Lua)?;
     assert_eq!(defaults_result.semantics, SubSplitSemantics::ReviewUnits);
     let defaults_kinds = defaults_result
         .blocks
@@ -192,18 +184,16 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
         "expected Defaults module review units to expose self-style method fields: {defaults_kinds:?}"
     );
 
-    let aliases_module = expand_block_for_review_splitting(
-        blocks
-            .iter()
-            .find(|block| {
-                block.kind == BlockKind::Module
-                    && block.content.trim_start().starts_with("aliases = {")
-            })
-            .cloned()
-            .context("expected aliases module block")?,
-    );
+    let aliases_module = blocks
+        .iter()
+        .find(|block| {
+            block.kind == BlockKind::Module && block.content.trim_start().starts_with("aliases = {")
+        })
+        .cloned()
+        .context("expected aliases module block")?;
 
-    let aliases_result = sub_splitter::split_result(&aliases_module, Language::Lua)?;
+    let aliases_result =
+        sub_splitter::split_result_for_child_navigation(&aliases_module, Language::Lua)?;
     assert_eq!(aliases_result.semantics, SubSplitSemantics::ReviewUnits);
     let aliases_kinds = aliases_result
         .blocks
@@ -229,15 +219,16 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
 
 #[test]
 fn test_lua_function_sub_splitting_handles_long_comments_and_trailing_commas() -> Result<()> {
-    let block = expand_block_for_review_splitting(Block::new(
-        "handler = function(self)\r\n  --[[Long-form reviewer note.]]\r\n  return self\r\nend,\r\n"
-            .to_string(),
+    let content =
+        "handler = function(self)\r\n  --[[Long-form reviewer note.]]\r\n  return self\r\nend,\r\n";
+    let block = Block::new(
+        content.to_string(),
         BlockKind::Function,
-        0,
-        4,
-    ));
+        LineSpan::new(0, content.lines().count()),
+        ByteSpan::new(0, content.len()),
+    );
 
-    let result = sub_splitter::split_result(&block, Language::Lua)?;
+    let result = sub_splitter::split_result_for_child_navigation(&block, Language::Lua)?;
     assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
     let kinds = result
         .blocks
@@ -260,14 +251,15 @@ fn test_lua_function_sub_splitting_handles_long_comments_and_trailing_commas() -
 
 #[test]
 fn test_lua_module_sub_splitting_handles_leading_comments() -> Result<()> {
-    let block = expand_block_for_review_splitting(Block::new(
-        "-- Module preface\nlocal M = {\n  value = 1,\n}\n".to_string(),
+    let content = "-- Module preface\nlocal M = {\n  value = 1,\n}\n";
+    let block = Block::new(
+        content.to_string(),
         BlockKind::Module,
-        0,
-        4,
-    ));
+        LineSpan::new(0, content.lines().count()),
+        ByteSpan::new(0, content.len()),
+    );
 
-    let result = sub_splitter::split_result(&block, Language::Lua)?;
+    let result = sub_splitter::split_result_for_child_navigation(&block, Language::Lua)?;
     assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
     let kinds = result
         .blocks

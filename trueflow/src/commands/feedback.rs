@@ -2,9 +2,9 @@ use crate::block::BlockKind;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::feedback_export::{
-    FeedbackCursor, FeedbackEntry, FeedbackQuery, FeedbackSinceFilter, RepoFeedbackContextResolver,
-    collect_feedback_entries, feedback_cursor_path, resolve_allowed_revisions,
-    resolve_since_filter, write_feedback_cursor,
+    FeedbackBlockView, FeedbackCursor, FeedbackEntry, FeedbackQuery, FeedbackSinceFilter,
+    RepoFeedbackContextResolver, collect_feedback_entries, feedback_cursor_path,
+    resolve_allowed_revisions, resolve_since_filter, write_feedback_cursor,
 };
 use crate::feedback_since::{FeedbackSinceExpr, ResolvedFeedbackSince as ParsedFeedbackSince};
 use crate::github::{
@@ -1607,14 +1607,8 @@ fn feedback_entry_to_json_value(entry: &FeedbackEntry) -> serde_json::Value {
     })
 }
 
-fn print_block_xml(block: &crate::block::Block, reviews: &[crate::store::Record]) {
-    println!(
-        "    <block start_line=\"{}\" end_line=\"{}\" kind=\"{}\" hash=\"{}\">",
-        block.start_line,
-        block.end_line,
-        escape_xml(block.kind.as_str()),
-        block.hash
-    );
+fn print_block_xml(block: &FeedbackBlockView, reviews: &[crate::store::Record]) {
+    println!("{}", block_xml_open_tag(block));
 
     println!("      <context><![CDATA[");
     if block.content.contains("]]>") {
@@ -1641,6 +1635,22 @@ fn print_block_xml(block: &crate::block::Block, reviews: &[crate::store::Record]
     }
     println!("      </reviews>");
     println!("    </block>");
+}
+fn block_xml_open_tag(block: &FeedbackBlockView) -> String {
+    let common = format!(
+        "    <block start_line=\"{}\" end_line=\"{}\" kind=\"{}\" hash=\"{}\"",
+        block.start_line,
+        block.end_line,
+        escape_xml(block.kind.as_str()),
+        block.hash
+    );
+    match block.byte_span {
+        Some(byte_span) => format!(
+            "{common} start_byte=\"{}\" end_byte=\"{}\">",
+            byte_span.start_byte, byte_span.end_byte
+        ),
+        None => format!("{common}>"),
+    }
 }
 
 fn escape_xml(s: &str) -> Cow<'_, str> {
@@ -1809,14 +1819,15 @@ mod tests {
         duplicate_previous.timestamp = 10;
         let mut current = review_record("current", &revision, None, None);
         current.timestamp = 10;
+        let block = crate::block::Block::new(
+            "fn value() {}\n".to_string(),
+            BlockKind::Function,
+            crate::block::LineSpan::new(0, 1),
+            crate::block::ByteSpan::new(0, "fn value() {}\n".len()),
+        );
         let entry = FeedbackEntry {
             file_path: "src/lib.rs".to_string(),
-            block: crate::block::Block::new(
-                "fn value() {}\n".to_string(),
-                BlockKind::Function,
-                0,
-                1,
-            ),
+            block: FeedbackBlockView::from_canonical_block(&block),
             reviews: vec![older, duplicate_previous, current],
             latest_verdict: "comment".to_string(),
         };
@@ -1837,6 +1848,80 @@ mod tests {
             vec!["current".to_string(), "previous".to_string()]
         );
         Ok(())
+    }
+
+    #[test]
+    fn source_backed_feedback_serializes_byte_span() {
+        let content = "fn source_backed() {}\n";
+        let block = crate::block::Block::new(
+            content.to_string(),
+            BlockKind::Function,
+            crate::block::LineSpan::new(3, 4),
+            crate::block::ByteSpan::new(23, 23 + content.len()),
+        );
+        let entry = FeedbackEntry {
+            file_path: "src/lib.rs".to_string(),
+            block: FeedbackBlockView::from_canonical_block(&block),
+            reviews: Vec::new(),
+            latest_verdict: "comment".to_string(),
+        };
+
+        let value = feedback_entry_to_json_value(&entry);
+        assert_eq!(value["block"]["start_byte"].as_u64(), Some(23));
+        assert_eq!(
+            value["block"]["end_byte"].as_u64(),
+            u64::try_from(23 + content.len()).ok()
+        );
+        assert!(block_xml_open_tag(&entry.block).contains("start_byte=\"23\""));
+    }
+
+    #[test]
+    fn resolved_scoped_feedback_does_not_copy_canonical_byte_span() {
+        let block = FeedbackBlockView {
+            hash: TreeHash::from_content("canonical"),
+            content: "rewritten scoped context\n".to_string(),
+            kind: BlockKind::Function,
+            tags: Vec::new(),
+            complexity: None,
+            start_line: 10,
+            end_line: 12,
+            byte_span: None,
+        };
+        let entry = FeedbackEntry {
+            file_path: "src/lib.rs".to_string(),
+            block,
+            reviews: Vec::new(),
+            latest_verdict: "comment".to_string(),
+        };
+
+        let value = feedback_entry_to_json_value(&entry);
+        assert!(value["block"].get("start_byte").is_none());
+        assert!(value["block"].get("end_byte").is_none());
+        assert!(!block_xml_open_tag(&entry.block).contains("start_byte="));
+    }
+
+    #[test]
+    fn detached_feedback_does_not_fabricate_byte_span() {
+        let entry = FeedbackEntry {
+            file_path: "<unknown>".to_string(),
+            block: FeedbackBlockView {
+                hash: TreeHash::from_content("historical"),
+                content: "[unresolved historical context]".to_string(),
+                kind: BlockKind::Code,
+                tags: Vec::new(),
+                complexity: None,
+                start_line: 0,
+                end_line: 1,
+                byte_span: None,
+            },
+            reviews: Vec::new(),
+            latest_verdict: "unreviewed".to_string(),
+        };
+
+        let value = feedback_entry_to_json_value(&entry);
+        assert!(value["block"].get("start_byte").is_none());
+        assert!(value["block"].get("end_byte").is_none());
+        assert!(!block_xml_open_tag(&entry.block).contains("end_byte="));
     }
 
     #[test]

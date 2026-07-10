@@ -320,21 +320,18 @@ fn infer_target_kind_from_tree(tree: &tree::Tree, fingerprint: &str) -> Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::hashing::TreeHash;
     use crate::tree::TreeBuilder;
     use anyhow::anyhow;
 
     fn test_block(hash: &str, start_line: usize) -> Block {
-        Block {
-            hash: TreeHash::new(hash),
-            content: "fn demo() {}\n".to_string(),
-            kind: BlockKind::Function,
-            tags: Vec::new(),
-            complexity: None,
-            start_line,
-            end_line: start_line.saturating_add(1),
-        }
+        let content = "fn demo() {}\n".to_string();
+        let line_span = LineSpan::new(start_line, start_line + content.lines().count());
+        let byte_span = ByteSpan::new(0, content.len());
+        let mut block = Block::new(content, BlockKind::Function, line_span, byte_span);
+        block.hash = TreeHash::new(hash);
+        block
     }
 
     #[test]

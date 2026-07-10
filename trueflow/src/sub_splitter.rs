@@ -1,9 +1,8 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::code_comments;
-use crate::hashing::TreeHash;
 use crate::review_units::{MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES, MAX_REVIEW_UNIT_SPAN_LINES};
-use crate::text_split::{paragraph_break_regex, split_by_paragraph_breaks};
+use crate::text_split::paragraph_break_regex;
 use crate::tree_sitter_support::{
     classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
     find_named_descendant, find_named_descendant_any, kotlin_type_body, markdown_heading_level,
@@ -388,15 +387,55 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
 
 pub(crate) fn split_code_review_units(block: &Block) -> Result<Vec<Block>> {
     let content = &block.content;
-    let blocks = split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
-        let block_kind = if is_gap {
-            BlockKind::Gap
-        } else {
-            classify_code_chunk(chunk)
-        };
-        create_sub_block_with_kind(block, chunk, start, end, block_kind)
-    });
-    Ok(blocks)
+    Ok(collect_valid_paragraph_blocks(
+        content,
+        |chunk, start, end, is_gap| {
+            let block_kind = if is_gap {
+                BlockKind::Gap
+            } else {
+                classify_code_chunk(chunk)
+            };
+            create_sub_block_with_kind(block, chunk, start, end, block_kind).ok()
+        },
+    ))
+}
+
+fn collect_valid_paragraph_blocks<F>(content: &str, mut make_block: F) -> Vec<Block>
+where
+    F: FnMut(&str, usize, usize, bool) -> Option<Block>,
+{
+    let re = paragraph_break_regex();
+    let mut blocks = Vec::new();
+    let mut start_offset = 0;
+
+    for mat in re.find_iter(content) {
+        let end_offset = mat.start();
+        if start_offset < end_offset
+            && let Some(chunk) = content.get(start_offset..end_offset)
+            && !chunk.is_empty()
+            && let Some(block) = make_block(chunk, start_offset, end_offset, false)
+        {
+            blocks.push(block);
+        }
+
+        if let Some(gap_chunk) = content.get(mat.start()..mat.end())
+            && let Some(block) = make_block(gap_chunk, mat.start(), mat.end(), true)
+        {
+            blocks.push(block);
+        }
+
+        start_offset = mat.end();
+    }
+
+    if start_offset < content.len()
+        && let Some(chunk) = content.get(start_offset..)
+        && !chunk.is_empty()
+        && let Some(block) = make_block(chunk, start_offset, content.len(), false)
+    {
+        blocks.push(block);
+    }
+
+    blocks
 }
 
 fn split_code(block: &Block) -> Result<Vec<Block>> {
@@ -410,17 +449,17 @@ fn split_toml_structural_children(block: &Block, kind: BlockKind) -> Result<Vec<
         _ => Vec::new(),
     };
 
-    Ok(spans_to_sub_blocks(block, &spans))
+    spans_to_sub_blocks(block, &spans)
 }
 
 fn split_nix_structural_children(block: &Block) -> Result<Option<Vec<Block>>> {
     let Some(spans) = nix_blocks::split_structural_children(&block.content, block.kind)? else {
         return Ok(None);
     };
-    Ok(Some(spans_to_sub_blocks(block, &spans)))
+    Ok(Some(spans_to_sub_blocks(block, &spans)?))
 }
 
-fn spans_to_sub_blocks<T>(block: &Block, spans: &[T]) -> Vec<Block>
+fn spans_to_sub_blocks<T>(block: &Block, spans: &[T]) -> Result<Vec<Block>>
 where
     T: StructuralSpan,
 {
@@ -529,7 +568,7 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
             root_heading.start,
             content_end,
             BlockKind::Section,
-        ));
+        )?);
     }
 
     for section in child_sections {
@@ -539,7 +578,7 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
             section.start,
             section.end,
             BlockKind::Section,
-        ));
+        )?);
     }
 
     if blocks.is_empty() {
@@ -629,7 +668,7 @@ fn split_markdown_flat_range_with_attached_heading(
 
     attach_markdown_heading_to_first_content(content, &mut parts, attached_heading_start);
 
-    Ok(parts
+    parts
         .into_iter()
         .map(|part| {
             create_sub_block_with_kind(
@@ -640,7 +679,7 @@ fn split_markdown_flat_range_with_attached_heading(
                 part.kind,
             )
         })
-        .collect())
+        .collect()
 }
 
 fn push_markdown_unstructured_part(
@@ -779,7 +818,7 @@ fn split_markdown_sentences(block: &Block) -> Result<Vec<Block>> {
             start,
             end,
             BlockKind::Sentence,
-        ));
+        )?);
     }
 
     if blocks.is_empty() {
@@ -789,7 +828,7 @@ fn split_markdown_sentences(block: &Block) -> Result<Vec<Block>> {
             0,
             content.len(),
             BlockKind::Sentence,
-        ));
+        )?);
     }
 
     Ok(blocks)
@@ -877,8 +916,8 @@ fn split_elisp_function(block: &Block) -> Result<Vec<Block>> {
         0,
         signature_end,
         BlockKind::FunctionSignature,
-    )];
-    blocks.extend(split_by_paragraph_breaks(
+    )?];
+    blocks.extend(collect_valid_paragraph_blocks(
         &content[signature_end..],
         |chunk, start, end, is_gap| {
             let kind = if is_gap {
@@ -893,6 +932,7 @@ fn split_elisp_function(block: &Block) -> Result<Vec<Block>> {
                 signature_end + end,
                 kind,
             )
+            .ok()
         },
     ));
 
@@ -955,7 +995,7 @@ fn same_tree_sitter_node(left: tree_sitter::Node<'_>, right: tree_sitter::Node<'
 }
 
 fn collect_rust_impl_items(parent: &Block, impl_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
-    Ok(rust::collect_impl_member_spans(impl_node)
+    rust::collect_impl_member_spans(impl_node)
         .into_iter()
         .map(|member| {
             create_sub_block_with_kind(
@@ -966,7 +1006,7 @@ fn collect_rust_impl_items(parent: &Block, impl_node: tree_sitter::Node<'_>) -> 
                 member.kind,
             )
         })
-        .collect())
+        .collect()
 }
 
 fn split_python_function(block: &Block) -> Result<Vec<Block>> {
@@ -1053,7 +1093,7 @@ fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     }
 
-    let items = collect_swift_type_items(block, body, content);
+    let items = collect_swift_type_items(block, body, content)?;
     if items.is_empty() {
         split_code(block)
     } else {
@@ -1092,7 +1132,7 @@ fn split_kotlin_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_kotlin_type_items(block, body, content);
+    let items = collect_kotlin_type_items(block, body, content)?;
     if items.is_empty() {
         split_code(block)
     } else {
@@ -1144,7 +1184,7 @@ fn split_java_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_java_type_items(block, body);
+    let items = collect_java_type_items(block, body)?;
     if items.is_empty() {
         split_code(block)
     } else {
@@ -1169,10 +1209,10 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
         0,
         signature_end,
         BlockKind::FunctionSignature,
-    )];
+    )?];
 
     let rest = &content[signature_end..];
-    let mut push_chunk = |chunk: &str, start: usize, end: usize, is_gap: bool| {
+    let mut push_chunk = |chunk: &str, start: usize, end: usize, is_gap: bool| -> Result<()> {
         if is_gap {
             blocks.push(create_sub_block_with_kind(
                 block,
@@ -1180,8 +1220,8 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
                 signature_end + start,
                 signature_end + end,
                 BlockKind::Gap,
-            ));
-            return;
+            )?);
+            return Ok(());
         }
 
         if let Some(comment_end) = leading_comment_prefix_len(chunk) {
@@ -1192,7 +1232,7 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
                 signature_end + start,
                 signature_end + start + comment_end,
                 BlockKind::Comment,
-            ));
+            )?);
 
             let remainder = &chunk[comment_end..];
             if !remainder.trim().is_empty() {
@@ -1202,9 +1242,9 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
                     signature_end + start + comment_end,
                     signature_end + end,
                     BlockKind::CodeParagraph,
-                ));
+                )?);
             }
-            return;
+            return Ok(());
         }
 
         let kind = classify_code_chunk(chunk);
@@ -1214,7 +1254,8 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
             signature_end + start,
             signature_end + end,
             kind,
-        ));
+        )?);
+        Ok(())
     };
 
     let re = paragraph_break_regex();
@@ -1223,19 +1264,19 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
         if start < mat.start() {
             let chunk = &rest[start..mat.start()];
             if !chunk.is_empty() {
-                push_chunk(chunk, start, mat.start(), false);
+                push_chunk(chunk, start, mat.start(), false)?;
             }
         }
 
         let gap = &rest[mat.start()..mat.end()];
-        push_chunk(gap, mat.start(), mat.end(), true);
+        push_chunk(gap, mat.start(), mat.end(), true)?;
         start = mat.end();
     }
 
     if start < rest.len() {
         let chunk = &rest[start..];
         if !chunk.is_empty() {
-            push_chunk(chunk, start, rest.len(), false);
+            push_chunk(chunk, start, rest.len(), false)?;
         }
     }
 
@@ -1267,7 +1308,7 @@ fn split_csharp_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_csharp_type_items(block, body);
+    let items = collect_csharp_type_items(block, body)?;
     if items.is_empty() {
         split_code(block)
     } else {
@@ -1288,7 +1329,7 @@ fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_ruby_scope_items(block, scope_node);
+    let items = collect_ruby_scope_items(block, scope_node)?;
     if items.is_empty() {
         split_code(block)
     } else {
@@ -1335,7 +1376,7 @@ fn split_php_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_php_type_items(block, body);
+    let items = collect_php_type_items(block, body)?;
     if items.is_empty() {
         split_code(block)
     } else {
@@ -1379,7 +1420,7 @@ fn split_c_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_c_type_items(block, type_node);
+    let items = collect_c_type_items(block, type_node)?;
     if items.is_empty() {
         split_code(block)
     } else {
@@ -1419,7 +1460,7 @@ fn split_function_with_parser(
             0,
             signature_end,
             BlockKind::FunctionSignature,
-        ));
+        )?);
     }
 
     let nodes = collect_body_nodes(split_node, config.comment_kinds);
@@ -1474,7 +1515,7 @@ fn split_function_with_parser(
                 start_idx,
                 current_end,
                 BlockKind::CodeParagraph,
-            ));
+            )?);
         }
 
         if gap_prefix_len > 0 {
@@ -1485,7 +1526,7 @@ fn split_function_with_parser(
                 last_end,
                 gap_prefix_end,
                 BlockKind::Gap,
-            ));
+            )?);
         }
 
         if node_kind == BlockKind::Comment {
@@ -1495,7 +1536,7 @@ fn split_function_with_parser(
                 leading_start,
                 end,
                 node_kind,
-            ));
+            )?);
             last_kind = Some(BlockKind::Comment);
             last_end = end;
             continue;
@@ -1519,7 +1560,7 @@ fn split_function_with_parser(
             start_idx,
             current_end,
             BlockKind::CodeParagraph,
-        ));
+        )?);
     }
 
     if last_end < content.len() {
@@ -1532,7 +1573,7 @@ fn split_function_with_parser(
                 last_end,
                 content.len(),
                 kind,
-            ));
+            )?);
         }
     }
 
@@ -1622,7 +1663,7 @@ fn collect_swift_type_items(
     parent: &Block,
     body: tree_sitter::Node<'_>,
     content: &str,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     for member in swift::collect_type_member_spans(body, content) {
         let chunk = &parent.content[member.start_byte..member.end_byte];
@@ -1632,99 +1673,99 @@ fn collect_swift_type_items(
             member.start_byte,
             member.end_byte,
             member.kind,
-        ));
+        )?);
     }
 
-    blocks
+    Ok(blocks)
 }
 
-fn collect_java_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<Block> {
+fn collect_java_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = match child.kind() {
-                "field_declaration" => BlockKind::Variable,
-                "constant_declaration" => BlockKind::Const,
-                "method_declaration"
-                | "constructor_declaration"
-                | "compact_constructor_declaration" => BlockKind::Method,
-                "class_declaration" => BlockKind::Class,
-                "interface_declaration" => BlockKind::Interface,
-                "enum_declaration" => BlockKind::Enum,
-                "record_declaration" => BlockKind::Struct,
-                "annotation_type_declaration" => BlockKind::Type,
-                _ => return None,
-            };
-            Some(create_sub_block_with_kind(
-                parent,
-                &parent.content[child.start_byte()..child.end_byte()],
-                child.start_byte(),
-                child.end_byte(),
-                kind,
-            ))
-        })
-        .collect()
+    for child in body.named_children(&mut cursor) {
+        let kind = match child.kind() {
+            "field_declaration" => BlockKind::Variable,
+            "constant_declaration" => BlockKind::Const,
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => BlockKind::Method,
+            "class_declaration" => BlockKind::Class,
+            "interface_declaration" => BlockKind::Interface,
+            "enum_declaration" => BlockKind::Enum,
+            "record_declaration" => BlockKind::Struct,
+            "annotation_type_declaration" => BlockKind::Type,
+            _ => continue,
+        };
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            &parent.content[child.start_byte()..child.end_byte()],
+            child.start_byte(),
+            child.end_byte(),
+            kind,
+        )?);
+    }
+    Ok(blocks)
 }
 
 fn collect_kotlin_type_items(
     parent: &Block,
     body: tree_sitter::Node<'_>,
     content: &str,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = match child.kind() {
-                "function_declaration" => {
-                    if find_named_descendant(child, "function_body").is_some() {
-                        BlockKind::Method
-                    } else {
-                        BlockKind::FunctionSignature
-                    }
+    for child in body.named_children(&mut cursor) {
+        let kind = match child.kind() {
+            "function_declaration" => {
+                if find_named_descendant(child, "function_body").is_some() {
+                    BlockKind::Method
+                } else {
+                    BlockKind::FunctionSignature
                 }
-                "property_declaration" => {
-                    classify_kotlin_property_kind(&content[child.start_byte()..child.end_byte()])
-                }
-                "class_declaration" => classify_kotlin_class_kind(child, content),
-                "object_declaration" | "companion_object" => BlockKind::Class,
-                "secondary_constructor" => BlockKind::Method,
-                _ => return None,
-            };
-            Some(create_sub_block_with_kind(
-                parent,
-                &parent.content[child.start_byte()..child.end_byte()],
-                child.start_byte(),
-                child.end_byte(),
-                kind,
-            ))
-        })
-        .collect()
+            }
+            "property_declaration" => {
+                classify_kotlin_property_kind(&content[child.start_byte()..child.end_byte()])
+            }
+            "class_declaration" => classify_kotlin_class_kind(child, content),
+            "object_declaration" | "companion_object" => BlockKind::Class,
+            "secondary_constructor" => BlockKind::Method,
+            _ => continue,
+        };
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            &parent.content[child.start_byte()..child.end_byte()],
+            child.start_byte(),
+            child.end_byte(),
+            kind,
+        )?);
+    }
+    Ok(blocks)
 }
 
-fn collect_csharp_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<Block> {
+fn collect_csharp_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = match child.kind() {
-                "field_declaration" | "property_declaration" | "event_declaration" => {
-                    BlockKind::Variable
-                }
-                "method_declaration" | "constructor_declaration" => BlockKind::Method,
-                "class_declaration" => BlockKind::Class,
-                "interface_declaration" => BlockKind::Interface,
-                "enum_declaration" => BlockKind::Enum,
-                "record_declaration" | "struct_declaration" => BlockKind::Struct,
-                _ => return None,
-            };
-            Some(create_sub_block_with_kind(
-                parent,
-                &parent.content[child.start_byte()..child.end_byte()],
-                child.start_byte(),
-                child.end_byte(),
-                kind,
-            ))
-        })
-        .collect()
+    for child in body.named_children(&mut cursor) {
+        let kind = match child.kind() {
+            "field_declaration" | "property_declaration" | "event_declaration" => {
+                BlockKind::Variable
+            }
+            "method_declaration" | "constructor_declaration" => BlockKind::Method,
+            "class_declaration" => BlockKind::Class,
+            "interface_declaration" => BlockKind::Interface,
+            "enum_declaration" => BlockKind::Enum,
+            "record_declaration" | "struct_declaration" => BlockKind::Struct,
+            _ => continue,
+        };
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            &parent.content[child.start_byte()..child.end_byte()],
+            child.start_byte(),
+            child.end_byte(),
+            kind,
+        )?);
+    }
+    Ok(blocks)
 }
 
 fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
@@ -1749,9 +1790,12 @@ fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
     None
 }
 
-fn collect_ruby_scope_items(parent: &Block, scope_node: tree_sitter::Node<'_>) -> Vec<Block> {
+fn collect_ruby_scope_items(
+    parent: &Block,
+    scope_node: tree_sitter::Node<'_>,
+) -> Result<Vec<Block>> {
     let Some(body) = scope_node.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut blocks = Vec::new();
@@ -1772,7 +1816,7 @@ fn collect_ruby_scope_items(parent: &Block, scope_node: tree_sitter::Node<'_>) -
             child.start_byte(),
             child.end_byte(),
             kind,
-        ));
+        )?);
 
         if matches!(child.kind(), "class" | "module")
             && let Some(body) = child.child_by_field_name("body")
@@ -1781,7 +1825,7 @@ fn collect_ruby_scope_items(parent: &Block, scope_node: tree_sitter::Node<'_>) -
         }
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn ruby_scope_body_children(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
@@ -1798,29 +1842,29 @@ fn ruby_call_is_import(node: tree_sitter::Node<'_>, content: &str) -> bool {
     )
 }
 
-fn collect_php_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Vec<Block> {
+fn collect_php_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = match child.kind() {
-                "const_declaration" | "enum_case" => BlockKind::Const,
-                "property_declaration" => BlockKind::Variable,
-                "method_declaration" => BlockKind::Method,
-                "use_declaration" => BlockKind::Impl,
-                _ => return None,
-            };
-            Some(create_sub_block_with_kind(
-                parent,
-                &parent.content[child.start_byte()..child.end_byte()],
-                child.start_byte(),
-                child.end_byte(),
-                kind,
-            ))
-        })
-        .collect()
+    for child in body.named_children(&mut cursor) {
+        let kind = match child.kind() {
+            "const_declaration" | "enum_case" => BlockKind::Const,
+            "property_declaration" => BlockKind::Variable,
+            "method_declaration" => BlockKind::Method,
+            "use_declaration" => BlockKind::Impl,
+            _ => continue,
+        };
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            &parent.content[child.start_byte()..child.end_byte()],
+            child.start_byte(),
+            child.end_byte(),
+            kind,
+        )?);
+    }
+    Ok(blocks)
 }
 
-fn collect_c_type_items(parent: &Block, type_node: tree_sitter::Node<'_>) -> Vec<Block> {
+fn collect_c_type_items(parent: &Block, type_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
     let specifier = if type_node.kind() == "type_definition" {
         type_node.child_by_field_name("type").unwrap_or(type_node)
     } else {
@@ -1828,28 +1872,27 @@ fn collect_c_type_items(parent: &Block, type_node: tree_sitter::Node<'_>) -> Vec
     };
 
     let Some(body) = specifier.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.children(&mut cursor)
-        .filter_map(|child| {
-            let kind = match child.kind() {
-                "field_declaration" => BlockKind::Variable,
-                "enumerator" => BlockKind::Const,
-                "comment" => BlockKind::Comment,
-                _ => return None,
-            };
-
-            Some(create_sub_block_with_kind(
-                parent,
-                &parent.content[child.start_byte()..child.end_byte()],
-                child.start_byte(),
-                child.end_byte(),
-                kind,
-            ))
-        })
-        .collect()
+    for child in body.children(&mut cursor) {
+        let kind = match child.kind() {
+            "field_declaration" => BlockKind::Variable,
+            "enumerator" => BlockKind::Const,
+            "comment" => BlockKind::Comment,
+            _ => continue,
+        };
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            &parent.content[child.start_byte()..child.end_byte()],
+            child.start_byte(),
+            child.end_byte(),
+            kind,
+        )?);
+    }
+    Ok(blocks)
 }
 
 fn gap_prefix_length(gap: &str) -> usize {
@@ -1881,25 +1924,14 @@ fn create_sub_block_with_kind(
     parent: &Block,
     content: &str,
     start_offset: usize,
-    _end_offset: usize,
+    end_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&c| c == '\n').count();
-    let chunk_newlines = content.chars().filter(|&c| c == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + if content.ends_with('\n') { 0 } else { 1 };
-
-    Block {
-        hash: TreeHash::from_content(content),
-        content: content.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block =
+        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    assert_eq!(block.content, content, "sub-split range must name content");
+    block.tags = parent.tags.clone();
+    Ok(block)
 }
 
 #[cfg(test)]
@@ -1909,33 +1941,10 @@ mod tests {
     use crate::block::Block;
 
     fn make_block(content: &str, kind: BlockKind) -> Block {
-        make_block_with_span(content, kind, 0, content.lines().count())
-    }
-
-    fn make_block_with_span(
-        content: &str,
-        kind: BlockKind,
-        start_line: usize,
-        end_line: usize,
-    ) -> Block {
-        Block {
-            hash: TreeHash::new("test"),
-            content: content.to_string(),
-            kind,
-            tags: Vec::new(),
-            complexity: None,
-            start_line,
-            end_line,
+        match Block::from_file_range(content, kind, ByteSpan::new(0, content.len())) {
+            Ok(block) => block,
+            Err(error) => panic!("test source range must be valid: {error}"),
         }
-    }
-
-    fn make_large_block(content: &str, kind: BlockKind) -> Block {
-        make_block_with_span(
-            content,
-            kind,
-            0,
-            crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES + 8,
-        )
     }
 
     fn merge_blocks(blocks: Vec<Block>) -> String {
@@ -1955,8 +1964,10 @@ mod tests {
     #[test]
     fn test_split_code_multiple() {
         let content = "fn foo() {\n    part1();\n\n    part2();\n}";
-        let block = make_large_block(content, BlockKind::Code);
-        let chunks = split(&block, Language::Rust).unwrap();
+        let block = make_block(content, BlockKind::Code);
+        let chunks = split_result_for_child_navigation(&block, Language::Rust)
+            .unwrap()
+            .blocks;
 
         // "fn foo() {\n    part1();" (CodeParagraph)
         // "\n\n" (Gap)
@@ -1972,13 +1983,10 @@ mod tests {
     #[test]
     fn test_split_markdown() {
         let content = "Para 1.\n\nPara 2.";
-        let block = make_block_with_span(
-            content,
-            BlockKind::Code,
-            0,
-            MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES + 8,
-        );
-        let chunks = split(&block, Language::Markdown).unwrap();
+        let block = make_block(content, BlockKind::Code);
+        let chunks = split_result_for_child_navigation(&block, Language::Markdown)
+            .unwrap()
+            .blocks;
 
         let kinds: Vec<BlockKind> = chunks.iter().map(|b| b.kind).collect();
         assert_eq!(
@@ -2002,8 +2010,10 @@ mod tests {
     #[test]
     fn test_split_text_sentences_when_block_exceeds_threshold() {
         let content = "Line one. Line two?";
-        let block = make_large_block(content, BlockKind::Paragraph);
-        let chunks = split(&block, Language::Text).unwrap();
+        let block = make_block(content, BlockKind::Paragraph);
+        let chunks = split_result_for_child_navigation(&block, Language::Text)
+            .unwrap()
+            .blocks;
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].kind, BlockKind::Sentence);
         assert_eq!(merge_blocks(chunks), content);
@@ -2246,8 +2256,10 @@ mod tests {
     #[test]
     fn test_split_rust_impl_into_items() {
         let content = "impl Foo {\n    fn read_heavy(&self) {}\n    const MAX: usize = 1;\n}\n";
-        let block = make_large_block(content, BlockKind::Impl);
-        let chunks = split(&block, Language::Rust).unwrap();
+        let block = make_block(content, BlockKind::Impl);
+        let chunks = split_result_for_child_navigation(&block, Language::Rust)
+            .unwrap()
+            .blocks;
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Const));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Impl));
@@ -2256,8 +2268,10 @@ mod tests {
     #[test]
     fn test_split_swift_extension_into_members_when_non_trivial() {
         let content = "extension Context {\n    func fetchWorld() -> World {\n        world\n    }\n\n    func reset() async -> [UInt8] {\n        await world.transform([])\n    }\n}\n";
-        let block = make_large_block(content, BlockKind::Impl);
-        let chunks = split(&block, Language::Swift).unwrap();
+        let block = make_block(content, BlockKind::Impl);
+        let chunks = split_result_for_child_navigation(&block, Language::Swift)
+            .unwrap()
+            .blocks;
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Impl));
     }
@@ -2265,8 +2279,10 @@ mod tests {
     #[test]
     fn test_split_java_class_into_members() {
         let content = "class Worker {\n    private final int scale;\n\n    Worker(int scale) {\n        this.scale = scale;\n    }\n\n    int process(int value) {\n        if (value > 0) {\n            return value * scale;\n        }\n        return 0;\n    }\n}\n";
-        let block = make_large_block(content, BlockKind::Class);
-        let chunks = split(&block, Language::Java).unwrap();
+        let block = make_block(content, BlockKind::Class);
+        let chunks = split_result_for_child_navigation(&block, Language::Java)
+            .unwrap()
+            .blocks;
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Variable));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Class));
@@ -2275,8 +2291,10 @@ mod tests {
     #[test]
     fn test_split_kotlin_class_into_members() {
         let content = "class Worker {\n    val name = \"worker\"\n    var enabled = true\n\n    fun load(id: String): Worker {\n        return this\n    }\n\n    fun reset() {\n        enabled = true\n    }\n}\n";
-        let block = make_large_block(content, BlockKind::Class);
-        let chunks = split(&block, Language::Kotlin).unwrap();
+        let block = make_block(content, BlockKind::Class);
+        let chunks = split_result_for_child_navigation(&block, Language::Kotlin)
+            .unwrap()
+            .blocks;
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Const));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Variable));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
@@ -2286,8 +2304,10 @@ mod tests {
     #[test]
     fn test_split_kotlin_function_into_review_units() {
         let content = "fun process(values: List<Int>): Int {\n    var total = 0\n\n    // accumulate positive values\n    for (value in values) {\n        if (value > 0) {\n            total += value\n        }\n    }\n\n    return total\n}\n";
-        let block = make_large_block(content, BlockKind::Function);
-        let chunks = split(&block, Language::Kotlin).unwrap();
+        let block = make_block(content, BlockKind::Function);
+        let chunks = split_result_for_child_navigation(&block, Language::Kotlin)
+            .unwrap()
+            .blocks;
         let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
         assert_eq!(
             kinds,
@@ -2307,8 +2327,10 @@ mod tests {
     #[test]
     fn test_split_java_method_into_review_units() {
         let content = "int process(int value) {\n    int total = value;\n\n    // only positive values count\n    if (value > 0) {\n        total += scale;\n    }\n\n    return total;\n}\n";
-        let block = make_large_block(content, BlockKind::Method);
-        let chunks = split(&block, Language::Java).unwrap();
+        let block = make_block(content, BlockKind::Method);
+        let chunks = split_result_for_child_navigation(&block, Language::Java)
+            .unwrap()
+            .blocks;
         let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
         assert_eq!(
             kinds,
@@ -2328,8 +2350,10 @@ mod tests {
     #[test]
     fn test_split_csharp_class_into_members() {
         let content = "public class Greeter {\n    public string Name { get; }\n\n    public WorkflowStatus Status { get; private set; }\n\n    public Greeter(string name) {\n        Name = name;\n    }\n\n    public GreetingResult BuildGreeting(string target) {\n        return new GreetingResult(target, 1);\n    }\n}\n";
-        let block = make_large_block(content, BlockKind::Class);
-        let chunks = split(&block, Language::CSharp).unwrap();
+        let block = make_block(content, BlockKind::Class);
+        let chunks = split_result_for_child_navigation(&block, Language::CSharp)
+            .unwrap()
+            .blocks;
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Variable));
         assert!(chunks.iter().any(|b| b.kind == BlockKind::Method));
         assert!(!chunks.iter().any(|b| b.kind == BlockKind::Class));
@@ -2338,8 +2362,10 @@ mod tests {
     #[test]
     fn test_split_csharp_method_into_review_units() {
         let content = "public GreetingResult BuildGreeting(string target) {\n    var parts = new List<string>();\n\n    // normalize the target before storing it\n    if (target.Length > 0) {\n        parts.Add(target.ToUpperInvariant());\n    }\n\n    return new GreetingResult(string.Join(\",\", parts), parts.Count);\n}\n";
-        let block = make_large_block(content, BlockKind::Method);
-        let chunks = split(&block, Language::CSharp).unwrap();
+        let block = make_block(content, BlockKind::Method);
+        let chunks = split_result_for_child_navigation(&block, Language::CSharp)
+            .unwrap()
+            .blocks;
         let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
         assert_eq!(
             kinds,
@@ -2359,8 +2385,10 @@ mod tests {
     #[test]
     fn test_split_ruby_method_into_review_units() {
         let content = "def process(values)\n  output = []\n\n  # Preserve only meaningful slices.\n  values.each do |value|\n    output << value * SCALE\n  end\n\n  Formatting.render(output)\nend\n";
-        let block = make_large_block(content, BlockKind::Method);
-        let chunks = split(&block, Language::Ruby).unwrap();
+        let block = make_block(content, BlockKind::Method);
+        let chunks = split_result_for_child_navigation(&block, Language::Ruby)
+            .unwrap()
+            .blocks;
         let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
         assert_eq!(
             kinds,
@@ -2381,8 +2409,10 @@ mod tests {
     #[test]
     fn test_split_ruby_module_into_members() {
         let content = "module Trueflow\n  DEFAULT_LIMIT = 4\n\n  module Formatting\n    def self.render(values)\n      values.join(\",\")\n    end\n  end\n\n  class Processor\n    SCALE = 2\n\n    def process(values)\n      values.map { |value| value * SCALE }\n    end\n  end\nend\n";
-        let block = make_large_block(content, BlockKind::Module);
-        let chunks = split(&block, Language::Ruby).unwrap();
+        let block = make_block(content, BlockKind::Module);
+        let chunks = split_result_for_child_navigation(&block, Language::Ruby)
+            .unwrap()
+            .blocks;
         assert!(chunks.iter().any(|block| block.kind == BlockKind::Const));
         assert!(chunks.iter().any(|block| block.kind == BlockKind::Module));
         assert!(chunks.iter().any(|block| block.kind == BlockKind::Class));
@@ -2396,8 +2426,10 @@ mod tests {
     #[test]
     fn test_split_nix_paragraphs_preserve_content() {
         let content = "{ foo = \"bar\"; }\n\n{ baz = \"qux\"; }";
-        let block = make_large_block(content, BlockKind::Code);
-        let chunks = split(&block, Language::Nix).unwrap();
+        let block = make_block(content, BlockKind::Code);
+        let chunks = split_result_for_child_navigation(&block, Language::Nix)
+            .unwrap()
+            .blocks;
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
         assert_eq!(chunks[1].kind, BlockKind::Gap);
@@ -2408,8 +2440,10 @@ mod tests {
     #[test]
     fn test_split_just_paragraphs_preserve_content() {
         let content = "build:\n\techo ok\n\ntest:\n\techo ok";
-        let block = make_large_block(content, BlockKind::Code);
-        let chunks = split(&block, Language::Just).unwrap();
+        let block = make_block(content, BlockKind::Code);
+        let chunks = split_result_for_child_navigation(&block, Language::Just)
+            .unwrap()
+            .blocks;
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].kind, BlockKind::CodeParagraph);
         assert_eq!(chunks[1].kind, BlockKind::Gap);
@@ -2420,8 +2454,10 @@ mod tests {
     #[test]
     fn test_split_elisp_function_into_review_units() {
         let content = "(defun elisp-support-run (items)\n  \"Normalize ITEMS and report the active entries.\"\n  (let ((normalized (seq-filter #'identity items))\n        (results nil))\n    ;; keep only truthy values\n    (dolist (item normalized)\n      (push (string-trim item) results))\n\n    (when elisp-support-enabled\n      (message \"%s\" elisp-support-mode-name))\n\n    (nreverse results)))\n";
-        let block = make_large_block(content, BlockKind::Function);
-        let chunks = split(&block, Language::Elisp).unwrap();
+        let block = make_block(content, BlockKind::Function);
+        let chunks = split_result_for_child_navigation(&block, Language::Elisp)
+            .unwrap()
+            .blocks;
         let kinds: Vec<_> = chunks.iter().map(|block| block.kind).collect();
         assert_eq!(
             kinds,
@@ -2448,12 +2484,58 @@ mod tests {
     #[test]
     fn test_sub_blocks_do_not_inherit_parent_complexity() {
         let content = "fn foo() {\n    if true {\n        run();\n    }\n\n    finish();\n}";
-        let mut block = make_large_block(content, BlockKind::Function);
+        let mut block = make_block(content, BlockKind::Function);
         block.complexity = Some(7);
 
-        let chunks = split(&block, Language::Rust).unwrap();
+        let chunks = split_result_for_child_navigation(&block, Language::Rust)
+            .unwrap()
+            .blocks;
 
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| chunk.complexity.is_none()));
+    }
+    #[test]
+    fn sub_blocks_translate_relative_offsets_to_absolute_byte_spans() {
+        let source = "prefix α\nimpl Outer {\n    const FLAG: bool = true;\n\n    fn nested() {\n        let β = 1;\n\n        let gamma = 2;\n    }\n}\n";
+        let parent_start = source.find("impl Outer").unwrap();
+        let parent = Block::from_file_range(
+            source,
+            BlockKind::Impl,
+            ByteSpan::new(parent_start, source.len()),
+        )
+        .unwrap();
+
+        let first_level = split_result_for_child_navigation(&parent, Language::Rust)
+            .unwrap()
+            .blocks;
+        assert!(first_level.len() > 1);
+        for child in &first_level {
+            assert!(source.is_char_boundary(child.start_byte));
+            assert!(source.is_char_boundary(child.end_byte));
+            assert_eq!(
+                child.content,
+                source[child.start_byte..child.end_byte],
+                "first-level child range must remain absolute"
+            );
+        }
+
+        let code = first_level
+            .iter()
+            .find(|child| child.kind == BlockKind::Method && child.content.contains("fn nested"))
+            .unwrap();
+        let second_level = split_result_for_child_navigation(code, Language::Rust)
+            .unwrap()
+            .blocks;
+        assert!(second_level.len() > 1);
+        for child in second_level {
+            assert!(source.is_char_boundary(child.start_byte));
+            assert!(source.is_char_boundary(child.end_byte));
+            assert_eq!(
+                child.content,
+                source[child.start_byte..child.end_byte],
+                "nested child range must remain absolute"
+            );
+            assert!(parent.byte_span().contains(&child.byte_span()));
+        }
     }
 }

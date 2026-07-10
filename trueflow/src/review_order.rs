@@ -231,11 +231,14 @@ fn is_test_path(path: &RepoPath) -> bool {
 mod tests {
     use super::*;
     use crate::analysis::Language;
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::tree::TreeBuilder;
 
     fn test_block(kind: BlockKind, start: usize, tags: &[&str]) -> Block {
-        let mut block = Block::new(format!("line {start}"), kind, start, start + 1);
+        let content = format!("line {start}");
+        let line_span = LineSpan::new(start, start + content.lines().count());
+        let byte_span = ByteSpan::new(0, content.len());
+        let mut block = Block::new(content, kind, line_span, byte_span);
         block.tags = tags.iter().map(|tag| (*tag).to_string()).collect();
         block
     }

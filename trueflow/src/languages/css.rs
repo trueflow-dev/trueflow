@@ -3,8 +3,8 @@ use super::{
     TopLevelRegistration, default_code_sub_split, no_attribute_nodes, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
-use crate::hashing::TreeHash;
+use crate::block::{Block, BlockKind, ByteSpan};
+
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
@@ -171,7 +171,7 @@ fn split_rule_like(block: &Block, review_root: Node<'_>) -> Result<Vec<Block>> {
         return crate::sub_splitter::split_code_review_units(block);
     }
 
-    Ok(build_review_blocks(block, &spans))
+    build_review_blocks(block, &spans)
 }
 
 fn split_container_like(
@@ -194,7 +194,7 @@ fn split_container_like(
         return crate::sub_splitter::split_code_review_units(block);
     }
 
-    Ok(build_review_blocks(block, &spans))
+    build_review_blocks(block, &spans)
 }
 
 fn collect_container_spans(container: Node<'_>, content: &str) -> Vec<SemanticSpan> {
@@ -277,33 +277,39 @@ fn flush_pending_group(spans: &mut Vec<SemanticSpan>, pending_group: &mut Option
     }
 }
 
-fn build_review_blocks(parent: &Block, spans: &[SemanticSpan]) -> Vec<Block> {
+fn build_review_blocks(parent: &Block, spans: &[SemanticSpan]) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut last_end = 0usize;
 
     for span in spans {
-        push_fragment_block(&mut blocks, parent, last_end, span.start_byte);
+        push_fragment_block(&mut blocks, parent, last_end, span.start_byte)?;
         blocks.push(create_sub_block(
             parent,
             &parent.content[span.start_byte..span.end_byte],
             span.start_byte,
             span.kind,
-        ));
+        )?);
         last_end = span.end_byte;
     }
 
-    push_fragment_block(&mut blocks, parent, last_end, parent.content.len());
-    blocks
+    push_fragment_block(&mut blocks, parent, last_end, parent.content.len())?;
+    Ok(blocks)
 }
 
-fn push_fragment_block(blocks: &mut Vec<Block>, parent: &Block, start: usize, end: usize) {
+fn push_fragment_block(
+    blocks: &mut Vec<Block>,
+    parent: &Block,
+    start: usize,
+    end: usize,
+) -> Result<()> {
     if start >= end {
-        return;
+        return Ok(());
     }
 
     let fragment = &parent.content[start..end];
     let kind = classify_fragment(fragment);
-    blocks.push(create_sub_block(parent, fragment, start, kind));
+    blocks.push(create_sub_block(parent, fragment, start, kind)?);
+    Ok(())
 }
 
 fn classify_fragment(fragment: &str) -> BlockKind {
@@ -319,23 +325,23 @@ fn classify_fragment(fragment: &str) -> BlockKind {
     }
 }
 
-fn create_sub_block(parent: &Block, content: &str, start_offset: usize, kind: BlockKind) -> Block {
-    let prefix = &parent.content[..start_offset];
-    let offset_newlines = prefix.chars().filter(|ch| *ch == '\n').count();
-    let chunk_newlines = content.chars().filter(|ch| *ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + usize::from(!content.ends_with('\n'));
-
-    Block {
-        hash: TreeHash::from_content(content),
-        content: content.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
+fn create_sub_block(
+    parent: &Block,
+    content: &str,
+    start_offset: usize,
+    kind: BlockKind,
+) -> Result<Block> {
+    let end_offset = start_offset
+        .checked_add(content.len())
+        .context("CSS sub-split end offset overflow")?;
+    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+        .context("CSS sub-split range must be a valid parent UTF-8 slice")?;
+    assert_eq!(
+        block.content, content,
+        "CSS sub-split range must name content"
+    );
+    block.tags = parent.tags.clone();
+    Ok(block)
 }
 
 fn parse_css(content: &str) -> Result<tree_sitter::Tree> {

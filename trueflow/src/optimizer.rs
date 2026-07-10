@@ -1,4 +1,4 @@
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan};
 use crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use std::mem;
 
@@ -8,14 +8,14 @@ const MAX_CODE_PARAGRAPH_SPAN_LINES: usize = MAX_REVIEW_UNIT_SPAN_LINES;
 const SMALL_FILE_MAX_SPAN_LINES: usize = MAX_REVIEW_UNIT_SPAN_LINES;
 const SMALL_FILE_MAX_NON_TRIVIAL_BLOCKS: usize = 12;
 
-pub fn optimize(blocks: Vec<Block>) -> Vec<Block> {
-    let blocks = optimize_imports(blocks);
-    let blocks = optimize_modules(blocks);
-    let blocks = optimize_code_paragraphs(blocks);
-    optimize_small_files(blocks)
+pub fn optimize(blocks: Vec<Block>, source: &str) -> Vec<Block> {
+    let blocks = optimize_imports(blocks, source);
+    let blocks = optimize_modules(blocks, source);
+    let blocks = optimize_code_paragraphs(blocks, source);
+    optimize_small_files(blocks, source)
 }
 
-fn optimize_imports(blocks: Vec<Block>) -> Vec<Block> {
+fn optimize_imports(blocks: Vec<Block>, source: &str) -> Vec<Block> {
     optimize_sequence(
         blocks,
         |block, buffer| {
@@ -59,11 +59,11 @@ fn optimize_imports(blocks: Vec<Block>) -> Vec<Block> {
 
             Decision::FlushAndEmit
         },
-        |buffer| flush_blocks(buffer, BlockKind::Import, BlockKind::Imports, Some("\n")),
+        |buffer| flush_blocks(buffer, BlockKind::Import, BlockKind::Imports, source),
     )
 }
 
-fn optimize_code_paragraphs(blocks: Vec<Block>) -> Vec<Block> {
+fn optimize_code_paragraphs(blocks: Vec<Block>, source: &str) -> Vec<Block> {
     optimize_sequence(
         blocks,
         |block, buffer| {
@@ -95,13 +95,13 @@ fn optimize_code_paragraphs(blocks: Vec<Block>) -> Vec<Block> {
                 buffer,
                 BlockKind::CodeParagraph,
                 BlockKind::CodeParagraph,
-                None,
+                source,
             )
         },
     )
 }
 
-fn optimize_modules(blocks: Vec<Block>) -> Vec<Block> {
+fn optimize_modules(blocks: Vec<Block>, source: &str) -> Vec<Block> {
     optimize_sequence(
         blocks,
         |block, buffer| {
@@ -130,28 +130,17 @@ fn optimize_modules(blocks: Vec<Block>) -> Vec<Block> {
                 Decision::Buffer
             }
         },
-        |buffer| flush_blocks(buffer, BlockKind::Module, BlockKind::Modules, None),
+        |buffer| flush_blocks(buffer, BlockKind::Module, BlockKind::Modules, source),
     )
 }
 
-fn optimize_small_files(blocks: Vec<Block>) -> Vec<Block> {
+fn optimize_small_files(blocks: Vec<Block>, source: &str) -> Vec<Block> {
     if !should_merge_small_file(&blocks) {
         return blocks;
     }
 
-    let mut content = String::new();
-    for block in &blocks {
-        content.push_str(&block.content);
-    }
-
-    let start_line = blocks.first().map_or(0, |block| block.start_line);
-    let end_line = blocks.last().map_or(start_line, |block| block.end_line);
     let merged_kind = merged_small_file_kind(&blocks);
-    let mut merged = Block::new(content, merged_kind, start_line, end_line);
-    let (tags, complexity) = merged_metadata(&blocks);
-    merged.tags = tags;
-    merged.complexity = complexity;
-    vec![merged]
+    exact_source_merge(source, &blocks, merged_kind).map_or(blocks, |merged| vec![merged])
 }
 
 enum Decision {
@@ -200,7 +189,7 @@ fn flush_blocks(
     buffer: Vec<Block>,
     target_kind: BlockKind,
     merged_kind: BlockKind,
-    separator: Option<&str>,
+    source: &str,
 ) -> Vec<Block> {
     let target_count = buffer.iter().filter(|b| b.kind == target_kind).count();
     if target_count < 2 {
@@ -214,40 +203,49 @@ fn flush_blocks(
         return buffer;
     };
 
-    let mut result = Vec::with_capacity(buffer.len() - (last_idx - first_idx));
-
-    // Emit leading gaps
-    result.extend(buffer.iter().take(first_idx).cloned());
-
-    // Merge range
     let range = &buffer[first_idx..=last_idx];
-    let start_line = buffer[first_idx].start_line;
-    let end_line = buffer[last_idx].end_line;
+    let Some(merged_block) = exact_source_merge(source, range, merged_kind) else {
+        return buffer;
+    };
 
-    let mut content = String::new();
-    let mut prev_was_target = false;
+    let mut result = Vec::with_capacity(buffer.len() - (last_idx - first_idx));
+    result.extend(buffer.iter().take(first_idx).cloned());
+    result.push(merged_block);
+    result.extend(buffer.iter().skip(last_idx + 1).cloned());
+    result
+}
 
-    for block in range {
-        if let Some(sep) = separator
-            && prev_was_target
-            && block.kind == target_kind
+/// Merges a source-ordered, pairwise-disjoint sequence only when every input is
+/// proven to be an exact UTF-8 slice of `source`.
+fn exact_source_merge(source: &str, blocks: &[Block], merged_kind: BlockKind) -> Option<Block> {
+    let first = blocks.first()?;
+    let mut previous_end = None;
+
+    for block in blocks {
+        let start = block.start_byte;
+        let end = block.end_byte;
+        if start > end
+            || end > source.len()
+            || !source.is_char_boundary(start)
+            || !source.is_char_boundary(end)
+            || (!block.content.is_empty() && start == end)
+            || source.get(start..end)? != block.content.as_str()
         {
-            content.push_str(sep);
+            return None;
         }
-        content.push_str(&block.content);
-        prev_was_target = block.kind == target_kind;
+        if previous_end.is_some_and(|previous_end| previous_end > start) {
+            return None;
+        }
+        previous_end = Some(end);
     }
 
-    let mut merged_block = Block::new(content, merged_kind, start_line, end_line);
-    let (merged_tags, merged_complexity) = merged_metadata(range);
-    merged_block.tags = merged_tags;
-    merged_block.complexity = merged_complexity;
-    result.push(merged_block);
-
-    // Emit trailing gaps
-    result.extend(buffer.iter().skip(last_idx + 1).cloned());
-
-    result
+    let end = previous_end?;
+    let mut merged =
+        Block::from_file_range(source, merged_kind, ByteSpan::new(first.start_byte, end)).ok()?;
+    let (tags, complexity) = merged_metadata(blocks);
+    merged.tags = tags;
+    merged.complexity = complexity;
+    Some(merged)
 }
 
 fn merged_metadata(blocks: &[Block]) -> (Vec<String>, Option<u32>) {
@@ -394,10 +392,50 @@ fn is_small_file_logic_kind(kind: BlockKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::Block;
+    use crate::block::{Block, ByteSpan, LineSpan};
 
     fn make_block(kind: BlockKind, content: &str, start: usize, end: usize) -> Block {
-        Block::new(content.to_string(), kind, start, end)
+        Block::new(
+            content.to_string(),
+            kind,
+            LineSpan::new(start, end),
+            ByteSpan::new(0, content.len()),
+        )
+    }
+
+    fn optimize_test_blocks(mut blocks: Vec<Block>) -> Vec<Block> {
+        let capacity = blocks.iter().map(|block| block.content.len()).sum();
+        let mut source = String::with_capacity(capacity);
+        for block in &mut blocks {
+            block.start_byte = source.len();
+            source.push_str(&block.content);
+            block.end_byte = source.len();
+        }
+        optimize(blocks, &source)
+    }
+
+    fn source_block(source: &str, kind: BlockKind, start_byte: usize, end_byte: usize) -> Block {
+        Block::from_file_range(source, kind, ByteSpan::new(start_byte, end_byte))
+            .unwrap_or_else(|error| panic!("valid source block: {error}"))
+    }
+
+    fn assert_blocks_unchanged(actual: &[Block], expected: &[Block]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.hash, expected.hash);
+            assert_eq!(actual.content, expected.content);
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.tags, expected.tags);
+            assert_eq!(actual.complexity, expected.complexity);
+            assert_eq!(
+                (actual.start_line, actual.end_line),
+                (expected.start_line, expected.end_line)
+            );
+            assert_eq!(
+                (actual.start_byte, actual.end_byte),
+                (expected.start_byte, expected.end_byte)
+            );
+        }
     }
 
     #[test]
@@ -409,7 +447,7 @@ mod tests {
         ];
         // Total span: 5 - 0 = 5 lines. Should merge.
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
         assert_eq!(optimized[0].content, "P1\n\nP2\n");
@@ -423,7 +461,7 @@ mod tests {
             make_block(BlockKind::CodeParagraph, "P2\n", 17, 32),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
         assert_eq!(optimized[0].content, "P1\n\nP2\n");
@@ -437,7 +475,7 @@ mod tests {
             make_block(BlockKind::CodeParagraph, "P2\n", 17, 33),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 3);
         assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
         assert_eq!(optimized[1].kind, BlockKind::Gap);
@@ -452,7 +490,7 @@ mod tests {
             make_block(BlockKind::Paragraph, "P2\n", 11, 20),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].kind, BlockKind::Paragraph);
         assert_eq!(optimized[0].content, "P1\n\nP2\n");
@@ -471,7 +509,7 @@ mod tests {
         // Adding P3: Span 0..71 = 71 lines. Too big.
         // Should flush P1+Gap+P2. Then emit the large gap. Then buffer P3.
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         // P1+Gap+P2 merged = 1 block.
         // Gap(6) = 1 block.
         // P3 = 1 block.
@@ -496,7 +534,7 @@ mod tests {
 
         let blocks = vec![module_a, make_block(BlockKind::Gap, "\n", 2, 3), module_b];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].kind, BlockKind::Modules);
         assert_eq!(
@@ -514,7 +552,7 @@ mod tests {
             make_block(BlockKind::Module, "mod helper {\n}\n", 3, 5),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].complexity, None);
     }
@@ -527,7 +565,7 @@ mod tests {
             make_block(BlockKind::Import, "use b;", 3, 4),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].kind, BlockKind::Imports);
         assert_eq!(
@@ -546,7 +584,7 @@ mod tests {
             make_block(BlockKind::Import, "use c;", 8, 9),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 3);
         assert_eq!(optimized[0].kind, BlockKind::Imports);
         assert_eq!(optimized[0].content, "use a;\nuse b;");
@@ -565,7 +603,7 @@ mod tests {
             make_block(BlockKind::Const, "const LIMIT: usize = 3;\n", 4, 5),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].kind, BlockKind::Code);
         assert_eq!(
@@ -582,7 +620,7 @@ mod tests {
             make_block(BlockKind::Function, "fn b() {}\n", 70, 71),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 3);
         assert_eq!(optimized[0].kind, BlockKind::Function);
         assert_eq!(optimized[1].kind, BlockKind::Gap);
@@ -599,7 +637,7 @@ mod tests {
             make_block(BlockKind::CodeParagraph, "P3\n", 70, 71),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 3);
         assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
         assert_eq!(optimized[1].kind, BlockKind::Gap);
@@ -616,7 +654,7 @@ mod tests {
             make_block(BlockKind::Function, "fn b() {}\n", 4, 5),
         ];
 
-        let optimized = optimize(blocks);
+        let optimized = optimize_test_blocks(blocks);
         assert_eq!(optimized.len(), 5);
         assert_eq!(optimized[0].kind, BlockKind::Import);
         assert_eq!(optimized[2].kind, BlockKind::Function);
@@ -632,11 +670,176 @@ mod tests {
             make_block(BlockKind::Import, "in { inherit foo bar; }\n", 5, 6),
         ];
 
-        let optimized = optimize(blocks.clone());
+        let optimized = optimize_test_blocks(blocks.clone());
         assert_eq!(optimized.len(), blocks.len());
         assert_eq!(optimized[0].kind, BlockKind::FunctionSignature);
         assert_eq!(optimized[1].kind, BlockKind::Variable);
         assert_eq!(optimized[3].kind, BlockKind::Variable);
         assert_eq!(optimized[4].kind, BlockKind::Import);
+    }
+
+    #[test]
+    fn test_source_integrity_merge_slices_disjoint_source_and_metadata() {
+        let source = "use first;\n\nuse second;";
+        let first_end = source.find('\n').unwrap();
+        let second_start = source.find("use second;").unwrap();
+        let mut first = source_block(source, BlockKind::Import, 0, first_end);
+        first.tags = vec!["test".to_string(), "shared".to_string()];
+        first.complexity = Some(2);
+        let mut second = source_block(
+            source,
+            BlockKind::Import,
+            second_start,
+            second_start + "use second;".len(),
+        );
+        second.tags = vec!["shared".to_string(), "integration".to_string()];
+        second.complexity = Some(5);
+
+        let Some(merged) = exact_source_merge(source, &[first, second], BlockKind::Imports) else {
+            panic!("disjoint source blocks should merge");
+        };
+
+        assert_eq!(merged.content, source);
+        assert_eq!(merged.hash, crate::hashing::TreeHash::from_content(source));
+        assert_eq!((merged.start_byte, merged.end_byte), (0, source.len()));
+        assert_eq!((merged.start_line, merged.end_line), (0, 3));
+        assert_eq!(
+            merged.tags,
+            vec![
+                "test".to_string(),
+                "shared".to_string(),
+                "integration".to_string()
+            ]
+        );
+        assert_eq!(merged.complexity, Some(7));
+    }
+
+    #[test]
+    fn test_source_integrity_merge_refuses_unprovable_candidate() {
+        let source = "abcd";
+        let first = source_block(source, BlockKind::Import, 0, 2);
+        let second = source_block(source, BlockKind::Import, 2, 4);
+
+        let mut reversed_first = first.clone();
+        let mut reversed_second = second.clone();
+        reversed_first.start_byte = 2;
+        reversed_first.end_byte = 4;
+        reversed_first.content = source[2..4].to_string();
+        reversed_first.hash = crate::hashing::TreeHash::from_content(&reversed_first.content);
+        reversed_second.start_byte = 0;
+        reversed_second.end_byte = 2;
+        reversed_second.content = source[0..2].to_string();
+        reversed_second.hash = crate::hashing::TreeHash::from_content(&reversed_second.content);
+
+        let mut overlapping = second.clone();
+        overlapping.start_byte = 1;
+        overlapping.end_byte = 3;
+        overlapping.content = source[1..3].to_string();
+        overlapping.hash = crate::hashing::TreeHash::from_content(&overlapping.content);
+
+        let mut backwards = first.clone();
+        backwards.start_byte = 3;
+        backwards.end_byte = 2;
+
+        let mut out_of_bounds = second.clone();
+        out_of_bounds.end_byte = source.len() + 1;
+
+        let unicode_source = "éx";
+        let mut non_boundary = source_block(unicode_source, BlockKind::Import, 0, 2);
+        non_boundary.end_byte = 1;
+        let unicode_tail = source_block(unicode_source, BlockKind::Import, 2, 3);
+
+        let mut empty_non_empty = first.clone();
+        empty_non_empty.end_byte = empty_non_empty.start_byte;
+
+        let cases = vec![
+            (source, vec![reversed_first, reversed_second]),
+            (source, vec![first.clone(), overlapping]),
+            (source, vec![backwards, second.clone()]),
+            (source, vec![first, out_of_bounds]),
+            (unicode_source, vec![non_boundary, unicode_tail]),
+            (source, vec![empty_non_empty, second]),
+        ];
+        for (case_source, blocks) in cases {
+            let result = flush_blocks(
+                blocks.clone(),
+                BlockKind::Import,
+                BlockKind::Imports,
+                case_source,
+            );
+            assert_blocks_unchanged(&result, &blocks);
+        }
+    }
+
+    #[test]
+    fn test_source_integrity_flush_refuses_overlapping_whole_buffer() {
+        let source = "// lead\nuse a;\nuse b;\n// tail";
+        let first_import_start = source.find("use a;").unwrap();
+        let second_import_start = source.find("use b;").unwrap();
+        let mut second = source_block(
+            source,
+            BlockKind::Import,
+            second_import_start,
+            second_import_start + "use b;".len(),
+        );
+        second.start_byte = first_import_start + "use a".len();
+        let blocks = vec![
+            source_block(source, BlockKind::Comment, 0, first_import_start),
+            source_block(
+                source,
+                BlockKind::Import,
+                first_import_start,
+                first_import_start + "use a;".len(),
+            ),
+            second,
+            source_block(
+                source,
+                BlockKind::Comment,
+                source.find("// tail").unwrap(),
+                source.len(),
+            ),
+        ];
+
+        let result = flush_blocks(
+            blocks.clone(),
+            BlockKind::Import,
+            BlockKind::Imports,
+            source,
+        );
+        assert_blocks_unchanged(&result, &blocks);
+    }
+
+    #[test]
+    fn test_source_integrity_small_file_refuses_overlapping_whole_vector() {
+        let source = "import os\nx = 1";
+        let mut code = source_block(source, BlockKind::Code, 10, source.len());
+        code.start_byte = 8;
+        let blocks = vec![source_block(source, BlockKind::Import, 0, 9), code];
+
+        let result = optimize_small_files(blocks.clone(), source);
+        assert_blocks_unchanged(&result, &blocks);
+    }
+
+    #[test]
+    fn test_source_integrity_code_paragraph_merge_slices_source() {
+        let source = "first\n\nsecond";
+        let second_start = source.find("second").unwrap();
+        let blocks = vec![
+            source_block(source, BlockKind::CodeParagraph, 0, "first".len()),
+            source_block(source, BlockKind::CodeParagraph, second_start, source.len()),
+        ];
+
+        let optimized = optimize(blocks, source);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].kind, BlockKind::CodeParagraph);
+        assert_eq!(optimized[0].content, source);
+        assert_eq!(
+            (optimized[0].start_byte, optimized[0].end_byte),
+            (0, source.len())
+        );
+        assert_eq!(
+            optimized[0].hash,
+            crate::hashing::TreeHash::from_content(source)
+        );
     }
 }

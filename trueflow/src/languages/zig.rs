@@ -5,9 +5,9 @@ use super::{
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
 use crate::code_comments;
-use crate::hashing::TreeHash;
+
 use crate::text_split::paragraph_break_regex;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 const TYPE_LIKE_DECLARATIONS: &[&str] = &[
@@ -219,7 +219,7 @@ fn split_type_like(block: &Block) -> Result<Vec<Block>> {
         return crate::sub_splitter::split_code_review_units(block);
     };
 
-    let items = collect_container_member_blocks(block, container);
+    let items = collect_container_member_blocks(block, container)?;
     if items.is_empty() {
         crate::sub_splitter::split_code_review_units(block)
     } else {
@@ -270,22 +270,25 @@ fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<
     None
 }
 
-fn collect_container_member_blocks(parent: &Block, container: Node<'_>) -> Vec<Block> {
+fn collect_container_member_blocks(parent: &Block, container: Node<'_>) -> Result<Vec<Block>> {
     let mut cursor = container.walk();
-    container
-        .named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = classify_node(child, &parent.content, true)?;
-            (!matches!(kind, BlockKind::Code)).then(|| {
-                create_container_member_block(
-                    parent,
-                    &parent.content[child.start_byte()..child.end_byte()],
-                    child.start_byte(),
-                    kind,
-                )
-            })
-        })
-        .collect()
+    let mut blocks = Vec::new();
+    for child in container.named_children(&mut cursor) {
+        let Some(kind) = classify_node(child, &parent.content, true) else {
+            continue;
+        };
+        if matches!(kind, BlockKind::Code) {
+            continue;
+        }
+
+        blocks.push(create_container_member_block(
+            parent,
+            &parent.content[child.start_byte()..child.end_byte()],
+            child.start_byte(),
+            kind,
+        )?);
+    }
+    Ok(blocks)
 }
 
 fn create_container_member_block(
@@ -293,13 +296,13 @@ fn create_container_member_block(
     content: &str,
     start_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let mut block = create_sub_block_with_kind(parent, content, start_offset, kind);
+) -> Result<Block> {
+    let mut block = create_sub_block_with_kind(parent, content, start_offset, kind)?;
     block.tags.retain(|tag| tag != "test");
     if content.trim_start().starts_with("test ") && !block.has_tag("test") {
         block.tags.push("test".to_string());
     }
-    block
+    Ok(block)
 }
 
 fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Result<Vec<Block>> {
@@ -309,7 +312,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
         &content[..signature_end],
         0,
         BlockKind::FunctionSignature,
-    )];
+    )?];
 
     let rest = &content[signature_end..];
     let mut start = 0;
@@ -317,7 +320,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
         if start < gap.start() {
             let chunk = &rest[start..gap.start()];
             if !chunk.is_empty() {
-                push_review_chunk(block, &mut blocks, chunk, signature_end + start);
+                push_review_chunk(block, &mut blocks, chunk, signature_end + start)?;
             }
         }
 
@@ -326,21 +329,26 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
             &rest[gap.start()..gap.end()],
             signature_end + gap.start(),
             BlockKind::Gap,
-        ));
+        )?);
         start = gap.end();
     }
 
     if start < rest.len() {
         let chunk = &rest[start..];
         if !chunk.is_empty() {
-            push_review_chunk(block, &mut blocks, chunk, signature_end + start);
+            push_review_chunk(block, &mut blocks, chunk, signature_end + start)?;
         }
     }
 
     Ok(blocks)
 }
 
-fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start_offset: usize) {
+fn push_review_chunk(
+    parent: &Block,
+    blocks: &mut Vec<Block>,
+    chunk: &str,
+    start_offset: usize,
+) -> Result<()> {
     if let Some(comment_end) = leading_comment_prefix_len(chunk) {
         let comment = &chunk[..comment_end];
         blocks.push(create_sub_block_with_kind(
@@ -348,7 +356,7 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
             comment,
             start_offset,
             BlockKind::Comment,
-        ));
+        )?);
 
         let remainder = &chunk[comment_end..];
         if !remainder.trim().is_empty() {
@@ -357,9 +365,9 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
                 remainder,
                 start_offset + comment_end,
                 BlockKind::CodeParagraph,
-            ));
+            )?);
         }
-        return;
+        return Ok(());
     }
 
     let kind = classify_code_chunk(chunk);
@@ -369,8 +377,9 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
             chunk,
             start_offset,
             kind,
-        ));
+        )?);
     }
+    Ok(())
 }
 
 fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
@@ -426,21 +435,16 @@ fn create_sub_block_with_kind(
     content: &str,
     start_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = content.chars().filter(|&ch| ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + if content.ends_with('\n') { 0 } else { 1 };
-
-    Block {
-        hash: TreeHash::from_content(content),
-        content: content.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let end_offset = start_offset
+        .checked_add(content.len())
+        .ok_or_else(|| anyhow!("Zig sub-split end offset overflow"))?;
+    let mut block =
+        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    assert_eq!(
+        block.content, content,
+        "Zig sub-split range must name content"
+    );
+    block.tags = parent.tags.clone();
+    Ok(block)
 }

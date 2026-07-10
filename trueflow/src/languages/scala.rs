@@ -5,8 +5,8 @@ use super::{
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
 use crate::code_comments;
-use crate::hashing::TreeHash;
-use crate::text_split::split_by_paragraph_breaks;
+
+use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
@@ -515,25 +515,49 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
         signature_end,
         BlockKind::FunctionSignature,
         Vec::new(),
-    )];
+    )?];
 
     let body = &block.content[signature_end..];
-    let mut tail_blocks = split_by_paragraph_breaks(body, |chunk, start, end, is_gap| {
-        let kind = if is_gap {
-            BlockKind::Gap
-        } else {
-            classify_review_chunk(chunk)
-        };
-        create_sub_block(
+    let mut start = 0;
+    for gap in paragraph_break_regex().find_iter(body) {
+        if start < gap.start() {
+            let chunk = &body[start..gap.start()];
+            if !chunk.is_empty() {
+                blocks.push(create_sub_block(
+                    block,
+                    chunk,
+                    signature_end + start,
+                    signature_end + gap.start(),
+                    classify_review_chunk(chunk),
+                    Vec::new(),
+                )?);
+            }
+        }
+
+        blocks.push(create_sub_block(
             block,
-            chunk,
-            signature_end + start,
-            signature_end + end,
-            kind,
+            &body[gap.start()..gap.end()],
+            signature_end + gap.start(),
+            signature_end + gap.end(),
+            BlockKind::Gap,
             Vec::new(),
-        )
-    });
-    blocks.append(&mut tail_blocks);
+        )?);
+        start = gap.end();
+    }
+
+    if start < body.len() {
+        let chunk = &body[start..];
+        if !chunk.is_empty() {
+            blocks.push(create_sub_block(
+                block,
+                chunk,
+                signature_end + start,
+                signature_end + body.len(),
+                classify_review_chunk(chunk),
+                Vec::new(),
+            )?);
+        }
+    }
 
     Ok(blocks)
 }
@@ -591,7 +615,7 @@ fn split_type_like(block: &Block) -> Result<Vec<Block>> {
     let mut current = 0usize;
     for span in spans {
         if current < span.start_byte {
-            push_non_child_chunk(block, current, span.start_byte, &mut blocks);
+            push_non_child_chunk(block, current, span.start_byte, &mut blocks)?;
         }
 
         blocks.push(create_sub_block(
@@ -601,20 +625,25 @@ fn split_type_like(block: &Block) -> Result<Vec<Block>> {
             span.end_byte,
             span.kind,
             span.tags,
-        ));
+        )?);
         current = span.end_byte;
     }
 
     if current < block.content.len() {
-        push_non_child_chunk(block, current, block.content.len(), &mut blocks);
+        push_non_child_chunk(block, current, block.content.len(), &mut blocks)?;
     }
 
     Ok(blocks)
 }
 
-fn push_non_child_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<Block>) {
+fn push_non_child_chunk(
+    parent: &Block,
+    start: usize,
+    end: usize,
+    blocks: &mut Vec<Block>,
+) -> Result<()> {
     if end <= start {
-        return;
+        return Ok(());
     }
 
     let chunk = &parent.content[start..end];
@@ -626,7 +655,8 @@ fn push_non_child_chunk(parent: &Block, start: usize, end: usize, blocks: &mut V
         end,
         kind,
         Vec::new(),
-    ));
+    )?);
+    Ok(())
 }
 
 fn parse_tree(source: &str) -> Result<Tree> {
@@ -656,31 +686,21 @@ fn create_sub_block(
     parent: &Block,
     text: &str,
     start_offset: usize,
-    _end_offset: usize,
+    end_offset: usize,
     kind: BlockKind,
     tags: Vec<String>,
-) -> Block {
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = text.chars().filter(|&ch| ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + if text.ends_with('\n') { 0 } else { 1 };
-
-    let mut combined_tags = parent.tags.clone();
+) -> Result<Block> {
+    let mut block =
+        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    block.tags = parent.tags.clone();
+    assert_eq!(
+        block.content, text,
+        "Scala sub-split range must name content"
+    );
     for tag in tags {
-        if !combined_tags.iter().any(|existing| existing == &tag) {
-            combined_tags.push(tag);
+        if !block.tags.iter().any(|existing| existing == &tag) {
+            block.tags.push(tag);
         }
     }
-
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: combined_tags,
-        complexity: None,
-        start_line,
-        end_line,
-    }
+    Ok(block)
 }

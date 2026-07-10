@@ -49,11 +49,14 @@ pub fn next_review_target(
 mod tests {
     use super::*;
     use crate::analysis::Language;
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::tree::{Tree, TreeBuilder};
 
-    fn test_block(kind: BlockKind, start: usize, end: usize) -> Block {
-        Block::new(format!("{kind:?}-{start}"), kind, start, end)
+    fn test_block(kind: BlockKind, start: usize) -> Block {
+        let content = format!("{kind:?}-{start}");
+        let line_span = LineSpan::new(start, start + content.lines().count());
+        let byte_span = ByteSpan::new(0, content.len());
+        Block::new(content, kind, line_span, byte_span)
     }
 
     fn navigator_from_blocks(tree: Tree, block_ids: &[TreeNodeId]) -> ReviewNavigator {
@@ -78,7 +81,7 @@ mod tests {
             file,
             "function".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 10, 20),
+            test_block(BlockKind::Function, 10),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -104,21 +107,21 @@ mod tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Impl, 1, 50),
+            test_block(BlockKind::Impl, 1),
             Language::Rust,
         );
         let method_a = builder.add_block(
             impl_block,
             "method_a".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Method, 3, 10),
+            test_block(BlockKind::Method, 3),
             Language::Rust,
         );
         let method_b = builder.add_block(
             impl_block,
             "method_b".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Method, 20, 28),
+            test_block(BlockKind::Method, 20),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -147,21 +150,21 @@ mod tests {
             file,
             "class".to_string(),
             "src/lib.swift".to_string(),
-            test_block(BlockKind::Class, 1, 50),
+            test_block(BlockKind::Class, 1),
             Language::Swift,
         );
         let method_a = builder.add_block(
             class_block,
             "method_a".to_string(),
             "src/lib.swift".to_string(),
-            test_block(BlockKind::Method, 3, 10),
+            test_block(BlockKind::Method, 3),
             Language::Swift,
         );
         let method_b = builder.add_block(
             class_block,
             "method_b".to_string(),
             "src/lib.swift".to_string(),
-            test_block(BlockKind::Method, 20, 28),
+            test_block(BlockKind::Method, 20),
             Language::Swift,
         );
         let tree = builder.finalize();
@@ -190,14 +193,14 @@ mod tests {
             file,
             "first".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 1, 3),
+            test_block(BlockKind::Function, 1),
             Language::Rust,
         );
         let second = builder.add_block(
             file,
             "second".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 10, 12),
+            test_block(BlockKind::Function, 10),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -226,21 +229,21 @@ mod tests {
             file,
             "first".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 1, 3),
+            test_block(BlockKind::Function, 1),
             Language::Rust,
         );
         let second = builder.add_block(
             file,
             "second".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 10, 12),
+            test_block(BlockKind::Function, 10),
             Language::Rust,
         );
         let third = builder.add_block(
             file,
             "third".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 20, 22),
+            test_block(BlockKind::Function, 20),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -268,21 +271,21 @@ mod tests {
             file,
             "impl".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Impl, 1, 80),
+            test_block(BlockKind::Impl, 1),
             Language::Rust,
         );
         let method = builder.add_block(
             impl_block,
             "method".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Method, 3, 9),
+            test_block(BlockKind::Method, 3),
             Language::Rust,
         );
         let tail = builder.add_block(
             file,
             "tail".to_string(),
             "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 100, 110),
+            test_block(BlockKind::Function, 100),
             Language::Rust,
         );
         let tree = builder.finalize();
@@ -310,21 +313,21 @@ mod tests {
             file,
             "class".to_string(),
             "src/lib.swift".to_string(),
-            test_block(BlockKind::Class, 1, 80),
+            test_block(BlockKind::Class, 1),
             Language::Swift,
         );
         let method = builder.add_block(
             class_block,
             "method".to_string(),
             "src/lib.swift".to_string(),
-            test_block(BlockKind::Method, 3, 9),
+            test_block(BlockKind::Method, 3),
             Language::Swift,
         );
         let tail = builder.add_block(
             file,
             "tail".to_string(),
             "src/lib.swift".to_string(),
-            test_block(BlockKind::Function, 100, 110),
+            test_block(BlockKind::Function, 100),
             Language::Swift,
         );
         let tree = builder.finalize();

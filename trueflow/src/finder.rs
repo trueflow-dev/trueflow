@@ -15,7 +15,7 @@ pub fn fuzzy_find_block(path: &Path, fuzzy_ident: &str) -> Result<Block> {
         _ => Language::Unknown,
     };
 
-    let blocks = block_splitter::split(&content, language).into_review_blocks();
+    let blocks = block_splitter::split(&content, language).into_review_blocks(&content);
 
     let mut matches = blocks
         .iter()

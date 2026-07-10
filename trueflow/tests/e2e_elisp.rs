@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use trueflow::analysis::Language;
 use trueflow::block::BlockKind;
 use trueflow::block_splitter;
-use trueflow::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use trueflow::sub_splitter::{self, SubSplitSemantics};
 use trueflow_test_support::*;
 
@@ -96,17 +95,16 @@ fn test_elisp_fixture_scans_as_structured_language() -> Result<()> {
 fn test_elisp_function_subblocks_are_review_units() -> Result<()> {
     let fixture = fixture_file();
     let content = std::fs::read_to_string(&fixture)?;
-    let mut block = block_splitter::split(&content, Language::Elisp)
-        .into_review_blocks()
+    let block = block_splitter::split(&content, Language::Elisp)
+        .into_review_blocks(&content)
         .into_iter()
         .find(|block| {
             block.kind == BlockKind::Function
                 && block.content.starts_with("(defun elisp-support-run")
         })
         .context("missing elisp-support-run function block")?;
-    block.end_line = block.start_line + MAX_REVIEW_UNIT_SPAN_LINES + 8;
 
-    let result = sub_splitter::split_result(&block, Language::Elisp)?;
+    let result = sub_splitter::split_result_for_child_navigation(&block, Language::Elisp)?;
     let kinds: Vec<_> = result
         .blocks
         .iter()

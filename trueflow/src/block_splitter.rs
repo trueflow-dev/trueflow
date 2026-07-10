@@ -2,10 +2,9 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
 use crate::code_comments;
 use crate::complexity;
-use crate::hashing::TreeHash;
 use crate::optimizer;
 use crate::review_units::MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES;
-use crate::text_split::split_by_paragraph_breaks;
+use crate::text_split::paragraph_break_regex;
 use crate::tree_sitter_support::{
     classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
     find_named_descendant, first_child_of_kind, kotlin_type_body, markdown_heading_level,
@@ -153,12 +152,13 @@ impl BlockSplitResult {
         }
     }
 
-    /// Convert raw split blocks into the optimized review-time block set.
-    pub fn into_review_blocks(self) -> Vec<Block> {
+    /// Convert raw split blocks into optimized review blocks using the exact
+    /// source previously passed to `split`.
+    pub fn into_review_blocks(self, source: &str) -> Vec<Block> {
         if self.blocks.is_empty() {
             Vec::new()
         } else {
-            optimizer::optimize(self.blocks)
+            optimizer::optimize(self.blocks, source)
         }
     }
 }
@@ -374,7 +374,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                             last_end_byte,
                             start_byte,
                             lang,
-                        ));
+                        )?);
                     }
                 }
                 pending_start = Some(start_byte);
@@ -396,7 +396,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                         last_end_byte,
                         start_byte,
                         lang,
-                    ));
+                    )?);
                 }
             }
             start_byte
@@ -410,13 +410,13 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
             block_start,
             end_byte,
             complexity::calculate_from_node(child, lang, content),
-        ));
+        )?);
 
         if let Some(registration) = registration {
             blocks.extend(
                 (registration.top_level.collect_nested_blocks)(child, content, lang)
                     .into_iter()
-                    .map(|nested| {
+                    .filter_map(|nested| {
                         create_block(
                             &content[nested.start_byte..nested.end_byte],
                             nested.kind,
@@ -425,16 +425,17 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                             nested.end_byte,
                             lang,
                         )
+                        .ok()
                     }),
             );
         } else {
             if matches!(lang, Language::Rust) && matches!(ts_kind, "impl_item" | "trait_item") {
-                blocks.extend(collect_rust_impl_items(child, content, lang));
+                blocks.extend(collect_rust_impl_items(child, content, lang)?);
             }
             if matches!(lang, Language::Swift)
                 && matches!(ts_kind, "class_declaration" | "protocol_declaration")
             {
-                blocks.extend(collect_swift_type_items(child, content, lang));
+                blocks.extend(collect_swift_type_items(child, content, lang)?);
             }
             if matches!(lang, Language::Java)
                 && matches!(
@@ -446,12 +447,12 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                         | "annotation_type_declaration"
                 )
             {
-                blocks.extend(collect_java_type_items(child, content, lang));
+                blocks.extend(collect_java_type_items(child, content, lang)?);
             }
             if matches!(lang, Language::Kotlin)
                 && matches!(ts_kind, "class_declaration" | "object_declaration")
             {
-                blocks.extend(collect_kotlin_type_items(child, content, lang));
+                blocks.extend(collect_kotlin_type_items(child, content, lang)?);
             }
             if matches!(lang, Language::CSharp)
                 && matches!(
@@ -459,7 +460,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                     "namespace_declaration" | "file_scoped_namespace_declaration"
                 )
             {
-                blocks.extend(collect_csharp_namespace_items(child, content, lang));
+                blocks.extend(collect_csharp_namespace_items(child, content, lang)?);
             }
             if matches!(lang, Language::CSharp)
                 && matches!(
@@ -471,10 +472,10 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                         | "struct_declaration"
                 )
             {
-                blocks.extend(collect_csharp_type_items(child, content, lang));
+                blocks.extend(collect_csharp_type_items(child, content, lang)?);
             }
             if matches!(lang, Language::Ruby) && matches!(ts_kind, "class" | "module") {
-                blocks.extend(collect_ruby_scope_items(child, content, lang));
+                blocks.extend(collect_ruby_scope_items(child, content, lang)?);
             }
             if matches!(lang, Language::Php)
                 && matches!(
@@ -485,7 +486,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                         | "enum_declaration"
                 )
             {
-                blocks.extend(collect_php_type_items(child, content, lang));
+                blocks.extend(collect_php_type_items(child, content, lang)?);
             }
         }
 
@@ -503,7 +504,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
             start,
             pending_end,
             lang,
-        ));
+        )?);
         last_end_byte = pending_end;
     }
 
@@ -517,7 +518,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
                 last_end_byte,
                 content.len(),
                 lang,
-            ));
+            )?);
         }
     }
 
@@ -609,7 +610,7 @@ pub(crate) fn fallback_split_blocks(
     mode: FallbackMode,
     lang: Language,
 ) -> Vec<Block> {
-    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+    collect_valid_paragraph_blocks(content, |chunk, start, end, is_gap| {
         let kind = classify_fallback_chunk(chunk, mode, is_gap);
         create_fallback_block(content, chunk, kind, start, end, lang)
     })
@@ -646,27 +647,62 @@ fn create_fallback_block(
     start: usize,
     end: usize,
     lang: Language,
-) -> Block {
-    let (start_line, end_line) = byte_range_to_lines(full_source, start, end);
-    Block {
-        hash: TreeHash::from_content(chunk),
-        content: chunk.to_string(),
-        kind,
-        tags: Vec::new(),
-        complexity: complexity::calculate(chunk, lang),
-        start_line,
-        end_line,
+) -> Option<Block> {
+    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start, end)).ok()?;
+    assert_eq!(
+        block.content, chunk,
+        "fallback splitter range must name the supplied chunk"
+    );
+    block.complexity = complexity::calculate(&block.content, lang);
+    Some(block)
+}
+
+fn collect_valid_paragraph_blocks<F>(content: &str, mut make_block: F) -> Vec<Block>
+where
+    F: FnMut(&str, usize, usize, bool) -> Option<Block>,
+{
+    let re = paragraph_break_regex();
+    let mut blocks = Vec::new();
+    let mut start_offset = 0;
+
+    for mat in re.find_iter(content) {
+        let end_offset = mat.start();
+        if start_offset < end_offset
+            && let Some(chunk) = content.get(start_offset..end_offset)
+            && !chunk.is_empty()
+            && let Some(block) = make_block(chunk, start_offset, end_offset, false)
+        {
+            blocks.push(block);
+        }
+
+        if let Some(gap_chunk) = content.get(mat.start()..mat.end())
+            && let Some(block) = make_block(gap_chunk, mat.start(), mat.end(), true)
+        {
+            blocks.push(block);
+        }
+
+        start_offset = mat.end();
     }
+
+    if start_offset < content.len()
+        && let Some(chunk) = content.get(start_offset..)
+        && !chunk.is_empty()
+        && let Some(block) = make_block(chunk, start_offset, content.len(), false)
+    {
+        blocks.push(block);
+    }
+
+    blocks
 }
 
 fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
-    split_by_paragraph_breaks(content, |chunk, start, end, is_gap| {
+    collect_valid_paragraph_blocks(content, |chunk, start, end, is_gap| {
         let kind = if is_gap {
             BlockKind::Gap
         } else {
             BlockKind::Paragraph
         };
-        create_block(chunk, kind, content, start, end, lang)
+        create_block(chunk, kind, content, start, end, lang).ok()
     })
 }
 
@@ -676,7 +712,7 @@ fn split_toml(content: &str) -> Result<Vec<Block>> {
     let mut last_end = 0usize;
 
     for span in spans {
-        push_non_empty_toml_gap(&mut blocks, content, last_end, span.start);
+        push_non_empty_toml_gap(&mut blocks, content, last_end, span.start)?;
         blocks.push(create_block(
             &content[span.start..span.end],
             span.kind,
@@ -684,22 +720,27 @@ fn split_toml(content: &str) -> Result<Vec<Block>> {
             span.start,
             span.end,
             Language::Toml,
-        ));
+        )?);
         last_end = span.end;
     }
 
-    push_non_empty_toml_gap(&mut blocks, content, last_end, content.len());
+    push_non_empty_toml_gap(&mut blocks, content, last_end, content.len())?;
     Ok(blocks)
 }
 
-fn push_non_empty_toml_gap(blocks: &mut Vec<Block>, content: &str, start: usize, end: usize) {
+fn push_non_empty_toml_gap(
+    blocks: &mut Vec<Block>,
+    content: &str,
+    start: usize,
+    end: usize,
+) -> Result<()> {
     if end <= start {
-        return;
+        return Ok(());
     }
 
     let chunk = &content[start..end];
     if chunk.is_empty() || chunk.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
     let kind = if code_comments::chunk_is_comment_only(chunk) {
@@ -715,7 +756,8 @@ fn push_non_empty_toml_gap(blocks: &mut Vec<Block>, content: &str, start: usize,
         start,
         end,
         Language::Toml,
-    ));
+    )?);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -734,7 +776,7 @@ fn split_nix(content: &str) -> Result<Vec<Block>> {
     let root = tree.root_node();
 
     let Some(expression) = root.child_by_field_name("expression") else {
-        return Ok(split_by_paragraph_breaks(
+        return Ok(collect_valid_paragraph_blocks(
             content,
             |chunk, start, end, is_gap| {
                 let kind = if is_gap {
@@ -744,7 +786,7 @@ fn split_nix(content: &str) -> Result<Vec<Block>> {
                 } else {
                     BlockKind::Code
                 };
-                create_block(chunk, kind, content, start, end, Language::Nix)
+                create_block(chunk, kind, content, start, end, Language::Nix).ok()
             },
         ));
     };
@@ -764,7 +806,7 @@ fn split_nix(content: &str) -> Result<Vec<Block>> {
             0,
             content.len(),
             Language::Nix,
-        )]);
+        )?]);
     }
 
     let mut blocks = Vec::new();
@@ -787,7 +829,7 @@ fn split_nix(content: &str) -> Result<Vec<Block>> {
             last_end,
             boundary.end,
             Language::Nix,
-        ));
+        )?);
         last_end = boundary.end;
     }
 
@@ -807,7 +849,7 @@ fn split_nix(content: &str) -> Result<Vec<Block>> {
             last_end,
             content.len(),
             Language::Nix,
-        ));
+        )?);
     }
 
     Ok(blocks)
@@ -965,12 +1007,12 @@ fn split_markdown_section_for_review(
         return Ok(Vec::new());
     }
 
-    let line_count = markdown_span_line_count(content, section.start, section.end);
+    let line_count = markdown_span_line_count(content, section.start, section.end)?;
     let child_sections = markdown_section_child_sections(&section, headings).unwrap_or_default();
     let should_refine = force_refine
         || line_count > MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES
         || (child_sections.len() == 1
-            && markdown_span_line_count(content, child_sections[0].start, child_sections[0].end)
+            && markdown_span_line_count(content, child_sections[0].start, child_sections[0].end)?
                 > MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES);
 
     if !should_refine {
@@ -981,7 +1023,7 @@ fn split_markdown_section_for_review(
             section.start,
             section.end,
             Language::Markdown,
-        )]);
+        )?]);
     }
 
     if child_sections.is_empty() {
@@ -992,7 +1034,7 @@ fn split_markdown_section_for_review(
             section.start,
             section.end,
             Language::Markdown,
-        )];
+        )?];
         let body_start = headings
             .iter()
             .find(|heading| heading.start == section.start)
@@ -1021,7 +1063,7 @@ fn split_markdown_section_for_review(
         section.start,
         section.end,
         Language::Markdown,
-    )];
+    )?];
     let root_heading = headings
         .iter()
         .find(|heading| heading.start == section.start);
@@ -1037,7 +1079,7 @@ fn split_markdown_section_for_review(
                 end: root_content_end,
             },
             headings,
-            markdown_span_line_count(content, section.start, root_content_end)
+            markdown_span_line_count(content, section.start, root_content_end)?
                 > MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES,
         )?);
     }
@@ -1070,9 +1112,8 @@ fn markdown_section_child_sections(
     ))
 }
 
-fn markdown_span_line_count(content: &str, start: usize, end: usize) -> usize {
-    let (start_line, end_line) = byte_range_to_lines(content, start, end);
-    end_line.saturating_sub(start_line)
+fn markdown_span_line_count(content: &str, start: usize, end: usize) -> Result<usize> {
+    Ok(Block::line_span_from_file_range(content, ByteSpan::new(start, end))?.len())
 }
 
 #[derive(Debug, Clone)]
@@ -1148,7 +1189,7 @@ fn split_markdown_flat_range_with_attached_heading(
 
     attach_markdown_heading_to_first_content(content, &mut parts, attached_heading_start);
 
-    Ok(parts
+    parts
         .into_iter()
         .map(|part| {
             create_block(
@@ -1160,7 +1201,7 @@ fn split_markdown_flat_range_with_attached_heading(
                 Language::Markdown,
             )
         })
-        .collect())
+        .collect()
 }
 
 fn push_markdown_unstructured_part(
@@ -1539,12 +1580,12 @@ fn collect_swift_type_items(
     type_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if !swift::body_is_non_trivial(body, content) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut blocks = Vec::new();
@@ -1557,17 +1598,17 @@ fn collect_swift_type_items(
             member.start_byte,
             member.end_byte,
             lang,
-        ));
+        )?);
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn collect_rust_impl_items(
     impl_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     rust::collect_impl_member_spans(impl_node)
         .into_iter()
         .map(|member| {
@@ -1587,54 +1628,56 @@ fn collect_java_type_items(
     type_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = map_kind(lang, child.kind());
-            (!matches!(kind, BlockKind::Code)).then(|| {
-                create_block(
-                    &content[child.start_byte()..child.end_byte()],
-                    kind,
-                    content,
-                    child.start_byte(),
-                    child.end_byte(),
-                    lang,
-                )
-            })
-        })
-        .collect()
+    for child in body.named_children(&mut cursor) {
+        let kind = map_kind(lang, child.kind());
+        if matches!(kind, BlockKind::Code) {
+            continue;
+        }
+        blocks.push(create_block(
+            &content[child.start_byte()..child.end_byte()],
+            kind,
+            content,
+            child.start_byte(),
+            child.end_byte(),
+            lang,
+        )?);
+    }
+    Ok(blocks)
 }
 
 fn collect_kotlin_type_items(
     type_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let Some(body) = kotlin_type_body(type_node) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = map_kotlin_type_member_kind(child, content);
-            (!matches!(kind, BlockKind::Code)).then(|| {
-                create_block(
-                    &content[child.start_byte()..child.end_byte()],
-                    kind,
-                    content,
-                    child.start_byte(),
-                    child.end_byte(),
-                    lang,
-                )
-            })
-        })
-        .collect()
+    for child in body.named_children(&mut cursor) {
+        let kind = map_kotlin_type_member_kind(child, content);
+        if matches!(kind, BlockKind::Code) {
+            continue;
+        }
+        blocks.push(create_block(
+            &content[child.start_byte()..child.end_byte()],
+            kind,
+            content,
+            child.start_byte(),
+            child.end_byte(),
+            lang,
+        )?);
+    }
+    Ok(blocks)
 }
 
 fn map_kotlin_type_member_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
@@ -1660,24 +1703,24 @@ fn collect_csharp_namespace_items(
     namespace_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let Some(body) = namespace_node.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut blocks = Vec::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
-        blocks.extend(collect_csharp_declaration_blocks(child, content, lang));
+        blocks.extend(collect_csharp_declaration_blocks(child, content, lang)?);
     }
-    blocks
+    Ok(blocks)
 }
 
 fn collect_csharp_declaration_blocks(
     node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let kind = map_kind(lang, node.kind());
     let mut blocks = Vec::new();
 
@@ -1689,33 +1732,33 @@ fn collect_csharp_declaration_blocks(
             node.start_byte(),
             node.end_byte(),
             lang,
-        ));
+        )?);
     }
 
     match node.kind() {
         "namespace_declaration" | "file_scoped_namespace_declaration" => {
-            blocks.extend(collect_csharp_namespace_items(node, content, lang));
+            blocks.extend(collect_csharp_namespace_items(node, content, lang)?);
         }
         "class_declaration"
         | "interface_declaration"
         | "enum_declaration"
         | "record_declaration"
         | "struct_declaration" => {
-            blocks.extend(collect_csharp_type_items(node, content, lang));
+            blocks.extend(collect_csharp_type_items(node, content, lang)?);
         }
         _ => {}
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn collect_ruby_scope_items(
     scope_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let Some(body) = scope_node.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut blocks = Vec::new();
@@ -1733,7 +1776,7 @@ fn collect_ruby_scope_items(
             child.start_byte(),
             child.end_byte(),
             lang,
-        ));
+        )?);
 
         if matches!(child.kind(), "class" | "module")
             && let Some(body) = child.child_by_field_name("body")
@@ -1742,7 +1785,7 @@ fn collect_ruby_scope_items(
         }
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn ruby_scope_body_children(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
@@ -1756,44 +1799,45 @@ fn collect_csharp_type_items(
     type_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut blocks = Vec::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
-        blocks.extend(collect_csharp_declaration_blocks(child, content, lang));
+        blocks.extend(collect_csharp_declaration_blocks(child, content, lang)?);
     }
-    blocks
+    Ok(blocks)
 }
 
 fn collect_php_type_items(
     type_node: tree_sitter::Node<'_>,
     content: &str,
     lang: Language,
-) -> Vec<Block> {
+) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
+    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter_map(|child| {
-            let kind = map_kind(lang, child.kind());
-            (!matches!(kind, BlockKind::Code)).then(|| {
-                create_block(
-                    &content[child.start_byte()..child.end_byte()],
-                    kind,
-                    content,
-                    child.start_byte(),
-                    child.end_byte(),
-                    lang,
-                )
-            })
-        })
-        .collect()
+    for child in body.named_children(&mut cursor) {
+        let kind = map_kind(lang, child.kind());
+        if matches!(kind, BlockKind::Code) {
+            continue;
+        }
+        blocks.push(create_block(
+            &content[child.start_byte()..child.end_byte()],
+            kind,
+            content,
+            child.start_byte(),
+            child.end_byte(),
+            lang,
+        )?);
+    }
+    Ok(blocks)
 }
 
 fn create_block(
@@ -1803,7 +1847,7 @@ fn create_block(
     start_byte: usize,
     end_byte: usize,
     lang: Language,
-) -> Block {
+) -> Result<Block> {
     create_block_with_complexity(
         text,
         kind,
@@ -1821,22 +1865,14 @@ fn create_block_with_complexity(
     start_byte: usize,
     end_byte: usize,
     complexity: Option<u32>,
-) -> Block {
-    let hash = TreeHash::from_content(text);
-
-    // Line mapping (byte -> line index)
-    // Reusing the logic from previous implementation
-    let (start_line, end_line) = byte_range_to_lines(full_source, start_byte, end_byte);
-
-    Block {
-        hash,
-        content: text.to_string(),
-        kind,
-        tags: Vec::new(),
-        complexity,
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    assert_eq!(
+        block.content, text,
+        "parser split range must name the supplied block content"
+    );
+    block.complexity = complexity;
+    Ok(block)
 }
 
 fn collect_test_ranges(
@@ -1957,16 +1993,10 @@ fn collect_test_line_spans(
     tree: &tree_sitter::Tree,
     source: &str,
 ) -> Result<Vec<LineSpan>> {
-    collect_test_ranges(lang, tree, source).map(|ranges| {
-        ranges
-            .into_iter()
-            .map(|range| {
-                let (start_line, end_line) =
-                    byte_range_to_lines(source, range.start_byte, range.end_byte);
-                LineSpan::new(start_line, end_line)
-            })
-            .collect()
-    })
+    collect_test_ranges(lang, tree, source)?
+        .into_iter()
+        .map(|range| Block::line_span_from_file_range(source, range))
+        .collect()
 }
 
 fn apply_test_tags(blocks: &mut [Block], test_spans: &[LineSpan]) {
@@ -2378,22 +2408,6 @@ fn ruby_definition_name(node: tree_sitter::Node<'_>, source: &str) -> Result<Opt
         .map(|name| name.utf8_text(source.as_bytes()).map(str::to_string))
         .transpose()
         .map_err(Into::into)
-}
-
-fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let pre = &source[..start];
-    let start_line = pre.lines().count();
-    let start_line = if start > 0 && pre.ends_with('\n') {
-        start_line
-    } else {
-        start_line.saturating_sub(1)
-    };
-
-    let mid = &source[start..end];
-    let new_lines = mid.chars().filter(|&c| c == '\n').count();
-    let end_line = start_line + new_lines + if mid.ends_with('\n') { 0 } else { 1 };
-
-    (start_line, end_line)
 }
 
 #[cfg(test)]
@@ -3046,12 +3060,58 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
     }
 
     #[test]
-    fn test_split_includes_optimization_pipeline() {
-        let result = split_result("use std::fmt;\n\nuse std::io;\n", Language::Rust);
+    fn tree_sitter_blocks_preserve_absolute_utf8_byte_spans() {
+        let source = "// é\nconst α: &str = \"λ\";\n\nfn later() {}\n";
+        let result = split_result(source, Language::Rust);
         assert_eq!(result.strategy, BlockSplitStrategy::Structured);
-        let blocks = result.into_review_blocks();
+
+        let later_start = source.find("fn later").unwrap();
+        let later_end = later_start + "fn later() {}".len();
+        let later = result
+            .blocks
+            .iter()
+            .find(|block| block.content == "fn later() {}")
+            .unwrap();
+        assert_eq!(later.byte_span(), ByteSpan::new(later_start, later_end));
+
+        for block in result.blocks {
+            assert!(source.is_char_boundary(block.start_byte));
+            assert!(source.is_char_boundary(block.end_byte));
+            assert_eq!(
+                block.content,
+                source[block.start_byte..block.end_byte],
+                "tree-sitter block must retain its absolute source slice"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_blocks_preserve_absolute_utf8_byte_spans() {
+        let source = "éclair paragraph.\n\nλater paragraph.";
+        let blocks = fallback_split_blocks(source, FallbackMode::Text, Language::Unknown);
+        assert_eq!(blocks.len(), 3);
+
+        for block in blocks {
+            assert!(source.is_char_boundary(block.start_byte));
+            assert!(source.is_char_boundary(block.end_byte));
+            assert_eq!(
+                block.content,
+                source[block.start_byte..block.end_byte],
+                "fallback block must retain its absolute source slice"
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_includes_optimization_pipeline() {
+        let source = "use std::fmt;\n\nuse std::io;\n";
+        let expected = &source[..source.len() - 1];
+        let result = split_result(source, Language::Rust);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        let blocks = result.into_review_blocks(source);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Imports);
-        assert_eq!(blocks[0].content, "use std::fmt;\nuse std::io;");
+        assert_eq!(blocks[0].content, expected);
+        assert_eq!(blocks[0].byte_span(), ByteSpan::new(0, expected.len()));
     }
 }

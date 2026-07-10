@@ -13,7 +13,7 @@ use super::{
     should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
 use crate::commands::mark;
 use crate::commands::review::{BlockChangeKind, FileChangeKind};
 use crate::review_navigator::ReviewNavigator;
@@ -516,6 +516,42 @@ fn current_or_ancestor_file_id(state: &AppState, start: TreeNodeId) -> Option<Tr
     None
 }
 
+fn synthetic_block(
+    content: String,
+    kind: BlockKind,
+    line_span: LineSpan,
+    start_byte: usize,
+) -> Block {
+    let end_byte = start_byte
+        .checked_add(content.len())
+        .unwrap_or_else(|| panic!("synthetic test block byte end overflow"));
+    Block::new(
+        content,
+        kind,
+        line_span,
+        ByteSpan::new(start_byte, end_byte),
+    )
+}
+
+fn file_range_for_lines(source: &str, start_line: usize, end_line: usize) -> ByteSpan {
+    let line_offsets = source
+        .char_indices()
+        .filter_map(|(offset, ch)| (ch == '\n').then_some(offset.saturating_add(1)))
+        .chain(std::iter::once(source.len()))
+        .collect::<Vec<_>>();
+    let start_byte = if start_line == 0 {
+        0
+    } else {
+        *line_offsets
+            .get(start_line - 1)
+            .unwrap_or_else(|| panic!("test block start line must be in source"))
+    };
+    let end_byte = *line_offsets
+        .get(end_line.saturating_sub(1))
+        .unwrap_or_else(|| panic!("test block end line must be in source"));
+    ByteSpan::new(start_byte, end_byte)
+}
+
 fn build_root_state<I, S>(file_names: I) -> Result<AppState>
 where
     I: IntoIterator<Item = S>,
@@ -540,7 +576,12 @@ where
             file,
             format!("{}-block", name.trim_end_matches(".rs")),
             name,
-            Block::new("fn item() {}\n".to_string(), BlockKind::Function, 0, 1),
+            synthetic_block(
+                "fn item() {}\n".to_string(),
+                BlockKind::Function,
+                LineSpan::new(0, 1),
+                0,
+            ),
             Language::Rust,
         );
         visible.insert(block_id);
@@ -620,12 +661,10 @@ fn build_state_with_single_rust_block_file(
         "file-hash".to_string(),
         Language::Rust,
     );
-    let block = Block::new(
-        block_content.to_string(),
-        BlockKind::Function,
-        block_start_line,
-        block_end_line,
-    );
+    let byte_span = file_range_for_lines(file_content, block_start_line, block_end_line);
+    let block = Block::from_file_range(file_content, BlockKind::Function, byte_span)
+        .unwrap_or_else(|error| panic!("test block range must be valid: {error}"));
+    assert_eq!(block.content, block_content);
     let block_id = builder.add_block(
         file,
         "function".to_string(),

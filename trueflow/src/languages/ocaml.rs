@@ -4,8 +4,8 @@ use super::{
     no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind};
-use crate::hashing::TreeHash;
+use crate::block::{Block, BlockKind, ByteSpan};
+
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -44,7 +44,7 @@ fn split_top_level(_root: Node<'_>, content: &str, lang: Language) -> Result<Vec
 
         if is_ocaml_attribute_like(child.kind()) {
             if pending_start.is_none() {
-                push_non_whitespace_gap(&mut blocks, content, last_end, start, lang);
+                push_non_whitespace_gap(&mut blocks, content, last_end, start, lang)?;
                 pending_start = Some(start);
             }
             pending_end = end;
@@ -53,7 +53,7 @@ fn split_top_level(_root: Node<'_>, content: &str, lang: Language) -> Result<Vec
 
         let block_start = pending_start.take().unwrap_or(start);
         if pending_end == 0 {
-            push_non_whitespace_gap(&mut blocks, content, last_end, block_start, lang);
+            push_non_whitespace_gap(&mut blocks, content, last_end, block_start, lang)?;
         }
 
         let kind = map_kind(child, content);
@@ -64,8 +64,8 @@ fn split_top_level(_root: Node<'_>, content: &str, lang: Language) -> Result<Vec
             block_start,
             end,
             lang,
-        ));
-        blocks.extend(collect_nested_file_blocks(child, content, lang));
+        )?);
+        blocks.extend(collect_nested_file_blocks(child, content, lang)?);
 
         last_end = end;
         pending_end = 0;
@@ -79,11 +79,11 @@ fn split_top_level(_root: Node<'_>, content: &str, lang: Language) -> Result<Vec
             start,
             pending_end,
             lang,
-        ));
+        )?);
         last_end = pending_end;
     }
 
-    push_non_whitespace_gap(&mut blocks, content, last_end, content.len(), lang);
+    push_non_whitespace_gap(&mut blocks, content, last_end, content.len(), lang)?;
 
     Ok(blocks)
 }
@@ -219,7 +219,7 @@ fn split_module_like(block: &Block) -> Result<Vec<Block>> {
     }
     children.sort_by_key(|child| child.start_byte);
 
-    Ok(build_child_preserving_review_units(block, &children))
+    build_child_preserving_review_units(block, &children)
 }
 
 fn split_type_like(block: &Block) -> Result<Vec<Block>> {
@@ -249,10 +249,10 @@ fn split_type_like(block: &Block) -> Result<Vec<Block>> {
         return crate::sub_splitter::split_code_review_units(block);
     }
 
-    Ok(build_child_preserving_review_units(block, &children))
+    build_child_preserving_review_units(block, &children)
 }
 
-fn collect_nested_file_blocks(node: Node<'_>, content: &str, lang: Language) -> Vec<Block> {
+fn collect_nested_file_blocks(node: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
     enum Work<'tree> {
         Visit(Node<'tree>),
         Emit(NestedBlock),
@@ -269,7 +269,7 @@ fn collect_nested_file_blocks(node: Node<'_>, content: &str, lang: Language) -> 
                 child.start_byte,
                 child.end_byte,
                 lang,
-            )),
+            )?),
             Work::Visit(current) => {
                 let Some(container) = stable_module_container(current) else {
                     continue;
@@ -295,7 +295,7 @@ fn collect_nested_file_blocks(node: Node<'_>, content: &str, lang: Language) -> 
             }
         }
     }
-    blocks
+    Ok(blocks)
 }
 
 fn collect_immediate_nested_blocks(container: Node<'_>, content: &str) -> Vec<NestedBlock> {
@@ -350,13 +350,16 @@ fn collect_variant_constructors(variant: Node<'_>) -> Vec<NestedBlock> {
     constructors
 }
 
-fn build_child_preserving_review_units(block: &Block, children: &[NestedBlock]) -> Vec<Block> {
+fn build_child_preserving_review_units(
+    block: &Block,
+    children: &[NestedBlock],
+) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut current = 0;
 
     for child in children {
         if current < child.start_byte {
-            push_non_child_chunk(block, current, child.start_byte, &mut blocks);
+            push_non_child_chunk(block, current, child.start_byte, &mut blocks)?;
         }
 
         blocks.push(create_sub_block(
@@ -364,15 +367,15 @@ fn build_child_preserving_review_units(block: &Block, children: &[NestedBlock]) 
             child.start_byte,
             child.end_byte,
             child.kind,
-        ));
+        )?);
         current = child.end_byte;
     }
 
     if current < block.content.len() {
-        push_non_child_chunk(block, current, block.content.len(), &mut blocks);
+        push_non_child_chunk(block, current, block.content.len(), &mut blocks)?;
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Result<Vec<Block>> {
@@ -382,7 +385,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
         0,
         signature_end,
         BlockKind::FunctionSignature,
-    )];
+    )?];
 
     let rest = &content[signature_end..];
     let mut start = 0;
@@ -390,7 +393,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
         if start < gap.start() {
             let chunk = &rest[start..gap.start()];
             if !chunk.is_empty() {
-                push_review_chunk(block, &mut blocks, chunk, signature_end + start);
+                push_review_chunk(block, &mut blocks, chunk, signature_end + start)?;
             }
         }
 
@@ -399,21 +402,26 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
             signature_end + gap.start(),
             signature_end + gap.end(),
             BlockKind::Gap,
-        ));
+        )?);
         start = gap.end();
     }
 
     if start < rest.len() {
         let chunk = &rest[start..];
         if !chunk.is_empty() {
-            push_review_chunk(block, &mut blocks, chunk, signature_end + start);
+            push_review_chunk(block, &mut blocks, chunk, signature_end + start)?;
         }
     }
 
     Ok(blocks)
 }
 
-fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start_offset: usize) {
+fn push_review_chunk(
+    parent: &Block,
+    blocks: &mut Vec<Block>,
+    chunk: &str,
+    start_offset: usize,
+) -> Result<()> {
     if let Some(prefix_len) = leading_ocaml_comment_prefix_len(chunk)
         && prefix_len < chunk.len()
     {
@@ -422,7 +430,7 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
             start_offset,
             start_offset + prefix_len,
             BlockKind::Comment,
-        ));
+        )?);
 
         let remainder = &chunk[prefix_len..];
         let remainder_kind = classify_ocaml_chunk(remainder);
@@ -432,9 +440,9 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
                 start_offset + prefix_len,
                 start_offset + chunk.len(),
                 remainder_kind,
-            ));
+            )?);
         }
-        return;
+        return Ok(());
     }
 
     let kind = classify_ocaml_chunk(chunk);
@@ -444,18 +452,25 @@ fn push_review_chunk(parent: &Block, blocks: &mut Vec<Block>, chunk: &str, start
             start_offset,
             start_offset + chunk.len(),
             kind,
-        ));
+        )?);
     }
+    Ok(())
 }
 
-fn push_non_child_chunk(parent: &Block, start: usize, end: usize, blocks: &mut Vec<Block>) {
+fn push_non_child_chunk(
+    parent: &Block,
+    start: usize,
+    end: usize,
+    blocks: &mut Vec<Block>,
+) -> Result<()> {
     if start >= end {
-        return;
+        return Ok(());
     }
 
     let chunk = &parent.content[start..end];
     let kind = classify_ocaml_chunk(chunk);
-    blocks.push(create_sub_block(parent, start, end, kind));
+    blocks.push(create_sub_block(parent, start, end, kind)?);
+    Ok(())
 }
 
 fn push_non_whitespace_gap(
@@ -464,14 +479,14 @@ fn push_non_whitespace_gap(
     start: usize,
     end: usize,
     lang: Language,
-) {
+) -> Result<()> {
     if start >= end {
-        return;
+        return Ok(());
     }
 
     let chunk = &content[start..end];
     if chunk.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
     blocks.push(create_file_block(
@@ -481,7 +496,8 @@ fn push_non_whitespace_gap(
         start,
         end,
         lang,
-    ));
+    )?);
+    Ok(())
 }
 
 fn signature_end_for_value_binding(content: &str, binding: Node<'_>) -> usize {
@@ -750,17 +766,14 @@ fn create_file_block(
     start_byte: usize,
     end_byte: usize,
     lang: Language,
-) -> Block {
-    let (start_line, end_line) = byte_range_to_lines(full_source, start_byte, end_byte);
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: Vec::new(),
-        complexity: crate::complexity::calculate(text, lang),
-        start_line,
-        end_line,
-    }
+) -> Result<Block> {
+    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    assert_eq!(
+        block.content, text,
+        "OCaml top-level range must name content"
+    );
+    block.complexity = crate::complexity::calculate(&block.content, lang);
+    Ok(block)
 }
 
 fn create_sub_block(
@@ -768,31 +781,11 @@ fn create_sub_block(
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
-) -> Block {
-    let text = &parent.content[start_offset..end_offset];
-    let pre_chunk = &parent.content[..start_offset];
-    let offset_newlines = pre_chunk.chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = text.chars().filter(|&ch| ch == '\n').count();
-
-    let start_line = parent.start_line + offset_newlines;
-    let end_line = start_line + chunk_newlines + usize::from(!text.ends_with('\n'));
-
-    Block {
-        hash: TreeHash::from_content(text),
-        content: text.to_string(),
-        kind,
-        tags: parent.tags.clone(),
-        complexity: None,
-        start_line,
-        end_line,
-    }
-}
-
-fn byte_range_to_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let start_line = source[..start].chars().filter(|&ch| ch == '\n').count();
-    let chunk_newlines = source[start..end].chars().filter(|&ch| ch == '\n').count();
-    let end_line = start_line + chunk_newlines + usize::from(!source[start..end].ends_with('\n'));
-    (start_line, end_line)
+) -> Result<Block> {
+    let mut block =
+        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    block.tags = parent.tags.clone();
+    Ok(block)
 }
 
 #[cfg(test)]
