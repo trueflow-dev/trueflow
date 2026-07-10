@@ -346,9 +346,6 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
 
         let language = file.language;
-        // Diff-scoped requests returned above through the target-first batch
-        // path, so this ordinary scan never computes a per-file tree diff.
-        let file_changed_lines: Option<vcs::DiffChangedLineIndex> = None;
         let mut reviewable_blocks = Vec::new();
         for block in file.blocks {
             if !query.filters.allows_block(block.kind) {
@@ -366,12 +363,6 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                 &block,
                 &query.filters,
             ) {
-                continue;
-            }
-            if let Some(changed_lines) = file_changed_lines.as_ref()
-                && changed_lines.change_kind_for_block(&block)
-                    != vcs::BlockDiffChangeKind::ReviewableChanges
-            {
                 continue;
             }
             reviewable_blocks.push((block, node_id));
@@ -592,6 +583,7 @@ struct TargetDiffBatch<'a> {
     diffs: vcs::SelectedFileDiffs,
 }
 
+#[derive(Clone)]
 struct TargetFileDiffInput {
     base: Option<crate::block::FileState>,
     file_diff: vcs::FileDiff,
@@ -667,31 +659,19 @@ fn collect_diff_review_files(
         }
 
         let has_base = target_inputs.iter().any(|input| input.base.is_some());
-        let mut base_blocks = dedupe_blocks(
-            target_inputs
-                .iter()
-                .filter_map(|input| input.base.as_ref())
-                .flat_map(|file| file.blocks.clone())
-                .collect::<Vec<_>>(),
-        );
         let base_language = target_inputs
             .iter()
             .find_map(|input| input.base.as_ref().map(|file| file.language));
         let base_file_hash = target_inputs
             .iter()
             .find_map(|input| input.base.as_ref().map(|file| file.tree_hash.clone()));
-        let hunks = target_inputs
-            .into_iter()
-            .flat_map(|input| input.file_diff.into_hunks())
-            .collect::<Vec<_>>();
         let mut head_blocks = head_file
             .as_ref()
             .map(|file| file.blocks.clone())
             .unwrap_or_default();
-        base_blocks.sort_by_key(|block| (block.start_line, block.end_line, block.kind.as_str()));
         head_blocks.sort_by_key(|block| (block.start_line, block.end_line, block.kind.as_str()));
 
-        let blocks = collect_diff_review_blocks_for_file(&base_blocks, &head_blocks, &hunks)
+        let blocks = collect_diff_review_blocks_for_target_inputs(&target_inputs, &head_blocks)
             .into_iter()
             .filter(|review_block| {
                 let display_block = review_block.display_block();
@@ -768,16 +748,6 @@ fn selected_review_paths(
             selected
         }
     }
-}
-
-fn dedupe_blocks(blocks: Vec<Block>) -> Vec<Block> {
-    let mut unique = HashMap::new();
-    for block in blocks {
-        unique
-            .entry((block.hash.clone(), block.start_line, block.end_line))
-            .or_insert(block);
-    }
-    unique.into_values().collect()
 }
 
 fn classify_file_change_kind(has_base: bool, has_head: bool) -> Option<FileChangeKind> {
@@ -1049,163 +1019,316 @@ fn is_subblock_covered(
     true
 }
 
+fn collect_diff_review_blocks_for_target_inputs(
+    target_inputs: &[TargetFileDiffInput],
+    head_blocks: &[Block],
+) -> Vec<DiffReviewBlock> {
+    let mut candidates = Vec::new();
+    for target_input in target_inputs {
+        let base_blocks = target_input
+            .base
+            .as_ref()
+            .map(|file| file.blocks.as_slice())
+            .unwrap_or_default();
+        candidates.extend(collect_diff_review_blocks_for_file(
+            base_blocks,
+            head_blocks,
+            target_input.file_diff.hunks(),
+        ));
+    }
+    dedupe_diff_review_blocks(candidates)
+}
+
 fn collect_diff_review_blocks_for_file(
     base_blocks: &[Block],
     head_blocks: &[Block],
     hunks: &[vcs::DiffHunk],
 ) -> Vec<DiffReviewBlock> {
-    let base_changed_lines = vcs::DiffChangedLineIndex::from_hunks(hunks, vcs::DiffBlockSide::Base);
-    let head_changed_lines = vcs::DiffChangedLineIndex::from_hunks(hunks, vcs::DiffBlockSide::Head);
-    let changed_base_blocks = base_blocks
-        .iter()
-        .filter(|block| {
-            base_changed_lines.change_kind_for_block(block)
-                == vcs::BlockDiffChangeKind::ReviewableChanges
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let changed_head_blocks = head_blocks
-        .iter()
-        .filter(|block| {
-            head_changed_lines.change_kind_for_block(block)
-                == vcs::BlockDiffChangeKind::ReviewableChanges
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let changed_lines = vcs::DiffChangedLineIndex::from_hunks(hunks);
+    let mut unmatched_base = vec![true; base_blocks.len()];
+    let mut unmatched_head = vec![true; head_blocks.len()];
+    // Reserve semantic survivors before positional evidence can consume them.
+    let mut matched = reserve_unique_semantic_matches(
+        base_blocks,
+        head_blocks,
+        &mut unmatched_base,
+        &mut unmatched_head,
+    );
+    // Remaining survivors require real unchanged old/head coordinate overlap.
+    let unchanged_lines = UnchangedLineIndex::from_hunks(hunks);
+    matched.extend(reserve_unique_unchanged_line_matches(
+        base_blocks,
+        head_blocks,
+        &mut unmatched_base,
+        &mut unmatched_head,
+        &unchanged_lines,
+    ));
+    // Positional anchors may pair only blocks independently changed on both sides.
+    matched.extend(reserve_unique_positional_matches(
+        base_blocks,
+        head_blocks,
+        &mut unmatched_base,
+        &mut unmatched_head,
+        &changed_lines,
+        hunks,
+    ));
 
-    let mut unmatched_head_blocks = changed_head_blocks
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>();
-    let head_match_index = HeadBlockMatchIndex::from_blocks(&unmatched_head_blocks);
     let mut diff_blocks = Vec::new();
-
-    for base_block in changed_base_blocks {
-        if let Some(head_index) = find_matching_head_block(
-            &base_block,
-            &unmatched_head_blocks,
-            &head_match_index,
-            hunks,
-        ) {
-            let head_block = unmatched_head_blocks[head_index]
-                .take()
-                .unwrap_or_else(|| panic!("matched head block should still be present"));
-            let sides = DiffBlockSides {
-                base: Some(base_block),
-                head: Some(head_block),
-            };
-            diff_blocks.push(DiffReviewBlock {
-                change_kind: classify_block_change_kind(&sides)
-                    .unwrap_or_else(|| panic!("paired diff block should have a change kind")),
-                sides,
-            });
-        } else {
-            let sides = DiffBlockSides {
-                base: Some(base_block),
-                head: None,
-            };
-            diff_blocks.push(DiffReviewBlock {
-                change_kind: classify_block_change_kind(&sides)
-                    .unwrap_or_else(|| panic!("base-only diff block should have a change kind")),
-                sides,
-            });
+    for (base_index, head_index) in matched {
+        let base = &base_blocks[base_index];
+        let head = &head_blocks[head_index];
+        if changed_lines.change_kind_for_block(vcs::DiffBlockOwnership::Matched { base, head })
+            == vcs::BlockDiffChangeKind::ReviewableChanges
+        {
+            diff_blocks.push(diff_review_block(Some(base.clone()), Some(head.clone())));
         }
     }
 
-    diff_blocks.extend(
-        unmatched_head_blocks
-            .into_iter()
-            .flatten()
-            .map(|head_block| {
-                let sides = DiffBlockSides {
-                    base: None,
-                    head: Some(head_block),
-                };
-                DiffReviewBlock {
-                    change_kind: classify_block_change_kind(&sides).unwrap_or_else(|| {
-                        panic!("head-only diff block should have a change kind")
-                    }),
-                    sides,
-                }
-            }),
-    );
+    for (index, base) in base_blocks.iter().enumerate() {
+        if unmatched_base[index]
+            && changed_lines.change_kind_for_block(vcs::DiffBlockOwnership::BaseOnly(base))
+                == vcs::BlockDiffChangeKind::ReviewableChanges
+        {
+            diff_blocks.push(diff_review_block(Some(base.clone()), None));
+        }
+    }
 
-    diff_blocks.sort_by_key(|block| {
-        let display = block.display_block();
-        (
-            display.start_line,
-            display.end_line,
-            display.kind.default_review_priority(),
-        )
-    });
+    for (index, head) in head_blocks.iter().enumerate() {
+        if unmatched_head[index]
+            && changed_lines.change_kind_for_block(vcs::DiffBlockOwnership::HeadOnly(head))
+                == vcs::BlockDiffChangeKind::ReviewableChanges
+        {
+            diff_blocks.push(diff_review_block(None, Some(head.clone())));
+        }
+    }
+
+    sort_diff_review_blocks(&mut diff_blocks);
     diff_blocks
 }
 
-struct HeadBlockMatchIndex {
-    semantic_matches: HashMap<(BlockKind, String), Vec<usize>>,
+fn diff_review_block(base: Option<Block>, head: Option<Block>) -> DiffReviewBlock {
+    let sides = DiffBlockSides { base, head };
+    DiffReviewBlock {
+        change_kind: classify_block_change_kind(&sides)
+            .unwrap_or_else(|| panic!("diff review block must own at least one side")),
+        sides,
+    }
 }
 
-impl HeadBlockMatchIndex {
-    fn from_blocks(head_blocks: &[Option<Block>]) -> Self {
-        let mut semantic_matches: HashMap<(BlockKind, String), Vec<usize>> = HashMap::new();
-        for (index, head_block) in head_blocks.iter().enumerate() {
-            let Some(head_block) = head_block else {
-                continue;
-            };
-            let Some(identifier) = review_metadata::semantic_block_identifier(head_block) else {
-                continue;
-            };
-            semantic_matches
-                .entry((head_block.kind, identifier))
-                .or_default()
-                .push(index);
+fn reserve_unique_semantic_matches(
+    base_blocks: &[Block],
+    head_blocks: &[Block],
+    unmatched_base: &mut [bool],
+    unmatched_head: &mut [bool],
+) -> Vec<(usize, usize)> {
+    let mut base_by_identifier = semantic_block_indices(base_blocks);
+    let head_by_identifier = semantic_block_indices(head_blocks);
+    let mut matches = Vec::new();
+
+    for (identifier, base_indices) in base_by_identifier.drain() {
+        let Some(head_indices) = head_by_identifier.get(&identifier) else {
+            continue;
+        };
+        if base_indices.len() != 1 || head_indices.len() != 1 {
+            continue;
         }
-        Self { semantic_matches }
-    }
 
-    fn unique_semantic_match(
-        &self,
-        base_block: &Block,
-        head_blocks: &[Option<Block>],
-    ) -> Option<usize> {
-        let identifier = review_metadata::semantic_block_identifier(base_block)?;
-        let candidate_indices = self.semantic_matches.get(&(base_block.kind, identifier))?;
-        let mut available_matches = candidate_indices
-            .iter()
-            .copied()
-            .filter(|index| head_blocks[*index].is_some());
-        let index = available_matches.next()?;
-        available_matches.next().is_none().then_some(index)
+        let base_index = base_indices[0];
+        let head_index = head_indices[0];
+        if unmatched_base[base_index] && unmatched_head[head_index] {
+            unmatched_base[base_index] = false;
+            unmatched_head[head_index] = false;
+            matches.push((base_index, head_index));
+        }
     }
+    matches.sort_unstable_by_key(|(base_index, _)| *base_index);
+    matches
 }
 
-fn find_matching_head_block(
-    base_block: &Block,
-    head_blocks: &[Option<Block>],
-    head_match_index: &HeadBlockMatchIndex,
-    hunks: &[vcs::DiffHunk],
-) -> Option<usize> {
-    if let Some(index) = head_match_index.unique_semantic_match(base_block, head_blocks) {
-        return Some(index);
+fn semantic_block_indices(blocks: &[Block]) -> HashMap<(BlockKind, String), Vec<usize>> {
+    let mut by_identifier = HashMap::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let Some(identifier) = review_metadata::semantic_block_identifier(block) else {
+            continue;
+        };
+        by_identifier
+            .entry((block.kind, identifier))
+            .or_insert_with(Vec::new)
+            .push(index);
     }
+    by_identifier
+}
 
-    let mapped_base_range = mapped_head_range_for_base_block(base_block, hunks);
-    head_blocks
+fn reserve_unique_unchanged_line_matches(
+    base_blocks: &[Block],
+    head_blocks: &[Block],
+    unmatched_base: &mut [bool],
+    unmatched_head: &mut [bool],
+    unchanged_lines: &UnchangedLineIndex,
+) -> Vec<(usize, usize)> {
+    let base_choices = base_blocks
         .iter()
         .enumerate()
-        .filter_map(|(index, head_block)| {
-            let head_block = head_block.as_ref()?;
-            if head_block.kind != base_block.kind {
-                return None;
-            }
-            let head_range = head_block_line_range(head_block);
-            let overlap = line_range_overlap(&mapped_base_range, &head_range);
-            (overlap > 0).then_some((index, overlap))
+        .map(|(base_index, base)| {
+            unmatched_base[base_index].then(|| {
+                unique_best_overlap(
+                    head_blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(head_index, head)| {
+                            unmatched_head[*head_index] && head.kind == base.kind
+                        })
+                        .map(|(head_index, head)| {
+                            (head_index, unchanged_lines.overlap_for_blocks(base, head))
+                        }),
+                )
+            })
         })
-        .max_by_key(|(_, overlap)| *overlap)
-        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let head_choices = head_blocks
+        .iter()
+        .enumerate()
+        .map(|(head_index, head)| {
+            unmatched_head[head_index].then(|| {
+                unique_best_overlap(
+                    base_blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(base_index, base)| {
+                            unmatched_base[*base_index] && base.kind == head.kind
+                        })
+                        .map(|(base_index, base)| {
+                            (base_index, unchanged_lines.overlap_for_blocks(base, head))
+                        }),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut matches = Vec::new();
+    for (base_index, head_index) in base_choices.into_iter().enumerate() {
+        let Some(Some(head_index)) = head_index else {
+            continue;
+        };
+        if head_choices[head_index] == Some(Some(base_index)) {
+            unmatched_base[base_index] = false;
+            unmatched_head[head_index] = false;
+            matches.push((base_index, head_index));
+        }
+    }
+    matches
+}
+fn reserve_unique_positional_matches(
+    base_blocks: &[Block],
+    head_blocks: &[Block],
+    unmatched_base: &mut [bool],
+    unmatched_head: &mut [bool],
+    changed_lines: &vcs::DiffChangedLineIndex,
+    hunks: &[vcs::DiffHunk],
+) -> Vec<(usize, usize)> {
+    let base_reviewable = base_blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            unmatched_base[index]
+                && changed_lines.change_kind_for_block(vcs::DiffBlockOwnership::BaseOnly(block))
+                    == vcs::BlockDiffChangeKind::ReviewableChanges
+        })
+        .collect::<Vec<_>>();
+    let head_reviewable = head_blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            unmatched_head[index]
+                && changed_lines.change_kind_for_block(vcs::DiffBlockOwnership::HeadOnly(block))
+                    == vcs::BlockDiffChangeKind::ReviewableChanges
+        })
+        .collect::<Vec<_>>();
+    let mapped_base_ranges = base_blocks
+        .iter()
+        .map(|block| mapped_head_range_for_base_block(block, hunks))
+        .collect::<Vec<_>>();
+
+    let base_choices = base_blocks
+        .iter()
+        .enumerate()
+        .map(|(base_index, base)| {
+            base_reviewable[base_index].then(|| {
+                unique_best_overlap(
+                    head_blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(head_index, head)| {
+                            head_reviewable[*head_index] && head.kind == base.kind
+                        })
+                        .map(|(head_index, head)| {
+                            (
+                                head_index,
+                                line_range_overlap(
+                                    &mapped_base_ranges[base_index],
+                                    &block_line_range(head),
+                                ),
+                            )
+                        }),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let head_choices = head_blocks
+        .iter()
+        .enumerate()
+        .map(|(head_index, head)| {
+            head_reviewable[head_index].then(|| {
+                unique_best_overlap(
+                    base_blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(base_index, base)| {
+                            base_reviewable[*base_index] && base.kind == head.kind
+                        })
+                        .map(|(base_index, _)| {
+                            (
+                                base_index,
+                                line_range_overlap(
+                                    &mapped_base_ranges[base_index],
+                                    &block_line_range(head),
+                                ),
+                            )
+                        }),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut matches = Vec::new();
+    for (base_index, head_index) in base_choices.into_iter().enumerate() {
+        let Some(Some(head_index)) = head_index else {
+            continue;
+        };
+        if head_choices[head_index] == Some(Some(base_index)) {
+            unmatched_base[base_index] = false;
+            unmatched_head[head_index] = false;
+            matches.push((base_index, head_index));
+        }
+    }
+    matches
 }
 
+fn unique_best_overlap(overlaps: impl Iterator<Item = (usize, u32)>) -> Option<usize> {
+    let mut best_index = None;
+    let mut best_overlap = 0;
+    let mut tied = false;
+    for (index, overlap) in overlaps.filter(|(_, overlap)| *overlap > 0) {
+        if overlap > best_overlap {
+            best_index = Some(index);
+            best_overlap = overlap;
+            tied = false;
+        } else if overlap == best_overlap {
+            tied = true;
+        }
+    }
+    (!tied).then_some(best_index).flatten()
+}
 fn mapped_head_range_for_base_block(
     base_block: &Block,
     hunks: &[vcs::DiffHunk],
@@ -1222,8 +1345,10 @@ fn mapped_head_range_for_base_block(
 fn map_base_line_to_head_anchor(old_line: u32, hunks: &[vcs::DiffHunk]) -> u32 {
     let mut old_cursor = 1u32;
     let mut new_cursor = 1u32;
+    let mut sorted_hunks = hunks.iter().collect::<Vec<_>>();
+    sorted_hunks.sort_by_key(|hunk| (hunk.old_start, hunk.new_start));
 
-    for hunk in hunks {
+    for hunk in sorted_hunks {
         while old_cursor < hunk.old_start {
             if old_line == old_cursor {
                 return new_cursor;
@@ -1247,9 +1372,7 @@ fn map_base_line_to_head_anchor(old_line: u32, hunks: &[vcs::DiffHunk]) -> u32 {
                     }
                     old_cursor = old_cursor.saturating_add(1);
                 }
-                vcs::DiffLineKind::Added => {
-                    new_cursor = new_cursor.saturating_add(1);
-                }
+                vcs::DiffLineKind::Added => new_cursor = new_cursor.saturating_add(1),
             }
         }
     }
@@ -1259,7 +1382,152 @@ fn map_base_line_to_head_anchor(old_line: u32, hunks: &[vcs::DiffHunk]) -> u32 {
     u32::try_from(mapped.max(1).min(i64::from(u32::MAX))).unwrap_or(u32::MAX)
 }
 
-fn head_block_line_range(block: &Block) -> std::ops::Range<u32> {
+#[derive(Debug, Clone, Copy)]
+struct UnchangedLineSegment {
+    base_start: u32,
+    base_end: u32,
+    head_start: u32,
+}
+
+#[derive(Debug, Default)]
+struct UnchangedLineIndex {
+    segments: Vec<UnchangedLineSegment>,
+}
+
+impl UnchangedLineIndex {
+    fn from_hunks(hunks: &[vcs::DiffHunk]) -> Self {
+        let mut sorted_hunks = hunks.iter().collect::<Vec<_>>();
+        sorted_hunks.sort_by_key(|hunk| (hunk.old_start, hunk.new_start));
+
+        let mut index = Self::default();
+        let mut old_line = 1;
+        let mut new_line = 1;
+        for hunk in sorted_hunks {
+            index.push_segment(old_line, hunk.old_start, new_line);
+            old_line = hunk.old_start;
+            new_line = hunk.new_start;
+
+            for line in &hunk.lines {
+                match line.kind {
+                    vcs::DiffLineKind::Context => {
+                        index.push_segment(old_line, old_line.saturating_add(1), new_line);
+                        old_line = old_line.saturating_add(1);
+                        new_line = new_line.saturating_add(1);
+                    }
+                    vcs::DiffLineKind::Removed => old_line = old_line.saturating_add(1),
+                    vcs::DiffLineKind::Added => new_line = new_line.saturating_add(1),
+                }
+            }
+        }
+        index.push_segment(old_line, u32::MAX, new_line);
+        index
+    }
+
+    fn overlap_for_blocks(&self, base: &Block, head: &Block) -> u32 {
+        let base_range = block_line_range(base);
+        let head_range = block_line_range(head);
+        self.segments
+            .iter()
+            .map(|segment| {
+                let base_overlap_start = base_range.start.max(segment.base_start);
+                let base_overlap_end = base_range.end.min(segment.base_end);
+                if base_overlap_start >= base_overlap_end {
+                    return 0;
+                }
+
+                let offset = base_overlap_start.saturating_sub(segment.base_start);
+                let mapped_head_start = segment.head_start.saturating_add(offset);
+                let mapped_head_end =
+                    mapped_head_start.saturating_add(base_overlap_end - base_overlap_start);
+                line_range_overlap(&(mapped_head_start..mapped_head_end), &head_range)
+            })
+            .sum()
+    }
+
+    fn push_segment(&mut self, base_start: u32, base_end: u32, head_start: u32) {
+        if base_start >= base_end {
+            return;
+        }
+        if let Some(last) = self.segments.last_mut()
+            && last.base_end == base_start
+            && last
+                .head_start
+                .saturating_add(last.base_end - last.base_start)
+                == head_start
+        {
+            last.base_end = base_end;
+            return;
+        }
+        self.segments.push(UnchangedLineSegment {
+            base_start,
+            base_end,
+            head_start,
+        });
+    }
+}
+
+fn dedupe_diff_review_blocks(blocks: Vec<DiffReviewBlock>) -> Vec<DiffReviewBlock> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let identity = (
+            block
+                .sides
+                .base
+                .as_ref()
+                .map(|side| (side.hash.clone(), side.start_line, side.end_line)),
+            block
+                .sides
+                .head
+                .as_ref()
+                .map(|side| (side.hash.clone(), side.start_line, side.end_line)),
+        );
+        if seen.insert(identity) {
+            deduped.push(block);
+        }
+    }
+    sort_diff_review_blocks(&mut deduped);
+    deduped
+}
+
+fn sort_diff_review_blocks(blocks: &mut [DiffReviewBlock]) {
+    blocks.sort_by(|left, right| {
+        let left_display = left.display_block();
+        let right_display = right.display_block();
+        (
+            left_display.start_line,
+            left_display.end_line,
+            left_display.kind.default_review_priority(),
+            left_display.hash.as_str(),
+            left.sides
+                .base
+                .as_ref()
+                .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+            left.sides
+                .head
+                .as_ref()
+                .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+        )
+            .cmp(&(
+                right_display.start_line,
+                right_display.end_line,
+                right_display.kind.default_review_priority(),
+                right_display.hash.as_str(),
+                right
+                    .sides
+                    .base
+                    .as_ref()
+                    .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+                right
+                    .sides
+                    .head
+                    .as_ref()
+                    .map(|side| (side.hash.as_str(), side.start_line, side.end_line)),
+            ))
+    });
+}
+
+fn block_line_range(block: &Block) -> std::ops::Range<u32> {
     let start = u32::try_from(block.start_line.saturating_add(1)).unwrap_or(u32::MAX);
     let end = u32::try_from(block.end_line.saturating_add(1)).unwrap_or(u32::MAX);
     start..end
@@ -1580,6 +1848,33 @@ mod tests {
     fn diff_review_blocks(blocks: &[DiffReviewBlock]) -> Vec<&DiffBlockSides> {
         blocks.iter().map(|block| &block.sides).collect()
     }
+    fn rust_review_blocks(content: &str) -> Vec<Block> {
+        crate::block_splitter::split(content, Language::Rust).into_review_blocks()
+    }
+    fn target_file_diff_input(
+        source_path: &str,
+        base_content: &str,
+        base_blocks: Vec<Block>,
+        hunk: vcs::DiffHunk,
+    ) -> TargetFileDiffInput {
+        let source_location = RepoPath::new(source_path).unwrap();
+        let location = RepoPath::new("src/dest.rs").unwrap();
+        TargetFileDiffInput {
+            base: Some(crate::block::FileState::from_text(
+                source_location.clone(),
+                Language::Rust,
+                base_content.as_bytes(),
+                base_blocks,
+            )),
+            file_diff: vcs::FileDiff::Text {
+                changed_path: vcs::ChangedPath {
+                    source_location,
+                    location,
+                },
+                hunks: vec![hunk],
+            },
+        }
+    }
 
     #[test]
     fn classify_file_change_kind_marks_head_and_base_as_changed() {
@@ -1847,6 +2142,359 @@ mod tests {
             Some(adjacent.hash.as_str())
         );
         assert!(sides[1].base.is_none());
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_block_start_removal_marks_attached_attribute_as_changed() {
+        let base_blocks = rust_review_blocks("#[inline]\npub fn retained() {}\n");
+        let head_blocks = rust_review_blocks("pub fn retained() {}\n");
+        assert_eq!(base_blocks.len(), 1);
+        assert_eq!(head_blocks.len(), 1);
+
+        let blocks = collect_diff_review_blocks_for_file(
+            &base_blocks,
+            &head_blocks,
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("#[inline]\n"),
+                    vcs::DiffHunkLine::context("pub fn retained() {}\n"),
+                ],
+            }],
+        );
+
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected one paired review unit: {blocks:?}"
+        );
+        assert_eq!(blocks[0].change_kind, BlockChangeKind::Changed);
+        assert_eq!(
+            blocks[0]
+                .sides
+                .base
+                .as_ref()
+                .map(|block| block.hash.as_str()),
+            Some(base_blocks[0].hash.as_str())
+        );
+        assert_eq!(
+            blocks[0]
+                .sides
+                .head
+                .as_ref()
+                .map(|block| block.hash.as_str()),
+            Some(head_blocks[0].hash.as_str())
+        );
+        assert_eq!(blocks[0].display_block().hash, head_blocks[0].hash);
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_block_start_removal_marks_attached_doc_comment_as_changed() {
+        let base_blocks = rust_review_blocks("/// Retained documentation.\npub fn retained() {}\n");
+        let head_blocks = rust_review_blocks("pub fn retained() {}\n");
+        assert_eq!(base_blocks.len(), 1);
+        assert_eq!(head_blocks.len(), 1);
+
+        let blocks = collect_diff_review_blocks_for_file(
+            &base_blocks,
+            &head_blocks,
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("/// Retained documentation.\n"),
+                    vcs::DiffHunkLine::context("pub fn retained() {}\n"),
+                ],
+            }],
+        );
+
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected one paired review unit: {blocks:?}"
+        );
+        assert_eq!(blocks[0].change_kind, BlockChangeKind::Changed);
+        assert_eq!(
+            blocks[0]
+                .sides
+                .base
+                .as_ref()
+                .map(|block| block.hash.as_str()),
+            Some(base_blocks[0].hash.as_str())
+        );
+        assert_eq!(
+            blocks[0]
+                .sides
+                .head
+                .as_ref()
+                .map(|block| block.hash.as_str()),
+            Some(head_blocks[0].hash.as_str())
+        );
+        assert_eq!(blocks[0].display_block().hash, head_blocks[0].hash);
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_block_start_removal_does_not_attribute_predecessor_to_survivor() {
+        let base_blocks = rust_review_blocks("pub fn removed() {}\npub fn retained() {}\n");
+        let head_blocks = rust_review_blocks("pub fn retained() {}\n");
+        assert_eq!(base_blocks.len(), 2);
+        assert_eq!(head_blocks.len(), 1);
+
+        let blocks = collect_diff_review_blocks_for_file(
+            &base_blocks,
+            &head_blocks,
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("pub fn removed() {}\n"),
+                    vcs::DiffHunkLine::context("pub fn retained() {}\n"),
+                ],
+            }],
+        );
+
+        assert_eq!(
+            blocks.len(),
+            1,
+            "unexpected survivor review unit: {blocks:?}"
+        );
+        assert_eq!(blocks[0].change_kind, BlockChangeKind::Deleted);
+        assert_eq!(
+            blocks[0]
+                .sides
+                .base
+                .as_ref()
+                .map(|block| block.hash.as_str()),
+            Some(base_blocks[0].hash.as_str())
+        );
+        assert!(blocks[0].sides.head.is_none());
+        assert!(
+            blocks.iter().all(|block| {
+                block
+                    .sides
+                    .head
+                    .as_ref()
+                    .is_none_or(|head| head.hash != head_blocks[0].hash)
+            }),
+            "retained block must not be paired or added: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_keeps_block_start_replacement_paired() {
+        let base = make_diff_block(
+            "base-retained",
+            BlockKind::Function,
+            0,
+            1,
+            "pub fn retained() {}\n",
+        );
+        let head = make_diff_block(
+            "head-retained",
+            BlockKind::Function,
+            0,
+            1,
+            "fn retained() {}\n",
+        );
+
+        let blocks = collect_diff_review_blocks_for_file(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&head),
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("pub fn retained() {}\n"),
+                    vcs::DiffHunkLine::added("fn retained() {}\n"),
+                ],
+            }],
+        );
+
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected one paired review unit: {blocks:?}"
+        );
+        assert_eq!(blocks[0].change_kind, BlockChangeKind::Changed);
+        assert_eq!(
+            blocks[0]
+                .sides
+                .base
+                .as_ref()
+                .map(|block| block.hash.as_str()),
+            Some(base.hash.as_str())
+        );
+        assert_eq!(
+            blocks[0]
+                .sides
+                .head
+                .as_ref()
+                .map(|block| block.hash.as_str()),
+            Some(head.hash.as_str())
+        );
+    }
+
+    #[test]
+    fn collect_diff_review_blocks_filters_block_start_whitespace_churn() {
+        let base = make_diff_block("base-whitespace", BlockKind::Code, 0, 1, " \n");
+        let head = make_diff_block("head-whitespace", BlockKind::Code, 0, 1, "\t\n");
+
+        let blocks = collect_diff_review_blocks_for_file(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&head),
+            &[vcs::DiffHunk {
+                file_path: RepoPath::new("src/lib.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed(" \n"),
+                    vcs::DiffHunkLine::added("\t\n"),
+                ],
+            }],
+        );
+
+        assert!(
+            blocks.is_empty(),
+            "whitespace churn must be absent: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn collect_diff_review_files_block_start_removal_scopes_ownership_by_target_source_path() {
+        let head_blocks = rust_review_blocks("pub fn retained() {}\n");
+        let base_a_blocks = rust_review_blocks("#[inline]\npub fn retained() {}\n");
+        let base_b_blocks = rust_review_blocks("pub fn removed() {}\npub fn retained() {}\n");
+        assert_eq!(head_blocks.len(), 1);
+        assert_eq!(base_a_blocks.len(), 1);
+        assert_eq!(base_b_blocks.len(), 2);
+
+        let target_a = target_file_diff_input(
+            "src/old-a.rs",
+            "#[inline]\npub fn retained() {}\n",
+            base_a_blocks.clone(),
+            vcs::DiffHunk {
+                file_path: RepoPath::new("src/dest.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("#[inline]\n"),
+                    vcs::DiffHunkLine::context("pub fn retained() {}\n"),
+                ],
+            },
+        );
+        let target_b = target_file_diff_input(
+            "src/old-b.rs",
+            "pub fn removed() {}\npub fn retained() {}\n",
+            base_b_blocks.clone(),
+            vcs::DiffHunk {
+                file_path: RepoPath::new("src/dest.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("pub fn removed() {}\n"),
+                    vcs::DiffHunkLine::context("pub fn retained() {}\n"),
+                ],
+            },
+        );
+
+        let blocks = collect_diff_review_blocks_for_target_inputs(
+            &[target_a.clone(), target_b.clone()],
+            &head_blocks,
+        );
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected one result per target: {blocks:?}"
+        );
+        assert!(blocks.iter().any(|block| {
+            block.change_kind == BlockChangeKind::Changed
+                && block
+                    .sides
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| base.hash == base_a_blocks[0].hash)
+                && block
+                    .sides
+                    .head
+                    .as_ref()
+                    .is_some_and(|head| head.hash == head_blocks[0].hash)
+        }));
+        assert!(blocks.iter().any(|block| {
+            block.change_kind == BlockChangeKind::Deleted
+                && block
+                    .sides
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| base.hash == base_b_blocks[0].hash)
+                && block.sides.head.is_none()
+        }));
+        let reversed =
+            collect_diff_review_blocks_for_target_inputs(&[target_b, target_a], &head_blocks);
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.display_block().hash.clone())
+                .collect::<Vec<_>>(),
+            reversed
+                .iter()
+                .map(|block| block.display_block().hash.clone())
+                .collect::<Vec<_>>(),
+            "target processing order must not change final display ordering"
+        );
+    }
+
+    #[test]
+    fn collect_diff_review_files_block_start_removal_preserves_duplicate_target_boundaries() {
+        let head_blocks = rust_review_blocks("pub fn retained() {}\n");
+        let base_blocks = rust_review_blocks("#[inline]\npub fn retained() {}\n");
+        let input = target_file_diff_input(
+            "src/old.rs",
+            "#[inline]\npub fn retained() {}\n",
+            base_blocks.clone(),
+            vcs::DiffHunk {
+                file_path: RepoPath::new("src/dest.rs").unwrap(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    vcs::DiffHunkLine::removed("#[inline]\n"),
+                    vcs::DiffHunkLine::context("pub fn retained() {}\n"),
+                ],
+            },
+        );
+
+        let per_target = collect_diff_review_blocks_for_file(
+            input
+                .base
+                .as_ref()
+                .map(|base| base.blocks.as_slice())
+                .unwrap(),
+            &head_blocks,
+            input.file_diff.hunks(),
+        );
+        assert_eq!(per_target.len(), 1);
+        assert_eq!(per_target[0].change_kind, BlockChangeKind::Changed);
+
+        let blocks =
+            collect_diff_review_blocks_for_target_inputs(&[input.clone(), input], &head_blocks);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "duplicate inputs must survive mapping then deduplicate visibly: {blocks:?}"
+        );
+        assert_eq!(blocks[0].change_kind, BlockChangeKind::Changed);
+        assert_eq!(
+            blocks[0].sides.base.as_ref().map(|base| base.hash.as_str()),
+            Some(base_blocks[0].hash.as_str())
+        );
+        assert_eq!(
+            blocks[0].sides.head.as_ref().map(|head| head.hash.as_str()),
+            Some(head_blocks[0].hash.as_str())
+        );
     }
 
     #[test]
