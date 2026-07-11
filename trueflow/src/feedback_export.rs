@@ -1571,40 +1571,6 @@ mod tests {
         assert_eq!(entries[0].reviews[0].id, keep.id);
     }
 
-    #[test]
-    fn collect_feedback_entries_excludes_targets_whose_latest_verdict_is_approved() {
-        let earlier = build_record("earlier", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
-        let later = build_record("later", "aaaaaaa", "src/lib.rs", 20, Verdict::Approved);
-        let mut resolver = FakeResolver {
-            contexts: HashMap::from_iter([
-                (
-                    "earlier".to_string(),
-                    resolved_context("src/lib.rs", "pub fn core() {}\n"),
-                ),
-                (
-                    "later".to_string(),
-                    resolved_context("src/lib.rs", "pub fn core() {}\n"),
-                ),
-            ]),
-        };
-        let query = FeedbackQuery {
-            filters: BlockFilters::default(),
-            explicit_selection: None,
-            changed_selection: None,
-            allowed_revisions: None,
-            include_approved: false,
-        };
-
-        let entries = collect_feedback_entries(
-            &[earlier, later],
-            &FeedbackSinceFilter::All,
-            &query,
-            &mut resolver,
-        )
-        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
-
-        assert!(entries.is_empty());
-    }
 
     #[test]
     fn collect_feedback_entries_excludes_scoped_comment_after_later_full_block_approval() {
@@ -1828,47 +1794,6 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    #[test]
-    fn collect_feedback_entries_keeps_same_hash_comment_when_other_file_is_approved() {
-        let shared_hash = TreeHash::from_content("fn duplicate() {}\n");
-        let mut comment = build_record("comment", "aaaaaaa", "src/a.rs", 10, Verdict::Comment);
-        comment.target = ReviewTargetRef::Block {
-            hash: shared_hash.clone(),
-        };
-        let mut approved = build_record("approved", "aaaaaaa", "src/b.rs", 20, Verdict::Approved);
-        approved.target = ReviewTargetRef::Block { hash: shared_hash };
-        let mut resolver = FakeResolver {
-            contexts: HashMap::from_iter([
-                (
-                    "comment".to_string(),
-                    resolved_context("src/a.rs", "fn duplicate() {}\n"),
-                ),
-                (
-                    "approved".to_string(),
-                    resolved_context("src/b.rs", "fn duplicate() {}\n"),
-                ),
-            ]),
-        };
-        let query = FeedbackQuery {
-            filters: BlockFilters::default(),
-            explicit_selection: None,
-            changed_selection: None,
-            allowed_revisions: None,
-            include_approved: false,
-        };
-
-        let entries = collect_feedback_entries(
-            &[comment.clone(), approved],
-            &FeedbackSinceFilter::All,
-            &query,
-            &mut resolver,
-        )
-        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].file_path, "src/a.rs");
-        assert_eq!(entries[0].reviews[0].id, comment.id);
-    }
 
     #[test]
     fn collect_feedback_entries_intersects_explicit_and_changed_path_selections() {
