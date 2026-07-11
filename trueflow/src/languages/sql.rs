@@ -325,7 +325,6 @@ mod tests {
             .unwrap_or_else(|| panic!("parse SQL source"))
     }
 
-
     #[test]
     fn split_top_level_attaches_leading_comment_to_following_statement() {
         let source = "-- docs for report\nSELECT id FROM accounts;\n";

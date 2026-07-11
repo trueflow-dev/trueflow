@@ -1245,7 +1245,6 @@ mod tests {
         assert!(!payload.contains("comment_context"));
     }
 
-
     #[test]
     fn parse_records_jsonl_reports_skipped_legacy_diff_target_records() {
         let content = concat!(

@@ -611,7 +611,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn split_inline_table_children_emits_key_value_pairs() {
         let source = "targets = { primary = \"cache\", secondary = \"backup\" }";

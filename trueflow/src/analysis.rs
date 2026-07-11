@@ -262,7 +262,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn analyze_file_detects_kotlin_script_by_extension() {
         assert!(matches!(
@@ -272,7 +271,6 @@ mod tests {
             })
         ));
     }
-
 
     #[test]
     fn wave2_language_registrations_smoke() {

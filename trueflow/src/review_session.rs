@@ -134,7 +134,6 @@ mod tests {
         assert_eq!(selected, expected);
     }
 
-
     #[test]
     fn action_block_ids_for_file_includes_all_visible_descendant_blocks() {
         let mut builder = TreeBuilder::new();
@@ -254,5 +253,4 @@ mod tests {
         let next = next_review_target(&navigator, &order, &remaining, impl_block);
         assert_eq!(next, Some(tail));
     }
-
 }

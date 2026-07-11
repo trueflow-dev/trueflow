@@ -85,7 +85,6 @@ mod tests {
     use super::*;
     use tree_sitter::Parser;
 
-
     #[test]
     fn collect_impl_member_spans_keep_trailing_attributes_as_code() {
         let source = "impl Worker {\n    #[cfg(test)]\n}\n";

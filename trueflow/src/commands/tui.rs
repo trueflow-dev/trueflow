@@ -12564,7 +12564,6 @@ mod diff_scope_tests {
         );
     }
 
-
     #[test]
     fn build_mode_banner_line_shows_navigation_mode() {
         let mut state = build_test_state(ScopePreset::All, HashMap::new());
@@ -13307,8 +13306,6 @@ mod diff_scope_tests {
             ]
         );
     }
-
-
 
     #[test]
     fn build_header_lines_show_unknown_change_when_diff_metadata_missing() {

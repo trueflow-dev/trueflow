@@ -833,7 +833,6 @@ fn create_sub_block(
 mod tests {
     use super::*;
 
-
     #[test]
     fn split_type_like_review_units_preserves_full_class_content() {
         let source =
@@ -850,5 +849,4 @@ mod tests {
 
         assert_eq!(rebuilt, source);
     }
-
 }

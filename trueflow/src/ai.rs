@@ -1063,14 +1063,12 @@ mod tests {
     fn suggestion_request_key_tracks_every_cache_identity_dimension() {
         let base_review_set = review_set();
         let base_context = review_context("fn checked() {}");
-        let key_for = |
-            provider,
-            model: &str,
-            review_set: &AiReviewSetContext,
-            context: &AiReviewContext,
-            max_context_lines,
-            max_response_chars,
-        | {
+        let key_for = |provider,
+                       model: &str,
+                       review_set: &AiReviewSetContext,
+                       context: &AiReviewContext,
+                       max_context_lines,
+                       max_response_chars| {
             AiSuggestionRequest::with_response_char_limit(
                 provider,
                 model.to_string(),

@@ -3,7 +3,6 @@ use chrono::{Duration, Utc};
 
 use trueflow_test_support::{FeedbackScenario, ReviewRecordOverrides};
 
-
 #[test]
 fn test_feedback_since_relative_duration_survives_tree_drift() -> Result<()> {
     let scenario = FeedbackScenario::new("feedback_relative_since_tree_drift")?;
@@ -162,7 +161,6 @@ fn test_feedback_target_dir_and_revision_intersect() -> Result<()> {
     Ok(())
 }
 
-
 #[test]
 fn test_feedback_target_revision_range_includes_in_range_reviews_on_unchanged_files() -> Result<()>
 {
@@ -203,4 +201,3 @@ fn test_feedback_target_revision_range_includes_in_range_reviews_on_unchanged_fi
 
     Ok(())
 }
-

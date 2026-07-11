@@ -1571,7 +1571,6 @@ mod tests {
         assert_eq!(entries[0].reviews[0].id, keep.id);
     }
 
-
     #[test]
     fn collect_feedback_entries_excludes_scoped_comment_after_later_full_block_approval() {
         let mut comment = build_record("comment", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
@@ -1794,7 +1793,6 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-
     #[test]
     fn collect_feedback_entries_intersects_explicit_and_changed_path_selections() {
         let keep = build_record("keep", "aaaaaaa", "src/keep.rs", 10, Verdict::Comment);
@@ -1972,7 +1970,6 @@ mod tests {
         .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
         assert_eq!(feedback_entry_ids(&entries), vec!["appended"]);
     }
-
 
     #[test]
     fn resolve_record_in_files_uses_line_hint_for_duplicate_block_hashes() {

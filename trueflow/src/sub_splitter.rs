@@ -2473,7 +2473,6 @@ mod tests {
         assert_eq!(merge_blocks(chunks), content);
     }
 
-
     #[test]
     fn test_sub_blocks_do_not_inherit_parent_complexity() {
         let content = "fn foo() {\n    if true {\n        run();\n    }\n\n    finish();\n}";

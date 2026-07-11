@@ -30,7 +30,6 @@ fn configure_tui_pty_command(cmd: &mut CommandBuilder) {
     }
 }
 
-
 struct PtyOutput {
     state: Mutex<PtyOutputState>,
     changed: Condvar,

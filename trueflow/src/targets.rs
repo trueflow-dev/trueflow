@@ -592,7 +592,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn dir_target_rejects_absolute_path() {
         assert!(ReviewTarget::from_cli("dir:/tmp/absolute").is_err());
@@ -745,7 +744,6 @@ mod tests {
         assert!(explicit_source_selection.includes(&inside_to_outside.location));
     }
 
-
     #[test]
     fn resolve_targets_rejects_mixed_historical_and_worktree_content_sources() {
         let targets = vec![
@@ -794,7 +792,6 @@ mod tests {
             ReviewDiffSelection::Targets(_)
         ));
     }
-
 
     #[test]
     fn resolve_targets_intersects_explicit_file_and_changed_paths() {

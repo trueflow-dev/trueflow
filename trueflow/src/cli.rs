@@ -644,7 +644,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn review_command_accepts_whitespace_exclude_alias() {
         let cli = Cli::parse_from(["trueflow", "review", "--exclude", "whitespace"]);

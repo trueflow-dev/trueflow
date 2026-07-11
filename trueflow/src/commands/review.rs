@@ -2048,7 +2048,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn parse_review_request_defaults_to_dirty_worktree() {
         let request = parse_review_request(false, &[], None)
@@ -2106,7 +2105,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn expand_cli_review_targets_combines_since_with_explicit_targets() {
         let targets = expand_cli_review_targets_with(
@@ -2124,7 +2122,6 @@ mod tests {
             ]
         );
     }
-
 
     #[test]
     fn collect_review_returns_empty_without_scanning_when_path_selection_is_empty() {

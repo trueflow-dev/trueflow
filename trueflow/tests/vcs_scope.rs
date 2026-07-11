@@ -28,7 +28,6 @@ fn test_recent_commits_in_repo_returns_head_first() -> Result<()> {
     Ok(())
 }
 
-
 #[test]
 fn test_files_changed_main_to_head_preserves_rename_source_and_destination() -> Result<()> {
     let repo = TestRepo::new("main_diff_rename_pair")?;
@@ -108,7 +107,6 @@ fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
 
     Ok(())
 }
-
 
 #[test]
 fn dirty_files_reports_staged_only_deletion() -> Result<()> {

@@ -141,7 +141,6 @@ impl ReviewOrder {
     fn ordered_ids(&self) -> Vec<TreeNodeId> {
         self.ordered.iter().map(|cursor| cursor.node_id).collect()
     }
-
 }
 
 fn review_band_from_kind_rank(kind_rank: u8) -> ReviewBand {
@@ -447,7 +446,6 @@ mod tests {
 
         assert_eq!(order.ordered_ids(), vec![helper_block_id, source_block_id]);
     }
-
 
     #[test]
     fn next_remaining_after_uses_typed_anchor_for_block_and_subtree() {

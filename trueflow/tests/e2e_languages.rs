@@ -66,8 +66,6 @@ fn test_all_languages_detection() -> Result<()> {
     Ok(())
 }
 
-
-
 #[test]
 fn test_all_languages_java_blocks_are_structural() -> Result<()> {
     let repo = TestRepo::fixture("all_languages")?;

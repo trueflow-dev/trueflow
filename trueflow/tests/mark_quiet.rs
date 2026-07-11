@@ -2,7 +2,6 @@ use anyhow::Result;
 
 use trueflow_test_support::{TestRepo, first_block_hash, json_array};
 
-
 #[test]
 fn test_mark_default_is_silent() -> Result<()> {
     let repo = TestRepo::new("mark_default_silent")?;

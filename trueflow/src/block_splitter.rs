@@ -2631,7 +2631,6 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(merged, content);
     }
 
-
     #[test]
     fn test_split_markdown_headers() {
         let result = split_result(
@@ -2966,8 +2965,6 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
     }
-
-
 
     #[test]
     fn test_split_rust_impl_methods() {

@@ -792,7 +792,6 @@ fn create_sub_block(
 mod tests {
     use super::*;
 
-
     #[test]
     fn ocaml_comment_helpers_recognize_nested_comment_only_chunks() {
         let chunk = "  (* outer (* inner *) comment *)\n\n";

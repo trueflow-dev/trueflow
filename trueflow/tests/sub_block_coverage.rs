@@ -437,4 +437,3 @@ fn test_hash_only_approval_does_not_cover_duplicate_generated_review_units() -> 
 
     Ok(())
 }
-

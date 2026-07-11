@@ -181,7 +181,6 @@ mod tests {
         );
     }
 
-
     fn parse_tree(source: &str) -> tree_sitter::Tree {
         let mut parser = Parser::new();
         parser
