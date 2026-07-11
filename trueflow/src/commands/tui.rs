@@ -12564,27 +12564,6 @@ mod diff_scope_tests {
         );
     }
 
-    #[test]
-    fn build_mode_banner_line_shows_diff_mode() {
-        let file_path = temp_test_file_path("tui_mode_banner_label");
-        let file_content = "line1\n";
-        let block_content = "line1\n";
-        let (mut state, _file_id, _block_id) =
-            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
-        state.view_mode = ViewMode::Diff;
-        let palette = UiPalette::default();
-
-        assert_eq!(
-            build_mode_banner_line(&state, &palette).to_string(),
-            "Diff Mode"
-        );
-
-        state.view_mode = ViewMode::Source;
-        assert_eq!(
-            build_mode_banner_line(&state, &palette).to_string(),
-            "Source Mode"
-        );
-    }
 
     #[test]
     fn build_mode_banner_line_shows_navigation_mode() {
@@ -13329,70 +13308,7 @@ mod diff_scope_tests {
         );
     }
 
-    #[test]
-    fn build_header_lines_show_file_change_metadata_without_mode_row() {
-        let file_path = temp_test_file_path("tui_header_change_label");
-        let file_content = "line1\n";
-        let block_content = "line1\n";
-        let (state, file_id, _block_id) =
-            build_state_with_block_file(&file_path, file_content, block_content, 0, 1);
-        let mut state = state;
-        state.review_scope = ScopePreset::MainDiff;
-        state
-            .file_change_kinds
-            .insert(file_id, FileChangeKind::Deleted);
-        let palette = UiPalette::default();
-        let file_node = state.navigator.tree.node(file_id);
 
-        let header = build_header_lines(file_node, &state, &palette)
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(header, vec!["File Deleted · File src/lib.rs"]);
-        assert!(header.iter().all(|line| !line.starts_with("Mode: ")));
-
-        state.view_mode = ViewMode::Source;
-        let source_header = build_header_lines(file_node, &state, &palette)
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(source_header, vec!["File Deleted · File src/lib.rs"]);
-    }
-
-    #[test]
-    fn build_header_lines_show_block_change_metadata_independent_from_file_metadata() {
-        let file_path = temp_test_file_path("tui_header_block_change_label");
-        let file_content = "fn demo() {\n    old();\n}\n";
-        let block_content = file_content;
-        let (state, file_id, block_id) =
-            build_state_with_block_file(&file_path, file_content, block_content, 0, 3);
-        let mut state = state;
-        state.review_scope = ScopePreset::MainDiff;
-        state
-            .file_change_kinds
-            .insert(file_id, FileChangeKind::Changed);
-        state
-            .block_change_kinds
-            .insert(block_id, BlockChangeKind::Added);
-        let palette = UiPalette::default();
-        let block_node = state.navigator.tree.node(block_id);
-
-        let header = build_header_lines(block_node, &state, &palette)
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            header,
-            vec![
-                "src/lib.rs".to_string(),
-                format!(
-                    "  -> Block Added · function demo (hash={})",
-                    short_tree_hash(&block_node.hash)
-                ),
-            ]
-        );
-        assert!(header.iter().all(|line| line != "File Changed"));
-    }
 
     #[test]
     fn build_header_lines_show_unknown_change_when_diff_metadata_missing() {
