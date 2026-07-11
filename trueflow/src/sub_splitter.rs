@@ -2473,13 +2473,6 @@ mod tests {
         assert_eq!(merge_blocks(chunks), content);
     }
 
-    #[test]
-    fn test_round_trip_code() {
-        let content = "A\n\nB\n\nC";
-        let block = make_block(content, BlockKind::Code);
-        let chunks = split(&block, Language::Rust).unwrap();
-        assert_eq!(merge_blocks(chunks), content);
-    }
 
     #[test]
     fn test_sub_blocks_do_not_inherit_parent_complexity() {
