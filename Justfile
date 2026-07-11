@@ -3,7 +3,7 @@ default:
     @just --list
 
 # Run the default local gate (tests, lint, fmt)
-check: test lint fmt-check test-release-publication
+check: test lint fmt-check test-release-publication test-installer
 
 # Run the faster no-test local gate (lint, fmt)
 check-fast: lint fmt-check
@@ -66,6 +66,10 @@ test:
 # Run deterministic network-free release publication safety contracts
 test-release-publication:
     sh scripts/tests/release-publication-safety.sh
+
+# Run deterministic network-free installer safety contracts
+test-installer:
+    sh scripts/tests/installer-safety.sh
 
 # Run the broad local test path without benches
 test-code:

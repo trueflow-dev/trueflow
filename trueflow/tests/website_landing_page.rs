@@ -21,63 +21,8 @@ fn assert_contains(haystack: &str, needle: &str, context: &str) {
     );
 }
 
-fn assert_not_contains(haystack: &str, needle: &str, context: &str) {
-    assert!(
-        !haystack.contains(needle),
-        "expected {context} to not contain {needle:?}"
-    );
-}
 
 
-#[test]
-fn website_install_script_targets_same_domain_and_macos_arm64() -> Result<()> {
-    let script = read_repo_file("website/install.sh")?;
-
-    assert_contains(
-        &script,
-        "BASE_URL=\"${TRUEFLOW_BASE_URL:-https://trueflow.dev}\"",
-        "installer base url",
-    );
-    assert_contains(
-        &script,
-        "DEFAULT_VERSION=\"v0.1.1\"",
-        "installer default version",
-    );
-    assert_contains(
-        &script,
-        "aarch64-apple-darwin",
-        "installer macos supported target",
-    );
-    assert_contains(
-        &script,
-        "x86_64-unknown-linux-musl",
-        "installer linux supported target",
-    );
-    assert_contains(
-        &script,
-        "trueflow-${VERSION}-${TARGET}.tar.gz",
-        "installer artifact naming",
-    );
-    assert_contains(
-        &script,
-        "trueflow-${VERSION}-SHA256SUMS.txt",
-        "installer checksum naming",
-    );
-    assert_contains(&script, "--version", "installer pinned version flag");
-    assert_contains(&script, "--to", "installer custom install dir flag");
-    assert_not_contains(
-        &script,
-        "current draft support is Apple Silicon macOS only",
-        "installer stale draft support message",
-    );
-    assert_not_contains(
-        &script,
-        "current support is Apple Silicon macOS only",
-        "installer stale single-platform support message",
-    );
-
-    Ok(())
-}
 
 
 #[test]
