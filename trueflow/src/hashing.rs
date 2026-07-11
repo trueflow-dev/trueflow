@@ -139,9 +139,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hash_str_snapshot() {
-        let raw_hello_hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
-        assert_ne!(hash_str("hello"), raw_hello_hash);
+    fn canonical_text_hash_has_stable_protocol_fingerprint() {
+        assert_eq!(
+            hash_str("hello").as_str(),
+            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
     }
 
     #[test]
