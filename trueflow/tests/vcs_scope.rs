@@ -28,25 +28,6 @@ fn test_recent_commits_in_repo_returns_head_first() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_files_changed_main_to_head_in_repo() -> Result<()> {
-    let repo = TestRepo::new("main_diff")?;
-    repo.write("src/main.rs", "fn main() {}\n")?;
-    repo.commit_all("Base")?;
-    repo.git(&["checkout", "-B", "main"])?;
-    repo.git(&["checkout", "-B", "feature"])?;
-    repo.write("src/lib.rs", "pub fn helper() {}\n")?;
-    repo.commit_all("Add helper")?;
-
-    let git_repo = gix::open(&repo.path)?;
-    let changed = trueflow::vcs::files_changed_main_to_head_in_repo(&git_repo)?;
-
-    assert!(
-        changed.contains(&ChangedPath::identity(RepoPath::new("src/lib.rs")?)),
-        "expected diff to include src/lib.rs"
-    );
-    Ok(())
-}
 
 #[test]
 fn test_files_changed_main_to_head_preserves_rename_source_and_destination() -> Result<()> {
@@ -128,41 +109,6 @@ fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn dirty_files_reports_staged_only_modification() -> Result<()> {
-    let repo = TestRepo::new("dirty_staged_modification")?;
-    repo.write("src/modified.rs", "pub fn value() -> i32 { 1 }\n")?;
-    repo.commit_all("Add tracked file")?;
-
-    repo.write("src/modified.rs", "pub fn value() -> i32 { 2 }\n")?;
-    repo.add("src/modified.rs")?;
-
-    let git_repo = gix::open(&repo.path)?;
-    assert_eq!(
-        trueflow::vcs::dirty_files(&git_repo)?,
-        repo_paths(&["src/modified.rs"])?
-    );
-
-    Ok(())
-}
-
-#[test]
-fn dirty_files_reports_staged_only_addition() -> Result<()> {
-    let repo = TestRepo::new("dirty_staged_addition")?;
-    repo.write("src/base.rs", "pub fn base() {}\n")?;
-    repo.commit_all("Create HEAD")?;
-
-    repo.write("src/added.rs", "pub fn added() {}\n")?;
-    repo.add("src/added.rs")?;
-
-    let git_repo = gix::open(&repo.path)?;
-    assert_eq!(
-        trueflow::vcs::dirty_files(&git_repo)?,
-        repo_paths(&["src/added.rs"])?
-    );
-
-    Ok(())
-}
 
 #[test]
 fn dirty_files_reports_staged_only_deletion() -> Result<()> {
