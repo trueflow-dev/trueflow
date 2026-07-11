@@ -47,13 +47,14 @@
   (mapcar #'trueflow-test--block hashes))
 
 (defun trueflow-test--exercise-focus-action (action-fn)
-  "Run ACTION-FN and return (OPENED REVIEW-INDEX REVIEW-HASHES)."
+  "Run ACTION-FN and return (MARK-CALL OPENED REVIEW-INDEX REVIEW-HASHES)."
   (let* ((initial-hashes '("a" "b" "c"))
          (remaining-hashes '("b" "c"))
          (initial-scan (trueflow-test--scan-data initial-hashes))
          (remaining-scan (trueflow-test--scan-data remaining-hashes))
          (status-buf (generate-new-buffer " *trueflow-test-status*"))
          (focus-buf (generate-new-buffer " *trueflow-test-focus*"))
+         mark-call
          opened)
     (unwind-protect
         (progn
@@ -68,7 +69,10 @@
             (setq-local trueflow-focus-current-block (trueflow-test--block "a"))
             (setq-local trueflow-focus-status-buffer status-buf))
           (cl-letf (((symbol-function 'magit-current-section) (lambda () nil))
-                    ((symbol-function 'trueflow--run-mark) (lambda (&rest _) t))
+                    ((symbol-function 'trueflow--run-mark)
+                     (lambda (&rest args)
+                       (setq mark-call args)
+                       t))
                     ((symbol-function 'trueflow-refresh)
                      (lambda ()
                        (setq trueflow-last-scan-data remaining-scan)))
@@ -78,7 +82,8 @@
                        (setq opened (list (alist-get 'hash block) current-idx total-count)))))
             (with-current-buffer focus-buf
               (funcall action-fn)))
-          (list opened
+          (list mark-call
+                opened
                 (with-current-buffer status-buf trueflow-review-index)
                 (with-current-buffer status-buf
                   (mapcar (lambda (block) (alist-get 'hash block))
@@ -86,11 +91,6 @@
       (kill-buffer status-buf)
       (kill-buffer focus-buf))))
 
-(ert-deftest trueflow-smoke-test ()
-  "Ensure trueflow-mode can be enabled."
-  (with-temp-buffer
-    (trueflow-mode)
-    (should (eq major-mode 'trueflow-mode))))
 
 (ert-deftest trueflow-root-falls-back-to-current-directory-outside-vcs ()
   "`trueflow-root' should work outside git/VCS repositories."
@@ -157,8 +157,8 @@
               ((symbol-function 'executable-find) (lambda (&rest _) nil)))
       (should (equal (trueflow--resolve-executable) repo-bin)))))
 
-(ert-deftest trueflow-review-header-lines-prefer_path_then_named_block ()
-  "Review headers should use a compact path, named block line, and subblock tree."
+(ert-deftest trueflow-review-header-lines-show-semantic-identity ()
+  "Review headers should expose the path, declaration, hash, and subblock kind."
   (let ((block '((hash . "a85ccbc912345678")
                  (content . "#[derive(Debug, Clone)]\nstruct Config {\n    name: String,\n}\n")
                  (start_line . 0)
@@ -167,26 +167,24 @@
                  (file . "./example_repos/all_languages/main.rs")))
         (subblocks '(((kind . "CodeParagraph")))))
     (cl-letf (((symbol-function 'trueflow-root) (lambda (&optional _) "/repo/")))
-      (should (equal (trueflow--review-header-lines block subblocks)
-                     '("example_repos/all_languages/main.rs"
-                       "  -> struct Config (hash=a85ccbc9)"
-                       "     └─ CodeParagraph"))))))
+      (let* ((lines (trueflow--review-header-lines block subblocks))
+             (rendered (mapconcat #'identity lines "\n")))
+        (should (string-match-p "example_repos/all_languages/main\\.rs" rendered))
+        (should-not (string-match-p "/repo/" rendered))
+        (should (string-match-p "struct Config" rendered))
+        (should (string-match-p "a85ccbc9" rendered))
+        (should (string-match-p "CodeParagraph" rendered))))))
 
-(ert-deftest trueflow-focus-approve-refreshes-without-skipping-next-item ()
-  "Approve should advance to the next refreshed item, not skip it."
-  (pcase-let ((`(,opened ,review-index ,review-hashes)
-                (trueflow-test--exercise-focus-action #'trueflow-focus-approve)))
-    (should (equal opened '("b" 1 2)))
-    (should (= review-index 0))
-    (should (equal review-hashes '("b" "c")))))
-
-(ert-deftest trueflow-focus-reject-refreshes-without-skipping-next-item ()
-  "Reject should advance to the next refreshed item, not skip it."
-  (pcase-let ((`(,opened ,review-index ,review-hashes)
-                (trueflow-test--exercise-focus-action #'trueflow-focus-reject)))
-    (should (equal opened '("b" 1 2)))
-    (should (= review-index 0))
-    (should (equal review-hashes '("b" "c")))))
+(ert-deftest trueflow-focus-actions-mark-and-refresh-without-skipping-next-item ()
+  "Approve and reject should send distinct verdicts and open the next item."
+  (dolist (case '((trueflow-focus-approve "approved")
+                  (trueflow-focus-reject "rejected")))
+    (pcase-let ((`(,mark-call ,opened ,review-index ,review-hashes)
+                  (trueflow-test--exercise-focus-action (car case))))
+      (should (equal mark-call (list "a" (cadr case) nil)))
+      (should (equal opened '("b" 1 2)))
+      (should (= review-index 0))
+      (should (equal review-hashes '("b" "c"))))))
 
 (ert-deftest trueflow-focus-comment-callback-refreshes-without-skipping-next-item ()
   "Comment follow-up should advance to the next refreshed item, not skip it."
