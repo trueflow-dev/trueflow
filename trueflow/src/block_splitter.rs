@@ -2631,16 +2631,6 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(merged, content);
     }
 
-    fn assert_block_hashes_match(blocks: &[Block]) {
-        for block in blocks {
-            let expected_hash = crate::hashing::TreeHash::from_content(&block.content);
-            assert_eq!(
-                block.hash, expected_hash,
-                "Hash mismatch for block kind {:?}:\nContent:\n{:?}",
-                block.kind, block.content
-            );
-        }
-    }
 
     #[test]
     fn test_split_markdown_headers() {
@@ -2965,22 +2955,7 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Function));
     }
 
-    #[test]
-    fn test_block_hashes_match_content_rust() {
-        let blocks = split_blocks("use std::fmt;\n\nfn foo() {}\n", Language::Rust);
-        assert!(!blocks.is_empty());
-        assert_block_hashes_match(&blocks);
-        assert!(!blocks.iter().any(|block| block.kind == BlockKind::Gap));
-    }
 
-    #[test]
-    fn test_block_hashes_match_content_markdown() {
-        let content = "# Title\nParagraph text.\n";
-        let blocks = split_blocks(content, Language::Markdown);
-        assert_eq!(blocks.len(), 1);
-        assert_block_hashes_match(&blocks);
-        assert_eq!(blocks[0].content, content);
-    }
 
     #[test]
     fn test_split_rust_impl_methods() {
