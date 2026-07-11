@@ -3,7 +3,7 @@ default:
     @just --list
 
 # Run the default local gate (tests, lint, fmt)
-check: test lint fmt-check
+check: test lint fmt-check test-release-publication
 
 # Run the faster no-test local gate (lint, fmt)
 check-fast: lint fmt-check
@@ -62,6 +62,10 @@ compile-check-code:
 # Run the local test suite with nextest
 test:
     cd trueflow && cargo nextest run --features tui-test-support
+
+# Run deterministic network-free release publication safety contracts
+test-release-publication:
+    sh scripts/tests/release-publication-safety.sh
 
 # Run the broad local test path without benches
 test-code:

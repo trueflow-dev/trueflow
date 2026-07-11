@@ -714,17 +714,17 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
     );
     assert_contains(
         &deploy_public_site,
-        "scripts/deploy-website.sh",
+        "$SCRIPT_DIR/deploy-website.sh",
         "one-shot deploy website step",
     );
     assert_contains(
         &deploy_public_site,
-        "scripts/package-macos-release.sh",
+        "$SCRIPT_DIR/package-macos-release.sh",
         "one-shot deploy package step",
     );
     assert_contains(
         &deploy_public_site,
-        "scripts/deploy-downloads.sh",
+        "$SCRIPT_DIR/deploy-downloads.sh",
         "one-shot deploy downloads step",
     );
     assert_contains(
@@ -764,8 +764,13 @@ fn infra_terraform_skeleton_is_present_and_public_safe() -> Result<()> {
     );
     assert_contains(
         &deploy_downloads,
-        "REQUIRED_TARGETS=\"aarch64-apple-darwin x86_64-unknown-linux-musl\"",
-        "download deploy requires every published target",
+        "REQUIRED_MACOS_TARGET=\"aarch64-apple-darwin\"",
+        "download deploy requires the macOS release target",
+    );
+    assert_contains(
+        &deploy_downloads,
+        "REQUIRED_LINUX_TARGET=\"x86_64-unknown-linux-musl\"",
+        "download deploy requires the Linux release target",
     );
     assert_contains(
         &deploy_downloads,

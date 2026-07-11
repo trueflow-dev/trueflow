@@ -34,6 +34,17 @@ die() {
 have_command() {
   command -v "$1" >/dev/null 2>&1
 }
+validate_filename_component() {
+  value=$1
+  label=$2
+
+  case "$value" in
+    ""|.|..|*[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*)
+      die "$label must contain only letters, digits, '.', '_', '+', or '-'"
+      ;;
+  esac
+}
+
 
 read_default_version() {
   cargo_version=$(awk -F '"' '/^version = "/ { print $2; exit }' "$CRATE_DIR/Cargo.toml")
@@ -56,6 +67,35 @@ sha256_line() {
 
   die "shasum or sha256sum is required"
 }
+sha256_digest() {
+  archive_path=$1
+  hash_line=$(sha256_line "$archive_path") || return 1
+  digest=$(printf '%s\n' "$hash_line" | awk 'NR == 1 { print $1; exit }')
+
+  printf '%s\n' "$digest" |
+    awk 'length($0) == 64 && $0 ~ /^[0-9a-f]+$/ { valid = 1 } END { exit valid ? 0 : 1 }' ||
+    die "failed to calculate SHA-256 for $archive_path"
+  printf '%s\n' "$digest"
+}
+
+append_checksum_entry() {
+  archive_path=$1
+  archive_name=$2
+
+  case "$MANIFEST_ARCHIVES" in
+    *"
+$archive_name
+"*)
+      die "duplicate archive basename: $archive_name"
+      ;;
+  esac
+
+  MANIFEST_ARCHIVES="${MANIFEST_ARCHIVES}${archive_name}
+"
+  digest=$(sha256_digest "$archive_path")
+  printf '%s  %s\n' "$digest" "$archive_name" >> "$CHECKSUM_TMP"
+}
+
 
 copy_executable() {
   source_path=$1
@@ -70,6 +110,14 @@ copy_executable() {
 }
 
 cleanup() {
+  if [ -n "${ARCHIVE_TMP:-}" ] && [ -e "$ARCHIVE_TMP" ]; then
+    rm -f "$ARCHIVE_TMP" || true
+  fi
+
+  if [ -n "${CHECKSUM_TMP:-}" ] && [ -e "$CHECKSUM_TMP" ]; then
+    rm -f "$CHECKSUM_TMP" || true
+  fi
+
   if [ -n "${STAGE_DIR:-}" ] && [ -d "$STAGE_DIR" ] && have_command trash; then
     trash "$STAGE_DIR" >/dev/null 2>&1 || true
   fi
@@ -116,15 +164,24 @@ if [ -z "$VERSION" ]; then
   VERSION=$(read_default_version)
 fi
 
+validate_filename_component "$VERSION" "version"
+validate_filename_component "$TARGET" "target"
+
 ARTIFACT_DIR="$OUTPUT_BASE/$VERSION"
 ARCHIVE_NAME="trueflow-${VERSION}-${TARGET}.tar.gz"
 CHECKSUM_NAME="trueflow-${VERSION}-SHA256SUMS.txt"
 ARCHIVE_PATH="$ARTIFACT_DIR/$ARCHIVE_NAME"
 CHECKSUM_PATH="$ARTIFACT_DIR/$CHECKSUM_NAME"
 
+STAGE_DIR=
+ARCHIVE_TMP=
+CHECKSUM_TMP=
+trap cleanup EXIT HUP INT TERM
+
 mkdir -p "$ARTIFACT_DIR"
+ARCHIVE_TMP=$(mktemp "$ARTIFACT_DIR/.${ARCHIVE_NAME}.XXXXXX")
+CHECKSUM_TMP=$(mktemp "$ARTIFACT_DIR/.${CHECKSUM_NAME}.XXXXXX")
 STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/trueflow-package.XXXXXX")
-trap cleanup EXIT INT TERM
 PACKAGE_DIR="$STAGE_DIR/package"
 mkdir -p "$PACKAGE_DIR"
 
@@ -133,20 +190,26 @@ cp "$REPO_ROOT/LICENSE" "$PACKAGE_DIR/"
 cp "$REPO_ROOT/README.md" "$PACKAGE_DIR/"
 
 printf '==> packaging %s\n' "$ARCHIVE_NAME"
-tar -C "$PACKAGE_DIR" -czf "$ARCHIVE_PATH" trueflow LICENSE README.md
+tar -C "$PACKAGE_DIR" -czf "$ARCHIVE_TMP" trueflow LICENSE README.md
+tar -tzf "$ARCHIVE_TMP" >/dev/null
 
-(
-  cd "$ARTIFACT_DIR"
-  : > "$CHECKSUM_NAME"
-  found_archive=0
-  for archive in trueflow-"${VERSION}"-*.tar.gz; do
-    [ -f "$archive" ] || continue
-    sha256_line "$archive" >> "$CHECKSUM_NAME"
-    found_archive=1
-  done
-  [ "$found_archive" -eq 1 ] || die "no packaged archives found in $ARTIFACT_DIR"
-)
+MANIFEST_ARCHIVES='
+'
+
+for archive_path in "$ARTIFACT_DIR"/trueflow-"${VERSION}"-*.tar.gz; do
+  [ -f "$archive_path" ] || continue
+  archive_name=${archive_path##*/}
+  [ "$archive_name" = "$ARCHIVE_NAME" ] && continue
+  append_checksum_entry "$archive_path" "$archive_name"
+done
+
+append_checksum_entry "$ARCHIVE_TMP" "$ARCHIVE_NAME"
+
+[ -s "$CHECKSUM_TMP" ] || die "checksum manifest generation produced no data"
+mv -f "$ARCHIVE_TMP" "$ARCHIVE_PATH"
+ARCHIVE_TMP=
+mv -f "$CHECKSUM_TMP" "$CHECKSUM_PATH"
+CHECKSUM_TMP=
 
 printf '==> wrote %s\n' "$ARCHIVE_PATH"
 printf '==> wrote %s\n' "$CHECKSUM_PATH"
-printf '==> next: %s/scripts/deploy-downloads.sh %s\n' "$REPO_ROOT" "$ARTIFACT_DIR"

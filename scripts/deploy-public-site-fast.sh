@@ -7,17 +7,17 @@ usage() {
   cat <<'EOF'
 Usage: deploy-public-site-fast.sh [options]
 
-Fast path for redeploying trueflow.dev content after infra already exists.
+Fast path for a safe public release switch after infrastructure already exists.
+It forwards all options to deploy-public-site.sh with --skip-infra-apply.
 
-This wrapper calls deploy-public-site.sh with --skip-infra-apply, so it will:
+Normal inherited ordering is: package; freeze and strictly validate a private
+snapshot; smoke-test that frozen macOS archive; verify website version; run tofu
+init/fmt/validate without apply; begin the held download publication; perform
+receipt-bound website sync/invalidation; then finalize download cleanup.
 
-1. run tofu init/fmt/validate
-2. skip tofu apply
-3. upload website/
-4. package the Apple Silicon macOS binary artifact
-5. upload /download artifacts
-
-All other flags are forwarded through.
+--skip-downloads selects the inherited standalone locked website mode and never
+removes downloads. --skip-website prepares then aborts a publication without
+cleanup. A bare artifact directory is never a destructive deployment command.
 
 Examples:
   ./scripts/deploy-public-site-fast.sh
@@ -27,7 +27,7 @@ Examples:
 EOF
 }
 
-if [ $# -gt 0 ]; then
+if [ "$#" -gt 0 ]; then
   case "$1" in
     -h|--help)
       usage

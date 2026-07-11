@@ -57,32 +57,45 @@ Note: on local Darwin right now, the flake-pinned Nix `aws` binary hangs during
 startup, so the repo dev shell intentionally relies on your existing ambient
 `aws` instead of shadowing it.
 
-## Local workflow
+## Safe public release workflow
 
-From the repo root:
+From the repo root, use the full orchestrator for every public download release:
 
 ```sh
 nix develop
 ./scripts/deploy-public-site.sh
 ```
 
-That one command will:
+It is the only supported download publication path. It packages the macOS
+artifact, requires the versioned artifact directory to contain the exact macOS
+and Linux archives plus their checksum manifest, then:
 
-- run `tofu init`, `tofu fmt -check`, `tofu validate`, and `tofu apply`
-- upload `website/`
-- package the Apple Silicon macOS binary artifact, either by building on Apple Silicon macOS or by packaging a supplied macOS binary
-- upload `/download/` artifacts from the versioned artifact directory
+1. freezes and validates a private exact snapshot;
+2. begins a receipt-bound publication while old and new download sets coexist;
+3. switches and invalidates the website using that receipt; and
+4. finalizes old-download cleanup only after the website switch.
 
-For the common fast path after infra is already up:
+The Linux archive must be prepared on native Linux before the final publication:
+
+```sh
+./scripts/package-linux-release.sh
+./scripts/smoke-test-release.sh .trueflow/release-artifacts/vX.Y.Z/trueflow-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
+```
+
+For a supplied macOS binary, keep the same full publication workflow:
+
+```sh
+./scripts/deploy-public-site.sh --macos-binary path/to/aarch64-apple-darwin/trueflow
+```
+
+The fast path preserves the same release protocol and skips only `tofu apply`:
 
 ```sh
 ./scripts/deploy-public-site-fast.sh
 ```
 
-That keeps the safety checks (`tofu init`, `fmt`, `validate`) but skips
-`tofu apply` before uploading website + download artifacts.
-
-If you want to run the steps manually instead:
+If infrastructure is applied manually, finish with the safe full workflow
+without a second apply:
 
 ```sh
 cd infra/terraform
@@ -90,44 +103,26 @@ tofu init
 tofu fmt -check
 tofu plan
 # inspect the plan carefully
-# when ready:
 tofu apply
 cd ../..
-./scripts/deploy-website.sh
+./scripts/deploy-public-site.sh --skip-infra-apply
 ```
 
-To package and upload the current Apple Silicon macOS binary on Apple Silicon
-macOS:
+`./scripts/deploy-website.sh` without a receipt is a standalone website-only
+deployment. It takes the same release lock, verifies the website release
+against its immutable ledger, and preserves both `download/` and
+`.trueflow-release/`; it never cleans downloads.
 
-```sh
-./scripts/package-macos-release.sh
-./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.1
-```
-
-To package a macOS binary built on another machine:
-
-```sh
-./scripts/package-macos-release.sh --binary path/to/aarch64-apple-darwin/trueflow
-./scripts/deploy-downloads.sh .trueflow/release-artifacts/v0.1.1
-```
-
-To package and smoke-test a native Linux x86_64 musl release on Linux x86_64:
-
-```sh
-./scripts/package-linux-release.sh
-./scripts/smoke-test-release.sh .trueflow/release-artifacts/v0.1.1/trueflow-v0.1.1-x86_64-unknown-linux-musl.tar.gz
-```
-
-To upload a different artifact directory later:
-
-```sh
-./scripts/deploy-downloads.sh path/to/release-artifacts
-```
-
-Important: `deploy-downloads.sh` uses `aws s3 sync --delete`, so upload only an
-artifact directory containing every platform artifact you still want published,
-plus the regenerated checksum file.
-
+Snapshots and receipts are private by default under
+`.trueflow/release-snapshots/<version>-<nonce>` and
+`.trueflow/release-receipts/<version>-<nonce>.receipt` (or their corresponding
+`TRUEFLOW_RELEASE_SNAPSHOT_BASE` and `TRUEFLOW_RELEASE_RECEIPT_BASE`
+overrides). Keep both for recovery. Abort is permitted only before the
+receipt-bound website switch and never cleans downloads. A failure after the
+switch leaves the lock for manual, phase-aware recovery. Stale receipt/phase
+data or a competing lock fails closed—never delete a lock manually. Normal
+unlock uses an ETag-conditional current-key delete marker, never a version-ID
+deletion.
 ## State
 
 This repo now commits its S3 backend config directly in `backend.tf`.
