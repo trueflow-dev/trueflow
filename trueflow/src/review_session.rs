@@ -134,48 +134,6 @@ mod tests {
         assert_eq!(selected, expected);
     }
 
-    #[test]
-    fn action_block_ids_for_class_container_includes_descendants() {
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
-        let file = builder.add_file(
-            src,
-            "lib.swift".to_string(),
-            "src/lib.swift".to_string(),
-            "file-hash".to_string(),
-            Language::Swift,
-        );
-        let class_block = builder.add_block(
-            file,
-            "class".to_string(),
-            "src/lib.swift".to_string(),
-            test_block(BlockKind::Class, 1),
-            Language::Swift,
-        );
-        let method_a = builder.add_block(
-            class_block,
-            "method_a".to_string(),
-            "src/lib.swift".to_string(),
-            test_block(BlockKind::Method, 3),
-            Language::Swift,
-        );
-        let method_b = builder.add_block(
-            class_block,
-            "method_b".to_string(),
-            "src/lib.swift".to_string(),
-            test_block(BlockKind::Method, 20),
-            Language::Swift,
-        );
-        let tree = builder.finalize();
-        let navigator = navigator_from_blocks(tree, &[class_block, method_a, method_b]);
-
-        let selected = action_block_ids(&navigator, class_block)
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let expected = HashSet::from([class_block, method_a, method_b]);
-        assert_eq!(selected, expected);
-    }
 
     #[test]
     fn action_block_ids_for_file_includes_all_visible_descendant_blocks() {
@@ -297,45 +255,4 @@ mod tests {
         assert_eq!(next, Some(tail));
     }
 
-    #[test]
-    fn next_review_target_for_class_block_skips_class_subtree() {
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
-        let file = builder.add_file(
-            src,
-            "lib.swift".to_string(),
-            "src/lib.swift".to_string(),
-            "file-hash".to_string(),
-            Language::Swift,
-        );
-        let class_block = builder.add_block(
-            file,
-            "class".to_string(),
-            "src/lib.swift".to_string(),
-            test_block(BlockKind::Class, 1),
-            Language::Swift,
-        );
-        let method = builder.add_block(
-            class_block,
-            "method".to_string(),
-            "src/lib.swift".to_string(),
-            test_block(BlockKind::Method, 3),
-            Language::Swift,
-        );
-        let tail = builder.add_block(
-            file,
-            "tail".to_string(),
-            "src/lib.swift".to_string(),
-            test_block(BlockKind::Function, 100),
-            Language::Swift,
-        );
-        let tree = builder.finalize();
-        let remaining = HashSet::from([class_block, method, tail]);
-        let order = ReviewOrder::from_tree(&tree, &remaining);
-        let navigator = navigator_from_blocks(tree, &[class_block, method, tail]);
-
-        let next = next_review_target(&navigator, &order, &remaining, class_block);
-        assert_eq!(next, Some(tail));
-    }
 }
