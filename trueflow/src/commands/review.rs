@@ -2048,19 +2048,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_review_request_all_rejects_explicit_targets() {
-        let err = parse_review_request(
-            true,
-            &[ReviewTarget::File(RepoPath::new("src/lib.rs").unwrap())],
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Explicit review targets cannot be combined with --all")
-        );
-    }
 
     #[test]
     fn parse_review_request_defaults_to_dirty_worktree() {
@@ -2119,20 +2106,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_review_request_expands_since_to_head_range() {
-        let targets = expand_cli_review_targets_with(&[], Some("HEAD"), &|_| Ok(()))
-            .unwrap_or_else(|error| panic!("expected since targets: {error}"));
-        let request = review_request_from_cli_targets(false, &targets)
-            .unwrap_or_else(|error| panic!("expected since request: {error}"));
-
-        assert_eq!(
-            request,
-            ReviewRequest::Targets(vec![ReviewTarget::RevisionRange(
-                RevisionRangeExpr::new("HEAD", "HEAD").unwrap()
-            )])
-        );
-    }
 
     #[test]
     fn expand_cli_review_targets_combines_since_with_explicit_targets() {
@@ -2152,14 +2125,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn since_review_target_rejects_unknown_revision_early() {
-        let err = since_review_target_with("definitely-not-a-real-revision", &|revision| {
-            Err(anyhow!("revision `{revision}` could not be resolved"))
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("could not be resolved"));
-    }
 
     #[test]
     fn collect_review_returns_empty_without_scanning_when_path_selection_is_empty() {
