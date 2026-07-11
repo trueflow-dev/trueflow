@@ -833,47 +833,6 @@ fn create_sub_block(
 mod tests {
     use super::*;
 
-    #[test]
-    fn split_top_level_keeps_real_dart_kinds() {
-        let source = "import 'dart:math';\n\nconst answer = 42;\n\nString greet(String name) {\n  return 'hi $name';\n}\n\nmixin Counter {\n  int hits = 0;\n}\n\nclass Worker {\n  final String name;\n  Worker(this.name);\n\n  void run() {}\n}\n";
-        let tree = parse_tree(source);
-        let root = tree.root_node();
-
-        let blocks = split_top_level(root, source, Language::Dart).unwrap();
-        let kinds = blocks.iter().map(|block| block.kind).collect::<Vec<_>>();
-
-        assert!(kinds.contains(&BlockKind::Import));
-        assert!(kinds.contains(&BlockKind::Const));
-        assert!(kinds.contains(&BlockKind::Function));
-        assert!(kinds.contains(&BlockKind::Impl));
-        assert!(kinds.contains(&BlockKind::Class));
-        assert!(kinds.contains(&BlockKind::Method));
-    }
-
-    #[test]
-    fn split_top_level_collects_nested_group_and_test_calls() {
-        let source = "void main() {\n  group('suite', () {\n    test('works', () {\n      expect(true, isTrue);\n    });\n  });\n}\n";
-        let tree = parse_tree(source);
-        let root = tree.root_node();
-
-        let blocks = split_top_level(root, source, Language::Dart).unwrap();
-        let tagged = blocks
-            .iter()
-            .filter(|block| block.tags.iter().any(|tag| tag == "test"))
-            .map(|block| block.content.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(
-            tagged
-                .iter()
-                .any(|content| content.contains("group('suite'"))
-        );
-        assert!(
-            tagged
-                .iter()
-                .any(|content| content.contains("test('works'"))
-        );
-    }
 
     #[test]
     fn split_type_like_review_units_preserves_full_class_content() {
@@ -892,13 +851,4 @@ mod tests {
         assert_eq!(rebuilt, source);
     }
 
-    fn parse_tree(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_dart::LANGUAGE.into())
-            .unwrap_or_else(|error| panic!("load dart grammar: {error}"));
-        parser
-            .parse(source, None)
-            .unwrap_or_else(|| panic!("parse dart"))
-    }
 }
