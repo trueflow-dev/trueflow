@@ -1060,26 +1060,132 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_request_key_includes_provider_model_and_context_limit() {
-        let review_set = review_set();
-        let request = AiSuggestionRequest::new(
+    fn suggestion_request_key_tracks_every_cache_identity_dimension() {
+        let base_review_set = review_set();
+        let base_context = review_context("fn checked() {}");
+        let key_for = |
+            provider,
+            model: &str,
+            review_set: &AiReviewSetContext,
+            context: &AiReviewContext,
+            max_context_lines,
+            max_response_chars,
+        | {
+            AiSuggestionRequest::with_response_char_limit(
+                provider,
+                model.to_string(),
+                review_set.clone(),
+                context.clone(),
+                max_context_lines,
+                max_response_chars,
+            )
+            .key
+        };
+        let base = key_for(
             AiProvider::Anthropic,
-            "claude-3-5-haiku".to_string(),
-            review_set.clone(),
-            review_context("fn checked() {}"),
+            "claude-3-5-haiku",
+            &base_review_set,
+            &base_context,
             40,
+            DEFAULT_AI_RESPONSE_CHAR_LIMIT,
         );
 
-        assert_eq!(request.key.provider, AiProvider::Anthropic);
-        assert_eq!(request.key.model, "claude-3-5-haiku");
-        assert_eq!(request.key.review_set_hash, review_set.review_set_hash);
-        assert_eq!(request.key.path, "src/lib.rs");
-        assert_eq!(request.key.start_line, 4);
-        assert_eq!(request.key.end_line, 8);
-        assert_eq!(request.key.max_context_lines, 40);
         assert_eq!(
-            request.key.max_response_chars,
-            DEFAULT_AI_RESPONSE_CHAR_LIMIT
+            base,
+            key_for(
+                AiProvider::Anthropic,
+                "claude-3-5-haiku",
+                &base_review_set,
+                &base_context,
+                40,
+                DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+            )
+        );
+        assert_ne!(
+            base,
+            key_for(
+                AiProvider::OpenAi,
+                "claude-3-5-haiku",
+                &base_review_set,
+                &base_context,
+                40,
+                DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+            )
+        );
+        assert_ne!(
+            base,
+            key_for(
+                AiProvider::Anthropic,
+                "different-model",
+                &base_review_set,
+                &base_context,
+                40,
+                DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+            )
+        );
+
+        let different_review_set = AiReviewSetContext::new(
+            TreeHash::from_content("different-review-set"),
+            base_review_set.overview.clone(),
+        );
+        assert_ne!(
+            base,
+            key_for(
+                AiProvider::Anthropic,
+                "claude-3-5-haiku",
+                &different_review_set,
+                &base_context,
+                40,
+                DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+            )
+        );
+
+        let mut different_path = base_context.clone();
+        different_path.path = "src/other.rs".to_string();
+        let different_content = review_context("fn changed() {}");
+        let mut different_start = base_context.clone();
+        different_start.start_line += 1;
+        let mut different_end = base_context.clone();
+        different_end.end_line += 1;
+        for context in [
+            &different_path,
+            &different_content,
+            &different_start,
+            &different_end,
+        ] {
+            assert_ne!(
+                base,
+                key_for(
+                    AiProvider::Anthropic,
+                    "claude-3-5-haiku",
+                    &base_review_set,
+                    context,
+                    40,
+                    DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+                )
+            );
+        }
+        assert_ne!(
+            base,
+            key_for(
+                AiProvider::Anthropic,
+                "claude-3-5-haiku",
+                &base_review_set,
+                &base_context,
+                41,
+                DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+            )
+        );
+        assert_ne!(
+            base,
+            key_for(
+                AiProvider::Anthropic,
+                "claude-3-5-haiku",
+                &base_review_set,
+                &base_context,
+                40,
+                DEFAULT_AI_RESPONSE_CHAR_LIMIT + 1,
+            )
         );
     }
 
