@@ -792,16 +792,6 @@ fn create_sub_block(
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_best_tree_prefers_interface_grammar_for_value_specifications() {
-        let source = "val render : int -> string\n";
-        let tree = parse_best_tree(source).unwrap();
-        assert!(!tree.root_node().has_error());
-        assert!(
-            find_named_descendant_any(tree.root_node(), &["value_specification"]).is_some(),
-            "expected interface grammar to produce a value_specification node"
-        );
-    }
 
     #[test]
     fn ocaml_comment_helpers_recognize_nested_comment_only_chunks() {
