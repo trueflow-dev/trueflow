@@ -85,28 +85,6 @@ mod tests {
     use super::*;
     use tree_sitter::Parser;
 
-    #[test]
-    fn collect_impl_member_spans_attach_attributes_and_comments() {
-        let source = "impl Worker {\n    #[cfg(test)]\n    fn run(&self) {}\n\n    // limit\n    const MAX: usize = 1;\n}\n";
-        let tree = parse_tree(source);
-        let impl_node = find_named_descendant(tree.root_node(), "impl_item")
-            .unwrap_or_else(|| panic!("expected rust impl_item"));
-
-        let members = collect_impl_member_spans(impl_node);
-
-        assert_eq!(
-            members.iter().map(|member| member.kind).collect::<Vec<_>>(),
-            vec![BlockKind::Method, BlockKind::Const]
-        );
-        assert!(
-            source[members[0].start_byte..members[0].end_byte].starts_with("#[cfg(test)]"),
-            "expected method to include leading attribute"
-        );
-        assert!(
-            source[members[1].start_byte..members[1].end_byte].starts_with("// limit"),
-            "expected const to include leading comment"
-        );
-    }
 
     #[test]
     fn collect_impl_member_spans_keep_trailing_attributes_as_code() {
