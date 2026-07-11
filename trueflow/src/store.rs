@@ -1234,13 +1234,6 @@ mod tests {
         assert!(!payload.contains("comment_context"));
     }
 
-    #[test]
-    fn parse_records_jsonl_skips_legacy_diff_target_records() {
-        let content = "{\"id\":\"legacy-diff\",\"version\":2,\"target\":{\"kind\":\"diff\",\"fingerprint\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},\"check\":\"review\",\"verdict\":\"approved\",\"identity\":{\"type\":\"email\",\"email\":\"dev@example.com\"},\"repo_ref\":{\"type\":\"vcs\",\"system\":\"git\",\"revision\":\"0123456789abcdef\"},\"block_state\":\"committed\",\"timestamp\":1,\"path_hint\":null,\"line_hint\":null,\"note\":null,\"tags\":null}\n";
-
-        let parsed = parse_records_jsonl(content);
-        assert!(parsed.is_empty());
-    }
 
     #[test]
     fn parse_records_jsonl_reports_skipped_legacy_diff_target_records() {
