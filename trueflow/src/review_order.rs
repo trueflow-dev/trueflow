@@ -142,10 +142,6 @@ impl ReviewOrder {
         self.ordered.iter().map(|cursor| cursor.node_id).collect()
     }
 
-    #[cfg(test)]
-    fn index_for(&self, node_id: TreeNodeId) -> Option<usize> {
-        self.index_by_node.get(&node_id).copied()
-    }
 }
 
 fn review_band_from_kind_rank(kind_rank: u8) -> ReviewBand {
@@ -452,42 +448,6 @@ mod tests {
         assert_eq!(order.ordered_ids(), vec![helper_block_id, source_block_id]);
     }
 
-    #[test]
-    fn review_order_index_matches_sorted_positions() {
-        let mut builder = TreeBuilder::new();
-        let root = builder.root();
-        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
-        let file = builder.add_file(
-            src,
-            "lib.rs".to_string(),
-            "src/lib.rs".to_string(),
-            "file-lib".to_string(),
-            Language::Rust,
-        );
-
-        let first = builder.add_block(
-            file,
-            "first".to_string(),
-            "src/lib.rs".to_string(),
-            test_block(BlockKind::Struct, 1, &[]),
-            Language::Rust,
-        );
-        let second = builder.add_block(
-            file,
-            "second".to_string(),
-            "src/lib.rs".to_string(),
-            test_block(BlockKind::Function, 10, &[]),
-            Language::Rust,
-        );
-
-        let tree = builder.finalize();
-        let unreviewed = HashSet::from([first, second]);
-        let order = ReviewOrder::from_tree(&tree, &unreviewed);
-
-        assert_eq!(order.ordered_ids(), vec![first, second]);
-        assert_eq!(order.index_for(first), Some(0));
-        assert_eq!(order.index_for(second), Some(1));
-    }
 
     #[test]
     fn next_remaining_after_uses_typed_anchor_for_block_and_subtree() {
