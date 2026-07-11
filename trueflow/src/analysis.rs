@@ -262,25 +262,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn analyze_file_detects_java_by_extension() {
-        assert!(matches!(
-            analyze_file(Path::new("Main.java"), b"class Main {}\n"),
-            FileType::Code(CodeFile {
-                language: Language::Java
-            })
-        ));
-    }
-
-    #[test]
-    fn analyze_file_detects_kotlin_by_extension() {
-        assert!(matches!(
-            analyze_file(Path::new("Main.kt"), b"class Main\n"),
-            FileType::Code(CodeFile {
-                language: Language::Kotlin
-            })
-        ));
-    }
 
     #[test]
     fn analyze_file_detects_kotlin_script_by_extension() {
@@ -292,45 +273,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn analyze_file_detects_csharp_by_extension() {
-        assert!(matches!(
-            analyze_file(Path::new("Program.cs"), b"class Program {}\n"),
-            FileType::Code(CodeFile {
-                language: Language::CSharp
-            })
-        ));
-    }
-
-    #[test]
-    fn analyze_file_detects_ruby_by_extension() {
-        assert!(matches!(
-            analyze_file(Path::new("app.rb"), b"class App\nend\n"),
-            FileType::Code(CodeFile {
-                language: Language::Ruby
-            })
-        ));
-    }
-
-    #[test]
-    fn analyze_file_detects_php_by_extension() {
-        assert!(matches!(
-            analyze_file(Path::new("index.php"), b"<?php\nfunction main() {}\n"),
-            FileType::Code(CodeFile {
-                language: Language::Php
-            })
-        ));
-    }
-
-    #[test]
-    fn analyze_file_detects_c_by_extension() {
-        assert!(matches!(
-            analyze_file(Path::new("main.c"), b"int main(void) { return 0; }\n"),
-            FileType::Code(CodeFile {
-                language: Language::C
-            })
-        ));
-    }
 
     #[test]
     fn wave2_language_registrations_smoke() {
