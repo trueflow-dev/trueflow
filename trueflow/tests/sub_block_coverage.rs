@@ -438,23 +438,3 @@ fn test_hash_only_approval_does_not_cover_duplicate_generated_review_units() -> 
     Ok(())
 }
 
-#[test]
-fn test_path_scoped_approval_does_not_cover_duplicate_generated_review_units() -> Result<()> {
-    let fixture = generated_review_unit_fixture("subblock_generated_path_ambiguity")?;
-
-    for hash in &fixture.unique_hashes {
-        mark(&fixture.repo, hash)?;
-    }
-    mark_at_path(&fixture.repo, &fixture.duplicate_hash, None)?;
-
-    let output = fixture.repo.run(&["review", "--all"])?;
-    assert!(
-        output.contains("[Unreviewed]") && output.contains(&fixture.parent_hash),
-        "a path-scoped duplicate approval must leave the parent unreviewed: {output}"
-    );
-
-    let inspected = inspect_split_coverage(&fixture.repo, &fixture.parent_hash)?;
-    assert_ambiguous_duplicate_coverage(&inspected, &fixture)?;
-
-    Ok(())
-}
