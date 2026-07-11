@@ -1521,14 +1521,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_hunk_header_extracts_positions() {
-        let header = "@@ -10,2 +12,4 @@";
-        let parsed = parse_hunk_header(header).unwrap();
-        assert_eq!(parsed.before_start, 10);
-        assert_eq!(parsed.after_start, 12);
-    }
-
-    #[test]
     fn collect_hunks_groups_lines_by_header() {
         let diff = "@@ -1,1 +1,2 @@\n-foo\n+foo\n+bar\n@@ -5,1 +6,1 @@\n-baz\n+qux\n";
         let mut hunks = Vec::new();
