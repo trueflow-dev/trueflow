@@ -7,7 +7,7 @@ use tracing::warn;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -1053,9 +1053,20 @@ impl JsonlStoreBackend {
     fn append(&self, record: &Record) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.db_path)?;
         file.lock_exclusive()?;
+
+        let file_len = file.metadata()?.len();
+        if file_len > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last_byte = [0];
+            file.read_exact(&mut last_byte)?;
+            if last_byte[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
 
         let mut line = serde_json::to_string(record)?;
         line.push('\n');
