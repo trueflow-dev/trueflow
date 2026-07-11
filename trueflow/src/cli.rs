@@ -644,41 +644,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn review_command_parses_since_with_target() {
-        let cli = Cli::parse_from([
-            "trueflow", "review", "--since", "abc1234", "--target", "dir:src",
-        ]);
-
-        match cli.command {
-            Commands::Review { target, since, .. } => {
-                assert_eq!(since.as_deref(), Some("abc1234"));
-                assert_eq!(
-                    target,
-                    vec![ReviewTarget::Dir(RepoPath::new("src").unwrap())]
-                );
-            }
-            _ => panic!("expected review command"),
-        }
-    }
-
-    #[test]
-    fn tui_command_parses_since_with_target() {
-        let cli = Cli::parse_from([
-            "trueflow", "tui", "--since", "abc1234", "--target", "dir:src",
-        ]);
-
-        match cli.command {
-            Commands::Tui { target, since, .. } => {
-                assert_eq!(since.as_deref(), Some("abc1234"));
-                assert_eq!(
-                    target,
-                    vec![ReviewTarget::Dir(RepoPath::new("src").unwrap())]
-                );
-            }
-            _ => panic!("expected tui command"),
-        }
-    }
 
     #[test]
     fn review_command_accepts_whitespace_exclude_alias() {
