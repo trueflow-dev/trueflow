@@ -531,15 +531,12 @@ ensure_remote_object() {
   fi
 
   if [ "$checksum_mode" = manifest ]; then
-    have_command base64 || die "base64 is required for manifest request checksum"
-    object_checksum=$(base64 < "$local_path" | tr -d '\n')
     aws s3api put-object \
       --bucket "$SITE_BUCKET" \
       --key "$remote_key" \
       --body "$local_path" \
       --if-none-match '*' \
-      --checksum-algorithm SHA256 \
-      --checksum-sha256 "$object_checksum" >/dev/null
+      --checksum-algorithm SHA256 >/dev/null
   else
     aws s3api put-object \
       --bucket "$SITE_BUCKET" \

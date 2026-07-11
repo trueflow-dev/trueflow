@@ -417,6 +417,8 @@ s3api_put() {
   body=
   none=0
   etag=
+  checksum_algorithm=
+  checksum_sha256=
   query=
   output=json
   while [ $# -gt 0 ]; do
@@ -426,7 +428,9 @@ s3api_put() {
       --body) shift; body=${1:-} ;;
       --if-none-match) shift; [ "${1:-}" = '*' ] || { printf 'fake aws: unsupported if-none-match\n' >&2; exit 127; }; none=1 ;;
       --if-match) shift; etag=${1:-} ;;
-      --checksum-algorithm|--checksum-sha256|--expected-bucket-owner|--content-type) shift; [ $# -gt 0 ] || exit 127 ;;
+      --checksum-algorithm) shift; checksum_algorithm=${1:-} ;;
+      --checksum-sha256) shift; checksum_sha256=${1:-} ;;
+      --expected-bucket-owner|--content-type) shift; [ $# -gt 0 ] || exit 127 ;;
       --query) shift; query=${1:-} ;;
       --output) shift; output=${1:-} ;;
       --no-cli-pager) ;;
@@ -435,6 +439,14 @@ s3api_put() {
     shift
   done
   [ -n "$bucket" ] && [ -n "$key" ] && [ -n "$body" ] || { printf 'fake aws: put-object needs bucket/key/body\n' >&2; exit 127; }
+  if [ -n "$checksum_sha256" ]; then
+    [ "$checksum_algorithm" = SHA256 ] || { printf 'fake aws: checksum-sha256 requires SHA256 algorithm\n' >&2; exit 127; }
+    decoded_length=$(printf '%s' "$checksum_sha256" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+    if [ "$decoded_length" != 32 ]; then
+      decoded_length=$(printf '%s' "$checksum_sha256" | base64 -D 2>/dev/null | wc -c | tr -d ' ')
+    fi
+    [ "$decoded_length" = 32 ] || { printf 'fake aws: invalid checksum-sha256 payload\n' >&2; exit 127; }
+  fi
   fail_if_requested s3api-put
   put_object "$bucket" "$key" "$body" "$none" "$etag" || exit $?
   emit_object_result "$query" "$output" "$NEW_VERSION" "$NEW_ETAG"
