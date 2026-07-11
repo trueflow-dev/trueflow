@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn version_flag_reports_only_the_package_version() {
-        let version = Cli::command().render_version().to_string();
+        let version = Cli::command().render_version();
         assert_eq!(version, format!("trueflow {}\n", build_info::VERSION));
     }
 
