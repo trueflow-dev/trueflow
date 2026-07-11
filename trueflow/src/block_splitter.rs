@@ -2925,8 +2925,20 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
 
     #[test]
     fn test_split_rust_simple() {
-        let blocks = split_blocks("fn foo() {}\n\nstruct Bar;", Language::Rust);
-        assert!(!blocks.is_empty());
+        let result = split_result("fn foo() {}\n\nstruct Bar;", Language::Rust);
+        assert_eq!(result.strategy, BlockSplitStrategy::Structured);
+        assert!(result.diagnostics.is_empty());
+
+        let review_blocks = result
+            .blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .collect::<Vec<_>>();
+        assert_eq!(review_blocks.len(), 2);
+        assert_eq!(review_blocks[0].kind, BlockKind::Function);
+        assert_eq!(review_blocks[0].content, "fn foo() {}");
+        assert_eq!(review_blocks[1].kind, BlockKind::Struct);
+        assert_eq!(review_blocks[1].content, "struct Bar;");
     }
 
     #[test]
