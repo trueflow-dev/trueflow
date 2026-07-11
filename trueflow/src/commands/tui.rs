@@ -7515,8 +7515,8 @@ mod diff_scope_tests {
     use crate::block_splitter;
     use crate::cli::Cli;
     use crate::commands::review::{
-        BlockChangeKind, CollectedReview, FileChangeKind, ReviewDiagnostic, ReviewRequest,
-        ReviewSummary, UnreviewedFile,
+        BlockChangeKind, CollectedReview, ReviewDiagnostic, ReviewRequest, ReviewSummary,
+        UnreviewedFile,
     };
     use crate::config::{BatchConfirmPolicy, BlockFilters};
     use crate::context::TrueflowContext;
