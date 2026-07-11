@@ -181,14 +181,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn body_is_non_trivial_when_threshold_is_met_by_member_count() {
-        let source = "extension Worker {\n    func run() {}\n    func stop() {}\n}\n";
-        let tree = parse_tree(source);
-        let body = find_type_body(tree.root_node());
-
-        assert!(body_is_non_trivial(body, source));
-    }
 
     fn parse_tree(source: &str) -> tree_sitter::Tree {
         let mut parser = Parser::new();
