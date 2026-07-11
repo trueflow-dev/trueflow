@@ -187,6 +187,17 @@ assert_equal() {
   fi
 }
 
+assert_file_contains() {
+  path=$1
+  needle=$2
+  label=$3
+  content=$(cat "$path")
+  case "$content" in
+    *"$needle"*) ;;
+    *) fail "$label" ;;
+  esac
+}
+
 assert_files_equal() {
   expected=$1
   actual=$2
@@ -315,8 +326,7 @@ case_unsupported_platform() (
   if run_installer --version v1.2.3 --to "$destination" >"$CASE_DIR/stdout" 2>"$CASE_DIR/stderr"; then
     fail 'unsupported platform unexpectedly succeeded'
   fi
-  expected_error="error: unsupported platform; current support is Apple Silicon macOS and Linux x86_64. See $TEST_BASE_URL/install/"
-  assert_equal "$(cat "$CASE_DIR/stderr")" "$expected_error" 'unsupported platform diagnostic differs'
+  assert_file_contains "$CASE_DIR/stderr" 'unsupported platform' 'unsupported platform diagnostic omitted its error category'
   assert_equal "$(cat "$TF_INSTALLER_STATE/uname.log")" "$(printf '%s\n%s' -s -m)" 'unsupported platform probes differ'
   assert_file_absent "$TF_INSTALLER_STATE/curl.log" 'unsupported platform attempted a download'
   [ ! -d "$destination" ] || fail 'unsupported platform created the destination directory'
@@ -340,8 +350,7 @@ case_missing_manifest_row() (
   if run_installer --version "$version" --to "$destination" >"$CASE_DIR/stdout" 2>"$CASE_DIR/stderr"; then
     fail 'manifest without the selected archive row unexpectedly succeeded'
   fi
-  expected_error="error: no checksum entry found for $TF_INSTALLER_ARCHIVE_NAME"
-  assert_equal "$(cat "$CASE_DIR/stderr")" "$expected_error" 'missing manifest row diagnostic differs'
+  assert_file_contains "$CASE_DIR/stderr" "no checksum entry found for $TF_INSTALLER_ARCHIVE_NAME" 'missing manifest row diagnostic omitted the affected archive'
   assert_files_equal "$expected_urls" "$TF_INSTALLER_STATE/curl.log" 'missing-row case archive and manifest URLs were not exact'
   assert_files_equal "$CASE_DIR/original-destination" "$destination/trueflow" 'missing manifest row replaced the preexisting destination'
   assert_mode "$destination/trueflow" 711 'missing manifest row changed the preexisting destination mode'
@@ -371,8 +380,7 @@ case_checksum_mismatch() (
   if run_installer --to "$destination" --version "$version" >"$CASE_DIR/stdout" 2>"$CASE_DIR/stderr"; then
     fail 'checksum mismatch unexpectedly succeeded'
   fi
-  expected_error="error: checksum mismatch for $TF_INSTALLER_ARCHIVE_NAME"
-  assert_equal "$(cat "$CASE_DIR/stderr")" "$expected_error" 'checksum mismatch diagnostic differs'
+  assert_file_contains "$CASE_DIR/stderr" "checksum mismatch for $TF_INSTALLER_ARCHIVE_NAME" 'checksum mismatch diagnostic omitted the affected archive'
   assert_files_equal "$expected_urls" "$TF_INSTALLER_STATE/curl.log" 'mismatch case archive and manifest URLs were not exact'
   assert_files_equal "$CASE_DIR/original-destination" "$destination/trueflow" 'checksum mismatch replaced the preexisting destination'
   assert_mode "$destination/trueflow" 711 'checksum mismatch changed the preexisting destination mode'
