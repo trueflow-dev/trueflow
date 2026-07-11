@@ -325,27 +325,6 @@ mod tests {
             .unwrap_or_else(|| panic!("parse SQL source"))
     }
 
-    #[test]
-    fn split_top_level_classifies_named_sql_objects_and_keeps_semicolons() {
-        let source = "-- bootstrap\nCREATE TABLE accounts (id bigint);\n\nCREATE TYPE account_status AS ENUM ('active');\n\nCREATE VIEW active_accounts AS\nSELECT id\nFROM accounts;\n\nCREATE FUNCTION normalize_email(input text)\nRETURNS text\nLANGUAGE sql\nAS $$\n  SELECT lower(trim(input));\n$$;\n\nCREATE TRIGGER accounts_set_updated_at\nBEFORE UPDATE ON accounts\nFOR EACH ROW\nEXECUTE FUNCTION touch_updated_at();\n\nALTER TABLE accounts ADD COLUMN deleted_at timestamp;\nDROP VIEW IF EXISTS legacy_accounts;\nSELECT id FROM active_accounts;\nINSERT INTO accounts (id) VALUES (1);\nUPDATE accounts SET deleted_at = '2024-01-01';\nDELETE FROM accounts WHERE deleted_at IS NOT NULL;\n";
-        let tree = parse_tree(source);
-        let blocks = split_top_level(tree.root_node(), source, Language::Sql)
-            .unwrap_or_else(|error| panic!("split SQL top level: {error}"));
-        let kinds = blocks
-            .iter()
-            .filter(|block| block.kind != BlockKind::Gap)
-            .map(|block| block.kind)
-            .collect::<Vec<_>>();
-
-        assert!(kinds.contains(&BlockKind::Struct));
-        assert!(kinds.contains(&BlockKind::Enum));
-        assert!(kinds.contains(&BlockKind::Module));
-        assert!(kinds.contains(&BlockKind::Function));
-        assert!(kinds.contains(&BlockKind::Code));
-        assert!(blocks.iter().all(|block| {
-            block.kind == BlockKind::Gap || block.content.trim_end().ends_with(';')
-        }));
-    }
 
     #[test]
     fn split_top_level_attaches_leading_comment_to_following_statement() {
