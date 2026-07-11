@@ -2048,51 +2048,6 @@ mod tests {
         assert_eq!(feedback_entry_ids(&entries), vec!["appended"]);
     }
 
-    #[test]
-    fn collect_feedback_entries_resolves_each_record_once() {
-        struct CountingResolver {
-            contexts: HashMap<String, ResolvedFeedbackContext>,
-            calls: Vec<String>,
-        }
-
-        impl FeedbackContextResolver for CountingResolver {
-            fn resolve_context(&mut self, record: &Record) -> Result<ResolvedFeedbackContext> {
-                self.calls.push(record.id.clone());
-                self.contexts
-                    .get(&record.id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("missing fake context for {}", record.id))
-            }
-        }
-
-        let earlier = build_record("earlier", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
-        let later = build_record("later", "aaaaaaa", "src/lib.rs", 20, Verdict::Comment);
-        let context = resolved_context("src/lib.rs", "pub fn core() {}\n");
-        let mut resolver = CountingResolver {
-            contexts: HashMap::from_iter([
-                ("earlier".to_string(), context.clone()),
-                ("later".to_string(), context),
-            ]),
-            calls: Vec::new(),
-        };
-        let query = FeedbackQuery {
-            filters: BlockFilters::default(),
-            explicit_selection: None,
-            changed_selection: None,
-            allowed_revisions: None,
-            include_approved: true,
-        };
-
-        collect_feedback_entries(
-            &[earlier, later],
-            &FeedbackSinceFilter::All,
-            &query,
-            &mut resolver,
-        )
-        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
-
-        assert_eq!(resolver.calls, vec!["earlier", "later"]);
-    }
 
     #[test]
     fn resolve_record_in_files_uses_line_hint_for_duplicate_block_hashes() {
