@@ -259,6 +259,12 @@ mod tests {
     }
 
     #[test]
+    fn version_flag_reports_only_the_package_version() {
+        let version = Cli::command().render_version().to_string();
+        assert_eq!(version, format!("trueflow {}\n", build_info::VERSION));
+    }
+
+    #[test]
     fn help_documents_pull_request_review_and_feedback_targets() {
         let mut command = Cli::command();
 
