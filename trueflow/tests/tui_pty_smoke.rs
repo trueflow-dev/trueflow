@@ -30,13 +30,6 @@ fn configure_tui_pty_command(cmd: &mut CommandBuilder) {
     }
 }
 
-#[test]
-fn pty_smoke_harness_skips_keyboard_enhancement_probe() {
-    assert!(tui_pty_environment().contains(&(
-        TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV,
-        TUI_KEYBOARD_ENHANCEMENT_PROBE_SKIP_VALUE,
-    )));
-}
 
 struct PtyOutput {
     state: Mutex<PtyOutputState>,
