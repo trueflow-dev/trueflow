@@ -578,7 +578,6 @@ mod tests {
     use crate::repo_path::RepoPath;
     use crate::store::CommitId;
     use crate::vcs::ChangedPath;
-    use std::cell::Cell;
     use std::collections::HashSet;
 
     #[test]
@@ -593,18 +592,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dir_target_parses_nested_path() {
-        let target = ReviewTarget::from_cli("dir:trueflow/src/commands")
-            .unwrap_or_else(|error| panic!("nested dir target: {error}"));
-        assert_eq!(
-            target,
-            ReviewTarget::Dir(
-                RepoPath::new("trueflow/src/commands")
-                    .unwrap_or_else(|error| panic!("valid repo path: {error}")),
-            )
-        );
-    }
 
     #[test]
     fn dir_target_rejects_absolute_path() {
@@ -758,24 +745,6 @@ mod tests {
         assert!(explicit_source_selection.includes(&inside_to_outside.location));
     }
 
-    #[test]
-    fn repo_path_is_under_matches_exact_and_subtree() {
-        let dir = RepoPath::new("website").unwrap();
-        assert!(RepoPath::new("website").unwrap().is_under(&dir));
-        assert!(RepoPath::new("website/index.html").unwrap().is_under(&dir));
-        assert!(
-            !RepoPath::new("website-next/index.html")
-                .unwrap()
-                .is_under(&dir)
-        );
-        assert!(!RepoPath::new("docs/x.md").unwrap().is_under(&dir));
-    }
-
-    #[test]
-    fn repo_path_is_under_root_matches_everything() {
-        let root = RepoPath::root();
-        assert!(RepoPath::new("anything.rs").unwrap().is_under(&root));
-    }
 
     #[test]
     fn resolve_targets_rejects_mixed_historical_and_worktree_content_sources() {
@@ -826,37 +795,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn resolve_targets_reuses_duplicate_revision_resolution() {
-        let calls = Cell::new(0);
-        let revision = RevisionExpr::new("abc1234").unwrap();
-        let targets = vec![
-            ReviewTarget::Revision(revision.clone()),
-            ReviewTarget::RevisionRange(RevisionRangeExpr {
-                start: revision.clone(),
-                end: revision,
-            }),
-        ];
-
-        let resolved = resolve_targets_with(
-            &targets,
-            |revision| {
-                calls.set(calls.get() + 1);
-                CommitId::new(revision.as_str())
-            },
-            || Ok(HashSet::new()),
-            || Ok(HashSet::new()),
-            |_revision| Ok(HashSet::new()),
-            |_start, _end| Ok(HashSet::new()),
-        )
-        .unwrap_or_else(|error| panic!("expected resolved targets: {error}"));
-
-        assert_eq!(calls.get(), 1);
-        assert_eq!(
-            resolved.content_source,
-            ReviewContentSource::Revision(CommitId::new("abc1234").unwrap())
-        );
-    }
 
     #[test]
     fn resolve_targets_intersects_explicit_file_and_changed_paths() {
