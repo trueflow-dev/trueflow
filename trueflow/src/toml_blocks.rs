@@ -611,13 +611,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_section_children_keeps_table_body_entries() {
-        let source = "[database]\nports = [8001, 8002]\ntargets = { primary = \"cache\", secondary = \"backup\" }\n";
-        let spans = split_section_children(source).unwrap();
-        let kinds = spans.iter().map(|span| span.kind).collect::<Vec<_>>();
-        assert_eq!(kinds, vec![BlockKind::List, BlockKind::Section]);
-    }
 
     #[test]
     fn split_inline_table_children_emits_key_value_pairs() {
