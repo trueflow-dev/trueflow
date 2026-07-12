@@ -119,16 +119,31 @@ pub fn hash_bytes(input: &[u8]) -> String {
 /// - Replaces Windows/Mac line endings with \n.
 /// - Ensures a single trailing newline.
 pub fn canonicalize(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-
-    for line in input.lines() {
-        let trimmed = line.trim_end();
-        output.push_str(trimmed);
-        output.push('\n');
-    }
-
     if input.is_empty() {
         return String::new();
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut line_start = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if matches!(bytes[index], b'\r' | b'\n') {
+            output.push_str(input[line_start..index].trim_end());
+            output.push('\n');
+
+            if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                index += 1;
+            }
+            line_start = index + 1;
+        }
+        index += 1;
+    }
+
+    if line_start < input.len() {
+        output.push_str(input[line_start..].trim_end());
+        output.push('\n');
     }
 
     output
@@ -156,6 +171,11 @@ mod tests {
         );
         assert_eq!(base, hash_str("line\r\n"), "CRLF should be normalized");
         assert_eq!(
+            hash_str("first\rsecond"),
+            hash_str("first\nsecond"),
+            "Lone CR line endings should be normalized"
+        );
+        assert_eq!(
             base,
             hash_str("line  "),
             "Trailing spaces on line should be trimmed"
@@ -168,6 +188,7 @@ mod tests {
         assert_eq!(canonicalize("foo"), "foo\n");
         assert_eq!(canonicalize("foo\n"), "foo\n");
         assert_eq!(canonicalize("foo\r\n"), "foo\n");
+        assert_eq!(canonicalize("foo\rbar\r"), "foo\nbar\n");
         assert_eq!(canonicalize("foo  \n"), "foo\n");
         assert_eq!(canonicalize("  foo"), "  foo\n");
         assert_eq!(canonicalize(""), "");
