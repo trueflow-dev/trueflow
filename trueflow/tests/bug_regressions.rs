@@ -1540,32 +1540,11 @@ fn test_review_rejects_mixed_historical_targets_with_different_content_revisions
 
 #[test]
 fn test_review_rejects_all_with_explicit_targets() -> Result<()> {
-    let repo = TestRepo::new("review_mixed_historical_and_worktree_targets")?;
-    repo.write(
-        "src/lib.rs",
-        "pub fn tracked() {\n    println!(\"before\");\n}\n",
-    )?;
-    repo.commit_all("Initial")?;
-
-    repo.git(&["checkout", "-b", "feature/mixed-history-worktree"])?;
-    repo.write(
-        "src/lib.rs",
-        "pub fn tracked() {\n    println!(\"target revision\");\n}\n",
-    )?;
-    repo.commit_all("Target revision")?;
-    let target_revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
-    let target_revision = target_revision.trim().to_string();
-
-    let err = repo.run_err(&[
-        "review",
-        "--json",
-        "--all",
-        "--target",
-        &format!("rev:{target_revision}"),
-    ])?;
+    let repo = TestRepo::new("review_all_with_explicit_target")?;
+    let err = repo.run_err(&["review", "--all", "--target", "dirty"])?;
 
     assert!(
-        err.contains("Explicit review targets cannot be combined with --all"),
+        err.contains("cannot be used with '--target <TARGET>'"),
         "expected all-plus-target error, got: {err}"
     );
 

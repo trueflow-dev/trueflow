@@ -104,7 +104,7 @@ pub enum Commands {
         all: bool,
 
         /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, `rev:abc1234..def5678`, or `pr:11`
-        #[arg(long, value_name = "TARGET")]
+        #[arg(long, value_name = "TARGET", conflicts_with = "all")]
         target: Vec<ReviewTarget>,
 
         /// Review committed changes since this commit (equivalent to `rev:COMMIT..HEAD`)
@@ -203,7 +203,7 @@ pub enum Commands {
         all: bool,
 
         /// Review targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, `rev:abc1234..def5678`, or `pr:11`
-        #[arg(long, value_name = "TARGET")]
+        #[arg(long, value_name = "TARGET", conflicts_with = "all")]
         target: Vec<ReviewTarget>,
 
         /// Review committed changes since this commit (equivalent to `rev:COMMIT..HEAD`)
@@ -618,6 +618,16 @@ mod tests {
                 assert!(exclude.is_empty());
             }
             _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
+    fn review_commands_reject_all_with_explicit_targets() {
+        for command in ["review", "tui"] {
+            assert!(
+                Cli::try_parse_from(["trueflow", command, "--all", "--target", "dirty"]).is_err(),
+                "expected clap to reject {command} --all with --target"
+            );
         }
     }
 
