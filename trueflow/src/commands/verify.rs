@@ -26,6 +26,11 @@ pub fn run(selection: VerifySelection<'_>) -> Result<()> {
     let records = store.read_history()?;
 
     let filtered = filter_records(records, selection);
+    if let VerifySelection::Id(id) = selection
+        && filtered.is_empty()
+    {
+        anyhow::bail!("review record not found: {id}");
+    }
 
     let mut attested = 0;
     let mut unattested = 0;

@@ -32,6 +32,26 @@ fn test_verify_unsigned_records() -> Result<()> {
 }
 
 #[test]
+fn test_verify_rejects_missing_record_id() -> Result<()> {
+    let repo = TestRepo::new("verify_missing_id")?;
+    let record = build_review_record(
+        "deadbeef",
+        ReviewRecordOverrides {
+            id: Some("existing"),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[record])?;
+
+    let output = repo.run_raw(&["verify", "--id", "missing"])?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("review record not found: missing"));
+    Ok(())
+}
+
+#[test]
 fn test_verify_invalid_attestation() -> Result<()> {
     let repo = TestRepo::new("verify_invalid")?;
 
