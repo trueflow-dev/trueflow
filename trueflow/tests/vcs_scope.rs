@@ -87,6 +87,21 @@ fn test_files_changed_uses_remote_tracking_main() -> Result<()> {
 }
 
 #[test]
+fn test_dirty_files_includes_staged_only_changes() -> Result<()> {
+    let repo = TestRepo::new("staged_dirty_file")?;
+    repo.write("src/lib.rs", "pub fn value() -> i32 { 1 }\n")?;
+    repo.commit_all("Base")?;
+    repo.write("src/lib.rs", "pub fn value() -> i32 { 2 }\n")?;
+    repo.git(&["add", "src/lib.rs"])?;
+
+    let git_repo = gix::open(&repo.path)?;
+    let dirty = trueflow::vcs::dirty_files(&git_repo)?;
+
+    assert!(dirty.contains(&trueflow::repo_path::RepoPath::new("src/lib.rs")?));
+    Ok(())
+}
+
+#[test]
 fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
     let repo = TestRepo::new("revision_diff_hunks")?;
     repo.write("src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n")?;
