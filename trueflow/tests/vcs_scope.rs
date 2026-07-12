@@ -68,6 +68,25 @@ pub fn retained_gamma() {
 }
 
 #[test]
+fn test_files_changed_uses_remote_tracking_main() -> Result<()> {
+    let repo = TestRepo::new("remote_main_diff")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.commit_all("Base")?;
+    repo.git(&["checkout", "-B", "main"])?;
+    repo.git(&["checkout", "-B", "feature"])?;
+    repo.write("src/lib.rs", "pub fn helper() {}\n")?;
+    repo.commit_all("Add helper")?;
+    repo.git(&["update-ref", "refs/remotes/origin/main", "refs/heads/main"])?;
+    repo.git(&["branch", "-D", "main"])?;
+
+    let git_repo = gix::open(&repo.path)?;
+    let changed = trueflow::vcs::files_changed_main_to_head_in_repo(&git_repo)?;
+
+    assert!(changed.contains("src/lib.rs"));
+    Ok(())
+}
+
+#[test]
 fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
     let repo = TestRepo::new("revision_diff_hunks")?;
     repo.write("src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n")?;

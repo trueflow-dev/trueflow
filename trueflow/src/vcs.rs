@@ -1212,17 +1212,23 @@ fn file_diff_from_change(
     }
 }
 
+pub(crate) fn mainline_commit(repo: &gix::Repository) -> Result<gix::Commit<'_>> {
+    let mut main_ref = repo
+        .find_reference("main")
+        .or_else(|_| repo.find_reference("master"))
+        .or_else(|_| repo.find_reference("refs/remotes/origin/main"))
+        .or_else(|_| repo.find_reference("refs/remotes/origin/master"))
+        .context("Could not find main, master, origin/main, or origin/master branch")?;
+    Ok(main_ref.peel_to_commit()?)
+}
+
 fn main_and_head_trees<'repo>(
     repo: &'repo gix::Repository,
 ) -> Result<(gix::Tree<'repo>, gix::Tree<'repo>)> {
     let head_commit = repo.head_commit()?;
     let head_tree = head_commit.tree()?;
 
-    let mut main_ref = repo
-        .find_reference("main")
-        .or_else(|_| repo.find_reference("master"))
-        .context("Could not find main or master branch")?;
-    let main_commit = main_ref.peel_to_commit()?;
+    let main_commit = mainline_commit(repo)?;
     let main_id = main_commit.id().detach();
 
     let base_tree = match repo.merge_base(head_commit.id().detach(), main_id) {

@@ -986,11 +986,7 @@ fn revisions_in_range(repo: &gix::Repository, start: &str, end: &str) -> Result<
 
 fn revisions_in_main_to_head(repo: &gix::Repository) -> Result<HashSet<String>> {
     let head_id = repo.head_commit()?.id().detach().to_string();
-    let mut main_ref = repo
-        .find_reference("main")
-        .or_else(|_| repo.find_reference("master"))
-        .map_err(|error| anyhow!("Could not find main or master branch: {error}"))?;
-    let main_id = main_ref.peel_to_commit()?.id().detach().to_string();
+    let main_id = crate::vcs::mainline_commit(repo)?.id().detach().to_string();
     revisions_reachable_from_tip_with_hidden(repo, &head_id, &[main_id])
 }
 
