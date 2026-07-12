@@ -397,16 +397,11 @@ impl<'a> NodeCoverage<'a> {
         check: &ReviewCheck,
         verdict_requirement: VerdictRequirement,
     ) -> usize {
-        let mut identities = HashSet::new();
-        for ancestor_id in self.index.tree.ancestors(self.node_id) {
-            for record_index in self.index.direct_record_indices_for_node(ancestor_id) {
-                let record = &self.index.database.records()[record_index];
-                if record_matches_review_requirement(record, check, verdict_requirement) {
-                    identities.insert(identity_key(&record.identity));
-                }
-            }
-        }
-        identities.len()
+        distinct_identity_count_matching(
+            self.effective_records().into_iter(),
+            check,
+            verdict_requirement,
+        )
     }
 
     pub fn is_well_reviewed(&self, policy: &CoveragePolicy) -> bool {
@@ -1047,11 +1042,27 @@ fn distinct_identity_count_matching<'a>(
     check: &ReviewCheck,
     verdict_requirement: VerdictRequirement,
 ) -> usize {
-    records
-        .filter(|record| record_matches_review_requirement(record, check, verdict_requirement))
-        .map(|record| identity_key(&record.identity))
-        .collect::<HashSet<_>>()
-        .len()
+    let mut latest_by_identity = HashMap::new();
+    for (position, record) in records.enumerate() {
+        if &record.check != check {
+            continue;
+        }
+
+        latest_by_identity
+            .entry(identity_key(&record.identity))
+            .and_modify(|(best_position, best_record): &mut (usize, &Record)| {
+                if (record.timestamp, position) > (best_record.timestamp, *best_position) {
+                    *best_position = position;
+                    *best_record = record;
+                }
+            })
+            .or_insert((position, record));
+    }
+
+    latest_by_identity
+        .values()
+        .filter(|(_, record)| record_matches_review_requirement(record, check, verdict_requirement))
+        .count()
 }
 
 fn record_matches_review_requirement(
@@ -1298,6 +1309,43 @@ mod tests {
                 .node(function_id)
                 .is_well_reviewed(&CoveragePolicy::two_person_review())
         );
+    }
+
+    #[test]
+    fn two_person_policy_ignores_withdrawn_approval() {
+        let (tree, _, function_id, _, _) = build_function_tree();
+        let function_hash = tree.node(function_id).hash.clone();
+        let mut alice_rejected = approved_block_record(
+            "2",
+            function_hash.clone(),
+            "src/lib.rs",
+            1,
+            "alice@example.com",
+            2,
+        );
+        alice_rejected.verdict = Verdict::Rejected;
+        let records = vec![
+            approved_block_record(
+                "1",
+                function_hash.clone(),
+                "src/lib.rs",
+                1,
+                "alice@example.com",
+                1,
+            ),
+            alice_rejected,
+            approved_block_record("3", function_hash, "src/lib.rs", 1, "bob@example.com", 3),
+        ];
+        let database = ReviewDatabase::from_records(records);
+        let coverage =
+            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let function_coverage = coverage.node(function_id);
+
+        assert_eq!(
+            function_coverage.direct_latest_verdict_for(&ReviewCheck::review()),
+            Some(&Verdict::Approved)
+        );
+        assert!(!function_coverage.is_well_reviewed(&CoveragePolicy::two_person_review()));
     }
 
     #[test]
