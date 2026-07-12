@@ -520,10 +520,7 @@ pub fn head_blocks_for_path(repo: &gix::Repository, path: &RepoPath) -> Result<V
     }
     let blob = entry.object()?.try_into_blob()?;
     let content = std::str::from_utf8(&blob.data).context("utf8")?;
-    let extension = tree_path.extension().and_then(|ext| ext.to_str());
-    let language = extension
-        .and_then(Language::from_extension)
-        .unwrap_or(Language::Unknown);
+    let language = language_for_tree_path(tree_path);
     Ok(split_blocks(content, language))
 }
 
@@ -726,6 +723,18 @@ fn display_path_for_tree_entry(path: &str, _workdir_prefix: Option<&str>) -> Res
     RepoPath::new(normalized_path)
 }
 
+fn language_for_tree_path(path: &Path) -> Language {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(Language::from_extension)
+        .or_else(|| {
+            path.file_name()
+                .and_then(|file_name| file_name.to_str())
+                .and_then(Language::from_file_name)
+        })
+        .unwrap_or(Language::Unknown)
+}
+
 fn file_state_from_blob(
     blob: &gix::Blob<'_>,
     tree_path: &Path,
@@ -736,11 +745,7 @@ fn file_state_from_blob(
         Err(_) => return FileState::from_binary(output_path, &blob.data),
     };
 
-    let language = tree_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(Language::from_extension)
-        .unwrap_or(Language::Unknown);
+    let language = language_for_tree_path(tree_path);
     let blocks = split_blocks(content, language);
 
     FileState::from_text(output_path, language, &blob.data, blocks)

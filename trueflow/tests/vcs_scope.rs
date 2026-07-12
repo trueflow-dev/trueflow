@@ -102,6 +102,28 @@ fn test_dirty_files_includes_staged_only_changes() -> Result<()> {
 }
 
 #[test]
+fn test_revision_file_states_recognize_canonical_file_names() -> Result<()> {
+    let repo = TestRepo::new("revision_justfile_language")?;
+    repo.write("Justfile", "build:\n    echo build\n")?;
+    repo.commit_all("Add Justfile")?;
+
+    let git_repo = gix::open(&repo.path)?;
+    let files = trueflow::vcs::file_states_in_revision(&git_repo, "HEAD", None)?;
+    let Some(justfile) = files.iter().find(|file| file.path.as_str() == "Justfile") else {
+        anyhow::bail!("expected committed Justfile");
+    };
+
+    assert_eq!(justfile.language, trueflow::analysis::Language::Just);
+    assert!(
+        justfile
+            .blocks
+            .iter()
+            .any(|block| block.kind == trueflow::block::BlockKind::CodeParagraph)
+    );
+    Ok(())
+}
+
+#[test]
 fn test_diff_hunks_for_file_in_revision_uses_selected_revision() -> Result<()> {
     let repo = TestRepo::new("revision_diff_hunks")?;
     repo.write("src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n")?;
