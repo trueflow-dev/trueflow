@@ -122,7 +122,12 @@ pub enum Commands {
     /// Export feedback for LLM/Agent consumption
     Feedback {
         /// Output format (xml or json)
-        #[arg(long, value_enum, default_value_t = FeedbackFormat::Xml)]
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = FeedbackFormat::Xml,
+            conflicts_with = "pr"
+        )]
         format: FeedbackFormat,
 
         /// Only include records since this point ("all", "last", relative durations like "1h", unix ts, or RFC3339)
@@ -545,6 +550,19 @@ mod tests {
         };
         let rendered = err.to_string();
         assert!(rendered.contains("cannot be used with '--target <TARGET>'"));
+    }
+
+    #[test]
+    fn feedback_command_rejects_format_when_pr_is_present() {
+        let err = match Cli::try_parse_from([
+            "trueflow", "feedback", "--pr", "pr:11", "--format", "json",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --format in pull request mode"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("--format <FORMAT>"));
+        assert!(rendered.contains("--pr <PR>"));
     }
 
     #[test]
