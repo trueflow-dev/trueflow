@@ -62,11 +62,11 @@ pub enum Commands {
         line: Option<u32>,
 
         /// Internal scoped comment line span start (0-indexed, inclusive)
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, requires = "comment_scope_end")]
         comment_scope_start: Option<u32>,
 
         /// Internal scoped comment line span end (0-indexed, exclusive)
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, requires = "comment_scope_start")]
         comment_scope_end: Option<u32>,
 
         /// Internal scoped comment context
@@ -745,6 +745,28 @@ mod tests {
             err.to_string()
                 .contains("repo path contains invalid segment")
         );
+    }
+
+    #[test]
+    fn mark_command_rejects_unpaired_comment_scope_endpoints() {
+        for (provided, required) in [
+            ("--comment-scope-start", "--comment-scope-end"),
+            ("--comment-scope-end", "--comment-scope-start"),
+        ] {
+            let err = match Cli::try_parse_from([
+                "trueflow",
+                "mark",
+                "--fingerprint",
+                "abc1234",
+                provided,
+                "1",
+            ]) {
+                Ok(_) => panic!("expected clap to reject {provided} without {required}"),
+                Err(err) => err,
+            };
+
+            assert!(err.to_string().contains(required));
+        }
     }
 
     #[test]
