@@ -5,9 +5,11 @@ use std::sync::OnceLock;
 static PARAGRAPH_BREAK: OnceLock<Regex> = OnceLock::new();
 
 pub fn paragraph_break_regex() -> &'static Regex {
-    PARAGRAPH_BREAK.get_or_init(|| match Regex::new(r"\n\s*\n") {
-        Ok(regex) => regex,
-        Err(error) => panic!("invalid paragraph regex: {error}"),
+    PARAGRAPH_BREAK.get_or_init(|| {
+        Regex::new(
+            r"(?:\r\n[^\S\r\n]*(?:\r\n|\r|\n)|\r[^\S\r\n]*(?:\r\n|\r)|\n[^\S\r\n]*(?:\r\n|\r|\n))(?:[^\S\r\n]*(?:\r\n|\r|\n))*",
+        )
+            .unwrap_or_else(|error| panic!("invalid paragraph regex: {error}"))
     })
 }
 
@@ -42,4 +44,24 @@ where
     }
 
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paragraph_break_consumes_complete_newline_sequences() {
+        for (content, expected_gap) in
+            [("alpha\r\n\r\nbeta", "\r\n\r\n"), ("alpha\r\rbeta", "\r\r")]
+        {
+            let paragraph_break = paragraph_break_regex()
+                .find(content)
+                .unwrap_or_else(|| panic!("expected paragraph break in {content:?}"));
+
+            assert_eq!(&content[..paragraph_break.start()], "alpha");
+            assert_eq!(&content[paragraph_break.range()], expected_gap);
+            assert_eq!(&content[paragraph_break.end()..], "beta");
+        }
+    }
 }
