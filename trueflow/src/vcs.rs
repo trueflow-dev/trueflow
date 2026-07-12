@@ -1277,6 +1277,14 @@ fn collect_hunks(hunks: &mut Vec<DiffHunk>, path: &RepoPath, unified: &str) -> R
             });
             continue;
         }
+        if line == r"\ No newline at end of file" {
+            if let Some(previous_line) = current.as_mut().and_then(|hunk| hunk.lines.last_mut())
+                && previous_line.text.ends_with('\n')
+            {
+                previous_line.text.pop();
+            }
+            continue;
+        }
         if let Some(hunk) = &mut current
             && let Some(line) = DiffHunkLine::from_unified_line(line)
         {
@@ -1753,9 +1761,9 @@ mod tests {
     }
 
     #[test]
-    fn collect_hunks_ignores_no_newline_metadata_lines() {
+    fn collect_hunks_preserves_missing_trailing_newlines() {
         let unified_text =
-            "@@ -1 +1 @@\n-let value = 42;\n\\ No newline at end of file\n+let value = 42;\n";
+            "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
         let mut hunks = Vec::new();
 
         collect_hunks(
@@ -1768,7 +1776,7 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert_eq!(
             hunks[0].lines,
-            vec![unified("-let value = 42;\n"), unified("+let value = 42;\n")]
+            vec![DiffHunkLine::removed("old"), DiffHunkLine::added("new")]
         );
     }
 
