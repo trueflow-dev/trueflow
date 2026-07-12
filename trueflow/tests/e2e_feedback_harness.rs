@@ -9,7 +9,7 @@ fn feedback_scenario_review_block_uses_cli_record_defaults() -> Result<()> {
     scenario.write("src/lib.rs", "pub fn core() {}\n")?;
     let revision = scenario.commit_all("Initial")?;
 
-    let record = scenario.review_block("src/lib.rs", "comment")?;
+    let record = scenario.review_block("src/lib.rs", "rejected")?;
 
     assert_eq!(record.block_state, BlockState::Committed);
     assert_eq!(

@@ -159,6 +159,28 @@ fn test_mark_rejects_empty_or_reversed_comment_scope() -> Result<()> {
 }
 
 #[test]
+fn test_mark_comment_requires_visible_note_text() -> Result<()> {
+    let repo = TestRepo::new("comment_requires_note")?;
+    let fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    for note in [None, Some("   ")] {
+        let mut args = vec!["mark", "--fingerprint", fingerprint, "--verdict", "comment"];
+        if let Some(note) = note {
+            args.extend(["--note", note]);
+        }
+
+        let error = repo.run_err(&args)?;
+        assert!(
+            error.contains("comment verdict requires non-empty note text"),
+            "expected missing comment note error, got: {error}"
+        );
+    }
+
+    assert!(!repo.path.join(".trueflow/reviews.jsonl").exists());
+    Ok(())
+}
+
+#[test]
 fn test_mark_diff_block_hash_records_block_target() -> Result<()> {
     let repo = TestRepo::new("mark_diff_block_hash_block_target")?;
     repo.write("src/lib.rs", "pub fn value() -> i32 { 1 }\n")?;

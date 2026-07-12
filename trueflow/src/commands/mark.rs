@@ -118,6 +118,15 @@ fn run_with_signing_mode(
     params: MarkParams,
     signing_mode: SigningMode,
 ) -> Result<()> {
+    if params.verdict == Verdict::Comment
+        && params
+            .note
+            .as_ref()
+            .is_none_or(|note| note.trim().is_empty())
+    {
+        anyhow::bail!("comment verdict requires non-empty note text");
+    }
+
     if let Some(scope) = &params.comment_scope
         && scope.start_line >= scope.end_line
     {

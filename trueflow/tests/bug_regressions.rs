@@ -2001,6 +2001,8 @@ fn test_feedback_uses_precise_block_lookup_for_coverage() -> Result<()> {
         &duplicate_hash,
         "--verdict",
         "question",
+        "--note",
+        "Investigate duplicate block",
         "--quiet",
     ])?;
 
