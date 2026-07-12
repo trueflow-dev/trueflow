@@ -1356,28 +1356,7 @@ fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(Stri
                     .map(|block| (file.path.as_str().to_string(), block.clone()))
             })
         }
-        ReviewTargetRef::Tree { .. } => {
-            if let Some(path_hint) = record.path_hint.as_ref() {
-                if let Some(file) = files.iter().find(|file| file.path == *path_hint) {
-                    return best_block_for_file(file, record.line_hint)
-                        .map(|block| (file.path.as_str().to_string(), block.clone()));
-                }
-
-                let path_hint = path_hint.as_str();
-                if let Some(file) = files
-                    .iter()
-                    .find(|file| path_matches_dir_hint(file.path.as_str(), path_hint))
-                {
-                    return best_block_for_file(file, record.line_hint)
-                        .map(|block| (file.path.as_str().to_string(), block.clone()));
-                }
-            }
-
-            files.iter().find_map(|file| {
-                best_block_for_file(file, record.line_hint)
-                    .map(|block| (file.path.as_str().to_string(), block.clone()))
-            })
-        }
+        ReviewTargetRef::Tree { .. } => None,
     }
 }
 
@@ -1405,13 +1384,6 @@ fn best_block_for_file(file: &FileState, line_hint: Option<u32>) -> Option<&Bloc
                 .find(|block| block.start_line <= line && line < block.end_line)
         })
         .or_else(|| file.blocks.first())
-}
-
-fn path_matches_dir_hint(file_path: &str, dir_hint: &str) -> bool {
-    file_path == dir_hint
-        || file_path
-            .strip_prefix(dir_hint)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn path_matches_feedback_selections(
@@ -2032,6 +2004,23 @@ mod tests {
             .unwrap_or_else(|| panic!("expected duplicate block to resolve"));
 
         assert_eq!(block.start_line, second.start_line);
+    }
+
+    #[test]
+    fn resolve_record_in_files_does_not_bind_tree_target_to_arbitrary_child() {
+        let block = Block::new("fn child() {}\n".to_string(), BlockKind::Function, 0, 1);
+        let file = FileState::from_text(
+            RepoPath::new("src/child.rs").unwrap(),
+            crate::analysis::Language::Rust,
+            b"fn child() {}\n",
+            vec![block],
+        );
+        let mut record = build_record("tree", "aaaaaaa", "src", 10, Verdict::Comment);
+        record.target = ReviewTargetRef::Tree {
+            hash: TreeHash::new("unrelated-tree"),
+        };
+
+        assert!(resolve_record_in_files(&record, &[file]).is_none());
     }
 
     #[test]
