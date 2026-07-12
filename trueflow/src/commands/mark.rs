@@ -118,6 +118,12 @@ fn run_with_signing_mode(
     params: MarkParams,
     signing_mode: SigningMode,
 ) -> Result<()> {
+    if let Some(scope) = &params.comment_scope
+        && scope.start_line >= scope.end_line
+    {
+        anyhow::bail!("comment scope end must be greater than start");
+    }
+
     info!(
         "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?}, comment_scope={:?}, comment_context_present={}, comment_anchor_present={}, signing_mode={:?})",
         &params.fingerprint,

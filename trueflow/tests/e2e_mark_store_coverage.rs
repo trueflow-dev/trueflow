@@ -134,6 +134,31 @@ fn test_mark_unknown_state_no_path() -> Result<()> {
 }
 
 #[test]
+fn test_mark_rejects_empty_or_reversed_comment_scope() -> Result<()> {
+    let repo = TestRepo::new("invalid_comment_scope")?;
+    let fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    for (start, end) in [("4", "4"), ("5", "4")] {
+        let error = repo.run_err(&[
+            "mark",
+            "--fingerprint",
+            fingerprint,
+            "--comment-scope-start",
+            start,
+            "--comment-scope-end",
+            end,
+        ])?;
+        assert!(
+            error.contains("comment scope end must be greater than start"),
+            "expected invalid comment scope error, got: {error}"
+        );
+    }
+
+    assert!(!repo.path.join(".trueflow/reviews.jsonl").exists());
+    Ok(())
+}
+
+#[test]
 fn test_mark_diff_block_hash_records_block_target() -> Result<()> {
     let repo = TestRepo::new("mark_diff_block_hash_block_target")?;
     repo.write("src/lib.rs", "pub fn value() -> i32 { 1 }\n")?;
