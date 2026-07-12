@@ -142,7 +142,11 @@ pub enum Commands {
         open: bool,
 
         /// Submit the current trueflow-owned pending review as a COMMENT review. Requires `--pr`.
-        #[arg(long, requires = "pr")]
+        #[arg(
+            long,
+            requires = "pr",
+            conflicts_with_all = ["since", "include_approved", "only", "exclude"]
+        )]
         submit: bool,
 
         /// Feedback export targets such as `dirty`, `main`, `file:src/lib.rs`, `dir:src`, or `rev:abc1234..def5678`; use `--pr` for pull request posting
@@ -510,6 +514,24 @@ mod tests {
                 assert!(submit);
             }
             _ => panic!("expected feedback command"),
+        }
+    }
+
+    #[test]
+    fn feedback_command_rejects_record_filters_when_submitting() {
+        for filter in [
+            &["--since", "1h"][..],
+            &["--include-approved"][..],
+            &["--only", "function"][..],
+            &["--exclude", "gap"][..],
+        ] {
+            let mut args = vec!["trueflow", "feedback", "--pr", "pr:11", "--submit"];
+            args.extend_from_slice(filter);
+
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "expected clap to reject --submit with {filter:?}"
+            );
         }
     }
 
