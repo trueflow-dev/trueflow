@@ -303,7 +303,8 @@ pub fn collect_feedback_entries(
         _ => None,
     };
     let resolved_records = resolve_feedback_records(records, resolver)?;
-    let latest_verdicts = latest_verdicts_by_verdict_key(&resolved_records);
+    let latest_verdicts =
+        latest_verdicts_by_verdict_key(&resolved_records, query.allowed_revisions.as_ref());
 
     let mut grouped = HashMap::<FeedbackPresentationEntryKey, FeedbackEntry>::new();
     for resolved in resolved_records {
@@ -945,10 +946,14 @@ pub fn resolve_allowed_revisions(
 
 fn latest_verdicts_by_verdict_key(
     records: &[ResolvedFeedbackRecord<'_>],
+    allowed_revisions: Option<&HashSet<String>>,
 ) -> HashMap<FeedbackVerdictKey, &'static str> {
     let mut latest = HashMap::<FeedbackVerdictKey, (i64, usize, &'static str)>::new();
     for resolved in records {
         let record = resolved.record;
+        if !record_matches_allowed_revisions(record, allowed_revisions) {
+            continue;
+        }
         let should_replace =
             latest
                 .get(&resolved.verdict_key)
@@ -1597,6 +1602,38 @@ mod tests {
         .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
 
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn collect_feedback_entries_ignores_approvals_outside_allowed_revisions() {
+        let comment = build_record("comment", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
+        let approval = build_record("approval", "bbbbbbb", "src/lib.rs", 20, Verdict::Approved);
+        let context = resolved_context("src/lib.rs", "pub fn core() {}\n");
+        let mut resolver = FakeResolver {
+            contexts: HashMap::from_iter([
+                ("comment".to_string(), context.clone()),
+                ("approval".to_string(), context),
+            ]),
+        };
+        let query = FeedbackQuery {
+            filters: BlockFilters::default(),
+            explicit_selection: None,
+            changed_selection: None,
+            allowed_revisions: Some(HashSet::from_iter(["aaaaaaa".to_string()])),
+            include_approved: false,
+        };
+
+        let entries = collect_feedback_entries(
+            &[comment.clone(), approval],
+            &FeedbackSinceFilter::All,
+            &query,
+            &mut resolver,
+        )
+        .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].reviews.len(), 1);
+        assert_eq!(entries[0].reviews[0].id, comment.id);
     }
 
     #[test]
