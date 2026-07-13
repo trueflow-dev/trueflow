@@ -82,7 +82,7 @@ fn test_files_changed_uses_remote_tracking_main() -> Result<()> {
     let git_repo = gix::open(&repo.path)?;
     let changed = trueflow::vcs::files_changed_main_to_head_in_repo(&git_repo)?;
 
-    assert!(changed.contains("src/lib.rs"));
+    assert!(changed.contains(&ChangedPath::identity(RepoPath::new("src/lib.rs")?)));
     Ok(())
 }
 

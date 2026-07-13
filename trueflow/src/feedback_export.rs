@@ -272,11 +272,13 @@ struct ResolvedFeedbackRecord<'a> {
 
 fn resolve_feedback_records<'a>(
     records: &'a [Record],
+    allowed_revisions: Option<&HashSet<String>>,
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<ResolvedFeedbackRecord<'a>>> {
     records
         .iter()
         .enumerate()
+        .filter(|(_, record)| record_matches_allowed_revisions(record, allowed_revisions))
         .map(|(index, record)| {
             let context = resolver.resolve_context(record)?;
             let (file_path, block, entry_key, verdict_key) = feedback_entry_parts(record, &context);
@@ -302,9 +304,9 @@ pub fn collect_feedback_entries(
         FeedbackSinceFilter::Cursor(cursor) => Some(validate_feedback_cursor(cursor, records)?),
         _ => None,
     };
-    let resolved_records = resolve_feedback_records(records, resolver)?;
-    let latest_verdicts =
-        latest_verdicts_by_verdict_key(&resolved_records, query.allowed_revisions.as_ref());
+    let resolved_records =
+        resolve_feedback_records(records, query.allowed_revisions.as_ref(), resolver)?;
+    let latest_verdicts = latest_verdicts_by_verdict_key(&resolved_records);
 
     let mut grouped = HashMap::<FeedbackPresentationEntryKey, FeedbackEntry>::new();
     for resolved in resolved_records {
@@ -946,14 +948,10 @@ pub fn resolve_allowed_revisions(
 
 fn latest_verdicts_by_verdict_key(
     records: &[ResolvedFeedbackRecord<'_>],
-    allowed_revisions: Option<&HashSet<String>>,
 ) -> HashMap<FeedbackVerdictKey, &'static str> {
     let mut latest = HashMap::<FeedbackVerdictKey, (i64, usize, &'static str)>::new();
     for resolved in records {
         let record = resolved.record;
-        if !record_matches_allowed_revisions(record, allowed_revisions) {
-            continue;
-        }
         let should_replace =
             latest
                 .get(&resolved.verdict_key)
@@ -1512,16 +1510,10 @@ mod tests {
         let keep = build_record("keep", "aaaaaaa", "src/lib.rs", 10, Verdict::Comment);
         let skip = build_record("skip", "bbbbbbb", "src/lib.rs", 20, Verdict::Comment);
         let mut resolver = FakeResolver {
-            contexts: HashMap::from_iter([
-                (
-                    "keep".to_string(),
-                    resolved_context("src/lib.rs", "pub fn keep() {}\n"),
-                ),
-                (
-                    "skip".to_string(),
-                    resolved_context("src/lib.rs", "pub fn keep() {}\n"),
-                ),
-            ]),
+            contexts: HashMap::from_iter([(
+                "keep".to_string(),
+                resolved_context("src/lib.rs", "pub fn keep() {}\n"),
+            )]),
         };
         let query = FeedbackQuery {
             filters: BlockFilters::default(),
@@ -2008,7 +2000,12 @@ mod tests {
 
     #[test]
     fn resolve_record_in_files_does_not_bind_tree_target_to_arbitrary_child() {
-        let block = Block::new("fn child() {}\n".to_string(), BlockKind::Function, 0, 1);
+        let block = Block::new(
+            "fn child() {}\n".to_string(),
+            BlockKind::Function,
+            LineSpan::new(0, 1),
+            ByteSpan::new(0, "fn child() {}\n".len()),
+        );
         let file = FileState::from_text(
             RepoPath::new("src/child.rs").unwrap(),
             crate::analysis::Language::Rust,
