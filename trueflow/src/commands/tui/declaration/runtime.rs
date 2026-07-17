@@ -678,6 +678,9 @@ fn collection_status_text(status: &CollectionStatus) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        CollectionStatus::Partial { diagnostic_count } => {
+            format!("Declaration review is partial: {diagnostic_count} projection diagnostic(s)")
+        }
         CollectionStatus::FullyReviewed => {
             "All declaration surfaces are already reviewed".to_owned()
         }

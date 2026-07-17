@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::snapshot::{PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId};
@@ -92,6 +92,11 @@ pub fn diff_declarations(snapshot_pairs: &[SnapshotPair]) -> Result<DeclarationD
 }
 
 fn diff_pair(pair: &SnapshotPair, diff: &mut DeclarationDiff) -> Result<()> {
+    ensure!(
+        pair.base.is_some() || pair.head.is_some(),
+        "snapshot pair {} is missing both base and head endpoints",
+        pair.id.as_str()
+    );
     let base_facts = pair
         .base
         .as_ref()

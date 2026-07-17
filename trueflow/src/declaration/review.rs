@@ -88,6 +88,7 @@ pub enum DeclarationReviewStatus {
     Ready,
     NoSurfaceChanges,
     UnsupportedLanguage { languages: Vec<Language> },
+    Partial { diagnostic_count: usize },
     FullyReviewed,
 }
 
@@ -202,6 +203,10 @@ pub fn collect_declaration_review(
     let status = if !unsupported_languages.is_empty() {
         DeclarationReviewStatus::UnsupportedLanguage {
             languages: unsupported_languages,
+        }
+    } else if !diagnostics.is_empty() {
+        DeclarationReviewStatus::Partial {
+            diagnostic_count: diagnostics.len(),
         }
     } else if !items.is_empty() {
         DeclarationReviewStatus::Ready
