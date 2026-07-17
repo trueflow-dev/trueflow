@@ -555,11 +555,31 @@ fn declaration_language(path: &RepoPath) -> Option<Language> {
     matches!(
         language,
         Language::Rust
+            | Language::Swift
+            | Language::Elisp
+            | Language::JavaScript
             | Language::TypeScript
+            | Language::Java
+            | Language::Kotlin
+            | Language::CSharp
             | Language::Python
+            | Language::Ruby
+            | Language::Php
             | Language::Go
             | Language::C
             | Language::Cpp
+            | Language::Zig
+            | Language::Lua
+            | Language::Dart
+            | Language::Scala
+            | Language::Haskell
+            | Language::OCaml
+            | Language::Elixir
+            | Language::Clojure
+            | Language::Sql
+            | Language::Shell
+            | Language::Nix
+            | Language::Just
     )
     .then_some(language)
 }
