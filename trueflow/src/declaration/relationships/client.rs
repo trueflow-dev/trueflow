@@ -17,16 +17,19 @@ use async_lsp::lsp_types::notification::{
 };
 use async_lsp::lsp_types::request::{
     ApplyWorkspaceEdit, CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls,
-    CallHierarchyPrepare, WorkspaceConfiguration, WorkspaceFoldersRequest,
+    CallHierarchyPrepare, GotoDeclaration, GotoDefinition, GotoTypeDefinition, References,
+    WorkspaceConfiguration, WorkspaceFoldersRequest,
 };
 use async_lsp::lsp_types::{
     ApplyWorkspaceEditResponse, CallHierarchyIncomingCall, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyPrepareParams, CallHierarchyServerCapability,
-    ClientCapabilities, ClientInfo, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DynamicRegistrationClientCapabilities, GeneralClientCapabilities, InitializeParams,
-    InitializedParams, Position, PositionEncodingKind, PublishDiagnosticsParams,
-    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    ClientCapabilities, ClientInfo, DeclarationCapability, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DynamicRegistrationClientCapabilities, GeneralClientCapabilities,
+    GotoCapability, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
+    InitializedParams, Location, OneOf, PartialResultParams, Position, PositionEncodingKind,
+    PublishDiagnosticsParams, ReferenceClientCapabilities, TextDocumentClientCapabilities,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TypeDefinitionProviderCapability, Url,
     WorkDoneProgressParams, WorkspaceFolder,
 };
 use async_lsp::router::Router;
@@ -46,8 +49,8 @@ use crate::analysis::Language;
 
 use super::{
     DocumentHash, LaunchError, LspServerLauncher, LspServerProfile, PositionEncoding,
-    RelationshipCapability, RelationshipRequestKey, WorkspaceTrust, incoming_calls_params,
-    outgoing_calls_params,
+    RelationshipBackend, RelationshipCapability, RelationshipMethod, RelationshipRequest,
+    RelationshipRequestKey, WorkspaceTrust, incoming_calls_params, outgoing_calls_params,
 };
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -250,11 +253,37 @@ impl LspServerLauncher for AsyncLspLauncher {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProviderCapabilities {
+    call_hierarchy: bool,
+    declaration: bool,
+    definition: bool,
+    type_definition: bool,
+    references: bool,
+    document_synchronization: bool,
+}
+
+impl ProviderCapabilities {
+    const fn supports(self, capability: RelationshipCapability) -> bool {
+        match capability {
+            RelationshipCapability::PrepareCallHierarchy
+            | RelationshipCapability::IncomingCalls
+            | RelationshipCapability::OutgoingCalls => self.call_hierarchy,
+            RelationshipCapability::Declaration => self.declaration,
+            RelationshipCapability::Definition => self.definition,
+            RelationshipCapability::TypeDefinition => self.type_definition,
+            RelationshipCapability::References => self.references,
+            RelationshipCapability::DocumentSynchronization => self.document_synchronization,
+        }
+    }
+}
+
 pub struct RelationshipProvider {
     profile: LspServerProfile,
     language: Language,
     position_encoding: PositionEncoding,
     text_sync: TextDocumentSync,
+    capabilities: ProviderCapabilities,
     command_tx: mpsc::Sender<WorkerCommand>,
     thread: Option<JoinHandle<()>>,
     closed: bool,
@@ -317,7 +346,7 @@ impl RelationshipProvider {
         let startup = startup_rx
             .recv_timeout(INITIALIZE_TIMEOUT + SHUTDOWN_TIMEOUT)
             .map_err(|_| ProviderError::Timeout)?;
-        let (position_encoding, text_sync) = match startup {
+        let (position_encoding, text_sync, capabilities) = match startup {
             Ok(metadata) => metadata,
             Err(error) => {
                 let _ = thread.join();
@@ -330,6 +359,7 @@ impl RelationshipProvider {
             language,
             position_encoding,
             text_sync,
+            capabilities,
             command_tx,
             thread: Some(thread),
             closed: false,
@@ -353,11 +383,11 @@ impl RelationshipProvider {
     }
 
     pub fn synchronize_document(&mut self, document: DocumentSnapshot) -> Result<(), ProviderError> {
-        self.request(|reply| WorkerCommand::Synchronize { document, reply })?
+        self.worker_request(|reply| WorkerCommand::Synchronize { document, reply })?
     }
 
     pub fn close_document(&mut self, uri: Url) -> Result<(), ProviderError> {
-        self.request(|reply| WorkerCommand::CloseDocument { uri, reply })?
+        self.worker_request(|reply| WorkerCommand::CloseDocument { uri, reply })?
     }
 
     pub fn call_hierarchy(
@@ -366,7 +396,7 @@ impl RelationshipProvider {
         position: Position,
     ) -> ProviderCallHierarchyState {
         let failure_key = key.clone();
-        match self.request(|reply| WorkerCommand::CallHierarchy {
+        match self.worker_request(|reply| WorkerCommand::CallHierarchy {
             key,
             position,
             reply,
@@ -395,7 +425,7 @@ impl RelationshipProvider {
         reply?
     }
 
-    fn request<T>(
+    fn worker_request<T>(
         &self,
         command: impl FnOnce(std_mpsc::SyncSender<T>) -> WorkerCommand,
     ) -> Result<T, ProviderError> {
@@ -421,6 +451,28 @@ impl RelationshipProvider {
             })
     }
 }
+impl RelationshipBackend for RelationshipProvider {
+    fn supports(&self, capability: RelationshipCapability) -> bool {
+        self.capabilities.supports(capability)
+    }
+
+    fn request(
+        &mut self,
+        request: RelationshipRequest,
+    ) -> Result<Vec<Location>, ProviderError> {
+        let capability = relationship_request_capability(&request);
+        if !self.supports(capability) {
+            return Err(ProviderError::Protocol(format!(
+                "LSP server does not advertise {capability:?} support"
+            )));
+        }
+        self.worker_request(|reply| WorkerCommand::Relationship {
+            request,
+            reply,
+        })?
+    }
+}
+
 
 impl Drop for RelationshipProvider {
     fn drop(&mut self) {
@@ -441,6 +493,10 @@ enum WorkerCommand {
         key: RelationshipRequestKey,
         position: Position,
         reply: std_mpsc::SyncSender<ProviderCallHierarchyState>,
+    },
+    Relationship {
+        request: RelationshipRequest,
+        reply: std_mpsc::SyncSender<Result<Vec<Location>, ProviderError>>,
     },
     Shutdown {
         reply: std_mpsc::SyncSender<Result<(), ProviderError>>,
@@ -464,7 +520,7 @@ struct WorkerSession {
     stderr_drain: TokioJoinHandle<()>,
     position_encoding: PositionEncoding,
     text_sync: TextDocumentSync,
-    call_hierarchy_supported: bool,
+    capabilities: ProviderCapabilities,
     documents: HashMap<Url, OpenDocument>,
     document_bytes: usize,
 }
@@ -492,7 +548,7 @@ async fn worker_main(
     executable: PathBuf,
     mut command_rx: mpsc::Receiver<WorkerCommand>,
     startup_tx: std_mpsc::SyncSender<
-        Result<(PositionEncoding, TextDocumentSync), ProviderError>,
+        Result<(PositionEncoding, TextDocumentSync, ProviderCapabilities), ProviderError>,
     >,
 ) {
     let mut session = match start_worker_session(profile, language, root, executable).await {
@@ -502,7 +558,11 @@ async fn worker_main(
             return;
         }
     };
-    let _ = startup_tx.send(Ok((session.position_encoding, session.text_sync)));
+    let _ = startup_tx.send(Ok((
+        session.position_encoding,
+        session.text_sync,
+        session.capabilities,
+    )));
 
     while let Some(command) = command_rx.recv().await {
         match command {
@@ -520,6 +580,14 @@ async fn worker_main(
                 let execution = session.call_hierarchy(key, position).await;
                 let poison = execution.poison_session;
                 let _ = reply.send(execution.state);
+                if poison {
+                    break;
+                }
+            }
+            WorkerCommand::Relationship { request, reply } => {
+                let execution = session.relationship(request).await;
+                let poison = execution.poison_session;
+                let _ = reply.send(execution.result);
                 if poison {
                     break;
                 }
@@ -643,6 +711,21 @@ async fn start_worker_session(
             call_hierarchy: Some(DynamicRegistrationClientCapabilities {
                 dynamic_registration: Some(false),
             }),
+            declaration: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(true),
+            }),
+            definition: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(true),
+            }),
+            type_definition: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(true),
+            }),
+            references: Some(ReferenceClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
             ..TextDocumentClientCapabilities::default()
         }),
         ..ClientCapabilities::default()
@@ -683,11 +766,33 @@ async fn start_worker_session(
         None => PositionEncoding::Utf16,
     };
     let text_sync = TextDocumentSync::negotiate(initialized.capabilities.text_document_sync);
-    let call_hierarchy_supported = matches!(
-        initialized.capabilities.call_hierarchy_provider,
-        Some(CallHierarchyServerCapability::Simple(true))
-            | Some(CallHierarchyServerCapability::Options(_))
-    );
+    let capabilities = ProviderCapabilities {
+        call_hierarchy: matches!(
+            initialized.capabilities.call_hierarchy_provider,
+            Some(CallHierarchyServerCapability::Simple(true))
+                | Some(CallHierarchyServerCapability::Options(_))
+        ),
+        declaration: matches!(
+            initialized.capabilities.declaration_provider,
+            Some(DeclarationCapability::Simple(true))
+                | Some(DeclarationCapability::RegistrationOptions(_))
+                | Some(DeclarationCapability::Options(_))
+        ),
+        definition: matches!(
+            initialized.capabilities.definition_provider,
+            Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+        ),
+        type_definition: matches!(
+            initialized.capabilities.type_definition_provider,
+            Some(TypeDefinitionProviderCapability::Simple(true))
+                | Some(TypeDefinitionProviderCapability::Options(_))
+        ),
+        references: matches!(
+            initialized.capabilities.references_provider,
+            Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+        ),
+        document_synchronization: text_sync.open_close,
+    };
     server
         .notify::<async_lsp::lsp_types::notification::Initialized>(InitializedParams {})
         .map_err(|error| ProviderError::Protocol(format!("cannot send initialized: {error}")))?;
@@ -702,7 +807,7 @@ async fn start_worker_session(
         stderr_drain,
         position_encoding,
         text_sync,
-        call_hierarchy_supported,
+        capabilities,
         documents: HashMap::new(),
         document_bytes: 0,
     })
@@ -808,7 +913,7 @@ impl WorkerSession {
                 poison_session: false,
             };
         }
-        if !self.call_hierarchy_supported {
+        if !self.capabilities.call_hierarchy {
             return QueryExecution {
                 state: ProviderCallHierarchyState::Unsupported {
                     key,
@@ -956,6 +1061,102 @@ impl WorkerSession {
         }
     }
 
+    async fn relationship(&self, request: RelationshipRequest) -> RelationshipQueryExecution {
+        let capability = relationship_request_capability(&request);
+        if !self.capabilities.supports(capability) {
+            return RelationshipQueryExecution::failed(ProviderError::Protocol(format!(
+                "LSP server does not advertise {capability:?} support"
+            )));
+        }
+        let document_uri = relationship_request_uri(&request);
+        if document_uri.scheme() != "file" || !self.documents.contains_key(document_uri) {
+            return RelationshipQueryExecution::failed(ProviderError::InvalidDocument(
+                "the exact relationship request document is not synchronized".to_owned(),
+            ));
+        }
+
+        match request {
+            RelationshipRequest::Resolve { method, params } => {
+                let params = GotoDefinitionParams {
+                    text_document_position_params: params,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                };
+                match method {
+                    RelationshipMethod::Declaration => {
+                        self.goto_relationship::<GotoDeclaration>(params, method).await
+                    }
+                    RelationshipMethod::Definition => {
+                        self.goto_relationship::<GotoDefinition>(params, method).await
+                    }
+                    RelationshipMethod::TypeDefinition => {
+                        self.goto_relationship::<GotoTypeDefinition>(params, method).await
+                    }
+                    RelationshipMethod::References => RelationshipQueryExecution::failed(
+                        ProviderError::Protocol(
+                            "References must use a relationship references request".to_owned(),
+                        ),
+                    ),
+                }
+            }
+            RelationshipRequest::References(params) => self.references(params).await,
+        }
+    }
+
+    async fn goto_relationship<R>(
+        &self,
+        params: GotoDefinitionParams,
+        method: RelationshipMethod,
+    ) -> RelationshipQueryExecution
+    where
+        R: async_lsp::lsp_types::request::Request<
+                Params = GotoDefinitionParams,
+                Result = Option<GotoDefinitionResponse>,
+            >,
+    {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            match timeout_at(deadline, self.server.request::<R>(params.clone())).await {
+                Ok(Ok(response)) => {
+                    return RelationshipQueryExecution::locations(goto_locations(response));
+                }
+                Ok(Err(Error::Response(response)))
+                    if response.code == ErrorCode::CONTENT_MODIFIED =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(Err(error)) => {
+                    return RelationshipQueryExecution::failed(ProviderError::Protocol(format!(
+                        "{method:?} relationship request failed: {error}"
+                    )));
+                }
+                Err(_) => return RelationshipQueryExecution::timed_out(),
+            }
+        }
+    }
+
+    async fn references(&self, params: async_lsp::lsp_types::ReferenceParams) -> RelationshipQueryExecution {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            match timeout_at(deadline, self.server.request::<References>(params.clone())).await {
+                Ok(Ok(locations)) => {
+                    return RelationshipQueryExecution::locations(locations.unwrap_or_default());
+                }
+                Ok(Err(Error::Response(response)))
+                    if response.code == ErrorCode::CONTENT_MODIFIED =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(Err(error)) => {
+                    return RelationshipQueryExecution::failed(ProviderError::Protocol(format!(
+                        "References relationship request failed: {error}"
+                    )));
+                }
+                Err(_) => return RelationshipQueryExecution::timed_out(),
+            }
+        }
+    }
+
     async fn stop(&mut self) -> Result<(), ProviderError> {
         let uris: Vec<_> = self.documents.keys().cloned().collect();
         for uri in uris {
@@ -982,6 +1183,79 @@ impl WorkerSession {
             Ok(Err(error)) => Err(ProviderError::Protocol(format!("LSP shutdown failed: {error}"))),
             Err(_) => Err(ProviderError::Timeout),
         }
+    }
+}
+
+struct RelationshipQueryExecution {
+    result: Result<Vec<Location>, ProviderError>,
+    poison_session: bool,
+}
+
+impl RelationshipQueryExecution {
+    fn locations(locations: Vec<Location>) -> Self {
+        let result = if locations.len() > MAX_HIERARCHY_ITEMS {
+            Err(ProviderError::ResourceLimit(format!(
+                "relationship response exceeded the {MAX_HIERARCHY_ITEMS}-location limit"
+            )))
+        } else {
+            Ok(locations)
+        };
+        Self {
+            result,
+            poison_session: false,
+        }
+    }
+
+    fn failed(error: ProviderError) -> Self {
+        Self {
+            result: Err(error),
+            poison_session: false,
+        }
+    }
+
+    fn timed_out() -> Self {
+        Self {
+            result: Err(ProviderError::Timeout),
+            poison_session: true,
+        }
+    }
+}
+
+const fn relationship_request_capability(
+    request: &RelationshipRequest,
+) -> RelationshipCapability {
+    match request {
+        RelationshipRequest::Resolve { method, .. } => match method {
+            RelationshipMethod::Declaration => RelationshipCapability::Declaration,
+            RelationshipMethod::Definition => RelationshipCapability::Definition,
+            RelationshipMethod::TypeDefinition => RelationshipCapability::TypeDefinition,
+            RelationshipMethod::References => RelationshipCapability::References,
+        },
+        RelationshipRequest::References(_) => RelationshipCapability::References,
+    }
+}
+
+fn relationship_request_uri(request: &RelationshipRequest) -> &Url {
+    match request {
+        RelationshipRequest::Resolve { params, .. } => &params.text_document.uri,
+        RelationshipRequest::References(params) => {
+            &params.text_document_position.text_document.uri
+        }
+    }
+}
+
+fn goto_locations(response: Option<GotoDefinitionResponse>) -> Vec<Location> {
+    match response {
+        None => Vec::new(),
+        Some(GotoDefinitionResponse::Scalar(location)) => vec![location],
+        Some(GotoDefinitionResponse::Array(locations)) => locations,
+        Some(GotoDefinitionResponse::Link(links)) => links
+            .into_iter()
+            .map(|link| Location {
+                uri: link.target_uri,
+                range: link.target_selection_range,
+            })
+            .collect(),
     }
 }
 
