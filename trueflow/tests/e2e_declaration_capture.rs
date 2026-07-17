@@ -400,6 +400,45 @@ fn added_deleted_and_explicitly_renamed_files_keep_their_correct_endpoint_paths_
 }
 
 #[test]
+fn explicit_cross_language_rename_classifies_each_snapshot_from_its_endpoint_path() -> Result<()> {
+    let repo = TestRepo::new("declaration_capture_cross_language_rename")?;
+    repo.git(&["config", "diff.renames", "true"])?;
+    const SOURCE: &str = "pub struct Renamed {\n    pub value: u64,\n}\n";
+
+    repo.write("src/renamed.rs", SOURCE)?;
+    repo.commit_all("rust endpoint")?;
+    let base = commit_id(&repo, "HEAD")?;
+
+    repo.git(&["mv", "src/renamed.rs", "src/renamed.py"])?;
+    repo.commit_all("python endpoint")?;
+    let head = commit_id(&repo, "HEAD")?;
+
+    let capture = capture_declaration_sources(&repo.path, &range_query(base, head))?;
+    let batch = one_batch(&capture)?;
+    let renamed = pair_for_display_path(batch, "src/renamed.py")?;
+    assert_eq!(renamed.path_evidence, PathPairEvidence::ExplicitRename);
+
+    let renamed_base = renamed
+        .base
+        .as_ref()
+        .context("cross-language rename base")?;
+    let renamed_head = renamed
+        .head
+        .as_ref()
+        .context("cross-language rename head")?;
+    assert_eq!(renamed_base.path, Path::new("src/renamed.rs"));
+    assert_eq!(renamed_head.path, Path::new("src/renamed.py"));
+    assert_eq!(renamed_base.source(), SOURCE);
+    assert_eq!(renamed_head.source(), SOURCE);
+    assert_eq!(
+        (renamed_base.language, renamed_head.language),
+        (Language::Rust, Language::Python)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn multiple_revision_targets_remain_distinct_and_in_request_order() -> Result<()> {
     let repo = TestRepo::new("declaration_capture_ordered_revisions")?;
     repo.write("src/first.rs", "pub fn first() {}\n")?;

@@ -111,29 +111,31 @@ fn capture_immutable_target(
         if !changed_pair_selected(&query.path_selection, &changed_path) {
             continue;
         }
-        let Some(language) = declaration_language(&changed_path.location) else {
+        let base_language = declaration_language(&changed_path.source_location);
+        let head_language = declaration_language(&changed_path.location);
+        if base_language.is_none() && head_language.is_none() {
             continue;
+        }
+        let base = match (base_tree.as_ref(), base_language) {
+            (Some(tree), Some(language)) => snapshot_from_tree(
+                tree,
+                &changed_path.source_location,
+                language,
+                "base",
+                &target_key,
+            )?,
+            _ => None,
         };
-        let base = base_tree
-            .as_ref()
-            .map(|tree| {
-                snapshot_from_tree(
-                    tree,
-                    &changed_path.source_location,
-                    language,
-                    "base",
-                    &target_key,
-                )
-            })
-            .transpose()?
-            .flatten();
-        let head = snapshot_from_tree(
-            &head_tree,
-            &changed_path.location,
-            language,
-            "head",
-            &target_key,
-        )?;
+        let head = match head_language {
+            Some(language) => snapshot_from_tree(
+                &head_tree,
+                &changed_path.location,
+                language,
+                "head",
+                &target_key,
+            )?,
+            None => None,
+        };
         if base.is_none() && head.is_none() {
             continue;
         }
@@ -258,10 +260,13 @@ where
         .iter()
         .filter(|path| changed_pair_selected(&query.path_selection, path))
         .filter_map(|path| {
-            declaration_language(&path.location).map(|language| (path.clone(), language))
+            let base_language = declaration_language(&path.source_location);
+            let head_language = declaration_language(&path.location);
+            (base_language.is_some() || head_language.is_some())
+                .then(|| (path.clone(), base_language, head_language))
         })
         .collect::<Vec<_>>();
-    selected.sort_by(|(left, _), (right, _)| {
+    selected.sort_by(|(left, _, _), (right, _, _)| {
         left.location
             .cmp(&right.location)
             .then_with(|| left.source_location.cmp(&right.source_location))
@@ -270,18 +275,21 @@ where
     let mut pairs = Vec::with_capacity(selected.len());
     let mut fingerprints = Vec::with_capacity(selected.len());
     let target_key = format!("dirty:{}", head_id.as_str());
-    for (changed_path, language) in &selected {
-        let base = snapshot_from_tree(
-            &head_tree,
-            &changed_path.source_location,
-            *language,
-            "base",
-            &target_key,
-        )?;
+    for (changed_path, base_language, head_language) in &selected {
+        let base = match base_language {
+            Some(language) => snapshot_from_tree(
+                &head_tree,
+                &changed_path.source_location,
+                *language,
+                "base",
+                &target_key,
+            )?,
+            None => None,
+        };
         let (head_snapshot, fingerprint) = snapshot_from_worktree(
             workdir,
             &changed_path.location,
-            *language,
+            *head_language,
             "head",
             &target_key,
         )?;
@@ -327,7 +335,7 @@ where
     let target_key = format!("worktree:{}", head_id.as_str());
     for (path, language) in paths {
         let (head, fingerprint) =
-            snapshot_from_worktree(workdir, &path, language, "head", &target_key)?;
+            snapshot_from_worktree(workdir, &path, Some(language), "head", &target_key)?;
         fingerprints.push((path.clone(), fingerprint));
         if let Some(head) = head {
             pairs.push(snapshot_pair(
@@ -475,7 +483,7 @@ fn snapshot_from_tree(
 fn snapshot_from_worktree(
     workdir: &Path,
     path: &RepoPath,
-    language: Language,
+    language: Option<Language>,
     endpoint_name: &str,
     target_key: &str,
 ) -> Result<(Option<SourceSnapshot>, FileFingerprint)> {
@@ -492,19 +500,22 @@ fn snapshot_from_worktree(
     if before != after {
         return Err(anyhow!(CAPTURE_DRIFT_ERROR));
     }
-    let source = std::str::from_utf8(&bytes)
-        .with_context(|| format!("{} contains invalid UTF-8", path.as_str()))?;
     let fingerprint = FileFingerprint::from_metadata(after, Some(BytesHash::from_bytes(&bytes)));
-    Ok((
-        Some(source_snapshot(
-            path,
-            language,
-            source,
-            endpoint_name,
-            target_key,
-        )),
-        fingerprint,
-    ))
+    let snapshot = match language {
+        Some(language) => {
+            let source = std::str::from_utf8(&bytes)
+                .with_context(|| format!("{} contains invalid UTF-8", path.as_str()))?;
+            Some(source_snapshot(
+                path,
+                language,
+                source,
+                endpoint_name,
+                target_key,
+            ))
+        }
+        None => None,
+    };
+    Ok((snapshot, fingerprint))
 }
 
 fn source_snapshot(
