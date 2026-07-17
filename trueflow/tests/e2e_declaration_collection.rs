@@ -290,7 +290,6 @@ fn force_kind_and_ordinal_ties(diff: &mut DeclarationDiff) {
 
 #[test]
 fn canonical_order_is_stable_by_pair_path_source_kind_and_ordinal() -> Result<()> {
-    let launch = declaration_launch("[tui]\nmode = \"declarations\"\n")?;
     let mut first_pairs = vec![
         added_pair(
             "commit-one",
