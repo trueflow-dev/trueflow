@@ -1551,23 +1551,17 @@ mod tests {
             }
         }
 
-        let mut rename_paths = HashSet::new();
-        insert_tree_index_change_paths(&mut rename_paths, rewrite(false)).unwrap();
         assert_eq!(
-            rename_paths,
-            [
-                RepoPath::new("src/old.rs").unwrap(),
-                RepoPath::new("src/new.rs").unwrap(),
-            ]
-            .into_iter()
-            .collect()
+            changed_path_from_index_change(rewrite(false)).unwrap(),
+            ChangedPath {
+                source_location: RepoPath::new("src/old.rs").unwrap(),
+                location: RepoPath::new("src/new.rs").unwrap(),
+            }
         );
 
-        let mut copy_paths = HashSet::new();
-        insert_tree_index_change_paths(&mut copy_paths, rewrite(true)).unwrap();
         assert_eq!(
-            copy_paths,
-            [RepoPath::new("src/new.rs").unwrap()].into_iter().collect()
+            changed_path_from_index_change(rewrite(true)).unwrap(),
+            ChangedPath::identity(RepoPath::new("src/new.rs").unwrap())
         );
     }
 
