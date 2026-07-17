@@ -69,6 +69,10 @@ tree-sitter-clojure = { version = "0.2.5", package = "tree-sitter-clojure-orchar
 tree-sitter-sql = { version = "0.3.11", package = "tree-sitter-sequel" }
 tree-sitter-go = "0.25.0"
 tree-sitter-cpp = "0.23.4"
+async-lsp = { version = "0.2.4", features = ["tokio"] }
+tokio = { version = "1.52.4", features = ["io-util", "process", "rt", "sync", "time"] }
+tower = "0.5"
+tokio-util = { version = "0.7.18", features = ["compat"] }
 
 # [dependencies]
 # dioxus = "0.4.3"
