@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::hash::Hash;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -147,11 +149,12 @@ fn diff_pair(pair: &SnapshotPair, diff: &mut DeclarationDiff) -> Result<()> {
         _ => true,
     };
 
-    let reserved = if path_allows_matching && languages_match {
+    let matching = if path_allows_matching && languages_match {
         match_declarations(base, head)
     } else {
-        Vec::new()
+        DeclarationMatching::default()
     };
+    let reserved = &matching.reserved;
 
     let mut base_matches = vec![None; base.len()];
     let mut head_matches = vec![None; head.len()];
@@ -160,10 +163,7 @@ fn diff_pair(pair: &SnapshotPair, diff: &mut DeclarationDiff) -> Result<()> {
         head_matches[reserved_match.head] = Some(match_index);
     }
 
-    if path_allows_matching
-        && languages_match
-        && has_ambiguous_candidates(base, head, &base_matches, &head_matches, &reserved)
-    {
+    if path_allows_matching && languages_match && matching.has_ambiguity {
         diff.diagnostics.push(DiffDiagnostic {
             snapshot_pair_id: pair.id.clone(),
             kind: DiffDiagnosticKind::AmbiguousDeclarationMatch,
@@ -278,175 +278,406 @@ fn matching_paths_are_proven(pair: &SnapshotPair, diff: &mut DeclarationDiff) ->
     }
 }
 
-fn match_declarations(base: &[DeclarationNode], head: &[DeclarationNode]) -> Vec<ReservedMatch> {
-    let mut reserved = Vec::new();
+#[derive(Default)]
+struct DeclarationMatching {
+    reserved: Vec<ReservedMatch>,
+    has_ambiguity: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ParentGroup {
+    Root,
+    Matched(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatchSide {
+    Base,
+    Head,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatchingPhase {
+    ExactKey,
+    ExactProjection,
+    UniqueCompatible,
+    UniqueNameElided,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DeclarationGroup<'a> {
+    ExactKey(&'a str),
+    ExactProjection {
+        kind: super::DeclarationKind,
+        name: &'a str,
+        parent: ParentGroup,
+        projection_hash: &'a str,
+    },
+    Compatible {
+        kind: super::DeclarationKind,
+        name: &'a str,
+        parent: ParentGroup,
+    },
+    NameElided {
+        kind: super::DeclarationKind,
+        parent: ParentGroup,
+        discriminator: &'a str,
+    },
+}
+
+struct ParentCorrespondence<'a> {
+    base: HashMap<&'a str, usize>,
+    head: HashMap<&'a str, usize>,
+}
+
+impl<'a> ParentCorrespondence<'a> {
+    fn new() -> Self {
+        Self {
+            base: HashMap::new(),
+            head: HashMap::new(),
+        }
+    }
+
+    fn group(&self, declaration: &DeclarationNode, side: MatchSide) -> Option<ParentGroup> {
+        let Some(parent) = &declaration.parent_part else {
+            return Some(ParentGroup::Root);
+        };
+        let matches = match side {
+            MatchSide::Base => &self.base,
+            MatchSide::Head => &self.head,
+        };
+        matches
+            .get(parent.as_str())
+            .copied()
+            .map(ParentGroup::Matched)
+    }
+
+    fn insert(&mut self, match_index: usize, base: &'a DeclarationNode, head: &'a DeclarationNode) {
+        self.base.insert(base.id.as_str(), match_index);
+        self.head.insert(head.id.as_str(), match_index);
+    }
+}
+
+fn match_declarations(base: &[DeclarationNode], head: &[DeclarationNode]) -> DeclarationMatching {
+    let base_discriminators = base
+        .iter()
+        .map(name_elided_discriminator)
+        .collect::<Vec<_>>();
+    let head_discriminators = head
+        .iter()
+        .map(name_elided_discriminator)
+        .collect::<Vec<_>>();
+    let mut matching = DeclarationMatching::default();
     let mut base_used = vec![false; base.len()];
     let mut head_used = vec![false; head.len()];
+    let mut parents = ParentCorrespondence::new();
+    let mut base_children = remaining_children(base);
+    let mut head_children = remaining_children(head);
 
-    reserve_unique(
+    reserve_phase(
+        MatchingPhase::ExactKey,
+        MatchingEvidence::ExactKey,
         base,
         head,
+        &base_discriminators,
+        &head_discriminators,
         &mut base_used,
         &mut head_used,
-        &mut reserved,
-        MatchingEvidence::ExactKey,
-        |left, right, _| left.key == right.key,
+        &mut matching.reserved,
+        &mut parents,
+        &mut base_children,
+        &mut head_children,
     );
+
     loop {
-        let matched_before = reserved.len();
-        reserve_unique(
-            base,
-            head,
-            &mut base_used,
-            &mut head_used,
-            &mut reserved,
-            MatchingEvidence::ExactProjection,
-            |left, right, prior| {
-                same_named_group(left, right, base, head, prior)
-                    && left.projection_hash == right.projection_hash
-            },
-        );
-        reserve_unique(
-            base,
-            head,
-            &mut base_used,
-            &mut head_used,
-            &mut reserved,
-            MatchingEvidence::UniqueCompatible,
-            |left, right, prior| same_named_group(left, right, base, head, prior),
-        );
-        reserve_unique(
-            base,
-            head,
-            &mut base_used,
-            &mut head_used,
-            &mut reserved,
-            MatchingEvidence::UniqueNameElided,
-            |left, right, prior| {
-                left.kind == right.kind
-                    && parents_compatible(left, right, base, head, prior)
-                    && name_elided_discriminator(left) == name_elided_discriminator(right)
-            },
-        );
-        if reserved.len() == matched_before {
+        let matched_before = matching.reserved.len();
+        for (phase, evidence) in [
+            (
+                MatchingPhase::ExactProjection,
+                MatchingEvidence::ExactProjection,
+            ),
+            (
+                MatchingPhase::UniqueCompatible,
+                MatchingEvidence::UniqueCompatible,
+            ),
+            (
+                MatchingPhase::UniqueNameElided,
+                MatchingEvidence::UniqueNameElided,
+            ),
+        ] {
+            reserve_phase(
+                phase,
+                evidence,
+                base,
+                head,
+                &base_discriminators,
+                &head_discriminators,
+                &mut base_used,
+                &mut head_used,
+                &mut matching.reserved,
+                &mut parents,
+                &mut base_children,
+                &mut head_children,
+            );
+        }
+
+        if matching.reserved.len() == matched_before
+            || !matching.reserved[matched_before..].iter().any(|matched| {
+                base_children
+                    .get(base[matched.base].id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+                    && head_children
+                        .get(head[matched.head].id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        > 0
+            })
+        {
             break;
         }
     }
 
-    reserved
+    matching.has_ambiguity = has_ambiguous_candidates(
+        base,
+        head,
+        &base_discriminators,
+        &head_discriminators,
+        &base_used,
+        &head_used,
+        &parents,
+    );
+    matching
 }
 
-fn reserve_unique<F>(
-    base: &[DeclarationNode],
-    head: &[DeclarationNode],
+#[allow(clippy::too_many_arguments)]
+fn reserve_phase<'a>(
+    phase: MatchingPhase,
+    evidence: MatchingEvidence,
+    base: &'a [DeclarationNode],
+    head: &'a [DeclarationNode],
+    base_discriminators: &'a [String],
+    head_discriminators: &'a [String],
     base_used: &mut [bool],
     head_used: &mut [bool],
     reserved: &mut Vec<ReservedMatch>,
-    evidence: MatchingEvidence,
-    compatible: F,
-) where
-    F: Fn(&DeclarationNode, &DeclarationNode, &[ReservedMatch]) -> bool,
-{
-    let mut candidates = Vec::new();
-    let mut base_counts = HashMap::<usize, usize>::new();
-    let mut head_counts = HashMap::<usize, usize>::new();
+    parents: &mut ParentCorrespondence<'a>,
+    base_children: &mut HashMap<&'a str, usize>,
+    head_children: &mut HashMap<&'a str, usize>,
+) {
+    let base_groups =
+        declaration_groups(base, base_discriminators, MatchSide::Base, phase, parents);
+    let head_groups =
+        declaration_groups(head, head_discriminators, MatchSide::Head, phase, parents);
+    reserve_unique(
+        base,
+        head,
+        &base_groups,
+        &head_groups,
+        base_used,
+        head_used,
+        reserved,
+        parents,
+        base_children,
+        head_children,
+        evidence,
+    );
+}
 
-    for (base_index, base_declaration) in base.iter().enumerate() {
+fn declaration_groups<'a>(
+    declarations: &'a [DeclarationNode],
+    discriminators: &'a [String],
+    side: MatchSide,
+    phase: MatchingPhase,
+    parents: &ParentCorrespondence<'_>,
+) -> Vec<Option<DeclarationGroup<'a>>> {
+    declarations
+        .iter()
+        .zip(discriminators)
+        .map(|(declaration, discriminator)| match phase {
+            MatchingPhase::ExactKey => Some(DeclarationGroup::ExactKey(declaration.key.as_str())),
+            MatchingPhase::ExactProjection => {
+                parents
+                    .group(declaration, side)
+                    .map(|parent| DeclarationGroup::ExactProjection {
+                        kind: declaration.kind,
+                        name: &declaration.name,
+                        parent,
+                        projection_hash: declaration.projection_hash.as_str(),
+                    })
+            }
+            MatchingPhase::UniqueCompatible => {
+                parents
+                    .group(declaration, side)
+                    .map(|parent| DeclarationGroup::Compatible {
+                        kind: declaration.kind,
+                        name: &declaration.name,
+                        parent,
+                    })
+            }
+            MatchingPhase::UniqueNameElided => {
+                parents
+                    .group(declaration, side)
+                    .map(|parent| DeclarationGroup::NameElided {
+                        kind: declaration.kind,
+                        parent,
+                        discriminator,
+                    })
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct GroupCount {
+    index: usize,
+    count: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reserve_unique<'a, K: Copy + Eq + Hash>(
+    base: &'a [DeclarationNode],
+    head: &'a [DeclarationNode],
+    base_groups: &[Option<K>],
+    head_groups: &[Option<K>],
+    base_used: &mut [bool],
+    head_used: &mut [bool],
+    reserved: &mut Vec<ReservedMatch>,
+    parents: &mut ParentCorrespondence<'a>,
+    base_children: &mut HashMap<&'a str, usize>,
+    head_children: &mut HashMap<&'a str, usize>,
+    evidence: MatchingEvidence,
+) {
+    let base_counts = group_counts(base_groups, base_used);
+    let head_counts = group_counts(head_groups, head_used);
+
+    // Base source order makes reservation deterministic without resolving ambiguity by order.
+    for (base_index, group) in base_groups.iter().enumerate() {
         if base_used[base_index] {
             continue;
         }
-        for (head_index, head_declaration) in head.iter().enumerate() {
-            if !head_used[head_index] && compatible(base_declaration, head_declaration, reserved) {
-                candidates.push((base_index, head_index));
-                *base_counts.entry(base_index).or_default() += 1;
-                *head_counts.entry(head_index).or_default() += 1;
-            }
+        let Some(group) = group else {
+            continue;
+        };
+        let Some(base_count) = base_counts.get(group) else {
+            continue;
+        };
+        let Some(head_count) = head_counts.get(group) else {
+            continue;
+        };
+        if base_count.count != 1 || head_count.count != 1 {
+            continue;
         }
-    }
 
-    for (base_index, head_index) in candidates {
-        if base_counts.get(&base_index) == Some(&1) && head_counts.get(&head_index) == Some(&1) {
-            base_used[base_index] = true;
-            head_used[head_index] = true;
-            reserved.push(ReservedMatch {
-                base: base_index,
-                head: head_index,
-                evidence,
-            });
-        }
+        let head_index = head_count.index;
+        base_used[base_index] = true;
+        head_used[head_index] = true;
+        decrement_parent_count(&base[base_index], base_children);
+        decrement_parent_count(&head[head_index], head_children);
+        let match_index = reserved.len();
+        parents.insert(match_index, &base[base_index], &head[head_index]);
+        reserved.push(ReservedMatch {
+            base: base_index,
+            head: head_index,
+            evidence,
+        });
     }
 }
 
-fn same_named_group(
-    left: &DeclarationNode,
-    right: &DeclarationNode,
-    base: &[DeclarationNode],
-    head: &[DeclarationNode],
-    prior: &[ReservedMatch],
-) -> bool {
-    left.kind == right.kind
-        && left.name == right.name
-        && parents_compatible(left, right, base, head, prior)
+fn group_counts<K: Copy + Eq + Hash>(
+    groups: &[Option<K>],
+    used: &[bool],
+) -> HashMap<K, GroupCount> {
+    let mut counts = HashMap::new();
+    for (index, group) in groups.iter().enumerate() {
+        if used[index] {
+            continue;
+        }
+        if let Some(group) = group {
+            counts
+                .entry(*group)
+                .and_modify(|count: &mut GroupCount| count.count += 1)
+                .or_insert(GroupCount { index, count: 1 });
+        }
+    }
+    counts
 }
 
-fn parents_compatible(
-    left: &DeclarationNode,
-    right: &DeclarationNode,
-    base: &[DeclarationNode],
-    head: &[DeclarationNode],
-    prior: &[ReservedMatch],
-) -> bool {
-    match (&left.parent_part, &right.parent_part) {
-        (None, None) => true,
-        (Some(left_parent), Some(right_parent)) => prior.iter().any(|matched| {
-            base[matched.base].id == *left_parent && head[matched.head].id == *right_parent
-        }),
-        _ => false,
+fn remaining_children(declarations: &[DeclarationNode]) -> HashMap<&str, usize> {
+    let mut children = HashMap::new();
+    for declaration in declarations {
+        if let Some(parent) = &declaration.parent_part {
+            *children.entry(parent.as_str()).or_default() += 1;
+        }
+    }
+    children
+}
+
+fn decrement_parent_count<'a>(
+    declaration: &DeclarationNode,
+    children: &mut HashMap<&'a str, usize>,
+) {
+    if let Some(parent) = &declaration.parent_part
+        && let Some(count) = children.get_mut(parent.as_str())
+    {
+        *count -= 1;
     }
 }
 
 fn name_elided_discriminator(declaration: &DeclarationNode) -> String {
-    let mut discriminator = String::new();
+    let mut discriminator = String::with_capacity(declaration.projection_text.len());
     let mut name_elided = false;
     for component in &declaration.components {
         if component.role == SourceComponentRole::Documentation {
             continue;
         }
-        let text = if name_elided {
-            component.text.clone()
-        } else if let Some(position) = component.text.find(&declaration.name) {
-            name_elided = true;
-            let mut normalized = component.text.clone();
-            normalized.replace_range(position..position + declaration.name.len(), "<name>");
-            normalized
-        } else {
-            component.text.clone()
-        };
         discriminator.push_str(component.role.protocol_tag());
         discriminator.push(':');
-        discriminator.push_str(&text.len().to_string());
-        discriminator.push(':');
-        discriminator.push_str(&text);
+        if !name_elided && let Some(position) = component.text.find(&declaration.name) {
+            name_elided = true;
+            let normalized_len = component.text.len() - declaration.name.len() + "<name>".len();
+            write!(discriminator, "{normalized_len}:").expect("writing to a String cannot fail");
+            discriminator.push_str(&component.text[..position]);
+            discriminator.push_str("<name>");
+            discriminator.push_str(&component.text[position + declaration.name.len()..]);
+        } else {
+            write!(discriminator, "{}:", component.text.len())
+                .expect("writing to a String cannot fail");
+            discriminator.push_str(&component.text);
+        }
     }
     discriminator
 }
 
+#[allow(clippy::too_many_arguments)]
 fn has_ambiguous_candidates(
     base: &[DeclarationNode],
     head: &[DeclarationNode],
-    base_matches: &[Option<usize>],
-    head_matches: &[Option<usize>],
-    prior: &[ReservedMatch],
+    base_discriminators: &[String],
+    head_discriminators: &[String],
+    base_used: &[bool],
+    head_used: &[bool],
+    parents: &ParentCorrespondence<'_>,
 ) -> bool {
-    base.iter().enumerate().any(|(base_index, left)| {
-        base_matches[base_index].is_none()
-            && head.iter().enumerate().any(|(head_index, right)| {
-                head_matches[head_index].is_none()
-                    && left.kind == right.kind
-                    && parents_compatible(left, right, base, head, prior)
-                    && (left.name == right.name
-                        || name_elided_discriminator(left) == name_elided_discriminator(right))
-            })
+    [
+        MatchingPhase::UniqueCompatible,
+        MatchingPhase::UniqueNameElided,
+    ]
+    .into_iter()
+    .any(|phase| {
+        let base_groups =
+            declaration_groups(base, base_discriminators, MatchSide::Base, phase, parents);
+        let head_groups =
+            declaration_groups(head, head_discriminators, MatchSide::Head, phase, parents);
+        let head_keys = head_groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| (!head_used[index]).then_some(*group).flatten())
+            .collect::<HashSet<_>>();
+        base_groups.iter().enumerate().any(|(index, group)| {
+            !base_used[index] && group.is_some_and(|group| head_keys.contains(&group))
+        })
     })
 }
 

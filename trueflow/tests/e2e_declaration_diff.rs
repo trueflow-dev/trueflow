@@ -319,6 +319,61 @@ fn ambiguous_duplicate_declarations_are_not_arbitrarily_paired() -> Result<()> {
 }
 
 #[test]
+fn thousands_of_duplicate_declarations_remain_ambiguous_without_arbitrary_matches() -> Result<()> {
+    const DECLARATIONS_PER_ENDPOINT: usize = 2_000;
+    let base = "fn duplicate() -> u8 { 1 }\n".repeat(DECLARATIONS_PER_ENDPOINT);
+    let head = "fn duplicate() -> u8 { 2 }\n".repeat(DECLARATIONS_PER_ENDPOINT);
+
+    let diff = diff_declarations(&[same_path_pair(
+        "thousands-of-ambiguous-duplicates",
+        "src/duplicates.rs",
+        Some(&base),
+        Some(&head),
+    )])?;
+
+    assert!(
+        diff.matches.is_empty(),
+        "ambiguous duplicates must not be paired according to source order or another arbitrary tie-breaker"
+    );
+    assert_eq!(
+        diff.units
+            .iter()
+            .filter(|unit| unit.change_kind == DeclarationChangeKind::Deleted)
+            .count(),
+        DECLARATIONS_PER_ENDPOINT,
+        "every unmatched base declaration must remain a deletion"
+    );
+    assert_eq!(
+        diff.units
+            .iter()
+            .filter(|unit| unit.change_kind == DeclarationChangeKind::Added)
+            .count(),
+        DECLARATIONS_PER_ENDPOINT,
+        "every unmatched head declaration must remain an addition"
+    );
+    assert_eq!(
+        diff.diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.snapshot_pair_id
+                    == SnapshotPairId::new("thousands-of-ambiguous-duplicates")
+                    && diagnostic.kind == DiffDiagnosticKind::AmbiguousDeclarationMatch
+            })
+            .count(),
+        1,
+        "the ambiguous declaration set must remain diagnosed"
+    );
+    assert!(
+        diff.diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != DiffDiagnosticKind::ProjectionDiagnostic),
+        "the generated duplicate declarations must all remain syntactically parseable"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn pure_file_rename_requires_explicit_path_pair_evidence() -> Result<()> {
     const SOURCE: &str = "/// Stable API.\npub fn retained(value: u32) -> u32 { value }\n";
     let without_evidence = SnapshotPair::new(
