@@ -35,6 +35,7 @@ struct TopLevelItem<'tree> {
 struct MemberCallable<'tree> {
     item: Node<'tree>,
     documentation: Vec<Range<usize>>,
+    leading_start: usize,
 }
 
 struct Projector<'a> {
@@ -82,9 +83,18 @@ pub(super) fn project(
 
 impl Projector<'_> {
     fn collect_program(&mut self, program: Node<'_>) -> Result<()> {
+        self.collect_scope(program, None, None)
+    }
+
+    fn collect_scope(
+        &mut self,
+        scope: Node<'_>,
+        parent_id: Option<DeclarationId>,
+        parent_lineage: Option<&str>,
+    ) -> Result<()> {
         let mut pending_documentation = Vec::new();
-        let mut cursor = program.walk();
-        for child in program.named_children(&mut cursor) {
+        let mut cursor = scope.walk();
+        for child in scope.named_children(&mut cursor) {
             if child.kind() == "comment" {
                 if is_jsdoc(child, self.source) {
                     pending_documentation.push(child.byte_range());
@@ -107,14 +117,34 @@ impl Projector<'_> {
                         item.kind,
                         &documentation,
                         None,
-                        None,
+                        parent_id.clone(),
+                        parent_lineage,
                     )?;
                 }
                 DeclarationKind::Class | DeclarationKind::Interface => {
-                    self.add_class_like(item, &documentation)?;
+                    self.add_class_like(item, &documentation, parent_id.clone(), parent_lineage)?;
+                }
+                DeclarationKind::TypeAlias
+                    if item
+                        .declaration
+                        .child_by_field_name("value")
+                        .is_some_and(|value| value.kind() == "object_type") =>
+                {
+                    self.add_class_like(item, &documentation, parent_id.clone(), parent_lineage)?;
                 }
                 DeclarationKind::TypeAlias | DeclarationKind::Enum => {
-                    self.add_contiguous_aggregate(item, &documentation)?;
+                    self.add_contiguous_aggregate(
+                        item,
+                        &documentation,
+                        parent_id.clone(),
+                        parent_lineage,
+                    )?;
+                }
+                DeclarationKind::Module => {
+                    self.add_module(item, &documentation, parent_id.clone(), parent_lineage)?;
+                }
+                DeclarationKind::Constant | DeclarationKind::Static => {
+                    self.add_value(item, &documentation, parent_id.clone(), parent_lineage)?;
                 }
                 _ => {}
             }
@@ -126,10 +156,17 @@ impl Projector<'_> {
         &mut self,
         item: TopLevelItem<'_>,
         documentation: &[Range<usize>],
+        parent_id: Option<DeclarationId>,
+        parent_lineage: Option<&str>,
     ) -> Result<()> {
-        let Some(body) = item.declaration.child_by_field_name("body") else {
+        let body = if item.kind == DeclarationKind::TypeAlias {
+            item.declaration.child_by_field_name("value")
+        } else {
+            item.declaration.child_by_field_name("body")
+        };
+        let Some(body) = body else {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
-                "omitted TypeScript {:?} at byte {} because it has no body",
+                "omitted TypeScript {:?} at byte {} because it has no aggregate body",
                 item.kind,
                 item.declaration.start_byte()
             )));
@@ -147,6 +184,11 @@ impl Projector<'_> {
             .context("TypeScript aggregate name was not on UTF-8 boundaries")?
             .to_owned();
 
+        let aggregate_role = if item.kind == DeclarationKind::TypeAlias {
+            SourceComponentRole::TypeAlias
+        } else {
+            SourceComponentRole::AggregateShape
+        };
         let mut includes = Vec::<Range<usize>>::new();
         let mut semantics = Vec::<SemanticRange>::new();
         let surface_start = documentation
@@ -156,12 +198,13 @@ impl Projector<'_> {
         includes.push(surface_start..header_end);
         semantics.push(SemanticRange {
             range: item.outer.start_byte()..header_end,
-            role: SourceComponentRole::AggregateShape,
+            role: aggregate_role,
         });
         add_documentation_semantics(&mut semantics, documentation);
 
         let mut callables = Vec::<MemberCallable<'_>>::new();
         let mut pending_documentation = Vec::new();
+        let mut pending_decorators = Vec::<Range<usize>>::new();
         let mut cursor = body.walk();
         for member in body.named_children(&mut cursor) {
             if member.kind() == "comment" {
@@ -169,38 +212,46 @@ impl Projector<'_> {
                     pending_documentation.push(member.byte_range());
                 } else {
                     pending_documentation.clear();
+                    pending_decorators.clear();
                 }
+                continue;
+            }
+            if member.kind() == "decorator" {
+                pending_decorators.push(member.byte_range());
                 continue;
             }
 
             let member_documentation = std::mem::take(&mut pending_documentation);
+            let member_decorators = std::mem::take(&mut pending_decorators);
+            let leading_start = member_documentation
+                .iter()
+                .chain(&member_decorators)
+                .map(|range| range.start)
+                .min()
+                .unwrap_or(member.start_byte());
             if is_callable_member(member) {
                 callables.push(MemberCallable {
                     item: member,
-                    documentation: member_documentation.clone(),
+                    documentation: member_documentation,
+                    leading_start,
                 });
-            } else if member.kind() == "call_signature" {
+                continue;
+            }
+
+            if member.kind() == "call_signature" {
                 self.diagnostics.push(ProjectionDiagnostic::new(format!(
-                    "TypeScript call signature at byte {} is included in its aggregate but has no stable declared name for a callable target",
+                    "TypeScript call signature at byte {} remains aggregate-owned because it has no stable declared name for an independent callable target",
                     member.start_byte()
                 )));
             }
 
             match member.kind() {
-                "property_signature"
-                | "index_signature"
-                | "call_signature"
-                | "construct_signature"
-                | "method_signature"
-                | "abstract_method_signature" => {
-                    let first_start = member_documentation
-                        .first()
-                        .map_or(member.start_byte(), |range| range.start);
-                    let include_start = leading_whitespace_start(self.source, first_start);
+                "property_signature" | "index_signature" | "call_signature" => {
+                    let include_start = leading_whitespace_start(self.source, leading_start);
                     includes.push(include_start..member.end_byte());
                     semantics.push(SemanticRange {
                         range: member.byte_range(),
-                        role: SourceComponentRole::AggregateShape,
+                        role: aggregate_role,
                     });
                     add_documentation_semantics(&mut semantics, &member_documentation);
                     if let Some(terminator) = declaration_terminator(member, self.source) {
@@ -212,15 +263,12 @@ impl Projector<'_> {
                     }
                 }
                 "public_field_definition" => {
-                    let first_start = member_documentation
-                        .first()
-                        .map_or(member.start_byte(), |range| range.start);
-                    let include_start = leading_whitespace_start(self.source, first_start);
+                    let include_start = leading_whitespace_start(self.source, leading_start);
                     let signature_end = field_signature_end(member, self.source);
                     includes.push(include_start..signature_end);
                     semantics.push(SemanticRange {
                         range: member.start_byte()..signature_end,
-                        role: SourceComponentRole::AggregateShape,
+                        role: aggregate_role,
                     });
                     add_documentation_semantics(&mut semantics, &member_documentation);
                     if let Some(terminator) = declaration_terminator(member, self.source) {
@@ -230,6 +278,12 @@ impl Projector<'_> {
                             role: SourceComponentRole::Terminator,
                         });
                     }
+                }
+                "class_static_block" => {
+                    self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                        "TypeScript class static block at byte {} is intentionally excluded because executable bodies are not declaration review surfaces",
+                        member.start_byte()
+                    )));
                 }
                 _ => {}
             }
@@ -241,7 +295,7 @@ impl Projector<'_> {
             includes.push(include_start..item.outer.end_byte());
             semantics.push(SemanticRange {
                 range: close_start..item.outer.end_byte(),
-                role: SourceComponentRole::AggregateShape,
+                role: aggregate_role,
             });
         }
         normalize_ranges(&mut includes);
@@ -260,7 +314,7 @@ impl Projector<'_> {
             &self.comments,
             &self.decorators,
         )?;
-        let overload_discriminator = key_discriminator(&components);
+        let overload_discriminator = key_discriminator(item.outer, &components, self.source);
         let source_start = surface_start;
         let parent_index = self.declarations.len();
         let id = self.push_declaration(
@@ -269,13 +323,14 @@ impl Projector<'_> {
             name_node.byte_range(),
             item.kind,
             top_level_visibility(item.outer),
-            None,
-            None,
+            parent_id,
+            parent_lineage,
             source_start..item.outer.end_byte(),
             components,
             &overload_discriminator,
         )?;
 
+        let lineage = declaration_lineage(parent_lineage, item.kind, &name);
         let children_start = self.declarations.len();
         for callable in callables {
             let callable_kind = callable_kind(callable.item, self.source);
@@ -284,12 +339,14 @@ impl Projector<'_> {
                 callable.item,
                 callable_kind,
                 &callable.documentation,
+                Some(callable.leading_start),
                 Some(id.clone()),
-                Some(&name),
+                Some(&lineage),
             )?;
         }
         self.declarations[parent_index].children = self.declarations[children_start..]
             .iter()
+            .filter(|declaration| declaration.parent_part.as_ref() == Some(&id))
             .map(|declaration| declaration.id.clone())
             .collect();
         Ok(())
@@ -299,6 +356,8 @@ impl Projector<'_> {
         &mut self,
         item: TopLevelItem<'_>,
         documentation: &[Range<usize>],
+        parent_id: Option<DeclarationId>,
+        parent_lineage: Option<&str>,
     ) -> Result<()> {
         let Some(name_node) = item.declaration.child_by_field_name("name") else {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
@@ -333,6 +392,17 @@ impl Projector<'_> {
             role,
         }];
         add_documentation_semantics(&mut semantics, documentation);
+        semantics.extend(
+            self.comments
+                .iter()
+                .filter(|comment| {
+                    comment.jsdoc && contains_range(&item.outer.byte_range(), &comment.range)
+                })
+                .map(|comment| SemanticRange {
+                    range: comment.range.clone(),
+                    role: SourceComponentRole::Documentation,
+                }),
+        );
         let components = build_components(
             self.source,
             includes,
@@ -340,18 +410,194 @@ impl Projector<'_> {
             &self.comments,
             &self.decorators,
         )?;
-        let overload_discriminator = key_discriminator(&components);
+        let overload_discriminator = key_discriminator(item.outer, &components, self.source);
         self.push_declaration(
             item.outer,
             name,
             name_node.byte_range(),
             item.kind,
             top_level_visibility(item.outer),
-            None,
-            None,
+            parent_id,
+            parent_lineage,
             surface_start..item.outer.end_byte(),
             components,
             &overload_discriminator,
+        )?;
+        Ok(())
+    }
+
+    fn add_module(
+        &mut self,
+        item: TopLevelItem<'_>,
+        documentation: &[Range<usize>],
+        parent_id: Option<DeclarationId>,
+        parent_lineage: Option<&str>,
+    ) -> Result<()> {
+        let name_node = item
+            .declaration
+            .child_by_field_name("name")
+            .or_else(|| direct_child_by_kind(item.declaration, "global"));
+        let Some(name_node) = name_node else {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted TypeScript Module at byte {} because it has no declared name",
+                item.declaration.start_byte()
+            )));
+            return Ok(());
+        };
+        let name = node_text(name_node, self.source)
+            .context("TypeScript module name was not on UTF-8 boundaries")?
+            .to_owned();
+        let surface_start = documentation
+            .first()
+            .map_or(item.outer.start_byte(), |range| range.start);
+        let mut includes = Vec::new();
+        let mut semantics = Vec::new();
+        add_documentation_semantics(&mut semantics, documentation);
+        let body = item
+            .declaration
+            .child_by_field_name("body")
+            .or_else(|| direct_child_by_kind(item.declaration, "statement_block"));
+        if let Some(body) = body {
+            let header_end = opening_delimiter_end(body, self.source).unwrap_or(body.start_byte());
+            includes.push(surface_start..header_end);
+            semantics.push(SemanticRange {
+                range: item.outer.start_byte()..header_end,
+                role: SourceComponentRole::AggregateShape,
+            });
+            let close_start = body.end_byte().saturating_sub(1);
+            if close_start >= header_end {
+                includes.push(
+                    leading_whitespace_start(self.source, close_start)..item.outer.end_byte(),
+                );
+                semantics.push(SemanticRange {
+                    range: close_start..item.outer.end_byte(),
+                    role: SourceComponentRole::AggregateShape,
+                });
+            }
+        } else {
+            includes.push(surface_start..item.outer.end_byte());
+            semantics.push(SemanticRange {
+                range: item.outer.byte_range(),
+                role: SourceComponentRole::AggregateShape,
+            });
+        }
+        normalize_ranges(&mut includes);
+        if has_syntax_error_in_ranges(item.outer, &includes) {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted TypeScript Module {name} because its projected surface contains a syntax error"
+            )));
+            return Ok(());
+        }
+        let components = build_components(
+            self.source,
+            &includes,
+            &semantics,
+            &self.comments,
+            &self.decorators,
+        )?;
+        let discriminator = key_discriminator(item.outer, &components, self.source);
+        let parent_index = self.declarations.len();
+        let id = self.push_declaration(
+            item.outer,
+            name.clone(),
+            name_node.byte_range(),
+            DeclarationKind::Module,
+            top_level_visibility(item.outer),
+            parent_id,
+            parent_lineage,
+            surface_start..item.outer.end_byte(),
+            components,
+            &discriminator,
+        )?;
+        if let Some(body) = body {
+            let lineage = declaration_lineage(parent_lineage, DeclarationKind::Module, &name);
+            let children_start = self.declarations.len();
+            self.collect_scope(body, Some(id.clone()), Some(&lineage))?;
+            self.declarations[parent_index].children = self.declarations[children_start..]
+                .iter()
+                .filter(|declaration| declaration.parent_part.as_ref() == Some(&id))
+                .map(|declaration| declaration.id.clone())
+                .collect();
+        }
+        Ok(())
+    }
+
+    fn add_value(
+        &mut self,
+        item: TopLevelItem<'_>,
+        documentation: &[Range<usize>],
+        parent_id: Option<DeclarationId>,
+        parent_lineage: Option<&str>,
+    ) -> Result<()> {
+        let mut cursor = item.declaration.walk();
+        let declarators = item
+            .declaration
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "variable_declarator")
+            .collect::<Vec<_>>();
+        let [declarator] = declarators.as_slice() else {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted TypeScript {:?} declaration at byte {} because a multi-declarator statement has no exclusive standalone source surface",
+                item.kind,
+                item.declaration.start_byte()
+            )));
+            return Ok(());
+        };
+        let Some(name_node) = declarator.child_by_field_name("name") else {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted TypeScript {:?} at byte {} because it has no declared name",
+                item.kind,
+                declarator.start_byte()
+            )));
+            return Ok(());
+        };
+        if name_node.kind() != "identifier" {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted TypeScript {:?} at byte {} because destructuring has no single lossless declaration identity",
+                item.kind,
+                declarator.start_byte()
+            )));
+            return Ok(());
+        }
+        let name = node_text(name_node, self.source)
+            .context("TypeScript value name was not on UTF-8 boundaries")?
+            .to_owned();
+        let surface_start = documentation
+            .first()
+            .map_or(item.outer.start_byte(), |range| range.start);
+        let include = surface_start..item.outer.end_byte();
+        let includes = std::slice::from_ref(&include);
+        if has_syntax_error_in_ranges(item.outer, includes) {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted TypeScript {:?} {name} because its projected surface contains a syntax error",
+                item.kind
+            )));
+            return Ok(());
+        }
+        let mut semantics = vec![SemanticRange {
+            range: item.outer.byte_range(),
+            role: SourceComponentRole::Value,
+        }];
+        add_documentation_semantics(&mut semantics, documentation);
+        let components = build_components(
+            self.source,
+            includes,
+            &semantics,
+            &self.comments,
+            &self.decorators,
+        )?;
+        let discriminator = value_key_discriminator(item.outer, *declarator, self.source);
+        self.push_declaration(
+            item.outer,
+            name,
+            name_node.byte_range(),
+            item.kind,
+            top_level_visibility(item.outer),
+            parent_id,
+            parent_lineage,
+            surface_start..item.outer.end_byte(),
+            components,
+            &discriminator,
         )?;
         Ok(())
     }
@@ -363,6 +609,7 @@ impl Projector<'_> {
         declaration: Node<'_>,
         kind: DeclarationKind,
         documentation: &[Range<usize>],
+        leading_start: Option<usize>,
         parent_id: Option<DeclarationId>,
         parent_name: Option<&str>,
     ) -> Result<()> {
@@ -404,9 +651,11 @@ impl Projector<'_> {
             )));
             return Ok(());
         }
-        let surface_start = documentation
-            .first()
-            .map_or(outer.start_byte(), |range| range.start);
+        let surface_start = leading_start
+            .into_iter()
+            .chain(documentation.first().map(|range| range.start))
+            .min()
+            .unwrap_or(outer.start_byte());
         let include = surface_start..signature_end;
         let includes = std::slice::from_ref(&include);
         if has_syntax_error_in_ranges(outer, includes) {
@@ -427,7 +676,7 @@ impl Projector<'_> {
             &self.comments,
             &self.decorators,
         )?;
-        let overload_discriminator = key_discriminator(&components);
+        let overload_discriminator = key_discriminator(outer, &components, self.source);
         let visibility = if parent_id.is_some() {
             member_visibility(declaration, self.source)
         } else {
@@ -520,7 +769,9 @@ fn top_level_item(node: Node<'_>) -> Option<TopLevelItem<'_>> {
     } else {
         node
     };
-    if declaration.kind() == "ambient_declaration" {
+    if declaration.kind() == "ambient_declaration"
+        && direct_child_by_kind(declaration, "global").is_none()
+    {
         let mut cursor = declaration.walk();
         declaration = declaration.named_children(&mut cursor).find(|child| {
             matches!(
@@ -531,6 +782,10 @@ fn top_level_item(node: Node<'_>) -> Option<TopLevelItem<'_>> {
                     | "interface_declaration"
                     | "type_alias_declaration"
                     | "enum_declaration"
+                    | "internal_module"
+                    | "module"
+                    | "lexical_declaration"
+                    | "variable_declaration"
             )
         })?;
     }
@@ -540,6 +795,18 @@ fn top_level_item(node: Node<'_>) -> Option<TopLevelItem<'_>> {
         "interface_declaration" => DeclarationKind::Interface,
         "type_alias_declaration" => DeclarationKind::TypeAlias,
         "enum_declaration" => DeclarationKind::Enum,
+        "internal_module" | "module" | "ambient_declaration" => DeclarationKind::Module,
+        "lexical_declaration" => {
+            if declaration
+                .child_by_field_name("kind")
+                .is_some_and(|kind| kind.kind() == "const")
+            {
+                DeclarationKind::Constant
+            } else {
+                DeclarationKind::Static
+            }
+        }
+        "variable_declaration" => DeclarationKind::Static,
         _ => return None,
     };
     Some(TopLevelItem {
@@ -547,6 +814,14 @@ fn top_level_item(node: Node<'_>) -> Option<TopLevelItem<'_>> {
         declaration,
         kind,
     })
+}
+
+fn direct_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    let child = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == kind);
+    child
 }
 
 fn is_callable_member(node: Node<'_>) -> bool {
@@ -566,7 +841,14 @@ fn callable_kind(node: Node<'_>, source: &str) -> DeclarationKind {
             .and_then(|name| node_text(name, source))
             .is_some_and(|name| name == "constructor")
     {
-        DeclarationKind::Constructor
+        return DeclarationKind::Constructor;
+    }
+    let mut cursor = node.walk();
+    if node
+        .children(&mut cursor)
+        .any(|child| matches!(child.kind(), "get" | "set"))
+    {
+        DeclarationKind::Property
     } else {
         DeclarationKind::Method
     }
@@ -692,17 +974,89 @@ fn normalize_ranges(ranges: &mut Vec<Range<usize>>) {
     *ranges = normalized;
 }
 
-fn key_discriminator(components: &[SourceComponent]) -> String {
-    components
+fn key_discriminator(syntax: Node<'_>, components: &[SourceComponent], source: &str) -> String {
+    let identity_ranges = components
         .iter()
         .filter(|component| {
             !matches!(
                 component.role,
-                SourceComponentRole::Documentation | SourceComponentRole::Layout
+                SourceComponentRole::Documentation
+                    | SourceComponentRole::Attribute
+                    | SourceComponentRole::Layout
             )
         })
-        .map(|component| component.text.as_str())
-        .collect()
+        .map(|component| component.source_range.clone())
+        .collect::<Vec<_>>();
+    let mut discriminator = String::new();
+    collect_identity_tokens(syntax, &identity_ranges, source, &mut discriminator);
+    discriminator
+}
+
+fn collect_identity_tokens(
+    node: Node<'_>,
+    identity_ranges: &[Range<usize>],
+    source: &str,
+    discriminator: &mut String,
+) {
+    let node_range = node.byte_range();
+    if node.kind() == "comment"
+        || !identity_ranges
+            .iter()
+            .any(|range| ranges_overlap(range, &node_range))
+    {
+        return;
+    }
+    if node.child_count() == 0 {
+        if identity_ranges
+            .iter()
+            .any(|range| contains_range(range, &node_range))
+            && let Some(text) = node_text(node, source)
+        {
+            discriminator.push_str(&text.len().to_string());
+            discriminator.push(':');
+            discriminator.push_str(text);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identity_tokens(child, identity_ranges, source, discriminator);
+    }
+}
+
+fn declaration_lineage(parent_lineage: Option<&str>, kind: DeclarationKind, name: &str) -> String {
+    let parent = parent_lineage.unwrap_or_default();
+    format!(
+        "{}:{}{}:{}{}:{}",
+        parent.len(),
+        parent,
+        kind.protocol_tag().len(),
+        kind.protocol_tag(),
+        name.len(),
+        name
+    )
+}
+
+fn value_key_discriminator(outer: Node<'_>, declarator: Node<'_>, source: &str) -> String {
+    let mut identity_end = declarator.end_byte();
+    if let Some(value) = declarator.child_by_field_name("value") {
+        identity_end = value.start_byte();
+        let bytes = source.as_bytes();
+        while identity_end > declarator.start_byte()
+            && bytes
+                .get(identity_end - 1)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            identity_end -= 1;
+        }
+        if bytes.get(identity_end - 1) == Some(&b'=') {
+            identity_end -= 1;
+        }
+    }
+    let identity_ranges = [outer.start_byte()..identity_end];
+    let mut discriminator = String::new();
+    collect_identity_tokens(outer, &identity_ranges, source, &mut discriminator);
+    discriminator
 }
 
 fn build_components(
@@ -922,9 +1276,11 @@ fn type_use_role(
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
         match current.kind() {
-            "constraint" | "default_type" | "extends_type_clause" | "implements_clause" => {
-                return TypeUseRole::Bound;
-            }
+            "constraint"
+            | "default_type"
+            | "extends_clause"
+            | "extends_type_clause"
+            | "implements_clause" => return TypeUseRole::Bound,
             "required_parameter" | "optional_parameter" | "rest_pattern" => {
                 return TypeUseRole::Parameter;
             }
