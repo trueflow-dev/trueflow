@@ -106,11 +106,7 @@ fn pair_for_display_path<'a>(batch: &'a CaptureBatch, path: &str) -> Result<&'a 
         .with_context(|| format!("missing captured pair displayed at {path}"))
 }
 
-fn assert_endpoint(
-    endpoint: &CaptureEndpointProvenance,
-    revision: &CommitId,
-    state: BlockState,
-) {
+fn assert_endpoint(endpoint: &CaptureEndpointProvenance, revision: &CommitId, state: &BlockState) {
     assert_eq!(
         endpoint.repo_ref,
         RepoRef::Vcs {
@@ -118,7 +114,7 @@ fn assert_endpoint(
             revision: revision.clone(),
         }
     );
-    assert_eq!(endpoint.block_state, state);
+    assert_eq!(&endpoint.block_state, state);
 }
 
 fn head_inventory(batch: &CaptureBatch) -> Vec<(String, Language, String)> {
@@ -139,7 +135,8 @@ fn head_inventory(batch: &CaptureBatch) -> Vec<(String, Language, String)> {
 }
 
 #[test]
-fn all_file_and_dir_worktree_scopes_capture_only_selected_supported_sources_byte_exactly() -> Result<()> {
+fn all_file_and_dir_worktree_scopes_capture_only_selected_supported_sources_byte_exactly()
+-> Result<()> {
     let repo = TestRepo::new("declaration_capture_worktree_scopes")?;
     let sources = [
         (
@@ -179,11 +176,15 @@ fn all_file_and_dir_worktree_scopes_capture_only_selected_supported_sources_byte
     repo.commit_all("supported sources")?;
     let head = commit_id(&repo, "HEAD")?;
 
-    let all_capture = capture_declaration_sources(&repo.path, &worktree_query(ReviewPathSelection::All))?;
+    let all_capture =
+        capture_declaration_sources(&repo.path, &worktree_query(ReviewPathSelection::All))?;
     let all_batch = one_batch(&all_capture)?;
-    assert!(all_batch.diagnostics.is_empty(), "supported sources must capture without diagnostics");
+    assert!(
+        all_batch.diagnostics.is_empty(),
+        "supported sources must capture without diagnostics"
+    );
     assert!(all_batch.provenance.base.is_none());
-    assert_endpoint(&all_batch.provenance.head, &head, BlockState::Committed);
+    assert_endpoint(&all_batch.provenance.head, &head, &BlockState::Committed);
 
     let mut expected = sources
         .into_iter()
@@ -264,10 +265,21 @@ fn main_diff_uses_the_existing_mainline_precedence_and_merge_base() -> Result<()
     let batch = one_batch(&capture)?;
     let pair = one_pair(batch)?;
     assert_eq!(pair.base.as_ref().context("main base")?.source(), COMMON);
-    assert_eq!(pair.head.as_ref().context("feature head")?.source(), FEATURE);
+    assert_eq!(
+        pair.head.as_ref().context("feature head")?.source(),
+        FEATURE
+    );
     assert_eq!(pair.path_evidence, PathPairEvidence::SamePath);
-    assert_endpoint(batch.provenance.base.as_ref().context("main provenance base")?, &common, BlockState::Committed);
-    assert_endpoint(&batch.provenance.head, &feature, BlockState::Committed);
+    assert_endpoint(
+        batch
+            .provenance
+            .base
+            .as_ref()
+            .context("main provenance base")?,
+        &common,
+        &BlockState::Committed,
+    );
+    assert_endpoint(&batch.provenance.head, &feature, &BlockState::Committed);
     assert!(batch.diagnostics.is_empty());
 
     Ok(())
@@ -288,8 +300,11 @@ fn root_revision_pairs_the_commit_against_the_empty_tree() -> Result<()> {
     let head = pair.head.as_ref().context("root commit head snapshot")?;
     assert_eq!(head.path, Path::new("src/root.rs"));
     assert_eq!(head.source(), ROOT_SOURCE);
-    assert!(batch.provenance.base.is_none(), "empty-tree provenance must not invent a commit");
-    assert_endpoint(&batch.provenance.head, &root, BlockState::Committed);
+    assert!(
+        batch.provenance.base.is_none(),
+        "empty-tree provenance must not invent a commit"
+    );
+    assert_endpoint(&batch.provenance.head, &root, &BlockState::Committed);
 
     Ok(())
 }
@@ -310,19 +325,35 @@ fn revision_range_preserves_the_resolved_start_and_end_instead_of_using_head() -
     repo.write("src/lib.rs", LATER_SOURCE)?;
     repo.commit_all("later head")?;
 
-    let capture = capture_declaration_sources(&repo.path, &range_query(start.clone(), end.clone()))?;
+    let capture =
+        capture_declaration_sources(&repo.path, &range_query(start.clone(), end.clone()))?;
     let batch = one_batch(&capture)?;
     let pair = one_pair(batch)?;
-    assert_eq!(pair.base.as_ref().context("range base")?.source(), START_SOURCE);
-    assert_eq!(pair.head.as_ref().context("range head")?.source(), END_SOURCE);
-    assert_endpoint(batch.provenance.base.as_ref().context("range provenance base")?, &start, BlockState::Committed);
-    assert_endpoint(&batch.provenance.head, &end, BlockState::Committed);
+    assert_eq!(
+        pair.base.as_ref().context("range base")?.source(),
+        START_SOURCE
+    );
+    assert_eq!(
+        pair.head.as_ref().context("range head")?.source(),
+        END_SOURCE
+    );
+    assert_endpoint(
+        batch
+            .provenance
+            .base
+            .as_ref()
+            .context("range provenance base")?,
+        &start,
+        &BlockState::Committed,
+    );
+    assert_endpoint(&batch.provenance.head, &end, &BlockState::Committed);
 
     Ok(())
 }
 
 #[test]
-fn added_deleted_and_explicitly_renamed_files_keep_their_correct_endpoint_paths_and_bytes() -> Result<()> {
+fn added_deleted_and_explicitly_renamed_files_keep_their_correct_endpoint_paths_and_bytes()
+-> Result<()> {
     let repo = TestRepo::new("declaration_capture_change_endpoints")?;
     repo.git(&["config", "diff.renames", "true"])?;
     const DELETED: &str = "pub fn removed() -> u8 { 1 }\n";
@@ -388,14 +419,22 @@ fn multiple_revision_targets_remain_distinct_and_in_request_order() -> Result<()
     );
     let batches = capture_declaration_sources(&repo.path, &ordered_query)?;
     assert_eq!(batches.len(), 2);
-    assert_endpoint(&batches[0].provenance.head, &first, BlockState::Committed);
-    assert_endpoint(&batches[1].provenance.head, &second, BlockState::Committed);
+    assert_endpoint(&batches[0].provenance.head, &first, &BlockState::Committed);
+    assert_endpoint(&batches[1].provenance.head, &second, &BlockState::Committed);
     assert_eq!(
-        one_pair(&batches[0])?.head.as_ref().context("first root head")?.path,
+        one_pair(&batches[0])?
+            .head
+            .as_ref()
+            .context("first root head")?
+            .path,
         Path::new("src/first.rs")
     );
     assert_eq!(
-        one_pair(&batches[1])?.head.as_ref().context("second commit head")?.path,
+        one_pair(&batches[1])?
+            .head
+            .as_ref()
+            .context("second commit head")?
+            .path,
         Path::new("src/second.rs")
     );
     assert_ne!(one_pair(&batches[0])?.id, one_pair(&batches[1])?.id);
@@ -416,27 +455,52 @@ fn dirty_capture_returns_every_selected_file_from_one_validated_generation() -> 
     repo.write("src/a.rs", A_GENERATION)?;
     repo.write("src/b.rs", B_GENERATION)?;
 
-    let capture = capture_declaration_sources(&repo.path, &dirty_query(&["src/a.rs", "src/b.rs"] )?)?;
+    let capture =
+        capture_declaration_sources(&repo.path, &dirty_query(&["src/a.rs", "src/b.rs"])?)?;
     let batch = one_batch(&capture)?;
     assert_eq!(batch.pairs.len(), 2);
     assert_eq!(
-        pair_for_display_path(batch, "src/a.rs")?.base.as_ref().context("a base")?.source(),
+        pair_for_display_path(batch, "src/a.rs")?
+            .base
+            .as_ref()
+            .context("a base")?
+            .source(),
         "pub fn a() -> u8 { 0 }\n"
     );
     assert_eq!(
-        pair_for_display_path(batch, "src/a.rs")?.head.as_ref().context("a head")?.source(),
+        pair_for_display_path(batch, "src/a.rs")?
+            .head
+            .as_ref()
+            .context("a head")?
+            .source(),
         A_GENERATION
     );
     assert_eq!(
-        pair_for_display_path(batch, "src/b.rs")?.base.as_ref().context("b base")?.source(),
+        pair_for_display_path(batch, "src/b.rs")?
+            .base
+            .as_ref()
+            .context("b base")?
+            .source(),
         "pub fn b() -> u8 { 0 }\n"
     );
     assert_eq!(
-        pair_for_display_path(batch, "src/b.rs")?.head.as_ref().context("b head")?.source(),
+        pair_for_display_path(batch, "src/b.rs")?
+            .head
+            .as_ref()
+            .context("b head")?
+            .source(),
         B_GENERATION
     );
-    assert_endpoint(batch.provenance.base.as_ref().context("dirty base provenance")?, &head, BlockState::Committed);
-    assert_endpoint(&batch.provenance.head, &head, BlockState::Uncommitted);
+    assert_endpoint(
+        batch
+            .provenance
+            .base
+            .as_ref()
+            .context("dirty base provenance")?,
+        &head,
+        &BlockState::Committed,
+    );
+    assert_endpoint(&batch.provenance.head, &head, &BlockState::Uncommitted);
 
     Ok(())
 }
@@ -484,8 +548,10 @@ fn dirty_capture_fails_closed_when_head_changes_before_finalize() -> Result<()> 
 #[test]
 fn body_only_diff_from_a_captured_pair_yields_zero_declaration_review_units() -> Result<()> {
     let repo = TestRepo::new("declaration_capture_body_only")?;
-    const BASE: &str = "/// Returns the value.\npub fn value(input: u8) -> u8 {\n    input + 1\n}\n";
-    const HEAD: &str = "/// Returns the value.\npub fn value(input: u8) -> u8 {\n    input.saturating_add(1)\n}\n";
+    const BASE: &str =
+        "/// Returns the value.\npub fn value(input: u8) -> u8 {\n    input + 1\n}\n";
+    const HEAD: &str =
+        "/// Returns the value.\npub fn value(input: u8) -> u8 {\n    input.saturating_add(1)\n}\n";
     repo.write("src/lib.rs", BASE)?;
     repo.commit_all("base body")?;
     let base = commit_id(&repo, "HEAD")?;
@@ -500,8 +566,15 @@ fn body_only_diff_from_a_captured_pair_yields_zero_declaration_review_units() ->
     assert_eq!(pair.head.as_ref().context("body head")?.source(), HEAD);
 
     let diff = diff_declarations(&batch.pairs)?;
-    assert!(diff.units.is_empty(), "body-only edits must not create declaration review units");
-    assert_eq!(diff.matches.len(), 1, "the unchanged declaration surface must still match");
+    assert!(
+        diff.units.is_empty(),
+        "body-only edits must not create declaration review units"
+    );
+    assert_eq!(
+        diff.matches.len(),
+        1,
+        "the unchanged declaration surface must still match"
+    );
 
     Ok(())
 }

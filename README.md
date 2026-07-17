@@ -154,6 +154,12 @@ trueflow tui
 # Review a GitHub pull request in the TUI
 trueflow tui --target pr:11
 
+# Review only documentation, signatures, and data-structure shapes.
+trueflow tui --mode declarations
+
+# Explicitly trust the workspace before requesting callers, callees, or type uses.
+trueflow tui --mode declarations --trust-lsp-workspace
+
 # Review current changes as JSON. Machine-readable, suitable for integrations.
 trueflow review --json
 
@@ -214,6 +220,9 @@ exclude = ["comment"]
 exclude = ["comment"]
 
 [tui]
+# Review modality: blocks|declarations. CLI --mode takes precedence.
+mode = "blocks"
+
 # disabled|old_new
 # default: disabled
 # diff_line_numbers = "old_new"
@@ -261,6 +270,35 @@ Main review actions:
 - `g` jump to root
 - `d` choose another review scope from the recap screen
 - `q` quit
+
+#### Declaration Review
+
+`trueflow tui --mode declarations` starts a distinct review track for declaration
+surfaces. It renders existing documentation, callable signatures, and
+data-structure shape; implementation bodies are never rendered or marked as
+reviewed. Diff scopes include only added, deleted, or changed declaration
+surfaces, so a body-only change produces no Declaration Review targets.
+
+The initial projectors support Rust, TypeScript, Python, Go, C, and C++. All
+visibilities are included. Approvals, comments, and rejections are stored as
+declaration-specific records and remain separate from ordinary block-review
+coverage. Declaration comments are available through JSON/XML feedback export
+and GitHub pull-request feedback.
+
+Declaration Review keys are intentionally fixed to its two-pane model:
+
+- `j`/`k`, Up/Down, PageUp/PageDown move within the active pane
+- `Tab` switches between the declaration outline and relationship graph on wide terminals
+- `o` expands relationships; Enter also opens the graph on narrow terminals
+- Enter follows an in-review relationship; Backspace returns
+- `a` approves, `c` comments, `r` rejects, and Space skips the current declaration
+- `q` quits
+
+Relationship expansion is advisory and on demand. It never changes review
+order or creates review targets. Trueflow launches only the fixed language
+server profile for the declaration's language, and only when the current
+invocation includes `--trust-lsp-workspace`; without that flag, the graph shows
+an explicit unavailable state. There is no name-matching or lexical fallback.
 
 To override the default TUI keys, add a `[tui.keybinds]` section to
 `trueflow.toml`:

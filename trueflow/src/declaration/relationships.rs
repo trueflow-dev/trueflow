@@ -195,8 +195,8 @@ pub fn lsp_position_for_byte_offset(
     };
 
     Ok(Position::new(
-        u32::try_from(line).map_err(|_| anyhow!("document has too many lines"))?,
-        u32::try_from(character).map_err(|_| anyhow!("line is too long"))?,
+        u32::try_from(line).map_err(|_error| anyhow!("document has too many lines"))?,
+        u32::try_from(character).map_err(|_error| anyhow!("line is too long"))?,
     ))
 }
 
@@ -205,7 +205,7 @@ pub fn byte_offset_for_lsp_position(
     position: Position,
     encoding: PositionEncoding,
 ) -> Result<usize> {
-    let target_line = usize::try_from(position.line).map_err(|_| anyhow!("invalid line"))?;
+    let target_line = usize::try_from(position.line).map_err(|_error| anyhow!("invalid line"))?;
     let mut line_start = 0usize;
     for _ in 0..target_line {
         let Some(relative_newline) = source[line_start..].find('\n') else {
@@ -225,12 +225,17 @@ pub fn byte_offset_for_lsp_position(
         physical_end
     };
     let line = &source[line_start..line_end];
-    let target = usize::try_from(position.character).map_err(|_| anyhow!("invalid character"))?;
+    let target =
+        usize::try_from(position.character).map_err(|_error| anyhow!("invalid character"))?;
 
     match encoding {
         PositionEncoding::Utf8 => {
             if target > line.len() {
-                bail!("character {} is past the end of line {}", position.character, position.line);
+                bail!(
+                    "character {} is past the end of line {}",
+                    position.character,
+                    position.line
+                );
             }
             if !line.is_char_boundary(target) {
                 bail!("UTF-8 position splits a code point");
@@ -252,15 +257,17 @@ pub fn byte_offset_for_lsp_position(
             if units == target {
                 Ok(line_end)
             } else {
-                bail!("character {} is past the end of line {}", position.character, position.line)
+                bail!(
+                    "character {} is past the end of line {}",
+                    position.character,
+                    position.line
+                )
             }
         }
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SourceGeneration(u64);
 
@@ -507,8 +514,7 @@ pub fn execute_relationship_plan(
 ) -> std::result::Result<RelationshipExecution, ProviderError> {
     let kind = match &plan.kind {
         RelationshipPlanKind::UsesTypes { sites, .. } => {
-            let declaration_supported =
-                backend.supports(RelationshipCapability::Declaration);
+            let declaration_supported = backend.supports(RelationshipCapability::Declaration);
             let definition_supported = backend.supports(RelationshipCapability::Definition);
             if !declaration_supported && !definition_supported {
                 RelationshipExecutionKind::Unsupported(RelationshipCapability::Declaration)
@@ -543,19 +549,20 @@ pub fn execute_relationship_plan(
             if !backend.supports(RelationshipCapability::References) {
                 RelationshipExecutionKind::Unsupported(RelationshipCapability::References)
             } else {
-                let locations = backend.request(RelationshipRequest::References(ReferenceParams {
-                    text_document_position: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier {
-                            uri: declaration.uri.clone(),
+                let locations =
+                    backend.request(RelationshipRequest::References(ReferenceParams {
+                        text_document_position: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier {
+                                uri: declaration.uri.clone(),
+                            },
+                            position: declaration.range.start,
                         },
-                        position: declaration.range.start,
-                    },
-                    context: ReferenceContext {
-                        include_declaration: false,
-                    },
-                    work_done_progress_params: WorkDoneProgressParams::default(),
-                    partial_result_params: PartialResultParams::default(),
-                }))?;
+                        context: ReferenceContext {
+                            include_declaration: false,
+                        },
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                    }))?;
                 RelationshipExecutionKind::UsedBy(locations)
             }
         }
@@ -605,7 +612,11 @@ fn reconcile_uses_types(
             Some(location) => reconcile_type_target(index, location, plan.encoding)?
                 .map(RelationshipTarget::InReview)
                 .unwrap_or_else(|| {
-                    if index.documents.iter().any(|document| document.uri == location.uri) {
+                    if index
+                        .documents
+                        .iter()
+                        .any(|document| document.uri == location.uri)
+                    {
                         RelationshipTarget::Unresolved {
                             name: site.name.clone(),
                         }
@@ -659,9 +670,10 @@ fn reconcile_used_by(
                 scope: plan.scope,
             },
         };
-        if let Some(edge) = edges.iter_mut().find(|edge| {
-            matches!(&edge.target, RelationshipTarget::InReview(id) if id == &owner)
-        }) {
+        if let Some(edge) = edges
+            .iter_mut()
+            .find(|edge| matches!(&edge.target, RelationshipTarget::InReview(id) if id == &owner))
+        {
             edge.locations.push(relationship_location);
         } else {
             edges.push(RelationshipEdge {

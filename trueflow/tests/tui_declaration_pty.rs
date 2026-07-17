@@ -170,10 +170,14 @@ impl PtySession {
                 return Ok(screen);
             }
 
-            let child = self.child.as_mut().context("PTY child was already reaped")?;
+            let child = self
+                .child
+                .as_mut()
+                .context("PTY child was already reaped")?;
             if let Some(status) = child.try_wait()? {
                 if !reader_done {
-                    self.output.wait_for_change_or_deadline(generation, deadline);
+                    self.output
+                        .wait_for_change_or_deadline(generation, deadline);
                     continue;
                 }
                 let transcript = String::from_utf8_lossy(&bytes);
@@ -187,12 +191,16 @@ impl PtySession {
                     String::from_utf8_lossy(&bytes)
                 );
             }
-            self.output.wait_for_change_or_deadline(generation, deadline);
+            self.output
+                .wait_for_change_or_deadline(generation, deadline);
         }
     }
 
     fn send(&mut self, bytes: &[u8]) -> Result<()> {
-        let writer = self.writer.as_mut().context("PTY input was already closed")?;
+        let writer = self
+            .writer
+            .as_mut()
+            .context("PTY input was already closed")?;
         writer.write_all(bytes)?;
         writer.flush()?;
         Ok(())
@@ -202,7 +210,10 @@ impl PtySession {
         self.writer.take();
         let deadline = Instant::now() + EXIT_TIMEOUT;
         let status = loop {
-            let child = self.child.as_mut().context("PTY child was already reaped")?;
+            let child = self
+                .child
+                .as_mut()
+                .context("PTY child was already reaped")?;
             if let Some(status) = child.try_wait()? {
                 break status;
             }
@@ -225,10 +236,10 @@ impl PtySession {
     }
 
     fn finish_reader(&mut self) -> Result<()> {
-        if let Some(reader_thread) = self.reader_thread.take() {
-            if reader_thread.join().is_err() {
-                bail!("PTY reader thread panicked");
-            }
+        if let Some(reader_thread) = self.reader_thread.take()
+            && reader_thread.join().is_err()
+        {
+            bail!("PTY reader thread panicked");
         }
         Ok(())
     }
@@ -265,12 +276,18 @@ fn review_records(path: &Path) -> Result<Vec<Record>> {
     source
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<Record>(line).context("review store contained invalid JSON or record shape"))
+        .map(|line| {
+            serde_json::from_str::<Record>(line)
+                .context("review store contained invalid JSON or record shape")
+        })
         .collect()
 }
 
 fn control_sequence_count(bytes: &[u8], sequence: &[u8]) -> usize {
-    bytes.windows(sequence.len()).filter(|window| *window == sequence).count()
+    bytes
+        .windows(sequence.len())
+        .filter(|window| *window == sequence)
+        .count()
 }
 
 fn assert_terminal_restored(session: &PtySession) {
@@ -305,9 +322,18 @@ fn signature_change_renders_only_the_declaration_surface_and_quits_cleanly() -> 
             && screen.contains("/// Converts a wider value.")
             && screen.contains("pub fn convert(value: u16) -> u16")
     })?;
-    assert!(!screen.contains(BODY_SENTINEL), "executable body text leaked into the declaration screen:\n{screen}");
-    assert!(!screen.contains("Speed Read"), "block speed-read UI leaked into declaration mode:\n{screen}");
-    assert!(!screen.contains("AI Suggestion"), "block AI UI leaked into declaration mode:\n{screen}");
+    assert!(
+        !screen.contains(BODY_SENTINEL),
+        "executable body text leaked into the declaration screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Speed Read"),
+        "block speed-read UI leaked into declaration mode:\n{screen}"
+    );
+    assert!(
+        !screen.contains("AI Suggestion"),
+        "block AI UI leaked into declaration mode:\n{screen}"
+    );
 
     session.send(b"q")?;
     session.wait_for_success()?;
@@ -333,7 +359,10 @@ fn approve_appends_one_valid_v5_declaration_record_then_advances() -> Result<()>
     session.wait_for_screen("to render alpha before approval", |screen| {
         screen.contains("Declaration Review") && screen.contains("pub fn alpha(value: u16) -> u16")
     })?;
-    assert!(!records_path.exists(), "launching declaration review must not persist an approval");
+    assert!(
+        !records_path.exists(),
+        "launching declaration review must not persist an approval"
+    );
 
     session.send(b"a")?;
     session.wait_for_screen("to advance to beta after approval", |screen| {
@@ -342,14 +371,23 @@ fn approve_appends_one_valid_v5_declaration_record_then_advances() -> Result<()>
     })?;
 
     let records = review_records(&records_path)?;
-    ensure!(records.len() == 1, "one approval must append exactly one record, got {records:#?}");
+    ensure!(
+        records.len() == 1,
+        "one approval must append exactly one record, got {records:#?}"
+    );
     let record = &records[0];
     assert_eq!(record.version, 5);
     assert!(matches!(record.target, ReviewTargetRef::Declaration { .. }));
     assert_eq!(record.check, ReviewCheck::declaration());
     assert_eq!(record.verdict, Verdict::Approved);
-    assert!(record.declaration_locator.is_some(), "declaration approval lost its locator");
-    assert!(matches!(record.comment_anchor, Some(CommentAnchor::Declaration(_))));
+    assert!(
+        record.declaration_locator.is_some(),
+        "declaration approval lost its locator"
+    );
+    assert!(matches!(
+        record.comment_anchor,
+        Some(CommentAnchor::Declaration(_))
+    ));
     record.validate()?;
 
     session.send(b"q")?;
@@ -374,7 +412,10 @@ fn body_only_change_reports_no_declaration_surface_changes_and_quits() -> Result
     let screen = session.wait_for_screen("to explain the empty declaration review", |screen| {
         screen.contains("No declaration surface changes")
     })?;
-    assert!(!screen.contains("pub fn total"), "an unchanged declaration surface was presented as reviewable:\n{screen}");
+    assert!(
+        !screen.contains("pub fn total"),
+        "an unchanged declaration surface was presented as reviewable:\n{screen}"
+    );
 
     session.send(b"q")?;
     session.wait_for_success()?;

@@ -7,10 +7,10 @@ use trueflow::declaration::{DeclarationKey, DeclarationProjectionHash};
 use trueflow::hashing::BytesHash;
 use trueflow::repo_path::RepoPath;
 use trueflow::store::{
-    BlockState, CommentAnchor, CommitId, DeclarationAnchorRange, DeclarationCommentAnchor,
-    DeclarationRecordLocator, FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore,
-    ReviewTargetRef, ReviewedDeclarationSnapshot, SourceCommentAnchor, VcsSystem, Verdict,
-    CURRENT_VERSION,
+    BlockState, CURRENT_VERSION, CommentAnchor, CommitId, DeclarationAnchorRange,
+    DeclarationCommentAnchor, DeclarationRecordLocator, FileStore, Identity, Record, RepoRef,
+    ReviewCheck, ReviewStore, ReviewTargetRef, ReviewedDeclarationSnapshot, SourceCommentAnchor,
+    VcsSystem, Verdict,
 };
 use trueflow_test_support::temp_test_dir;
 
@@ -39,7 +39,11 @@ fn anchor_range(start_byte: usize, end_byte: usize, exact_text: &str) -> Declara
     }
 }
 
-fn declaration_locator(path: &str, key: &str, source_ordinal: usize) -> Result<DeclarationRecordLocator> {
+fn declaration_locator(
+    path: &str,
+    key: &str,
+    source_ordinal: usize,
+) -> Result<DeclarationRecordLocator> {
     Ok(DeclarationRecordLocator {
         path: RepoPath::new(path)?,
         declaration_key: DeclarationKey::new(key),
@@ -140,7 +144,9 @@ fn locator_mut(record: &mut Record) -> Result<&mut DeclarationRecordLocator> {
 fn declaration_anchor_mut(record: &mut Record) -> Result<&mut DeclarationCommentAnchor> {
     match record.comment_anchor.as_mut() {
         Some(CommentAnchor::Declaration(anchor)) => Ok(anchor),
-        other => anyhow::bail!("test declaration record must have a declaration anchor, got {other:?}"),
+        other => {
+            anyhow::bail!("test declaration record must have a declaration anchor, got {other:?}")
+        }
     }
 }
 
@@ -216,7 +222,10 @@ fn v5_signing_payload_binds_locator_and_declaration_anchor() -> Result<()> {
 
 #[test]
 fn signing_dispatch_rejects_every_unsupported_record_version() -> Result<()> {
-    assert_eq!(CURRENT_VERSION, 5, "these fixtures define the V5 wire contract");
+    assert_eq!(
+        CURRENT_VERSION, 5,
+        "these fixtures define the V5 wire contract"
+    );
 
     for version in [0, 1, CURRENT_VERSION + 1, u32::MAX] {
         let mut record = legacy_record(4)?;
@@ -277,13 +286,18 @@ fn v5_declaration_target_requires_a_complete_locator_and_declaration_check() -> 
     locator_mut(&mut empty_span)?.source_span = 7..7;
 
     let mut reversed_span = declaration_record()?;
-    locator_mut(&mut reversed_span)?.source_span = 32..7;
+    locator_mut(&mut reversed_span)?.source_span = std::ops::Range { start: 32, end: 7 };
 
     let mut empty_snapshot_id = declaration_record()?;
-    locator_mut(&mut empty_snapshot_id)?.reviewed_snapshot.snapshot_id.clear();
+    locator_mut(&mut empty_snapshot_id)?
+        .reviewed_snapshot
+        .snapshot_id
+        .clear();
 
     let mut empty_content_hash = declaration_record()?;
-    locator_mut(&mut empty_content_hash)?.reviewed_snapshot.content_hash = BytesHash::new("");
+    locator_mut(&mut empty_content_hash)?
+        .reviewed_snapshot
+        .content_hash = BytesHash::new("");
 
     let mut wrong_check = declaration_record()?;
     wrong_check.check = ReviewCheck::review();
@@ -302,7 +316,10 @@ fn v5_declaration_target_requires_a_complete_locator_and_declaration_check() -> 
         ("empty reviewed snapshot id", empty_snapshot_id),
         ("empty reviewed content hash", empty_content_hash),
         ("declaration target with ordinary review check", wrong_check),
-        ("declaration check with block target", declaration_check_on_block),
+        (
+            "declaration check with block target",
+            declaration_check_on_block,
+        ),
     ]);
     Ok(())
 }
@@ -400,8 +417,8 @@ fn declaration_anchor_rejects_empty_unordered_overlapping_or_out_of_bounds_range
 }
 
 #[test]
-fn declaration_anchor_proves_utf8_boundaries_exact_slices_and_snapshot_hash_against_source(
-) -> Result<()> {
+fn declaration_anchor_proves_utf8_boundaries_exact_slices_and_snapshot_hash_against_source()
+-> Result<()> {
     declaration_anchor().validate_against_source(VALID_SOURCE)?;
 
     let mut split_code_point = declaration_anchor();
@@ -466,7 +483,10 @@ fn load_fails_closed_when_history_contains_a_malformed_declaration_record() -> R
     let store = FileStore::for_root(&root)?;
     let mut malformed = serde_json::to_value(declaration_record()?)?;
     malformed["declaration_locator"]["projection_hash"] = json!(OTHER_PROJECTION_HASH);
-    fs::write(store.db_path(), format!("{}\n", serde_json::to_string(&malformed)?))?;
+    fs::write(
+        store.db_path(),
+        format!("{}\n", serde_json::to_string(&malformed)?),
+    )?;
 
     assert!(
         store.read_history().is_err(),
@@ -514,7 +534,11 @@ fn equal_projection_hashes_at_distinct_locators_remain_distinct_in_history() -> 
     let mut second = declaration_record()?;
     second.id = "declaration-record-2".to_string();
     second.timestamp += 1;
-    second.declaration_locator = Some(declaration_locator("src/other.rs", "crate::other::run()", 3)?);
+    second.declaration_locator = Some(declaration_locator(
+        "src/other.rs",
+        "crate::other::run()",
+        3,
+    )?);
     second.comment_anchor = None;
 
     store.append(&first)?;
@@ -532,8 +556,21 @@ fn equal_projection_hashes_at_distinct_locators_remain_distinct_in_history() -> 
 
     assert_eq!(loaded.len(), 2);
     assert_eq!(locators.len(), 2);
-    assert!(locators.contains(first.declaration_locator.as_ref().context("first locator")?));
-    assert!(locators.contains(second.declaration_locator.as_ref().context("second locator")?));
+    assert!(
+        locators.contains(
+            first
+                .declaration_locator
+                .as_ref()
+                .context("first locator")?
+        )
+    );
+    assert!(
+        locators.contains(
+            second
+                .declaration_locator
+                .as_ref()
+                .context("second locator")?
+        )
+    );
     Ok(())
 }
-

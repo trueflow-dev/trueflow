@@ -8,8 +8,7 @@ use crate::store::{Record, Verdict};
 
 use super::coverage::DeclarationCoverageIndex;
 use super::diff::{
-    DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic,
-    DiffDiagnosticKind,
+    DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic, DiffDiagnosticKind,
 };
 use super::snapshot::{SnapshotPair, SnapshotPairId, SourceSnapshot};
 use super::{Capability, DeclarationId, DeclarationKind, DeclarationNode, capabilities_for};
@@ -55,10 +54,7 @@ impl DeclarationReviewQuery {
         }
     }
 
-    pub fn with_reviewed_target_ids(
-        mut self,
-        reviewed_target_ids: Vec<DeclarationId>,
-    ) -> Self {
+    pub fn with_reviewed_target_ids(mut self, reviewed_target_ids: Vec<DeclarationId>) -> Self {
         self.reviewed_target_ids = reviewed_target_ids.into_iter().collect();
         self
     }
@@ -150,12 +146,14 @@ pub fn collect_declaration_review(
                 batch_ordinal,
                 item: CollectedDeclarationItem {
                     snapshot_pair_id: unit.snapshot_pair_id.clone(),
-                    display_path: RepoPath::from_relative_path(&snapshot.path).with_context(|| {
-                        format!(
-                            "snapshot path {} is not a valid repository-relative display path",
-                            snapshot.path.display()
-                        )
-                    })?,
+                    display_path: RepoPath::from_relative_path(&snapshot.path).with_context(
+                        || {
+                            format!(
+                                "snapshot path {} is not a valid repository-relative display path",
+                                snapshot.path.display()
+                            )
+                        },
+                    )?,
                     snapshot: snapshot.clone(),
                     declaration: declaration.clone(),
                     diff_unit: unit.clone(),
@@ -237,18 +235,15 @@ fn resolve_snapshot_pair<'a>(
         pair_id_count += 1;
         let endpoints_match = match unit.change_kind {
             DeclarationChangeKind::Added => {
-                pair.head.as_ref().map(|snapshot| &snapshot.id)
-                    == unit.head_snapshot_id.as_ref()
+                pair.head.as_ref().map(|snapshot| &snapshot.id) == unit.head_snapshot_id.as_ref()
             }
             DeclarationChangeKind::Changed => {
-                pair.base.as_ref().map(|snapshot| &snapshot.id)
-                    == unit.base_snapshot_id.as_ref()
+                pair.base.as_ref().map(|snapshot| &snapshot.id) == unit.base_snapshot_id.as_ref()
                     && pair.head.as_ref().map(|snapshot| &snapshot.id)
                         == unit.head_snapshot_id.as_ref()
             }
             DeclarationChangeKind::Deleted => {
-                pair.base.as_ref().map(|snapshot| &snapshot.id)
-                    == unit.base_snapshot_id.as_ref()
+                pair.base.as_ref().map(|snapshot| &snapshot.id) == unit.base_snapshot_id.as_ref()
             }
         };
         if endpoints_match {

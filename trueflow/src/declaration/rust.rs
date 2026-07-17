@@ -77,7 +77,7 @@ impl Projector<'_> {
         &mut self,
         scope: Node<'_>,
         scope_kind: ScopeKind,
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_name: Option<&str>,
     ) -> Result<()> {
         let mut pending = Vec::<SemanticRange>::new();
@@ -116,7 +116,7 @@ impl Projector<'_> {
                         child,
                         kind,
                         std::mem::take(&mut pending),
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                 }
@@ -125,7 +125,7 @@ impl Projector<'_> {
                         child,
                         DeclarationKind::Struct,
                         std::mem::take(&mut pending),
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                 }
@@ -134,7 +134,7 @@ impl Projector<'_> {
                         child,
                         DeclarationKind::Enum,
                         std::mem::take(&mut pending),
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                 }
@@ -145,7 +145,7 @@ impl Projector<'_> {
                         child,
                         DeclarationKind::Trait,
                         attachments,
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                     if added {
@@ -156,7 +156,7 @@ impl Projector<'_> {
                             self.collect_scope(
                                 body,
                                 ScopeKind::Trait,
-                                Some(trait_id),
+                                Some(&trait_id),
                                 Some(&trait_name),
                             )?;
                         }
@@ -181,7 +181,7 @@ impl Projector<'_> {
                         child,
                         DeclarationKind::Module,
                         attachments,
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                     if added {
@@ -192,7 +192,7 @@ impl Projector<'_> {
                             self.collect_scope(
                                 body,
                                 ScopeKind::Module,
-                                Some(module_id),
+                                Some(&module_id),
                                 Some(&module_name),
                             )?;
                         }
@@ -213,7 +213,7 @@ impl Projector<'_> {
                         child,
                         kind,
                         std::mem::take(&mut pending),
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                 }
@@ -222,7 +222,7 @@ impl Projector<'_> {
                         child,
                         DeclarationKind::Constant,
                         std::mem::take(&mut pending),
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                 }
@@ -231,7 +231,7 @@ impl Projector<'_> {
                         child,
                         DeclarationKind::Static,
                         std::mem::take(&mut pending),
-                        parent_id.clone(),
+                        parent_id,
                         parent_name,
                     )?;
                 }
@@ -246,7 +246,7 @@ impl Projector<'_> {
         item: Node<'_>,
         kind: DeclarationKind,
         mut attachments: Vec<SemanticRange>,
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_name: Option<&str>,
     ) -> Result<bool> {
         let Some(name_node) = item.child_by_field_name("name") else {
@@ -280,9 +280,7 @@ impl Projector<'_> {
             | DeclarationKind::Method
             | DeclarationKind::Trait
             | DeclarationKind::Module => SourceComponentRole::Signature,
-            DeclarationKind::Struct | DeclarationKind::Enum => {
-                SourceComponentRole::AggregateShape
-            }
+            DeclarationKind::Struct | DeclarationKind::Enum => SourceComponentRole::AggregateShape,
             DeclarationKind::TypeAlias | DeclarationKind::AssociatedType => {
                 SourceComponentRole::TypeAlias
             }
@@ -323,7 +321,7 @@ impl Projector<'_> {
         );
         let item_projection = self
             .source
-            .get(item_projection_range.clone())
+            .get(item_projection_range)
             .context("Rust projection was not on UTF-8 boundaries")?;
         let key = declaration_key(Language::Rust, kind, &name, parent_name, item_projection);
         let implicit_visibility = parent_id.is_some()
@@ -334,13 +332,8 @@ impl Projector<'_> {
                     | DeclarationKind::Constant
             );
         let visibility = rust_visibility(item, self.source, implicit_visibility)?;
-        let type_use_sites = collect_type_use_sites(
-            item,
-            self.source,
-            &components,
-            name_node.byte_range(),
-            kind,
-        )?;
+        let type_use_sites =
+            collect_type_use_sites(item, self.source, &components, name_node.byte_range(), kind)?;
 
         self.declarations.push(DeclarationNode {
             id: id.clone(),
@@ -348,7 +341,7 @@ impl Projector<'_> {
             name,
             kind,
             visibility,
-            parent_part: parent_id,
+            parent_part: parent_id.cloned(),
             source_ordinal,
             source_span,
             components,
@@ -376,7 +369,11 @@ fn projected_item_range(
             .map_or(item.end_byte(), |body| body.start_byte()),
         _ => item.end_byte(),
     };
-    while end > item.start_byte() && source.as_bytes().get(end - 1).is_some_and(u8::is_ascii_whitespace)
+    while end > item.start_byte()
+        && source
+            .as_bytes()
+            .get(end - 1)
+            .is_some_and(u8::is_ascii_whitespace)
     {
         end -= 1;
     }
@@ -426,9 +423,7 @@ fn build_components(
         }
         let role = semantic_ranges
             .iter()
-            .find(|semantic| {
-                semantic.range.start <= range.start && semantic.range.end >= range.end
-            })
+            .find(|semantic| semantic.range.start <= range.start && semantic.range.end >= range.end)
             .map_or(SourceComponentRole::Layout, |semantic| semantic.role);
         let text = source
             .get(range.clone())
@@ -525,11 +520,7 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     source.get(node.byte_range())
 }
 
-fn rust_visibility(
-    item: Node<'_>,
-    source: &str,
-    implicit_visibility: bool,
-) -> Result<Visibility> {
+fn rust_visibility(item: Node<'_>, source: &str, implicit_visibility: bool) -> Result<Visibility> {
     let mut cursor = item.walk();
     let visibility = item
         .named_children(&mut cursor)

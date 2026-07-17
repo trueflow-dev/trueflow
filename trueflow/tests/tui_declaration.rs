@@ -7,8 +7,8 @@ use anyhow::{Context, Result, ensure};
 use crossterm::event::KeyCode;
 use trueflow::commands::tui::declaration::tui_test_support::{
     DeclarationPane, DeclarationTestApp, GraphSelection, TestDeclarationAnchor,
-    TestDeclarationFixture, TestLayout, TestOutlineRow, TestRelationship,
-    TestRelationshipGroup, TestRelationshipState, TestReviewActionKind,
+    TestDeclarationFixture, TestLayout, TestOutlineRow, TestRelationship, TestRelationshipGroup,
+    TestRelationshipState, TestReviewActionKind,
 };
 
 const SNAPSHOT_ID: &str = "snapshot-head";
@@ -120,11 +120,7 @@ fn ready_load_relationships() -> TestRelationshipState {
             "Calls",
             vec![
                 // Deliberately opposite to canonical review order. This is the regression boundary.
-                TestRelationship::in_review(
-                    "load.calls.validate",
-                    "crate::validate",
-                    "validate",
-                ),
+                TestRelationship::in_review("load.calls.validate", "crate::validate", "validate"),
                 TestRelationship::in_review("load.calls.save", "crate::save", "save"),
             ],
         ),
@@ -161,12 +157,7 @@ fn review_fixture() -> Result<TestDeclarationFixture> {
         )?,
         component_row("mode.fast", "mode", MODE_FAST)?,
         component_row("mode.safe", "mode", MODE_SAFE)?,
-        target_row(
-            "load",
-            LOAD_DECLARATION,
-            LOAD_SIGNATURE,
-            &[LOAD_SIGNATURE],
-        )?,
+        target_row("load", LOAD_DECLARATION, LOAD_SIGNATURE, &[LOAD_SIGNATURE])?,
         target_row("save", SAVE_SIGNATURE, SAVE_SIGNATURE, &[SAVE_SIGNATURE])?,
         target_row(
             "validate",
@@ -221,15 +212,20 @@ fn comment_and_submit(app: &mut DeclarationTestApp, body: &str) -> Result<()> {
     app.press(KeyCode::Enter)
 }
 
-fn only_action(app: &mut DeclarationTestApp) -> Result<trueflow::commands::tui::declaration::tui_test_support::TestReviewAction> {
+fn only_action(
+    app: &mut DeclarationTestApp,
+) -> Result<trueflow::commands::tui::declaration::tui_test_support::TestReviewAction> {
     let mut actions = app.take_review_actions();
-    ensure!(actions.len() == 1, "expected exactly one review action, got {actions:?}");
+    ensure!(
+        actions.len() == 1,
+        "expected exactly one review action, got {actions:?}"
+    );
     Ok(actions.remove(0))
 }
 
 #[test]
-fn wide_split_renders_exact_projection_rows_and_relationship_groups_with_one_active_selection(
-) -> Result<()> {
+fn wide_split_renders_exact_projection_rows_and_relationship_groups_with_one_active_selection()
+-> Result<()> {
     let mut app = app_with_fixture(review_fixture()?, 120, 18)?;
     let rendered = app.render()?;
 
@@ -275,8 +271,8 @@ fn wide_split_renders_exact_projection_rows_and_relationship_groups_with_one_act
 }
 
 #[test]
-fn narrow_relationship_replacement_backspace_restores_outline_selection_expansion_and_scroll(
-) -> Result<()> {
+fn narrow_relationship_replacement_backspace_restores_outline_selection_expansion_and_scroll()
+-> Result<()> {
     for open_key in [KeyCode::Char('o'), KeyCode::Enter] {
         let mut app = app_with_fixture(review_fixture()?, 99, 5)?;
         assert_eq!(
@@ -287,7 +283,10 @@ fn narrow_relationship_replacement_backspace_restores_outline_selection_expansio
             }
         );
         let outline_before = app.state_snapshot();
-        assert!(outline_before.outline.scroll > 0, "fixture must exercise restoration below the fold");
+        assert!(
+            outline_before.outline.scroll > 0,
+            "fixture must exercise restoration below the fold"
+        );
         assert_eq!(
             outline_before.outline.expanded,
             BTreeSet::from(["config".to_owned(), "mode".to_owned()])
@@ -303,7 +302,11 @@ fn narrow_relationship_replacement_backspace_restores_outline_selection_expansio
         );
 
         app.press(KeyCode::Backspace)?;
-        assert_eq!(app.state_snapshot(), outline_before, "{open_key:?} replacement lost outline state");
+        assert_eq!(
+            app.state_snapshot(),
+            outline_before,
+            "{open_key:?} replacement lost outline state"
+        );
         assert_eq!(
             app.render()?.layout,
             TestLayout::Single {
@@ -316,18 +319,27 @@ fn narrow_relationship_replacement_backspace_restores_outline_selection_expansio
 }
 
 #[test]
-fn crossing_100_columns_preserves_both_pane_cursors_expansion_scroll_and_comment_draft(
-) -> Result<()> {
+fn crossing_100_columns_preserves_both_pane_cursors_expansion_scroll_and_comment_draft()
+-> Result<()> {
     let mut app = app_with_fixture(review_fixture()?, 100, 5)?;
     app.render()?;
     app.press(KeyCode::Char('c'))?;
     app.type_text("draft survives layout changes")?;
 
     let before = app.state_snapshot();
-    assert!(before.outline.scroll > 0, "outline fixture must be scrolled");
-    assert!(before.relationships.scroll > 0, "graph fixture must be scrolled");
+    assert!(
+        before.outline.scroll > 0,
+        "outline fixture must be scrolled"
+    );
+    assert!(
+        before.relationships.scroll > 0,
+        "graph fixture must be scrolled"
+    );
     assert!(before.relationships.selection.is_some());
-    assert_eq!(before.comment_draft.as_deref(), Some("draft survives layout changes"));
+    assert_eq!(
+        before.comment_draft.as_deref(),
+        Some("draft survives layout changes")
+    );
     assert_eq!(
         before.outline.expanded,
         BTreeSet::from(["config".to_owned(), "mode".to_owned()])
@@ -335,7 +347,11 @@ fn crossing_100_columns_preserves_both_pane_cursors_expansion_scroll_and_comment
     assert!(matches!(app.render()?.layout, TestLayout::Split { .. }));
 
     app.resize(99, 5)?;
-    assert_eq!(app.state_snapshot(), before, "wide-to-narrow resize mutated reducer state");
+    assert_eq!(
+        app.state_snapshot(),
+        before,
+        "wide-to-narrow resize mutated reducer state"
+    );
     assert_eq!(
         app.render()?.layout,
         TestLayout::Single {
@@ -345,21 +361,27 @@ fn crossing_100_columns_preserves_both_pane_cursors_expansion_scroll_and_comment
     );
 
     app.resize(100, 5)?;
-    assert_eq!(app.state_snapshot(), before, "narrow-to-wide resize mutated reducer state");
+    assert_eq!(
+        app.state_snapshot(),
+        before,
+        "narrow-to-wide resize mutated reducer state"
+    );
     assert!(matches!(app.render()?.layout, TestLayout::Split { .. }));
     Ok(())
 }
 
 #[test]
-fn space_advances_canonical_declaration_order_even_when_graph_selection_points_elsewhere(
-) -> Result<()> {
+fn space_advances_canonical_declaration_order_even_when_graph_selection_points_elsewhere()
+-> Result<()> {
     let mut app = app_with_fixture(review_fixture()?, 120, 12)?;
     app.press(KeyCode::Tab)?;
     let before = app.state_snapshot();
     assert_eq!(before.active_declaration, "load");
     assert_eq!(
         before.relationships.selection,
-        Some(GraphSelection::Relationship("load.calls.validate".to_owned()))
+        Some(GraphSelection::Relationship(
+            "load.calls.validate".to_owned()
+        ))
     );
 
     app.press(KeyCode::Char(' '))?;
@@ -368,13 +390,16 @@ fn space_advances_canonical_declaration_order_even_when_graph_selection_points_e
         after.active_declaration, "save",
         "canonical successor to load is save; graph order points to validate"
     );
-    assert_eq!(after.back_stack_depth, 0, "Space is canonical advance, not a graph jump");
+    assert_eq!(
+        after.back_stack_depth, 0,
+        "Space is canonical advance, not a graph jump"
+    );
     Ok(())
 }
 
 #[test]
-fn in_review_relationship_jump_round_trips_back_stack_but_external_and_unresolved_are_inspection_only(
-) -> Result<()> {
+fn in_review_relationship_jump_round_trips_back_stack_but_external_and_unresolved_are_inspection_only()
+-> Result<()> {
     let mut jumping = app_with_fixture(review_fixture()?, 120, 12)?;
     jumping.press(KeyCode::Tab)?;
     let before_jump = jumping.state_snapshot();
@@ -382,12 +407,15 @@ fn in_review_relationship_jump_round_trips_back_stack_but_external_and_unresolve
     assert_eq!(jumping.state_snapshot().active_declaration, "validate");
     assert_eq!(jumping.state_snapshot().back_stack_depth, 1);
     jumping.press(KeyCode::Backspace)?;
-    assert_eq!(jumping.state_snapshot(), before_jump, "Backspace must restore the complete pre-jump view");
+    assert_eq!(
+        jumping.state_snapshot(),
+        before_jump,
+        "Backspace must restore the complete pre-jump view"
+    );
 
     for relationship_id in ["load.called_by.external", "load.called_by.unresolved"] {
-        let fixture = review_fixture()?.with_initial_graph_selection(
-            GraphSelection::Relationship(relationship_id.to_owned()),
-        );
+        let fixture = review_fixture()?
+            .with_initial_graph_selection(GraphSelection::Relationship(relationship_id.to_owned()));
         let mut app = app_with_fixture(fixture, 120, 12)?;
         app.press(KeyCode::Tab)?;
         app.press(KeyCode::Enter)?;
@@ -395,12 +423,21 @@ fn in_review_relationship_jump_round_trips_back_stack_but_external_and_unresolve
         let inspected = app.state_snapshot();
         assert_eq!(inspected.active_declaration, "load");
         assert_eq!(inspected.back_stack_depth, 0);
-        assert_eq!(inspected.inspected_relationship.as_deref(), Some(relationship_id));
+        assert_eq!(
+            inspected.inspected_relationship.as_deref(),
+            Some(relationship_id)
+        );
 
         app.press(KeyCode::Char('a'))?;
         app.press(KeyCode::Char('c'))?;
-        assert!(app.take_review_actions().is_empty(), "{relationship_id} became actionable");
-        assert!(app.state_snapshot().comment_draft.is_none(), "{relationship_id} created a source editor");
+        assert!(
+            app.take_review_actions().is_empty(),
+            "{relationship_id} became actionable"
+        );
+        assert!(
+            app.state_snapshot().comment_draft.is_none(),
+            "{relationship_id} created a source editor"
+        );
     }
     Ok(())
 }
@@ -420,7 +457,10 @@ fn field_approval_and_variant_comment_resolve_to_the_aggregate_review_owner() ->
     let variant_action = only_action(&mut variant_app)?;
     assert_eq!(variant_action.kind, TestReviewActionKind::Comment);
     assert_eq!(variant_action.owner_id, "mode");
-    assert_eq!(variant_action.comment_body.as_deref(), Some("variant contract"));
+    assert_eq!(
+        variant_action.comment_body.as_deref(),
+        Some("variant contract")
+    );
 
     let anchor = variant_action.anchor.context("variant comment anchor")?;
     assert_eq!(anchor.snapshot_id, SNAPSHOT_ID);
@@ -491,14 +531,10 @@ fn relationship_and_capability_rows_cannot_approve_or_open_source_comments() -> 
 }
 
 #[test]
-fn relationship_loading_empty_partial_and_unavailable_states_have_distinct_semantic_output(
-) -> Result<()> {
+fn relationship_loading_empty_partial_and_unavailable_states_have_distinct_semantic_output()
+-> Result<()> {
     let cases = [
-        (
-            "checking",
-            TestRelationshipState::Checking,
-            "Checking…",
-        ),
+        ("checking", TestRelationshipState::Checking, "Checking…"),
         (
             "successful empty",
             TestRelationshipState::NoRelationships,
@@ -525,8 +561,15 @@ fn relationship_loading_empty_partial_and_unavailable_states_have_distinct_seman
         let fixture = review_fixture()?.with_relationship_state("load", state);
         let mut app = app_with_fixture(fixture, 120, 10)?;
         let rendered = app.render()?;
-        assert_eq!(rendered.relationship_status.as_deref(), Some(expected), "{case}");
-        assert!(rendered.visible_text.contains(expected), "{case} was not rendered");
+        assert_eq!(
+            rendered.relationship_status.as_deref(),
+            Some(expected),
+            "{case}"
+        );
+        assert!(
+            rendered.visible_text.contains(expected),
+            "{case} was not rendered"
+        );
     }
     Ok(())
 }

@@ -85,11 +85,8 @@ impl Projector<'_> {
                 continue;
             }
 
-            let documentation = trailing_comment_group(
-                self.source,
-                &pending_comments,
-                child.start_byte(),
-            );
+            let documentation =
+                trailing_comment_group(self.source, &pending_comments, child.start_byte());
             pending_comments.clear();
             match child.kind() {
                 "function_declaration" => {
@@ -99,13 +96,13 @@ impl Projector<'_> {
                     self.add_callable(child, DeclarationKind::Method, documentation)?;
                 }
                 "type_declaration" => {
-                    self.add_type_declaration(child, documentation)?;
+                    self.add_type_declaration(child, &documentation)?;
                 }
                 "const_declaration" => {
-                    self.add_value_declaration(child, DeclarationKind::Constant, documentation)?;
+                    self.add_value_declaration(child, DeclarationKind::Constant, &documentation)?;
                 }
                 "var_declaration" => {
-                    self.add_value_declaration(child, DeclarationKind::Static, documentation)?;
+                    self.add_value_declaration(child, DeclarationKind::Static, &documentation)?;
                 }
                 _ => {}
             }
@@ -134,13 +131,14 @@ impl Projector<'_> {
             )));
             return Ok(());
         };
-        let Some(surface) = trim_range_end(self.source, item.start_byte()..body.start_byte()) else {
+        let Some(surface) = trim_range_end(self.source, item.start_byte()..body.start_byte())
+        else {
             return Ok(());
         };
 
         let mut semantic_ranges = documentation_ranges(documentation);
         semantic_ranges.push(SemanticRange {
-            range: surface.clone(),
+            range: surface,
             role: SourceComponentRole::Signature,
         });
         let mut type_use_sites = Vec::new();
@@ -196,7 +194,7 @@ impl Projector<'_> {
     fn add_type_declaration(
         &mut self,
         declaration: Node<'_>,
-        declaration_documentation: Vec<Range<usize>>,
+        declaration_documentation: &[Range<usize>],
     ) -> Result<()> {
         let grouped = is_grouped_declaration(declaration);
         let specs = collect_specs(declaration, &["type_spec", "type_alias"], self.source);
@@ -229,7 +227,7 @@ impl Projector<'_> {
             };
             let item = if ungrouped_single { declaration } else { spec };
             let mut semantic_ranges = if ungrouped_single {
-                documentation_ranges(declaration_documentation.clone())
+                documentation_ranges(declaration_documentation.iter().cloned())
             } else {
                 documentation_ranges(entry.documentation)
             };
@@ -297,7 +295,7 @@ impl Projector<'_> {
         &mut self,
         declaration: Node<'_>,
         kind: DeclarationKind,
-        declaration_documentation: Vec<Range<usize>>,
+        declaration_documentation: &[Range<usize>],
     ) -> Result<()> {
         let spec_kind = if kind == DeclarationKind::Constant {
             "const_spec"
@@ -322,7 +320,7 @@ impl Projector<'_> {
             }
             let item = if ungrouped_single { declaration } else { spec };
             let mut semantic_ranges = if ungrouped_single {
-                documentation_ranges(declaration_documentation.clone())
+                documentation_ranges(declaration_documentation.iter().cloned())
             } else {
                 documentation_ranges(entry.documentation)
             };
@@ -385,9 +383,8 @@ impl Projector<'_> {
             .context("Go declaration name was not on UTF-8 boundaries")?
             .to_owned();
         semantic_ranges.sort_by_key(|semantic| (semantic.range.start, semantic.range.end));
-        semantic_ranges.dedup_by(|left, right| {
-            left.range == right.range && left.role == right.role
-        });
+        semantic_ranges
+            .dedup_by(|left, right| left.range == right.range && left.role == right.role);
         let Some(projected_surface) = semantic_ranges
             .iter()
             .filter(|semantic| semantic.role != SourceComponentRole::Documentation)
@@ -429,13 +426,7 @@ impl Projector<'_> {
             source_span.start,
             &projection_hash,
         );
-        let key = declaration_key(
-            Language::Go,
-            kind,
-            &name,
-            parent_name,
-            &projection_text,
-        );
+        let key = declaration_key(Language::Go, kind, &name, parent_name, &projection_text);
         let visibility = go_visibility(&name);
         self.declarations.push(DeclarationNode {
             id: id.clone(),
@@ -457,7 +448,7 @@ impl Projector<'_> {
     }
 }
 
-fn documentation_ranges(ranges: Vec<Range<usize>>) -> Vec<SemanticRange> {
+fn documentation_ranges(ranges: impl IntoIterator<Item = Range<usize>>) -> Vec<SemanticRange> {
     ranges
         .into_iter()
         .map(|range| SemanticRange {
@@ -609,16 +600,13 @@ fn build_components(
     semantic_ranges: &[SemanticRange],
     comments: &[CommentRange],
 ) -> Result<Vec<SourceComponent>> {
-    let Some(surface_start) = semantic_ranges.iter().map(|semantic| semantic.range.start).min()
+    let Some(surface) = semantic_ranges
+        .iter()
+        .map(|semantic| semantic.range.clone())
+        .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
     else {
         return Ok(Vec::new());
     };
-    let surface_end = semantic_ranges
-        .iter()
-        .map(|semantic| semantic.range.end)
-        .max()
-        .expect("a minimum semantic range implies a maximum");
-    let surface = surface_start..surface_end;
     let documentation = semantic_ranges
         .iter()
         .filter(|semantic| semantic.role == SourceComponentRole::Documentation)
@@ -627,7 +615,7 @@ fn build_components(
     let excluded = comments
         .iter()
         .filter(|comment| {
-            !documentation.iter().any(|range| *range == comment.raw)
+            !documentation.contains(&comment.raw)
                 && comment.exclusion.start < surface.end
                 && comment.exclusion.end > surface.start
         })
@@ -754,7 +742,8 @@ fn first_type_identifier(node: Node<'_>) -> Option<Node<'_>> {
         return Some(node);
     }
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).find_map(first_type_identifier)
+    node.named_children(&mut cursor)
+        .find_map(first_type_identifier)
 }
 
 fn collect_type_identifiers(
@@ -812,12 +801,7 @@ fn collect_interface_type_uses(
         match member.kind() {
             "method_elem" => {
                 if let Some(parameters) = member.child_by_field_name("parameters") {
-                    collect_type_identifiers(
-                        parameters,
-                        source,
-                        TypeUseRole::Parameter,
-                        sites,
-                    )?;
+                    collect_type_identifiers(parameters, source, TypeUseRole::Parameter, sites)?;
                 }
                 if let Some(result) = member.child_by_field_name("result") {
                     collect_type_identifiers(result, source, TypeUseRole::Return, sites)?;

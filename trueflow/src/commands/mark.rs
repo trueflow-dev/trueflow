@@ -78,6 +78,49 @@ pub fn build_structured_record(request: StructuredMarkRequest) -> Result<Record>
     Ok(record)
 }
 
+pub(crate) fn structured_identity_from_workdir() -> Identity {
+    let config = runtime_config_from_git_config(vcs::git_config_from_workdir().ok());
+    Identity::Email {
+        email: config.email,
+    }
+}
+
+pub(crate) fn append_structured_record(record: &Record) -> Result<()> {
+    append_structured_record_with_signing_mode(record, SigningMode::Interactive)
+}
+
+pub(crate) fn append_structured_record_with_noninteractive_signing(record: &Record) -> Result<()> {
+    append_structured_record_with_signing_mode(record, SigningMode::NonInteractive)
+}
+
+fn append_structured_record_with_signing_mode(
+    record: &Record,
+    signing_mode: SigningMode,
+) -> Result<()> {
+    record.validate()?;
+    let runtime_config = runtime_config_from_git_config(vcs::git_config_from_workdir().ok());
+    let mut record = record.clone();
+    if let Some(signing_key) = runtime_config.signing_key.as_deref() {
+        let gpg = GpgClient::new();
+        let payload = record.signing_payload()?;
+        let signature = with_noninteractive_signing_context(
+            gpg.sign_detached(&payload, Some(signing_key), signing_mode),
+            signing_mode,
+        )?;
+        let public_key = with_noninteractive_signing_context(
+            gpg.export_public_key(Some(signing_key)),
+            signing_mode,
+        )?;
+        record.attestations = Some(vec![Attestation {
+            kind: AttestationKind::Pgp,
+            canonicalization: Canonicalization::JcsV1,
+            signature,
+            public_key,
+        }]);
+    }
+    FileStore::new()?.append(&record)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalSuspendRequirement {
     NotRequired,

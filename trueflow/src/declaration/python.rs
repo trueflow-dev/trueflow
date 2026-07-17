@@ -91,7 +91,9 @@ impl Projector<'_> {
             self.omitted("callable", function.start_byte(), "it has no declared name");
             return Ok(None);
         };
-        let name = self.node_text(name_node, "Python callable name")?.to_owned();
+        let name = self
+            .node_text(name_node, "Python callable name")?
+            .to_owned();
         let Some(header) = definition_header_range(function) else {
             self.omitted_named("callable", &name, "its terminating colon is missing");
             return Ok(None);
@@ -189,8 +191,7 @@ impl Projector<'_> {
             return Ok(None);
         }
         semantic.retain(|component| {
-            component.range == header
-                || !has_syntax_error_in_range(class, &component.range)
+            component.range == header || !has_syntax_error_in_range(class, &component.range)
         });
         let components = build_sparse_components(self.source, &semantic)?;
         let type_use_sites = class_type_uses(class, self.source, &semantic)?;
@@ -330,7 +331,6 @@ impl Projector<'_> {
             }
         }
     }
-
 
     #[allow(clippy::too_many_arguments)]
     fn push_declaration(
@@ -480,9 +480,7 @@ fn is_docstring_statement(statement: Node<'_>, source: &str) -> bool {
 }
 
 fn is_unicode_string_expression(expression: Node<'_>, source: &str) -> bool {
-    if expression.kind() == "parenthesized_expression"
-        && expression.named_child_count() == 1
-    {
+    if expression.kind() == "parenthesized_expression" && expression.named_child_count() == 1 {
         return expression
             .named_child(0)
             .is_some_and(|inner| is_unicode_string_expression(inner, source));
@@ -501,9 +499,7 @@ fn is_unicode_string_expression(expression: Node<'_>, source: &str) -> bool {
     let Some(text) = source.get(expression.byte_range()) else {
         return false;
     };
-    let prefix_end = text
-        .find(['\'', '"'])
-        .unwrap_or(text.len());
+    let prefix_end = text.find(['\'', '"']).unwrap_or(text.len());
     !text[..prefix_end]
         .bytes()
         .any(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'f'))
@@ -549,11 +545,7 @@ fn is_attribute_target(node: Node<'_>) -> bool {
     !children.is_empty() && children.into_iter().all(is_attribute_target)
 }
 
-fn is_signature_only_property(
-    function: Node<'_>,
-    decorators: &[Node<'_>],
-    source: &str,
-) -> bool {
+fn is_signature_only_property(function: Node<'_>, decorators: &[Node<'_>], source: &str) -> bool {
     let property = decorators.iter().any(|decorator| {
         decorator_name(*decorator, source).is_some_and(|name| {
             name == "property"
@@ -630,12 +622,11 @@ fn build_sparse_components(
     let mut components = Vec::new();
     let mut previous_end = None;
     for semantic in semantic_ranges {
-        if let Some(end) = previous_end {
-            if end < semantic.range.start {
-                if let Some(layout) = sparse_layout_range(source, end..semantic.range.start) {
-                    push_component(source, &mut components, SourceComponentRole::Layout, layout)?;
-                }
-            }
+        if let Some(end) = previous_end
+            && end < semantic.range.start
+            && let Some(layout) = sparse_layout_range(source, end..semantic.range.start)
+        {
+            push_component(source, &mut components, SourceComponentRole::Layout, layout)?;
         }
         push_component(
             source,
@@ -659,15 +650,12 @@ fn sparse_layout_range(source: &str, gap: Range<usize>) -> Option<Range<usize>> 
         .iter()
         .rposition(|byte| matches!(*byte, b'\n' | b';'))?;
     let mut start = gap.start + separator;
-    if bytes.get(start) == Some(&b'\n') && start > gap.start && bytes.get(start - 1) == Some(&b'\r') {
+    if bytes.get(start) == Some(&b'\n') && start > gap.start && bytes.get(start - 1) == Some(&b'\r')
+    {
         start -= 1;
     }
     let suffix = source.get(start..gap.end)?;
-    let rest = if suffix.starts_with("\r\n") {
-        &suffix[2..]
-    } else {
-        &suffix[1..]
-    };
+    let rest = suffix.strip_prefix("\r\n").unwrap_or(&suffix[1..]);
     rest.chars()
         .all(char::is_whitespace)
         .then_some(start..gap.end)
@@ -704,7 +692,8 @@ fn callable_type_uses(function: Node<'_>, source: &str) -> Result<Vec<TypeUseSit
         collect_type_parameter_bounds(type_parameters, source, &mut sites)?;
     }
     sites.sort_by_key(|site| site.source_range.start);
-    sites.dedup_by(|left, right| left.source_range == right.source_range && left.role == right.role);
+    sites
+        .dedup_by(|left, right| left.source_range == right.source_range && left.role == right.role);
     Ok(sites)
 }
 
@@ -725,7 +714,8 @@ fn class_type_uses(
         collect_class_owned_types(body, source, semantic, &mut sites)?;
     }
     sites.sort_by_key(|site| site.source_range.start);
-    sites.dedup_by(|left, right| left.source_range == right.source_range && left.role == right.role);
+    sites
+        .dedup_by(|left, right| left.source_range == right.source_range && left.role == right.role);
     Ok(sites)
 }
 
@@ -859,11 +849,10 @@ fn terminal_identifier(node: Node<'_>) -> Option<Node<'_>> {
         return Some(attribute);
     }
     let mut cursor = node.walk();
-    let result = node
-        .named_children(&mut cursor)
+
+    node.named_children(&mut cursor)
         .filter(|child| child.kind() == "identifier")
-        .last();
-    result
+        .last()
 }
 fn has_syntax_error_in_range(node: Node<'_>, range: &Range<usize>) -> bool {
     if (node.is_error() || node.is_missing())
@@ -873,8 +862,7 @@ fn has_syntax_error_in_range(node: Node<'_>, range: &Range<usize>) -> bool {
         return true;
     }
     let mut cursor = node.walk();
-    let found = node
-        .children(&mut cursor)
-        .any(|child| has_syntax_error_in_range(child, range));
-    found
+
+    node.children(&mut cursor)
+        .any(|child| has_syntax_error_in_range(child, range))
 }

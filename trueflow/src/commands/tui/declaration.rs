@@ -4,14 +4,24 @@
 //! display or comment text from the enclosing declaration span, which may include a body.
 
 pub mod graph;
+mod relationship_bridge;
 mod runtime;
+pub(super) mod terminal;
 
+pub use relationship_bridge::{
+    BackgroundRelationshipProvider, DeclarationRelationshipProvider,
+    DeclarationRelationshipRequest, DeclarationRelationshipResults, RelationshipBridge,
+    RelationshipUpdate,
+};
 pub use runtime::{
     DeclarationAppRuntime, DeclarationRecordAppender, PreparedDeclarationLaunch,
     PreparedDeclarationTarget, prepare_declaration_launch,
 };
 
-use std::{collections::{BTreeMap, BTreeSet}, ops::Range};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 use anyhow::{Result, bail, ensure};
 use crossterm::event::KeyCode;
@@ -130,19 +140,42 @@ pub struct DeclarationDocument {
 
 impl DeclarationDocument {
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.snapshot_id.is_empty(), "declaration snapshot id cannot be empty");
-        ensure!(!self.path.is_empty(), "declaration snapshot path cannot be empty");
+        ensure!(
+            !self.snapshot_id.is_empty(),
+            "declaration snapshot id cannot be empty"
+        );
+        ensure!(
+            !self.path.is_empty(),
+            "declaration snapshot path cannot be empty"
+        );
         let mut ids = BTreeSet::new();
         for row in &self.outline_rows {
             ensure!(!row.id.is_empty(), "outline row id cannot be empty");
-            ensure!(ids.insert(row.id.as_str()), "duplicate outline row id {}", row.id);
-            validate_range(&self.exact_source, &row.declaration_range, &row.id, "declaration")?;
+            ensure!(
+                ids.insert(row.id.as_str()),
+                "duplicate outline row id {}",
+                row.id
+            );
+            validate_range(
+                &self.exact_source,
+                &row.declaration_range,
+                &row.id,
+                "declaration",
+            )?;
             validate_range(&self.exact_source, &row.display_range, &row.id, "display")?;
-            ensure!(!row.anchor_ranges.is_empty(), "outline row {} has no source anchors", row.id);
+            ensure!(
+                !row.anchor_ranges.is_empty(),
+                "outline row {} has no source anchors",
+                row.id
+            );
             let mut previous_end = 0;
             for range in &row.anchor_ranges {
                 validate_range(&self.exact_source, range, &row.id, "anchor")?;
-                ensure!(range.start >= previous_end, "outline row {} has unordered/overlapping anchors", row.id);
+                ensure!(
+                    range.start >= previous_end,
+                    "outline row {} has unordered/overlapping anchors",
+                    row.id
+                );
                 previous_end = range.end;
             }
         }
@@ -154,21 +187,40 @@ impl DeclarationDocument {
                 row.review_owner
             );
             if let Some(parent) = &row.parent {
-                ensure!(ids.contains(parent.as_str()), "outline row {} has missing parent {parent}", row.id);
+                ensure!(
+                    ids.contains(parent.as_str()),
+                    "outline row {} has missing parent {parent}",
+                    row.id
+                );
             }
         }
         let mut canonical = BTreeSet::new();
         for id in &self.canonical_order {
-            ensure!(canonical.insert(id.as_str()), "duplicate canonical declaration {id}");
+            ensure!(
+                canonical.insert(id.as_str()),
+                "duplicate canonical declaration {id}"
+            );
             let row = self.outline_rows.iter().find(|row| row.id == *id);
-            ensure!(row.is_some_and(|row| row.review_target), "canonical declaration {id} is not a review target");
+            ensure!(
+                row.is_some_and(|row| row.review_target),
+                "canonical declaration {id} is not a review target"
+            );
         }
-        ensure!(!self.canonical_order.is_empty(), "canonical declaration order cannot be empty");
+        ensure!(
+            !self.canonical_order.is_empty(),
+            "canonical declaration order cannot be empty"
+        );
         if let Some(selection) = &self.initial_outline_selection {
-            ensure!(ids.contains(selection.as_str()), "initial outline selection {selection} does not exist");
+            ensure!(
+                ids.contains(selection.as_str()),
+                "initial outline selection {selection} does not exist"
+            );
         }
         for expanded in &self.initial_expanded {
-            ensure!(ids.contains(expanded.as_str()), "initial expanded row {expanded} does not exist");
+            ensure!(
+                ids.contains(expanded.as_str()),
+                "initial expanded row {expanded} does not exist"
+            );
         }
         for (source_id, state) in &self.relationships {
             ensure!(
@@ -178,20 +230,29 @@ impl DeclarationDocument {
             let mut group_labels = BTreeSet::new();
             let mut relationship_ids = BTreeSet::new();
             for group in state.groups() {
-                ensure!(!group.label.is_empty(), "relationship group label cannot be empty");
+                ensure!(
+                    !group.label.is_empty(),
+                    "relationship group label cannot be empty"
+                );
                 ensure!(
                     group_labels.insert(group.label.as_str()),
                     "duplicate relationship group label {} for {source_id}",
                     group.label
                 );
                 for relationship in &group.relationships {
-                    ensure!(!relationship.id.is_empty(), "relationship id cannot be empty");
+                    ensure!(
+                        !relationship.id.is_empty(),
+                        "relationship id cannot be empty"
+                    );
                     ensure!(
                         relationship_ids.insert(relationship.id.as_str()),
                         "duplicate relationship id {} for {source_id}",
                         relationship.id
                     );
-                    ensure!(!relationship.label.is_empty(), "relationship label cannot be empty");
+                    ensure!(
+                        !relationship.label.is_empty(),
+                        "relationship label cannot be empty"
+                    );
                     if let RelationshipDestination::InReview { declaration_id } =
                         &relationship.destination
                     {
@@ -226,9 +287,18 @@ impl DeclarationDocument {
 }
 
 fn validate_range(source: &str, range: &Range<usize>, id: &str, role: &str) -> Result<()> {
-    ensure!(range.start < range.end, "outline row {id} has an empty {role} range");
-    ensure!(range.end <= source.len(), "outline row {id} has an out-of-bounds {role} range");
-    ensure!(source.is_char_boundary(range.start) && source.is_char_boundary(range.end), "outline row {id} has a non-UTF-8-boundary {role} range");
+    ensure!(
+        range.start < range.end,
+        "outline row {id} has an empty {role} range"
+    );
+    ensure!(
+        range.end <= source.len(),
+        "outline row {id} has an out-of-bounds {role} range"
+    );
+    ensure!(
+        source.is_char_boundary(range.start) && source.is_char_boundary(range.end),
+        "outline row {id} has a non-UTF-8-boundary {role} range"
+    );
     Ok(())
 }
 
@@ -359,6 +429,7 @@ pub struct DeclarationController {
     outline: OutlinePaneState,
     relationships: GraphPaneState,
     comment_draft: Option<String>,
+    rejection_draft: bool,
     back_stack: Vec<NavigationSnapshot>,
     replacement_restore: Option<Box<NavigationSnapshot>>,
     inspected_relationship: Option<String>,
@@ -396,6 +467,7 @@ impl DeclarationController {
             active_declaration,
             active_pane: DeclarationPane::Outline,
             comment_draft: None,
+            rejection_draft: false,
             back_stack: Vec::new(),
             replacement_restore: None,
             inspected_relationship: None,
@@ -424,6 +496,37 @@ impl DeclarationController {
         self.inner_height = inner_height;
     }
 
+    pub fn is_editing(&self) -> bool {
+        self.comment_draft.is_some()
+    }
+
+    pub fn apply_relationship_state(
+        &mut self,
+        declaration_id: &str,
+        state: RelationshipState,
+    ) -> Result<()> {
+        ensure!(
+            self.document
+                .canonical_order
+                .iter()
+                .any(|id| id == declaration_id),
+            "relationship update targets an unknown declaration {declaration_id}"
+        );
+        self.document
+            .relationships
+            .insert(declaration_id.to_owned(), state);
+        if self.active_declaration == declaration_id {
+            let state = self.current_relationship_state();
+            normalize_graph_selection(&mut self.relationships, &state);
+            ensure_graph_selection_visible(
+                &mut self.relationships,
+                &state,
+                usize::from(self.inner_height),
+            );
+        }
+        Ok(())
+    }
+
     pub fn take_actions(&mut self) -> Vec<DeclarationReviewAction> {
         std::mem::take(&mut self.pending_actions)
     }
@@ -435,12 +538,18 @@ impl DeclarationController {
         match key {
             KeyCode::Char('j') | KeyCode::Down => self.move_active_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_active_selection(-1),
-            KeyCode::PageDown => self.move_active_selection(self.inner_height.max(1) as isize),
-            KeyCode::PageUp => self.move_active_selection(-(self.inner_height.max(1) as isize)),
+            KeyCode::PageDown => self.move_active_selection(
+                isize::try_from(self.inner_height.max(1)).unwrap_or(isize::MAX),
+            ),
+            KeyCode::PageUp => self.move_active_selection(
+                -isize::try_from(self.inner_height.max(1)).unwrap_or(isize::MAX),
+            ),
             KeyCode::Home => self.move_to_edge(false),
             KeyCode::End => self.move_to_edge(true),
             KeyCode::Tab | KeyCode::BackTab if self.is_wide() => self.toggle_pane(),
-            KeyCode::Char('o') if !self.is_wide() && self.active_pane == DeclarationPane::Outline => {
+            KeyCode::Char('o')
+                if !self.is_wide() && self.active_pane == DeclarationPane::Outline =>
+            {
                 self.open_relationship_replacement();
             }
             KeyCode::Enter if !self.is_wide() && self.active_pane == DeclarationPane::Outline => {
@@ -483,7 +592,7 @@ impl DeclarationController {
 
     fn render_model_for(&self, inner_width: u16, row_height: u16) -> DeclarationRenderModel {
         let layout = layout_for(inner_width, self.active_pane);
-        let row_height = row_height as usize;
+        let row_height = usize::from(row_height);
         let visible_outline = self.visible_outline_rows();
         let outline_selection = visible_outline
             .iter()
@@ -515,10 +624,7 @@ impl DeclarationController {
         );
         let relationship_status = relationship_state.status_text();
         let graph_active = self.active_pane == DeclarationPane::Relationships;
-        let graph_rows = graph_rows(
-            &relationship_state,
-            &self.relationships.collapsed_groups,
-        );
+        let graph_rows = graph_rows(&relationship_state, &self.relationships.collapsed_groups);
         let graph_selection = self.relationships.selection.as_ref().and_then(|selection| {
             graph_rows
                 .iter()
@@ -588,8 +694,18 @@ impl DeclarationController {
             relationship_status,
             relationship_rows,
             title: format!("Declaration Review · {}", self.document.path),
-            footer: "[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned(),
-            banner: "Declaration Review".to_owned(),
+            footer: match &self.comment_draft {
+                Some(draft) if self.rejection_draft => format!("Reject: {draft}"),
+                Some(draft) => format!("Comment: {draft}"),
+                None => {
+                    "[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned()
+                }
+            },
+            banner: if self.comment_draft.is_some() {
+                "[Enter] submit · [Esc] cancel".to_owned()
+            } else {
+                "Declaration Review".to_owned()
+            },
             active_selections,
             visible_text,
         }
@@ -622,7 +738,7 @@ impl DeclarationController {
         ensure_graph_selection_visible(
             &mut self.relationships,
             &relationship_state,
-            self.inner_height as usize,
+            usize::from(self.inner_height),
         );
     }
 
@@ -644,22 +760,21 @@ impl DeclarationController {
             }
             return;
         };
-        let height = (self.inner_height as usize).max(1);
+        let height = usize::from(self.inner_height).max(1);
         if index < self.outline.scroll {
             self.outline.scroll = index;
         } else if index >= self.outline.scroll.saturating_add(height) {
             self.outline.scroll = index + 1 - height;
         }
-        self.outline.scroll = self
-            .outline
-            .scroll
-            .min(visible_len.saturating_sub(height));
+        self.outline.scroll = self.outline.scroll.min(visible_len.saturating_sub(height));
     }
 
     fn select_outline_index(&mut self, index: usize) {
         let (id, owner) = {
             let visible = self.visible_outline_rows();
-            let Some(row) = visible.get(index) else { return };
+            let Some(row) = visible.get(index) else {
+                return;
+            };
             (row.id.clone(), row.review_owner.clone())
         };
         self.outline.selection = id;
@@ -672,7 +787,11 @@ impl DeclarationController {
         }
         self.ensure_outline_visible();
         let state = self.current_relationship_state();
-        ensure_graph_selection_visible(&mut self.relationships, &state, self.inner_height as usize);
+        ensure_graph_selection_visible(
+            &mut self.relationships,
+            &state,
+            usize::from(self.inner_height),
+        );
     }
 
     fn move_active_selection(&mut self, delta: isize) {
@@ -682,7 +801,7 @@ impl DeclarationController {
                 &mut self.relationships,
                 &state,
                 delta,
-                self.inner_height as usize,
+                usize::from(self.inner_height),
             );
             self.inspected_relationship = None;
             return;
@@ -696,7 +815,7 @@ impl DeclarationController {
             current.saturating_sub(delta.unsigned_abs())
         } else {
             current
-                .saturating_add(delta as usize)
+                .saturating_add(delta.unsigned_abs())
                 .min(visible.len().saturating_sub(1))
         };
         self.select_outline_index(next);
@@ -709,7 +828,7 @@ impl DeclarationController {
                 &mut self.relationships,
                 &state,
                 if end { isize::MAX } else { isize::MIN },
-                self.inner_height as usize,
+                usize::from(self.inner_height),
             );
         } else {
             let index = if end {
@@ -770,10 +889,14 @@ impl DeclarationController {
             return;
         };
         let state = self.current_relationship_state();
-        let Some(relationship) = state.relationship(&id) else { return };
+        let Some(relationship) = state.relationship(&id) else {
+            return;
+        };
         match &relationship.destination {
             RelationshipDestination::InReview { declaration_id } => {
-                let Some(target) = self.document.row(declaration_id) else { return };
+                let Some(target) = self.document.row(declaration_id) else {
+                    return;
+                };
                 let owner = target.review_owner.clone();
                 let selected_id = target.id.clone();
                 self.back_stack.push(self.navigation_snapshot());
@@ -787,7 +910,7 @@ impl DeclarationController {
                 ensure_graph_selection_visible(
                     &mut self.relationships,
                     &target_state,
-                    self.inner_height as usize,
+                    usize::from(self.inner_height),
                 );
             }
             RelationshipDestination::External { .. } | RelationshipDestination::Unresolved => {
@@ -812,7 +935,11 @@ impl DeclarationController {
         self.ensure_outline_visible();
         let state = self.current_relationship_state();
         normalize_graph_selection(&mut self.relationships, &state);
-        ensure_graph_selection_visible(&mut self.relationships, &state, self.inner_height as usize);
+        ensure_graph_selection_visible(
+            &mut self.relationships,
+            &state,
+            usize::from(self.inner_height),
+        );
     }
 
     fn selected_source_row(&self) -> Option<&OutlineRow> {
@@ -826,14 +953,16 @@ impl DeclarationController {
         DeclarationAnchor::new(
             self.document.snapshot_id.clone(),
             self.document.path.clone(),
-            row.anchor_ranges.iter().map(|range| {
-                (range.clone(), self.document.source_text(range).to_owned())
-            }),
+            row.anchor_ranges
+                .iter()
+                .map(|range| (range.clone(), self.document.source_text(range).to_owned())),
         )
     }
 
     fn emit_approval(&mut self) {
-        let Some(row) = self.selected_source_row() else { return };
+        let Some(row) = self.selected_source_row() else {
+            return;
+        };
         let owner_id = row.review_owner.clone();
         let anchor = self.anchor_for_row(row);
         self.pending_actions.push(DeclarationReviewAction {
@@ -846,18 +975,16 @@ impl DeclarationController {
 
     fn open_comment(&mut self) {
         if self.selected_source_row().is_some() {
+            self.rejection_draft = false;
             self.comment_draft = Some(String::new());
         }
     }
+
     fn open_rejection(&mut self) {
-        let Some(row) = self.selected_source_row() else { return };
-        let anchor = self.anchor_for_row(row);
-        self.pending_actions.push(DeclarationReviewAction {
-            kind: DeclarationReviewActionKind::Reject,
-            owner_id: row.review_owner.clone(),
-            comment_body: None,
-            anchor: Some(anchor),
-        });
+        if self.selected_source_row().is_some() {
+            self.rejection_draft = true;
+            self.comment_draft = Some(String::new());
+        }
     }
 
     fn handle_editor_key(&mut self, key: KeyCode) -> Result<()> {
@@ -871,14 +998,23 @@ impl DeclarationController {
                     bail!("comment source row disappeared")
                 };
                 let anchor = self.anchor_for_row(row);
+                let kind = if self.rejection_draft {
+                    DeclarationReviewActionKind::Reject
+                } else {
+                    DeclarationReviewActionKind::Comment
+                };
+                self.rejection_draft = false;
                 self.pending_actions.push(DeclarationReviewAction {
-                    kind: DeclarationReviewActionKind::Comment,
+                    kind,
                     owner_id: row.review_owner.clone(),
                     comment_body: Some(body),
                     anchor: Some(anchor),
                 });
             }
-            KeyCode::Esc => self.comment_draft = None,
+            KeyCode::Esc => {
+                self.comment_draft = None;
+                self.rejection_draft = false;
+            }
             KeyCode::Backspace => {
                 if let Some(draft) = &mut self.comment_draft {
                     draft.pop();
@@ -902,14 +1038,12 @@ impl DeclarationController {
             .document
             .row(&selected)
             .and_then(|row| row.parent.clone())
-        {
-            if let Some(index) = self
+            && let Some(index) = self
                 .visible_outline_rows()
                 .iter()
                 .position(|row| row.id == parent)
-            {
-                self.select_outline_index(index);
-            }
+        {
+            self.select_outline_index(index);
         }
     }
 
@@ -950,13 +1084,15 @@ impl DeclarationController {
         let next = if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs())
         } else {
-            current.saturating_add(delta as usize).min(groups.len() - 1)
+            current
+                .saturating_add(delta.unsigned_abs())
+                .min(groups.len() - 1)
         };
         self.relationships.selection = Some(groups[next].clone());
         ensure_graph_selection_visible(
             &mut self.relationships,
             &state,
-            self.inner_height as usize,
+            usize::from(self.inner_height),
         );
     }
 
@@ -968,9 +1104,21 @@ impl DeclarationController {
     ) -> String {
         let mut lines = vec![format!("Declaration Review · {}", self.document.path)];
         let show_outline = matches!(layout, DeclarationLayout::Split { .. })
-            || matches!(layout, DeclarationLayout::Single { pane: DeclarationPane::Outline, .. });
+            || matches!(
+                layout,
+                DeclarationLayout::Single {
+                    pane: DeclarationPane::Outline,
+                    ..
+                }
+            );
         let show_graph = matches!(layout, DeclarationLayout::Split { .. })
-            || matches!(layout, DeclarationLayout::Single { pane: DeclarationPane::Relationships, .. });
+            || matches!(
+                layout,
+                DeclarationLayout::Single {
+                    pane: DeclarationPane::Relationships,
+                    ..
+                }
+            );
         if show_outline {
             lines.push("OUTLINE".to_owned());
             lines.extend(
@@ -984,9 +1132,15 @@ impl DeclarationController {
             lines.extend(relationship_rows.iter().map(|row| row.text.clone()));
         }
         if let Some(draft) = &self.comment_draft {
-            lines.push(format!("Comment: {draft}"));
+            let label = if self.rejection_draft {
+                "Reject"
+            } else {
+                "Comment"
+            };
+            lines.push(format!("{label}: {draft}"));
         }
-        lines.push("[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned());
+        lines
+            .push("[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned());
         lines.push("Declaration Review".to_owned());
         lines.join("\n")
     }
@@ -1020,7 +1174,7 @@ pub fn layout_for(inner_width: u16, active_pane: DeclarationPane) -> Declaration
         };
     }
     let available = inner_width.saturating_sub(1);
-    let outline_width = ((u32::from(available) * 58) / 100) as u16;
+    let outline_width = u16::try_from((u32::from(available) * 58) / 100).unwrap_or(available);
     DeclarationLayout::Split {
         outline_width,
         divider_width: 1,
@@ -1045,9 +1199,24 @@ pub fn render_declaration_review(
         return;
     }
     let header = Rect::new(area.x, area.y, area.width, 1);
-    let panes = Rect::new(area.x, area.y.saturating_add(1), area.width, area.height - 3);
-    let footer = Rect::new(area.x, area.y.saturating_add(area.height - 2), area.width, 1);
-    let banner = Rect::new(area.x, area.y.saturating_add(area.height - 1), area.width, 1);
+    let panes = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height - 3,
+    );
+    let footer = Rect::new(
+        area.x,
+        area.y.saturating_add(area.height - 2),
+        area.width,
+        1,
+    );
+    let banner = Rect::new(
+        area.x,
+        area.y.saturating_add(area.height - 1),
+        area.width,
+        1,
+    );
     frame.render_widget(
         Paragraph::new(model.title.as_str()).style(
             Style::default()
@@ -1078,16 +1247,30 @@ pub fn render_model(area: Rect, buffer: &mut Buffer, model: &DeclarationRenderMo
         } => {
             let outline = Rect::new(area.x, area.y, outline_width.min(area.width), area.height);
             let divider_x = area.x.saturating_add(outline.width);
-            let divider = Rect::new(divider_x, area.y, divider_width.min(area.width.saturating_sub(outline.width)), area.height);
+            let divider = Rect::new(
+                divider_x,
+                area.y,
+                divider_width.min(area.width.saturating_sub(outline.width)),
+                area.height,
+            );
             let relationship = Rect::new(
                 divider_x.saturating_add(divider.width),
                 area.y,
-                relationship_width.min(area.width.saturating_sub(outline.width).saturating_sub(divider.width)),
+                relationship_width.min(
+                    area.width
+                        .saturating_sub(outline.width)
+                        .saturating_sub(divider.width),
+                ),
                 area.height,
             );
-            render_outline_pane(outline, buffer, &model.outline_rows, true_if_active(model, DeclarationPane::Outline));
+            render_outline_pane(
+                outline,
+                buffer,
+                &model.outline_rows,
+                true_if_active(model, DeclarationPane::Outline),
+            );
             if divider.width > 0 {
-                Paragraph::new(vec![Line::from("│"); area.height as usize])
+                Paragraph::new(vec![Line::from("│"); usize::from(area.height)])
                     .style(Style::default().fg(Color::DarkGray))
                     .render(divider, buffer);
             }
@@ -1099,7 +1282,9 @@ pub fn render_model(area: Rect, buffer: &mut Buffer, model: &DeclarationRenderMo
             );
         }
         DeclarationLayout::Single { pane, .. } => match pane {
-            DeclarationPane::Outline => render_outline_pane(area, buffer, &model.outline_rows, true),
+            DeclarationPane::Outline => {
+                render_outline_pane(area, buffer, &model.outline_rows, true);
+            }
             DeclarationPane::Relationships => {
                 graph::render_relationship_pane(area, buffer, &model.relationship_rows, true);
             }
@@ -1108,9 +1293,11 @@ pub fn render_model(area: Rect, buffer: &mut Buffer, model: &DeclarationRenderMo
 }
 
 fn true_if_active(model: &DeclarationRenderModel, pane: DeclarationPane) -> bool {
-    model.active_selections.first().is_some_and(|selection| selection.pane == pane)
+    model
+        .active_selections
+        .first()
+        .is_some_and(|selection| selection.pane == pane)
 }
-
 
 pub fn render_outline_pane(
     area: Rect,
@@ -1122,9 +1309,13 @@ pub fn render_outline_pane(
         return;
     }
     let heading_style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
     };
     Paragraph::new("OUTLINE")
         .style(heading_style)
@@ -1147,7 +1338,11 @@ pub fn render_outline_pane(
     let lines = rows
         .iter()
         .map(|row| {
-            let row_style = if active && row.selected { selected } else { normal };
+            let row_style = if active && row.selected {
+                selected
+            } else {
+                normal
+            };
             let prefix = if active && row.selected { "> " } else { "  " };
             let indent = "  ".repeat(row.depth);
             Line::from(vec![
@@ -1164,7 +1359,12 @@ pub fn render_outline_pane(
 #[cfg(feature = "tui-test-support")]
 #[doc(hidden)]
 pub mod tui_test_support {
-    use super::*;
+    use super::{
+        BTreeMap, BTreeSet, DeclarationAnchor, DeclarationController, DeclarationDocument,
+        DeclarationLayout, DeclarationRenderModel, DeclarationReviewAction,
+        DeclarationReviewActionKind, DeclarationStateSnapshot, KeyCode, OutlineRow, Relationship,
+        RelationshipDestination, RelationshipGroup, RelationshipState, Result, ensure,
+    };
     pub use super::{DeclarationPane, GraphSelection};
 
     pub type TestOutlineRow = OutlineRow;
@@ -1269,7 +1469,9 @@ pub mod tui_test_support {
             declaration_id: impl Into<String>,
             state: TestRelationshipState,
         ) -> Self {
-            self.document.relationships.insert(declaration_id.into(), state);
+            self.document
+                .relationships
+                .insert(declaration_id.into(), state);
             self
         }
 
@@ -1317,7 +1519,10 @@ pub mod tui_test_support {
         }
 
         pub fn type_text(&mut self, text: &str) -> Result<()> {
-            ensure!(self.controller.comment_draft.is_some(), "comment editor is not open");
+            ensure!(
+                self.controller.comment_draft.is_some(),
+                "comment editor is not open"
+            );
             self.controller.insert_text(text);
             Ok(())
         }

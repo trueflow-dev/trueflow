@@ -2,10 +2,11 @@ use crate::block::BlockKind;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::feedback_export::{
-    FeedbackBlockView, FeedbackCursorReadGuard, FeedbackCursorUpdateGuard, FeedbackEntry,
-    FeedbackQuery, FeedbackSinceFilter, RepoFeedbackContextResolver, collect_feedback_entries,
+    DeclarationFeedbackSource, FeedbackBlockView, FeedbackCursorReadGuard,
+    FeedbackCursorUpdateGuard, FeedbackEntry, FeedbackEntryKind, FeedbackQuery,
+    FeedbackSinceFilter, RepoFeedbackContextResolver, collect_feedback_entries,
     feedback_cursor_path, feedback_since_filter_for_cursor, resolve_allowed_revisions,
-    resolve_since_filter,
+    resolve_declaration_feedback, resolve_since_filter,
 };
 use crate::feedback_since::{FeedbackSinceExpr, ResolvedFeedbackSince as ParsedFeedbackSince};
 use crate::github::{
@@ -25,18 +26,17 @@ use crate::github_delivery::{
     GitHubDeliveryPendingReview, GitHubDeliveryPendingReviewReceipt, GitHubDeliveryTerminalReason,
 };
 use crate::store::{
-    CommentAnchor, CommitId, DiffCommentAnchor, FileStore, Record, RepoRef, ReviewDatabase,
-    ReviewStore, SourceCommentAnchor,
+    BlockState, CommentAnchor, CommitId, DeclarationCommentAnchor, DiffCommentAnchor, FileStore,
+    Record, RepoRef, ReviewDatabase, ReviewStore, SourceCommentAnchor,
 };
 use crate::targets::{
     ResolvedTargets, ReviewContentSource, ReviewPathSelection, ReviewTarget,
     extract_pull_request_target, resolve_targets_with, workdir_prefix_from_git_root,
 };
 use crate::vcs;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use gix::object::tree::EntryKind;
-use serde::ser::{SerializeSeq, Serializer as _};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -147,7 +147,7 @@ pub fn run(_context: &TrueflowContext, params: FeedbackParams<'_>) -> Result<()>
         only,
         exclude,
     })?;
-    render_feedback(format, result.entries)?;
+    render_feedback(format, &result.entries)?;
     write_feedback_cursor_update(result.cursor_update)?;
 
     Ok(())
@@ -300,9 +300,9 @@ fn feedback_changed_selection(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PullRequestFeedbackPlan {
-    draft: GitHubReviewDraft,
-    staged_record_ids: Vec<String>,
+pub struct PullRequestFeedbackPlan {
+    pub draft: GitHubReviewDraft,
+    pub staged_record_ids: Vec<String>,
     staged_comments: Vec<StagedPullRequestComment>,
     skipped: Vec<SkippedPullRequestRecord>,
 }
@@ -317,6 +317,14 @@ struct StagedPullRequestComment {
 struct SkippedPullRequestRecord {
     record_id: String,
     reason: PullRequestFeedbackSkipReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneralDeclarationFeedback {
+    record_id: String,
+    path: crate::repo_path::RepoPath,
+    semantic_key: String,
+    note: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,9 +363,7 @@ impl std::fmt::Display for PullRequestFeedbackSkipReason {
             Self::PathRemappingUnsupported => {
                 "anchor path moved across the pull request in an unsupported or ambiguous way"
             }
-            Self::DeclarationAnchorUnsupported => {
-                "declaration comment delivery is not supported"
-            }
+            Self::DeclarationAnchorUnsupported => "declaration comment delivery is not supported",
         };
         f.write_str(message)
     }
@@ -1348,13 +1354,14 @@ fn filter_pull_request_feedback_records(
         .collect())
 }
 
-fn build_pull_request_feedback_plan(
+pub fn build_pull_request_feedback_plan(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
     records: &[Record],
     excluded_ids: &HashSet<String>,
 ) -> Result<PullRequestFeedbackPlan> {
     let mut staged_comments = Vec::new();
+    let mut general_declaration_feedback = Vec::new();
     let mut skipped = Vec::new();
 
     for record in records {
@@ -1364,13 +1371,37 @@ fn build_pull_request_feedback_plan(
         let Some(note) = record.note.as_ref().filter(|note| !note.trim().is_empty()) else {
             continue;
         };
+
+        if matches!(
+            record.target,
+            crate::store::ReviewTargetRef::Declaration { .. }
+        ) {
+            match map_record_to_github_comment(repo, metadata, record, note)? {
+                Ok(comment) => staged_comments.push(StagedPullRequestComment {
+                    record_id: record.id.clone(),
+                    comment,
+                }),
+                Err(_) => {
+                    let Some(locator) = record.declaration_locator.as_ref() else {
+                        continue;
+                    };
+                    general_declaration_feedback.push(GeneralDeclarationFeedback {
+                        record_id: record.id.clone(),
+                        path: locator.path.clone(),
+                        semantic_key: locator.declaration_key.as_str().to_string(),
+                        note: note.clone(),
+                    });
+                }
+            }
+            continue;
+        }
+
         let Some(record_revision) = record_revision(record) else {
             continue;
         };
         if !pull_request_contains_revision(metadata, record_revision) {
             continue;
         }
-
         match map_record_to_github_comment(repo, metadata, record, note)? {
             Ok(comment) => staged_comments.push(StagedPullRequestComment {
                 record_id: record.id.clone(),
@@ -1391,6 +1422,13 @@ fn build_pull_request_feedback_plan(
             .then(left.comment.body.cmp(&right.comment.body))
             .then(left.record_id.cmp(&right.record_id))
     });
+    general_declaration_feedback.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.semantic_key.cmp(&right.semantic_key))
+            .then(left.record_id.cmp(&right.record_id))
+            .then(left.note.cmp(&right.note))
+    });
     let comments = staged_comments
         .iter()
         .map(|staged| staged.comment.clone())
@@ -1398,13 +1436,23 @@ fn build_pull_request_feedback_plan(
     let mut staged_record_ids = staged_comments
         .iter()
         .map(|staged| staged.record_id.clone())
+        .chain(
+            general_declaration_feedback
+                .iter()
+                .map(|feedback| feedback.record_id.clone()),
+        )
         .collect::<Vec<_>>();
     staged_record_ids.sort();
     staged_record_ids.dedup();
 
     Ok(PullRequestFeedbackPlan {
         draft: GitHubReviewDraft {
-            body: build_pull_request_review_body(metadata, comments.len(), skipped.len()),
+            body: build_pull_request_review_body(
+                metadata,
+                comments.len(),
+                skipped.len(),
+                &general_declaration_feedback,
+            ),
             comments,
         },
         staged_record_ids,
@@ -1430,10 +1478,113 @@ fn map_record_to_github_comment(
         CommentAnchor::Diff(anchor) => {
             map_diff_anchor_to_github_comment(repo, metadata, anchor, note)
         }
-        CommentAnchor::Declaration(_) => Ok(Err(
-            PullRequestFeedbackSkipReason::DeclarationAnchorUnsupported,
-        )),
+        CommentAnchor::Declaration(anchor) => {
+            map_declaration_anchor_to_github_comment(repo, metadata, record, anchor, note)
+        }
     }
+}
+
+fn map_declaration_anchor_to_github_comment(
+    repo: &gix::Repository,
+    metadata: &PullRequestMetadata,
+    record: &Record,
+    anchor: &DeclarationCommentAnchor,
+    note: &str,
+) -> Result<std::result::Result<GitHubInlineComment, PullRequestFeedbackSkipReason>> {
+    if record.block_state != BlockState::Committed || anchor.ranges.len() != 1 {
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::DeclarationAnchorUnsupported,
+        ));
+    }
+    let Some(revision) = record_revision(record) else {
+        return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
+    };
+    if !pull_request_contains_revision(metadata, revision) {
+        return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
+    }
+    let Some(locator) = record.declaration_locator.as_ref() else {
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::DeclarationAnchorUnsupported,
+        ));
+    };
+    let Some(source) = source_blob_in_revision(repo, revision, &locator.path)? else {
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+        ));
+    };
+    let path = Path::new(locator.path.as_str());
+    let language = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(crate::analysis::Language::from_extension)
+        .or_else(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(crate::analysis::Language::from_file_name)
+        })
+        .unwrap_or(crate::analysis::Language::Unknown);
+    let snapshot = crate::declaration::snapshot::SourceSnapshot::new(
+        crate::declaration::snapshot::SnapshotId::new(
+            locator.reviewed_snapshot.snapshot_id.clone(),
+        ),
+        path,
+        language,
+        &source,
+    );
+    let catalog = [DeclarationFeedbackSource::from_snapshot(snapshot)?];
+    if resolve_declaration_feedback(record, &catalog)?.is_none() {
+        return Ok(Err(
+            PullRequestFeedbackSkipReason::DeclarationAnchorUnsupported,
+        ));
+    }
+
+    let range = &anchor.ranges[0];
+    let Some(source_anchor) = declaration_range_source_anchor(
+        revision,
+        &locator.path,
+        &source,
+        range.start_byte,
+        range.end_byte,
+    ) else {
+        return Ok(Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange));
+    };
+    map_source_anchor_to_github_comment(repo, metadata, &source_anchor, note)
+}
+
+fn declaration_range_source_anchor(
+    revision: &CommitId,
+    path: &crate::repo_path::RepoPath,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<SourceCommentAnchor> {
+    if start_byte >= end_byte
+        || end_byte > source.len()
+        || !source.is_char_boundary(start_byte)
+        || !source.is_char_boundary(end_byte)
+    {
+        return None;
+    }
+    let start_line = u32::try_from(
+        source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+    )
+    .ok()?;
+    let last_line = u32::try_from(
+        source[..end_byte - 1]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+    )
+    .ok()?;
+    Some(SourceCommentAnchor {
+        revision: revision.clone(),
+        path: path.clone(),
+        start_line,
+        end_line: last_line.checked_add(1)?,
+    })
 }
 
 fn map_source_anchor_to_github_comment(
@@ -2056,6 +2207,28 @@ fn path_exists_in_revision(
         .is_some())
 }
 
+fn source_blob_in_revision(
+    repo: &gix::Repository,
+    revision: &CommitId,
+    path: &crate::repo_path::RepoPath,
+) -> Result<Option<String>> {
+    let object = repo.rev_parse_single(revision.as_str())?;
+    let commit = object.object()?.peel_to_commit()?;
+    let tree = commit.tree()?;
+    let Some(entry) = tree.lookup_entry_by_path(Path::new(path.as_str()))? else {
+        return Ok(None);
+    };
+    if entry.mode().kind() == EntryKind::Tree {
+        return Ok(None);
+    }
+    let blob = entry.object()?.try_into_blob()?;
+    Ok(Some(
+        std::str::from_utf8(&blob.data)
+            .with_context(|| format!("{} contains invalid UTF-8", path.as_str()))?
+            .to_string(),
+    ))
+}
+
 fn source_blob_line_count_in_revision(
     repo: &gix::Repository,
     revision: &CommitId,
@@ -2110,11 +2283,26 @@ fn build_pull_request_review_body(
     metadata: &PullRequestMetadata,
     staged_comments: usize,
     skipped_comments: usize,
+    general_declaration_feedback: &[GeneralDeclarationFeedback],
 ) -> String {
-    format!(
-        "{TRUEFLOW_PENDING_REVIEW_MARKER}\nGenerated by trueflow for PR #{} at head {}.\nInline comments staged: {}.\nSkipped locally: {}.",
-        metadata.pr.number, metadata.head_sha, staged_comments, skipped_comments
-    )
+    let mut body = format!(
+        "{TRUEFLOW_PENDING_REVIEW_MARKER}\nGenerated by trueflow for PR #{} at head {}.\nInline comments staged: {}.\nGeneral declaration comments staged: {}.\nSkipped locally: {}.",
+        metadata.pr.number,
+        metadata.head_sha,
+        staged_comments,
+        general_declaration_feedback.len(),
+        skipped_comments,
+    );
+    if !general_declaration_feedback.is_empty() {
+        body.push_str("\n\n## General declaration feedback");
+        for feedback in general_declaration_feedback {
+            body.push_str(&format!(
+                "\n\n### `{}`\nPath: `{}`  \nRecord: `{}`\n\n{}",
+                feedback.semantic_key, feedback.path, feedback.record_id, feedback.note,
+            ));
+        }
+    }
+    body
 }
 
 fn print_pull_request_feedback_outcome(
@@ -2235,100 +2423,165 @@ fn is_contiguous(lines: &[u32]) -> bool {
         .all(|pair| pair[1] == pair[0].saturating_add(1))
 }
 
-fn render_feedback(format: FeedbackFormat, entries: Vec<FeedbackEntry>) -> Result<()> {
+fn render_feedback(format: FeedbackFormat, entries: &[FeedbackEntry]) -> Result<()> {
     match format {
-        FeedbackFormat::Json => {
-            print_feedback_json(&entries)?;
-        }
-        FeedbackFormat::Xml => {
-            println!("<trueflow_feedback>");
-
-            let mut current_file_path: Option<String> = None;
-            for entry in entries {
-                let FeedbackEntry {
-                    file_path,
-                    block,
-                    reviews,
-                    ..
-                } = entry;
-                if current_file_path.as_deref() != Some(file_path.as_str()) {
-                    if current_file_path.is_some() {
-                        println!("  </file>");
-                    }
-                    println!("  <file path=\"{}\">", escape_xml(&file_path));
-                    current_file_path = Some(file_path);
-                }
-
-                print_block_xml(&block, &reviews);
-            }
-
-            if current_file_path.is_some() {
-                println!("  </file>");
-            }
-
-            println!("</trueflow_feedback>");
-        }
+        FeedbackFormat::Json => print_feedback_json(entries)?,
+        FeedbackFormat::Xml => print!("{}", feedback_entries_to_xml(entries)?),
     }
-
     Ok(())
 }
 
 fn print_feedback_json(entries: &[FeedbackEntry]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    {
-        let mut serializer = serde_json::Serializer::pretty(&mut stdout);
-        let mut sequence = serializer.serialize_seq(Some(entries.len()))?;
-        for entry in entries {
-            sequence.serialize_element(&feedback_entry_to_json_value(entry))?;
-        }
-        sequence.end()?;
-    }
+    serde_json::to_writer_pretty(&mut stdout, &feedback_entries_to_json_values(entries))?;
     writeln!(stdout)?;
     Ok(())
 }
 
-fn feedback_entries_to_json_values(entries: &[FeedbackEntry]) -> Vec<serde_json::Value> {
+pub fn feedback_entries_to_json_values(entries: &[FeedbackEntry]) -> Vec<serde_json::Value> {
     entries.iter().map(feedback_entry_to_json_value).collect()
 }
 
 fn feedback_entry_to_json_value(entry: &FeedbackEntry) -> serde_json::Value {
-    serde_json::json!({
-        "file": entry.file_path,
-        "block": entry.block,
-        "reviews": entry.reviews,
-        "latest_verdict": entry.latest_verdict,
-    })
+    let mut object = serde_json::Map::new();
+    object.insert("file".to_string(), serde_json::json!(entry.file_path));
+    object.insert("reviews".to_string(), serde_json::json!(entry.reviews));
+    object.insert(
+        "latest_verdict".to_string(),
+        serde_json::json!(entry.latest_verdict),
+    );
+    match entry.kind {
+        FeedbackEntryKind::Block => {
+            object.insert("target".to_string(), serde_json::json!({ "kind": "block" }));
+            if let Some(block) = &entry.block {
+                object.insert("block".to_string(), serde_json::json!(block));
+            }
+        }
+        FeedbackEntryKind::Declaration => {
+            if let Some(declaration) = &entry.declaration {
+                object.insert(
+                    "target".to_string(),
+                    serde_json::json!({
+                        "kind": "declaration",
+                        "semantic_key": declaration.semantic_key,
+                    }),
+                );
+                object.insert("declaration".to_string(), serde_json::json!(declaration));
+            }
+        }
+    }
+    serde_json::Value::Object(object)
 }
 
-fn print_block_xml(block: &FeedbackBlockView, reviews: &[crate::store::Record]) {
-    println!("{}", block_xml_open_tag(block));
-
-    println!("      <context><![CDATA[");
-    if block.content.contains("]]>") {
-        println!("{}", block.content.replace("]]>", "]]]]><![CDATA[>"));
-    } else {
-        println!("{}", block.content);
+pub fn feedback_entries_to_xml(entries: &[FeedbackEntry]) -> Result<String> {
+    let mut xml = String::from("<trueflow_feedback>\n");
+    let mut current_file_path: Option<&str> = None;
+    for entry in entries {
+        if current_file_path != Some(entry.file_path.as_str()) {
+            if current_file_path.is_some() {
+                xml.push_str("  </file>\n");
+            }
+            xml.push_str(&format!(
+                "  <file path=\"{}\">\n",
+                escape_xml(&entry.file_path)
+            ));
+            current_file_path = Some(entry.file_path.as_str());
+        }
+        match entry.kind {
+            FeedbackEntryKind::Block => {
+                let Some(block) = entry.block.as_ref() else {
+                    return Err(anyhow!("block feedback entry is missing its block surface"));
+                };
+                xml.push_str(&block_xml(block, &entry.reviews));
+            }
+            FeedbackEntryKind::Declaration => {
+                let Some(declaration) = entry.declaration.as_ref() else {
+                    return Err(anyhow!(
+                        "declaration feedback entry is missing its declaration surface"
+                    ));
+                };
+                xml.push_str(&declaration_xml(declaration, &entry.reviews));
+            }
+        }
     }
-    println!("]]></context>");
+    if current_file_path.is_some() {
+        xml.push_str("  </file>\n");
+    }
+    xml.push_str("</trueflow_feedback>\n");
+    Ok(xml)
+}
 
-    println!("      <reviews>");
+fn block_xml(block: &FeedbackBlockView, reviews: &[crate::store::Record]) -> String {
+    let mut xml = format!("{}\n", block_xml_open_tag(block));
+    xml.push_str("      <context><![CDATA[\n");
+    xml.push_str(&escape_cdata(&block.content));
+    xml.push_str("\n]]></context>\n");
+    xml.push_str(&reviews_xml(reviews));
+    xml.push_str("    </block>\n");
+    xml
+}
+
+fn declaration_xml(
+    declaration: &crate::feedback_export::ResolvedDeclarationFeedback,
+    reviews: &[crate::store::Record],
+) -> String {
+    let mut xml = format!(
+        "    <declaration target_kind=\"declaration\" semantic_key=\"{}\" path=\"{}\" projection_hash=\"{}\">\n      <ranges>\n",
+        escape_xml(declaration.semantic_key.as_str()),
+        escape_xml(declaration.path.as_str()),
+        escape_xml(declaration.projection_hash.as_str()),
+    );
+    for range in &declaration.ranges {
+        xml.push_str(&format!(
+            "        <range start_byte=\"{}\" end_byte=\"{}\"><![CDATA[{}]]></range>\n",
+            range.start_byte,
+            range.end_byte,
+            escape_cdata(&range.exact_text),
+        ));
+    }
+    xml.push_str("      </ranges>\n      <projection><![CDATA[");
+    xml.push_str(&escape_cdata(&declaration.projection_text));
+    xml.push_str("]]></projection>\n");
+    if let Some(context) = &declaration.context {
+        xml.push_str("      <context><![CDATA[");
+        xml.push_str(&escape_cdata(context));
+        xml.push_str("]]></context>\n");
+    }
+    xml.push_str(&reviews_xml(reviews));
+    xml.push_str("    </declaration>\n");
+    xml
+}
+
+fn reviews_xml(reviews: &[crate::store::Record]) -> String {
+    let mut xml = String::from("      <reviews>\n");
     for review in reviews {
         let author = match &review.identity {
             crate::store::Identity::Email { email, .. } => email,
         };
-        println!(
-            "        <review verdict=\"{}\" author=\"{}\">",
+        xml.push_str(&format!(
+            "        <review verdict=\"{}\" author=\"{}\">\n",
             escape_xml(review.verdict.as_str()),
-            escape_xml(author)
-        );
+            escape_xml(author),
+        ));
         if let Some(note) = &review.note {
-            println!("          <comment>{}</comment>", escape_xml(note));
+            xml.push_str(&format!(
+                "          <comment>{}</comment>\n",
+                escape_xml(note),
+            ));
         }
-        println!("        </review>");
+        xml.push_str("        </review>\n");
     }
-    println!("      </reviews>");
-    println!("    </block>");
+    xml.push_str("      </reviews>\n");
+    xml
+}
+
+fn escape_cdata(s: &str) -> Cow<'_, str> {
+    if s.contains("]]>") {
+        Cow::Owned(s.replace("]]>", "]]]]><![CDATA[>"))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 fn block_xml_open_tag(block: &FeedbackBlockView) -> String {
     let common = format!(
@@ -2564,8 +2817,10 @@ mod tests {
             crate::block::ByteSpan::new(23, 23 + content.len()),
         );
         let entry = FeedbackEntry {
+            kind: FeedbackEntryKind::Block,
             file_path: "src/lib.rs".to_string(),
-            block: FeedbackBlockView::from_canonical_block(&block),
+            block: Some(FeedbackBlockView::from_canonical_block(&block)),
+            declaration: None,
             reviews: Vec::new(),
             latest_verdict: "comment".to_string(),
         };
@@ -2576,7 +2831,7 @@ mod tests {
             value["block"]["end_byte"].as_u64(),
             u64::try_from(23 + content.len()).ok()
         );
-        assert!(block_xml_open_tag(&entry.block).contains("start_byte=\"23\""));
+        assert!(block_xml_open_tag(entry.block.as_ref().unwrap()).contains("start_byte=\"23\""));
     }
 
     #[test]
@@ -2592,8 +2847,10 @@ mod tests {
             byte_span: None,
         };
         let entry = FeedbackEntry {
+            kind: FeedbackEntryKind::Block,
             file_path: "src/lib.rs".to_string(),
-            block,
+            block: Some(block),
+            declaration: None,
             reviews: Vec::new(),
             latest_verdict: "comment".to_string(),
         };
@@ -2601,14 +2858,15 @@ mod tests {
         let value = feedback_entry_to_json_value(&entry);
         assert!(value["block"].get("start_byte").is_none());
         assert!(value["block"].get("end_byte").is_none());
-        assert!(!block_xml_open_tag(&entry.block).contains("start_byte="));
+        assert!(!block_xml_open_tag(entry.block.as_ref().unwrap()).contains("start_byte="));
     }
 
     #[test]
     fn detached_feedback_does_not_fabricate_byte_span() {
         let entry = FeedbackEntry {
+            kind: FeedbackEntryKind::Block,
             file_path: "<unknown>".to_string(),
-            block: FeedbackBlockView {
+            block: Some(FeedbackBlockView {
                 hash: TreeHash::from_content("historical"),
                 content: "[unresolved historical context]".to_string(),
                 kind: BlockKind::Code,
@@ -2617,7 +2875,8 @@ mod tests {
                 start_line: 0,
                 end_line: 1,
                 byte_span: None,
-            },
+            }),
+            declaration: None,
             reviews: Vec::new(),
             latest_verdict: "unreviewed".to_string(),
         };
@@ -2625,7 +2884,7 @@ mod tests {
         let value = feedback_entry_to_json_value(&entry);
         assert!(value["block"].get("start_byte").is_none());
         assert!(value["block"].get("end_byte").is_none());
-        assert!(!block_xml_open_tag(&entry.block).contains("end_byte="));
+        assert!(!block_xml_open_tag(entry.block.as_ref().unwrap()).contains("end_byte="));
     }
 
     #[test]
@@ -4851,6 +5110,7 @@ mod tests {
             comment_scope: None,
             comment_context: None,
             comment_anchor,
+            declaration_locator: None,
             tags: None,
             attestations: None,
         }

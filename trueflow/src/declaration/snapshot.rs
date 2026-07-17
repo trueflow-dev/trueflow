@@ -58,12 +58,7 @@ pub struct SourceSnapshot {
 }
 
 impl SourceSnapshot {
-    pub fn new(
-        id: SnapshotId,
-        path: &Path,
-        language: Language,
-        source: impl AsRef<str>,
-    ) -> Self {
+    pub fn new(id: SnapshotId, path: &Path, language: Language, source: impl AsRef<str>) -> Self {
         let source: Arc<str> = Arc::from(source.as_ref());
         let bytes_hash = BytesHash::from_bytes(source.as_bytes());
         Self {

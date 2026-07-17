@@ -6,18 +6,18 @@ use trueflow::analysis::Language;
 use trueflow::block::BlockKind;
 use trueflow::cli::{Cli, Commands, TuiReviewMode};
 use trueflow::commands::tui::{
-    build_pull_request_launch_queue, resolve_tui_launch, TuiLaunchPayload,
+    TuiLaunchPayload, build_pull_request_launch_queue, resolve_tui_launch,
 };
 use trueflow::config::TrueflowConfig;
-use trueflow::declaration::diff::{diff_declarations, DeclarationDiff};
+use trueflow::declaration::Visibility;
+use trueflow::declaration::diff::{DeclarationDiff, diff_declarations};
 use trueflow::declaration::review::{
-    collect_declaration_review, DeclarationReviewDiffBatch, DeclarationReviewQuery,
-    DeclarationReviewStatus,
+    DeclarationReviewDiffBatch, DeclarationReviewQuery, DeclarationReviewStatus,
+    collect_declaration_review,
 };
 use trueflow::declaration::snapshot::{
     PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId, SourceSnapshot,
 };
-use trueflow::declaration::Visibility;
 use trueflow::github::PullRequestCommit;
 use trueflow::review_scope::ScopePreset;
 use trueflow::store::CommitId;
@@ -124,7 +124,10 @@ fn cli_parses_declaration_mode_and_omission_preserves_configured_blocks() -> Res
     assert!(declarations.trust_lsp_workspace);
 
     let omitted = parse_tui(&["trueflow", "tui"])?;
-    assert_eq!(omitted.mode, None, "clap must preserve the absence of an override");
+    assert_eq!(
+        omitted.mode, None,
+        "clap must preserve the absence of an override"
+    );
 
     let blocks_config = parse_config("[tui]\nmode = \"blocks\"\n")?;
     let launch = resolve_launch(&blocks_config, &omitted)?;
@@ -141,7 +144,7 @@ fn configured_declarations_are_selected_and_cli_mode_overrides_them() -> Result<
 
     let overridden = resolve_launch(
         &config,
-        &parse_tui(&["trueflow", "tui", "--mode", "blocks"] )?,
+        &parse_tui(&["trueflow", "tui", "--mode", "blocks"])?,
     )?;
     assert_eq!(overridden.mode, TuiReviewMode::Blocks);
     Ok(())
@@ -151,16 +154,10 @@ fn configured_declarations_are_selected_and_cli_mode_overrides_them() -> Result<
 fn declaration_mode_rejects_cli_block_filters_with_actionable_errors() -> Result<()> {
     let config = parse_config("[tui]\nmode = \"blocks\"\n")?;
     for (flag, value) in [("--only", "function"), ("--exclude", "comment")] {
-        let parsed = parse_tui(&[
-            "trueflow",
-            "tui",
-            "--mode",
-            "declarations",
-            flag,
-            value,
-        ])?;
-        let error = resolve_launch(&config, &parsed)
-            .expect_err("declaration mode must reject block-only CLI filters");
+        let parsed = parse_tui(&["trueflow", "tui", "--mode", "declarations", flag, value])?;
+        let Err(error) = resolve_launch(&config, &parsed) else {
+            anyhow::bail!("declaration mode must reject block-only CLI filter {flag}");
+        };
         let message = format!("{error:#}");
         assert!(
             message.contains(flag) && message.contains("declaration"),
@@ -245,9 +242,7 @@ fn unsupported_language_and_fully_reviewed_are_distinct_empty_states() -> Result
         Language::Rust,
         "pub fn reviewed(value: u8) -> u8 { value }\n",
     )])?;
-    let initial = collect_declaration_review(
-        &launch.declaration_query(vec![supported.clone()])?,
-    )?;
+    let initial = collect_declaration_review(&launch.declaration_query(vec![supported.clone()])?)?;
     assert_eq!(initial.status, DeclarationReviewStatus::Ready);
     let reviewed_ids = initial
         .items
@@ -259,11 +254,16 @@ fn unsupported_language_and_fully_reviewed_are_distinct_empty_states() -> Result
         .with_reviewed_target_ids(reviewed_ids);
     let fully_reviewed = collect_declaration_review(&reviewed_query)?;
     assert!(fully_reviewed.items.is_empty());
-    assert_eq!(fully_reviewed.status, DeclarationReviewStatus::FullyReviewed);
+    assert_eq!(
+        fully_reviewed.status,
+        DeclarationReviewStatus::FullyReviewed
+    );
     Ok(())
 }
 
-fn declaration_for_unit(unit: &mut trueflow::declaration::diff::DeclarationDiffUnit) -> &mut trueflow::declaration::DeclarationNode {
+fn declaration_for_unit(
+    unit: &mut trueflow::declaration::diff::DeclarationDiffUnit,
+) -> &mut trueflow::declaration::DeclarationNode {
     match (&mut unit.head, &mut unit.base) {
         (Some(head), _) => head,
         (None, Some(base)) => base,
@@ -345,18 +345,26 @@ fn canonical_order_is_stable_by_pair_path_source_kind_and_ordinal() -> Result<()
             .collect::<Vec<_>>()
     };
     let ordered = identity(&forward);
-    assert_eq!(ordered, identity(&reverse), "input permutations must not alter review order");
+    assert_eq!(
+        ordered,
+        identity(&reverse),
+        "input permutations must not alter review order"
+    );
 
     let first_commit_end = ordered
         .iter()
         .position(|(pair, _, _)| pair == "commit-two")
         .context("missing second comparison pair")?;
-    assert!(ordered[..first_commit_end]
-        .iter()
-        .all(|(pair, _, _)| pair == "commit-one"));
-    assert!(ordered[..first_commit_end]
-        .windows(2)
-        .all(|window| window[0].1 <= window[1].1));
+    assert!(
+        ordered[..first_commit_end]
+            .iter()
+            .all(|(pair, _, _)| pair == "commit-one")
+    );
+    assert!(
+        ordered[..first_commit_end]
+            .windows(2)
+            .all(|window| window[0].1 <= window[1].1)
+    );
 
     let source_first = ordered
         .iter()

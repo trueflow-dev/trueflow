@@ -1,6 +1,6 @@
 # Declaration Review mode
 
-Status: proposed
+Status: implemented
 Date: 2026-07-17
 
 ## Decision
@@ -23,9 +23,9 @@ Do not call it “Spec Review” in the product. Signatures, documentation, and 
 5. The TUI uses a dedicated relationship graph pane: persistent on wide terminals, full-pane replacement on narrow terminals.
 6. Relationship edges are advisory context. They are never review targets, never affect declaration hashes, and never change canonical review order.
 
-## Current constraints
+## Baseline constraints
 
-Trueflow has useful pieces, but not this abstraction yet:
+At the start of implementation, Trueflow had useful pieces but not this abstraction:
 
 - `BlockKind` already distinguishes functions, methods, signatures, structs, enums, classes, interfaces, types, constants, and related forms.
 - `sub_splitter` can derive function-signature review units for many languages, but its output is optimized for ordinary review, may keep short functions whole, and is not a normalized declaration API.

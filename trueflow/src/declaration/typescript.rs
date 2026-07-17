@@ -61,12 +61,7 @@ pub(super) fn project(
 
     let mut comments = Vec::new();
     let mut decorators = Vec::new();
-    collect_syntax_ranges(
-        tree.root_node(),
-        source,
-        &mut comments,
-        &mut decorators,
-    );
+    collect_syntax_ranges(tree.root_node(), source, &mut comments, &mut decorators);
     let mut projector = Projector {
         path,
         source,
@@ -110,16 +105,16 @@ impl Projector<'_> {
                         item.outer,
                         item.declaration,
                         item.kind,
-                        documentation,
+                        &documentation,
                         None,
                         None,
                     )?;
                 }
                 DeclarationKind::Class | DeclarationKind::Interface => {
-                    self.add_class_like(item, documentation)?;
+                    self.add_class_like(item, &documentation)?;
                 }
                 DeclarationKind::TypeAlias | DeclarationKind::Enum => {
-                    self.add_contiguous_aggregate(item, documentation)?;
+                    self.add_contiguous_aggregate(item, &documentation)?;
                 }
                 _ => {}
             }
@@ -130,7 +125,7 @@ impl Projector<'_> {
     fn add_class_like(
         &mut self,
         item: TopLevelItem<'_>,
-        documentation: Vec<Range<usize>>,
+        documentation: &[Range<usize>],
     ) -> Result<()> {
         let Some(body) = item.declaration.child_by_field_name("body") else {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
@@ -163,7 +158,7 @@ impl Projector<'_> {
             range: item.outer.start_byte()..header_end,
             role: SourceComponentRole::AggregateShape,
         });
-        add_documentation_semantics(&mut semantics, &documentation);
+        add_documentation_semantics(&mut semantics, documentation);
 
         let mut callables = Vec::<MemberCallable<'_>>::new();
         let mut pending_documentation = Vec::new();
@@ -278,7 +273,7 @@ impl Projector<'_> {
             None,
             source_start..item.outer.end_byte(),
             components,
-            overload_discriminator,
+            &overload_discriminator,
         )?;
 
         let children_start = self.declarations.len();
@@ -288,7 +283,7 @@ impl Projector<'_> {
                 callable.item,
                 callable.item,
                 callable_kind,
-                callable.documentation,
+                &callable.documentation,
                 Some(id.clone()),
                 Some(&name),
             )?;
@@ -303,7 +298,7 @@ impl Projector<'_> {
     fn add_contiguous_aggregate(
         &mut self,
         item: TopLevelItem<'_>,
-        documentation: Vec<Range<usize>>,
+        documentation: &[Range<usize>],
     ) -> Result<()> {
         let Some(name_node) = item.declaration.child_by_field_name("name") else {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
@@ -319,8 +314,9 @@ impl Projector<'_> {
         let surface_start = documentation
             .first()
             .map_or(item.outer.start_byte(), |range| range.start);
-        let includes = vec![surface_start..item.outer.end_byte()];
-        if has_syntax_error_in_ranges(item.outer, &includes) {
+        let include = surface_start..item.outer.end_byte();
+        let includes = std::slice::from_ref(&include);
+        if has_syntax_error_in_ranges(item.outer, includes) {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
                 "omitted TypeScript {:?} {name} because its projected surface contains a syntax error",
                 item.kind
@@ -336,10 +332,10 @@ impl Projector<'_> {
             range: item.outer.byte_range(),
             role,
         }];
-        add_documentation_semantics(&mut semantics, &documentation);
+        add_documentation_semantics(&mut semantics, documentation);
         let components = build_components(
             self.source,
-            &includes,
+            includes,
             &semantics,
             &self.comments,
             &self.decorators,
@@ -355,7 +351,7 @@ impl Projector<'_> {
             None,
             surface_start..item.outer.end_byte(),
             components,
-            overload_discriminator,
+            &overload_discriminator,
         )?;
         Ok(())
     }
@@ -366,7 +362,7 @@ impl Projector<'_> {
         outer: Node<'_>,
         declaration: Node<'_>,
         kind: DeclarationKind,
-        documentation: Vec<Range<usize>>,
+        documentation: &[Range<usize>],
         parent_id: Option<DeclarationId>,
         parent_name: Option<&str>,
     ) -> Result<()> {
@@ -380,7 +376,10 @@ impl Projector<'_> {
                     name_node.byte_range(),
                 )
             } else {
-                ("constructor".to_owned(), declaration.start_byte()..declaration.start_byte())
+                (
+                    "constructor".to_owned(),
+                    declaration.start_byte()..declaration.start_byte(),
+                )
             }
         } else {
             let Some(name_node) = name_node else {
@@ -408,8 +407,9 @@ impl Projector<'_> {
         let surface_start = documentation
             .first()
             .map_or(outer.start_byte(), |range| range.start);
-        let includes = vec![surface_start..signature_end];
-        if has_syntax_error_in_ranges(outer, &includes) {
+        let include = surface_start..signature_end;
+        let includes = std::slice::from_ref(&include);
+        if has_syntax_error_in_ranges(outer, includes) {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
                 "omitted TypeScript {kind:?} {name} because its projected surface contains a syntax error"
             )));
@@ -419,10 +419,10 @@ impl Projector<'_> {
             range: outer.start_byte()..signature_end,
             role: SourceComponentRole::Signature,
         }];
-        add_documentation_semantics(&mut semantics, &documentation);
+        add_documentation_semantics(&mut semantics, documentation);
         let components = build_components(
             self.source,
-            &includes,
+            includes,
             &semantics,
             &self.comments,
             &self.decorators,
@@ -444,7 +444,7 @@ impl Projector<'_> {
             parent_name,
             source_span,
             components,
-            overload_discriminator,
+            &overload_discriminator,
         )?;
         Ok(())
     }
@@ -461,7 +461,7 @@ impl Projector<'_> {
         parent_name: Option<&str>,
         source_span: Range<usize>,
         components: Vec<SourceComponent>,
-        overload_discriminator: String,
+        overload_discriminator: &str,
     ) -> Result<DeclarationId> {
         if components.is_empty() {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
@@ -489,15 +489,10 @@ impl Projector<'_> {
             kind,
             &name,
             parent_name,
-            &overload_discriminator,
+            overload_discriminator,
         );
-        let type_use_sites = collect_type_use_sites(
-            syntax,
-            self.source,
-            &components,
-            &name_range,
-            kind,
-        )?;
+        let type_use_sites =
+            collect_type_use_sites(syntax, self.source, &components, &name_range, kind)?;
         self.declarations.push(DeclarationNode {
             id: id.clone(),
             key,
@@ -607,9 +602,7 @@ fn field_signature_end(field: Node<'_>, source: &str) -> usize {
     }
     if bytes.get(end - 1) == Some(&b'=') {
         end -= 1;
-        while end > field.start_byte()
-            && bytes.get(end - 1).is_some_and(u8::is_ascii_whitespace)
-        {
+        while end > field.start_byte() && bytes.get(end - 1).is_some_and(u8::is_ascii_whitespace) {
             end -= 1;
         }
     }
@@ -674,10 +667,7 @@ fn member_visibility(member: Node<'_>, source: &str) -> Visibility {
     }
 }
 
-fn add_documentation_semantics(
-    semantics: &mut Vec<SemanticRange>,
-    documentation: &[Range<usize>],
-) {
+fn add_documentation_semantics(semantics: &mut Vec<SemanticRange>, documentation: &[Range<usize>]) {
     semantics.extend(documentation.iter().cloned().map(|range| SemanticRange {
         range,
         role: SourceComponentRole::Documentation,
@@ -838,9 +828,9 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
 
 fn has_syntax_error_in_ranges(node: Node<'_>, ranges: &[Range<usize>]) -> bool {
     if (node.is_error() || node.is_missing())
-        && ranges.iter().any(|range| {
-            node.start_byte() < range.end && node.end_byte() >= range.start
-        })
+        && ranges
+            .iter()
+            .any(|range| node.start_byte() < range.end && node.end_byte() >= range.start)
     {
         return true;
     }

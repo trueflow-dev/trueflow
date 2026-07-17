@@ -4,6 +4,7 @@ use crate::repo_path::RepoPath;
 use crate::store::{Identity, Record, ReviewCheck, ReviewDatabase, ReviewTargetRef, Verdict};
 use crate::sub_splitter::{self, SubSplitSemantics};
 use crate::tree::{Tree, TreeNode, TreeNodeId, TreeNodeKind};
+use anyhow::Context;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -150,10 +151,32 @@ impl<'a> CoverageIndex<'a> {
         };
 
         for (record_index, record) in database.records().iter().enumerate() {
-            if matches!(record.target, ReviewTargetRef::Declaration { .. }) {
-                continue;
-            }
-            match lookups.bind_record(record, options.workdir_prefix.as_deref()) {
+            let binding = match &record.target {
+                ReviewTargetRef::Declaration { .. } => {
+                    record.validate().with_context(|| {
+                        format!("invalid declaration review record {}", record.id)
+                    })?;
+                    continue;
+                }
+                ReviewTargetRef::Block { hash } => {
+                    lookups.bind_block_record(record, hash, options.workdir_prefix.as_deref())
+                }
+                ReviewTargetRef::File { hash } => lookups.bind_path_target_record(
+                    record,
+                    hash,
+                    options.workdir_prefix.as_deref(),
+                    &lookups.file_by_path_hash,
+                    &lookups.file_by_hash,
+                ),
+                ReviewTargetRef::Tree { hash } => lookups.bind_path_target_record(
+                    record,
+                    hash,
+                    options.workdir_prefix.as_deref(),
+                    &lookups.tree_by_path_hash,
+                    &lookups.tree_by_hash,
+                ),
+            };
+            match binding {
                 Ok(binding) => {
                     let facts = coverage
                         .unit_facts
@@ -765,33 +788,6 @@ impl CoverageLookups {
             unit_id.clone(),
         );
         push_lookup(&mut self.block_by_hash, block.hash.clone(), unit_id);
-    }
-
-    fn bind_record(
-        &self,
-        record: &Record,
-        workdir_prefix: Option<&str>,
-    ) -> Result<RecordBinding, RecordBindingFailure> {
-        match &record.target {
-            ReviewTargetRef::Block { hash } => self.bind_block_record(record, hash, workdir_prefix),
-            ReviewTargetRef::File { hash } => self.bind_path_target_record(
-                record,
-                hash,
-                workdir_prefix,
-                &self.file_by_path_hash,
-                &self.file_by_hash,
-            ),
-            ReviewTargetRef::Tree { hash } => self.bind_path_target_record(
-                record,
-                hash,
-                workdir_prefix,
-                &self.tree_by_path_hash,
-                &self.tree_by_hash,
-            ),
-            ReviewTargetRef::Declaration { .. } => {
-                unreachable!("declaration records are filtered before ordinary coverage binding")
-            }
-        }
     }
 
     fn bind_block_record(

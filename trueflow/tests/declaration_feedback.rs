@@ -101,7 +101,11 @@ fn declaration_from_batch(
     let snapshot_id = diff
         .units
         .iter()
-        .find(|unit| unit.head.as_ref().is_some_and(|head| head.id == declaration.id))
+        .find(|unit| {
+            unit.head
+                .as_ref()
+                .is_some_and(|head| head.id == declaration.id)
+        })
         .and_then(|unit| unit.head_snapshot_id.as_ref())
         .context("projected declaration must retain its exact head snapshot")?;
     let snapshot = batch
@@ -114,13 +118,13 @@ fn declaration_from_batch(
     Ok((snapshot, declaration))
 }
 
-fn projected_snapshot(id: &str, path: &str, source: &str) -> Result<(SourceSnapshot, DeclarationNode)> {
-    let snapshot = SourceSnapshot::new(
-        SnapshotId::new(id),
-        Path::new(path),
-        Language::Rust,
-        source,
-    );
+fn projected_snapshot(
+    id: &str,
+    path: &str,
+    source: &str,
+) -> Result<(SourceSnapshot, DeclarationNode)> {
+    let snapshot =
+        SourceSnapshot::new(SnapshotId::new(id), Path::new(path), Language::Rust, source);
     let declaration = project_source(Path::new(path), Language::Rust, source)?
         .declarations()
         .iter()
@@ -248,11 +252,7 @@ fn declaration_json_entry<'a>(entries: &'a [Value], id: &str) -> Result<&'a Valu
 
 #[test]
 fn declaration_comment_json_and_xml_retain_exact_semantic_surface_without_body() -> TestResult {
-    let (snapshot, declaration) = projected_snapshot(
-        "source:exported",
-        PATH,
-        DECLARATION_SOURCE,
-    )?;
+    let (snapshot, declaration) = projected_snapshot("source:exported", PATH, DECLARATION_SOURCE)?;
     let revision = CommitId::new("0123456789abcdef")?;
     let record = declaration_record(
         "declaration-comment",
@@ -282,10 +282,13 @@ fn declaration_comment_json_and_xml_retain_exact_semantic_surface_without_body()
 
     let entries = feedback_entries_to_json_values(std::slice::from_ref(&entry));
     let entry_json = declaration_json_entry(&entries, "declaration-comment")?;
-    assert_eq!(entry_json["target"], json!({
-        "kind": "declaration",
-        "semantic_key": declaration.key.as_str(),
-    }));
+    assert_eq!(
+        entry_json["target"],
+        json!({
+            "kind": "declaration",
+            "semantic_key": declaration.key.as_str(),
+        })
+    );
     assert_eq!(entry_json["declaration"]["path"], PATH);
     assert_eq!(entry_json["declaration"]["ranges"], expected_ranges);
     assert_eq!(
@@ -301,10 +304,7 @@ fn declaration_comment_json_and_xml_retain_exact_semantic_surface_without_body()
 
     let xml = feedback_entries_to_xml(std::slice::from_ref(&entry))?;
     assert!(xml.contains("target_kind=\"declaration\""));
-    assert!(xml.contains(&format!(
-        "semantic_key=\"{}\"",
-        declaration.key.as_str()
-    )));
+    assert!(xml.contains(&format!("semantic_key=\"{}\"", declaration.key.as_str())));
     assert!(xml.contains("path=\"src/lib.rs\""));
     for range in expected_ranges
         .as_array()
@@ -314,11 +314,13 @@ fn declaration_comment_json_and_xml_retain_exact_semantic_surface_without_body()
             "start_byte=\"{}\" end_byte=\"{}\"",
             range["start_byte"], range["end_byte"]
         )));
-        assert!(xml.contains(
-            range["exact_text"]
-                .as_str()
-                .context("range exact_text must be a string")?
-        ));
+        assert!(
+            xml.contains(
+                range["exact_text"]
+                    .as_str()
+                    .context("range exact_text must be a string")?
+            )
+        );
     }
     assert!(xml.contains(&declaration.projection_text));
     assert!(xml.contains("relationship: used by crate::caller"));
@@ -328,11 +330,7 @@ fn declaration_comment_json_and_xml_retain_exact_semantic_surface_without_body()
 
 #[test]
 fn declaration_resolution_requires_exact_snapshot_hash_path_and_valid_anchor() -> TestResult {
-    let (snapshot, declaration) = projected_snapshot(
-        "source:captured",
-        PATH,
-        DECLARATION_SOURCE,
-    )?;
+    let (snapshot, declaration) = projected_snapshot("source:captured", PATH, DECLARATION_SOURCE)?;
     let revision = CommitId::new("0123456789abcdef")?;
     let record = declaration_record(
         "exact-resolution",
@@ -354,8 +352,9 @@ fn declaration_resolution_requires_exact_snapshot_hash_path_and_valid_anchor() -
     );
 
     let mut wrong_snapshot = record.clone();
-    locator_mut(&mut wrong_snapshot)?.reviewed_snapshot.snapshot_id =
-        "source:not-captured".to_string();
+    locator_mut(&mut wrong_snapshot)?
+        .reviewed_snapshot
+        .snapshot_id = "source:not-captured".to_string();
     declaration_anchor_mut(&mut wrong_snapshot)?
         .reviewed_snapshot
         .snapshot_id = "source:not-captured".to_string();
@@ -400,11 +399,7 @@ fn declaration_resolution_requires_exact_snapshot_hash_path_and_valid_anchor() -
 
 #[test]
 fn declaration_resolution_does_not_fall_back_to_ambiguous_equal_projections() -> TestResult {
-    let (captured, declaration) = projected_snapshot(
-        "source:captured",
-        PATH,
-        DECLARATION_SOURCE,
-    )?;
+    let (captured, declaration) = projected_snapshot("source:captured", PATH, DECLARATION_SOURCE)?;
     let revision = CommitId::new("0123456789abcdef")?;
     let mut record = declaration_record(
         "ambiguous-projection",
@@ -419,20 +414,12 @@ fn declaration_resolution_does_not_fall_back_to_ambiguous_equal_projections() ->
         .reviewed_snapshot
         .snapshot_id = "source:missing".to_string();
 
-    let (first, first_declaration) = projected_snapshot(
-        "source:first",
-        PATH,
-        DECLARATION_SOURCE,
-    )?;
-    let (second, second_declaration) = projected_snapshot(
-        "source:second",
-        PATH,
-        DECLARATION_SOURCE,
-    )?;
+    let (first, first_declaration) = projected_snapshot("source:first", PATH, DECLARATION_SOURCE)?;
+    let (second, second_declaration) =
+        projected_snapshot("source:second", PATH, DECLARATION_SOURCE)?;
     assert_eq!(first_declaration.key, second_declaration.key);
     assert_eq!(
-        first_declaration.projection_hash,
-        second_declaration.projection_hash,
+        first_declaration.projection_hash, second_declaration.projection_hash,
         "fixture must contain equal projections"
     );
     let candidates = [
@@ -460,11 +447,8 @@ impl FeedbackContextResolver for CountingOrdinaryResolver {
 
 #[test]
 fn ordinary_feedback_resolver_and_review_index_skip_declaration_records() -> TestResult {
-    let (snapshot, declaration) = projected_snapshot(
-        "source:ordinary-skip",
-        PATH,
-        DECLARATION_SOURCE,
-    )?;
+    let (snapshot, declaration) =
+        projected_snapshot("source:ordinary-skip", PATH, DECLARATION_SOURCE)?;
     let record = declaration_record(
         "declaration-only",
         &CommitId::new("0123456789abcdef")?,
@@ -524,7 +508,10 @@ fn mixed_block_and_declaration_history_exports_each_through_its_own_shape() -> T
     assert_eq!(entries.len(), 2);
     let block_entry = declaration_json_entry(&entries, &block.id)?;
     assert_eq!(block_entry["target"]["kind"], "block");
-    assert_eq!(block_entry["block"]["content"], source);
+    assert_eq!(
+        block_entry["block"]["content"],
+        source.trim_end_matches('\n')
+    );
     assert!(block_entry.get("declaration").is_none());
 
     let declaration_entry = declaration_json_entry(&entries, "mixed-declaration")?;
@@ -598,11 +585,7 @@ fn record_at_source(
         .revisions
         .get(revision_index)
         .context("fixture revision index must exist")?;
-    let (snapshot, declaration) = projected_snapshot(
-        &format!("source:{id}"),
-        PATH,
-        source,
-    )?;
+    let (snapshot, declaration) = projected_snapshot(&format!("source:{id}"), PATH, source)?;
     declaration_record(id, revision, &snapshot, &declaration, selection, note)
 }
 
@@ -627,14 +610,7 @@ fn github_declaration_mapper_inlines_one_exact_added_or_context_anchor() -> Test
 
     for (name, base, head, expected_line, note) in cases {
         let fixture = pull_request_fixture(name, &[base, head])?;
-        let record = record_at_source(
-            &fixture,
-            0,
-            head,
-            AnchorSelection::Signature,
-            name,
-            note,
-        )?;
+        let record = record_at_source(&fixture, 0, head, AnchorSelection::Signature, name, note)?;
         let repo = gix::discover(&fixture.repo.path)?;
         let plan = build_pull_request_feedback_plan(
             &repo,
@@ -652,7 +628,10 @@ fn github_declaration_mapper_inlines_one_exact_added_or_context_anchor() -> Test
         assert_eq!(comment.start_line, None, "{name}");
         assert_eq!(comment.start_side, None, "{name}");
         assert_eq!(comment.body, note, "{name}");
-        assert!(!plan.draft.body.contains(note), "{name} was duplicated as general feedback");
+        assert!(
+            !plan.draft.body.contains(note),
+            "{name} was duplicated as general feedback"
+        );
     }
     Ok(())
 }
@@ -672,7 +651,8 @@ fn github_declaration_mapper_uses_general_feedback_without_inventing_coordinates
         "multi-range declaration note",
     )?;
 
-    let rewritten_source = "/// Converts one value.\npub fn convert(value: u16) -> u16 {\n    value\n}\n";
+    let rewritten_source =
+        "/// Converts one value.\npub fn convert(value: u16) -> u16 {\n    value\n}\n";
     let rewritten = pull_request_fixture(
         "declaration_feedback_github_unmappable",
         &["", DECLARATION_SOURCE, rewritten_source],
@@ -700,7 +680,12 @@ fn github_declaration_mapper_uses_general_feedback_without_inventing_coordinates
     )?;
 
     for (case, fixture, record, note) in [
-        ("multi-range", multi, multi_record, "multi-range declaration note"),
+        (
+            "multi-range",
+            multi,
+            multi_record,
+            "multi-range declaration note",
+        ),
         (
             "unmappable",
             rewritten,
@@ -722,9 +707,15 @@ fn github_declaration_mapper_uses_general_feedback_without_inventing_coordinates
             &HashSet::new(),
         )?;
 
-        assert!(plan.draft.comments.is_empty(), "{case} fabricated an inline coordinate");
+        assert!(
+            plan.draft.comments.is_empty(),
+            "{case} fabricated an inline coordinate"
+        );
         assert_eq!(plan.staged_record_ids, vec![record.id.clone()], "{case}");
-        assert!(plan.draft.body.contains(note), "{case} feedback was dropped");
+        assert!(
+            plan.draft.body.contains(note),
+            "{case} feedback was dropped"
+        );
         let semantic_key = record
             .declaration_locator
             .as_ref()
@@ -743,11 +734,8 @@ fn github_declaration_mapper_uses_general_feedback_without_inventing_coordinates
 
 #[test]
 fn exact_resolution_rejects_same_snapshot_id_with_wrong_source_hash() -> TestResult {
-    let (snapshot, declaration) = projected_snapshot(
-        "source:hash-bound",
-        PATH,
-        DECLARATION_SOURCE,
-    )?;
+    let (snapshot, declaration) =
+        projected_snapshot("source:hash-bound", PATH, DECLARATION_SOURCE)?;
     let record = declaration_record(
         "wrong-source-hash",
         &CommitId::new("0123456789abcdef")?,
@@ -757,13 +745,12 @@ fn exact_resolution_rejects_same_snapshot_id_with_wrong_source_hash() -> TestRes
         "hash-bound note",
     )?;
     let changed_source = DECLARATION_SOURCE.replace("value\n}", "value.saturating_add(1)\n}");
-    let impostor = SourceSnapshot::new(
-        snapshot.id.clone(),
-        Path::new(PATH),
-        Language::Rust,
-        changed_source,
+    let impostor =
+        SourceSnapshot::new(snapshot.id, Path::new(PATH), Language::Rust, changed_source);
+    assert_ne!(
+        impostor.bytes_hash(),
+        &BytesHash::from_bytes(DECLARATION_SOURCE.as_bytes())
     );
-    assert_ne!(impostor.bytes_hash(), &BytesHash::from_bytes(DECLARATION_SOURCE.as_bytes()));
 
     assert!(
         resolve_declaration_feedback(

@@ -79,8 +79,12 @@ where
             Ok(batches)
         }
         ReviewDiffSelection::None => match dirty_changed_paths(&query.path_selection) {
-            Some(changed) => capture_dirty(&repo, &workdir, query, changed, hook).map(|batch| vec![batch]),
-            None => capture_worktree_inventory(&repo, &workdir, query, hook).map(|batch| vec![batch]),
+            Some(changed) => {
+                capture_dirty(&repo, &workdir, query, changed, hook).map(|batch| vec![batch])
+            }
+            None => {
+                capture_worktree_inventory(&repo, &workdir, query, hook).map(|batch| vec![batch])
+            }
         },
     }
 }
@@ -112,7 +116,15 @@ fn capture_immutable_target(
         };
         let base = base_tree
             .as_ref()
-            .map(|tree| snapshot_from_tree(tree, &changed_path.source_location, language, "base", &target_key))
+            .map(|tree| {
+                snapshot_from_tree(
+                    tree,
+                    &changed_path.source_location,
+                    language,
+                    "base",
+                    &target_key,
+                )
+            })
             .transpose()?
             .flatten();
         let head = snapshot_from_tree(
@@ -125,7 +137,12 @@ fn capture_immutable_target(
         if base.is_none() && head.is_none() {
             continue;
         }
-        pairs.push(snapshot_pair(target_key.as_str(), &changed_path, base, head));
+        pairs.push(snapshot_pair(
+            target_key.as_str(),
+            &changed_path,
+            base,
+            head,
+        ));
     }
 
     Ok(CaptureBatch {
@@ -240,7 +257,9 @@ where
     let mut selected = changed
         .iter()
         .filter(|path| changed_pair_selected(&query.path_selection, path))
-        .filter_map(|path| declaration_language(&path.location).map(|language| (path.clone(), language)))
+        .filter_map(|path| {
+            declaration_language(&path.location).map(|language| (path.clone(), language))
+        })
         .collect::<Vec<_>>();
     selected.sort_by(|(left, _), (right, _)| {
         left.location
@@ -270,7 +289,12 @@ where
         if base.is_none() && head_snapshot.is_none() {
             continue;
         }
-        pairs.push(snapshot_pair(&target_key, changed_path, base, head_snapshot));
+        pairs.push(snapshot_pair(
+            &target_key,
+            changed_path,
+            base,
+            head_snapshot,
+        ));
     }
 
     hook()?;
@@ -384,11 +408,17 @@ fn worktree_source_paths(
         let Ok(repo_path) = RepoPath::from_relative_path(relative) else {
             return false;
         };
-        if ignore_prefixes.iter().any(|prefix| repo_path.is_under(prefix)) {
+        if ignore_prefixes
+            .iter()
+            .any(|prefix| repo_path.is_under(prefix))
+        {
             return false;
         }
         !glob_matcher
-            .matched_path_or_any_parents(entry.path(), entry.file_type().is_some_and(|kind| kind.is_dir()))
+            .matched_path_or_any_parents(
+                entry.path(),
+                entry.file_type().is_some_and(|kind| kind.is_dir()),
+            )
             .is_ignore()
     });
 
@@ -458,8 +488,7 @@ fn snapshot_from_worktree(
         return Ok((None, FileFingerprint::from_metadata(before, None)));
     }
     let bytes = fs::read(&absolute).with_context(|| format!("failed to read {}", path.as_str()))?;
-    let after = file_metadata(&absolute)?
-        .ok_or_else(|| anyhow!(CAPTURE_DRIFT_ERROR))?;
+    let after = file_metadata(&absolute)?.ok_or_else(|| anyhow!(CAPTURE_DRIFT_ERROR))?;
     if before != after {
         return Err(anyhow!(CAPTURE_DRIFT_ERROR));
     }
@@ -513,8 +542,10 @@ fn snapshot_pair(
             "{target_key}\0{}\0{}\0{}\0{}",
             changed_path.source_location.as_str(),
             changed_path.location.as_str(),
-            base.as_ref().map_or("missing", |snapshot| snapshot.id.as_str()),
-            head.as_ref().map_or("missing", |snapshot| snapshot.id.as_str())
+            base.as_ref()
+                .map_or("missing", |snapshot| snapshot.id.as_str()),
+            head.as_ref()
+                .map_or("missing", |snapshot| snapshot.id.as_str())
         )
         .as_bytes(),
     );
@@ -632,8 +663,7 @@ fn worktree_path_selected(selection: &ReviewPathSelection, path: &RepoPath) -> b
             |changed| {
                 changed.iter().any(|candidate| {
                     candidate.location == *path
-                        && (files.is_empty()
-                            && dirs.is_empty()
+                        && (files.is_empty() && dirs.is_empty()
                             || explicit_path_selected(files, dirs, &candidate.source_location)
                             || explicit_path_selected(files, dirs, &candidate.location))
                 })
@@ -642,11 +672,7 @@ fn worktree_path_selected(selection: &ReviewPathSelection, path: &RepoPath) -> b
     }
 }
 
-fn explicit_path_selected(
-    files: &HashSet<RepoPath>,
-    dirs: &[RepoPath],
-    path: &RepoPath,
-) -> bool {
+fn explicit_path_selected(files: &HashSet<RepoPath>, dirs: &[RepoPath], path: &RepoPath) -> bool {
     files.contains(path) || dirs.iter().any(|directory| path.is_under(directory))
 }
 

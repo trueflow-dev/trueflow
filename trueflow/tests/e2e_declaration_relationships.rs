@@ -10,19 +10,19 @@ use async_lsp::lsp_types::{
 use serde_json::json;
 use trueflow::analysis::Language;
 use trueflow::declaration::relationships::{
+    DocumentHash, LaunchError, LspServerLauncher, LspServerProfile, PositionEncoding,
+    ProjectedDocument, ProviderError, RelationshipBackend, RelationshipCapability,
+    RelationshipEdge, RelationshipKind, RelationshipLocation, RelationshipMethod,
+    RelationshipOutcome, RelationshipProjectionIndex, RelationshipProvenance, RelationshipRequest,
+    RelationshipRequestKey, RelationshipResult, RelationshipScope, RelationshipState,
+    RelationshipTarget, ServerRequestDecision, SessionState, SourceGeneration, WorkspaceTrust,
     byte_offset_for_lsp_position, execute_relationship_plan, incoming_calls_params,
     lsp_position_for_byte_offset, outgoing_calls_params, plan_used_by, plan_uses_types,
     reconcile_relationship_execution, reconcile_relationship_result, server_request_policy,
-    start_session, DocumentHash, LaunchError, LspServerLauncher, LspServerProfile,
-    PositionEncoding, ProjectedDocument, ProviderError, RelationshipBackend,
-    RelationshipCapability, RelationshipEdge, RelationshipKind, RelationshipLocation,
-    RelationshipMethod, RelationshipOutcome, RelationshipProjectionIndex,
-    RelationshipProvenance, RelationshipRequest, RelationshipRequestKey, RelationshipResult,
-    RelationshipScope, RelationshipState, RelationshipTarget, ServerRequestDecision, SessionState,
-    SourceGeneration, WorkspaceTrust,
+    start_session,
 };
 use trueflow::declaration::{
-    project_source, DeclarationId, DeclarationKey, DeclarationKind, DeclarationNode, TypeUseRole,
+    DeclarationId, DeclarationKey, DeclarationKind, DeclarationNode, TypeUseRole, project_source,
 };
 
 #[test]
@@ -76,7 +76,11 @@ fn common_five_profiles_pin_executable_argv_and_language_id() -> Result<()> {
         let profile = LspServerProfile::for_language(language)
             .with_context(|| format!("missing fixed LSP profile for {language:?}"))?;
         assert_eq!(profile, expected_profile, "wrong profile for {language:?}");
-        assert_eq!(profile.executable(), executable, "wrong executable for {language:?}");
+        assert_eq!(
+            profile.executable(),
+            executable,
+            "wrong executable for {language:?}"
+        );
         assert_eq!(profile.argv(), argv, "wrong argv for {language:?}");
         assert_eq!(
             profile.language_id(language),
@@ -221,23 +225,19 @@ fn negotiated_positions_reject_split_code_points_and_surrogate_pairs() {
         "a byte offset inside 😀 must be rejected"
     );
     assert!(
-        byte_offset_for_lsp_position(SOURCE, Position::new(0, 2), PositionEncoding::Utf8)
-            .is_err(),
+        byte_offset_for_lsp_position(SOURCE, Position::new(0, 2), PositionEncoding::Utf8).is_err(),
         "a UTF-8 code-unit position inside é must be rejected"
     );
     assert!(
-        byte_offset_for_lsp_position(SOURCE, Position::new(0, 3), PositionEncoding::Utf16)
-            .is_err(),
+        byte_offset_for_lsp_position(SOURCE, Position::new(0, 3), PositionEncoding::Utf16).is_err(),
         "a UTF-16 position splitting 😀's surrogate pair must be rejected"
     );
     assert!(
-        byte_offset_for_lsp_position(SOURCE, Position::new(0, 8), PositionEncoding::Utf8)
-            .is_err(),
+        byte_offset_for_lsp_position(SOURCE, Position::new(0, 8), PositionEncoding::Utf8).is_err(),
         "a position past the line ending must be rejected"
     );
     assert!(
-        byte_offset_for_lsp_position(SOURCE, Position::new(2, 0), PositionEncoding::Utf16)
-            .is_err(),
+        byte_offset_for_lsp_position(SOURCE, Position::new(2, 0), PositionEncoding::Utf16).is_err(),
         "a position on a nonexistent line must be rejected"
     );
 }
@@ -340,7 +340,9 @@ fn unsupported_empty_failed_and_partial_relationship_results_remain_distinct() -
             key: key.clone(),
             outcome: RelationshipOutcome::Partial {
                 edges: vec![call_edge()],
-                diagnostics: vec!["one returned location no longer matches the document".to_owned()],
+                diagnostics: vec![
+                    "one returned location no longer matches the document".to_owned(),
+                ],
             },
         },
     );
@@ -505,7 +507,12 @@ fn location_at(
     }
 }
 
-fn resolve_request(method: RelationshipMethod, uri: &Url, line: u32, character: u32) -> RelationshipRequest {
+fn resolve_request(
+    method: RelationshipMethod,
+    uri: &Url,
+    line: u32,
+    character: u32,
+) -> RelationshipRequest {
     RelationshipRequest::Resolve {
         method,
         params: TextDocumentPositionParams {
@@ -535,8 +542,8 @@ fn references_request(
 }
 
 #[test]
-fn uses_types_queries_only_projected_type_tokens_and_reconciles_exact_targets_with_method_provenance(
-) -> Result<()> {
+fn uses_types_queries_only_projected_type_tokens_and_reconciles_exact_targets_with_method_provenance()
+-> Result<()> {
     const SOURCE: &str = concat!(
         "export interface Input {}\n",
         "const sameSpelling = \"Input\";\n",
@@ -549,7 +556,8 @@ fn uses_types_queries_only_projected_type_tokens_and_reconciles_exact_targets_wi
     );
     let uri = Url::parse("file:///review/workspace/src/mapper.ts")?;
     let facts = project_source(Path::new("src/mapper.ts"), Language::TypeScript, SOURCE)?;
-    let input = declaration_named(facts.declarations(), "Input", DeclarationKind::Interface).clone();
+    let input =
+        declaration_named(facts.declarations(), "Input", DeclarationKind::Interface).clone();
     let mapper = declaration_named(facts.declarations(), "map", DeclarationKind::Method).clone();
     let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
     let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
@@ -562,8 +570,16 @@ fn uses_types_queries_only_projected_type_tokens_and_reconciles_exact_targets_wi
             .map(|site| (site.name.as_str(), site.role, site.source_range.clone()))
             .collect::<Vec<_>>(),
         vec![
-            ("Input", TypeUseRole::Parameter, nth_byte_range(SOURCE, "Input", 2)),
-            ("Input", TypeUseRole::Parameter, nth_byte_range(SOURCE, "Input", 3)),
+            (
+                "Input",
+                TypeUseRole::Parameter,
+                nth_byte_range(SOURCE, "Input", 2)
+            ),
+            (
+                "Input",
+                TypeUseRole::Parameter,
+                nth_byte_range(SOURCE, "Input", 3)
+            ),
             (
                 "ExternalType",
                 TypeUseRole::Return,
@@ -704,8 +720,10 @@ fn used_by_keeps_only_declaration_surface_type_references_and_labels_subset_scop
     );
     let uri = Url::parse("file:///review/workspace/src/payload.ts")?;
     let facts = project_source(Path::new("src/payload.ts"), Language::TypeScript, SOURCE)?;
-    let payload = declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
-    let decode = declaration_named(facts.declarations(), "decode", DeclarationKind::Function).clone();
+    let payload =
+        declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
+    let decode =
+        declaration_named(facts.declarations(), "decode", DeclarationKind::Function).clone();
     let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
     let index = RelationshipProjectionIndex::new(RelationshipScope::ProjectedSubset, [document]);
     let plan = plan_used_by(&index, &payload.id, PositionEncoding::Utf16)?;
@@ -772,7 +790,8 @@ fn absent_references_capability_is_unsupported_but_supported_empty_is_complete()
     const SOURCE: &str = "export interface Payload {}\n";
     let uri = Url::parse("file:///review/workspace/src/payload.ts")?;
     let facts = project_source(Path::new("src/payload.ts"), Language::TypeScript, SOURCE)?;
-    let payload = declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
+    let payload =
+        declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
     let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
     let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
     let plan = plan_used_by(&index, &payload.id, PositionEncoding::Utf16)?;

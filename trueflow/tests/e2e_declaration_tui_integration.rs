@@ -17,8 +17,8 @@ use trueflow::repo_path::RepoPath;
 use trueflow::review_scope::ScopePreset;
 use trueflow::scanner::ScanOptions;
 use trueflow::store::{
-    BlockState, CommentAnchor, CommitId, Identity, Record, RepoRef, ReviewCheck, ReviewTargetRef,
-    VcsSystem, Verdict, CURRENT_VERSION,
+    BlockState, CURRENT_VERSION, CommentAnchor, CommitId, Identity, Record, RepoRef, ReviewCheck,
+    ReviewTargetRef, VcsSystem, Verdict,
 };
 use trueflow::targets::{ReviewContentSource, ReviewDiffSelection, ReviewPathSelection};
 use trueflow::vcs::ChangedPath;
@@ -121,7 +121,10 @@ fn head_revision(repo: &TestRepo) -> Result<CommitId> {
 }
 
 fn only_record(mut records: Vec<Record>) -> Result<Record> {
-    ensure!(records.len() == 1, "expected one appended record, got {records:#?}");
+    ensure!(
+        records.len() == 1,
+        "expected one appended record, got {records:#?}"
+    );
     Ok(records.remove(0))
 }
 
@@ -144,7 +147,10 @@ fn prepared_dirty_launch_uses_exact_sources_changed_surfaces_and_global_order() 
         prepared
             .targets()
             .iter()
-            .map(|target| (target.display_path.as_str(), target.declaration.name.as_str()))
+            .map(|target| (
+                target.display_path.as_str(),
+                target.declaration.name.as_str()
+            ))
             .collect::<Vec<_>>(),
         [("src/a.rs", "alpha"), ("src/z.rs", "beta")],
         "body-only stable must be absent and canonical order must span files by path/source"
@@ -159,17 +165,18 @@ fn prepared_dirty_launch_uses_exact_sources_changed_surfaces_and_global_order() 
             .as_slice()
     );
 
-    let runtime = DeclarationAppRuntime::new(
-        prepared,
-        identity(),
-        RecordingAppender::default(),
-        120,
-        20,
-    )?;
+    let runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
     let visible = runtime.visible_text();
     assert!(visible.contains("pub fn alpha(value: u16) -> u16"));
-    assert!(!visible.contains("stable"), "body-only edits became review targets");
-    assert!(!visible.contains(BODY_SENTINEL), "executable body text leaked into the review surface");
+    assert!(
+        !visible.contains("stable"),
+        "body-only edits became review targets"
+    );
+    assert!(
+        !visible.contains(BODY_SENTINEL),
+        "executable body text leaked into the review surface"
+    );
     Ok(())
 }
 
@@ -177,18 +184,26 @@ fn prepared_dirty_launch_uses_exact_sources_changed_surfaces_and_global_order() 
 fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result<()> {
     let (repo, query) = two_file_dirty_repo("declaration_tui_approval_runtime")?;
     let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
-    let approved = prepared.targets().first().context("missing alpha target")?.clone();
-    let successor = prepared.targets().get(1).context("missing beta target")?.declaration.id.clone();
+    let approved = prepared
+        .targets()
+        .first()
+        .context("missing alpha target")?
+        .clone();
+    let successor = prepared
+        .targets()
+        .get(1)
+        .context("missing beta target")?
+        .declaration
+        .id
+        .clone();
     let expected_revision = head_revision(&repo)?;
 
-    let mut runtime = DeclarationAppRuntime::new(
-        prepared,
-        identity(),
-        RecordingAppender::default(),
-        120,
-        20,
-    )?;
-    assert_eq!(runtime.current().map(|target| &target.declaration.id), Some(&approved.declaration.id));
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
+    assert_eq!(
+        runtime.current().map(|target| &target.declaration.id),
+        Some(&approved.declaration.id)
+    );
     runtime.submit(DeclarationReviewActionKind::Approve, None)?;
     assert_eq!(
         runtime.current().map(|target| &target.declaration.id),
@@ -198,28 +213,46 @@ fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result
     let record = only_record(runtime.into_appender().records)?;
 
     assert_eq!(record.version, CURRENT_VERSION);
-    assert_eq!(record.target, ReviewTargetRef::Declaration {
-        hash: approved.declaration.projection_hash.clone(),
-    });
+    assert_eq!(
+        record.target,
+        ReviewTargetRef::Declaration {
+            hash: approved.declaration.projection_hash.clone(),
+        }
+    );
     assert_eq!(record.check, ReviewCheck::declaration());
     assert_eq!(record.verdict, Verdict::Approved);
     assert!(matches!(
         &record.identity,
         Identity::Email { email } if email == "reviewer@example.com"
     ));
-    assert_eq!(record.repo_ref, RepoRef::Vcs {
-        system: VcsSystem::Git,
-        revision: expected_revision,
-    });
+    assert_eq!(
+        record.repo_ref,
+        RepoRef::Vcs {
+            system: VcsSystem::Git,
+            revision: expected_revision,
+        }
+    );
     assert_eq!(record.block_state, BlockState::Uncommitted);
-    let locator = record.declaration_locator.as_ref().context("approval locator")?;
+    let locator = record
+        .declaration_locator
+        .as_ref()
+        .context("approval locator")?;
     assert_eq!(locator.path, approved.display_path);
     assert_eq!(locator.declaration_key, approved.declaration.key);
     assert_eq!(locator.source_ordinal, approved.declaration.source_ordinal);
     assert_eq!(locator.source_span, approved.declaration.source_span);
-    assert_eq!(locator.reviewed_snapshot.snapshot_id, approved.snapshot.id.as_str());
-    assert_eq!(&locator.reviewed_snapshot.content_hash, approved.snapshot.bytes_hash());
-    assert_eq!(locator.projection_hash, approved.declaration.projection_hash);
+    assert_eq!(
+        locator.reviewed_snapshot.snapshot_id,
+        approved.snapshot.id.as_str()
+    );
+    assert_eq!(
+        &locator.reviewed_snapshot.content_hash,
+        approved.snapshot.bytes_hash()
+    );
+    assert_eq!(
+        locator.projection_hash,
+        approved.declaration.projection_hash
+    );
 
     let anchor = match record.comment_anchor.as_ref() {
         Some(CommentAnchor::Declaration(anchor)) => anchor,
@@ -233,7 +266,10 @@ fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result
         assert_eq!(actual.start_byte..actual.end_byte, component.source_range);
         assert_eq!(actual.exact_text, component.text);
         assert_eq!(
-            approved.snapshot.source().get(actual.start_byte..actual.end_byte),
+            approved
+                .snapshot
+                .source()
+                .get(actual.start_byte..actual.end_byte),
             Some(actual.exact_text.as_str())
         );
         assert!(!actual.exact_text.contains(BODY_SENTINEL));
@@ -252,7 +288,13 @@ fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result
     );
 
     let failing_prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
-    let original = failing_prepared.targets().first().context("missing failing target")?.declaration.id.clone();
+    let original = failing_prepared
+        .targets()
+        .first()
+        .context("missing failing target")?
+        .declaration
+        .id
+        .clone();
     let mut failing = DeclarationAppRuntime::new(
         failing_prepared,
         identity(),
@@ -260,11 +302,14 @@ fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result
         120,
         20,
     )?;
-    let error = failing
-        .submit(DeclarationReviewActionKind::Approve, None)
-        .expect_err("injected append failure must surface");
+    let Err(error) = failing.submit(DeclarationReviewActionKind::Approve, None) else {
+        anyhow::bail!("injected append failure must surface");
+    };
     assert!(format!("{error:#}").contains("injected append failure"));
-    assert_eq!(failing.current().map(|target| &target.declaration.id), Some(&original));
+    assert_eq!(
+        failing.current().map(|target| &target.declaration.id),
+        Some(&original)
+    );
     assert_eq!(failing.into_appender().attempts, 1);
     Ok(())
 }
@@ -291,8 +336,20 @@ fn comment_and_rejection_persist_then_remain_reviewable_with_status() -> Result<
 
     for (action, verdict, note, surface_status, visible_marker) in cases {
         let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
-        let first_id = prepared.targets().first().context("missing first target")?.declaration.id.clone();
-        let second_id = prepared.targets().get(1).context("missing successor")?.declaration.id.clone();
+        let first_id = prepared
+            .targets()
+            .first()
+            .context("missing first target")?
+            .declaration
+            .id
+            .clone();
+        let second_id = prepared
+            .targets()
+            .get(1)
+            .context("missing successor")?
+            .declaration
+            .id
+            .clone();
         let mut runtime = DeclarationAppRuntime::new(
             prepared,
             identity(),
@@ -312,7 +369,10 @@ fn comment_and_rejection_persist_then_remain_reviewable_with_status() -> Result<
         record.validate()?;
 
         let reloaded = prepare_declaration_launch(&repo.path, &query, vec![record])?;
-        let current = reloaded.targets().first().context("non-approved target disappeared")?;
+        let current = reloaded
+            .targets()
+            .first()
+            .context("non-approved target disappeared")?;
         assert_eq!(current.declaration.id, first_id);
         assert_eq!(current.latest_verdict.as_ref(), Some(&verdict));
         let owner_row = reloaded
@@ -353,28 +413,27 @@ fn empty_dirty_launches_preserve_explicit_reason_and_finish_without_a_controller
     let body_query = dirty_query(&["src/lib.rs"])?;
     let body = prepare_declaration_launch(&body_repo.path, &body_query, Vec::new())?;
     assert_eq!(body.status(), &CollectionStatus::NoSurfaceChanges);
-    let body_runtime = DeclarationAppRuntime::new(
-        body,
-        identity(),
-        RecordingAppender::default(),
-        100,
-        12,
-    )?;
+    let body_runtime =
+        DeclarationAppRuntime::new(body, identity(), RecordingAppender::default(), 100, 12)?;
     assert_eq!(body_runtime.status(), &CollectionStatus::NoSurfaceChanges);
     assert!(body_runtime.current().is_none());
     assert!(body_runtime.is_finished());
-    assert!(body_runtime.visible_text().contains("No declaration surface changes"));
+    assert!(
+        body_runtime
+            .visible_text()
+            .contains("No declaration surface changes")
+    );
 
     let unsupported_repo = TestRepo::new("declaration_tui_unsupported_empty")?;
     unsupported_repo.write("src/Only.java", "public final class Only {}\n")?;
     unsupported_repo.commit_all("base unsupported source")?;
-    unsupported_repo.write("src/Only.java", "public final class Only { public int id(); }\n")?;
-    let unsupported_query = dirty_query(&["src/Only.java"])?;
-    let unsupported = prepare_declaration_launch(
-        &unsupported_repo.path,
-        &unsupported_query,
-        Vec::new(),
+    unsupported_repo.write(
+        "src/Only.java",
+        "public final class Only { public int id(); }\n",
     )?;
+    let unsupported_query = dirty_query(&["src/Only.java"])?;
+    let unsupported =
+        prepare_declaration_launch(&unsupported_repo.path, &unsupported_query, Vec::new())?;
     assert_eq!(
         unsupported.status(),
         &CollectionStatus::UnsupportedLanguage {

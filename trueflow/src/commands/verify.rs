@@ -151,6 +151,7 @@ mod tests {
             comment_scope: None,
             comment_context: None,
             comment_anchor: None,
+            declaration_locator: None,
             tags: None,
             attestations: None,
         }

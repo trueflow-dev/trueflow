@@ -69,7 +69,7 @@ pub(super) fn project(
         declarations: Vec::new(),
         diagnostics: Vec::new(),
     };
-    projector.collect_scope(tree.root_node(), None, None, Visibility::Public)?;
+    projector.collect_scope(tree.root_node(), None, None, &Visibility::Public)?;
     if tree.root_node().has_error() {
         projector.diagnostics.push(ProjectionDiagnostic::new(
             "C/C++ source contains syntax errors; declarations with errors in projected surfaces were omitted",
@@ -82,9 +82,9 @@ impl Projector<'_> {
     fn collect_scope(
         &mut self,
         scope: Node<'_>,
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_name: Option<&str>,
-        default_visibility: Visibility,
+        default_visibility: &Visibility,
     ) -> Result<()> {
         let mut pending = Vec::<Part>::new();
         let mut cursor = scope.walk();
@@ -95,12 +95,7 @@ impl Projector<'_> {
             }
             if is_preprocessor_container(child.kind()) {
                 pending.clear();
-                self.collect_scope(
-                    child,
-                    parent_id.clone(),
-                    parent_name,
-                    default_visibility.clone(),
-                )?;
+                self.collect_scope(child, parent_id, parent_name, default_visibility)?;
                 continue;
             }
             if child.kind() == "namespace_definition" {
@@ -111,12 +106,21 @@ impl Projector<'_> {
                         .and_then(|node| node_text(node, self.source))
                         .filter(|name| !name.is_empty());
                     let qualified = qualify(parent_name, namespace);
-                    let visibility = if namespace.is_some() {
-                        default_visibility.clone()
+                    if namespace.is_some() {
+                        self.collect_scope(
+                            body,
+                            parent_id,
+                            qualified.as_deref(),
+                            default_visibility,
+                        )?;
                     } else {
-                        Visibility::Private
-                    };
-                    self.collect_scope(body, parent_id.clone(), qualified.as_deref(), visibility)?;
+                        self.collect_scope(
+                            body,
+                            parent_id,
+                            qualified.as_deref(),
+                            &Visibility::Private,
+                        )?;
+                    }
                 }
                 continue;
             }
@@ -129,7 +133,7 @@ impl Projector<'_> {
                         child,
                         specifier,
                         attachments,
-                        parent_id.clone(),
+                        parent_id.cloned(),
                         parent_name,
                         default_visibility.clone(),
                     )?;
@@ -149,7 +153,7 @@ impl Projector<'_> {
                         } else {
                             Vec::new()
                         },
-                        parent_id.clone(),
+                        parent_id.cloned(),
                         parent_name,
                         default_visibility.clone(),
                         false,
@@ -230,13 +234,8 @@ impl Projector<'_> {
             parent_name,
             &projection_text,
         );
-        let type_use_sites = collect_type_use_sites(
-            item,
-            self.source,
-            &components,
-            &name_info.range,
-            kind,
-        )?;
+        let type_use_sites =
+            collect_type_use_sites(item, self.source, &components, &name_info.range, kind)?;
         let aggregate_index = self.declarations.len();
         self.declarations.push(DeclarationNode {
             id: id.clone(),
@@ -262,12 +261,7 @@ impl Projector<'_> {
             } else {
                 Visibility::Public
             };
-            self.collect_member_scope(
-                body,
-                id,
-                &name_info.name,
-                member_visibility,
-            )?;
+            self.collect_member_scope(body, &id, &name_info.name, member_visibility)?;
             self.declarations[aggregate_index].children = self.declarations[children_start..]
                 .iter()
                 .map(|declaration| declaration.id.clone())
@@ -279,7 +273,7 @@ impl Projector<'_> {
     fn collect_member_scope(
         &mut self,
         body: Node<'_>,
-        parent_id: DeclarationId,
+        parent_id: &DeclarationId,
         parent_name: &str,
         mut visibility: Visibility,
     ) -> Result<()> {
@@ -377,7 +371,7 @@ impl Projector<'_> {
             return Ok(());
         };
         attachments.push(Part {
-            range: signature_range.clone(),
+            range: signature_range,
             role: SourceComponentRole::Signature,
         });
         if self.parts_have_errors(item, &attachments) {
@@ -416,13 +410,8 @@ impl Projector<'_> {
             effective_parent,
             &projection_text,
         );
-        let type_use_sites = collect_type_use_sites(
-            item,
-            self.source,
-            &components,
-            &name_info.range,
-            kind,
-        )?;
+        let type_use_sites =
+            collect_type_use_sites(item, self.source, &components, &name_info.range, kind)?;
         self.declarations.push(DeclarationNode {
             id: id.clone(),
             key,
@@ -468,9 +457,10 @@ impl Projector<'_> {
     }
 
     fn expire_detached_docs(&self, next_start: usize, pending: &mut Vec<Part>) {
-        if pending.last().is_some_and(|part| {
-            !immediately_precedes(self.source, part.range.end, next_start)
-        }) {
+        if pending
+            .last()
+            .is_some_and(|part| !immediately_precedes(self.source, part.range.end, next_start))
+        {
             pending.clear();
         }
     }
@@ -570,7 +560,8 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
         }
         previous_end = member_end;
     }
-    let close_start = whitespace_suffix_start(source, previous_end, body.end_byte().saturating_sub(1));
+    let close_start =
+        whitespace_suffix_start(source, previous_end, body.end_byte().saturating_sub(1));
     if close_start < body.end_byte() {
         parts.push(Part {
             range: close_start..body.end_byte(),
@@ -611,19 +602,22 @@ fn field_shape_parts(field: Node<'_>) -> Vec<Part> {
 }
 
 fn collect_initializer_removals(node: Node<'_>, removals: &mut Vec<Range<usize>>) {
-    if node.kind() == "init_declarator" {
-        if let (Some(declarator), Some(value)) = (
+    if node.kind() == "init_declarator"
+        && let (Some(declarator), Some(value)) = (
             node.child_by_field_name("declarator"),
             node.child_by_field_name("value"),
-        ) {
-            removals.push(initializer_removal(declarator.end_byte(), value));
-            return;
-        }
+        )
+    {
+        removals.push(initializer_removal(declarator.end_byte(), value));
+        return;
     }
     let mut cursor = node.walk();
     let mut last_declarator_end = None;
     for (index, child) in node.children(&mut cursor).enumerate() {
-        let field_name = node.field_name_for_child(index as u32);
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
+        let field_name = node.field_name_for_child(index);
         if field_name == Some("declarator") {
             last_declarator_end = Some(child.end_byte());
         }
@@ -641,7 +635,6 @@ fn collect_initializer_removals(node: Node<'_>, removals: &mut Vec<Range<usize>>
 fn initializer_removal(declarator_end: usize, value: Node<'_>) -> Range<usize> {
     declarator_end..value.end_byte()
 }
-
 
 fn callable_signature_range(item: Node<'_>, source: &str) -> Option<Range<usize>> {
     let function = function_node(item).unwrap_or(item);
@@ -872,16 +865,16 @@ fn is_aggregate_declaration(item: Node<'_>, specifier: Node<'_>) -> bool {
 }
 
 fn aggregate_name(item: Node<'_>, specifier: Node<'_>, source: &str) -> Option<NameInfo> {
-    if item.kind() == "type_definition" {
-        if let Some(alias) = item.child_by_field_name("declarator") {
-            let name = terminal_declarator_name(alias)?;
-            let range = name.byte_range();
-            return Some(NameInfo {
-                name: source.get(range.clone())?.to_owned(),
-                range,
-                qualifier: None,
-            });
-        }
+    if item.kind() == "type_definition"
+        && let Some(alias) = item.child_by_field_name("declarator")
+    {
+        let name = terminal_declarator_name(alias)?;
+        let range = name.byte_range();
+        return Some(NameInfo {
+            name: source.get(range.clone())?.to_owned(),
+            range,
+            qualifier: None,
+        });
     }
     let name = specifier.child_by_field_name("name")?;
     let range = name.byte_range();
@@ -980,21 +973,23 @@ fn materialize_components(
     let mut components = Vec::new();
     for pair in boundaries.windows(2) {
         let range = pair[0]..pair[1];
-        let Some(part) = parts.iter().find(|part| {
-            part.range.start <= range.start && part.range.end >= range.end
-        }) else {
+        let Some(part) = parts
+            .iter()
+            .find(|part| part.range.start <= range.start && part.range.end >= range.end)
+        else {
             continue;
         };
         if part.role != SourceComponentRole::Documentation
-            && comments.iter().any(|comment| {
-                comment.range.start < range.end && comment.range.end > range.start
-            })
+            && comments
+                .iter()
+                .any(|comment| comment.range.start < range.end && comment.range.end > range.start)
         {
             continue;
         }
-        let role = if attributes.iter().any(|attribute| {
-            attribute.start <= range.start && attribute.end >= range.end
-        }) {
+        let role = if attributes
+            .iter()
+            .any(|attribute| attribute.start <= range.start && attribute.end >= range.end)
+        {
             SourceComponentRole::Attribute
         } else {
             part.role
@@ -1036,9 +1031,7 @@ fn collect_attribute_ranges(node: Node<'_>, ranges: &mut Vec<Range<usize>>) {
 fn collect_comments(node: Node<'_>, source: &str, comments: &mut Vec<Comment>) {
     if node.kind() == "comment" {
         let range = whole_comment_line(source, node.byte_range());
-        comments.push(Comment {
-            range,
-        });
+        comments.push(Comment { range });
         return;
     }
     let mut cursor = node.walk();
@@ -1050,7 +1043,10 @@ fn collect_comments(node: Node<'_>, source: &str, comments: &mut Vec<Comment>) {
 fn whole_comment_line(source: &str, range: Range<usize>) -> Range<usize> {
     let bytes = source.as_bytes();
     let mut end = range.end;
-    while bytes.get(end).is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+    while bytes
+        .get(end)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
         end += 1;
     }
     if bytes.get(end) == Some(&b'\r') {
@@ -1078,10 +1074,9 @@ fn is_doxygen(text: &str) -> bool {
 }
 
 fn immediately_precedes(source: &str, previous_end: usize, next_start: usize) -> bool {
-    source.get(previous_end..next_start).is_some_and(|gap| {
-        gap.chars()
-            .all(|character| matches!(character, ' ' | '\t'))
-    })
+    source
+        .get(previous_end..next_start)
+        .is_some_and(|gap| gap.chars().all(|character| matches!(character, ' ' | '\t')))
 }
 
 fn whitespace_suffix_start(source: &str, lower: usize, end: usize) -> usize {

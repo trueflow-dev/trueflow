@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::repo_path::RepoPath;
 use crate::store::{
@@ -8,9 +8,9 @@ use crate::store::{
     Verdict,
 };
 
-use super::diff::{DeclarationChangeKind, DeclarationMatch, DeclarationDiffUnit};
+use super::diff::{DeclarationChangeKind, DeclarationDiffUnit, DeclarationMatch};
 use super::review::DeclarationReviewDiffBatch;
-use super::snapshot::{PathPairEvidence, SnapshotPair, SnapshotPairId, SnapshotId, SourceSnapshot};
+use super::snapshot::{PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId, SourceSnapshot};
 use super::{DeclarationId, DeclarationNode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,13 +79,21 @@ impl DeclarationCoverageIndex {
             let ReviewTargetRef::Declaration { hash } = &record.target else {
                 continue;
             };
-            record.validate()?;
+            record
+                .validate()
+                .with_context(|| format!("invalid declaration coverage record {}", record.id))?;
             if record.check.as_str() != ReviewCheck::declaration().as_str() {
-                continue;
+                bail!(
+                    "declaration coverage record {} does not use the declaration review check",
+                    record.id
+                );
             }
-            let Some(locator) = record.declaration_locator.as_ref() else {
-                continue;
-            };
+            let locator = record.declaration_locator.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "declaration coverage record {} has no declaration locator",
+                    record.id
+                )
+            })?;
 
             let tiers = [
                 (
@@ -213,11 +221,7 @@ fn collect_candidates(batches: &[DeclarationReviewDiffBatch]) -> Result<Vec<Cand
         }
 
         for declaration_match in &batch.diff().matches {
-            let pair = resolve_match_pair(
-                batch_index,
-                batch.snapshot_pairs(),
-                declaration_match,
-            )?;
+            let pair = resolve_match_pair(batch_index, batch.snapshot_pairs(), declaration_match)?;
             let head = pair.head.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "declaration match for pair {} has no head snapshot",
@@ -226,7 +230,12 @@ fn collect_candidates(batches: &[DeclarationReviewDiffBatch]) -> Result<Vec<Cand
             })?;
             let mut candidate = candidate_occurrence(pair, head, &declaration_match.head)?;
             if is_conservative_file_rename(pair, declaration_match) {
-                let base = pair.base.as_ref().expect("rename match has a base snapshot");
+                let base = pair.base.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "conservative rename match for pair {} has no base snapshot",
+                        pair.id.as_str()
+                    )
+                })?;
                 candidate
                     .rename_sources
                     .push(locator_for(base, &declaration_match.base)?);
@@ -304,8 +313,11 @@ fn resolve_unit_pair<'a>(
     pairs: &'a [SnapshotPair],
     unit: &DeclarationDiffUnit,
 ) -> Result<&'a SnapshotPair> {
-    resolve_exact_pair(batch_index, pairs, &unit.snapshot_pair_id, |pair| {
-        match unit.change_kind {
+    resolve_exact_pair(
+        batch_index,
+        pairs,
+        &unit.snapshot_pair_id,
+        |pair| match unit.change_kind {
             DeclarationChangeKind::Added => {
                 pair.head.as_ref().map(|snapshot| &snapshot.id) == unit.head_snapshot_id.as_ref()
             }
@@ -317,8 +329,8 @@ fn resolve_unit_pair<'a>(
             DeclarationChangeKind::Deleted => {
                 pair.base.as_ref().map(|snapshot| &snapshot.id) == unit.base_snapshot_id.as_ref()
             }
-        }
-    })
+        },
+    )
 }
 
 fn resolve_match_pair<'a>(

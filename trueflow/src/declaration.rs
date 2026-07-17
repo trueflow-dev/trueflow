@@ -10,9 +10,9 @@ use crate::analysis::Language;
 pub mod capture;
 pub mod coverage;
 pub mod diff;
-pub mod snapshot;
 pub mod relationships;
 pub mod review;
+pub mod snapshot;
 
 mod c_family;
 mod go;
@@ -132,7 +132,9 @@ impl DeclarationId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct DeclarationKey(String);
@@ -147,7 +149,9 @@ impl DeclarationKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct DeclarationProjectionHash(String);
@@ -263,7 +267,11 @@ impl FileDeclarationFacts {
     }
 }
 
-pub fn project_source(path: &Path, language: Language, source: &str) -> Result<FileDeclarationFacts> {
+pub fn project_source(
+    path: &Path,
+    language: Language,
+    source: &str,
+) -> Result<FileDeclarationFacts> {
     let (declarations, diagnostics) = match language {
         Language::Rust => rust::project(path, source)?,
         Language::TypeScript => typescript::project(path, source)?,

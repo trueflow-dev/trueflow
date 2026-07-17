@@ -22,8 +22,8 @@ use crate::store::{
 };
 
 use super::{
-    DeclarationController, DeclarationDocument, DeclarationReviewActionKind,
-    DeclarationReviewStatus, OutlineRow,
+    DeclarationController, DeclarationDocument, DeclarationReviewAction,
+    DeclarationReviewActionKind, DeclarationReviewStatus, OutlineRow, RelationshipState,
 };
 
 /// One collected declaration together with the immutable capture endpoint that produced it.
@@ -183,10 +183,14 @@ fn resolve_target_provenance(
 }
 
 fn build_documents(targets: &[PreparedDeclarationTarget]) -> Result<Vec<DeclarationDocument>> {
-    let mut grouped: BTreeMap<(RepoPath, String), Vec<&PreparedDeclarationTarget>> = BTreeMap::new();
+    let mut grouped: BTreeMap<(RepoPath, String), Vec<&PreparedDeclarationTarget>> =
+        BTreeMap::new();
     for target in targets {
         grouped
-            .entry((target.display_path.clone(), target.snapshot.id.as_str().to_owned()))
+            .entry((
+                target.display_path.clone(),
+                target.snapshot.id.as_str().to_owned(),
+            ))
             .or_default()
             .push(target);
     }
@@ -199,7 +203,11 @@ fn build_documents(targets: &[PreparedDeclarationTarget]) -> Result<Vec<Declarat
                     .source_span
                     .start
                     .cmp(&right.declaration.source_span.start)
-                    .then_with(|| left.declaration.source_ordinal.cmp(&right.declaration.source_ordinal))
+                    .then_with(|| {
+                        left.declaration
+                            .source_ordinal
+                            .cmp(&right.declaration.source_ordinal)
+                    })
                     .then_with(|| left.declaration.id.cmp(&right.declaration.id))
             });
             let first = group.first().context("empty declaration document group")?;
@@ -214,10 +222,13 @@ fn build_documents(targets: &[PreparedDeclarationTarget]) -> Result<Vec<Declarat
                 "declaration document group contains conflicting snapshot sources"
             );
 
-            let mut rows = Vec::with_capacity(group.len());
+            let mut rows = Vec::new();
             let mut canonical_order = Vec::with_capacity(group.len());
+            let mut expanded = std::collections::BTreeSet::new();
+            let mut relationships = BTreeMap::new();
             for target in group {
                 let declaration = &target.declaration;
+                let owner_id = declaration.id.as_str().to_owned();
                 let display_range = display_range(declaration).with_context(|| {
                     format!(
                         "declaration {} has no body-free display component",
@@ -225,7 +236,7 @@ fn build_documents(targets: &[PreparedDeclarationTarget]) -> Result<Vec<Declarat
                     )
                 })?;
                 let mut row = OutlineRow::review_target(
-                    declaration.id.as_str(),
+                    owner_id.clone(),
                     declaration.source_span.clone(),
                     display_range,
                     declaration
@@ -235,8 +246,27 @@ fn build_documents(targets: &[PreparedDeclarationTarget]) -> Result<Vec<Declarat
                         .collect(),
                 );
                 row.status = status_for_verdict(target.latest_verdict.as_ref());
-                canonical_order.push(declaration.id.as_str().to_owned());
+                canonical_order.push(owner_id.clone());
                 rows.push(row);
+                for (index, component) in declaration.components.iter().enumerate() {
+                    if component.role == SourceComponentRole::Layout
+                        || component.text.trim().is_empty()
+                    {
+                        continue;
+                    }
+                    rows.push(OutlineRow::aggregate_component(
+                        format!("{}::{}:{index}", owner_id, component.role.protocol_tag()),
+                        owner_id.clone(),
+                        component.source_range.clone(),
+                    ));
+                }
+                expanded.insert(owner_id.clone());
+                relationships.insert(
+                    owner_id,
+                    RelationshipState::Unavailable {
+                        reason: "relationship provider is not connected for this launch".to_owned(),
+                    },
+                );
             }
 
             let document = DeclarationDocument {
@@ -245,9 +275,9 @@ fn build_documents(targets: &[PreparedDeclarationTarget]) -> Result<Vec<Declarat
                 exact_source: snapshot.source().to_owned(),
                 outline_rows: rows,
                 canonical_order: canonical_order.clone(),
-                relationships: BTreeMap::new(),
+                relationships,
                 initial_outline_selection: canonical_order.first().cloned(),
-                initial_expanded: Default::default(),
+                initial_expanded: expanded,
                 initial_graph_selection: None,
             };
             document.validate()?;
@@ -294,7 +324,12 @@ fn status_for_verdict(verdict: Option<&Verdict>) -> DeclarationReviewStatus {
     }
 }
 
-/// Runtime coordinator that appends a validated V5 record before changing any review state.
+/// Marker used when the terminal owns the persistence boundary so it can suspend itself for GPG.
+pub struct ExternalDeclarationPersistence {
+    _private: (),
+}
+
+/// Runtime coordinator that persists a validated V5 record before changing review state.
 pub struct DeclarationAppRuntime<A> {
     prepared: PreparedDeclarationLaunch,
     identity: Identity,
@@ -305,8 +340,25 @@ pub struct DeclarationAppRuntime<A> {
     inner_height: u16,
 }
 
-impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
-    pub fn new(
+impl DeclarationAppRuntime<ExternalDeclarationPersistence> {
+    pub fn new_with_external_persistence(
+        prepared: PreparedDeclarationLaunch,
+        identity: Identity,
+        inner_width: u16,
+        inner_height: u16,
+    ) -> Result<Self> {
+        Self::initialize(
+            prepared,
+            identity,
+            ExternalDeclarationPersistence { _private: () },
+            inner_width,
+            inner_height,
+        )
+    }
+}
+
+impl<A> DeclarationAppRuntime<A> {
+    fn initialize(
         prepared: PreparedDeclarationLaunch,
         identity: Identity,
         appender: A,
@@ -334,6 +386,18 @@ impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
         self.prepared.targets.get(self.current_index)
     }
 
+    pub fn active_declaration_id(&self) -> Option<&str> {
+        self.current().map(|target| target.declaration.id.as_str())
+    }
+
+    pub fn controller(&self) -> Option<&DeclarationController> {
+        self.controller.as_ref()
+    }
+
+    pub fn controller_mut(&mut self) -> Option<&mut DeclarationController> {
+        self.controller.as_mut()
+    }
+
     pub fn is_finished(&self) -> bool {
         self.current().is_none()
     }
@@ -345,35 +409,68 @@ impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
         collection_status_text(self.prepared.status())
     }
 
-    pub fn submit(
+    pub fn resize(&mut self, inner_width: u16, inner_height: u16) {
+        self.inner_width = inner_width;
+        self.inner_height = inner_height;
+        if let Some(controller) = &mut self.controller {
+            controller.resize(inner_width, inner_height);
+        }
+    }
+
+    pub fn skip_current(&mut self) -> Result<()> {
+        ensure!(
+            !self.is_finished(),
+            "declaration review is already finished"
+        );
+        self.current_index += 1;
+        self.rebuild_controller()
+    }
+
+    pub fn apply_relationship_state(
         &mut self,
-        action: DeclarationReviewActionKind,
-        note: Option<String>,
+        declaration_id: &str,
+        state: RelationshipState,
     ) -> Result<()> {
+        let controller = self
+            .controller
+            .as_mut()
+            .context("declaration review is already finished")?;
+        controller.apply_relationship_state(declaration_id, state)
+    }
+
+    pub fn submit_action_with_persistence<F>(
+        &mut self,
+        action: &DeclarationReviewAction,
+        persist: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Record) -> Result<()>,
+    {
         let target = self
             .current()
             .cloned()
             .context("declaration review is already finished")?;
-        validate_note(action, note.as_deref())?;
-        let record = build_record(&target, self.identity.clone(), action, note)?;
+        validate_action_for_target(action, &target)?;
+        let record = build_record(&target, self.identity.clone(), action)?;
 
         // Atomicity boundary: neither status nor cursor changes until persistence succeeds.
-        self.appender.append(&record)?;
+        persist(&record)?;
+        self.finish_submission(&target, action.kind)
+    }
 
-        let owner_id = target.declaration.id.clone();
+    fn finish_submission(
+        &mut self,
+        target: &PreparedDeclarationTarget,
+        action: DeclarationReviewActionKind,
+    ) -> Result<()> {
         let status = match action {
             DeclarationReviewActionKind::Approve => DeclarationReviewStatus::Approved,
             DeclarationReviewActionKind::Comment => DeclarationReviewStatus::Commented,
             DeclarationReviewActionKind::Reject => DeclarationReviewStatus::Rejected,
         };
-        self.prepared.set_status(&owner_id, status);
+        self.prepared.set_status(&target.declaration.id, status);
         self.current_index += 1;
-        self.rebuild_controller()?;
-        Ok(())
-    }
-
-    pub fn into_appender(self) -> A {
-        self.appender
+        self.rebuild_controller()
     }
 
     fn rebuild_controller(&mut self) -> Result<()> {
@@ -385,8 +482,16 @@ impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
             .prepared
             .document_index_for_target(&target)
             .context("current declaration target has no exact-source document")?;
+        let owner_id = target.declaration.id.as_str();
         let mut document = self.prepared.documents[document_index].clone();
-        document.initial_outline_selection = Some(target.declaration.id.as_str().to_owned());
+        document
+            .outline_rows
+            .retain(|row| row.review_owner == owner_id);
+        document.canonical_order = vec![owner_id.to_owned()];
+        document.relationships.retain(|id, _| id == owner_id);
+        document.initial_outline_selection = Some(owner_id.to_owned());
+        document.initial_expanded.retain(|id| id == owner_id);
+        document.validate()?;
         self.controller = Some(DeclarationController::new(
             document,
             self.inner_width,
@@ -394,6 +499,94 @@ impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
         )?);
         Ok(())
     }
+}
+
+impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
+    pub fn new(
+        prepared: PreparedDeclarationLaunch,
+        identity: Identity,
+        appender: A,
+        inner_width: u16,
+        inner_height: u16,
+    ) -> Result<Self> {
+        Self::initialize(prepared, identity, appender, inner_width, inner_height)
+    }
+
+    pub fn submit(
+        &mut self,
+        kind: DeclarationReviewActionKind,
+        note: Option<String>,
+    ) -> Result<()> {
+        let target = self
+            .current()
+            .cloned()
+            .context("declaration review is already finished")?;
+        let action = full_declaration_action(&target, kind, note);
+        validate_action_for_target(&action, &target)?;
+        let record = build_record(&target, self.identity.clone(), &action)?;
+        self.appender.append(&record)?;
+        self.finish_submission(&target, kind)
+    }
+
+    pub fn into_appender(self) -> A {
+        self.appender
+    }
+}
+
+fn full_declaration_action(
+    target: &PreparedDeclarationTarget,
+    kind: DeclarationReviewActionKind,
+    comment_body: Option<String>,
+) -> DeclarationReviewAction {
+    DeclarationReviewAction {
+        kind,
+        owner_id: target.declaration.id.as_str().to_owned(),
+        comment_body,
+        anchor: Some(super::DeclarationAnchor::new(
+            target.snapshot.id.as_str(),
+            target.display_path.as_str(),
+            target
+                .declaration
+                .components
+                .iter()
+                .map(|component| (component.source_range.clone(), component.text.clone())),
+        )),
+    }
+}
+
+fn validate_action_for_target(
+    action: &DeclarationReviewAction,
+    target: &PreparedDeclarationTarget,
+) -> Result<()> {
+    ensure!(
+        action.owner_id == target.declaration.id.as_str(),
+        "declaration action owner does not match the current review target"
+    );
+    validate_note(action.kind, action.comment_body.as_deref())?;
+    let anchor = action
+        .anchor
+        .as_ref()
+        .context("declaration source action requires an exact anchor")?;
+    ensure!(
+        anchor.snapshot_id == target.snapshot.id.as_str(),
+        "declaration action snapshot does not match the current review target"
+    );
+    ensure!(
+        anchor.path == target.display_path.as_str(),
+        "declaration action path does not match the current review target"
+    );
+    ensure!(
+        !anchor.ranges.is_empty(),
+        "declaration action anchor has no ranges"
+    );
+    for range in &anchor.ranges {
+        ensure!(
+            target.snapshot.source().get(range.source_range.clone())
+                == Some(range.exact_text.as_str()),
+            "declaration action anchor does not match the captured source"
+        );
+    }
+    Ok(())
 }
 
 fn validate_note(action: DeclarationReviewActionKind, note: Option<&str>) -> Result<()> {
@@ -404,7 +597,10 @@ fn validate_note(action: DeclarationReviewActionKind, note: Option<&str>) -> Res
         action,
         DeclarationReviewActionKind::Comment | DeclarationReviewActionKind::Reject
     ) {
-        ensure!(note.is_some(), "comment and rejection actions require a non-empty note");
+        ensure!(
+            note.is_some(),
+            "comment and rejection actions require a non-empty note"
+        );
     }
     Ok(())
 }
@@ -412,8 +608,7 @@ fn validate_note(action: DeclarationReviewActionKind, note: Option<&str>) -> Res
 fn build_record(
     target: &PreparedDeclarationTarget,
     identity: Identity,
-    action: DeclarationReviewActionKind,
-    note: Option<String>,
+    action: &DeclarationReviewAction,
 ) -> Result<Record> {
     let reviewed_snapshot = ReviewedDeclarationSnapshot {
         snapshot_id: target.snapshot.id.as_str().to_owned(),
@@ -428,27 +623,33 @@ fn build_record(
         reviewed_snapshot: reviewed_snapshot.clone(),
         projection_hash: declaration.projection_hash.clone(),
     };
+    let action_anchor = action
+        .anchor
+        .as_ref()
+        .context("declaration source action requires an exact anchor")?;
     let anchor = DeclarationCommentAnchor {
         reviewed_snapshot,
         projection_hash: declaration.projection_hash.clone(),
         source_len_bytes: target.snapshot.source().len(),
-        ranges: declaration
-            .components
+        ranges: action_anchor
+            .ranges
             .iter()
-            .map(|component| RecordAnchorRange {
-                start_byte: component.source_range.start,
-                end_byte: component.source_range.end,
-                exact_text: component.text.clone(),
+            .map(|range| RecordAnchorRange {
+                start_byte: range.source_range.start,
+                end_byte: range.source_range.end,
+                exact_text: range.exact_text.clone(),
             })
             .collect(),
     };
     anchor.validate_against_source(target.snapshot.source())?;
 
-    let verdict = match action {
+    let verdict = match action.kind {
         DeclarationReviewActionKind::Approve => Verdict::Approved,
         DeclarationReviewActionKind::Comment => Verdict::Comment,
         DeclarationReviewActionKind::Reject => Verdict::Rejected,
     };
+    let comment_context = (!matches!(action.kind, DeclarationReviewActionKind::Approve))
+        .then(|| declaration.projection_text.clone());
     build_structured_record(StructuredMarkRequest {
         target: ReviewTargetRef::Declaration {
             hash: declaration.projection_hash.clone(),
@@ -458,8 +659,8 @@ fn build_record(
         identity,
         repo_ref: target.provenance.repo_ref.clone(),
         block_state: target.provenance.block_state.clone(),
-        note,
-        comment_context: None,
+        note: action.comment_body.clone(),
+        comment_context,
         comment_anchor: Some(CommentAnchor::Declaration(anchor)),
         declaration_locator: Some(locator),
     })
@@ -477,6 +678,8 @@ fn collection_status_text(status: &CollectionStatus) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        CollectionStatus::FullyReviewed => "All declaration surfaces are already reviewed".to_owned(),
+        CollectionStatus::FullyReviewed => {
+            "All declaration surfaces are already reviewed".to_owned()
+        }
     }
 }

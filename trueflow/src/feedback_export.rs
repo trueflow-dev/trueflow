@@ -1,14 +1,22 @@
+use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, FileState};
 use crate::config::BlockFilters;
+use crate::declaration::snapshot::SourceSnapshot;
+use crate::declaration::{
+    DeclarationKey, DeclarationNode, DeclarationProjectionHash, project_source,
+};
 use crate::feedback_since::ResolvedFeedbackSince as ParsedFeedbackSince;
 use crate::repo_path::RepoPath;
 use crate::scanner::{self, ScanOptions};
-use crate::store::{FileStore, Record, RepoRef, ReviewTargetRef, TreeHash};
+use crate::store::{
+    CommentAnchor, DeclarationAnchorRange, DeclarationRecordLocator, FileStore, Record, RepoRef,
+    ReviewTargetRef, TreeHash,
+};
 use crate::targets::{
     ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
 };
 use crate::vcs;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -75,10 +83,106 @@ impl FeedbackBlockView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackEntryKind {
+    Block,
+    Declaration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedDeclarationFeedback {
+    pub path: RepoPath,
+    pub semantic_key: DeclarationKey,
+    pub projection_hash: DeclarationProjectionHash,
+    pub projection_text: String,
+    pub ranges: Vec<DeclarationAnchorRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeclarationFeedbackSource {
+    snapshot: SourceSnapshot,
+    declarations: Vec<DeclarationNode>,
+}
+
+impl DeclarationFeedbackSource {
+    pub fn from_snapshot(snapshot: SourceSnapshot) -> Result<Self> {
+        let declarations = project_source(&snapshot.path, snapshot.language, snapshot.source())?
+            .into_declarations();
+        Ok(Self {
+            snapshot,
+            declarations,
+        })
+    }
+}
+
+pub fn resolve_declaration_feedback(
+    record: &Record,
+    sources: &[DeclarationFeedbackSource],
+) -> Result<Option<ResolvedDeclarationFeedback>> {
+    if !matches!(record.target, ReviewTargetRef::Declaration { .. }) {
+        return Ok(None);
+    }
+    record.validate()?;
+    let Some(locator) = record.declaration_locator.as_ref() else {
+        return Ok(None);
+    };
+    let anchor = match record.comment_anchor.as_ref() {
+        Some(CommentAnchor::Declaration(anchor)) => Some(anchor),
+        Some(_) => return Ok(None),
+        None => None,
+    };
+
+    let matching_sources = sources
+        .iter()
+        .filter(|source| {
+            source.snapshot.id.as_str() == locator.reviewed_snapshot.snapshot_id
+                && source.snapshot.bytes_hash() == &locator.reviewed_snapshot.content_hash
+                && RepoPath::from_relative_path(&source.snapshot.path)
+                    .is_ok_and(|path| path == locator.path)
+        })
+        .collect::<Vec<_>>();
+    let source = match matching_sources.as_slice() {
+        [] => return Ok(None),
+        [source] => *source,
+        _ => return Err(anyhow!("declaration feedback source identity is ambiguous")),
+    };
+    record.validate_against_source(source.snapshot.source())?;
+
+    let matching_declarations = source
+        .declarations
+        .iter()
+        .filter(|declaration| {
+            declaration.key == locator.declaration_key
+                && declaration.source_ordinal == locator.source_ordinal
+                && declaration.source_span == locator.source_span
+                && declaration.projection_hash == locator.projection_hash
+        })
+        .collect::<Vec<_>>();
+    let declaration = match matching_declarations.as_slice() {
+        [] => return Ok(None),
+        [declaration] => *declaration,
+        _ => return Err(anyhow!("declaration feedback locator is ambiguous")),
+    };
+
+    Ok(Some(ResolvedDeclarationFeedback {
+        path: locator.path.clone(),
+        semantic_key: declaration.key.clone(),
+        projection_hash: declaration.projection_hash.clone(),
+        projection_text: declaration.projection_text.clone(),
+        ranges: anchor.map_or_else(Vec::new, |anchor| anchor.ranges.clone()),
+        context: record.comment_context.clone(),
+    }))
+}
+
 #[derive(Debug, Clone)]
 pub struct FeedbackEntry {
+    pub kind: FeedbackEntryKind,
     pub file_path: String,
-    pub block: FeedbackBlockView,
+    pub block: Option<FeedbackBlockView>,
+    pub declaration: Option<ResolvedDeclarationFeedback>,
     pub reviews: Vec<Record>,
     pub latest_verdict: String,
 }
@@ -114,6 +218,13 @@ pub struct ResolvedFeedbackContext {
 
 pub trait FeedbackContextResolver {
     fn resolve_context(&mut self, record: &Record) -> Result<ResolvedFeedbackContext>;
+
+    fn resolve_declaration_context(
+        &mut self,
+        _record: &Record,
+    ) -> Result<Option<ResolvedDeclarationFeedback>> {
+        Ok(None)
+    }
 }
 
 pub struct RepoFeedbackContextResolver<'a> {
@@ -182,6 +293,57 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
             self.workdir_prefix,
             self.repo_root.as_deref(),
         )
+    }
+
+    fn resolve_declaration_context(
+        &mut self,
+        record: &Record,
+    ) -> Result<Option<ResolvedDeclarationFeedback>> {
+        let Some(locator) = record.declaration_locator.as_ref() else {
+            return Ok(None);
+        };
+        let RepoRef::Vcs { revision, .. } = &record.repo_ref else {
+            return Ok(None);
+        };
+        let repo = match self.repo_root.as_deref() {
+            Some(root) => gix::discover(root)?,
+            None => gix::discover(".")?,
+        };
+        let commit = repo
+            .rev_parse_single(revision.as_str())?
+            .object()?
+            .peel_to_commit()?;
+        let tree = commit.tree()?;
+        let Some(entry) = tree.lookup_entry_by_path(Path::new(locator.path.as_str()))? else {
+            return Ok(None);
+        };
+        let blob = match entry.object()?.try_into_blob() {
+            Ok(blob) => blob,
+            Err(_) => return Ok(None),
+        };
+        let source = std::str::from_utf8(&blob.data)
+            .with_context(|| format!("{} contains invalid UTF-8", locator.path))?;
+        let path = Path::new(locator.path.as_str());
+        let language = path
+            .extension()
+            .and_then(OsStr::to_str)
+            .and_then(Language::from_extension)
+            .or_else(|| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .and_then(Language::from_file_name)
+            })
+            .unwrap_or(Language::Unknown);
+        let snapshot = SourceSnapshot::new(
+            crate::declaration::snapshot::SnapshotId::new(
+                locator.reviewed_snapshot.snapshot_id.clone(),
+            ),
+            path,
+            language,
+            source,
+        );
+        let source = DeclarationFeedbackSource::from_snapshot(snapshot)?;
+        resolve_declaration_feedback(record, std::slice::from_ref(&source))
     }
 }
 
@@ -270,29 +432,53 @@ struct ResolvedFeedbackRecord<'a> {
     verdict_key: FeedbackVerdictKey,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeclarationFeedbackEntryKey {
+    locator: DeclarationRecordLocator,
+    ranges: Vec<DeclarationAnchorRange>,
+    context: Option<String>,
+}
+
+struct ResolvedDeclarationFeedbackRecord<'a> {
+    index: usize,
+    record: &'a Record,
+    locator: DeclarationRecordLocator,
+    declaration: ResolvedDeclarationFeedback,
+}
+
 fn resolve_feedback_records<'a>(
     records: &'a [Record],
     allowed_revisions: Option<&HashSet<String>>,
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<ResolvedFeedbackRecord<'a>>> {
-    records
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| record_matches_allowed_revisions(record, allowed_revisions))
-        .filter(|(_, record)| !matches!(record.target, ReviewTargetRef::Declaration { .. }))
-        .map(|(index, record)| {
-            let context = resolver.resolve_context(record)?;
-            let (file_path, block, entry_key, verdict_key) = feedback_entry_parts(record, &context);
-            Ok(ResolvedFeedbackRecord {
-                index,
-                record,
-                file_path,
-                block,
-                entry_key,
-                verdict_key,
-            })
-        })
-        .collect()
+    let mut resolved = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        if !record_matches_allowed_revisions(record, allowed_revisions) {
+            continue;
+        }
+        match &record.target {
+            ReviewTargetRef::Declaration { .. } => continue,
+            ReviewTargetRef::Block { .. }
+            | ReviewTargetRef::File { .. }
+            | ReviewTargetRef::Tree { .. } => {}
+        }
+
+        let context = resolver.resolve_context(record)?;
+        let Some((file_path, block, entry_key, verdict_key)) =
+            feedback_entry_parts(record, &context)
+        else {
+            continue;
+        };
+        resolved.push(ResolvedFeedbackRecord {
+            index,
+            record,
+            file_path,
+            block,
+            entry_key,
+            verdict_key,
+        });
+    }
+    Ok(resolved)
 }
 
 pub fn collect_feedback_entries(
@@ -359,8 +545,10 @@ pub fn collect_feedback_entries(
             ..
         } = resolved;
         let entry = grouped.entry(entry_key).or_insert_with(|| FeedbackEntry {
+            kind: FeedbackEntryKind::Block,
             file_path,
-            block,
+            block: Some(block),
+            declaration: None,
             reviews: Vec::new(),
             latest_verdict: latest_verdict.to_string(),
         });
@@ -368,6 +556,13 @@ pub fn collect_feedback_entries(
     }
 
     let mut entries = grouped.into_values().collect::<Vec<_>>();
+    entries.extend(collect_declaration_feedback_entries(
+        records,
+        since_filter,
+        query,
+        validated_cursor.as_ref(),
+        resolver,
+    )?);
     for entry in &mut entries {
         entry.reviews.sort_by(|left, right| {
             left.timestamp
@@ -378,22 +573,114 @@ pub fn collect_feedback_entries(
     entries.sort_by(|left, right| {
         left.file_path
             .cmp(&right.file_path)
-            .then_with(|| left.block.start_line.cmp(&right.block.start_line))
-            .then_with(|| left.block.end_line.cmp(&right.block.end_line))
+            .then_with(|| {
+                left.block
+                    .as_ref()
+                    .map_or(usize::MAX, |block| block.start_line)
+                    .cmp(
+                        &right
+                            .block
+                            .as_ref()
+                            .map_or(usize::MAX, |block| block.start_line),
+                    )
+            })
+            .then_with(|| {
+                left.declaration
+                    .as_ref()
+                    .map(|declaration| declaration.semantic_key.as_str())
+                    .cmp(
+                        &right
+                            .declaration
+                            .as_ref()
+                            .map(|declaration| declaration.semantic_key.as_str()),
+                    )
+            })
     });
 
     Ok(entries)
 }
 
+fn collect_declaration_feedback_entries(
+    records: &[Record],
+    since_filter: &FeedbackSinceFilter,
+    query: &FeedbackQuery,
+    validated_cursor: Option<&ValidatedFeedbackCursor>,
+    resolver: &mut impl FeedbackContextResolver,
+) -> Result<Vec<FeedbackEntry>> {
+    let mut resolved = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        if !matches!(record.target, ReviewTargetRef::Declaration { .. })
+            || !record_matches_allowed_revisions(record, query.allowed_revisions.as_ref())
+        {
+            continue;
+        }
+        let Some(declaration) = resolver.resolve_declaration_context(record)? else {
+            continue;
+        };
+        let Some(locator) = record.declaration_locator.clone() else {
+            continue;
+        };
+        resolved.push(ResolvedDeclarationFeedbackRecord {
+            index,
+            record,
+            locator,
+            declaration,
+        });
+    }
+
+    let mut latest = HashMap::<DeclarationRecordLocator, &'static str>::new();
+    for record in &resolved {
+        latest.insert(record.locator.clone(), record.record.verdict.as_str());
+    }
+    let mut grouped = HashMap::<DeclarationFeedbackEntryKey, FeedbackEntry>::new();
+    for resolved in resolved {
+        if !record_matches_since(
+            resolved.record,
+            resolved.index,
+            since_filter,
+            validated_cursor,
+        ) || !path_matches_feedback_selections(
+            resolved.declaration.path.as_str(),
+            query.explicit_selection.as_ref(),
+            query.changed_selection.as_ref(),
+        ) {
+            continue;
+        }
+        let latest_verdict = latest
+            .get(&resolved.locator)
+            .copied()
+            .unwrap_or("unreviewed");
+        if !query.include_approved && latest_verdict == "approved" {
+            continue;
+        }
+        let key = DeclarationFeedbackEntryKey {
+            locator: resolved.locator,
+            ranges: resolved.declaration.ranges.clone(),
+            context: resolved.declaration.context.clone(),
+        };
+        let file_path = resolved.declaration.path.to_string();
+        let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
+            kind: FeedbackEntryKind::Declaration,
+            file_path,
+            block: None,
+            declaration: Some(resolved.declaration),
+            reviews: Vec::new(),
+            latest_verdict: latest_verdict.to_string(),
+        });
+        entry.reviews.push(resolved.record.clone());
+    }
+    Ok(grouped.into_values().collect())
+}
+
 fn feedback_entry_parts(
     record: &Record,
     context: &ResolvedFeedbackContext,
-) -> (
+) -> Option<(
     String,
     FeedbackBlockView,
     FeedbackPresentationEntryKey,
     FeedbackVerdictKey,
-) {
+)> {
     let file_path = context
         .file_path
         .clone()
@@ -403,7 +690,10 @@ fn feedback_entry_parts(
         Some(block) => (block.presentation.clone(), block.presentation_is_scoped),
         None => match scoped_unresolved_feedback_block_for_record(record) {
             Some(block) => (block, true),
-            None => (unresolved_unscoped_feedback_block_for_record(record), false),
+            None => (
+                unresolved_unscoped_feedback_block_for_record(record)?,
+                false,
+            ),
         },
     };
     let entry_key = FeedbackPresentationEntryKey {
@@ -415,9 +705,9 @@ fn feedback_entry_parts(
         end_line: block.end_line,
         discriminator: feedback_presentation_discriminator(record, presentation_is_scoped),
     };
-    let verdict_key = feedback_verdict_key(record, context, &file_path);
+    let verdict_key = feedback_verdict_key(record, context, &file_path)?;
 
-    (file_path, block, entry_key, verdict_key)
+    Some((file_path, block, entry_key, verdict_key))
 }
 
 fn feedback_presentation_discriminator(
@@ -481,7 +771,7 @@ fn feedback_verdict_key(
     record: &Record,
     context: &ResolvedFeedbackContext,
     canonical_file_path: &str,
-) -> FeedbackVerdictKey {
+) -> Option<FeedbackVerdictKey> {
     let locator = match &record.target {
         ReviewTargetRef::Block { hash } => {
             let (block_hash, start_line, end_line) = context
@@ -496,7 +786,7 @@ fn feedback_verdict_key(
                 })
                 .unwrap_or_else(|| {
                     let (start_line, end_line) = unresolved_block_line_range(record);
-                    (feedback_target_hash(record), start_line, end_line)
+                    (hash.clone(), start_line, end_line)
                 });
             FeedbackVerdictLocator::Block {
                 target_hash: hash.clone(),
@@ -514,15 +804,13 @@ fn feedback_verdict_key(
             target_hash: hash.clone(),
             path: record.path_hint.as_ref().map(RepoPath::to_string),
         },
-        ReviewTargetRef::Declaration { .. } => {
-            unreachable!("declaration records are filtered before ordinary feedback export")
-        }
+        ReviewTargetRef::Declaration { .. } => return None,
     };
 
-    FeedbackVerdictKey {
+    Some(FeedbackVerdictKey {
         snapshot: context.snapshot.clone(),
         locator,
-    }
+    })
 }
 
 pub fn resolve_since_filter(
@@ -1140,7 +1428,7 @@ fn resolved_feedback_block_for_record(record: &Record, unscoped: Block) -> Resol
 fn scoped_unresolved_feedback_block_for_record(record: &Record) -> Option<FeedbackBlockView> {
     let scope = record.comment_scope.as_ref()?;
     let context = record.comment_context.as_ref()?;
-    let hash = feedback_target_hash(record);
+    let hash = feedback_target_hash(record)?.clone();
     let start_line = usize::try_from(scope.start_line).unwrap_or(usize::MAX);
     let end_line = usize::try_from(scope.end_line).unwrap_or(usize::MAX);
     if start_line >= end_line {
@@ -1414,10 +1702,10 @@ fn path_matches_feedback_selections(
     true
 }
 
-fn unresolved_unscoped_feedback_block_for_record(record: &Record) -> FeedbackBlockView {
+fn unresolved_unscoped_feedback_block_for_record(record: &Record) -> Option<FeedbackBlockView> {
     let (start_line, end_line) = unresolved_block_line_range(record);
-    FeedbackBlockView {
-        hash: feedback_target_hash(record),
+    Some(FeedbackBlockView {
+        hash: feedback_target_hash(record)?.clone(),
         content: "[unresolved historical context]".to_string(),
         kind: BlockKind::Code,
         tags: Vec::new(),
@@ -1425,7 +1713,7 @@ fn unresolved_unscoped_feedback_block_for_record(record: &Record) -> FeedbackBlo
         start_line,
         end_line,
         byte_span: None,
-    }
+    })
 }
 
 fn unresolved_block_line_range(record: &Record) -> (usize, usize) {
@@ -1436,14 +1724,12 @@ fn unresolved_block_line_range(record: &Record) -> (usize, usize) {
     (start_line, start_line.saturating_add(1))
 }
 
-fn feedback_target_hash(record: &Record) -> TreeHash {
+fn feedback_target_hash(record: &Record) -> Option<&TreeHash> {
     match &record.target {
         ReviewTargetRef::Block { hash }
         | ReviewTargetRef::File { hash }
-        | ReviewTargetRef::Tree { hash } => hash.clone(),
-        ReviewTargetRef::Declaration { .. } => {
-            unreachable!("declaration records are filtered before ordinary feedback export")
-        }
+        | ReviewTargetRef::Tree { hash } => Some(hash),
+        ReviewTargetRef::Declaration { .. } => None,
     }
 }
 
@@ -1665,13 +1951,19 @@ mod tests {
             &mut resolver,
         )
         .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
-        entries.sort_by(|left, right| left.block.content.cmp(&right.block.content));
+        entries.sort_by(|left, right| {
+            left.block
+                .as_ref()
+                .unwrap()
+                .content
+                .cmp(&right.block.as_ref().unwrap().content)
+        });
 
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].block.content, "+after\n");
+        assert_eq!(entries[0].block.as_ref().unwrap().content, "+after\n");
         assert_eq!(entries[0].reviews.len(), 1);
         assert_eq!(entries[0].reviews[0].id, "added");
-        assert_eq!(entries[1].block.content, "-before\n");
+        assert_eq!(entries[1].block.as_ref().unwrap().content, "-before\n");
         assert_eq!(entries[1].reviews.len(), 1);
         assert_eq!(entries[1].reviews[0].id, "removed");
     }
@@ -1746,7 +2038,7 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file_path, "src/a.rs");
-        assert_eq!(entries[0].block.content, canonical);
+        assert_eq!(entries[0].block.as_ref().unwrap().content, canonical);
         assert_eq!(entries[0].reviews.len(), 1);
         assert_eq!(entries[0].reviews[0].id, "comment");
     }
@@ -2519,6 +2811,7 @@ mod tests {
             comment_scope: None,
             comment_context: None,
             comment_anchor: None,
+            declaration_locator: None,
             tags: None,
             attestations: None,
         }

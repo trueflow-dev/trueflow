@@ -24,8 +24,8 @@ use crate::config::{
     BatchConfirmPolicy, BlockFilters, TrueflowConfig, TuiConfig, TuiDiffFocusMode,
     TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
-use crate::declaration::review::{DeclarationReviewDiffBatch, DeclarationReviewQuery};
 use crate::context::TrueflowContext;
+use crate::declaration::review::{DeclarationReviewDiffBatch, DeclarationReviewQuery};
 use crate::github::{
     GhGitHubClient, PullRequestCommit, PullRequestMetadata, PullRequestRef,
     prepare_pull_request_review,
@@ -1257,48 +1257,56 @@ pub fn build_pull_request_launch_queue(
         .collect())
 }
 
-pub fn run(
-    context: &TrueflowContext,
-    mode: Option<TuiReviewMode>,
-    trust_lsp_workspace: bool,
-    all: bool,
-    target: &[ReviewTarget],
-    since: Option<&str>,
-    only: &[BlockKind],
-    exclude: &[BlockKind],
-) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+pub struct TuiRunRequest<'a> {
+    pub mode: Option<TuiReviewMode>,
+    pub trust_lsp_workspace: bool,
+    pub all: bool,
+    pub target: &'a [ReviewTarget],
+    pub since: Option<&'a str>,
+    pub only: &'a [BlockKind],
+    pub exclude: &'a [BlockKind],
+}
+
+pub fn run(context: &TrueflowContext, request: TuiRunRequest<'_>) -> Result<()> {
     let config = load_config()?;
     let launch = resolve_tui_launch(
         &config,
-        mode,
-        trust_lsp_workspace,
+        request.mode,
+        request.trust_lsp_workspace,
         ScopePreset::All,
-        only,
-        exclude,
+        request.only,
+        request.exclude,
     )?;
     if launch.mode == TuiReviewMode::Declarations {
-        return Err(anyhow!(
-            "declaration review launch is configured, but its terminal app is not available yet"
-        ));
+        return declaration::terminal::run(&config, &request);
     }
     let scan_options = config.scan.resolve_options();
-    let filters = config.review.resolve_filters(only, exclude);
+    let filters = config.review.resolve_filters(request.only, request.exclude);
 
-    if let Some(pull_request) = resolve_pull_request_target_for_tui(all, target, since)? {
+    if let Some(pull_request) =
+        resolve_pull_request_target_for_tui(request.all, request.target, request.since)?
+    {
         return run_pull_request_review(
             context,
             &config,
             &scan_options,
             &filters,
             &pull_request,
-            only,
-            exclude,
+            request.only,
+            request.exclude,
         );
     }
 
-    let pending_cli_requests = cli_review_request(all, target, since, only, exclude)?
-        .into_iter()
-        .collect::<VecDeque<_>>();
+    let pending_cli_requests = cli_review_request(
+        request.all,
+        request.target,
+        request.since,
+        request.only,
+        request.exclude,
+    )?
+    .into_iter()
+    .collect::<VecDeque<_>>();
     run_tui_review_loop(
         context,
         &config,

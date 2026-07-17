@@ -106,11 +106,7 @@ fn diff_pair(pair: &SnapshotPair, diff: &mut DeclarationDiff) -> Result<()> {
     for diagnostic in base_facts
         .iter()
         .flat_map(|facts| facts.diagnostics.iter())
-        .chain(
-            head_facts
-                .iter()
-                .flat_map(|facts| facts.diagnostics.iter()),
-        )
+        .chain(head_facts.iter().flat_map(|facts| facts.diagnostics.iter()))
     {
         diff.diagnostics.push(DiffDiagnostic {
             snapshot_pair_id: pair.id.clone(),
@@ -177,16 +173,31 @@ fn diff_pair(pair: &SnapshotPair, diff: &mut DeclarationDiff) -> Result<()> {
     // Head order is canonical for additions and changed declarations.
     for (head_index, head_declaration) in head.iter().enumerate() {
         if let Some(match_index) = head_matches[head_index] {
-            let matched = reserved[match_index];
-            let base_declaration = &base[matched.base];
+            let matched = reserved.get(match_index).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "declaration diff for pair {} references missing reserved match {match_index}",
+                    pair.id.as_str()
+                )
+            })?;
+            let base_declaration = base.get(matched.base).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "declaration diff for pair {} references missing base declaration {}",
+                    pair.id.as_str(),
+                    matched.base
+                )
+            })?;
+            let (Some(matched_base_snapshot_id), Some(matched_head_snapshot_id)) =
+                (&base_snapshot_id, &head_snapshot_id)
+            else {
+                anyhow::bail!(
+                    "matched declaration for pair {} requires both base and head snapshots",
+                    pair.id.as_str()
+                );
+            };
             diff.matches.push(DeclarationMatch {
                 snapshot_pair_id: pair.id.clone(),
-                base_snapshot_id: base_snapshot_id
-                    .clone()
-                    .expect("a matched declaration has a base snapshot"),
-                head_snapshot_id: head_snapshot_id
-                    .clone()
-                    .expect("a matched declaration has a head snapshot"),
+                base_snapshot_id: matched_base_snapshot_id.clone(),
+                head_snapshot_id: matched_head_snapshot_id.clone(),
                 base: declaration_for_diff(base_declaration),
                 head: declaration_for_diff(head_declaration),
                 evidence: matched.evidence,
@@ -340,9 +351,7 @@ fn reserve_unique<F>(
             continue;
         }
         for (head_index, head_declaration) in head.iter().enumerate() {
-            if !head_used[head_index]
-                && compatible(base_declaration, head_declaration, reserved)
-            {
+            if !head_used[head_index] && compatible(base_declaration, head_declaration, reserved) {
                 candidates.push((base_index, head_index));
                 *base_counts.entry(base_index).or_default() += 1;
                 *head_counts.entry(head_index).or_default() += 1;
@@ -351,9 +360,7 @@ fn reserve_unique<F>(
     }
 
     for (base_index, head_index) in candidates {
-        if base_counts.get(&base_index) == Some(&1)
-            && head_counts.get(&head_index) == Some(&1)
-        {
+        if base_counts.get(&base_index) == Some(&1) && head_counts.get(&head_index) == Some(&1) {
             base_used[base_index] = true;
             head_used[head_index] = true;
             reserved.push(ReservedMatch {
@@ -448,7 +455,10 @@ fn declaration_for_diff(declaration: &DeclarationNode) -> DeclarationNode {
                 projection_text.push_str(&component.text[..=newline]);
                 trim_following_indent = true;
             } else if projection_text.ends_with('\n')
-                && component.text.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+                && component
+                    .text
+                    .bytes()
+                    .all(|byte| matches!(byte, b' ' | b'\t'))
             {
                 trim_following_indent = true;
             } else {

@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::declaration::{DeclarationKey, DeclarationProjectionHash};
@@ -329,7 +329,9 @@ impl ReviewedDeclarationSnapshot {
 impl DeclarationRecordLocator {
     fn validate(&self) -> Result<()> {
         if self.path.is_root() {
-            return Err(anyhow!("declaration locator path cannot be the repository root"));
+            return Err(anyhow!(
+                "declaration locator path cannot be the repository root"
+            ));
         }
         if self.declaration_key.as_str().trim().is_empty() {
             return Err(anyhow!("declaration locator key cannot be empty"));
@@ -367,13 +369,17 @@ impl DeclarationCommentAnchor {
             self.projection_hash.as_str(),
         )?;
         if self.ranges.is_empty() {
-            return Err(anyhow!("declaration comment anchor must contain a source range"));
+            return Err(anyhow!(
+                "declaration comment anchor must contain a source range"
+            ));
         }
 
         let mut previous_end = None;
         for range in &self.ranges {
             if range.start_byte >= range.end_byte {
-                return Err(anyhow!("declaration comment anchor ranges must be non-empty"));
+                return Err(anyhow!(
+                    "declaration comment anchor ranges must be non-empty"
+                ));
             }
             if range.end_byte > self.source_len_bytes {
                 return Err(anyhow!(
@@ -699,15 +705,15 @@ impl Record {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.version, 2 | 3 | 4 | 5) {
-            return Err(anyhow!("unsupported review record version {}", self.version));
+        if !matches!(self.version, 2..=5) {
+            return Err(anyhow!(
+                "unsupported review record version {}",
+                self.version
+            ));
         }
 
         let declaration_target = matches!(self.target, ReviewTargetRef::Declaration { .. });
-        let declaration_anchor = matches!(
-            self.comment_anchor,
-            Some(CommentAnchor::Declaration(_))
-        );
+        let declaration_anchor = matches!(self.comment_anchor, Some(CommentAnchor::Declaration(_)));
         let has_declaration_shape =
             declaration_target || self.declaration_locator.is_some() || declaration_anchor;
         if self.version < 5 && has_declaration_shape {
@@ -731,7 +737,9 @@ impl Record {
         }
 
         if self.version != 5 {
-            return Err(anyhow!("declaration targets require review record version 5"));
+            return Err(anyhow!(
+                "declaration targets require review record version 5"
+            ));
         }
         if self.check.as_str() != ReviewCheck::declaration().as_str() {
             return Err(anyhow!(
@@ -739,9 +747,10 @@ impl Record {
             ));
         }
 
-        let target_hash = match &self.target {
-            ReviewTargetRef::Declaration { hash } => hash,
-            _ => unreachable!("declaration target checked above"),
+        let ReviewTargetRef::Declaration { hash: target_hash } = &self.target else {
+            return Err(anyhow!(
+                "declaration target validation requires a declaration target"
+            ));
         };
         validate_protocol_hash("declaration target projection hash", target_hash.as_str())?;
 
@@ -878,7 +887,7 @@ impl Record {
                 declaration_locator: &self.declaration_locator,
                 tags: &self.tags,
             })?),
-            _ => unreachable!("record version validated above"),
+            version => Err(anyhow!("unsupported review record version {version}")),
         }
     }
 }
@@ -1370,7 +1379,7 @@ struct JsonlParseReport {
 }
 
 enum ParsedRecordLine {
-    Record(Record),
+    Record(Box<Record>),
     LegacyDiffTarget,
     Malformed {
         error: String,
@@ -1415,7 +1424,7 @@ fn parse_record_line(line: &str) -> ParsedRecordLine {
 
     let declaration_shape = value_has_declaration_shape(&value);
     match serde_json::from_value(value) {
-        Ok(record) => ParsedRecordLine::Record(record),
+        Ok(record) => ParsedRecordLine::Record(Box::new(record)),
         Err(error) => ParsedRecordLine::Malformed {
             error: error.to_string(),
             declaration_shape,
@@ -1428,7 +1437,7 @@ fn parse_records_jsonl_report_impl(content: &str) -> JsonlParseReport {
 
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         match parse_record_line(line) {
-            ParsedRecordLine::Record(record) => report.records.push(record),
+            ParsedRecordLine::Record(record) => report.records.push(*record),
             ParsedRecordLine::Malformed {
                 error,
                 declaration_shape,
@@ -1655,6 +1664,7 @@ mod tests {
             comment_scope: None,
             comment_context: None,
             comment_anchor: None,
+            declaration_locator: None,
             tags: None,
             attestations: None,
         }

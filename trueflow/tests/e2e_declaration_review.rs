@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use trueflow::analysis::Language;
 use trueflow::declaration::{
-    project_source, Capability, DeclarationKind, DeclarationNode, FileDeclarationFacts, Visibility,
+    Capability, DeclarationKind, DeclarationNode, FileDeclarationFacts, Visibility, project_source,
 };
 
 fn project(path: &str, language: Language, source: &str) -> Result<FileDeclarationFacts> {
@@ -261,7 +261,8 @@ fn common_languages_extract_exact_body_free_callable_and_aggregate_shapes() -> R
 
 #[test]
 fn unicode_component_spans_are_valid_utf8_boundaries() -> Result<()> {
-    const SOURCE: &str = "/// Résumé 🦀\npub fn café(名前: &str) -> String {\n    format!(\"Olá, {名前}\")\n}\n";
+    const SOURCE: &str =
+        "/// Résumé 🦀\npub fn café(名前: &str) -> String {\n    format!(\"Olá, {名前}\")\n}\n";
 
     let facts = project("src/unicode.rs", Language::Rust, SOURCE)?;
     let declaration = declaration_named(&facts, "café", DeclarationKind::Function)?;
@@ -423,7 +424,10 @@ fn every_language_reports_explicit_capability_for_every_declaration_facet() -> R
                 "aggregate projection",
                 &facts.capabilities.aggregate_projection,
             ),
-            ("type-use classification", &facts.capabilities.type_use_sites),
+            (
+                "type-use classification",
+                &facts.capabilities.type_use_sites,
+            ),
         ] {
             assert_explicit_capability(capability, language, facet);
         }

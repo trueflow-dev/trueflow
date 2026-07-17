@@ -119,13 +119,15 @@ fn main() -> Result<()> {
             exclude,
         } => commands::tui::run(
             &context,
-            *mode,
-            *trust_lsp_workspace,
-            *all,
-            target,
-            since.as_deref(),
-            only,
-            exclude,
+            commands::tui::TuiRunRequest {
+                mode: *mode,
+                trust_lsp_workspace: *trust_lsp_workspace,
+                all: *all,
+                target,
+                since: since.as_deref(),
+                only,
+                exclude,
+            },
         ),
     }
 }

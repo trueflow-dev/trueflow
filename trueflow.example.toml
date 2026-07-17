@@ -29,6 +29,8 @@ ignore_path_prefixes = []
 ignore_globs = []
 
 [tui]
+# Review modality: blocks|declarations. Default preserves ordinary block review.
+mode = "blocks"
 # Require confirmation modal for batch actions affecting >= N review blocks, or "never".
 confirm_batch_sub_blocks = 2
 # Diff-mode line numbers: disabled|old_new. Default keeps diffs focused on +/- content.

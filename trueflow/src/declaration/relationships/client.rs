@@ -68,7 +68,10 @@ const MAX_DIAGNOSTIC_DOCUMENTS: usize = 64;
 const MAX_MESSAGES: usize = 128;
 const MAX_MESSAGE_TEXT_BYTES: usize = 4 * 1024;
 const COMMAND_QUEUE_DEPTH: usize = 8;
-const INCOMING_REQUEST_LIMIT: usize = 4;
+const INCOMING_REQUEST_LIMIT: NonZeroUsize = match NonZeroUsize::new(4) {
+    Some(limit) => limit,
+    None => NonZeroUsize::MIN,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextDocumentSync {
@@ -170,17 +173,18 @@ impl fmt::Display for ProviderError {
                 formatter.write_str("the fixed LSP profile does not support this language")
             }
             Self::ExecutableNotFound(executable) => {
-                write!(formatter, "trusted LSP executable {executable:?} was not found")
+                write!(
+                    formatter,
+                    "trusted LSP executable {executable:?} was not found"
+                )
             }
             Self::InvalidWorkspace(message) | Self::InvalidDocument(message) => {
                 formatter.write_str(message)
             }
-            Self::DocumentSynchronizationUnsupported => {
-                formatter.write_str("the server does not support exact document open/close synchronization")
-            }
-            Self::SessionReplacementRequired => formatter.write_str(
-                "the immutable document changed; start a replacement snapshot session",
-            ),
+            Self::DocumentSynchronizationUnsupported => formatter
+                .write_str("the server does not support exact document open/close synchronization"),
+            Self::SessionReplacementRequired => formatter
+                .write_str("the immutable document changed; start a replacement snapshot session"),
             Self::ResourceLimit(message) => formatter.write_str(message),
             Self::SessionClosed => formatter.write_str("the LSP session is closed"),
             Self::Timeout => formatter.write_str("the LSP operation timed out"),
@@ -241,13 +245,8 @@ impl LspServerLauncher for AsyncLspLauncher {
         if self.provider.is_some() {
             return Err(LaunchError::new("an LSP provider is already active"));
         }
-        let provider = RelationshipProvider::launch(
-            profile,
-            language,
-            workspace_root,
-            self.trust,
-        )
-        .map_err(|error| LaunchError::new(error.to_string()))?;
+        let provider = RelationshipProvider::launch(profile, language, workspace_root, self.trust)
+            .map_err(|error| LaunchError::new(error.to_string()))?;
         self.provider = Some(provider);
         Ok(())
     }
@@ -321,7 +320,7 @@ impl RelationshipProvider {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
-            .name(format!("trueflow-lsp-{:?}", profile))
+            .name(format!("trueflow-lsp-{profile:?}"))
             .spawn(move || {
                 let runtime = match Builder::new_current_thread().enable_all().build() {
                     Ok(runtime) => runtime,
@@ -333,19 +332,16 @@ impl RelationshipProvider {
                     }
                 };
                 runtime.block_on(worker_main(
-                    profile,
-                    language,
-                    root,
-                    executable,
-                    command_rx,
-                    startup_tx,
+                    profile, language, root, executable, command_rx, startup_tx,
                 ));
             })
-            .map_err(|error| ProviderError::Protocol(format!("cannot start LSP worker: {error}")))?;
+            .map_err(|error| {
+                ProviderError::Protocol(format!("cannot start LSP worker: {error}"))
+            })?;
 
         let startup = startup_rx
             .recv_timeout(INITIALIZE_TIMEOUT + SHUTDOWN_TIMEOUT)
-            .map_err(|_| ProviderError::Timeout)?;
+            .map_err(|_error| ProviderError::Timeout)?;
         let (position_encoding, text_sync, capabilities) = match startup {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -382,7 +378,10 @@ impl RelationshipProvider {
         self.text_sync
     }
 
-    pub fn synchronize_document(&mut self, document: DocumentSnapshot) -> Result<(), ProviderError> {
+    pub fn synchronize_document(
+        &mut self,
+        document: DocumentSnapshot,
+    ) -> Result<(), ProviderError> {
         self.worker_request(|reply| WorkerCommand::Synchronize { document, reply })?
     }
 
@@ -442,7 +441,7 @@ impl RelationshipProvider {
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.command_tx
             .blocking_send(command(reply_tx))
-            .map_err(|_| ProviderError::SessionClosed)?;
+            .map_err(|_error| ProviderError::SessionClosed)?;
         reply_rx
             .recv_timeout(COMMAND_REPLY_TIMEOUT)
             .map_err(|error| match error {
@@ -456,23 +455,16 @@ impl RelationshipBackend for RelationshipProvider {
         self.capabilities.supports(capability)
     }
 
-    fn request(
-        &mut self,
-        request: RelationshipRequest,
-    ) -> Result<Vec<Location>, ProviderError> {
+    fn request(&mut self, request: RelationshipRequest) -> Result<Vec<Location>, ProviderError> {
         let capability = relationship_request_capability(&request);
         if !self.supports(capability) {
             return Err(ProviderError::Protocol(format!(
                 "LSP server does not advertise {capability:?} support"
             )));
         }
-        self.worker_request(|reply| WorkerCommand::Relationship {
-            request,
-            reply,
-        })?
+        self.worker_request(|reply| WorkerCommand::Relationship { request, reply })?
     }
 }
-
 
 impl Drop for RelationshipProvider {
     fn drop(&mut self) {
@@ -632,7 +624,7 @@ async fn start_worker_session(
         .take()
         .ok_or_else(|| ProviderError::Protocol("LSP stderr pipe is unavailable".to_owned()))?;
 
-    let workspace_uri = Url::from_directory_path(&root).map_err(|()| {
+    let workspace_uri = Url::from_directory_path(&root).map_err(|_error| {
         ProviderError::InvalidWorkspace(format!("workspace {} is not a file URI", root.display()))
     })?;
     let workspace_folder = WorkspaceFolder {
@@ -688,14 +680,13 @@ async fn start_worker_session(
             .unhandled_notification(|_, _| std::ops::ControlFlow::Continue(()));
 
         ServiceBuilder::new()
-            .layer(ConcurrencyLayer::new(
-                NonZeroUsize::new(INCOMING_REQUEST_LIMIT).expect("positive request limit"),
-            ))
+            .layer(ConcurrencyLayer::new(INCOMING_REQUEST_LIMIT))
             .service(router)
     });
 
     let bounded_stdout = BoundedLspReader::new(stdout);
-    let mainloop = tokio::spawn(mainloop.run_buffered(bounded_stdout.compat(), stdin.compat_write()));
+    let mainloop =
+        tokio::spawn(mainloop.run_buffered(bounded_stdout.compat(), stdin.compat_write()));
     let stderr_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_STDERR_BYTES)));
     let stderr_drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&stderr_buffer)));
 
@@ -739,7 +730,12 @@ async fn start_worker_session(
         }),
         ..InitializeParams::default()
     };
-    let initialized = match timeout(INITIALIZE_TIMEOUT, server.request::<async_lsp::lsp_types::request::Initialize>(initialize)).await {
+    let initialized = match timeout(
+        INITIALIZE_TIMEOUT,
+        server.request::<async_lsp::lsp_types::request::Initialize>(initialize),
+    )
+    .await
+    {
         Ok(Ok(initialized)) => initialized,
         Ok(Err(error)) => {
             let context =
@@ -844,7 +840,9 @@ impl WorkerSession {
         let new_total = self
             .document_bytes
             .checked_add(document.text.len())
-            .ok_or_else(|| ProviderError::ResourceLimit("document byte count overflow".to_owned()))?;
+            .ok_or_else(|| {
+                ProviderError::ResourceLimit("document byte count overflow".to_owned())
+            })?;
         if new_total > MAX_DOCUMENT_BYTES {
             return Err(ProviderError::ResourceLimit(format!(
                 "open documents exceed the {MAX_DOCUMENT_BYTES}-byte session limit"
@@ -882,7 +880,9 @@ impl WorkerSession {
                 .notify::<DidCloseTextDocument>(DidCloseTextDocumentParams {
                     text_document: TextDocumentIdentifier { uri: uri.clone() },
                 })
-                .map_err(|error| ProviderError::Protocol(format!("cannot send didClose: {error}")))?;
+                .map_err(|error| {
+                    ProviderError::Protocol(format!("cannot send didClose: {error}"))
+                })?;
             self.document_bytes = self.document_bytes.saturating_sub(open.byte_len);
         }
         Ok(())
@@ -990,10 +990,7 @@ impl WorkerSession {
                 Ok(Err(Error::Response(response)))
                     if response.code == ErrorCode::METHOD_NOT_FOUND =>
                 {
-                    return QueryExecution::unsupported(
-                        key,
-                        RelationshipCapability::IncomingCalls,
-                    );
+                    return QueryExecution::unsupported(key, RelationshipCapability::IncomingCalls);
                 }
                 Ok(Err(error)) => {
                     return QueryExecution::failed(
@@ -1025,10 +1022,7 @@ impl WorkerSession {
                 Ok(Err(Error::Response(response)))
                     if response.code == ErrorCode::METHOD_NOT_FOUND =>
                 {
-                    return QueryExecution::unsupported(
-                        key,
-                        RelationshipCapability::OutgoingCalls,
-                    );
+                    return QueryExecution::unsupported(key, RelationshipCapability::OutgoingCalls);
                 }
                 Ok(Err(error)) => {
                     return QueryExecution::failed(
@@ -1084,19 +1078,22 @@ impl WorkerSession {
                 };
                 match method {
                     RelationshipMethod::Declaration => {
-                        self.goto_relationship::<GotoDeclaration>(params, method).await
+                        self.goto_relationship::<GotoDeclaration>(params, method)
+                            .await
                     }
                     RelationshipMethod::Definition => {
-                        self.goto_relationship::<GotoDefinition>(params, method).await
+                        self.goto_relationship::<GotoDefinition>(params, method)
+                            .await
                     }
                     RelationshipMethod::TypeDefinition => {
-                        self.goto_relationship::<GotoTypeDefinition>(params, method).await
+                        self.goto_relationship::<GotoTypeDefinition>(params, method)
+                            .await
                     }
-                    RelationshipMethod::References => RelationshipQueryExecution::failed(
-                        ProviderError::Protocol(
+                    RelationshipMethod::References => {
+                        RelationshipQueryExecution::failed(ProviderError::Protocol(
                             "References must use a relationship references request".to_owned(),
-                        ),
-                    ),
+                        ))
+                    }
                 }
             }
             RelationshipRequest::References(params) => self.references(params).await,
@@ -1135,7 +1132,10 @@ impl WorkerSession {
         }
     }
 
-    async fn references(&self, params: async_lsp::lsp_types::ReferenceParams) -> RelationshipQueryExecution {
+    async fn references(
+        &self,
+        params: async_lsp::lsp_types::ReferenceParams,
+    ) -> RelationshipQueryExecution {
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
             match timeout_at(deadline, self.server.request::<References>(params.clone())).await {
@@ -1163,7 +1163,12 @@ impl WorkerSession {
             let _ = self.close_document(&uri);
         }
 
-        let shutdown_result = timeout(SHUTDOWN_TIMEOUT, self.server.request::<async_lsp::lsp_types::request::Shutdown>(())).await;
+        let shutdown_result = timeout(
+            SHUTDOWN_TIMEOUT,
+            self.server
+                .request::<async_lsp::lsp_types::request::Shutdown>(()),
+        )
+        .await;
         if matches!(&shutdown_result, Ok(Ok(()))) {
             let _ = self
                 .server
@@ -1180,7 +1185,9 @@ impl WorkerSession {
 
         match shutdown_result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(ProviderError::Protocol(format!("LSP shutdown failed: {error}"))),
+            Ok(Err(error)) => Err(ProviderError::Protocol(format!(
+                "LSP shutdown failed: {error}"
+            ))),
             Err(_) => Err(ProviderError::Timeout),
         }
     }
@@ -1221,9 +1228,7 @@ impl RelationshipQueryExecution {
     }
 }
 
-const fn relationship_request_capability(
-    request: &RelationshipRequest,
-) -> RelationshipCapability {
+const fn relationship_request_capability(request: &RelationshipRequest) -> RelationshipCapability {
     match request {
         RelationshipRequest::Resolve { method, .. } => match method {
             RelationshipMethod::Declaration => RelationshipCapability::Declaration,
@@ -1238,9 +1243,7 @@ const fn relationship_request_capability(
 fn relationship_request_uri(request: &RelationshipRequest) -> &Url {
     match request {
         RelationshipRequest::Resolve { params, .. } => &params.text_document.uri,
-        RelationshipRequest::References(params) => {
-            &params.text_document_position.text_document.uri
-        }
+        RelationshipRequest::References(params) => &params.text_document_position.text_document.uri,
     }
 }
 
@@ -1275,10 +1278,7 @@ impl QueryExecution {
         }
     }
 
-    fn unsupported(
-        key: RelationshipRequestKey,
-        capability: RelationshipCapability,
-    ) -> Self {
+    fn unsupported(key: RelationshipRequestKey, capability: RelationshipCapability) -> Self {
         Self {
             state: ProviderCallHierarchyState::Unsupported { key, capability },
             poison_session: false,
@@ -1326,7 +1326,8 @@ fn resolve_fixed_executable(
         return Err(ProviderError::ExecutableNotFound(executable.to_owned()));
     };
     for directory in env::split_paths(&path) {
-        if !directory.is_absolute() || directory.components().any(|part| part == Component::CurDir) {
+        if !directory.is_absolute() || directory.components().any(|part| part == Component::CurDir)
+        {
             continue;
         }
         let candidate = directory.join(executable);
@@ -1351,10 +1352,12 @@ fn validate_document_uri(root: &Path, uri: &Url) -> Result<(), ProviderError> {
             "only file: document URIs are accepted".to_owned(),
         ));
     }
-    let path = uri.to_file_path().map_err(|()| {
+    let path = uri.to_file_path().map_err(|_error| {
         ProviderError::InvalidDocument(format!("document URI {uri} is not a local file"))
     })?;
-    if path.components().any(|component| component == Component::ParentDir)
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
         || !path.starts_with(root)
     {
         return Err(ProviderError::InvalidDocument(format!(
@@ -1419,7 +1422,11 @@ async fn terminate_uninitialized(
     let stderr = stderr
         .lock()
         .ok()
-        .map(|mut bytes| String::from_utf8_lossy(bytes.make_contiguous()).trim().to_owned())
+        .map(|mut bytes| {
+            String::from_utf8_lossy(bytes.make_contiguous())
+                .trim()
+                .to_owned()
+        })
         .filter(|message| !message.is_empty());
     match (mainloop_failure, stderr) {
         (None, None) => String::new(),
@@ -1431,10 +1438,7 @@ async fn terminate_uninitialized(
     }
 }
 
-async fn drain_stderr(
-    mut stderr: tokio::process::ChildStderr,
-    buffer: Arc<Mutex<VecDeque<u8>>>,
-) {
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr, buffer: Arc<Mutex<VecDeque<u8>>>) {
     let mut chunk = [0u8; 4096];
     loop {
         let count = match stderr.read(&mut chunk).await {
@@ -1514,7 +1518,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLspReader<R> {
                 };
                 output.put_slice(&[byte]);
             }
-            if output.filled().len() > 0 {
+            if !output.filled().is_empty() {
                 return Poll::Ready(Ok(()));
             }
 
@@ -1535,7 +1539,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLspReader<R> {
 }
 
 fn parse_content_length(header: &[u8]) -> io::Result<usize> {
-    let header = std::str::from_utf8(header).map_err(|_| {
+    let header = std::str::from_utf8(header).map_err(|_error| {
         io::Error::new(io::ErrorKind::InvalidData, "LSP header is not valid UTF-8")
     })?;
     let mut content_length = None;
@@ -1550,8 +1554,11 @@ fn parse_content_length(header: &[u8]) -> io::Result<usize> {
                     "duplicate LSP Content-Length header",
                 ));
             }
-            content_length = Some(value.trim().parse::<usize>().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid LSP Content-Length header")
+            content_length = Some(value.trim().parse::<usize>().map_err(|_error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid LSP Content-Length header",
+                )
             })?);
         }
     }

@@ -13,7 +13,9 @@ use trueflow::declaration::review::{
 use trueflow::declaration::snapshot::{
     PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId, SourceSnapshot,
 };
-use trueflow::declaration::{DeclarationId, DeclarationKey, DeclarationNode, DeclarationProjectionHash};
+use trueflow::declaration::{
+    DeclarationId, DeclarationKey, DeclarationNode, DeclarationProjectionHash,
+};
 use trueflow::hashing::BytesHash;
 use trueflow::repo_path::RepoPath;
 use trueflow::store::{
@@ -25,12 +27,7 @@ use trueflow::store::{
 const REVISION: &str = "0123456789abcdef";
 
 fn snapshot(id: &str, path: &str, source: &str) -> SourceSnapshot {
-    SourceSnapshot::new(
-        SnapshotId::new(id),
-        Path::new(path),
-        Language::Rust,
-        source,
-    )
+    SourceSnapshot::new(SnapshotId::new(id), Path::new(path), Language::Rust, source)
 }
 
 fn pair(
@@ -44,10 +41,7 @@ fn pair(
 
 fn batch(pairs: Vec<SnapshotPair>) -> Result<(DeclarationReviewDiffBatch, DeclarationDiff)> {
     let diff = diff_declarations(&pairs)?;
-    Ok((
-        DeclarationReviewDiffBatch::new(pairs, diff.clone()),
-        diff,
-    ))
+    Ok((DeclarationReviewDiffBatch::new(pairs, diff.clone()), diff))
 }
 
 fn reviewed_snapshot(snapshot: &SourceSnapshot) -> ReviewedDeclarationSnapshot {
@@ -57,7 +51,10 @@ fn reviewed_snapshot(snapshot: &SourceSnapshot) -> ReviewedDeclarationSnapshot {
     }
 }
 
-fn locator(snapshot: &SourceSnapshot, declaration: &DeclarationNode) -> Result<DeclarationRecordLocator> {
+fn locator(
+    snapshot: &SourceSnapshot,
+    declaration: &DeclarationNode,
+) -> Result<DeclarationRecordLocator> {
     Ok(DeclarationRecordLocator {
         path: RepoPath::new(
             snapshot
@@ -80,12 +77,13 @@ fn record(
     verdict: Verdict,
     timestamp: i64,
 ) -> Result<Record> {
+    let is_comment = verdict == Verdict::Comment;
     let mut record = Record::new(
         ReviewTargetRef::Declaration {
             hash: declaration.projection_hash.clone(),
         },
         ReviewCheck::declaration(),
-        verdict.clone(),
+        verdict,
         Identity::Email {
             email: "reviewer@example.com".to_string(),
         },
@@ -98,7 +96,7 @@ fn record(
     record.id = id.to_string();
     record.timestamp = timestamp;
     record.declaration_locator = Some(locator(snapshot, declaration)?);
-    if verdict == Verdict::Comment {
+    if is_comment {
         record.note = Some("needs another look".to_string());
     }
     Ok(record)
@@ -142,13 +140,13 @@ fn assert_binding(
     declaration_id: &DeclarationId,
     record_index: usize,
     kind: CoverageBindingKind,
-    verdict: Verdict,
+    verdict: &Verdict,
 ) {
     let binding = binding(index, pair_id, declaration_id)
         .unwrap_or_else(|| panic!("missing binding for {pair_id}:{}", declaration_id.as_str()));
     assert_eq!(binding.record_index(), record_index);
     assert_eq!(binding.kind(), kind);
-    assert_eq!(binding.verdict(), &verdict);
+    assert_eq!(binding.verdict(), verdict);
 }
 
 #[test]
@@ -171,17 +169,10 @@ fn exact_locators_bind_duplicate_equal_hashes_before_verdict_selection() -> Resu
         ),
     ];
     let (batch, diff) = batch(pairs)?;
-    let first_declaration = diff.units[0]
-        .head
-        .as_ref()
-        .context("first declaration")?;
-    let second_declaration = diff.units[1]
-        .head
-        .as_ref()
-        .context("second declaration")?;
+    let first_declaration = diff.units[0].head.as_ref().context("first declaration")?;
+    let second_declaration = diff.units[1].head.as_ref().context("second declaration")?;
     assert_eq!(
-        first_declaration.projection_hash,
-        second_declaration.projection_hash,
+        first_declaration.projection_hash, second_declaration.projection_hash,
         "fixture must exercise equal content identities"
     );
 
@@ -209,7 +200,7 @@ fn exact_locators_bind_duplicate_equal_hashes_before_verdict_selection() -> Resu
         &first_declaration.id,
         0,
         CoverageBindingKind::ExactLocator,
-        Verdict::Approved,
+        &Verdict::Approved,
     );
     assert_binding(
         &index,
@@ -217,7 +208,7 @@ fn exact_locators_bind_duplicate_equal_hashes_before_verdict_selection() -> Resu
         &second_declaration.id,
         1,
         CoverageBindingKind::ExactLocator,
-        Verdict::Rejected,
+        &Verdict::Rejected,
     );
     Ok(())
 }
@@ -228,12 +219,7 @@ fn ambiguous_key_or_hash_fallbacks_leave_every_duplicate_uncovered() -> Result<(
     let first = snapshot("first-head", "src/first.rs", source);
     let second = snapshot("second-head", "src/second.rs", source);
     let pairs = vec![
-        pair(
-            "first-pair",
-            None,
-            Some(first.clone()),
-            PathPairEvidence::Unmatched,
-        ),
+        pair("first-pair", None, Some(first), PathPairEvidence::Unmatched),
         pair(
             "second-pair",
             None,
@@ -242,17 +228,11 @@ fn ambiguous_key_or_hash_fallbacks_leave_every_duplicate_uncovered() -> Result<(
         ),
     ];
     let (batch, diff) = batch(pairs)?;
-    let first_declaration = diff.units[0]
-        .head
-        .as_ref()
-        .context("first declaration")?;
-    let second_declaration = diff.units[1]
-        .head
-        .as_ref()
-        .context("second declaration")?;
+    let first_declaration = diff.units[0].head.as_ref().context("first declaration")?;
+    let second_declaration = diff.units[1].head.as_ref().context("second declaration")?;
 
     let obsolete = snapshot("obsolete", "old/location.rs", source);
-    let mut ambiguous_key = record(
+    let ambiguous_key = record(
         "ambiguous-key",
         &obsolete,
         first_declaration,
@@ -269,7 +249,7 @@ fn ambiguous_key_or_hash_fallbacks_leave_every_duplicate_uncovered() -> Result<(
         .declaration_key = DeclarationKey::new("non-matching-key");
 
     for candidate in [ambiguous_key, ambiguous_hash] {
-        let index = DeclarationCoverageIndex::build(&[batch.clone()], &[candidate])?;
+        let index = DeclarationCoverageIndex::build(std::slice::from_ref(&batch), &[candidate])?;
         assert!(binding(&index, "first-pair", &first_declaration.id).is_none());
         assert!(binding(&index, "second-pair", &second_declaration.id).is_none());
     }
@@ -301,7 +281,7 @@ fn same_path_unique_key_hash_fallback_survives_locator_drift() -> Result<()> {
         &declaration.id,
         0,
         CoverageBindingKind::SamePathKeyHash,
-        Verdict::Approved,
+        &Verdict::Approved,
     );
     Ok(())
 }
@@ -333,7 +313,7 @@ fn proven_file_rename_and_declaration_match_carry_approval() -> Result<()> {
         &declaration_match.head.id,
         0,
         CoverageBindingKind::ProvenRenameMatch,
-        Verdict::Approved,
+        &Verdict::Approved,
     );
     Ok(())
 }
@@ -371,8 +351,16 @@ fn unproven_move_and_declaration_rename_do_not_transfer_coverage() -> Result<()>
     let unproven = DeclarationCoverageIndex::build(&[unproven_batch], &[old_approval])?;
     assert!(binding(&unproven, "unproven-move", &moved_declaration.id).is_none());
 
-    let rename_base = snapshot("rename-base", "src/lib.rs", "pub fn before(value: u8) -> u8 { value }\n");
-    let rename_head = snapshot("rename-head", "src/lib.rs", "pub fn after(value: u8) -> u8 { value }\n");
+    let rename_base = snapshot(
+        "rename-base",
+        "src/lib.rs",
+        "pub fn before(value: u8) -> u8 { value }\n",
+    );
+    let rename_head = snapshot(
+        "rename-head",
+        "src/lib.rs",
+        "pub fn after(value: u8) -> u8 { value }\n",
+    );
     let (rename_batch, rename_diff) = batch(vec![pair(
         "declaration-rename",
         Some(rename_base.clone()),
@@ -436,14 +424,15 @@ fn path_independent_key_hash_and_hash_only_fallbacks_require_global_uniqueness()
         Verdict::Approved,
         10,
     )?;
-    let key_hash_index = DeclarationCoverageIndex::build(&[unique_batch.clone()], &[key_hash_record])?;
+    let key_hash_index =
+        DeclarationCoverageIndex::build(std::slice::from_ref(&unique_batch), &[key_hash_record])?;
     assert_binding(
         &key_hash_index,
         "unique-pair",
         &unique_declaration.id,
         0,
         CoverageBindingKind::UniqueKeyHash,
-        Verdict::Approved,
+        &Verdict::Approved,
     );
 
     let mut hash_only_record = record(
@@ -461,14 +450,14 @@ fn path_independent_key_hash_and_hash_only_fallbacks_require_global_uniqueness()
     hash_only_locator.declaration_key = DeclarationKey::new("unrelated-key");
     hash_only_locator.reviewed_snapshot.snapshot_id = "unrelated-snapshot".to_string();
     let hash_only_index =
-        DeclarationCoverageIndex::build(&[unique_batch], &[hash_only_record.clone()])?;
+        DeclarationCoverageIndex::build(&[unique_batch], std::slice::from_ref(&hash_only_record))?;
     assert_binding(
         &hash_only_index,
         "unique-pair",
         &unique_declaration.id,
         0,
         CoverageBindingKind::UniqueHash,
-        Verdict::Comment,
+        &Verdict::Comment,
     );
 
     let duplicate = snapshot("duplicate-head", "src/duplicate.rs", source);
@@ -490,7 +479,12 @@ fn path_independent_key_hash_and_hash_only_fallbacks_require_global_uniqueness()
     for unit in &ambiguous_diff.units {
         let declaration = unit.head.as_ref().context("added declaration")?;
         assert!(
-            binding(&ambiguous_index, unit.snapshot_pair_id.as_str(), &declaration.id).is_none(),
+            binding(
+                &ambiguous_index,
+                unit.snapshot_pair_id.as_str(),
+                &declaration.id
+            )
+            .is_none(),
             "hash-only coverage must not choose between equal candidates"
         );
     }
@@ -516,14 +510,8 @@ fn latest_verdict_is_chosen_after_binding_and_timestamp_ties_use_append_position
             PathPairEvidence::Unmatched,
         ),
     ])?;
-    let first_declaration = diff.units[0]
-        .head
-        .as_ref()
-        .context("first declaration")?;
-    let second_declaration = diff.units[1]
-        .head
-        .as_ref()
-        .context("second declaration")?;
+    let first_declaration = diff.units[0].head.as_ref().context("first declaration")?;
+    let second_declaration = diff.units[1].head.as_ref().context("second declaration")?;
     let records = vec![
         record(
             "first-old",
@@ -562,7 +550,7 @@ fn latest_verdict_is_chosen_after_binding_and_timestamp_ties_use_append_position
         &first_declaration.id,
         3,
         CoverageBindingKind::ExactLocator,
-        Verdict::Approved,
+        &Verdict::Approved,
     );
     assert_binding(
         &index,
@@ -570,7 +558,7 @@ fn latest_verdict_is_chosen_after_binding_and_timestamp_ties_use_append_position
         &second_declaration.id,
         1,
         CoverageBindingKind::ExactLocator,
-        Verdict::Comment,
+        &Verdict::Comment,
     );
     Ok(())
 }
@@ -688,7 +676,7 @@ fn structured_declaration_builder_preserves_resolved_provenance_locator_and_anch
     };
     let request = StructuredMarkRequest {
         target: ReviewTargetRef::Declaration {
-            hash: declaration.projection_hash.clone(),
+            hash: declaration.projection_hash,
         },
         check: ReviewCheck::declaration(),
         verdict: Verdict::Comment,
@@ -707,7 +695,10 @@ fn structured_declaration_builder_preserves_resolved_provenance_locator_and_anch
     assert_eq!(built.repo_ref, repo_ref);
     assert_eq!(built.block_state, BlockState::Uncommitted);
     assert_eq!(built.declaration_locator, Some(locator));
-    assert_eq!(built.comment_anchor, Some(CommentAnchor::Declaration(anchor)));
+    assert_eq!(
+        built.comment_anchor,
+        Some(CommentAnchor::Declaration(anchor))
+    );
     assert_eq!(built.path_hint, None);
     assert_eq!(built.line_hint, None);
     Ok(())
@@ -727,7 +718,7 @@ fn structured_declaration_builder_rejects_resolved_field_mismatches() -> Result<
     let anchor = declaration_anchor(&head, &declaration.projection_hash, source);
     let request = StructuredMarkRequest {
         target: ReviewTargetRef::Declaration {
-            hash: declaration.projection_hash.clone(),
+            hash: declaration.projection_hash,
         },
         check: ReviewCheck::declaration(),
         verdict: Verdict::Approved,

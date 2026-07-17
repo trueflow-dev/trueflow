@@ -201,7 +201,7 @@ pub(crate) fn move_selection(
     let next = if delta.is_negative() {
         current.saturating_sub(delta.unsigned_abs())
     } else {
-        current.saturating_add(delta as usize).min(last)
+        current.saturating_add(delta.unsigned_abs()).min(last)
     };
     pane.selection = Some(rows[next].selection());
     ensure_visible(pane, next, rows.len(), height);
@@ -272,9 +272,13 @@ pub fn render_relationship_pane(
         return;
     }
     let heading_style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
     };
     Paragraph::new("RELATIONSHIPS")
         .style(heading_style)
@@ -304,7 +308,10 @@ pub fn render_relationship_pane(
             } else {
                 normal
             };
-            Line::from(vec![Span::styled(prefix, style), Span::styled(&row.text, style)])
+            Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(&row.text, style),
+            ])
         })
         .collect::<Vec<_>>();
     Paragraph::new(lines).render(content, buffer);
