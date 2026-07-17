@@ -1,18 +1,29 @@
+use std::collections::{HashSet, VecDeque};
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use async_lsp::lsp_types::{CallHierarchyItem, Position, Range as LspRange, SymbolKind, Url};
+use async_lsp::lsp_types::{
+    CallHierarchyItem, Location, Position, Range as LspRange, ReferenceContext, ReferenceParams,
+    SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+};
 use serde_json::json;
 use trueflow::analysis::Language;
 use trueflow::declaration::relationships::{
-    byte_offset_for_lsp_position, incoming_calls_params, lsp_position_for_byte_offset,
-    outgoing_calls_params, reconcile_relationship_result, server_request_policy, start_session,
-    DocumentHash, LaunchError, LspServerLauncher, LspServerProfile, PositionEncoding,
-    RelationshipCapability, RelationshipEdge, RelationshipKind, RelationshipOutcome,
-    RelationshipRequestKey, RelationshipResult, RelationshipState, RelationshipTarget,
-    ServerRequestDecision, SessionState, SourceGeneration, WorkspaceTrust,
+    byte_offset_for_lsp_position, execute_relationship_plan, incoming_calls_params,
+    lsp_position_for_byte_offset, outgoing_calls_params, plan_used_by, plan_uses_types,
+    reconcile_relationship_execution, reconcile_relationship_result, server_request_policy,
+    start_session, DocumentHash, LaunchError, LspServerLauncher, LspServerProfile,
+    PositionEncoding, ProjectedDocument, ProviderError, RelationshipBackend,
+    RelationshipCapability, RelationshipEdge, RelationshipKind, RelationshipLocation,
+    RelationshipMethod, RelationshipOutcome, RelationshipProjectionIndex,
+    RelationshipProvenance, RelationshipRequest, RelationshipRequestKey, RelationshipResult,
+    RelationshipScope, RelationshipState, RelationshipTarget, ServerRequestDecision, SessionState,
+    SourceGeneration, WorkspaceTrust,
 };
-use trueflow::declaration::{DeclarationId, DeclarationKey};
+use trueflow::declaration::{
+    project_source, DeclarationId, DeclarationKey, DeclarationKind, DeclarationNode, TypeUseRole,
+};
 
 #[test]
 fn common_five_profiles_pin_executable_argv_and_language_id() -> Result<()> {
@@ -248,6 +259,7 @@ fn call_edge() -> RelationshipEdge {
         kind: RelationshipKind::Calls,
         source: DeclarationId::new("declaration:caller"),
         target: RelationshipTarget::InReview(DeclarationId::new("declaration:callee")),
+        locations: Vec::new(),
     }
 }
 
@@ -407,6 +419,391 @@ fn call_hierarchy_followups_preserve_the_prepared_item_including_opaque_data() -
         outgoing_calls_params(prepared.clone()).item,
         prepared,
         "outgoingCalls must receive the exact item returned by prepareCallHierarchy"
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FakeRelationshipBackend {
+    capabilities: HashSet<RelationshipCapability>,
+    replies: VecDeque<std::result::Result<Vec<Location>, ProviderError>>,
+    requests: Vec<RelationshipRequest>,
+}
+
+impl FakeRelationshipBackend {
+    fn new(
+        capabilities: impl IntoIterator<Item = RelationshipCapability>,
+        replies: impl IntoIterator<Item = Vec<Location>>,
+    ) -> Self {
+        Self {
+            capabilities: capabilities.into_iter().collect(),
+            replies: replies.into_iter().map(Ok).collect(),
+            requests: Vec::new(),
+        }
+    }
+
+    fn assert_exhausted(&self) {
+        assert!(
+            self.replies.is_empty(),
+            "the planner skipped {} scripted relationship replies",
+            self.replies.len()
+        );
+    }
+}
+
+impl RelationshipBackend for FakeRelationshipBackend {
+    fn supports(&self, capability: RelationshipCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    fn request(
+        &mut self,
+        request: RelationshipRequest,
+    ) -> std::result::Result<Vec<Location>, ProviderError> {
+        self.requests.push(request);
+        self.replies.pop_front().unwrap_or_else(|| {
+            Err(ProviderError::Protocol(
+                "relationship planner issued an unscripted request".to_owned(),
+            ))
+        })
+    }
+}
+
+fn declaration_named<'a>(
+    declarations: &'a [DeclarationNode],
+    name: &str,
+    kind: DeclarationKind,
+) -> &'a DeclarationNode {
+    declarations
+        .iter()
+        .find(|declaration| declaration.name == name && declaration.kind == kind)
+        .unwrap_or_else(|| panic!("missing projected {kind:?} declaration {name}"))
+}
+
+fn nth_byte_range(source: &str, needle: &str, occurrence: usize) -> Range<usize> {
+    let start = source
+        .match_indices(needle)
+        .nth(occurrence)
+        .map(|(start, _)| start)
+        .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {needle:?}"));
+    start..start + needle.len()
+}
+
+fn location_at(
+    uri: &Url,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+) -> Location {
+    Location {
+        uri: uri.clone(),
+        range: LspRange::new(
+            Position::new(start_line, start_character),
+            Position::new(end_line, end_character),
+        ),
+    }
+}
+
+fn resolve_request(method: RelationshipMethod, uri: &Url, line: u32, character: u32) -> RelationshipRequest {
+    RelationshipRequest::Resolve {
+        method,
+        params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position::new(line, character),
+        },
+    }
+}
+
+fn references_request(
+    uri: &Url,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> RelationshipRequest {
+    RelationshipRequest::References(ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position::new(line, character),
+        },
+        context: ReferenceContext {
+            include_declaration,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    })
+}
+
+#[test]
+fn uses_types_queries_only_projected_type_tokens_and_reconciles_exact_targets_with_method_provenance(
+) -> Result<()> {
+    const SOURCE: &str = concat!(
+        "export interface Input {}\n",
+        "const sameSpelling = \"Input\";\n",
+        "\n",
+        "export class Mapper {\n",
+        "    map(/*😀*/ first: Input, second: Input): ExternalType | Missing {\n",
+        "        throw new Error();\n",
+        "    }\n",
+        "}\n",
+    );
+    let uri = Url::parse("file:///review/workspace/src/mapper.ts")?;
+    let facts = project_source(Path::new("src/mapper.ts"), Language::TypeScript, SOURCE)?;
+    let input = declaration_named(facts.declarations(), "Input", DeclarationKind::Interface).clone();
+    let mapper = declaration_named(facts.declarations(), "map", DeclarationKind::Method).clone();
+    let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
+    let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
+    let plan = plan_uses_types(&index, &mapper.id, PositionEncoding::Utf16)?;
+
+    assert_eq!(
+        mapper
+            .type_use_sites
+            .iter()
+            .map(|site| (site.name.as_str(), site.role, site.source_range.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Input", TypeUseRole::Parameter, nth_byte_range(SOURCE, "Input", 2)),
+            ("Input", TypeUseRole::Parameter, nth_byte_range(SOURCE, "Input", 3)),
+            (
+                "ExternalType",
+                TypeUseRole::Return,
+                nth_byte_range(SOURCE, "ExternalType", 0),
+            ),
+            (
+                "Missing",
+                TypeUseRole::Return,
+                nth_byte_range(SOURCE, "Missing", 0),
+            ),
+        ],
+        "the request plan must originate only from projector-classified declaration-surface type uses"
+    );
+
+    let input_declaration = location_at(&uri, 0, 17, 0, 22);
+    let same_spelling_value = location_at(&uri, 1, 22, 1, 27);
+    let external_uri = Url::parse("file:///registry/types/index.d.ts")?;
+    let external_declaration = location_at(&external_uri, 2, 4, 2, 16);
+    let mut backend = FakeRelationshipBackend::new(
+        [
+            RelationshipCapability::Declaration,
+            RelationshipCapability::Definition,
+            RelationshipCapability::TypeDefinition,
+        ],
+        [
+            vec![input_declaration.clone()],
+            vec![same_spelling_value.clone()],
+            vec![],
+            vec![external_declaration.clone()],
+            vec![],
+            vec![],
+        ],
+    );
+    let execution = execute_relationship_plan(&plan, &mut backend)?;
+
+    assert_eq!(
+        backend.requests,
+        vec![
+            resolve_request(RelationshipMethod::Declaration, &uri, 4, 22),
+            resolve_request(RelationshipMethod::Declaration, &uri, 4, 37),
+            resolve_request(RelationshipMethod::Declaration, &uri, 4, 45),
+            resolve_request(RelationshipMethod::Definition, &uri, 4, 45),
+            resolve_request(RelationshipMethod::Declaration, &uri, 4, 60),
+            resolve_request(RelationshipMethod::Definition, &uri, 4, 60),
+        ],
+        "UTF-16 request positions must come from exact projected byte ranges; definition is only the declaration fallback"
+    );
+    backend.assert_exhausted();
+
+    let input_use = location_at(&uri, 4, 22, 4, 27);
+    let second_input_use = location_at(&uri, 4, 37, 4, 42);
+    let external_use = location_at(&uri, 4, 45, 4, 57);
+    let missing_use = location_at(&uri, 4, 60, 4, 67);
+    assert_eq!(
+        reconcile_relationship_execution(&plan, execution, &index)?,
+        RelationshipOutcome::Complete {
+            edges: vec![
+                RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: mapper.id.clone(),
+                    target: RelationshipTarget::InReview(input.id),
+                    locations: vec![RelationshipLocation {
+                        origin: input_use,
+                        target: Some(input_declaration),
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::Declaration,
+                            role: TypeUseRole::Parameter,
+                            scope: RelationshipScope::Workspace,
+                        },
+                    }],
+                },
+                RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: mapper.id.clone(),
+                    target: RelationshipTarget::Unresolved {
+                        name: "Input".to_owned(),
+                    },
+                    locations: vec![RelationshipLocation {
+                        origin: second_input_use,
+                        target: Some(same_spelling_value),
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::Declaration,
+                            role: TypeUseRole::Parameter,
+                            scope: RelationshipScope::Workspace,
+                        },
+                    }],
+                },
+                RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: mapper.id.clone(),
+                    target: RelationshipTarget::External {
+                        uri: external_uri,
+                        range: external_declaration.range,
+                    },
+                    locations: vec![RelationshipLocation {
+                        origin: external_use,
+                        target: Some(external_declaration),
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::Definition,
+                            role: TypeUseRole::Return,
+                            scope: RelationshipScope::Workspace,
+                        },
+                    }],
+                },
+                RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: mapper.id,
+                    target: RelationshipTarget::Unresolved {
+                        name: "Missing".to_owned(),
+                    },
+                    locations: vec![RelationshipLocation {
+                        origin: missing_use,
+                        target: None,
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::Definition,
+                            role: TypeUseRole::Return,
+                            scope: RelationshipScope::Workspace,
+                        },
+                    }],
+                },
+            ],
+        },
+        "same-spelled values must not reconcile as type declarations, while external and unresolved targets retain exact provenance"
+    );
+    Ok(())
+}
+
+#[test]
+fn used_by_keeps_only_declaration_surface_type_references_and_labels_subset_scope() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "export interface Payload {}\n",
+        "\n",
+        "export function decode(/*😀*/ input: Payload): Payload {\n",
+        "    console.log(Payload);\n",
+        "    const local: Payload = input;\n",
+        "    return input;\n",
+        "}\n",
+    );
+    let uri = Url::parse("file:///review/workspace/src/payload.ts")?;
+    let facts = project_source(Path::new("src/payload.ts"), Language::TypeScript, SOURCE)?;
+    let payload = declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
+    let decode = declaration_named(facts.declarations(), "decode", DeclarationKind::Function).clone();
+    let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
+    let index = RelationshipProjectionIndex::new(RelationshipScope::ProjectedSubset, [document]);
+    let plan = plan_used_by(&index, &payload.id, PositionEncoding::Utf16)?;
+
+    let payload_declaration = location_at(&uri, 0, 17, 0, 24);
+    let ordinary_value_reference = location_at(&uri, 3, 16, 3, 23);
+    let parameter_type_use = location_at(&uri, 2, 37, 2, 44);
+    let return_type_use = location_at(&uri, 2, 47, 2, 54);
+    let executable_body_type_use = location_at(&uri, 4, 17, 4, 24);
+    let mut backend = FakeRelationshipBackend::new(
+        [RelationshipCapability::References],
+        [vec![
+            payload_declaration.clone(),
+            ordinary_value_reference,
+            parameter_type_use.clone(),
+            return_type_use.clone(),
+            executable_body_type_use,
+        ]],
+    );
+    let execution = execute_relationship_plan(&plan, &mut backend)?;
+
+    assert_eq!(
+        backend.requests,
+        vec![references_request(&uri, 0, 17, false)],
+        "UsedBy must start at the reconciled type declaration and explicitly exclude declaration locations"
+    );
+    backend.assert_exhausted();
+    assert_eq!(
+        reconcile_relationship_execution(&plan, execution, &index)?,
+        RelationshipOutcome::Complete {
+            edges: vec![RelationshipEdge {
+                kind: RelationshipKind::UsedBy,
+                source: payload.id,
+                target: RelationshipTarget::InReview(decode.id),
+                locations: vec![
+                    RelationshipLocation {
+                        origin: payload_declaration.clone(),
+                        target: Some(parameter_type_use),
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::References,
+                            role: TypeUseRole::Parameter,
+                            scope: RelationshipScope::ProjectedSubset,
+                        },
+                    },
+                    RelationshipLocation {
+                        origin: payload_declaration,
+                        target: Some(return_type_use),
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::References,
+                            role: TypeUseRole::Return,
+                            scope: RelationshipScope::ProjectedSubset,
+                        },
+                    },
+                ],
+            }],
+        },
+        "references in value positions, the declaration itself, and executable bodies must be filtered even when the server returns them"
+    );
+    Ok(())
+}
+
+#[test]
+fn absent_references_capability_is_unsupported_but_supported_empty_is_complete() -> Result<()> {
+    const SOURCE: &str = "export interface Payload {}\n";
+    let uri = Url::parse("file:///review/workspace/src/payload.ts")?;
+    let facts = project_source(Path::new("src/payload.ts"), Language::TypeScript, SOURCE)?;
+    let payload = declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
+    let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
+    let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
+    let plan = plan_used_by(&index, &payload.id, PositionEncoding::Utf16)?;
+
+    let mut unsupported_backend = FakeRelationshipBackend::new([], []);
+    let unsupported_execution = execute_relationship_plan(&plan, &mut unsupported_backend)?;
+    assert!(
+        unsupported_backend.requests.is_empty(),
+        "an absent references capability must not be queried"
+    );
+    assert_eq!(
+        reconcile_relationship_execution(&plan, unsupported_execution, &index)?,
+        RelationshipOutcome::Unsupported {
+            capability: RelationshipCapability::References,
+        }
+    );
+
+    let mut empty_backend = FakeRelationshipBackend::new(
+        [RelationshipCapability::References],
+        [Vec::<Location>::new()],
+    );
+    let empty_execution = execute_relationship_plan(&plan, &mut empty_backend)?;
+    assert_eq!(
+        empty_backend.requests,
+        vec![references_request(&uri, 0, 17, false)]
+    );
+    empty_backend.assert_exhausted();
+    assert_eq!(
+        reconcile_relationship_execution(&plan, empty_execution, &index)?,
+        RelationshipOutcome::Complete { edges: Vec::new() },
+        "a supported references request with no locations is a successful empty relationship result"
     );
     Ok(())
 }
