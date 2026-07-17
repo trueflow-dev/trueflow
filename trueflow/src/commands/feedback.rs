@@ -2451,7 +2451,7 @@ fn feedback_entry_to_json_value(entry: &FeedbackEntry) -> serde_json::Value {
         "latest_verdict".to_string(),
         serde_json::json!(entry.latest_verdict),
     );
-    match entry.kind {
+    match &entry.kind {
         FeedbackEntryKind::Block => {
             object.insert("target".to_string(), serde_json::json!({ "kind": "block" }));
             if let Some(block) = &entry.block {
@@ -2469,6 +2469,13 @@ fn feedback_entry_to_json_value(entry: &FeedbackEntry) -> serde_json::Value {
                 );
                 object.insert("declaration".to_string(), serde_json::json!(declaration));
             }
+        }
+        FeedbackEntryKind::DeclarationResolutionFailed { reason } => {
+            object.insert(
+                "target".to_string(),
+                serde_json::json!({ "kind": "declaration" }),
+            );
+            object.insert("resolution_error".to_string(), serde_json::json!(reason));
         }
     }
     serde_json::Value::Object(object)
@@ -2488,7 +2495,7 @@ pub fn feedback_entries_to_xml(entries: &[FeedbackEntry]) -> Result<String> {
             ));
             current_file_path = Some(entry.file_path.as_str());
         }
-        match entry.kind {
+        match &entry.kind {
             FeedbackEntryKind::Block => {
                 let Some(block) = entry.block.as_ref() else {
                     return Err(anyhow!("block feedback entry is missing its block surface"));
@@ -2502,6 +2509,9 @@ pub fn feedback_entries_to_xml(entries: &[FeedbackEntry]) -> Result<String> {
                     ));
                 };
                 xml.push_str(&declaration_xml(declaration, &entry.reviews));
+            }
+            FeedbackEntryKind::DeclarationResolutionFailed { reason } => {
+                xml.push_str(&declaration_resolution_failure_xml(reason, &entry.reviews));
             }
         }
     }
@@ -2548,6 +2558,19 @@ fn declaration_xml(
         xml.push_str(&escape_cdata(context));
         xml.push_str("]]></context>\n");
     }
+    xml.push_str(&reviews_xml(reviews));
+    xml.push_str("    </declaration>\n");
+    xml
+}
+
+fn declaration_resolution_failure_xml(
+    reason: &str,
+    reviews: &[crate::store::Record],
+) -> String {
+    let mut xml = format!(
+        "    <declaration target_kind=\"declaration\" resolution_error=\"{}\">\n",
+        escape_xml(reason)
+    );
     xml.push_str(&reviews_xml(reviews));
     xml.push_str("    </declaration>\n");
     xml

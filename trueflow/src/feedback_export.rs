@@ -83,11 +83,12 @@ impl FeedbackBlockView {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackEntryKind {
     Block,
     Declaration,
+    DeclarationResolutionFailed { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -324,7 +325,7 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
                     Ok(blob) => blob,
                     Err(_) => return Ok(None),
                 };
-                blob.data.to_vec()
+                blob.data.clone()
             }
             BlockState::Uncommitted => {
                 let workdir = repo
@@ -455,17 +456,28 @@ struct ResolvedFeedbackRecord<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DeclarationFeedbackEntryKey {
-    locator: DeclarationRecordLocator,
-    ranges: Vec<DeclarationAnchorRange>,
-    context: Option<String>,
+enum DeclarationFeedbackEntryKey {
+    Resolved {
+        locator: DeclarationRecordLocator,
+        ranges: Vec<DeclarationAnchorRange>,
+        context: Option<String>,
+    },
+    ResolutionFailed {
+        locator: DeclarationRecordLocator,
+        reason: String,
+    },
+}
+
+enum DeclarationFeedbackResolution {
+    Resolved(ResolvedDeclarationFeedback),
+    Failed(String),
 }
 
 struct ResolvedDeclarationFeedbackRecord<'a> {
     index: usize,
     record: &'a Record,
     locator: DeclarationRecordLocator,
-    declaration: ResolvedDeclarationFeedback,
+    resolution: DeclarationFeedbackResolution,
 }
 
 fn resolve_feedback_records<'a>(
@@ -636,30 +648,33 @@ fn collect_declaration_feedback_entries(
         {
             continue;
         }
-        let Some(declaration) = resolver.resolve_declaration_context(record)? else {
-            continue;
-        };
         let Some(locator) = record.declaration_locator.clone() else {
             continue;
+        };
+        let resolution = match resolver.resolve_declaration_context(record) {
+            Ok(Some(declaration)) => DeclarationFeedbackResolution::Resolved(declaration),
+            Ok(None) => DeclarationFeedbackResolution::Failed(
+                "captured declaration source or projection is unavailable".to_owned(),
+            ),
+            Err(error) => DeclarationFeedbackResolution::Failed(format!("{error:#}")),
         };
         resolved.push(ResolvedDeclarationFeedbackRecord {
             index,
             record,
             locator,
-            declaration,
+            resolution,
         });
     }
 
     let mut latest = HashMap::<DeclarationRecordLocator, (i64, usize, &'static str)>::new();
     for resolved in &resolved {
         let record = resolved.record;
-        let should_replace =
-            latest
-                .get(&resolved.locator)
-                .is_none_or(|(timestamp, existing_index, _)| {
-                    record.timestamp > *timestamp
-                        || (record.timestamp == *timestamp && resolved.index > *existing_index)
-                });
+        let should_replace = latest
+            .get(&resolved.locator)
+            .is_none_or(|(timestamp, existing_index, _)| {
+                record.timestamp > *timestamp
+                    || (record.timestamp == *timestamp && resolved.index > *existing_index)
+            });
         if should_replace {
             latest.insert(
                 resolved.locator.clone(),
@@ -673,13 +688,17 @@ fn collect_declaration_feedback_entries(
         .collect::<HashMap<_, _>>();
     let mut grouped = HashMap::<DeclarationFeedbackEntryKey, FeedbackEntry>::new();
     for resolved in resolved {
+        let display_path = match &resolved.resolution {
+            DeclarationFeedbackResolution::Resolved(declaration) => declaration.path.as_str(),
+            DeclarationFeedbackResolution::Failed(_) => resolved.locator.path.as_str(),
+        };
         if !record_matches_since(
             resolved.record,
             resolved.index,
             since_filter,
             validated_cursor,
         ) || !path_matches_feedback_selections(
-            resolved.declaration.path.as_str(),
+            display_path,
             query.explicit_selection.as_ref(),
             query.changed_selection.as_ref(),
         ) {
@@ -692,21 +711,42 @@ fn collect_declaration_feedback_entries(
         if !query.include_approved && latest_verdict == "approved" {
             continue;
         }
-        let key = DeclarationFeedbackEntryKey {
-            locator: resolved.locator,
-            ranges: resolved.declaration.ranges.clone(),
-            context: resolved.declaration.context.clone(),
-        };
-        let file_path = resolved.declaration.path.to_string();
-        let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
-            kind: FeedbackEntryKind::Declaration,
-            file_path,
-            block: None,
-            declaration: Some(resolved.declaration),
-            reviews: Vec::new(),
-            latest_verdict: latest_verdict.to_string(),
-        });
-        entry.reviews.push(resolved.record.clone());
+
+        match resolved.resolution {
+            DeclarationFeedbackResolution::Resolved(declaration) => {
+                let key = DeclarationFeedbackEntryKey::Resolved {
+                    locator: resolved.locator,
+                    ranges: declaration.ranges.clone(),
+                    context: declaration.context.clone(),
+                };
+                let file_path = declaration.path.to_string();
+                let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
+                    kind: FeedbackEntryKind::Declaration,
+                    file_path,
+                    block: None,
+                    declaration: Some(declaration),
+                    reviews: Vec::new(),
+                    latest_verdict: latest_verdict.to_string(),
+                });
+                entry.reviews.push(resolved.record.clone());
+            }
+            DeclarationFeedbackResolution::Failed(reason) => {
+                let file_path = resolved.locator.path.to_string();
+                let key = DeclarationFeedbackEntryKey::ResolutionFailed {
+                    locator: resolved.locator,
+                    reason: reason.clone(),
+                };
+                let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
+                    kind: FeedbackEntryKind::DeclarationResolutionFailed { reason },
+                    file_path,
+                    block: None,
+                    declaration: None,
+                    reviews: Vec::new(),
+                    latest_verdict: latest_verdict.to_string(),
+                });
+                entry.reviews.push(resolved.record.clone());
+            }
+        }
     }
     Ok(grouped.into_values().collect())
 }

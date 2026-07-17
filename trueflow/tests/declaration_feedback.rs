@@ -2,24 +2,24 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 use trueflow::analysis::Language;
 use trueflow::commands::feedback::{
     build_pull_request_feedback_plan, feedback_entries_to_json_values, feedback_entries_to_xml,
 };
 use trueflow::commands::review::ResolvedReviewQuery;
 use trueflow::config::BlockFilters;
-use trueflow::declaration::capture::{CaptureBatch, capture_declaration_sources};
+use trueflow::declaration::capture::{capture_declaration_sources, CaptureBatch};
 use trueflow::declaration::diff::diff_declarations;
 use trueflow::declaration::snapshot::{SnapshotId, SourceSnapshot};
 use trueflow::declaration::{
-    DeclarationNode, DeclarationProjectionHash, SourceComponentRole, project_source,
+    project_source, DeclarationNode, DeclarationProjectionHash, SourceComponentRole,
 };
 use trueflow::feedback_export::{
-    DeclarationFeedbackSource, FeedbackContextResolver, FeedbackEntry, FeedbackEntryKind,
-    FeedbackQuery, FeedbackSinceFilter, ResolvedFeedbackContext, collect_feedback_entries,
-    resolve_declaration_feedback,
+    collect_feedback_entries, resolve_declaration_feedback, DeclarationFeedbackSource,
+    FeedbackContextResolver, FeedbackEntry, FeedbackEntryKind, FeedbackQuery, FeedbackSinceFilter,
+    ResolvedFeedbackContext,
 };
 use trueflow::github::{
     GitHubCommentSide, PullRequestCommit, PullRequestMetadata, ResolvedPullRequestRef,
@@ -36,7 +36,7 @@ use trueflow::targets::{
     ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
 };
 use trueflow::vcs::ChangedPath;
-use trueflow_test_support::{FeedbackScenario, TestRepo, run_git_output};
+use trueflow_test_support::{run_git_output, FeedbackScenario, TestRepo};
 
 const PATH: &str = "src/lib.rs";
 const BODY_SENTINEL: &str = "EXECUTABLE BODY SENTINEL MUST NEVER EXPORT";
@@ -315,13 +315,11 @@ fn declaration_comment_json_and_xml_retain_exact_semantic_surface_without_body()
             "start_byte=\"{}\" end_byte=\"{}\"",
             range["start_byte"], range["end_byte"]
         )));
-        assert!(
-            xml.contains(
-                range["exact_text"]
-                    .as_str()
-                    .context("range exact_text must be a string")?
-            )
-        );
+        assert!(xml.contains(
+            range["exact_text"]
+                .as_str()
+                .context("range exact_text must be a string")?
+        ));
     }
     assert!(xml.contains(&declaration.projection_text));
     assert!(xml.contains("relationship: used by crate::caller"));
@@ -447,7 +445,8 @@ impl FeedbackContextResolver for CountingOrdinaryResolver {
 }
 
 #[test]
-fn ordinary_feedback_resolver_and_review_index_skip_declaration_records() -> TestResult {
+fn ordinary_feedback_export_retains_unresolved_declaration_while_review_index_skips_it(
+) -> TestResult {
     let (snapshot, declaration) =
         projected_snapshot("source:ordinary-skip", PATH, DECLARATION_SOURCE)?;
     let record = declaration_record(
@@ -473,7 +472,40 @@ fn ordinary_feedback_resolver_and_review_index_skip_declaration_records() -> Tes
         },
         &mut resolver,
     )?;
-    assert!(entries.is_empty());
+    let [entry] = entries.as_slice() else {
+        bail!(
+            "expected one unresolved declaration feedback entry, got {}",
+            entries.len()
+        );
+    };
+    let resolution_error = match &entry.kind {
+        FeedbackEntryKind::DeclarationResolutionFailed { reason } => reason,
+        other => bail!("expected a declaration resolution failure, got {other:?}"),
+    };
+    assert!(!resolution_error.trim().is_empty());
+    assert!(entry.declaration.is_none());
+    assert!(entry.block.is_none());
+    assert_eq!(entry.reviews.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&entry.reviews[0])?,
+        serde_json::to_value(&record)?,
+        "the unresolved entry must retain the original review record"
+    );
+
+    let rendered = feedback_entries_to_json_values(&entries);
+    let [rendered] = rendered.as_slice() else {
+        bail!(
+            "expected one rendered feedback entry, got {}",
+            rendered.len()
+        );
+    };
+    assert_eq!(rendered["target"]["kind"], "declaration");
+    assert!(
+        rendered["resolution_error"]
+            .as_str()
+            .is_some_and(|reason| !reason.trim().is_empty()),
+        "rendered unresolved declarations must explain the resolution failure"
+    );
     assert_eq!(resolver.calls.get(), 0);
 
     let colliding_block = ReviewTargetRef::Block {
