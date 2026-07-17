@@ -110,11 +110,22 @@ fn main() -> Result<()> {
             commands::verify::VerifySelection::from_clap_args(*all, id.as_deref()),
         ),
         Commands::Tui {
+            mode,
+            trust_lsp_workspace,
             all,
             target,
             since,
             only,
             exclude,
-        } => commands::tui::run(&context, *all, target, since.as_deref(), only, exclude),
+        } => commands::tui::run(
+            &context,
+            *mode,
+            *trust_lsp_workspace,
+            *all,
+            target,
+            since.as_deref(),
+            only,
+            exclude,
+        ),
     }
 }

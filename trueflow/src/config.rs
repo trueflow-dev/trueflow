@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Entry, Item, Table, value};
 
 use crate::block::BlockKind;
+use crate::cli::TuiReviewMode;
 use crate::feedback_since::FeedbackSinceExpr;
 use crate::repo_path::RepoPath;
 use crate::scanner::{ScanCacheMode, ScanOptions};
@@ -31,6 +32,8 @@ pub struct TrueflowConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuiConfig {
+    #[serde(default = "default_tui_review_mode")]
+    pub mode: TuiReviewMode,
     #[serde(default = "default_confirm_batch_sub_blocks")]
     pub confirm_batch_sub_blocks: BatchConfirmPolicy,
     #[serde(default = "default_tui_diff_focus_mode")]
@@ -455,6 +458,7 @@ fn validate_speed_read_bounds(
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
+            mode: default_tui_review_mode(),
             confirm_batch_sub_blocks: default_confirm_batch_sub_blocks(),
             diff_focus_mode: default_tui_diff_focus_mode(),
             diff_focus_context_lines: default_diff_focus_context_lines(),
@@ -540,6 +544,10 @@ impl Default for FeedbackConfig {
 
 fn default_confirm_batch_sub_blocks() -> BatchConfirmPolicy {
     BatchConfirmPolicy::default()
+}
+
+fn default_tui_review_mode() -> TuiReviewMode {
+    TuiReviewMode::Blocks
 }
 
 fn default_tui_diff_focus_mode() -> TuiDiffFocusMode {

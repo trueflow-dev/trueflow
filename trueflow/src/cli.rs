@@ -10,6 +10,13 @@ use crate::logging::LoggingMode;
 use crate::repo_path::RepoPath;
 use crate::store::{ReviewCheck, Verdict};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiReviewMode {
+    Blocks,
+    Declarations,
+}
+
 #[derive(Parser)]
 #[command(name = "trueflow")]
 #[command(version = build_info::VERSION, long_version = build_info::LONG_VERSION)]
@@ -203,6 +210,14 @@ pub enum Commands {
     },
     /// Launch the TUI
     Tui {
+        /// Review surface to launch (defaults to [tui].mode)
+        #[arg(long, value_enum)]
+        mode: Option<TuiReviewMode>,
+
+        /// Trust the current workspace when declaration review uses language servers
+        #[arg(long)]
+        trust_lsp_workspace: bool,
+
         /// Review everything (Audit mode), ignoring git status
         #[arg(long)]
         all: bool,
@@ -359,6 +374,8 @@ mod tests {
                 since,
                 only,
                 exclude,
+                mode,
+                trust_lsp_workspace,
             } => {
                 assert!(!all);
                 assert_eq!(
@@ -371,6 +388,8 @@ mod tests {
                 assert!(since.is_none());
                 assert_eq!(only, vec![BlockKind::Function]);
                 assert_eq!(exclude, vec![BlockKind::Comment]);
+                assert_eq!(mode, None);
+                assert!(!trust_lsp_workspace);
             }
             _ => panic!("expected tui command"),
         }
@@ -387,12 +406,16 @@ mod tests {
                 since,
                 only,
                 exclude,
+                mode,
+                trust_lsp_workspace,
             } => {
                 assert!(!all);
                 assert!(target.is_empty());
                 assert!(since.is_none());
                 assert!(only.is_empty());
                 assert!(exclude.is_empty());
+                assert_eq!(mode, None);
+                assert!(!trust_lsp_workspace);
             }
             _ => panic!("expected tui command"),
         }
@@ -597,6 +620,8 @@ mod tests {
                 since,
                 only,
                 exclude,
+                mode,
+                trust_lsp_workspace,
             } => {
                 assert!(!all);
                 assert_eq!(
@@ -608,6 +633,8 @@ mod tests {
                 assert!(since.is_none());
                 assert!(only.is_empty());
                 assert!(exclude.is_empty());
+                assert_eq!(mode, None);
+                assert!(!trust_lsp_workspace);
             }
             _ => panic!("expected tui command"),
         }
@@ -683,12 +710,16 @@ mod tests {
                 since,
                 only,
                 exclude,
+                mode,
+                trust_lsp_workspace,
             } => {
                 assert!(!all);
                 assert!(target.is_empty());
                 assert_eq!(since.as_deref(), Some("abc1234"));
                 assert!(only.is_empty());
                 assert!(exclude.is_empty());
+                assert_eq!(mode, None);
+                assert!(!trust_lsp_workspace);
             }
             _ => panic!("expected tui command"),
         }

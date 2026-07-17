@@ -1,3 +1,5 @@
+pub mod declaration;
+
 use super::tui_speedread::SpeedReadController;
 #[cfg(test)]
 use super::tui_terminal::{
@@ -11,6 +13,7 @@ use crate::ai::{
 };
 use crate::analysis::Language;
 use crate::block::BlockKind;
+use crate::cli::TuiReviewMode;
 use crate::commands::mark;
 use crate::commands::review::{
     BlockChangeKind, CollectedReview, DiffBlockSides, FileChangeKind, ReviewRequest, ReviewSummary,
@@ -21,6 +24,7 @@ use crate::config::{
     BatchConfirmPolicy, BlockFilters, TrueflowConfig, TuiConfig, TuiDiffFocusMode,
     TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
+use crate::declaration::review::{DeclarationReviewDiffBatch, DeclarationReviewQuery};
 use crate::context::TrueflowContext;
 use crate::github::{
     GhGitHubClient, PullRequestCommit, PullRequestMetadata, PullRequestRef,
@@ -1167,8 +1171,83 @@ impl ContentNodeSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiLaunchPayload {
+    pub mode: TuiReviewMode,
+    pub trust_lsp_workspace: bool,
+    pub scope: ScopePreset,
+}
+
+impl TuiLaunchPayload {
+    pub fn for_scope(&self, scope: ScopePreset) -> Self {
+        Self {
+            mode: self.mode,
+            trust_lsp_workspace: self.trust_lsp_workspace,
+            scope,
+        }
+    }
+
+    pub fn declaration_query(
+        &self,
+        batches: Vec<DeclarationReviewDiffBatch>,
+    ) -> Result<DeclarationReviewQuery> {
+        if self.mode != TuiReviewMode::Declarations {
+            return Err(anyhow!(
+                "declaration review queries require declaration TUI mode"
+            ));
+        }
+        Ok(DeclarationReviewQuery::new(batches))
+    }
+}
+
+pub fn resolve_tui_launch(
+    config: &TrueflowConfig,
+    mode: Option<TuiReviewMode>,
+    trust_lsp_workspace: bool,
+    scope: ScopePreset,
+    only: &[BlockKind],
+    exclude: &[BlockKind],
+) -> Result<TuiLaunchPayload> {
+    let mode = mode.unwrap_or(config.tui.mode);
+    if mode == TuiReviewMode::Declarations {
+        if !only.is_empty() {
+            return Err(anyhow!(
+                "--only is a block filter and cannot be used in declaration review mode"
+            ));
+        }
+        if !exclude.is_empty() {
+            return Err(anyhow!(
+                "--exclude is a block filter and cannot be used in declaration review mode"
+            ));
+        }
+    }
+
+    Ok(TuiLaunchPayload {
+        mode,
+        trust_lsp_workspace,
+        scope,
+    })
+}
+
+pub fn build_pull_request_launch_queue(
+    launch: &TuiLaunchPayload,
+    commits: &[PullRequestCommit],
+) -> Result<Vec<TuiLaunchPayload>> {
+    Ok(commits
+        .iter()
+        .map(|commit| {
+            launch.for_scope(ScopePreset::Commit {
+                id: commit.sha.as_str().to_string(),
+                summary: commit.summary.clone(),
+            })
+        })
+        .collect())
+}
+
 pub fn run(
     context: &TrueflowContext,
+    mode: Option<TuiReviewMode>,
+    trust_lsp_workspace: bool,
     all: bool,
     target: &[ReviewTarget],
     since: Option<&str>,
@@ -1176,6 +1255,19 @@ pub fn run(
     exclude: &[BlockKind],
 ) -> Result<()> {
     let config = load_config()?;
+    let launch = resolve_tui_launch(
+        &config,
+        mode,
+        trust_lsp_workspace,
+        ScopePreset::All,
+        only,
+        exclude,
+    )?;
+    if launch.mode == TuiReviewMode::Declarations {
+        return Err(anyhow!(
+            "declaration review launch is configured, but its terminal app is not available yet"
+        ));
+    }
     let scan_options = config.scan.resolve_options();
     let filters = config.review.resolve_filters(only, exclude);
 
@@ -8300,6 +8392,7 @@ mod diff_scope_tests {
     #[test]
     fn block_diff_focus_mode_uses_configured_context() {
         let config = TuiConfig {
+            mode: TuiReviewMode::Blocks,
             confirm_batch_sub_blocks: BatchConfirmPolicy::Threshold(2),
             diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
             diff_focus_context_lines: 7,
