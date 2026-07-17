@@ -2,24 +2,24 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use trueflow::analysis::Language;
 use trueflow::commands::feedback::{
     build_pull_request_feedback_plan, feedback_entries_to_json_values, feedback_entries_to_xml,
 };
 use trueflow::commands::review::ResolvedReviewQuery;
 use trueflow::config::BlockFilters;
-use trueflow::declaration::capture::{capture_declaration_sources, CaptureBatch};
+use trueflow::declaration::capture::{CaptureBatch, capture_declaration_sources};
 use trueflow::declaration::diff::diff_declarations;
 use trueflow::declaration::snapshot::{SnapshotId, SourceSnapshot};
 use trueflow::declaration::{
-    project_source, DeclarationNode, DeclarationProjectionHash, SourceComponentRole,
+    DeclarationNode, DeclarationProjectionHash, SourceComponentRole, project_source,
 };
 use trueflow::feedback_export::{
-    collect_feedback_entries, resolve_declaration_feedback, DeclarationFeedbackSource,
-    FeedbackContextResolver, FeedbackEntry, FeedbackEntryKind, FeedbackQuery, FeedbackSinceFilter,
-    ResolvedFeedbackContext,
+    DeclarationFeedbackSource, FeedbackContextResolver, FeedbackEntry, FeedbackEntryKind,
+    FeedbackQuery, FeedbackSinceFilter, ResolvedFeedbackContext, collect_feedback_entries,
+    resolve_declaration_feedback,
 };
 use trueflow::github::{
     GitHubCommentSide, PullRequestCommit, PullRequestMetadata, ResolvedPullRequestRef,
@@ -36,7 +36,7 @@ use trueflow::targets::{
     ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
 };
 use trueflow::vcs::ChangedPath;
-use trueflow_test_support::{run_git_output, FeedbackScenario, TestRepo};
+use trueflow_test_support::{FeedbackScenario, TestRepo, run_git_output};
 
 const PATH: &str = "src/lib.rs";
 const BODY_SENTINEL: &str = "EXECUTABLE BODY SENTINEL MUST NEVER EXPORT";
@@ -315,11 +315,13 @@ fn declaration_comment_json_and_xml_retain_exact_semantic_surface_without_body()
             "start_byte=\"{}\" end_byte=\"{}\"",
             range["start_byte"], range["end_byte"]
         )));
-        assert!(xml.contains(
-            range["exact_text"]
-                .as_str()
-                .context("range exact_text must be a string")?
-        ));
+        assert!(
+            xml.contains(
+                range["exact_text"]
+                    .as_str()
+                    .context("range exact_text must be a string")?
+            )
+        );
     }
     assert!(xml.contains(&declaration.projection_text));
     assert!(xml.contains("relationship: used by crate::caller"));
@@ -445,8 +447,8 @@ impl FeedbackContextResolver for CountingOrdinaryResolver {
 }
 
 #[test]
-fn ordinary_feedback_export_retains_unresolved_declaration_while_review_index_skips_it(
-) -> TestResult {
+fn ordinary_feedback_export_retains_unresolved_declaration_while_review_index_skips_it()
+-> TestResult {
     let (snapshot, declaration) =
         projected_snapshot("source:ordinary-skip", PATH, DECLARATION_SOURCE)?;
     let record = declaration_record(

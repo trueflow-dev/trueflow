@@ -334,9 +334,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             if results.uses_types.key != received || results.used_by.key != received {
                 return None;
             }
-            let Some(issued_snapshot) = self.issued.get(&received) else {
-                return None;
-            };
+            let issued_snapshot = self.issued.get(&received)?;
             if issued_snapshot != &results.snapshot_id {
                 return None;
             }
@@ -1106,9 +1104,15 @@ impl DeclarationRelationshipProvider for BackgroundRelationshipProvider {
         if !worker.is_finished() {
             return Err(ProviderError::Timeout);
         }
-        let worker = self.worker.take().expect("checked relationship worker");
-        worker.join().map_err(|_| {
-            ProviderError::Protocol("relationship coordinator worker panicked".to_owned())
+        let Some(worker) = self.worker.take() else {
+            return Err(ProviderError::Protocol(
+                "relationship coordinator worker disappeared during shutdown".to_owned(),
+            ));
+        };
+        worker.join().map_err(|panic_payload| {
+            ProviderError::Protocol(format!(
+                "relationship coordinator worker panicked: {panic_payload:?}"
+            ))
         })
     }
 }
@@ -1167,12 +1171,13 @@ fn execute_provider_request(
         };
         providers.insert(session_key.clone(), provider);
     }
-    let result = execute_with_provider(
-        request,
-        providers
-            .get_mut(&session_key)
-            .expect("relationship provider was inserted"),
-    );
+    let Some(provider) = providers.get_mut(&session_key) else {
+        return failed_results(
+            request,
+            "relationship provider disappeared after launch".to_owned(),
+        );
+    };
+    let result = execute_with_provider(request, provider);
     let replace = providers
         .get(&session_key)
         .is_some_and(|provider| !provider.session_available());

@@ -7,10 +7,10 @@ use trueflow::declaration::{DeclarationKey, DeclarationProjectionHash};
 use trueflow::hashing::BytesHash;
 use trueflow::repo_path::RepoPath;
 use trueflow::store::{
-    BlockState, CommentAnchor, CommitId, DeclarationAnchorRange, DeclarationCommentAnchor,
-    DeclarationRecordLocator, FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore,
-    ReviewTargetRef, ReviewedDeclarationSnapshot, SourceCommentAnchor, VcsSystem, Verdict,
-    CURRENT_VERSION,
+    BlockState, CURRENT_VERSION, CommentAnchor, CommitId, DeclarationAnchorRange,
+    DeclarationCommentAnchor, DeclarationRecordLocator, FileStore, Identity, Record, RepoRef,
+    ReviewCheck, ReviewStore, ReviewTargetRef, ReviewedDeclarationSnapshot, SourceCommentAnchor,
+    VcsSystem, Verdict,
 };
 use trueflow_test_support::temp_test_dir;
 
@@ -417,8 +417,8 @@ fn declaration_anchor_rejects_empty_unordered_overlapping_or_out_of_bounds_range
 }
 
 #[test]
-fn declaration_anchor_proves_utf8_boundaries_exact_slices_and_snapshot_hash_against_source(
-) -> Result<()> {
+fn declaration_anchor_proves_utf8_boundaries_exact_slices_and_snapshot_hash_against_source()
+-> Result<()> {
     declaration_anchor().validate_against_source(VALID_SOURCE)?;
 
     let mut split_code_point = declaration_anchor();
@@ -658,17 +658,21 @@ fn equal_projection_hashes_at_distinct_locators_remain_distinct_in_history() -> 
 
     assert_eq!(loaded.len(), 2);
     assert_eq!(locators.len(), 2);
-    assert!(locators.contains(
-        first
-            .declaration_locator
-            .as_ref()
-            .context("first locator")?
-    ));
-    assert!(locators.contains(
-        second
-            .declaration_locator
-            .as_ref()
-            .context("second locator")?
-    ));
+    assert!(
+        locators.contains(
+            first
+                .declaration_locator
+                .as_ref()
+                .context("first locator")?
+        )
+    );
+    assert!(
+        locators.contains(
+            second
+                .declaration_locator
+                .as_ref()
+                .context("second locator")?
+        )
+    );
     Ok(())
 }

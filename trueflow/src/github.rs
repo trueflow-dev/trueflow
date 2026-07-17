@@ -595,8 +595,7 @@ impl GitHubClient for GhGitHubClient {
         }
         if review.state != PullRequestReviewState::Pending {
             return Err(anyhow!(
-                "GitHub review {} was no longer pending after its body update",
-                review_id
+                "GitHub review {review_id} was no longer pending after its body update"
             ));
         }
         Ok(review)

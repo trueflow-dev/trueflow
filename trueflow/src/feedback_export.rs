@@ -669,12 +669,13 @@ fn collect_declaration_feedback_entries(
     let mut latest = HashMap::<DeclarationRecordLocator, (i64, usize, &'static str)>::new();
     for resolved in &resolved {
         let record = resolved.record;
-        let should_replace = latest
-            .get(&resolved.locator)
-            .is_none_or(|(timestamp, existing_index, _)| {
-                record.timestamp > *timestamp
-                    || (record.timestamp == *timestamp && resolved.index > *existing_index)
-            });
+        let should_replace =
+            latest
+                .get(&resolved.locator)
+                .is_none_or(|(timestamp, existing_index, _)| {
+                    record.timestamp > *timestamp
+                        || (record.timestamp == *timestamp && resolved.index > *existing_index)
+                });
         if should_replace {
             latest.insert(
                 resolved.locator.clone(),

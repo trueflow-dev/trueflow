@@ -84,7 +84,7 @@ impl MixedFixture {
             path: RepoPath::new(PATH)?,
             semantic_key: projected.key.clone(),
             projection_hash: projected.projection_hash.clone(),
-            projection_text: projected.projection_text.clone(),
+            projection_text: projected.projection_text,
             ranges: Vec::new(),
             context: None,
         };

@@ -111,7 +111,7 @@ fn interface_method_jsdoc_and_signature_have_one_child_owner() -> Result<()> {
         "the complete inventory must contain only Codec and its decode child"
     );
     assert_eq!(decode.parent_part.as_ref(), Some(&codec.id));
-    assert_eq!(codec.children.as_slice(), [decode.id.clone()]);
+    assert_eq!(codec.children.as_slice(), std::slice::from_ref(&decode.id));
     assert_eq!(decode.review_owner, decode.id);
     assert_eq!(codec.review_owner, codec.id);
     assert_eq!(decode.projection_text, METHOD_SURFACE);
@@ -187,8 +187,11 @@ fn namespace_and_module_declarations_inventory_their_nested_functions() -> Resul
     );
     assert_eq!(parse.parent_part.as_ref(), Some(&api.id));
     assert_eq!(serialize.parent_part.as_ref(), Some(&legacy.id));
-    assert_eq!(api.children.as_slice(), [parse.id.clone()]);
-    assert_eq!(legacy.children.as_slice(), [serialize.id.clone()]);
+    assert_eq!(api.children.as_slice(), std::slice::from_ref(&parse.id));
+    assert_eq!(
+        legacy.children.as_slice(),
+        std::slice::from_ref(&serialize.id)
+    );
     assert_eq!(api.review_owner, api.id);
     assert_eq!(parse.review_owner, parse.id);
     assert_eq!(legacy.review_owner, legacy.id);

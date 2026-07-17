@@ -500,7 +500,8 @@ fn projected_item_ranges(item: Node<'_>, kind: DeclarationKind, source: &str) ->
         && let Some(body) = item.child_by_field_name("body")
         && let Some(header_end) = opening_delimiter_end(body, source)
     {
-        let mut ranges = vec![item.start_byte()..header_end];
+        let mut ranges = Vec::with_capacity(2);
+        ranges.push(item.start_byte()..header_end);
         if let Some(close_start) = closing_delimiter_start(body, source) {
             let close_with_layout = leading_whitespace_start(source, close_start, header_end);
             if close_with_layout < item.end_byte() {

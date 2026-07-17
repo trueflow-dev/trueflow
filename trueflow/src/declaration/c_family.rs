@@ -107,7 +107,7 @@ impl Projector<'_> {
                         attachments,
                         parent_id.cloned(),
                         parent_name,
-                        default_visibility.clone(),
+                        default_visibility,
                     )?;
                 }
                 continue;
@@ -185,7 +185,7 @@ impl Projector<'_> {
         mut attachments: Vec<Part>,
         parent_id: Option<DeclarationId>,
         parent_name: Option<&str>,
-        visibility: Visibility,
+        visibility: &Visibility,
     ) -> Result<()> {
         let Some(name_node) = item.child_by_field_name("name") else {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
@@ -268,7 +268,7 @@ impl Projector<'_> {
         });
 
         let children_start = self.declarations.len();
-        self.collect_scope(body, Some(&id), qualified_name.as_deref(), &visibility)?;
+        self.collect_scope(body, Some(&id), qualified_name.as_deref(), visibility)?;
         self.declarations[module_index].children = self.declarations[children_start..]
             .iter()
             .filter(|declaration| declaration.parent_part.as_ref() == Some(&id))

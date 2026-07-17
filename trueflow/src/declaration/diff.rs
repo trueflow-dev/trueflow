@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
 use std::hash::Hash;
 
 use anyhow::{Result, ensure};
@@ -614,10 +613,7 @@ fn remaining_children(declarations: &[DeclarationNode]) -> HashMap<&str, usize> 
     children
 }
 
-fn decrement_parent_count<'a>(
-    declaration: &DeclarationNode,
-    children: &mut HashMap<&'a str, usize>,
-) {
+fn decrement_parent_count(declaration: &DeclarationNode, children: &mut HashMap<&str, usize>) {
     if let Some(parent) = &declaration.parent_part
         && let Some(count) = children.get_mut(parent.as_str())
     {
@@ -626,6 +622,24 @@ fn decrement_parent_count<'a>(
 }
 
 fn name_elided_discriminator(declaration: &DeclarationNode) -> String {
+    fn push_usize(output: &mut String, mut value: usize) {
+        if value == 0 {
+            output.push('0');
+            return;
+        }
+
+        let mut digits = [0_u8; std::mem::size_of::<usize>() * 3];
+        let mut index = digits.len();
+        while value != 0 {
+            index -= 1;
+            digits[index] = b"0123456789"[value % 10];
+            value /= 10;
+        }
+        for digit in &digits[index..] {
+            output.push(char::from(*digit));
+        }
+    }
+
     let mut discriminator = String::with_capacity(declaration.projection_text.len());
     let mut name_elided = false;
     for component in &declaration.components {
@@ -637,13 +651,14 @@ fn name_elided_discriminator(declaration: &DeclarationNode) -> String {
         if !name_elided && let Some(position) = component.text.find(&declaration.name) {
             name_elided = true;
             let normalized_len = component.text.len() - declaration.name.len() + "<name>".len();
-            write!(discriminator, "{normalized_len}:").expect("writing to a String cannot fail");
+            push_usize(&mut discriminator, normalized_len);
+            discriminator.push(':');
             discriminator.push_str(&component.text[..position]);
             discriminator.push_str("<name>");
             discriminator.push_str(&component.text[position + declaration.name.len()..]);
         } else {
-            write!(discriminator, "{}:", component.text.len())
-                .expect("writing to a String cannot fail");
+            push_usize(&mut discriminator, component.text.len());
+            discriminator.push(':');
             discriminator.push_str(&component.text);
         }
     }

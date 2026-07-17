@@ -169,7 +169,7 @@ fn cpp_method_prototype_is_owned_only_by_the_method_and_not_its_aggregate() -> R
         ]
     );
 
-    assert_eq!(codec.children, [decode.id.clone()]);
+    assert_eq!(codec.children.as_slice(), std::slice::from_ref(&decode.id));
     assert_eq!(decode.parent_part.as_ref(), Some(&codec.id));
     assert_eq!(codec.review_owner, codec.id);
     assert_eq!(decode.review_owner, decode.id);
@@ -268,8 +268,8 @@ fn cpp_overload_documentation_edits_keep_signature_keys_and_pair_as_changed() ->
     );
 
     let diff = diff_declarations(&[cpp_same_path_pair("overload-docs", BASE, HEAD)])?;
-    assert_eq!(diff.matches.len(), 2, "{:#?}", diff);
-    assert_eq!(diff.units.len(), 2, "{:#?}", diff);
+    assert_eq!(diff.matches.len(), 2, "{diff:#?}");
+    assert_eq!(diff.units.len(), 2, "{diff:#?}");
     assert!(diff.diagnostics.is_empty(), "{:?}", diff.diagnostics);
 
     for (signature, base_projection, head_projection, expected_span) in CASES {
@@ -331,7 +331,7 @@ fn cpp_namespace_is_a_module_with_exact_child_lineage() -> Result<()> {
         SourceComponentRole::Signature,
         "namespace api",
     )?;
-    assert_eq!(module.children, [parse.id.clone()]);
+    assert_eq!(module.children.as_slice(), std::slice::from_ref(&parse.id));
     assert_eq!(parse.parent_part.as_ref(), Some(&module.id));
 
     assert_eq!(parse.projection_text, "int parse();");

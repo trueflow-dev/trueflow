@@ -1028,8 +1028,7 @@ fn syntax_discriminator(
                 node.kind(),
                 text.len(),
                 text
-            )
-            .expect("writing to a String cannot fail");
+            )?;
             return Ok(());
         }
         let mut cursor = node.walk();

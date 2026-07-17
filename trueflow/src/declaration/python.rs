@@ -126,7 +126,7 @@ impl Projector<'_> {
             })
             .collect::<Vec<_>>();
         semantic.push(SemanticRange {
-            range: header.clone(),
+            range: header,
             role: SourceComponentRole::Signature,
         });
         if let Some(docstring) = first_docstring(function, self.source) {
@@ -223,7 +223,7 @@ impl Projector<'_> {
             decorators
                 .iter()
                 .map(Node::byte_range)
-                .chain(std::iter::once(header.clone())),
+                .chain(std::iter::once(header)),
         )?;
         let class_id = self.push_declaration(
             outer,
@@ -488,10 +488,15 @@ impl Projector<'_> {
             return Ok(None);
         };
         let value = assignment.child_by_field_name("right");
-        if assignment_kind == AssignmentDeclarationKind::TypeAlias && value.is_none() {
-            self.omitted_named("type alias", &name, "its target type is missing");
-            return Ok(None);
-        }
+        let alias_target = if assignment_kind == AssignmentDeclarationKind::TypeAlias {
+            let Some(value) = value else {
+                self.omitted_named("type alias", &name, "its target type is missing");
+                return Ok(None);
+            };
+            Some(value)
+        } else {
+            None
+        };
         if has_syntax_error_in_range(statement, &statement.byte_range()) {
             self.omitted_named(
                 "typed assignment",
@@ -516,9 +521,9 @@ impl Projector<'_> {
         push_component(self.source, &mut components, role, statement.byte_range())?;
 
         let mut type_use_sites = Vec::new();
-        if assignment_kind == AssignmentDeclarationKind::TypeAlias {
+        if let Some(value) = alias_target {
             collect_type_names(
-                value.expect("a legacy type alias target was checked above"),
+                value,
                 self.source,
                 TypeUseRole::AliasTarget,
                 &mut type_use_sites,
@@ -716,7 +721,7 @@ fn semantic_key_discriminator(
         let text = source
             .get(range)
             .context("Python semantic key surface was not on UTF-8 boundaries")?;
-        let canonical = canonicalize_python_surface(text);
+        let canonical = canonicalize_python_surface(text)?;
         discriminator.push_str(&canonical.len().to_string());
         discriminator.push(':');
         discriminator.push_str(&canonical);
@@ -724,7 +729,7 @@ fn semantic_key_discriminator(
     Ok(discriminator)
 }
 
-fn canonicalize_python_surface(text: &str) -> String {
+fn canonicalize_python_surface(text: &str) -> Result<String> {
     let bytes = text.as_bytes();
     let mut canonical = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -781,7 +786,8 @@ fn canonicalize_python_surface(text: &str) -> String {
         index += 1;
     }
 
-    String::from_utf8(canonical).expect("removing ASCII layout preserves UTF-8")
+    String::from_utf8(canonical)
+        .context("canonical Python semantic key surface was not valid UTF-8")
 }
 
 fn definition_header_range(definition: Node<'_>) -> Option<Range<usize>> {

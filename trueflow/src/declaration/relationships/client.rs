@@ -421,13 +421,12 @@ impl RelationshipProvider {
         }
         self.closed = true;
         let reply = self.request_even_if_closing(|reply| WorkerCommand::Shutdown { reply });
-        let join_result = if reply.is_ok() {
+        let should_join =
+            reply.is_ok() || self.thread.as_ref().is_some_and(JoinHandle::is_finished);
+        let join_result = if should_join {
             self.thread.take().map(JoinHandle::join)
         } else {
-            self.thread
-                .as_ref()
-                .is_some_and(JoinHandle::is_finished)
-                .then(|| self.thread.take().expect("checked LSP worker").join())
+            None
         };
         if let Some(Err(_)) = join_result {
             return Err(ProviderError::Protocol("LSP worker panicked".to_owned()));
@@ -1158,18 +1157,23 @@ impl WorkerSession {
 
         match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => cleanup_failures.push(format!("cannot wait for LSP child: {error}")),
+            Ok(Err(error)) => {
+                cleanup_failures.push(format!("cannot wait for LSP child: {error}"));
+            }
             Err(_) => match self.child.kill().await {
                 Ok(()) => match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
-                        cleanup_failures.push(format!("cannot reap killed LSP child: {error}"))
+                        cleanup_failures.push(format!("cannot reap killed LSP child: {error}"));
                     }
                     Err(_) => {
-                        cleanup_failures.push("timed out while reaping killed LSP child".to_owned())
+                        cleanup_failures
+                            .push("timed out while reaping killed LSP child".to_owned());
                     }
                 },
-                Err(error) => cleanup_failures.push(format!("cannot kill LSP child: {error}")),
+                Err(error) => {
+                    cleanup_failures.push(format!("cannot kill LSP child: {error}"));
+                }
             },
         }
 

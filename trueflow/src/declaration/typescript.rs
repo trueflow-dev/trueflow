@@ -89,7 +89,7 @@ impl Projector<'_> {
     fn collect_scope(
         &mut self,
         scope: Node<'_>,
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_lineage: Option<&str>,
     ) -> Result<()> {
         let mut pending_documentation = Vec::new();
@@ -117,12 +117,12 @@ impl Projector<'_> {
                         item.kind,
                         &documentation,
                         None,
-                        parent_id.clone(),
+                        parent_id,
                         parent_lineage,
                     )?;
                 }
                 DeclarationKind::Class | DeclarationKind::Interface => {
-                    self.add_class_like(item, &documentation, parent_id.clone(), parent_lineage)?;
+                    self.add_class_like(item, &documentation, parent_id, parent_lineage)?;
                 }
                 DeclarationKind::TypeAlias
                     if item
@@ -130,21 +130,16 @@ impl Projector<'_> {
                         .child_by_field_name("value")
                         .is_some_and(|value| value.kind() == "object_type") =>
                 {
-                    self.add_class_like(item, &documentation, parent_id.clone(), parent_lineage)?;
+                    self.add_class_like(item, &documentation, parent_id, parent_lineage)?;
                 }
                 DeclarationKind::TypeAlias | DeclarationKind::Enum => {
-                    self.add_contiguous_aggregate(
-                        item,
-                        &documentation,
-                        parent_id.clone(),
-                        parent_lineage,
-                    )?;
+                    self.add_contiguous_aggregate(item, &documentation, parent_id, parent_lineage)?;
                 }
                 DeclarationKind::Module => {
-                    self.add_module(item, &documentation, parent_id.clone(), parent_lineage)?;
+                    self.add_module(item, &documentation, parent_id, parent_lineage)?;
                 }
                 DeclarationKind::Constant | DeclarationKind::Static => {
-                    self.add_value(item, &documentation, parent_id.clone(), parent_lineage)?;
+                    self.add_value(item, &documentation, parent_id, parent_lineage)?;
                 }
                 _ => {}
             }
@@ -156,7 +151,7 @@ impl Projector<'_> {
         &mut self,
         item: TopLevelItem<'_>,
         documentation: &[Range<usize>],
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_lineage: Option<&str>,
     ) -> Result<()> {
         let body = if item.kind == DeclarationKind::TypeAlias {
@@ -340,7 +335,7 @@ impl Projector<'_> {
                 callable_kind,
                 &callable.documentation,
                 Some(callable.leading_start),
-                Some(id.clone()),
+                Some(&id),
                 Some(&lineage),
             )?;
         }
@@ -356,7 +351,7 @@ impl Projector<'_> {
         &mut self,
         item: TopLevelItem<'_>,
         documentation: &[Range<usize>],
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_lineage: Option<&str>,
     ) -> Result<()> {
         let Some(name_node) = item.declaration.child_by_field_name("name") else {
@@ -430,7 +425,7 @@ impl Projector<'_> {
         &mut self,
         item: TopLevelItem<'_>,
         documentation: &[Range<usize>],
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_lineage: Option<&str>,
     ) -> Result<()> {
         let name_node = item
@@ -512,7 +507,7 @@ impl Projector<'_> {
         if let Some(body) = body {
             let lineage = declaration_lineage(parent_lineage, DeclarationKind::Module, &name);
             let children_start = self.declarations.len();
-            self.collect_scope(body, Some(id.clone()), Some(&lineage))?;
+            self.collect_scope(body, Some(&id), Some(&lineage))?;
             self.declarations[parent_index].children = self.declarations[children_start..]
                 .iter()
                 .filter(|declaration| declaration.parent_part.as_ref() == Some(&id))
@@ -526,7 +521,7 @@ impl Projector<'_> {
         &mut self,
         item: TopLevelItem<'_>,
         documentation: &[Range<usize>],
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_lineage: Option<&str>,
     ) -> Result<()> {
         let mut cursor = item.declaration.walk();
@@ -610,7 +605,7 @@ impl Projector<'_> {
         kind: DeclarationKind,
         documentation: &[Range<usize>],
         leading_start: Option<usize>,
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_name: Option<&str>,
     ) -> Result<()> {
         let name_node = declaration.child_by_field_name("name");
@@ -706,7 +701,7 @@ impl Projector<'_> {
         name_range: Range<usize>,
         kind: DeclarationKind,
         visibility: Visibility,
-        parent_id: Option<DeclarationId>,
+        parent_id: Option<&DeclarationId>,
         parent_name: Option<&str>,
         source_span: Range<usize>,
         components: Vec<SourceComponent>,
@@ -748,7 +743,7 @@ impl Projector<'_> {
             name,
             kind,
             visibility,
-            parent_part: parent_id,
+            parent_part: parent_id.cloned(),
             source_ordinal,
             source_span,
             components,
@@ -818,10 +813,9 @@ fn top_level_item(node: Node<'_>) -> Option<TopLevelItem<'_>> {
 
 fn direct_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
-    let child = node
-        .children(&mut cursor)
-        .find(|child| child.kind() == kind);
-    child
+
+    node.children(&mut cursor)
+        .find(|child| child.kind() == kind)
 }
 
 fn is_callable_member(node: Node<'_>) -> bool {
@@ -1053,9 +1047,14 @@ fn value_key_discriminator(outer: Node<'_>, declarator: Node<'_>, source: &str) 
             identity_end -= 1;
         }
     }
-    let identity_ranges = [outer.start_byte()..identity_end];
+    let identity_range = outer.start_byte()..identity_end;
     let mut discriminator = String::new();
-    collect_identity_tokens(outer, &identity_ranges, source, &mut discriminator);
+    collect_identity_tokens(
+        outer,
+        std::slice::from_ref(&identity_range),
+        source,
+        &mut discriminator,
+    );
     discriminator
 }
 

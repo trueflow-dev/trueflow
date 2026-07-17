@@ -80,7 +80,7 @@ fn named_interface_methods_are_independent_children_while_embedded_types_stay_ag
     assert_eq!(method.projection_text, METHOD_SURFACE);
     assert_eq!(method.parent_part.as_ref(), Some(&reader.id));
     assert_eq!(method.review_owner, method.id);
-    assert_eq!(reader.children.as_slice(), [method.id.clone()]);
+    assert_eq!(reader.children.as_slice(), std::slice::from_ref(&method.id));
     assert_eq!(reader.review_owner, reader.id);
     assert_eq!(
         facts.declarations().len(),
