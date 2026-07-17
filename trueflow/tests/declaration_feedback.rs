@@ -526,6 +526,45 @@ fn mixed_block_and_declaration_history_exports_each_through_its_own_shape() -> T
 }
 
 #[test]
+fn declaration_feedback_uses_newest_timestamp_when_older_comment_is_stored_last() -> TestResult {
+    const STALE_NOTE: &str = "stale declaration comment must not export";
+
+    let scenario = FeedbackScenario::new("declaration_feedback_latest_timestamp")?;
+    scenario.write(PATH, DECLARATION_SOURCE)?;
+    let revision = CommitId::new(scenario.commit_all("add declaration feedback source")?)?;
+    let (snapshot, declaration) = captured_declaration(scenario.repo(), &revision)?;
+
+    let mut older_comment = declaration_record(
+        "older-comment",
+        &revision,
+        &snapshot,
+        &declaration,
+        AnchorSelection::Signature,
+        STALE_NOTE,
+    )?;
+    older_comment.timestamp = 1_700_000_000;
+    older_comment.validate()?;
+
+    let mut newer_approval = older_comment.clone();
+    newer_approval.id = "newer-approval".to_string();
+    newer_approval.timestamp = 1_700_000_001;
+    newer_approval.verdict = Verdict::Approved;
+    newer_approval.note = None;
+    newer_approval.validate()?;
+
+    // The file order intentionally opposes time order: the stale comment is physically last.
+    scenario.write_reviews(&[newer_approval, older_comment])?;
+
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+    assert!(
+        entries.is_empty(),
+        "the newer approval must suppress feedback for its exact declaration locator; \
+         stale note {STALE_NOTE:?} was exported in {entries:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn uncommitted_declaration_feedback_resolves_against_captured_worktree_snapshot() -> TestResult {
     const INITIAL_SOURCE: &str =
         "/// Converts one wide value.\npub fn convert(value: u16) -> u16 { value }\n";

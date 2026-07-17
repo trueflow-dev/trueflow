@@ -650,10 +650,27 @@ fn collect_declaration_feedback_entries(
         });
     }
 
-    let mut latest = HashMap::<DeclarationRecordLocator, &'static str>::new();
-    for record in &resolved {
-        latest.insert(record.locator.clone(), record.record.verdict.as_str());
+    let mut latest = HashMap::<DeclarationRecordLocator, (i64, usize, &'static str)>::new();
+    for resolved in &resolved {
+        let record = resolved.record;
+        let should_replace =
+            latest
+                .get(&resolved.locator)
+                .is_none_or(|(timestamp, existing_index, _)| {
+                    record.timestamp > *timestamp
+                        || (record.timestamp == *timestamp && resolved.index > *existing_index)
+                });
+        if should_replace {
+            latest.insert(
+                resolved.locator.clone(),
+                (record.timestamp, resolved.index, record.verdict.as_str()),
+            );
+        }
     }
+    let latest = latest
+        .into_iter()
+        .map(|(locator, (_, _, verdict))| (locator, verdict))
+        .collect::<HashMap<_, _>>();
     let mut grouped = HashMap::<DeclarationFeedbackEntryKey, FeedbackEntry>::new();
     for resolved in resolved {
         if !record_matches_since(
