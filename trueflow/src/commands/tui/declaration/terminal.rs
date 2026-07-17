@@ -139,9 +139,17 @@ fn run_runtime(
             let _ = relationships.apply(runtime, update)?;
         }
         session.terminal_mut().draw(|frame| {
-            let [scope_area, review_area] =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(frame.area());
+            let incomplete_status = runtime.incomplete_status_text();
+            let [scope_area, status_area, review_area] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(u16::from(incomplete_status.is_some())),
+                Constraint::Min(1),
+            ])
+            .areas(frame.area());
             frame.render_widget(Paragraph::new(scope_label), scope_area);
+            if let Some(status) = incomplete_status {
+                frame.render_widget(Paragraph::new(status), status_area);
+            }
             if let Some(controller) = runtime.controller() {
                 render_declaration_review(frame, review_area, controller);
             } else {

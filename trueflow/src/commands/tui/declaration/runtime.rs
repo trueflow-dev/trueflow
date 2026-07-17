@@ -398,9 +398,25 @@ impl<A> DeclarationAppRuntime<A> {
 
     pub fn visible_text(&self) -> String {
         if let Some(controller) = &self.controller {
-            return controller.render_model().visible_text;
+            let review_text = controller.render_model().visible_text;
+            return self
+                .incomplete_status_text()
+                .map_or(review_text.clone(), |status| {
+                    format!("{status}\n\n{review_text}")
+                });
         }
         collection_status_text(self.prepared.status())
+    }
+
+    pub fn incomplete_status_text(&self) -> Option<String> {
+        match self.prepared.status() {
+            CollectionStatus::UnsupportedLanguage { .. } | CollectionStatus::Partial { .. } => {
+                Some(collection_status_text(self.prepared.status()))
+            }
+            CollectionStatus::Ready
+            | CollectionStatus::NoSurfaceChanges
+            | CollectionStatus::FullyReviewed => None,
+        }
     }
 
     pub fn resize(&mut self, inner_width: u16, inner_height: u16) {
