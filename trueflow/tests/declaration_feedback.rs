@@ -35,6 +35,7 @@ use trueflow::store::{
 use trueflow::targets::{
     ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
 };
+use trueflow::vcs::ChangedPath;
 use trueflow_test_support::{FeedbackScenario, TestRepo, run_git_output};
 
 const PATH: &str = "src/lib.rs";
@@ -521,6 +522,89 @@ fn mixed_block_and_declaration_history_exports_each_through_its_own_shape() -> T
         declaration.key.as_str()
     );
     assert!(declaration_entry.get("block").is_none());
+    Ok(())
+}
+
+#[test]
+fn uncommitted_declaration_feedback_resolves_against_captured_worktree_snapshot() -> TestResult {
+    const INITIAL_SOURCE: &str =
+        "/// Converts one wide value.\npub fn convert(value: u16) -> u16 { value }\n";
+    const RECORD_ID: &str = "uncommitted-declaration";
+    const NOTE: &str = "the dirty declaration contract needs revision";
+    const EXPECTED_PROJECTION: &str = "/// Converts one value.\npub fn convert(value: u8) -> u8";
+
+    let scenario = FeedbackScenario::new("uncommitted_declaration_feedback")?;
+    scenario.write(PATH, INITIAL_SOURCE)?;
+    let revision = CommitId::new(scenario.commit_all("add initial declaration")?)?;
+    scenario.write(PATH, DECLARATION_SOURCE)?;
+
+    let changed = HashSet::from([ChangedPath::identity(RepoPath::new(PATH)?)]);
+    let query = ResolvedReviewQuery {
+        filters: BlockFilters::default(),
+        scan_options: ScanOptions::default(),
+        content_source: ReviewContentSource::Workdir,
+        path_selection: ReviewPathSelection::Scoped {
+            files: HashSet::new(),
+            dirs: Vec::new(),
+            changed: Some(changed),
+        },
+        diff_selection: ReviewDiffSelection::None,
+    };
+    let batches = capture_declaration_sources(&scenario.repo().path, &query)?;
+    let batch = match batches.as_slice() {
+        [batch] => batch,
+        other => bail!("expected one dirty capture batch, got {}", other.len()),
+    };
+    let (snapshot, declaration) = declaration_from_batch(batch, "convert")?;
+    assert_eq!(
+        snapshot.source(),
+        DECLARATION_SOURCE,
+        "the record fixture must bind to the dirty worktree bytes"
+    );
+
+    let mut record = declaration_record(
+        RECORD_ID,
+        &revision,
+        &snapshot,
+        &declaration,
+        AnchorSelection::DocumentationAndSignature,
+        NOTE,
+    )?;
+    record.block_state = BlockState::Uncommitted;
+    record.validate()?;
+    let expected_ranges = match record.comment_anchor.as_ref() {
+        Some(CommentAnchor::Declaration(anchor)) => serde_json::to_value(&anchor.ranges)?,
+        _ => bail!("fixture record lost its declaration anchor"),
+    };
+    scenario.write_reviews(std::slice::from_ref(&record))?;
+
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+    assert!(
+        entries.iter().any(|entry| {
+            entry["reviews"]
+                .as_array()
+                .is_some_and(|reviews| reviews.iter().any(|review| review["id"] == RECORD_ID))
+        }),
+        "uncommitted declaration feedback must resolve against its captured worktree snapshot; \
+         exported entries: {entries:#?}"
+    );
+
+    let entry = declaration_json_entry(&entries, RECORD_ID)?;
+    assert_eq!(
+        entry["target"],
+        json!({
+            "kind": "declaration",
+            "semantic_key": declaration.key.as_str(),
+        })
+    );
+    assert_eq!(entry["declaration"]["path"], PATH);
+    assert_eq!(entry["declaration"]["ranges"], expected_ranges);
+    assert_eq!(entry["declaration"]["projection_text"], EXPECTED_PROJECTION);
+    assert_eq!(entry["reviews"][0]["note"], NOTE);
+    assert!(
+        !serde_json::to_string(entry)?.contains(BODY_SENTINEL),
+        "declaration feedback must not export executable body text"
+    );
     Ok(())
 }
 

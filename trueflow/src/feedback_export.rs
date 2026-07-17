@@ -9,8 +9,8 @@ use crate::feedback_since::ResolvedFeedbackSince as ParsedFeedbackSince;
 use crate::repo_path::RepoPath;
 use crate::scanner::{self, ScanOptions};
 use crate::store::{
-    CommentAnchor, DeclarationAnchorRange, DeclarationRecordLocator, FileStore, Record, RepoRef,
-    ReviewTargetRef, TreeHash,
+    BlockState, CommentAnchor, DeclarationAnchorRange, DeclarationRecordLocator, FileStore, Record,
+    RepoRef, ReviewTargetRef, TreeHash,
 };
 use crate::targets::{
     ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
@@ -309,21 +309,43 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
             Some(root) => gix::discover(root)?,
             None => gix::discover(".")?,
         };
-        let commit = repo
-            .rev_parse_single(revision.as_str())?
-            .object()?
-            .peel_to_commit()?;
-        let tree = commit.tree()?;
-        let Some(entry) = tree.lookup_entry_by_path(Path::new(locator.path.as_str()))? else {
-            return Ok(None);
-        };
-        let blob = match entry.object()?.try_into_blob() {
-            Ok(blob) => blob,
-            Err(_) => return Ok(None),
-        };
-        let source = std::str::from_utf8(&blob.data)
-            .with_context(|| format!("{} contains invalid UTF-8", locator.path))?;
         let path = Path::new(locator.path.as_str());
+        let bytes = match &record.block_state {
+            BlockState::Committed => {
+                let commit = repo
+                    .rev_parse_single(revision.as_str())?
+                    .object()?
+                    .peel_to_commit()?;
+                let tree = commit.tree()?;
+                let Some(entry) = tree.lookup_entry_by_path(path)? else {
+                    return Ok(None);
+                };
+                let blob = match entry.object()?.try_into_blob() {
+                    Ok(blob) => blob,
+                    Err(_) => return Ok(None),
+                };
+                blob.data.to_vec()
+            }
+            BlockState::Uncommitted => {
+                let workdir = repo
+                    .workdir()
+                    .context("uncommitted declaration feedback requires a non-bare repository")?;
+                let absolute = workdir.join(path);
+                let metadata = match fs::symlink_metadata(&absolute) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
+                if !metadata.file_type().is_file() {
+                    return Ok(None);
+                }
+                fs::read(&absolute)
+                    .with_context(|| format!("failed to read {}", locator.path.as_str()))?
+            }
+            BlockState::Unknown => return Ok(None),
+        };
+        let source = std::str::from_utf8(&bytes)
+            .with_context(|| format!("{} contains invalid UTF-8", locator.path))?;
         let language = path
             .extension()
             .and_then(OsStr::to_str)
