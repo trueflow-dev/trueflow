@@ -516,15 +516,19 @@ pub fn execute_relationship_plan(
         RelationshipPlanKind::UsesTypes { sites, .. } => {
             let declaration_supported = backend.supports(RelationshipCapability::Declaration);
             let definition_supported = backend.supports(RelationshipCapability::Definition);
-            if !declaration_supported && !definition_supported {
+            let type_definition_supported =
+                backend.supports(RelationshipCapability::TypeDefinition);
+            if !declaration_supported && !definition_supported && !type_definition_supported {
                 RelationshipExecutionKind::Unsupported(RelationshipCapability::Declaration)
             } else {
                 let mut executed = Vec::with_capacity(sites.len());
                 for site in sites {
                     let mut method = if declaration_supported {
                         RelationshipMethod::Declaration
-                    } else {
+                    } else if definition_supported {
                         RelationshipMethod::Definition
+                    } else {
+                        RelationshipMethod::TypeDefinition
                     };
                     let mut locations = backend.request(RelationshipRequest::Resolve {
                         method,
@@ -605,46 +609,57 @@ fn reconcile_uses_types(
     if sites.len() != executed.len() {
         bail!("relationship execution returned the wrong number of type-use results");
     }
-    let mut edges = Vec::with_capacity(sites.len());
+    let mut edges: Vec<RelationshipEdge> = Vec::with_capacity(sites.len());
     for (site, executed) in sites.iter().zip(executed) {
-        let location = executed.locations.into_iter().next();
-        let target = match location.as_ref() {
-            Some(location) => reconcile_type_target(index, location, plan.encoding)?
-                .map(RelationshipTarget::InReview)
-                .unwrap_or_else(|| {
-                    if index
-                        .documents
-                        .iter()
-                        .any(|document| document.uri == location.uri)
-                    {
-                        RelationshipTarget::Unresolved {
-                            name: site.name.clone(),
+        let method = executed.method;
+        let locations = executed.locations;
+        let unresolved = locations.is_empty().then_some(None);
+        for location in locations.into_iter().map(Some).chain(unresolved) {
+            let target = match location.as_ref() {
+                Some(location) => reconcile_type_target(index, location, plan.encoding)?
+                    .map(RelationshipTarget::InReview)
+                    .unwrap_or_else(|| {
+                        if index
+                            .documents
+                            .iter()
+                            .any(|document| document.uri == location.uri)
+                        {
+                            RelationshipTarget::Unresolved {
+                                name: site.name.clone(),
+                            }
+                        } else {
+                            RelationshipTarget::External {
+                                uri: location.uri.clone(),
+                                range: location.range,
+                            }
                         }
-                    } else {
-                        RelationshipTarget::External {
-                            uri: location.uri.clone(),
-                            range: location.range,
-                        }
-                    }
-                }),
-            None => RelationshipTarget::Unresolved {
-                name: site.name.clone(),
-            },
-        };
-        edges.push(RelationshipEdge {
-            kind: RelationshipKind::UsesType,
-            source: source.clone(),
-            target,
-            locations: vec![RelationshipLocation {
+                    }),
+                None => RelationshipTarget::Unresolved {
+                    name: site.name.clone(),
+                },
+            };
+            let relationship_location = RelationshipLocation {
                 origin: site.origin.clone(),
                 target: location,
                 provenance: RelationshipProvenance::TypeUse {
-                    method: executed.method,
+                    method,
                     role: site.role,
                     scope: plan.scope,
                 },
-            }],
-        });
+            };
+            if let Some(edge) = edges.iter_mut().find(|edge| edge.target == target) {
+                if !edge.locations.contains(&relationship_location) {
+                    edge.locations.push(relationship_location);
+                }
+            } else {
+                edges.push(RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: source.clone(),
+                    target,
+                    locations: vec![relationship_location],
+                });
+            }
+        }
     }
     Ok(RelationshipOutcome::Complete { edges })
 }

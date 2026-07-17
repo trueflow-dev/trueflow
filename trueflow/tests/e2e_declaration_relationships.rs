@@ -542,6 +542,140 @@ fn references_request(
 }
 
 #[test]
+fn type_definition_only_server_resolves_projected_type_use() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "export interface Payload {}\n",
+        "export function decode(input: Payload) {}\n",
+    );
+    let uri = Url::parse("file:///review/workspace/src/payload.ts")?;
+    let facts = project_source(Path::new("src/payload.ts"), Language::TypeScript, SOURCE)?;
+    let payload =
+        declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
+    let decode =
+        declaration_named(facts.declarations(), "decode", DeclarationKind::Function).clone();
+    let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
+    let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
+    let plan = plan_uses_types(&index, &decode.id, PositionEncoding::Utf16)?;
+
+    let payload_declaration = location_at(&uri, 0, 17, 0, 24);
+    let mut backend = FakeRelationshipBackend::new(
+        [RelationshipCapability::TypeDefinition],
+        [vec![payload_declaration.clone()]],
+    );
+    let execution = execute_relationship_plan(&plan, &mut backend)?;
+
+    assert_eq!(
+        backend.requests,
+        vec![resolve_request(
+            RelationshipMethod::TypeDefinition,
+            &uri,
+            1,
+            30,
+        )],
+        "a TypeDefinition-only server must receive the projected type-use request"
+    );
+    backend.assert_exhausted();
+    assert_eq!(
+        reconcile_relationship_execution(&plan, execution, &index)?,
+        RelationshipOutcome::Complete {
+            edges: vec![RelationshipEdge {
+                kind: RelationshipKind::UsesType,
+                source: decode.id,
+                target: RelationshipTarget::InReview(payload.id),
+                locations: vec![RelationshipLocation {
+                    origin: location_at(&uri, 1, 30, 1, 37),
+                    target: Some(payload_declaration),
+                    provenance: RelationshipProvenance::TypeUse {
+                        method: RelationshipMethod::TypeDefinition,
+                        role: TypeUseRole::Parameter,
+                        scope: RelationshipScope::Workspace,
+                    },
+                }],
+            }],
+        },
+        "TypeDefinition is a complete UsesTypes resolution path, not an unsupported fallback"
+    );
+    Ok(())
+}
+
+#[test]
+fn uses_types_preserves_every_location_from_one_resolution_response_in_order() -> Result<()> {
+    const SOURCE: &str = "export function decode(input: ExternalPayload) {}\n";
+    let uri = Url::parse("file:///review/workspace/src/decode.ts")?;
+    let facts = project_source(Path::new("src/decode.ts"), Language::TypeScript, SOURCE)?;
+    let decode =
+        declaration_named(facts.declarations(), "decode", DeclarationKind::Function).clone();
+    let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
+    let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
+    let plan = plan_uses_types(&index, &decode.id, PositionEncoding::Utf16)?;
+
+    let first_uri = Url::parse("file:///registry/types-a.d.ts")?;
+    let second_uri = Url::parse("file:///registry/types-b.d.ts")?;
+    let first_declaration = location_at(&first_uri, 2, 4, 2, 19);
+    let second_declaration = location_at(&second_uri, 7, 9, 7, 24);
+    let mut backend = FakeRelationshipBackend::new(
+        [RelationshipCapability::Declaration],
+        [vec![first_declaration.clone(), second_declaration.clone()]],
+    );
+    let execution = execute_relationship_plan(&plan, &mut backend)?;
+
+    assert_eq!(
+        backend.requests,
+        vec![resolve_request(
+            RelationshipMethod::Declaration,
+            &uri,
+            0,
+            30,
+        )]
+    );
+    backend.assert_exhausted();
+    let origin = location_at(&uri, 0, 30, 0, 45);
+    assert_eq!(
+        reconcile_relationship_execution(&plan, execution, &index)?,
+        RelationshipOutcome::Complete {
+            edges: vec![
+                RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: decode.id.clone(),
+                    target: RelationshipTarget::External {
+                        uri: first_uri,
+                        range: first_declaration.range,
+                    },
+                    locations: vec![RelationshipLocation {
+                        origin: origin.clone(),
+                        target: Some(first_declaration),
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::Declaration,
+                            role: TypeUseRole::Parameter,
+                            scope: RelationshipScope::Workspace,
+                        },
+                    }],
+                },
+                RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: decode.id,
+                    target: RelationshipTarget::External {
+                        uri: second_uri,
+                        range: second_declaration.range,
+                    },
+                    locations: vec![RelationshipLocation {
+                        origin,
+                        target: Some(second_declaration),
+                        provenance: RelationshipProvenance::TypeUse {
+                            method: RelationshipMethod::Declaration,
+                            role: TypeUseRole::Parameter,
+                            scope: RelationshipScope::Workspace,
+                        },
+                    }],
+                },
+            ],
+        },
+        "every legal location in one type-use response must survive reconciliation in response order"
+    );
+    Ok(())
+}
+
+#[test]
 fn uses_types_queries_only_projected_type_tokens_and_reconciles_exact_targets_with_method_provenance()
 -> Result<()> {
     const SOURCE: &str = concat!(
