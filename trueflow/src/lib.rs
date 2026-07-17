@@ -9,6 +9,7 @@ pub mod commands;
 pub mod complexity;
 pub mod config;
 pub mod context;
+pub mod declaration;
 pub mod coverage;
 pub(crate) mod feedback_export;
 pub mod feedback_since;
