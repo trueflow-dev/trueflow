@@ -1171,6 +1171,12 @@ impl ContentNodeSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiRuntimeKind {
+    Blocks,
+    Declarations,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiLaunchPayload {
     pub mode: TuiReviewMode,
@@ -1184,6 +1190,13 @@ impl TuiLaunchPayload {
             mode: self.mode,
             trust_lsp_workspace: self.trust_lsp_workspace,
             scope,
+        }
+    }
+
+    pub fn runtime_kind(&self) -> TuiRuntimeKind {
+        match self.mode {
+            TuiReviewMode::Blocks => TuiRuntimeKind::Blocks,
+            TuiReviewMode::Declarations => TuiRuntimeKind::Declarations,
         }
     }
 

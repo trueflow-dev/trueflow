@@ -4,6 +4,12 @@
 //! display or comment text from the enclosing declaration span, which may include a body.
 
 pub mod graph;
+mod runtime;
+
+pub use runtime::{
+    DeclarationAppRuntime, DeclarationRecordAppender, PreparedDeclarationLaunch,
+    PreparedDeclarationTarget, prepare_declaration_launch,
+};
 
 use std::{collections::{BTreeMap, BTreeSet}, ops::Range};
 
@@ -447,6 +453,7 @@ impl DeclarationController {
             KeyCode::Char(' ') => self.advance_canonical(),
             KeyCode::Char('a') => self.emit_approval(),
             KeyCode::Char('c') => self.open_comment(),
+            KeyCode::Char('r') => self.open_rejection(),
             KeyCode::Char('h') | KeyCode::Left if self.active_pane == DeclarationPane::Outline => {
                 self.collapse_selected();
             }
@@ -581,7 +588,7 @@ impl DeclarationController {
             relationship_status,
             relationship_rows,
             title: format!("Declaration Review · {}", self.document.path),
-            footer: "[a]pprove [c]omment [Tab]pane [o]relations [Backspace]back".to_owned(),
+            footer: "[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned(),
             banner: "Declaration Review".to_owned(),
             active_selections,
             visible_text,
@@ -842,6 +849,16 @@ impl DeclarationController {
             self.comment_draft = Some(String::new());
         }
     }
+    fn open_rejection(&mut self) {
+        let Some(row) = self.selected_source_row() else { return };
+        let anchor = self.anchor_for_row(row);
+        self.pending_actions.push(DeclarationReviewAction {
+            kind: DeclarationReviewActionKind::Reject,
+            owner_id: row.review_owner.clone(),
+            comment_body: None,
+            anchor: Some(anchor),
+        });
+    }
 
     fn handle_editor_key(&mut self, key: KeyCode) -> Result<()> {
         match key {
@@ -956,7 +973,11 @@ impl DeclarationController {
             || matches!(layout, DeclarationLayout::Single { pane: DeclarationPane::Relationships, .. });
         if show_outline {
             lines.push("OUTLINE".to_owned());
-            lines.extend(outline_rows.iter().map(|row| row.source_text.clone()));
+            lines.extend(
+                outline_rows
+                    .iter()
+                    .map(|row| format!("{}{}", row.source_text, row.status.marker())),
+            );
         }
         if show_graph {
             lines.push("RELATIONSHIPS".to_owned());
@@ -965,7 +986,7 @@ impl DeclarationController {
         if let Some(draft) = &self.comment_draft {
             lines.push(format!("Comment: {draft}"));
         }
-        lines.push("[a]pprove [c]omment [Tab]pane [o]relations [Backspace]back".to_owned());
+        lines.push("[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned());
         lines.push("Declaration Review".to_owned());
         lines.join("\n")
     }
