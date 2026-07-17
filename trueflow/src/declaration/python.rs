@@ -18,6 +18,13 @@ struct SemanticRange {
     role: SourceComponentRole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignmentDeclarationKind {
+    Constant,
+    Static,
+    TypeAlias,
+}
+
 struct Projector<'a> {
     path: &'a Path,
     source: &'a str,
@@ -72,6 +79,18 @@ impl Projector<'_> {
                     }
                     _ => {}
                 }
+            } else if child.kind() == "type_alias_statement" {
+                self.add_type_alias(child, None, None)?;
+            } else if let Some(assignment) = statement_assignment(child)
+                && explicit_assignment_kind(assignment, false, self.source).is_some()
+            {
+                self.add_assignment_declaration(assignment, child, None, None)?;
+            } else if let Some(assignment) = statement_assignment(child) {
+                self.omitted(
+                    "module variable",
+                    assignment.start_byte(),
+                    "the declaration model has no general Python variable kind and the syntax has no explicit Final or TypeAlias marker",
+                );
             } else if is_scope_preserving_compound(child) {
                 self.collect_module_scope(child)?;
             }
@@ -130,11 +149,15 @@ impl Projector<'_> {
             return Ok(None);
         }
         let components = build_sparse_components(self.source, &semantic)?;
-        let kind = callable_kind(&name, parent_id.is_some());
+        let kind = callable_kind(&name, parent_id.is_some(), decorators, self.source);
         let type_use_sites = callable_type_uses(function, self.source)?;
-        let key_discriminator = self
-            .node_text_range(header, "Python callable signature")?
-            .to_owned();
+        let key_discriminator = semantic_key_discriminator(
+            self.source,
+            semantic
+                .iter()
+                .filter(|component| component.role != SourceComponentRole::Documentation)
+                .map(|component| component.range.clone()),
+        )?;
         let id = self.push_declaration(
             outer,
             name,
@@ -195,9 +218,13 @@ impl Projector<'_> {
         });
         let components = build_sparse_components(self.source, &semantic)?;
         let type_use_sites = class_type_uses(class, self.source, &semantic)?;
-        let key_discriminator = self
-            .node_text_range(header, "Python class header")?
-            .to_owned();
+        let key_discriminator = semantic_key_discriminator(
+            self.source,
+            decorators
+                .iter()
+                .map(Node::byte_range)
+                .chain(std::iter::once(header.clone())),
+        )?;
         let class_id = self.push_declaration(
             outer,
             name.clone(),
@@ -210,8 +237,12 @@ impl Projector<'_> {
         );
         let class_index = self.declarations.len() - 1;
 
+        let qualified_name = parent_name.map_or_else(
+            || name.clone(),
+            |parent_name| format!("{parent_name}.{name}"),
+        );
         let children = if let Some(body) = class.child_by_field_name("body") {
-            self.collect_class_members(body, &class_id, &name)?
+            self.collect_class_members(body, &class_id, &qualified_name)?
         } else {
             Vec::new()
         };
@@ -230,6 +261,11 @@ impl Projector<'_> {
         for child in scope.named_children(&mut cursor) {
             if let Some((definition, decorators, outer)) = unpack_definition(child) {
                 let child_id = match definition.kind() {
+                    "function_definition"
+                        if is_signature_only_property(definition, &decorators, self.source) =>
+                    {
+                        None
+                    }
                     "function_definition" => self.add_callable(
                         definition,
                         &decorators,
@@ -247,6 +283,23 @@ impl Projector<'_> {
                     _ => None,
                 };
                 if let Some(child_id) = child_id {
+                    children.push(child_id);
+                }
+            } else if child.kind() == "type_alias_statement" {
+                if let Some(child_id) =
+                    self.add_type_alias(child, Some(class_id.clone()), Some(class_name))?
+                {
+                    children.push(child_id);
+                }
+            } else if let Some(assignment) = statement_assignment(child)
+                && explicit_assignment_kind(assignment, true, self.source).is_some()
+            {
+                if let Some(child_id) = self.add_assignment_declaration(
+                    assignment,
+                    child,
+                    Some(class_id.clone()),
+                    Some(class_name),
+                )? {
                     children.push(child_id);
                 }
             } else if is_scope_preserving_compound(child) {
@@ -281,19 +334,19 @@ impl Projector<'_> {
             if is_docstring_statement(statement, self.source) {
                 return;
             }
-            let Some(assignment) = statement
-                .named_child(0)
-                .filter(|node| node.kind() == "assignment")
-            else {
+            let Some(assignment) = statement_assignment(statement) else {
                 return;
             };
+            if explicit_assignment_kind(assignment, true, self.source).is_some() {
+                return;
+            }
             match class_attribute_range(assignment) {
                 Some(range) => semantic.push(SemanticRange {
                     range,
                     role: SourceComponentRole::AggregateShape,
                 }),
                 None => self.diagnostics.push(ProjectionDiagnostic::new(format!(
-                    "omitted a computed Python class attribute in {class_name} at byte {}",
+                    "omitted a computed Python class attribute in {class_name} at byte {} because the declaration model cannot represent its target exactly",
                     assignment.start_byte()
                 ))),
             }
@@ -315,6 +368,12 @@ impl Projector<'_> {
                     range,
                     role: SourceComponentRole::AggregateShape,
                 });
+                if let Some(docstring) = first_docstring(definition, self.source) {
+                    semantic.push(SemanticRange {
+                        range: docstring.byte_range(),
+                        role: SourceComponentRole::Documentation,
+                    });
+                }
             } else {
                 self.diagnostics.push(ProjectionDiagnostic::new(format!(
                     "omitted a malformed abstract Python property in {class_name} at byte {}",
@@ -330,6 +389,169 @@ impl Projector<'_> {
                 self.collect_class_shape_statement(child, class_name, semantic);
             }
         }
+    }
+
+    fn add_type_alias(
+        &mut self,
+        statement: Node<'_>,
+        parent_id: Option<DeclarationId>,
+        parent_name: Option<&str>,
+    ) -> Result<Option<DeclarationId>> {
+        let Some(left) = statement.child_by_field_name("left") else {
+            self.omitted(
+                "type alias",
+                statement.start_byte(),
+                "it has no declared name",
+            );
+            return Ok(None);
+        };
+        let Some(name_node) = type_alias_name(left) else {
+            self.omitted(
+                "type alias",
+                statement.start_byte(),
+                "its parameterized name cannot be represented exactly",
+            );
+            return Ok(None);
+        };
+        let name = self
+            .node_text(name_node, "Python type-alias name")?
+            .to_owned();
+        let Some(target) = statement.child_by_field_name("right") else {
+            self.omitted_named("type alias", &name, "it has no target type");
+            return Ok(None);
+        };
+        if has_syntax_error_in_range(statement, &statement.byte_range()) {
+            self.omitted_named("type alias", &name, "its surface contains a syntax error");
+            return Ok(None);
+        }
+
+        let mut components = Vec::new();
+        push_component(
+            self.source,
+            &mut components,
+            SourceComponentRole::TypeAlias,
+            statement.byte_range(),
+        )?;
+        let mut type_use_sites = Vec::new();
+        collect_type_names(
+            target,
+            self.source,
+            TypeUseRole::AliasTarget,
+            &mut type_use_sites,
+        )?;
+        collect_type_parameter_bounds(left, self.source, &mut type_use_sites)?;
+        normalize_type_uses(&mut type_use_sites);
+        let key_discriminator = semantic_key_discriminator(
+            self.source,
+            [left.byte_range(), target.byte_range()].into_iter(),
+        )?;
+        Ok(Some(self.push_declaration(
+            statement,
+            name,
+            DeclarationKind::TypeAlias,
+            parent_id,
+            parent_name,
+            components,
+            &key_discriminator,
+            type_use_sites,
+        )))
+    }
+
+    fn add_assignment_declaration(
+        &mut self,
+        assignment: Node<'_>,
+        statement: Node<'_>,
+        parent_id: Option<DeclarationId>,
+        parent_name: Option<&str>,
+    ) -> Result<Option<DeclarationId>> {
+        let Some((assignment_kind, marker)) =
+            explicit_assignment_marker(assignment, parent_id.is_some(), self.source)
+        else {
+            return Ok(None);
+        };
+        let Some(name_node) = assignment
+            .child_by_field_name("left")
+            .filter(|left| left.kind() == "identifier")
+        else {
+            self.omitted(
+                "typed assignment",
+                assignment.start_byte(),
+                "its explicit typing marker has a non-identifier target",
+            );
+            return Ok(None);
+        };
+        let name = self
+            .node_text(name_node, "Python typed-assignment name")?
+            .to_owned();
+        let Some(annotation) = assignment.child_by_field_name("type") else {
+            self.omitted_named("typed assignment", &name, "its annotation is missing");
+            return Ok(None);
+        };
+        let value = assignment.child_by_field_name("right");
+        if assignment_kind == AssignmentDeclarationKind::TypeAlias && value.is_none() {
+            self.omitted_named("type alias", &name, "its target type is missing");
+            return Ok(None);
+        }
+        if has_syntax_error_in_range(statement, &statement.byte_range()) {
+            self.omitted_named(
+                "typed assignment",
+                &name,
+                "its surface contains a syntax error",
+            );
+            return Ok(None);
+        }
+
+        let (kind, role) = match assignment_kind {
+            AssignmentDeclarationKind::Constant => {
+                (DeclarationKind::Constant, SourceComponentRole::Value)
+            }
+            AssignmentDeclarationKind::Static => {
+                (DeclarationKind::Static, SourceComponentRole::Value)
+            }
+            AssignmentDeclarationKind::TypeAlias => {
+                (DeclarationKind::TypeAlias, SourceComponentRole::TypeAlias)
+            }
+        };
+        let mut components = Vec::new();
+        push_component(self.source, &mut components, role, statement.byte_range())?;
+
+        let mut type_use_sites = Vec::new();
+        if assignment_kind == AssignmentDeclarationKind::TypeAlias {
+            collect_type_names(
+                value.expect("a legacy type alias target was checked above"),
+                self.source,
+                TypeUseRole::AliasTarget,
+                &mut type_use_sites,
+            )?;
+        } else {
+            collect_type_names(
+                annotation,
+                self.source,
+                TypeUseRole::Other,
+                &mut type_use_sites,
+            )?;
+            type_use_sites.retain(|site| site.source_range != marker.byte_range());
+        }
+        normalize_type_uses(&mut type_use_sites);
+
+        let key_ranges = if let Some(value) = value
+            && assignment_kind == AssignmentDeclarationKind::TypeAlias
+        {
+            vec![annotation.byte_range(), value.byte_range()]
+        } else {
+            vec![annotation.byte_range()]
+        };
+        let key_discriminator = semantic_key_discriminator(self.source, key_ranges.into_iter())?;
+        Ok(Some(self.push_declaration(
+            statement,
+            name,
+            kind,
+            parent_id,
+            parent_name,
+            components,
+            &key_discriminator,
+            type_use_sites,
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -354,7 +576,10 @@ impl Projector<'_> {
         let source_start = components
             .first()
             .map_or(outer.start_byte(), |component| component.source_range.start);
-        let source_span = source_start..outer.end_byte();
+        let source_end = components
+            .last()
+            .map_or(outer.end_byte(), |component| component.source_range.end);
+        let source_span = source_start..source_end;
         let id = declaration_id(
             self.path,
             kind,
@@ -394,14 +619,6 @@ impl Projector<'_> {
         self.source.get(node.byte_range()).context(context)
     }
 
-    fn node_text_range<'a>(
-        &'a self,
-        range: Range<usize>,
-        context: &'static str,
-    ) -> Result<&'a str> {
-        self.source.get(range).context(context)
-    }
-
     fn omitted(&mut self, construct: &str, byte: usize, reason: &str) {
         self.diagnostics.push(ProjectionDiagnostic::new(format!(
             "omitted Python {construct} at byte {byte} because {reason}"
@@ -429,6 +646,142 @@ fn unpack_definition(node: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>, Node<'_
         .filter(|child| child.kind() == "decorator")
         .collect();
     Some((definition, decorators, node))
+}
+
+fn statement_assignment(statement: Node<'_>) -> Option<Node<'_>> {
+    (statement.kind() == "expression_statement")
+        .then(|| statement.named_child(0))
+        .flatten()
+        .filter(|node| node.kind() == "assignment")
+}
+
+fn explicit_assignment_kind(
+    assignment: Node<'_>,
+    member: bool,
+    source: &str,
+) -> Option<AssignmentDeclarationKind> {
+    explicit_assignment_marker(assignment, member, source).map(|(kind, _)| kind)
+}
+
+fn explicit_assignment_marker<'tree>(
+    assignment: Node<'tree>,
+    member: bool,
+    source: &str,
+) -> Option<(AssignmentDeclarationKind, Node<'tree>)> {
+    let annotation = assignment.child_by_field_name("type")?;
+    let marker = annotation_marker(annotation)?;
+    let marker_name = source.get(marker.byte_range())?;
+    let kind = match marker_name {
+        "Final" => AssignmentDeclarationKind::Constant,
+        "ClassVar" if member => AssignmentDeclarationKind::Static,
+        "TypeAlias" => AssignmentDeclarationKind::TypeAlias,
+        _ => return None,
+    };
+    Some((kind, marker))
+}
+
+fn annotation_marker(mut annotation: Node<'_>) -> Option<Node<'_>> {
+    while annotation.kind() == "type" && annotation.named_child_count() == 1 {
+        annotation = annotation.named_child(0)?;
+    }
+    if annotation.kind() == "generic_type" {
+        annotation = annotation.named_child(0)?;
+    }
+    match annotation.kind() {
+        "identifier" => Some(annotation),
+        "attribute" | "member_type" | "dotted_name" => terminal_identifier(annotation),
+        _ => None,
+    }
+}
+
+fn type_alias_name(mut left: Node<'_>) -> Option<Node<'_>> {
+    while left.kind() == "type" && left.named_child_count() == 1 {
+        left = left.named_child(0)?;
+    }
+    if left.kind() == "generic_type" {
+        left = left.named_child(0)?;
+        while left.kind() == "type" && left.named_child_count() == 1 {
+            left = left.named_child(0)?;
+        }
+    }
+    (left.kind() == "identifier").then_some(left)
+}
+
+fn semantic_key_discriminator(
+    source: &str,
+    ranges: impl IntoIterator<Item = Range<usize>>,
+) -> Result<String> {
+    let mut discriminator = String::new();
+    for range in ranges {
+        let text = source
+            .get(range)
+            .context("Python semantic key surface was not on UTF-8 boundaries")?;
+        let canonical = canonicalize_python_surface(text);
+        discriminator.push_str(&canonical.len().to_string());
+        discriminator.push(':');
+        discriminator.push_str(&canonical);
+    }
+    Ok(discriminator)
+}
+
+fn canonicalize_python_surface(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut canonical = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut quote = None;
+    let mut triple_quoted = false;
+    let mut escaped = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            canonical.push(byte);
+            if triple_quoted {
+                if byte == delimiter
+                    && bytes.get(index + 1) == Some(&delimiter)
+                    && bytes.get(index + 2) == Some(&delimiter)
+                {
+                    canonical.extend_from_slice(&bytes[index + 1..=index + 2]);
+                    index += 3;
+                    quote = None;
+                    triple_quoted = false;
+                    continue;
+                }
+            } else if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if byte == b'#' {
+            index += 1;
+            while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                index += 1;
+            }
+            continue;
+        }
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        canonical.push(byte);
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            if bytes.get(index + 1) == Some(&byte) && bytes.get(index + 2) == Some(&byte) {
+                canonical.extend_from_slice(&bytes[index + 1..=index + 2]);
+                index += 2;
+                triple_quoted = true;
+            }
+        }
+        index += 1;
+    }
+
+    String::from_utf8(canonical).expect("removing ASCII layout preserves UTF-8")
 }
 
 fn definition_header_range(definition: Node<'_>) -> Option<Range<usize>> {
@@ -547,19 +900,18 @@ fn is_attribute_target(node: Node<'_>) -> bool {
 
 fn is_signature_only_property(function: Node<'_>, decorators: &[Node<'_>], source: &str) -> bool {
     let property = decorators.iter().any(|decorator| {
-        decorator_name(*decorator, source).is_some_and(|name| {
-            name == "property"
-                || name == "cached_property"
-                || name.ends_with(".setter")
-                || name.ends_with(".deleter")
-        })
+        decorator_name(*decorator, source).is_some_and(is_property_decorator_name)
     });
     if !property {
         return false;
     }
     let explicitly_abstract = decorators.iter().any(|decorator| {
-        decorator_name(*decorator, source)
-            .is_some_and(|name| name == "abstractmethod" || name.ends_with(".abstractmethod"))
+        decorator_name(*decorator, source).is_some_and(|name| {
+            matches!(
+                name.rsplit('.').next(),
+                Some("abstractmethod" | "abstractproperty")
+            )
+        })
     });
     explicitly_abstract || signature_only_body(function, source)
 }
@@ -578,10 +930,11 @@ fn signature_only_body(function: Node<'_>, source: &str) -> bool {
     let Some(body) = function.child_by_field_name("body") else {
         return false;
     };
+    let docstring = first_docstring(function, source);
     let mut cursor = body.walk();
     let statements = body
         .named_children(&mut cursor)
-        .filter(|child| child.kind() != "comment")
+        .filter(|child| child.kind() != "comment" && Some(*child) != docstring)
         .collect::<Vec<_>>();
     if statements.len() != 1 {
         return false;
@@ -593,16 +946,33 @@ fn signature_only_body(function: Node<'_>, source: &str) -> bool {
                 .get(statement.byte_range())
                 .is_some_and(|text| text.trim() == "...")
 }
-
-fn callable_kind(name: &str, member: bool) -> DeclarationKind {
+fn callable_kind(
+    name: &str,
+    member: bool,
+    decorators: &[Node<'_>],
+    source: &str,
+) -> DeclarationKind {
     if !member {
         return DeclarationKind::Function;
+    }
+    if decorators
+        .iter()
+        .any(|decorator| decorator_name(*decorator, source).is_some_and(is_property_decorator_name))
+    {
+        return DeclarationKind::Property;
     }
     match name {
         "__init__" | "__new__" => DeclarationKind::Constructor,
         "__del__" => DeclarationKind::Destructor,
         _ => DeclarationKind::Method,
     }
+}
+
+fn is_property_decorator_name(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').next(),
+        Some("property" | "cached_property" | "abstractproperty" | "setter" | "deleter" | "getter")
+    )
 }
 
 fn python_visibility(name: &str) -> Visibility {
@@ -638,7 +1008,6 @@ fn build_sparse_components(
     }
     Ok(components)
 }
-
 fn sparse_layout_range(source: &str, gap: Range<usize>) -> Option<Range<usize>> {
     let text = source.get(gap.clone())?;
     if text.chars().all(char::is_whitespace) {
@@ -646,19 +1015,26 @@ fn sparse_layout_range(source: &str, gap: Range<usize>) -> Option<Range<usize>> 
     }
 
     let bytes = source.as_bytes();
-    let separator = bytes[gap.clone()]
+    let separator_offset = bytes[gap.clone()]
         .iter()
         .rposition(|byte| matches!(*byte, b'\n' | b';'))?;
-    let mut start = gap.start + separator;
-    if bytes.get(start) == Some(&b'\n') && start > gap.start && bytes.get(start - 1) == Some(&b'\r')
-    {
-        start -= 1;
-    }
-    let suffix = source.get(start..gap.end)?;
-    let rest = suffix.strip_prefix("\r\n").unwrap_or(&suffix[1..]);
-    rest.chars()
+    let separator = gap.start + separator_offset;
+    let after_separator = separator + 1;
+    if !source
+        .get(after_separator..gap.end)?
+        .chars()
         .all(char::is_whitespace)
-        .then_some(start..gap.end)
+    {
+        return None;
+    }
+
+    let start =
+        if bytes[separator] == b'\n' && separator > gap.start && bytes[separator - 1] == b'\r' {
+            separator - 1
+        } else {
+            separator
+        };
+    Some(start..gap.end)
 }
 
 fn push_component(
@@ -691,9 +1067,7 @@ fn callable_type_uses(function: Node<'_>, source: &str) -> Result<Vec<TypeUseSit
     if let Some(type_parameters) = function.child_by_field_name("type_parameters") {
         collect_type_parameter_bounds(type_parameters, source, &mut sites)?;
     }
-    sites.sort_by_key(|site| site.source_range.start);
-    sites
-        .dedup_by(|left, right| left.source_range == right.source_range && left.role == right.role);
+    normalize_type_uses(&mut sites);
     Ok(sites)
 }
 
@@ -713,9 +1087,7 @@ fn class_type_uses(
     if let Some(body) = class.child_by_field_name("body") {
         collect_class_owned_types(body, source, semantic, &mut sites)?;
     }
-    sites.sort_by_key(|site| site.source_range.start);
-    sites
-        .dedup_by(|left, right| left.source_range == right.source_range && left.role == right.role);
+    normalize_type_uses(&mut sites);
     Ok(sites)
 }
 
@@ -742,7 +1114,7 @@ fn collect_class_owned_types(
             })
         }) {
             if let Some(parameters) = node.child_by_field_name("parameters") {
-                collect_parameter_types(parameters, source, sites)?;
+                collect_parameter_types_with_role(parameters, source, TypeUseRole::Field, sites)?;
             }
             if let Some(return_type) = node.child_by_field_name("return_type") {
                 collect_type_names(return_type, source, TypeUseRole::Field, sites)?;
@@ -777,32 +1149,43 @@ fn collect_parameter_types(
     source: &str,
     sites: &mut Vec<TypeUseSite>,
 ) -> Result<()> {
+    collect_parameter_types_with_role(node, source, TypeUseRole::Parameter, sites)
+}
+
+fn collect_parameter_types_with_role(
+    node: Node<'_>,
+    source: &str,
+    role: TypeUseRole,
+    sites: &mut Vec<TypeUseSite>,
+) -> Result<()> {
     if matches!(node.kind(), "typed_parameter" | "typed_default_parameter") {
         if let Some(annotation) = node.child_by_field_name("type") {
-            collect_type_names(annotation, source, TypeUseRole::Parameter, sites)?;
+            collect_type_names(annotation, source, role, sites)?;
         }
         return Ok(());
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_parameter_types(child, source, sites)?;
+        collect_parameter_types_with_role(child, source, role, sites)?;
     }
     Ok(())
 }
 
 fn collect_type_parameter_bounds(
-    parameters: Node<'_>,
+    node: Node<'_>,
     source: &str,
     sites: &mut Vec<TypeUseSite>,
 ) -> Result<()> {
-    let mut cursor = parameters.walk();
-    for parameter in parameters.named_children(&mut cursor) {
-        if matches!(parameter.kind(), "constrained_type" | "assignment") {
-            let mut parameter_cursor = parameter.walk();
-            for bound in parameter.named_children(&mut parameter_cursor).skip(1) {
-                collect_type_names(bound, source, TypeUseRole::Bound, sites)?;
-            }
+    if matches!(node.kind(), "constrained_type" | "assignment") {
+        let mut cursor = node.walk();
+        for bound in node.named_children(&mut cursor).skip(1) {
+            collect_type_names(bound, source, TypeUseRole::Bound, sites)?;
         }
+        return Ok(());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_type_parameter_bounds(child, source, sites)?;
     }
     Ok(())
 }
@@ -842,6 +1225,12 @@ fn collect_type_names(
         collect_type_names(child, source, role, sites)?;
     }
     Ok(())
+}
+
+fn normalize_type_uses(sites: &mut Vec<TypeUseSite>) {
+    sites.sort_by_key(|site| (site.source_range.start, site.source_range.end));
+    sites
+        .dedup_by(|left, right| left.source_range == right.source_range && left.role == right.role);
 }
 
 fn terminal_identifier(node: Node<'_>) -> Option<Node<'_>> {
