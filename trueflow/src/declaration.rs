@@ -8,6 +8,7 @@ use crate::analysis::Language;
 
 pub mod diff;
 pub mod snapshot;
+pub mod relationships;
 
 mod c_family;
 mod go;
