@@ -478,6 +478,69 @@ fn malformed_declaration_records_fail_during_deserialization() -> Result<()> {
 }
 
 #[test]
+fn explicit_null_declaration_fields_respect_the_v4_v5_runtime_boundary() -> Result<()> {
+    let mut declaration_target = serde_json::to_value(declaration_record()?)?;
+    declaration_target["declaration_locator"] = serde_json::Value::Null;
+    assert!(
+        serde_json::from_value::<Record>(declaration_target).is_err(),
+        "a declaration target with an explicitly null locator must fail runtime validation"
+    );
+
+    for version in [4, 5] {
+        let mut ordinary = serde_json::to_value(legacy_record(version)?)?;
+        ordinary["declaration_locator"] = serde_json::Value::Null;
+        ordinary["comment_anchor"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<Record>(ordinary).is_ok(),
+            "an ordinary V{version} record must accept explicitly null optional declaration fields"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn diff_target_with_any_declaration_signal_fails_closed_during_history_load() -> Result<()> {
+    let declaration = serde_json::to_value(declaration_record()?)?;
+    let signals = [
+        ("declaration check", "check", json!("declaration")),
+        (
+            "declaration locator",
+            "declaration_locator",
+            declaration["declaration_locator"].clone(),
+        ),
+        (
+            "declaration anchor",
+            "comment_anchor",
+            declaration["comment_anchor"].clone(),
+        ),
+    ];
+    let mut silently_skipped = Vec::new();
+
+    for (case, field, signal) in signals {
+        let root = temp_test_dir("diff_target_declaration_signal");
+        let store = FileStore::for_root(&root)?;
+        let mut raw = serde_json::to_value(legacy_record(5)?)?;
+        raw["target"] = json!({ "kind": "diff", "hash": PROJECTION_HASH });
+        raw[field] = signal;
+        fs::write(
+            store.db_path(),
+            format!("{}\n", serde_json::to_string(&raw)?),
+        )?;
+
+        if let Ok(records) = store.read_history() {
+            silently_skipped.push(format!("{case} ({} records returned)", records.len()));
+        }
+    }
+
+    assert!(
+        silently_skipped.is_empty(),
+        "diff targets carrying declaration signals were silently accepted by the legacy-diff skip: {}",
+        silently_skipped.join(", ")
+    );
+    Ok(())
+}
+
+#[test]
 fn load_fails_closed_when_history_contains_a_malformed_declaration_record() -> Result<()> {
     let root = temp_test_dir("declaration_record_invalid_load");
     let store = FileStore::for_root(&root)?;

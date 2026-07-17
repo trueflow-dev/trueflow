@@ -1413,16 +1413,15 @@ fn parse_record_line(line: &str) -> ParsedRecordLine {
         }
     };
 
+    let declaration_shape = value_has_declaration_shape(&value);
     let is_legacy_diff_target = value
         .get("target")
         .and_then(|target| target.get("kind"))
         .and_then(serde_json::Value::as_str)
         == Some("diff");
-    if is_legacy_diff_target {
+    if is_legacy_diff_target && !declaration_shape {
         return ParsedRecordLine::LegacyDiffTarget;
     }
-
-    let declaration_shape = value_has_declaration_shape(&value);
     match serde_json::from_value(value) {
         Ok(record) => ParsedRecordLine::Record(Box::new(record)),
         Err(error) => ParsedRecordLine::Malformed {
