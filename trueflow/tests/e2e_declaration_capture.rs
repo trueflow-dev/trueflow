@@ -21,6 +21,55 @@ use trueflow::vcs::ChangedPath;
 use trueflow_test_support::{TestRepo, run_git_output};
 
 const CAPTURE_DRIFT_ERROR: &str = "worktree changed during declaration capture; retry";
+const MAX_DECLARATION_SOURCE_BYTES: u64 = 1024 * 1024;
+const MAX_DECLARATION_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn write_sparse_source(repo: &TestRepo, path: &str, byte_len: u64) -> Result<()> {
+    let absolute = repo.path.join(path);
+    if let Some(parent) = absolute.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::create(absolute)?.set_len(byte_len)?;
+    Ok(())
+}
+
+fn captured_source_bytes(batches: &[CaptureBatch]) -> usize {
+    batches
+        .iter()
+        .flat_map(|batch| &batch.pairs)
+        .flat_map(|pair| [pair.base.as_ref(), pair.head.as_ref()])
+        .flatten()
+        .map(|snapshot| snapshot.source().len())
+        .sum()
+}
+
+fn assert_capture_limit_rejection(
+    result: Result<Vec<CaptureBatch>>,
+    finalize_hook_called: &std::cell::Cell<bool>,
+    rejected_contract: &str,
+    required_error_fragments: &[&str],
+) -> Result<()> {
+    let error = match result {
+        Ok(batches) => bail!(
+            "{rejected_contract}; capture accepted {} source bytes across {} batches",
+            captured_source_bytes(&batches),
+            batches.len()
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        !finalize_hook_called.get(),
+        "capture must enforce byte limits before capture finalization; error: {error:#}"
+    );
+    let message = format!("{error:#}");
+    for fragment in required_error_fragments {
+        assert!(
+            message.contains(fragment),
+            "capture limit error must contain {fragment:?}; actual error: {message}"
+        );
+    }
+    Ok(())
+}
 
 fn commit_id(repo: &TestRepo, revision: &str) -> Result<CommitId> {
     CommitId::new(run_git_output(&repo.path, &["rev-parse", revision])?)
@@ -616,4 +665,93 @@ fn body_only_diff_from_a_captured_pair_yields_zero_declaration_review_units() ->
     );
 
     Ok(())
+}
+
+#[test]
+fn capture_budget_rejects_oversized_worktree_source_before_finalization() -> Result<()> {
+    let repo = TestRepo::new("declaration_capture_oversized_worktree")?;
+    repo.git(&["commit", "--allow-empty", "-m", "base"])?;
+    const PATH: &str = "src/oversized.rs";
+    write_sparse_source(&repo, PATH, MAX_DECLARATION_SOURCE_BYTES + 1)?;
+
+    let finalize_hook_called = std::cell::Cell::new(false);
+    let result = capture_declaration_sources_with_hook(
+        &repo.path,
+        &worktree_query(ReviewPathSelection::All),
+        || {
+            finalize_hook_called.set(true);
+            Ok(())
+        },
+    );
+
+    assert_capture_limit_rejection(
+        result,
+        &finalize_hook_called,
+        "oversized worktree source must be rejected before it is loaded",
+        &[PATH, "1048576", "limit"],
+    )
+}
+
+#[test]
+fn capture_budget_rejects_oversized_committed_blob_before_finalization() -> Result<()> {
+    let repo = TestRepo::new("declaration_capture_oversized_blob")?;
+    const PATH: &str = "src/oversized_blob.rs";
+    write_sparse_source(&repo, PATH, MAX_DECLARATION_SOURCE_BYTES + 1)?;
+    repo.commit_all("oversized blob")?;
+    let revision = commit_id(&repo, "HEAD")?;
+
+    let finalize_hook_called = std::cell::Cell::new(false);
+    let result =
+        capture_declaration_sources_with_hook(&repo.path, &revision_query(revision), || {
+            finalize_hook_called.set(true);
+            Ok(())
+        });
+
+    assert_capture_limit_rejection(
+        result,
+        &finalize_hook_called,
+        "oversized committed Git blob must be rejected before it is loaded",
+        &[PATH, "1048576", "limit"],
+    )
+}
+
+#[test]
+fn capture_budget_rejects_aggregate_selected_sources_before_finalization() -> Result<()> {
+    let repo = TestRepo::new("declaration_capture_aggregate_budget")?;
+    repo.git(&["commit", "--allow-empty", "-m", "base"])?;
+    let source_sizes = [
+        MAX_DECLARATION_SOURCE_BYTES,
+        MAX_DECLARATION_SOURCE_BYTES,
+        MAX_DECLARATION_SOURCE_BYTES,
+        MAX_DECLARATION_SOURCE_BYTES,
+        1,
+    ];
+    let mut selected = HashSet::new();
+    for (index, source_size) in source_sizes.into_iter().enumerate() {
+        let path = format!("src/selected_{index}.rs");
+        write_sparse_source(&repo, &path, source_size)?;
+        selected.insert(RepoPath::new(path)?);
+    }
+    assert_eq!(
+        source_sizes.into_iter().sum::<u64>(),
+        MAX_DECLARATION_CAPTURE_BYTES + 1
+    );
+    let query = worktree_query(ReviewPathSelection::Scoped {
+        files: selected,
+        dirs: Vec::new(),
+        changed: None,
+    });
+
+    let finalize_hook_called = std::cell::Cell::new(false);
+    let result = capture_declaration_sources_with_hook(&repo.path, &query, || {
+        finalize_hook_called.set(true);
+        Ok(())
+    });
+
+    assert_capture_limit_rejection(
+        result,
+        &finalize_hook_called,
+        "selected declaration sources exceeding the aggregate budget must be rejected before loading completes",
+        &["4194304", "aggregate", "limit"],
+    )
 }

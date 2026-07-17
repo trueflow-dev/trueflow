@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
 use ignore::WalkBuilder;
@@ -21,6 +21,37 @@ use crate::targets::{ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection}
 use crate::vcs::{self, ChangedPath};
 
 const CAPTURE_DRIFT_ERROR: &str = "worktree changed during declaration capture; retry";
+
+const MAX_CAPTURE_SOURCE_BYTES: u64 = 1024 * 1024;
+const MAX_CAPTURE_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct CaptureBudget {
+    loaded_bytes: u64,
+}
+
+impl CaptureBudget {
+    fn reserve(&mut self, path: &RepoPath, source_bytes: u64) -> Result<()> {
+        if source_bytes > MAX_CAPTURE_SOURCE_BYTES {
+            bail!(
+                "declaration source {} is {source_bytes} bytes, exceeding the per-source capture limit of {MAX_CAPTURE_SOURCE_BYTES} bytes",
+                path.as_str()
+            );
+        }
+        let loaded_bytes = self
+            .loaded_bytes
+            .checked_add(source_bytes)
+            .ok_or_else(|| anyhow!("declaration capture aggregate byte count overflow"))?;
+        if loaded_bytes > MAX_CAPTURE_AGGREGATE_BYTES {
+            bail!(
+                "declaration capture aggregate limit of {MAX_CAPTURE_AGGREGATE_BYTES} bytes exceeded while adding {} ({source_bytes} bytes)",
+                path.as_str()
+            );
+        }
+        self.loaded_bytes = loaded_bytes;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureEndpointProvenance {
@@ -69,22 +100,21 @@ where
         .context("declaration capture requires a non-bare repository")?
         .to_path_buf();
 
+    let mut budget = CaptureBudget::default();
     match &query.diff_selection {
         ReviewDiffSelection::Targets(targets) => {
             let mut batches = Vec::with_capacity(targets.len());
             for target in targets {
-                batches.push(capture_immutable_target(&repo, query, target)?);
+                batches.push(capture_immutable_target(&repo, query, target, &mut budget)?);
             }
             hook()?;
             Ok(batches)
         }
         ReviewDiffSelection::None => match dirty_changed_paths(&query.path_selection) {
-            Some(changed) => {
-                capture_dirty(&repo, &workdir, query, changed, hook).map(|batch| vec![batch])
-            }
-            None => {
-                capture_worktree_inventory(&repo, &workdir, query, hook).map(|batch| vec![batch])
-            }
+            Some(changed) => capture_dirty(&repo, &workdir, query, changed, &mut budget, hook)
+                .map(|batch| vec![batch]),
+            None => capture_worktree_inventory(&repo, &workdir, query, &mut budget, hook)
+                .map(|batch| vec![batch]),
         },
     }
 }
@@ -93,6 +123,7 @@ fn capture_immutable_target(
     repo: &gix::Repository,
     query: &ResolvedReviewQuery,
     target: &ReviewDiffTarget,
+    budget: &mut CaptureBudget,
 ) -> Result<CaptureBatch> {
     let (base_commit, head_commit) = immutable_endpoints(repo, target)?;
     let base_tree = base_commit.as_ref().map(gix::Commit::tree).transpose()?;
@@ -123,6 +154,7 @@ fn capture_immutable_target(
                 language,
                 "base",
                 &target_key,
+                budget,
             )?,
             _ => None,
         };
@@ -133,6 +165,7 @@ fn capture_immutable_target(
                 language,
                 "head",
                 &target_key,
+                budget,
             )?,
             None => None,
         };
@@ -247,6 +280,7 @@ fn capture_dirty<F>(
     workdir: &Path,
     query: &ResolvedReviewQuery,
     changed: &HashSet<ChangedPath>,
+    budget: &mut CaptureBudget,
     hook: F,
 ) -> Result<CaptureBatch>
 where
@@ -283,6 +317,7 @@ where
                 *language,
                 "base",
                 &target_key,
+                budget,
             )?,
             None => None,
         };
@@ -292,6 +327,7 @@ where
             *head_language,
             "head",
             &target_key,
+            budget,
         )?;
         fingerprints.push((changed_path.location.clone(), fingerprint));
         if base.is_none() && head_snapshot.is_none() {
@@ -322,6 +358,7 @@ fn capture_worktree_inventory<F>(
     repo: &gix::Repository,
     workdir: &Path,
     query: &ResolvedReviewQuery,
+    budget: &mut CaptureBudget,
     hook: F,
 ) -> Result<CaptureBatch>
 where
@@ -335,7 +372,7 @@ where
     let target_key = format!("worktree:{}", head_id.as_str());
     for (path, language) in paths {
         let (head, fingerprint) =
-            snapshot_from_worktree(workdir, &path, Some(language), "head", &target_key)?;
+            snapshot_from_worktree(workdir, &path, Some(language), "head", &target_key, budget)?;
         fingerprints.push((path.clone(), fingerprint));
         if let Some(head) = head {
             pairs.push(snapshot_pair(
@@ -458,6 +495,7 @@ fn snapshot_from_tree(
     language: Language,
     endpoint_name: &str,
     target_key: &str,
+    budget: &mut CaptureBudget,
 ) -> Result<Option<SourceSnapshot>> {
     let Some(entry) = tree.lookup_entry_by_path(Path::new(path.as_str()))? else {
         return Ok(None);
@@ -468,6 +506,7 @@ fn snapshot_from_tree(
     ) {
         return Ok(None);
     }
+    budget.reserve(path, entry.id().header()?.size())?;
     let blob = entry.object()?.try_into_blob()?;
     let source = std::str::from_utf8(&blob.data)
         .with_context(|| format!("{} contains invalid UTF-8", path.as_str()))?;
@@ -486,6 +525,7 @@ fn snapshot_from_worktree(
     language: Option<Language>,
     endpoint_name: &str,
     target_key: &str,
+    budget: &mut CaptureBudget,
 ) -> Result<(Option<SourceSnapshot>, FileFingerprint)> {
     let absolute = workdir.join(path.as_str());
     let before = file_metadata(&absolute)?;
@@ -495,6 +535,7 @@ fn snapshot_from_worktree(
     if !before.is_file {
         return Ok((None, FileFingerprint::from_metadata(before, None)));
     }
+    budget.reserve(path, before.len)?;
     let bytes = fs::read(&absolute).with_context(|| format!("failed to read {}", path.as_str()))?;
     let after = file_metadata(&absolute)?.ok_or_else(|| anyhow!(CAPTURE_DRIFT_ERROR))?;
     if before != after {
