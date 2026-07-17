@@ -6,8 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::Language;
 
+
+mod c_family;
+mod go;
+mod python;
+
 mod projection;
 mod rust;
+mod typescript;
 
 pub use projection::projection_hash;
 
@@ -251,12 +257,10 @@ impl FileDeclarationFacts {
 pub fn project_source(path: &Path, language: Language, source: &str) -> Result<FileDeclarationFacts> {
     let (declarations, diagnostics) = match language {
         Language::Rust => rust::project(path, source)?,
-        Language::TypeScript | Language::Python | Language::Go | Language::C | Language::Cpp => (
-            Vec::new(),
-            vec![ProjectionDiagnostic::new(format!(
-                "{language:?} declaration extraction is pending its language adapter"
-            ))],
-        ),
+        Language::TypeScript => typescript::project(path, source)?,
+        Language::Python => python::project(path, source)?,
+        Language::Go => go::project(path, source)?,
+        Language::C | Language::Cpp => c_family::project(path, language, source)?,
         _ => (
             Vec::new(),
             vec![ProjectionDiagnostic::new(format!(
