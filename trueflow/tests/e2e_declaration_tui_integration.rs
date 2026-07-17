@@ -3,12 +3,14 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail, ensure};
+use crossterm::event::KeyCode;
 use trueflow::analysis::Language;
 use trueflow::cli::TuiReviewMode;
 use trueflow::commands::review::ResolvedReviewQuery;
 use trueflow::commands::tui::declaration::{
-    DeclarationAppRuntime, DeclarationRecordAppender, DeclarationReviewActionKind,
-    DeclarationReviewStatus as SurfaceStatus, prepare_declaration_launch,
+    DeclarationAppRuntime, DeclarationPane, DeclarationRecordAppender, DeclarationReviewActionKind,
+    DeclarationReviewStatus as SurfaceStatus, GraphSelection, Relationship,
+    RelationshipDestination, RelationshipGroup, RelationshipState, prepare_declaration_launch,
 };
 use trueflow::commands::tui::{TuiRuntimeKind, resolve_tui_launch};
 use trueflow::config::{BlockFilters, TrueflowConfig};
@@ -176,6 +178,75 @@ fn prepared_dirty_launch_uses_exact_sources_changed_surfaces_and_global_order() 
     assert!(
         !visible.contains(BODY_SENTINEL),
         "executable body text leaked into the review surface"
+    );
+    Ok(())
+}
+
+#[test]
+fn in_review_relationship_navigation_crosses_prepared_targets_and_back_restores_view() -> Result<()>
+{
+    let (repo, query) = two_file_dirty_repo("declaration_tui_relationship_navigation")?;
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+    let source = prepared
+        .targets()
+        .iter()
+        .find(|target| target.declaration.name == "alpha")
+        .context("missing prepared alpha target")?
+        .declaration
+        .id
+        .clone();
+    let destination = prepared
+        .targets()
+        .iter()
+        .find(|target| target.declaration.name == "beta")
+        .context("missing prepared beta target")?
+        .declaration
+        .id
+        .clone();
+
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
+    runtime.apply_relationship_state(
+        source.as_str(),
+        RelationshipState::Ready(vec![RelationshipGroup {
+            label: "Calls".to_owned(),
+            relationships: vec![Relationship {
+                id: "alpha.calls.beta".to_owned(),
+                label: "beta".to_owned(),
+                destination: RelationshipDestination::InReview {
+                    declaration_id: destination.as_str().to_owned(),
+                },
+            }],
+        }]),
+    )?;
+
+    let controller = runtime
+        .controller_mut()
+        .context("prepared runtime has no declaration controller")?;
+    controller.handle_key(KeyCode::Tab)?;
+    controller.handle_key(KeyCode::Down)?;
+    let before_activation = controller.state_snapshot();
+    ensure!(
+        before_activation.active_declaration == source.as_str()
+            && before_activation.active_pane == DeclarationPane::Relationships
+            && before_activation.relationships.selection
+                == Some(GraphSelection::Relationship("alpha.calls.beta".to_owned())),
+        "fixture did not select alpha's beta relationship: {before_activation:#?}"
+    );
+
+    controller.handle_key(KeyCode::Enter)?;
+    let after_activation = controller.state_snapshot();
+    controller.handle_key(KeyCode::Backspace)?;
+    let after_back = controller.state_snapshot();
+
+    assert_eq!(
+        after_activation.active_declaration,
+        destination.as_str(),
+        "activating an in-review relationship must open its prepared destination target"
+    );
+    assert_eq!(
+        after_back, before_activation,
+        "Backspace must restore the prior target, pane, and row selection"
     );
     Ok(())
 }

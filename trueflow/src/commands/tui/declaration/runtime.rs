@@ -80,23 +80,6 @@ impl PreparedDeclarationLaunch {
     pub fn canonical_order(&self) -> &[DeclarationId] {
         &self.canonical_order
     }
-
-    fn document_index_for_target(&self, target: &PreparedDeclarationTarget) -> Option<usize> {
-        self.documents.iter().position(|document| {
-            document.snapshot_id == target.snapshot.id.as_str()
-                && document.path == target.display_path.as_str()
-        })
-    }
-
-    fn set_status(&mut self, owner_id: &DeclarationId, status: DeclarationReviewStatus) {
-        for document in &mut self.documents {
-            for row in &mut document.outline_rows {
-                if row.review_owner == owner_id.as_str() {
-                    row.status = status;
-                }
-            }
-        }
-    }
 }
 
 /// Atomic persistence seam used by the declaration runtime.
@@ -359,23 +342,34 @@ impl DeclarationAppRuntime<ExternalDeclarationPersistence> {
 
 impl<A> DeclarationAppRuntime<A> {
     fn initialize(
-        prepared: PreparedDeclarationLaunch,
+        mut prepared: PreparedDeclarationLaunch,
         identity: Identity,
         appender: A,
         inner_width: u16,
         inner_height: u16,
     ) -> Result<Self> {
-        let mut runtime = Self {
+        let controller = prepared
+            .targets
+            .first()
+            .map(|target| target.declaration.id.as_str().to_owned())
+            .map(|active_declaration| {
+                DeclarationController::new_with_document_catalog(
+                    std::mem::take(&mut prepared.documents),
+                    active_declaration,
+                    inner_width,
+                    inner_height,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
             prepared,
             identity,
             appender,
             current_index: 0,
-            controller: None,
+            controller,
             inner_width,
             inner_height,
-        };
-        runtime.rebuild_controller()?;
-        Ok(runtime)
+        })
     }
 
     pub fn status(&self) -> &CollectionStatus {
@@ -468,36 +462,25 @@ impl<A> DeclarationAppRuntime<A> {
             DeclarationReviewActionKind::Comment => DeclarationReviewStatus::Commented,
             DeclarationReviewActionKind::Reject => DeclarationReviewStatus::Rejected,
         };
-        self.prepared.set_status(&target.declaration.id, status);
+        if let Some(controller) = &mut self.controller {
+            controller.apply_review_status(target.declaration.id.as_str(), status);
+        }
         self.current_index += 1;
         self.rebuild_controller()
     }
 
     fn rebuild_controller(&mut self) -> Result<()> {
-        let Some(target) = self.current().cloned() else {
+        let Some(declaration_id) = self
+            .current()
+            .map(|target| target.declaration.id.as_str().to_owned())
+        else {
             self.controller = None;
             return Ok(());
         };
-        let document_index = self
-            .prepared
-            .document_index_for_target(&target)
-            .context("current declaration target has no exact-source document")?;
-        let owner_id = target.declaration.id.as_str();
-        let mut document = self.prepared.documents[document_index].clone();
-        document
-            .outline_rows
-            .retain(|row| row.review_owner == owner_id);
-        document.canonical_order = vec![owner_id.to_owned()];
-        document.relationships.retain(|id, _| id == owner_id);
-        document.initial_outline_selection = Some(owner_id.to_owned());
-        document.initial_expanded.retain(|id| id == owner_id);
-        document.validate()?;
-        self.controller = Some(DeclarationController::new(
-            document,
-            self.inner_width,
-            self.inner_height,
-        )?);
-        Ok(())
+        self.controller
+            .as_mut()
+            .context("declaration document catalog disappeared before review completed")?
+            .begin_review(&declaration_id)
     }
 }
 

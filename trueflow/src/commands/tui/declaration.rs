@@ -23,7 +23,7 @@ use std::{
     ops::Range,
 };
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
@@ -320,13 +320,23 @@ pub struct DeclarationStateSnapshot {
     pub inspected_relationship: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocumentIdentity {
+    snapshot_id: String,
+    path: String,
+}
+
 #[derive(Debug, Clone)]
 struct NavigationSnapshot {
+    document: DocumentIdentity,
+    outline_scope: Option<String>,
     active_declaration: String,
     active_pane: DeclarationPane,
     outline: OutlinePaneState,
     relationships: GraphPaneState,
     comment_draft: Option<String>,
+    rejection_draft: bool,
+    replacement_restore: Option<Box<NavigationSnapshot>>,
     inspected_relationship: Option<String>,
 }
 
@@ -423,7 +433,9 @@ pub struct DeclarationRenderModel {
 
 #[derive(Debug, Clone)]
 pub struct DeclarationController {
-    document: DeclarationDocument,
+    documents: Vec<DeclarationDocument>,
+    active_document: usize,
+    outline_scope: Option<String>,
     active_declaration: String,
     active_pane: DeclarationPane,
     outline: OutlinePaneState,
@@ -449,6 +461,84 @@ impl DeclarationController {
             .row(&outline_selection)
             .map(|row| row.review_owner.clone())
             .unwrap_or_else(|| document.canonical_order[0].clone());
+        Self::from_document_catalog(
+            vec![document],
+            active_declaration,
+            outline_selection,
+            None,
+            inner_width,
+            inner_height,
+        )
+    }
+
+    pub(crate) fn new_with_document_catalog(
+        documents: Vec<DeclarationDocument>,
+        active_declaration: String,
+        inner_width: u16,
+        inner_height: u16,
+    ) -> Result<Self> {
+        let active_document = documents
+            .iter()
+            .position(|document| {
+                document
+                    .canonical_order
+                    .iter()
+                    .any(|id| id == &active_declaration)
+            })
+            .context("active declaration has no exact-source document")?;
+        let outline_selection = documents[active_document]
+            .row(&active_declaration)
+            .map(|row| row.id.clone())
+            .context("active declaration has no review-target outline row")?;
+        Self::from_document_catalog(
+            documents,
+            active_declaration.clone(),
+            outline_selection,
+            Some(active_declaration),
+            inner_width,
+            inner_height,
+        )
+    }
+
+    fn from_document_catalog(
+        documents: Vec<DeclarationDocument>,
+        active_declaration: String,
+        outline_selection: String,
+        outline_scope: Option<String>,
+        inner_width: u16,
+        inner_height: u16,
+    ) -> Result<Self> {
+        ensure!(
+            !documents.is_empty(),
+            "declaration document catalog cannot be empty"
+        );
+        let mut identities = BTreeSet::new();
+        let mut declarations = BTreeSet::new();
+        for document in &documents {
+            document.validate()?;
+            ensure!(
+                identities.insert((document.snapshot_id.as_str(), document.path.as_str())),
+                "duplicate declaration document {} at {}",
+                document.snapshot_id,
+                document.path
+            );
+            for declaration_id in &document.canonical_order {
+                ensure!(
+                    declarations.insert(declaration_id.as_str()),
+                    "declaration {declaration_id} appears in multiple documents"
+                );
+            }
+        }
+        let active_document = documents
+            .iter()
+            .position(|document| {
+                document
+                    .canonical_order
+                    .iter()
+                    .any(|id| id == &active_declaration)
+            })
+            .context("active declaration has no exact-source document")?;
+        let document = &documents[active_document];
         let mut controller = Self {
             outline: OutlinePaneState {
                 selection: outline_selection,
@@ -463,7 +553,9 @@ impl DeclarationController {
                 scroll: 0,
                 collapsed_groups: BTreeSet::new(),
             },
-            document,
+            documents,
+            active_document,
+            outline_scope,
             active_declaration,
             active_pane: DeclarationPane::Outline,
             comment_draft: None,
@@ -477,6 +569,82 @@ impl DeclarationController {
         };
         controller.normalize_view_state();
         Ok(controller)
+    }
+    fn document(&self) -> &DeclarationDocument {
+        &self.documents[self.active_document]
+    }
+
+    fn document_identity(&self) -> DocumentIdentity {
+        let document = self.document();
+        DocumentIdentity {
+            snapshot_id: document.snapshot_id.clone(),
+            path: document.path.clone(),
+        }
+    }
+
+    fn document_index(&self, identity: &DocumentIdentity) -> Option<usize> {
+        self.documents.iter().position(|document| {
+            document.snapshot_id == identity.snapshot_id && document.path == identity.path
+        })
+    }
+
+    fn declaration_document_index(&self, declaration_id: &str) -> Option<usize> {
+        self.documents.iter().position(|document| {
+            document
+                .canonical_order
+                .iter()
+                .any(|id| id == declaration_id)
+        })
+    }
+
+    pub(crate) fn begin_review(&mut self, declaration_id: &str) -> Result<()> {
+        let document_index = self
+            .declaration_document_index(declaration_id)
+            .with_context(|| format!("review declaration {declaration_id} has no document"))?;
+        let document = &self.documents[document_index];
+        let outline_selection = document
+            .row(declaration_id)
+            .map(|row| row.id.clone())
+            .with_context(|| format!("review declaration {declaration_id} has no outline row"))?;
+        self.active_document = document_index;
+        self.outline_scope = Some(declaration_id.to_owned());
+        self.active_declaration = declaration_id.to_owned();
+        self.active_pane = DeclarationPane::Outline;
+        self.outline = OutlinePaneState {
+            selection: outline_selection,
+            scroll: 0,
+            expanded: document.initial_expanded.clone(),
+        };
+        self.relationships = GraphPaneState {
+            selection: document
+                .initial_graph_selection
+                .clone()
+                .or(Some(GraphSelection::Status)),
+            scroll: 0,
+            collapsed_groups: BTreeSet::new(),
+        };
+        self.comment_draft = None;
+        self.rejection_draft = false;
+        self.back_stack.clear();
+        self.replacement_restore = None;
+        self.inspected_relationship = None;
+        self.pending_actions.clear();
+        self.normalize_view_state();
+        Ok(())
+    }
+
+    pub(crate) fn apply_review_status(
+        &mut self,
+        declaration_id: &str,
+        status: DeclarationReviewStatus,
+    ) {
+        for document in &mut self.documents {
+            for row in &mut document.outline_rows {
+                if row.review_owner == declaration_id {
+                    row.status = status;
+                }
+            }
+        }
     }
 
     pub fn state_snapshot(&self) -> DeclarationStateSnapshot {
@@ -505,14 +673,12 @@ impl DeclarationController {
         declaration_id: &str,
         state: RelationshipState,
     ) -> Result<()> {
-        ensure!(
-            self.document
-                .canonical_order
-                .iter()
-                .any(|id| id == declaration_id),
-            "relationship update targets an unknown declaration {declaration_id}"
-        );
-        self.document
+        let document_index = self
+            .declaration_document_index(declaration_id)
+            .with_context(|| {
+                format!("relationship update targets an unknown declaration {declaration_id}")
+            })?;
+        self.documents[document_index]
             .relationships
             .insert(declaration_id.to_owned(), state);
         if self.active_declaration == declaration_id {
@@ -558,7 +724,7 @@ impl DeclarationController {
             KeyCode::Enter if self.active_pane == DeclarationPane::Relationships => {
                 self.activate_graph_selection();
             }
-            KeyCode::Backspace | KeyCode::Esc => self.go_back(),
+            KeyCode::Backspace | KeyCode::Esc => self.go_back()?,
             KeyCode::Char(' ') => self.advance_canonical(),
             KeyCode::Char('a') => self.emit_approval(),
             KeyCode::Char('c') => self.open_comment(),
@@ -609,7 +775,7 @@ impl DeclarationController {
             .take(row_height)
             .map(|row| OutlineRenderRow {
                 id: row.id.clone(),
-                source_text: self.document.source_text(&row.display_range).to_owned(),
+                source_text: self.document().source_text(&row.display_range).to_owned(),
                 selected: self.active_pane == DeclarationPane::Outline
                     && row.id == self.outline.selection,
                 depth: usize::from(row.parent.is_some()),
@@ -693,7 +859,7 @@ impl DeclarationController {
             relationship_groups,
             relationship_status,
             relationship_rows,
-            title: format!("Declaration Review · {}", self.document.path),
+            title: format!("Declaration Review · {}", self.document().path),
             footer: match &self.comment_draft {
                 Some(draft) if self.rejection_draft => format!("Reject: {draft}"),
                 Some(draft) => format!("Comment: {draft}"),
@@ -716,17 +882,21 @@ impl DeclarationController {
     }
 
     fn current_relationship_state(&self) -> RelationshipState {
-        self.document.relationships_for(&self.active_declaration)
+        self.document().relationships_for(&self.active_declaration)
     }
 
     fn visible_outline_rows(&self) -> Vec<&OutlineRow> {
-        self.document
+        self.document()
             .outline_rows
             .iter()
             .filter(|row| {
-                row.parent
+                self.outline_scope
                     .as_ref()
-                    .is_none_or(|parent| self.outline.expanded.contains(parent))
+                    .is_none_or(|owner| &row.review_owner == owner)
+                    && row
+                        .parent
+                        .as_ref()
+                        .is_none_or(|parent| self.outline.expanded.contains(parent))
             })
             .collect()
     }
@@ -850,22 +1020,33 @@ impl DeclarationController {
 
     fn navigation_snapshot(&self) -> NavigationSnapshot {
         NavigationSnapshot {
+            document: self.document_identity(),
+            outline_scope: self.outline_scope.clone(),
             active_declaration: self.active_declaration.clone(),
             active_pane: self.active_pane,
             outline: self.outline.clone(),
             relationships: self.relationships.clone(),
             comment_draft: self.comment_draft.clone(),
             inspected_relationship: self.inspected_relationship.clone(),
+            rejection_draft: self.rejection_draft,
+            replacement_restore: self.replacement_restore.clone(),
         }
     }
 
-    fn restore_navigation(&mut self, snapshot: NavigationSnapshot) {
+    fn restore_navigation(&mut self, snapshot: NavigationSnapshot) -> Result<()> {
+        self.active_document = self
+            .document_index(&snapshot.document)
+            .context("navigation snapshot document disappeared from the launch catalog")?;
+        self.outline_scope = snapshot.outline_scope;
         self.active_declaration = snapshot.active_declaration;
         self.active_pane = snapshot.active_pane;
         self.outline = snapshot.outline;
         self.relationships = snapshot.relationships;
         self.comment_draft = snapshot.comment_draft;
         self.inspected_relationship = snapshot.inspected_relationship;
+        self.rejection_draft = snapshot.rejection_draft;
+        self.replacement_restore = snapshot.replacement_restore;
+        Ok(())
     }
 
     fn open_relationship_replacement(&mut self) {
@@ -876,12 +1057,13 @@ impl DeclarationController {
         self.inspected_relationship = None;
     }
 
-    fn go_back(&mut self) {
+    fn go_back(&mut self) -> Result<()> {
         if let Some(snapshot) = self.back_stack.pop() {
-            self.restore_navigation(snapshot);
+            self.restore_navigation(snapshot)?;
         } else if let Some(snapshot) = self.replacement_restore.take() {
-            self.restore_navigation(*snapshot);
+            self.restore_navigation(*snapshot)?;
         }
+        Ok(())
     }
 
     fn activate_graph_selection(&mut self) {
@@ -894,16 +1076,32 @@ impl DeclarationController {
         };
         match &relationship.destination {
             RelationshipDestination::InReview { declaration_id } => {
-                let Some(target) = self.document.row(declaration_id) else {
+                let Some(document_index) = self.declaration_document_index(declaration_id) else {
+                    return;
+                };
+                let Some(target) = self.documents[document_index].row(declaration_id) else {
                     return;
                 };
                 let owner = target.review_owner.clone();
                 let selected_id = target.id.clone();
+                let expanded = self.documents[document_index].initial_expanded.clone();
+                let graph_selection = self.documents[document_index]
+                    .initial_graph_selection
+                    .clone()
+                    .or(Some(GraphSelection::Status));
                 self.back_stack.push(self.navigation_snapshot());
+                self.active_document = document_index;
+                if self.outline_scope.is_some() {
+                    self.outline_scope = Some(owner.clone());
+                }
                 self.active_declaration = owner;
                 self.outline.selection = selected_id;
+                self.outline.scroll = 0;
+                self.outline.expanded = expanded;
                 self.inspected_relationship = None;
+                self.relationships.selection = graph_selection;
                 self.relationships.scroll = 0;
+                self.relationships.collapsed_groups.clear();
                 let target_state = self.current_relationship_state();
                 normalize_graph_selection(&mut self.relationships, &target_state);
                 self.ensure_outline_visible();
@@ -920,14 +1118,14 @@ impl DeclarationController {
     }
 
     fn advance_canonical(&mut self) {
-        let current = self
-            .document
+        let document = self.document();
+        let current = document
             .canonical_order
             .iter()
             .position(|id| id == &self.active_declaration)
             .unwrap_or(0);
-        let next = (current + 1).min(self.document.canonical_order.len().saturating_sub(1));
-        let id = self.document.canonical_order[next].clone();
+        let next = (current + 1).min(document.canonical_order.len().saturating_sub(1));
+        let id = document.canonical_order[next].clone();
         self.active_declaration = id.clone();
         self.outline.selection = id;
         self.inspected_relationship = None;
@@ -946,16 +1144,17 @@ impl DeclarationController {
         if self.active_pane != DeclarationPane::Outline {
             return None;
         }
-        self.document.row(&self.outline.selection)
+        self.document().row(&self.outline.selection)
     }
 
     fn anchor_for_row(&self, row: &OutlineRow) -> DeclarationAnchor {
+        let document = self.document();
         DeclarationAnchor::new(
-            self.document.snapshot_id.clone(),
-            self.document.path.clone(),
+            document.snapshot_id.clone(),
+            document.path.clone(),
             row.anchor_ranges
                 .iter()
-                .map(|range| (range.clone(), self.document.source_text(range).to_owned())),
+                .map(|range| (range.clone(), document.source_text(range).to_owned())),
         )
     }
 
@@ -994,10 +1193,10 @@ impl DeclarationController {
                 if body.trim().is_empty() {
                     return Ok(());
                 }
-                let Some(row) = self.document.row(&self.outline.selection) else {
+                let Some(row) = self.document().row(&self.outline.selection).cloned() else {
                     bail!("comment source row disappeared")
                 };
-                let anchor = self.anchor_for_row(row);
+                let anchor = self.anchor_for_row(&row);
                 let kind = if self.rejection_draft {
                     DeclarationReviewActionKind::Reject
                 } else {
@@ -1006,7 +1205,7 @@ impl DeclarationController {
                 self.rejection_draft = false;
                 self.pending_actions.push(DeclarationReviewAction {
                     kind,
-                    owner_id: row.review_owner.clone(),
+                    owner_id: row.review_owner,
                     comment_body: Some(body),
                     anchor: Some(anchor),
                 });
@@ -1035,7 +1234,7 @@ impl DeclarationController {
         if self.outline.expanded.remove(&selected) {
             self.ensure_outline_visible();
         } else if let Some(parent) = self
-            .document
+            .document()
             .row(&selected)
             .and_then(|row| row.parent.clone())
             && let Some(index) = self
@@ -1050,7 +1249,7 @@ impl DeclarationController {
     fn expand_selected(&mut self) {
         let selected = self.outline.selection.clone();
         if self
-            .document
+            .document()
             .outline_rows
             .iter()
             .any(|row| row.parent.as_deref() == Some(&selected))
@@ -1102,7 +1301,7 @@ impl DeclarationController {
         outline_rows: &[OutlineRenderRow],
         relationship_rows: &[RelationshipRenderRow],
     ) -> String {
-        let mut lines = vec![format!("Declaration Review · {}", self.document.path)];
+        let mut lines = vec![format!("Declaration Review · {}", self.document().path)];
         let show_outline = matches!(layout, DeclarationLayout::Split { .. })
             || matches!(
                 layout,
