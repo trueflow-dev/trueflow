@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::Path;
 
@@ -8,8 +10,8 @@ use crate::analysis::Language;
 
 use super::projection::{declaration_id, declaration_key};
 use super::{
-    DeclarationKind, DeclarationNode, ProjectionDiagnostic, SourceComponent, SourceComponentRole,
-    TypeUseRole, TypeUseSite, Visibility, projection_hash,
+    DeclarationId, DeclarationKind, DeclarationNode, ProjectionDiagnostic, SourceComponent,
+    SourceComponentRole, TypeUseRole, TypeUseSite, Visibility, projection_hash,
 };
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,7 @@ struct Projector<'a> {
     next_ordinal: usize,
     declarations: Vec<DeclarationNode>,
     diagnostics: Vec<ProjectionDiagnostic>,
+    pending_method_parents: Vec<(usize, String)>,
 }
 
 pub(super) fn project(
@@ -60,8 +63,10 @@ pub(super) fn project(
         next_ordinal: 0,
         declarations: Vec::new(),
         diagnostics: Vec::new(),
+        pending_method_parents: Vec::new(),
     };
     projector.collect_file(tree.root_node())?;
+    projector.resolve_method_lineage();
     if tree.root_node().has_error() {
         projector.diagnostics.push(ProjectionDiagnostic::new(
             "Go source contains syntax errors; declarations with errors in projected surfaces were omitted",
@@ -124,21 +129,22 @@ impl Projector<'_> {
             )));
             return Ok(());
         };
-        let Some(body) = item.child_by_field_name("body") else {
+        let name = node_text(name_node, self.source)
+            .context("Go callable name was not on UTF-8 boundaries")?
+            .to_owned();
+        let signature_end = item
+            .child_by_field_name("body")
+            .map_or(item.end_byte(), |body| body.start_byte());
+        let Some(surface) = trim_range_end(self.source, item.start_byte()..signature_end) else {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
-                "omitted Go {kind:?} at byte {} because its signature has no body boundary",
-                item.start_byte()
+                "omitted Go {kind:?} {name} because its projected signature is empty"
             )));
-            return Ok(());
-        };
-        let Some(surface) = trim_range_end(self.source, item.start_byte()..body.start_byte())
-        else {
             return Ok(());
         };
 
         let mut semantic_ranges = documentation_ranges(documentation);
         semantic_ranges.push(SemanticRange {
-            range: surface,
+            range: surface.clone(),
             role: SourceComponentRole::Signature,
         });
         let mut type_use_sites = Vec::new();
@@ -175,20 +181,34 @@ impl Projector<'_> {
             )?;
         }
         normalize_type_use_sites(&mut type_use_sites);
+
         let parent_name = item
             .child_by_field_name("receiver")
-            .and_then(first_type_identifier)
-            .and_then(|receiver| self.source.get(receiver.byte_range()))
+            .and_then(receiver_base_type_identifier)
+            .and_then(|receiver| node_text(receiver, self.source))
             .map(str::to_owned);
-        self.finish_declaration(
+        if kind == DeclarationKind::Method && parent_name.is_none() {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "Go Method {name} at byte {} has no representable local receiver base type; aggregate lineage was omitted",
+                item.start_byte()
+            )));
+        }
+        let index = self.finish_declaration(
             item,
-            name_node,
+            name,
             kind,
             semantic_ranges,
             item.end_byte(),
+            None,
             parent_name.as_deref(),
             type_use_sites,
-        )
+            surface,
+            &[],
+        )?;
+        if let (Some(index), Some(parent_name)) = (index, parent_name) {
+            self.pending_method_parents.push((index, parent_name));
+        }
+        Ok(())
     }
 
     fn add_type_declaration(
@@ -199,6 +219,11 @@ impl Projector<'_> {
         let grouped = is_grouped_declaration(declaration);
         let specs = collect_specs(declaration, &["type_spec", "type_alias"], self.source);
         let ungrouped_single = !grouped && specs.len() == 1;
+        if grouped && !declaration_documentation.is_empty() {
+            self.diagnostics.push(ProjectionDiagnostic::new(
+                "Go grouped type declaration documentation cannot be assigned to one spec without ambiguous ownership",
+            ));
+        }
 
         for entry in specs {
             let spec = entry.node;
@@ -209,6 +234,9 @@ impl Projector<'_> {
                 )));
                 continue;
             };
+            let name = node_text(name_node, self.source)
+                .context("Go type declaration name was not on UTF-8 boundaries")?
+                .to_owned();
             let Some(target) = spec.child_by_field_name("type") else {
                 self.diagnostics.push(ProjectionDiagnostic::new(format!(
                     "omitted Go type declaration at byte {} because it has no target type",
@@ -252,6 +280,22 @@ impl Projector<'_> {
                 );
             }
 
+            let interface_methods = if kind == DeclarationKind::Interface {
+                collect_interface_methods(target, self.source)
+            } else {
+                Vec::new()
+            };
+            let exclusions = interface_methods
+                .iter()
+                .map(|entry| {
+                    let start = entry
+                        .documentation
+                        .first()
+                        .map_or(entry.node.start_byte(), |range| range.start);
+                    member_line_exclusion(self.source, start..entry.node.end_byte())
+                })
+                .collect::<Vec<_>>();
+
             let mut type_use_sites = Vec::new();
             if let Some(type_parameters) = spec.child_by_field_name("type_parameters") {
                 collect_type_identifiers(
@@ -278,17 +322,90 @@ impl Projector<'_> {
                 }
             }
             normalize_type_use_sites(&mut type_use_sites);
-            self.finish_declaration(
+            let Some(parent_index) = self.finish_declaration(
                 item,
-                name_node,
+                name.clone(),
                 kind,
                 semantic_ranges,
                 item.end_byte(),
                 None,
+                None,
                 type_use_sites,
-            )?;
+                item.byte_range(),
+                &exclusions,
+            )?
+            else {
+                continue;
+            };
+
+            if !interface_methods.is_empty() {
+                let parent_id = self.declarations[parent_index].id.clone();
+                let mut children = Vec::new();
+                for method in interface_methods {
+                    if let Some(child_index) =
+                        self.add_interface_method(method, &parent_id, &name)?
+                    {
+                        children.push(self.declarations[child_index].id.clone());
+                    }
+                }
+                self.declarations[parent_index].children = children;
+            }
         }
         Ok(())
+    }
+
+    fn add_interface_method(
+        &mut self,
+        entry: SpecEntry<'_>,
+        parent_id: &DeclarationId,
+        parent_name: &str,
+    ) -> Result<Option<usize>> {
+        let method = entry.node;
+        let Some(name_node) = method.child_by_field_name("name") else {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted Go interface method at byte {} because it has no declared name",
+                method.start_byte()
+            )));
+            return Ok(None);
+        };
+        let name = node_text(name_node, self.source)
+            .context("Go interface method name was not on UTF-8 boundaries")?
+            .to_owned();
+        let mut semantic_ranges = documentation_ranges(entry.documentation);
+        semantic_ranges.push(SemanticRange {
+            range: method.byte_range(),
+            role: SourceComponentRole::Signature,
+        });
+        let mut type_use_sites = Vec::new();
+        if let Some(parameters) = method.child_by_field_name("parameters") {
+            collect_type_identifiers(
+                parameters,
+                self.source,
+                TypeUseRole::Parameter,
+                &mut type_use_sites,
+            )?;
+        }
+        if let Some(result) = method.child_by_field_name("result") {
+            collect_type_identifiers(
+                result,
+                self.source,
+                TypeUseRole::Return,
+                &mut type_use_sites,
+            )?;
+        }
+        normalize_type_use_sites(&mut type_use_sites);
+        self.finish_declaration(
+            method,
+            name,
+            DeclarationKind::Method,
+            semantic_ranges,
+            method.end_byte(),
+            Some(parent_id.clone()),
+            Some(parent_name),
+            type_use_sites,
+            method.byte_range(),
+            &[],
+        )
     }
 
     fn add_value_declaration(
@@ -305,6 +422,11 @@ impl Projector<'_> {
         let grouped = is_grouped_declaration(declaration);
         let specs = collect_specs(declaration, &[spec_kind], self.source);
         let ungrouped_single = !grouped && specs.len() == 1;
+        if grouped && !declaration_documentation.is_empty() {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "Go grouped {kind:?} declaration documentation cannot be assigned to one spec without ambiguous ownership"
+            )));
+        }
 
         for entry in specs {
             let spec = entry.node;
@@ -318,6 +440,40 @@ impl Projector<'_> {
                 )));
                 continue;
             }
+
+            let mut name_cursor = spec.walk();
+            let name_nodes = spec
+                .children_by_field_name("name", &mut name_cursor)
+                .filter(|name| name.is_named())
+                .collect::<Vec<_>>();
+            let mut names = Vec::new();
+            for name_node in &name_nodes {
+                let name = node_text(*name_node, self.source)
+                    .context("Go value declaration name was not on UTF-8 boundaries")?;
+                if name != "_" {
+                    names.push(name.to_owned());
+                }
+            }
+            if names.is_empty() {
+                self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                    "omitted Go {kind:?} at byte {} because it declares no named binding",
+                    spec.start_byte()
+                )));
+                continue;
+            }
+            let visibility = go_visibility(&names[0]);
+            if names
+                .iter()
+                .skip(1)
+                .any(|name| go_visibility(name) != visibility)
+            {
+                self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                    "omitted indivisible Go {kind:?} group {} because its names have different visibility and cannot have one exact review owner",
+                    names.join(", ")
+                )));
+                continue;
+            }
+            let name = names.join(", ");
             let item = if ungrouped_single { declaration } else { spec };
             let mut semantic_ranges = if ungrouped_single {
                 documentation_ranges(declaration_documentation.iter().cloned())
@@ -339,29 +495,18 @@ impl Projector<'_> {
                 )?;
             }
             normalize_type_use_sites(&mut type_use_sites);
-            let mut name_cursor = spec.walk();
-            let names = spec
-                .children_by_field_name("name", &mut name_cursor)
-                .filter(|name| name.is_named())
-                .collect::<Vec<_>>();
-            if names.is_empty() {
-                self.diagnostics.push(ProjectionDiagnostic::new(format!(
-                    "omitted Go {kind:?} at byte {} because it has no declared name",
-                    spec.start_byte()
-                )));
-                continue;
-            }
-            for name_node in names {
-                self.finish_declaration(
-                    item,
-                    name_node,
-                    kind,
-                    semantic_ranges.clone(),
-                    item.end_byte(),
-                    None,
-                    type_use_sites.clone(),
-                )?;
-            }
+            self.finish_declaration(
+                item,
+                name,
+                kind,
+                semantic_ranges,
+                item.end_byte(),
+                None,
+                None,
+                type_use_sites,
+                item.byte_range(),
+                &[],
+            )?;
         }
         Ok(())
     }
@@ -370,18 +515,16 @@ impl Projector<'_> {
     fn finish_declaration(
         &mut self,
         syntax_node: Node<'_>,
-        name_node: Node<'_>,
+        name: String,
         kind: DeclarationKind,
         mut semantic_ranges: Vec<SemanticRange>,
         source_span_end: usize,
+        parent_id: Option<DeclarationId>,
         parent_name: Option<&str>,
         type_use_sites: Vec<TypeUseSite>,
-    ) -> Result<()> {
-        let name = self
-            .source
-            .get(name_node.byte_range())
-            .context("Go declaration name was not on UTF-8 boundaries")?
-            .to_owned();
+        key_surface: Range<usize>,
+        ownership_exclusions: &[Range<usize>],
+    ) -> Result<Option<usize>> {
         semantic_ranges.sort_by_key(|semantic| (semantic.range.start, semantic.range.end));
         semantic_ranges
             .dedup_by(|left, right| left.range == right.range && left.role == right.role);
@@ -391,21 +534,30 @@ impl Projector<'_> {
             .map(|semantic| semantic.range.clone())
             .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
         else {
-            return Ok(());
+            return Ok(None);
         };
-        if has_syntax_error_in_range(syntax_node, &projected_surface) {
+        if has_syntax_error_outside_exclusions(
+            syntax_node,
+            &projected_surface,
+            ownership_exclusions,
+        ) {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
                 "omitted Go {kind:?} {name} because its projected surface contains a syntax error"
             )));
-            return Ok(());
+            return Ok(None);
         }
 
-        let components = build_components(self.source, &semantic_ranges, &self.comments)?;
+        let components = build_components(
+            self.source,
+            &semantic_ranges,
+            &self.comments,
+            ownership_exclusions,
+        )?;
         if components.is_empty() {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
                 "omitted Go {kind:?} {name} because it has no projectable source components"
             )));
-            return Ok(());
+            return Ok(None);
         }
         let projection_text = components
             .iter()
@@ -426,15 +578,18 @@ impl Projector<'_> {
             source_span.start,
             &projection_hash,
         );
-        let key = declaration_key(Language::Go, kind, &name, parent_name, &projection_text);
+        let key_discriminator =
+            syntax_discriminator(syntax_node, self.source, &key_surface, ownership_exclusions)?;
+        let key = declaration_key(Language::Go, kind, &name, parent_name, &key_discriminator);
         let visibility = go_visibility(&name);
+        let index = self.declarations.len();
         self.declarations.push(DeclarationNode {
             id: id.clone(),
             key,
             name,
             kind,
             visibility,
-            parent_part: None,
+            parent_part: parent_id,
             source_ordinal,
             source_span,
             components,
@@ -444,7 +599,58 @@ impl Projector<'_> {
             children: Vec::new(),
             type_use_sites,
         });
-        Ok(())
+        Ok(Some(index))
+    }
+
+    fn resolve_method_lineage(&mut self) {
+        for (method_index, parent_name) in std::mem::take(&mut self.pending_method_parents) {
+            let candidates = self
+                .declarations
+                .iter()
+                .enumerate()
+                .filter(|(index, declaration)| {
+                    *index != method_index
+                        && declaration.name == parent_name
+                        && matches!(
+                            declaration.kind,
+                            DeclarationKind::Struct
+                                | DeclarationKind::Interface
+                                | DeclarationKind::TypeAlias
+                        )
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let [parent_index] = candidates.as_slice() else {
+                let method = &self.declarations[method_index];
+                let reason = if candidates.is_empty() {
+                    "no matching type declaration occurs in this file"
+                } else {
+                    "more than one matching type declaration occurs in this file"
+                };
+                self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                    "Go Method {} receiver {parent_name} has no exact aggregate lineage because {reason}",
+                    method.name
+                )));
+                continue;
+            };
+            let parent_index = *parent_index;
+            let parent_id = self.declarations[parent_index].id.clone();
+            let method_id = self.declarations[method_index].id.clone();
+            self.declarations[method_index].parent_part = Some(parent_id);
+            self.declarations[parent_index].children.push(method_id);
+        }
+
+        let source_ordinals = self
+            .declarations
+            .iter()
+            .map(|declaration| (declaration.id.clone(), declaration.source_ordinal))
+            .collect::<HashMap<_, _>>();
+        for declaration in &mut self.declarations {
+            declaration
+                .children
+                .sort_by_key(|child| source_ordinals.get(child).copied().unwrap_or(usize::MAX));
+            declaration.children.dedup();
+        }
     }
 }
 
@@ -523,7 +729,7 @@ fn collect_aggregate_documentation(type_node: Node<'_>, source: &str) -> Vec<Ran
     let member_kinds: &[&str] = if type_node.kind() == "struct_type" {
         &["field_declaration"]
     } else {
-        &["method_elem", "type_elem"]
+        &["type_elem"]
     };
     let mut documentation = Vec::new();
     let mut pending_comments = Vec::<Range<usize>>::new();
@@ -549,6 +755,39 @@ fn collect_aggregate_documentation(type_node: Node<'_>, source: &str) -> Vec<Ran
         previous_item_end_row = Some(child.end_position().row);
     }
     documentation
+}
+
+fn collect_interface_methods<'tree>(
+    interface_type: Node<'tree>,
+    source: &str,
+) -> Vec<SpecEntry<'tree>> {
+    let mut entries = Vec::new();
+    let mut pending_comments = Vec::<Range<usize>>::new();
+    let mut previous_item_end_row = Some(interface_type.start_position().row);
+    let mut cursor = interface_type.walk();
+    for child in interface_type.named_children(&mut cursor) {
+        if child.kind() == "comment" {
+            if previous_item_end_row == Some(child.start_position().row) {
+                pending_comments.clear();
+            } else {
+                pending_comments.push(child.byte_range());
+            }
+            continue;
+        }
+        if child.kind() == "method_elem" {
+            entries.push(SpecEntry {
+                node: child,
+                documentation: trailing_comment_group(
+                    source,
+                    &pending_comments,
+                    child.start_byte(),
+                ),
+            });
+        }
+        pending_comments.clear();
+        previous_item_end_row = Some(child.end_position().row);
+    }
+    entries
 }
 
 fn trailing_comment_group(
@@ -599,6 +838,7 @@ fn build_components(
     source: &str,
     semantic_ranges: &[SemanticRange],
     comments: &[CommentRange],
+    ownership_exclusions: &[Range<usize>],
 ) -> Result<Vec<SourceComponent>> {
     let Some(surface) = semantic_ranges
         .iter()
@@ -612,7 +852,7 @@ fn build_components(
         .filter(|semantic| semantic.role == SourceComponentRole::Documentation)
         .map(|semantic| semantic.range.clone())
         .collect::<Vec<_>>();
-    let excluded = comments
+    let mut excluded = comments
         .iter()
         .filter(|comment| {
             !documentation.contains(&comment.raw)
@@ -623,6 +863,14 @@ fn build_components(
             comment.exclusion.start.max(surface.start)..comment.exclusion.end.min(surface.end)
         })
         .collect::<Vec<_>>();
+    excluded.extend(
+        ownership_exclusions
+            .iter()
+            .filter(|range| range.start < surface.end && range.end > surface.start)
+            .map(|range| range.start.max(surface.start)..range.end.min(surface.end)),
+    );
+    excluded.sort_by_key(|range| (range.start, range.end));
+    excluded.dedup();
 
     let mut boundaries = vec![surface.start, surface.end];
     for semantic in semantic_ranges {
@@ -717,16 +965,103 @@ fn whole_comment_line(source: &str, range: Range<usize>) -> Range<usize> {
     line_start..line_end
 }
 
-fn has_syntax_error_in_range(node: Node<'_>, range: &Range<usize>) -> bool {
+fn member_line_exclusion(source: &str, range: Range<usize>) -> Range<usize> {
+    let line_start = source.as_bytes()[..range.start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let start = if source[line_start..range.start].trim().is_empty() {
+        line_start
+    } else {
+        range.start
+    };
+    let line_content_end = source.as_bytes()[range.end..]
+        .iter()
+        .position(|byte| matches!(*byte, b'\r' | b'\n'))
+        .map_or(source.len(), |offset| range.end + offset);
+    if !source[range.end..line_content_end].trim().is_empty() {
+        return start..range.end;
+    }
+    let mut end = line_content_end;
+    if source.as_bytes().get(end) == Some(&b'\r') {
+        end += 1;
+    }
+    if source.as_bytes().get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    start..end
+}
+
+fn syntax_discriminator(
+    node: Node<'_>,
+    source: &str,
+    surface: &Range<usize>,
+    exclusions: &[Range<usize>],
+) -> Result<String> {
+    fn collect(
+        node: Node<'_>,
+        source: &str,
+        surface: &Range<usize>,
+        exclusions: &[Range<usize>],
+        output: &mut String,
+    ) -> Result<()> {
+        let range = node.byte_range();
+        if node.kind() == "comment"
+            || range.end <= surface.start
+            || range.start >= surface.end
+            || exclusions
+                .iter()
+                .any(|excluded| excluded.start <= range.start && excluded.end >= range.end)
+        {
+            return Ok(());
+        }
+        if node.child_count() == 0 {
+            if range.start < surface.start || range.end > surface.end || range.is_empty() {
+                return Ok(());
+            }
+            let text =
+                node_text(node, source).context("Go identity token was not on UTF-8 boundaries")?;
+            write!(
+                output,
+                "{}:{}{}:{}",
+                node.kind().len(),
+                node.kind(),
+                text.len(),
+                text
+            )
+            .expect("writing to a String cannot fail");
+            return Ok(());
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect(child, source, surface, exclusions, output)?;
+        }
+        Ok(())
+    }
+
+    let mut output = String::new();
+    collect(node, source, surface, exclusions, &mut output)?;
+    Ok(output)
+}
+
+fn has_syntax_error_outside_exclusions(
+    node: Node<'_>,
+    range: &Range<usize>,
+    exclusions: &[Range<usize>],
+) -> bool {
+    let node_range = node.byte_range();
     if (node.is_error() || node.is_missing())
-        && node.start_byte() < range.end
-        && node.end_byte() >= range.start
+        && node_range.start < range.end
+        && node_range.end >= range.start
+        && !exclusions
+            .iter()
+            .any(|exclusion| exclusion.start <= node_range.start && exclusion.end >= node_range.end)
     {
         return true;
     }
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .any(|child| has_syntax_error_in_range(child, range))
+        .any(|child| has_syntax_error_outside_exclusions(child, range, exclusions))
 }
 
 fn go_visibility(name: &str) -> Visibility {
@@ -737,13 +1072,29 @@ fn go_visibility(name: &str) -> Visibility {
     }
 }
 
-fn first_type_identifier(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() == "type_identifier" {
-        return Some(node);
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    source.get(node.byte_range())
+}
+
+fn receiver_base_type_identifier(receiver: Node<'_>) -> Option<Node<'_>> {
+    fn unwrap_type(node: Node<'_>) -> Option<Node<'_>> {
+        match node.kind() {
+            "type_identifier" => Some(node),
+            "generic_type" => node.child_by_field_name("type").and_then(unwrap_type),
+            "pointer_type" | "parenthesized_type" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor).find_map(unwrap_type)
+            }
+            _ => None,
+        }
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find_map(first_type_identifier)
+
+    let mut cursor = receiver.walk();
+    receiver
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameter_declaration")
+        .and_then(|parameter| parameter.child_by_field_name("type"))
+        .and_then(unwrap_type)
 }
 
 fn collect_type_identifiers(
@@ -798,19 +1149,8 @@ fn collect_interface_type_uses(
 ) -> Result<()> {
     let mut cursor = interface_type.walk();
     for member in interface_type.named_children(&mut cursor) {
-        match member.kind() {
-            "method_elem" => {
-                if let Some(parameters) = member.child_by_field_name("parameters") {
-                    collect_type_identifiers(parameters, source, TypeUseRole::Parameter, sites)?;
-                }
-                if let Some(result) = member.child_by_field_name("result") {
-                    collect_type_identifiers(result, source, TypeUseRole::Return, sites)?;
-                }
-            }
-            "type_elem" => {
-                collect_type_identifiers(member, source, TypeUseRole::Bound, sites)?;
-            }
-            _ => {}
+        if member.kind() == "type_elem" {
+            collect_type_identifiers(member, source, TypeUseRole::Bound, sites)?;
         }
     }
     Ok(())
