@@ -31,7 +31,7 @@ use async_lsp::lsp_types::{
     PublishDiagnosticsParams, ReferenceClientCapabilities, TextDocumentClientCapabilities,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TypeDefinitionProviderCapability, Url,
-    WorkDoneProgressParams, WorkspaceFolder,
+    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceFolder,
 };
 use async_lsp::router::Router;
 use async_lsp::{Error, ErrorCode, MainLoop, ResponseError, ServerSocket};
@@ -619,6 +619,16 @@ async fn start_worker_session(
     root: PathBuf,
     executable: PathBuf,
 ) -> Result<WorkerSession, ProviderError> {
+    let initialize = build_initialize_params(&root)?;
+    let router_folder = initialize
+        .workspace_folders
+        .as_ref()
+        .and_then(|folders| folders.first())
+        .cloned()
+        .ok_or_else(|| {
+            ProviderError::Protocol("initialize params omitted the workspace folder".to_owned())
+        })?;
+
     let mut command = Command::new(executable);
     command
         .args(profile.argv())
@@ -642,19 +652,6 @@ async fn start_worker_session(
         .stderr
         .take()
         .ok_or_else(|| ProviderError::Protocol("LSP stderr pipe is unavailable".to_owned()))?;
-
-    let workspace_uri = Url::from_directory_path(&root).map_err(|_error| {
-        ProviderError::InvalidWorkspace(format!("workspace {} is not a file URI", root.display()))
-    })?;
-    let workspace_folder = WorkspaceFolder {
-        uri: workspace_uri,
-        name: root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace")
-            .to_owned(),
-    };
-    let router_folder = workspace_folder.clone();
 
     let (mainloop, server) = MainLoop::new_client(move |_server| {
         let mut router = Router::new(RouterState {
@@ -709,46 +706,6 @@ async fn start_worker_session(
     let stderr_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_STDERR_BYTES)));
     let stderr_drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&stderr_buffer)));
 
-    let capabilities = ClientCapabilities {
-        general: Some(GeneralClientCapabilities {
-            position_encodings: Some(vec![
-                PositionEncodingKind::UTF8,
-                PositionEncodingKind::UTF16,
-            ]),
-            ..GeneralClientCapabilities::default()
-        }),
-        text_document: Some(TextDocumentClientCapabilities {
-            call_hierarchy: Some(DynamicRegistrationClientCapabilities {
-                dynamic_registration: Some(false),
-            }),
-            declaration: Some(GotoCapability {
-                dynamic_registration: Some(false),
-                link_support: Some(true),
-            }),
-            definition: Some(GotoCapability {
-                dynamic_registration: Some(false),
-                link_support: Some(true),
-            }),
-            type_definition: Some(GotoCapability {
-                dynamic_registration: Some(false),
-                link_support: Some(true),
-            }),
-            references: Some(ReferenceClientCapabilities {
-                dynamic_registration: Some(false),
-            }),
-            ..TextDocumentClientCapabilities::default()
-        }),
-        ..ClientCapabilities::default()
-    };
-    let initialize = InitializeParams {
-        capabilities,
-        workspace_folders: Some(vec![workspace_folder]),
-        client_info: Some(ClientInfo {
-            name: "trueflow".to_owned(),
-            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        }),
-        ..InitializeParams::default()
-    };
     let initialized = match timeout(
         INITIALIZE_TIMEOUT,
         server.request::<async_lsp::lsp_types::request::Initialize>(initialize),
@@ -1380,25 +1337,116 @@ fn resolve_fixed_executable(
     let Some(path) = env::var_os("PATH") else {
         return Err(ProviderError::ExecutableNotFound(executable.to_owned()));
     };
-    for directory in env::split_paths(&path) {
+    let search_directories = env::split_paths(&path).collect::<Vec<_>>();
+    resolve_fixed_executable_from_search_directories(profile, workspace_root, &search_directories)
+}
+
+fn resolve_fixed_executable_from_search_directories(
+    profile: LspServerProfile,
+    workspace_root: &Path,
+    search_directories: &[PathBuf],
+) -> Result<PathBuf, ProviderError> {
+    let executable = profile.executable();
+    if !workspace_root.is_absolute() {
+        return Err(ProviderError::ExecutableNotFound(executable.to_owned()));
+    }
+    let Ok(canonical_workspace_root) = workspace_root.canonicalize() else {
+        return Err(ProviderError::ExecutableNotFound(executable.to_owned()));
+    };
+    if !canonical_workspace_root.is_dir() {
+        return Err(ProviderError::ExecutableNotFound(executable.to_owned()));
+    }
+
+    for directory in search_directories {
         if !directory.is_absolute() || directory.components().any(|part| part == Component::CurDir)
         {
             continue;
         }
         let candidate = directory.join(executable);
-        if !candidate.is_file() {
+        if candidate.starts_with(workspace_root) {
             continue;
         }
         let Ok(resolved) = candidate.canonicalize() else {
             continue;
         };
-        if resolved.starts_with(workspace_root) {
+        if !resolved.is_file() || resolved.starts_with(&canonical_workspace_root) {
             continue;
         }
-        // Preserve the fixed basename for multi-call launchers such as rustup proxies.
-        return Ok(candidate);
+        return Ok(resolved);
     }
     Err(ProviderError::ExecutableNotFound(executable.to_owned()))
+}
+
+#[allow(deprecated)]
+fn build_initialize_params(workspace_root: &Path) -> Result<InitializeParams, ProviderError> {
+    let root = workspace_root.canonicalize().map_err(|error| {
+        ProviderError::InvalidWorkspace(format!(
+            "cannot resolve workspace {}: {error}",
+            workspace_root.display()
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(ProviderError::InvalidWorkspace(format!(
+            "workspace {} is not a directory",
+            root.display()
+        )));
+    }
+    let workspace_uri = Url::from_directory_path(&root).map_err(|_error| {
+        ProviderError::InvalidWorkspace(format!("workspace {} is not a file URI", root.display()))
+    })?;
+    let workspace_folder = WorkspaceFolder {
+        uri: workspace_uri.clone(),
+        name: root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+            .to_owned(),
+    };
+    let capabilities = ClientCapabilities {
+        workspace: Some(WorkspaceClientCapabilities {
+            workspace_folders: Some(true),
+            ..WorkspaceClientCapabilities::default()
+        }),
+        general: Some(GeneralClientCapabilities {
+            position_encodings: Some(vec![
+                PositionEncodingKind::UTF8,
+                PositionEncodingKind::UTF16,
+            ]),
+            ..GeneralClientCapabilities::default()
+        }),
+        text_document: Some(TextDocumentClientCapabilities {
+            call_hierarchy: Some(DynamicRegistrationClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            declaration: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(true),
+            }),
+            definition: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(true),
+            }),
+            type_definition: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(true),
+            }),
+            references: Some(ReferenceClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            ..TextDocumentClientCapabilities::default()
+        }),
+        ..ClientCapabilities::default()
+    };
+    Ok(InitializeParams {
+        root_uri: Some(workspace_uri),
+        capabilities,
+        workspace_folders: Some(vec![workspace_folder]),
+        client_info: Some(ClientInfo {
+            name: "trueflow".to_owned(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        }),
+        ..InitializeParams::default()
+    })
 }
 
 fn validate_document_uri(root: &Path, uri: &Url) -> Result<(), ProviderError> {
@@ -1623,4 +1671,182 @@ fn parse_content_length(header: &[u8]) -> io::Result<usize> {
             "missing LSP Content-Length header",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::*;
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let path = env::temp_dir()
+                .join("trueflow_tests")
+                .join(format!("{name}_{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap_or_else(|error| {
+                panic!("create test directory {}: {error}", path.display())
+            });
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_resolution_rejects_workspace_owned_paths_and_returns_canonical_external_identity()
+    {
+        let fixture = TestDirectory::new("lsp_executable_resolution_boundaries");
+        let workspace = fixture.path().join("workspace");
+        let workspace_bin = workspace.join(".bin");
+        let workspace_toolchain = workspace.join("toolchain");
+        let external_target_dir = fixture.path().join("external-target");
+        let external_selector_dir = fixture.path().join("external-selector");
+        let vetted_external_dir = fixture.path().join("vetted-external");
+        for directory in [
+            &workspace_bin,
+            &workspace_toolchain,
+            &external_target_dir,
+            &external_selector_dir,
+            &vetted_external_dir,
+        ] {
+            fs::create_dir_all(directory).unwrap_or_else(|error| {
+                panic!("create fixture directory {}: {error}", directory.display())
+            });
+        }
+
+        let external_target = external_target_dir.join("actual-rust-analyzer");
+        let workspace_target = workspace_toolchain.join("actual-rust-analyzer");
+        let vetted_external = vetted_external_dir.join("rust-analyzer");
+        for executable in [&external_target, &workspace_target, &vetted_external] {
+            fs::write(executable, "#!/bin/sh\nexit 0\n").unwrap_or_else(|error| {
+                panic!("write fixture executable {}: {error}", executable.display())
+            });
+            let mut permissions = fs::metadata(executable)
+                .unwrap_or_else(|error| {
+                    panic!("read fixture metadata {}: {error}", executable.display())
+                })
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).unwrap_or_else(|error| {
+                panic!(
+                    "make fixture executable {} executable: {error}",
+                    executable.display()
+                )
+            });
+        }
+
+        symlink(&external_target, workspace_bin.join("rust-analyzer"))
+            .unwrap_or_else(|error| panic!("create workspace selector symlink: {error}"));
+        symlink(
+            &workspace_target,
+            external_selector_dir.join("rust-analyzer"),
+        )
+        .unwrap_or_else(|error| panic!("create external selector symlink: {error}"));
+
+        let profile = LspServerProfile::RustAnalyzer;
+        let workspace_selector = resolve_fixed_executable_from_search_directories(
+            profile,
+            &workspace,
+            std::slice::from_ref(&workspace_bin),
+        );
+        assert!(
+            matches!(
+                workspace_selector,
+                Err(ProviderError::ExecutableNotFound(name)) if name == "rust-analyzer"
+            ),
+            "a lexical selector owned by the workspace must be rejected even when its target is external"
+        );
+
+        let workspace_target = resolve_fixed_executable_from_search_directories(
+            profile,
+            &workspace,
+            std::slice::from_ref(&external_selector_dir),
+        );
+        assert!(
+            matches!(
+                workspace_target,
+                Err(ProviderError::ExecutableNotFound(name)) if name == "rust-analyzer"
+            ),
+            "an external lexical selector must be rejected when its canonical target is workspace-owned"
+        );
+
+        let resolved = resolve_fixed_executable_from_search_directories(
+            profile,
+            &workspace,
+            std::slice::from_ref(&vetted_external_dir),
+        )
+        .unwrap_or_else(|error| panic!("resolve vetted external executable: {error}"));
+        assert_eq!(
+            resolved,
+            vetted_external
+                .canonicalize()
+                .unwrap_or_else(|error| panic!("canonicalize vetted executable: {error}")),
+            "the launched identity must be the canonical path that passed validation"
+        );
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn initialize_params_advertise_workspace_folders_and_identify_root() {
+        let fixture = TestDirectory::new("lsp_initialize_workspace_identity");
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap_or_else(|error| {
+            panic!(
+                "create workspace directory {}: {error}",
+                workspace.display()
+            )
+        });
+        let expected_uri = Url::from_directory_path(
+            workspace
+                .canonicalize()
+                .unwrap_or_else(|error| panic!("canonicalize workspace: {error}")),
+        )
+        .unwrap_or_else(|()| panic!("workspace {} is not a file URI", workspace.display()));
+
+        let initialize = build_initialize_params(&workspace)
+            .unwrap_or_else(|error| panic!("build initialize params: {error}"));
+
+        assert_eq!(
+            initialize
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.workspace_folders),
+            Some(true),
+            "non-null workspaceFolders require the matching advertised client capability"
+        );
+        assert_eq!(
+            initialize.root_uri.as_ref(),
+            Some(&expected_uri),
+            "initialize must identify the same workspace root sent in workspaceFolders"
+        );
+        let folder_uris = initialize.workspace_folders.as_deref().map(|folders| {
+            folders
+                .iter()
+                .map(|folder| folder.uri.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            folder_uris,
+            Some(vec![expected_uri]),
+            "workspaceFolders must be non-null and contain exactly the identified root"
+        );
+    }
 }
