@@ -467,6 +467,9 @@
           "check": {
             "const": "declaration"
           },
+          "declaration_locator": {
+            "$ref": "#/$defs/DeclarationRecordLocator"
+          },
           "version": {
             "const": 5
           }
@@ -478,6 +481,11 @@
     },
     {
       "if": {
+        "properties": {
+          "declaration_locator": {
+            "$ref": "#/$defs/DeclarationRecordLocator"
+          }
+        },
         "required": [
           "declaration_locator"
         ]
@@ -516,6 +524,9 @@
       },
       "then": {
         "properties": {
+          "declaration_locator": {
+            "$ref": "#/$defs/DeclarationRecordLocator"
+          },
           "target": {
             "properties": {
               "kind": {
@@ -546,7 +557,8 @@
             },
             "required": [
               "type"
-            ]
+            ],
+            "type": "object"
           }
         },
         "required": [
@@ -557,6 +569,9 @@
         "properties": {
           "check": {
             "const": "declaration"
+          },
+          "declaration_locator": {
+            "$ref": "#/$defs/DeclarationRecordLocator"
           },
           "target": {
             "properties": {

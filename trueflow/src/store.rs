@@ -433,6 +433,7 @@ pub enum CommentAnchor {
 }
 
 fn add_record_shape_constraints(schema: &mut schemars::Schema) {
+    let declaration_locator = serde_json::json!({ "$ref": "#/$defs/DeclarationRecordLocator" });
     schema.insert(
         "allOf".to_string(),
         serde_json::json!([
@@ -449,13 +450,19 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                 "then": {
                     "properties": {
                         "version": { "const": 5 },
-                        "check": { "const": "declaration" }
+                        "check": { "const": "declaration" },
+                        "declaration_locator": declaration_locator.clone()
                     },
                     "required": ["declaration_locator"]
                 }
             },
             {
-                "if": { "required": ["declaration_locator"] },
+                "if": {
+                    "properties": {
+                        "declaration_locator": declaration_locator.clone()
+                    },
+                    "required": ["declaration_locator"]
+                },
                 "then": {
                     "properties": {
                         "version": { "const": 5 },
@@ -478,7 +485,8 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                         "target": {
                             "properties": { "kind": { "const": "declaration" } },
                             "required": ["kind"]
-                        }
+                        },
+                        "declaration_locator": declaration_locator.clone()
                     },
                     "required": ["declaration_locator"]
                 }
@@ -487,6 +495,7 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                 "if": {
                     "properties": {
                         "comment_anchor": {
+                            "type": "object",
                             "properties": { "type": { "const": "declaration" } },
                             "required": ["type"]
                         }
@@ -500,7 +509,8 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                             "properties": { "kind": { "const": "declaration" } },
                             "required": ["kind"]
                         },
-                        "check": { "const": "declaration" }
+                        "check": { "const": "declaration" },
+                        "declaration_locator": declaration_locator
                     },
                     "required": ["declaration_locator"]
                 }
