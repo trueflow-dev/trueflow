@@ -4,7 +4,9 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::analysis::Language;
 use crate::repo_path::RepoPath;
+use crate::store::{Record, Verdict};
 
+use super::coverage::DeclarationCoverageIndex;
 use super::diff::{
     DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic,
     DiffDiagnosticKind,
@@ -37,10 +39,11 @@ impl DeclarationReviewDiffBatch {
 }
 
 /// Inputs needed to collect declaration review targets without re-reading source files.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DeclarationReviewQuery {
     batches: Vec<DeclarationReviewDiffBatch>,
     reviewed_target_ids: HashSet<DeclarationId>,
+    records: Vec<Record>,
 }
 
 impl DeclarationReviewQuery {
@@ -48,6 +51,7 @@ impl DeclarationReviewQuery {
         Self {
             batches,
             reviewed_target_ids: HashSet::new(),
+            records: Vec::new(),
         }
     }
 
@@ -56,6 +60,11 @@ impl DeclarationReviewQuery {
         reviewed_target_ids: Vec<DeclarationId>,
     ) -> Self {
         self.reviewed_target_ids = reviewed_target_ids.into_iter().collect();
+        self
+    }
+
+    pub fn with_records(mut self, records: Vec<Record>) -> Self {
+        self.records = records;
         self
     }
 
@@ -75,6 +84,7 @@ pub struct CollectedDeclarationItem {
     pub snapshot: SourceSnapshot,
     pub declaration: DeclarationNode,
     pub diff_unit: DeclarationDiffUnit,
+    pub latest_verdict: Option<Verdict>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +120,7 @@ pub fn collect_declaration_review(
     let mut diagnostics = Vec::new();
     let mut unsupported_languages = Vec::new();
     let mut reviewable_unit_count = 0usize;
+    let coverage = DeclarationCoverageIndex::build(&query.batches, &query.records)?;
 
     for (batch_ordinal, batch) in query.batches.iter().enumerate() {
         diagnostics.extend(batch.diff.diagnostics.iter().cloned());
@@ -128,6 +139,13 @@ pub fn collect_declaration_review(
                 continue;
             }
 
+            let latest_verdict = coverage
+                .binding_for(&unit.snapshot_pair_id, &declaration.id)
+                .map(|binding| binding.verdict().clone());
+            if latest_verdict == Some(Verdict::Approved) {
+                continue;
+            }
+
             ordered_items.push(OrderedItem {
                 batch_ordinal,
                 item: CollectedDeclarationItem {
@@ -141,6 +159,7 @@ pub fn collect_declaration_review(
                     snapshot: snapshot.clone(),
                     declaration: declaration.clone(),
                     diff_unit: unit.clone(),
+                    latest_verdict,
                 },
             });
         }

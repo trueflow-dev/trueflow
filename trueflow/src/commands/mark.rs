@@ -5,8 +5,8 @@ use crate::repo_path::RepoPath;
 use crate::scanner::ScanOptions;
 use crate::store::{
     Attestation, AttestationKind, BlockState, Canonicalization, CommentAnchor, CommentScope,
-    FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore, ReviewTargetKind, VcsSystem,
-    Verdict,
+    DeclarationRecordLocator, FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore,
+    ReviewTargetKind, ReviewTargetRef, VcsSystem, Verdict,
 };
 use crate::tree::{self, TreeNodeKind};
 use crate::vcs;
@@ -40,6 +40,42 @@ pub struct MarkParams {
     pub comment_scope: Option<CommentScope>,
     pub comment_context: Option<String>,
     pub comment_anchor: Option<CommentAnchor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredMarkRequest {
+    pub target: ReviewTargetRef,
+    pub check: ReviewCheck,
+    pub verdict: Verdict,
+    pub identity: Identity,
+    pub repo_ref: RepoRef,
+    pub block_state: BlockState,
+    pub note: Option<String>,
+    pub comment_context: Option<String>,
+    pub comment_anchor: Option<CommentAnchor>,
+    pub declaration_locator: Option<DeclarationRecordLocator>,
+}
+
+pub fn build_structured_record(request: StructuredMarkRequest) -> Result<Record> {
+    let StructuredMarkRequest {
+        target,
+        check,
+        verdict,
+        identity,
+        repo_ref,
+        block_state,
+        note,
+        comment_context,
+        comment_anchor,
+        declaration_locator,
+    } = request;
+    let mut record = Record::new(target, check, verdict, identity, repo_ref, block_state);
+    record.note = note;
+    record.comment_context = comment_context;
+    record.comment_anchor = comment_anchor;
+    record.declaration_locator = declaration_locator;
+    record.validate()?;
+    Ok(record)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
