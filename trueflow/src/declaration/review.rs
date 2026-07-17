@@ -199,14 +199,14 @@ pub fn collect_declaration_review(
         .iter()
         .map(|item| item.declaration.id.clone())
         .collect();
-    let status = if !items.is_empty() {
-        DeclarationReviewStatus::Ready
-    } else if reviewable_unit_count > 0 {
-        DeclarationReviewStatus::FullyReviewed
-    } else if !unsupported_languages.is_empty() {
+    let status = if !unsupported_languages.is_empty() {
         DeclarationReviewStatus::UnsupportedLanguage {
             languages: unsupported_languages,
         }
+    } else if !items.is_empty() {
+        DeclarationReviewStatus::Ready
+    } else if reviewable_unit_count > 0 {
+        DeclarationReviewStatus::FullyReviewed
     } else {
         DeclarationReviewStatus::NoSurfaceChanges
     };

@@ -5,12 +5,15 @@ use clap::Parser;
 use trueflow::analysis::Language;
 use trueflow::block::BlockKind;
 use trueflow::cli::{Cli, Commands, TuiReviewMode};
+use trueflow::commands::review::ResolvedReviewQuery;
 use trueflow::commands::tui::{
     TuiLaunchPayload, build_pull_request_launch_queue, resolve_tui_launch,
 };
+use trueflow::config::BlockFilters;
 use trueflow::config::TrueflowConfig;
 use trueflow::declaration::Visibility;
-use trueflow::declaration::diff::{DeclarationDiff, diff_declarations};
+use trueflow::declaration::capture::capture_declaration_sources;
+use trueflow::declaration::diff::{DeclarationDiff, DiffDiagnosticKind, diff_declarations};
 use trueflow::declaration::review::{
     DeclarationReviewDiffBatch, DeclarationReviewQuery, DeclarationReviewStatus,
     collect_declaration_review,
@@ -19,8 +22,14 @@ use trueflow::declaration::snapshot::{
     PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId, SourceSnapshot,
 };
 use trueflow::github::PullRequestCommit;
+use trueflow::repo_path::RepoPath;
 use trueflow::review_scope::ScopePreset;
+use trueflow::scanner::ScanOptions;
 use trueflow::store::CommitId;
+use trueflow::targets::{
+    CommitRange, ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
+};
+use trueflow_test_support::{TestRepo, run_git_output};
 
 #[derive(Debug)]
 struct ParsedTuiArgs {
@@ -424,5 +433,127 @@ fn repeated_and_pr_launches_preserve_mode_trust_and_commit_order() -> Result<()>
         })
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(queued_ids, ["1111111", "2222222", "3333333"]);
+    Ok(())
+}
+
+#[test]
+fn mixed_rust_and_unsupported_java_collection_retains_reviewable_items_and_unsupported_status()
+-> Result<()> {
+    let repo = TestRepo::new("declaration_collection_mixed_unsupported")?;
+    repo.write("src/lib.rs", "pub fn convert(value: u8) -> u8 { value }\n")?;
+    repo.write(
+        "src/Converter.java",
+        "public final class Converter { public int convert(int value) { return value; } }\n",
+    )?;
+    repo.commit_all("mixed base")?;
+    let base = CommitId::new(run_git_output(&repo.path, &["rev-parse", "HEAD"])?)?;
+
+    repo.write(
+        "src/lib.rs",
+        "pub fn convert(value: u16) -> u16 { value }\n",
+    )?;
+    repo.write(
+        "src/Converter.java",
+        "public final class Converter { public long convert(long value) { return value; } }\n",
+    )?;
+    repo.commit_all("change Rust and Java declarations")?;
+    let head = CommitId::new(run_git_output(&repo.path, &["rev-parse", "HEAD"])?)?;
+
+    let query = ResolvedReviewQuery {
+        filters: BlockFilters::default(),
+        scan_options: ScanOptions::default(),
+        content_source: ReviewContentSource::Revision(head.clone()),
+        path_selection: ReviewPathSelection::All,
+        diff_selection: ReviewDiffSelection::Targets(vec![ReviewDiffTarget::RevisionRange(
+            CommitRange {
+                start: base,
+                end: head,
+            },
+        )]),
+    };
+    let captures = capture_declaration_sources(&repo.path, &query)?;
+    let [capture] = captures.as_slice() else {
+        anyhow::bail!("expected one capture batch, got {}", captures.len());
+    };
+    assert!(
+        capture.diagnostics.is_empty(),
+        "fixture capture failed: {:?}",
+        capture.diagnostics
+    );
+    let captured_inventory = capture
+        .pairs
+        .iter()
+        .map(|pair| {
+            let snapshot =
+                pair.head.as_ref().or(pair.base.as_ref()).with_context(|| {
+                    format!("captured pair {} has no endpoint", pair.id.as_str())
+                })?;
+            Ok((
+                RepoPath::from_relative_path(&snapshot.path)?,
+                snapshot.language,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        captured_inventory,
+        [
+            (RepoPath::new("src/Converter.java")?, Language::Java),
+            (RepoPath::new("src/lib.rs")?, Language::Rust),
+        ],
+        "the real repository scope must carry both changed files into declaration capture"
+    );
+
+    let pairs = capture.pairs.clone();
+    let diff = diff_declarations(&pairs)?;
+    assert_eq!(
+        diff.units.iter().filter(|unit| unit.review_target).count(),
+        1,
+        "the changed Rust declaration must survive diff projection as a review target"
+    );
+    assert!(
+        diff.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == DiffDiagnosticKind::ProjectionDiagnostic
+                && diagnostic.message.contains("Java")
+                && diagnostic.message.contains("no declaration projector")
+        }),
+        "the changed Java declaration must be diagnosed as unsupported: {:?}",
+        diff.diagnostics
+    );
+
+    let collection = collect_declaration_review(&DeclarationReviewQuery::new(vec![
+        DeclarationReviewDiffBatch::new(pairs, diff),
+    ]))?;
+    let reviewable = collection
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.display_path.as_str(),
+                item.snapshot.language,
+                item.declaration.name.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reviewable,
+        [("src/lib.rs", Language::Rust, "convert")],
+        "unsupported Java must not discard the independently reviewable Rust declaration"
+    );
+    assert!(
+        collection.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == DiffDiagnosticKind::ProjectionDiagnostic
+                && diagnostic.message.contains("Java")
+                && diagnostic.message.contains("no declaration projector")
+        }),
+        "collection must retain the Java unsupported diagnostic: {:?}",
+        collection.diagnostics
+    );
+    assert_eq!(
+        collection.status,
+        DeclarationReviewStatus::UnsupportedLanguage {
+            languages: vec![Language::Java],
+        },
+        "mixed review must not report unqualified Ready while Java remains unsupported"
+    );
     Ok(())
 }
