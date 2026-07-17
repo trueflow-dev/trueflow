@@ -485,7 +485,9 @@ impl RelationshipBackend for RelationshipProvider {
 
 impl Drop for RelationshipProvider {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        if let Err(error) = self.shutdown() {
+            eprintln!("relationship provider shutdown failed: {error}");
+        }
     }
 }
 
@@ -1175,9 +1177,12 @@ impl WorkerSession {
     }
 
     async fn stop(&mut self) -> Result<(), ProviderError> {
+        let mut cleanup_failures = Vec::new();
         let uris: Vec<_> = self.documents.keys().cloned().collect();
         for uri in uris {
-            let _ = self.close_document(&uri);
+            if let Err(error) = self.close_document(&uri) {
+                cleanup_failures.push(error.to_string());
+            }
         }
 
         let shutdown_result = timeout(
@@ -1186,26 +1191,59 @@ impl WorkerSession {
                 .request::<async_lsp::lsp_types::request::Shutdown>(()),
         )
         .await;
-        if matches!(&shutdown_result, Ok(Ok(()))) {
-            let _ = self
+        if matches!(&shutdown_result, Ok(Ok(())))
+            && let Err(error) = self
                 .server
-                .notify::<async_lsp::lsp_types::notification::Exit>(());
+                .notify::<async_lsp::lsp_types::notification::Exit>(())
+        {
+            cleanup_failures.push(format!("cannot send LSP exit notification: {error}"));
         }
-        if timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await.is_err() {
-            let _ = self.child.kill().await;
-            let _ = timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await;
+
+        match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => cleanup_failures.push(format!("cannot wait for LSP child: {error}")),
+            Err(_) => match self.child.kill().await {
+                Ok(()) => match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        cleanup_failures.push(format!("cannot reap killed LSP child: {error}"))
+                    }
+                    Err(_) => {
+                        cleanup_failures.push("timed out while reaping killed LSP child".to_owned())
+                    }
+                },
+                Err(error) => cleanup_failures.push(format!("cannot kill LSP child: {error}")),
+            },
         }
-        if timeout(SHUTDOWN_TIMEOUT, &mut self.mainloop).await.is_err() {
-            self.mainloop.abort();
+
+        match timeout(SHUTDOWN_TIMEOUT, &mut self.mainloop).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                cleanup_failures.push(format!("LSP main loop failed: {error}"));
+            }
+            Ok(Err(error)) => cleanup_failures.push(format!("LSP worker join failed: {error}")),
+            Err(_) => {
+                self.mainloop.abort();
+                if timeout(SHUTDOWN_TIMEOUT, &mut self.mainloop).await.is_err() {
+                    cleanup_failures.push("timed out while aborting the LSP main loop".to_owned());
+                }
+            }
         }
         self.stderr_drain.abort();
+        if timeout(SHUTDOWN_TIMEOUT, &mut self.stderr_drain)
+            .await
+            .is_err()
+        {
+            cleanup_failures.push("timed out while aborting the LSP stderr drain".to_owned());
+        }
 
         match shutdown_result {
-            Ok(Ok(())) => Ok(()),
+            Err(_) => Err(ProviderError::Timeout),
             Ok(Err(error)) => Err(ProviderError::Protocol(format!(
                 "LSP shutdown failed: {error}"
             ))),
-            Err(_) => Err(ProviderError::Timeout),
+            Ok(Ok(())) if cleanup_failures.is_empty() => Ok(()),
+            Ok(Ok(())) => Err(ProviderError::Protocol(cleanup_failures.join("; "))),
         }
     }
 }

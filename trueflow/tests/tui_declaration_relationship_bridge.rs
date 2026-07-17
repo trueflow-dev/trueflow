@@ -130,7 +130,10 @@ fn historical_query(base: CommitId, head: CommitId) -> ResolvedReviewQuery {
         content_source: ReviewContentSource::Revision(head.clone()),
         path_selection: ReviewPathSelection::All,
         diff_selection: ReviewDiffSelection::Targets(vec![ReviewDiffTarget::RevisionRange(
-            CommitRange { start: base, end: head },
+            CommitRange {
+                start: base,
+                end: head,
+            },
         )]),
     }
 }
@@ -1046,8 +1049,7 @@ fn documented_declaration_reconciles_the_projected_identifier_instead_of_its_pro
         Z_BASE,
         Z_HEAD,
     )?;
-    let projected_identifier =
-        LspRange::new(Position::new(1, 7), Position::new(1, 12));
+    let projected_identifier = LspRange::new(Position::new(1, 7), Position::new(1, 12));
     let provider = FakeProvider::new(
         &fixture.repo.path,
         [Script::SelfCallAt(projected_identifier)],
@@ -1085,8 +1087,8 @@ fn documented_declaration_reconciles_the_projected_identifier_instead_of_its_pro
 }
 
 #[test]
-fn historical_snapshot_cannot_become_ready_from_a_different_live_workspace_generation()
--> Result<()> {
+fn historical_snapshot_cannot_become_ready_from_a_different_live_workspace_generation() -> Result<()>
+{
     let repo = TestRepo::new("relationship_bridge_historical_live_generation")?;
     repo.write("src/a.rs", A_BASE)?;
     repo.commit_all("historical base")?;
@@ -1096,11 +1098,8 @@ fn historical_snapshot_cannot_become_ready_from_a_different_live_workspace_gener
     let head = commit_id(&repo, "HEAD")?;
     repo.write("src/a.rs", A_LIVE)?;
 
-    let prepared = prepare_declaration_launch(
-        &repo.path,
-        &historical_query(base, head),
-        Vec::new(),
-    )?;
+    let prepared =
+        prepare_declaration_launch(&repo.path, &historical_query(base, head), Vec::new())?;
     let alpha = prepared
         .targets()
         .iter()
@@ -1122,7 +1121,10 @@ fn historical_snapshot_cannot_become_ready_from_a_different_live_workspace_gener
             .poll()
             .context("historical request remained Checking without a terminal state")?;
         assert!(
-            matches!(completed.state(), GraphRelationshipState::Unavailable { .. }),
+            matches!(
+                completed.state(),
+                GraphRelationshipState::Unavailable { .. }
+            ),
             "captured historical bytes were reported from the unrelated live workspace generation as {:?}",
             completed.state()
         );
@@ -1131,8 +1133,8 @@ fn historical_snapshot_cannot_become_ready_from_a_different_live_workspace_gener
 }
 
 #[test]
-fn same_uri_snapshots_with_distinct_hashes_reconcile_within_their_captured_generation()
--> Result<()> {
+fn same_uri_snapshots_with_distinct_hashes_reconcile_within_their_captured_generation() -> Result<()>
+{
     let repo = TestRepo::new("relationship_bridge_same_uri_snapshots")?;
     repo.write("src/a.rs", A_BASE)?;
     repo.commit_all("snapshot base")?;
@@ -1171,12 +1173,18 @@ fn same_uri_snapshots_with_distinct_hashes_reconcile_within_their_captured_gener
         "fixture expected two captured alpha generations, got {}",
         alphas.len()
     );
-    ensure!(alphas[0] != alphas[1], "captured generations reused one declaration ID");
+    ensure!(
+        alphas[0] != alphas[1],
+        "captured generations reused one declaration ID"
+    );
 
     let identifier = LspRange::new(Position::new(0, 7), Position::new(0, 12));
     let provider = FakeProvider::new(
         &repo.path,
-        [Script::SelfCallAt(identifier), Script::SelfCallAt(identifier)],
+        [
+            Script::SelfCallAt(identifier),
+            Script::SelfCallAt(identifier),
+        ],
     );
     let mut bridge = RelationshipBridge::new(
         &prepared,
