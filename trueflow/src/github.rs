@@ -469,6 +469,16 @@ pub trait GitHubClient {
         comment: &GitHubInlineComment,
         operation_id: &str,
     ) -> Result<PostedPullRequestReviewThread>;
+    fn update_pending_pull_request_review_body(
+        &self,
+        _pr: &ResolvedPullRequestRef,
+        _review_id: u64,
+        _body: &str,
+    ) -> Result<PostedPullRequestReview> {
+        Err(anyhow!(
+            "this GitHub client does not support pending review body updates"
+        ))
+    }
     fn pull_request_delivery_snapshot(
         &self,
         pr: &ResolvedPullRequestRef,
@@ -553,6 +563,43 @@ impl GitHubClient for GhGitHubClient {
             build_add_pull_request_review_thread_request(review_node_id, operation_id, comment)?;
         let response = run_gh_api_with_body(&pr.host, "POST", "graphql", &body)?;
         parse_add_pull_request_review_thread_response(&response, operation_id)
+    }
+
+    fn update_pending_pull_request_review_body(
+        &self,
+        pr: &ResolvedPullRequestRef,
+        review_id: u64,
+        body: &str,
+    ) -> Result<PostedPullRequestReview> {
+        if review_id == 0 {
+            return Err(anyhow!(
+                "cannot update a pending review with a zero database id"
+            ));
+        }
+        if body.trim().is_empty() {
+            return Err(anyhow!("cannot update a pending review with a blank body"));
+        }
+        let endpoint = format!(
+            "repos/{}/{}/pulls/{}/reviews/{review_id}",
+            pr.owner, pr.repo, pr.number
+        );
+        let request = serde_json::to_string(&serde_json::json!({ "body": body }))?;
+        let response = run_gh_api_with_body(&pr.host, "PATCH", &endpoint, &request)?;
+        let review = parse_posted_pull_request_review(&response)?;
+        if review.id != review_id {
+            return Err(anyhow!(
+                "GitHub updated pending review {} but acknowledged review {}",
+                review_id,
+                review.id
+            ));
+        }
+        if review.state != PullRequestReviewState::Pending {
+            return Err(anyhow!(
+                "GitHub review {} was no longer pending after its body update",
+                review_id
+            ));
+        }
+        Ok(review)
     }
     fn pull_request_delivery_snapshot(
         &self,

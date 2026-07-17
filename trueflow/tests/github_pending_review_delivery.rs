@@ -10,9 +10,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use trueflow::analysis::Language;
+use trueflow::declaration::snapshot::{SnapshotId, SourceSnapshot};
+use trueflow::declaration::{SourceComponentRole, project_source};
 use trueflow::repo_path::RepoPath;
 use trueflow::store::{
-    CommentAnchor, DiffCommentAnchor, DiffCommentAnchorRow, SourceCommentAnchor,
+    BlockState, CommentAnchor, CommitId, DeclarationAnchorRange, DeclarationCommentAnchor,
+    DeclarationRecordLocator, DiffCommentAnchor, DiffCommentAnchorRow, Identity, Record, RepoRef,
+    ReviewCheck, ReviewTargetRef, ReviewedDeclarationSnapshot, SourceCommentAnchor, VcsSystem,
+    Verdict,
 };
 use trueflow_test_support::{FeedbackScenario, ReviewRecordOverrides, temp_test_dir};
 
@@ -25,6 +31,10 @@ const PENDING_REVIEW_URL: &str =
     "https://github.com/trueflow-test-owner/trueflow-test-repository/pull/11#pullrequestreview-101";
 const PENDING_REVIEW_OPERATION: &str = "11111111-1111-4111-8111-111111111111";
 const EXISTING_COMMENT_OPERATION: &str = "22222222-2222-4222-8222-222222222222";
+const GENERAL_DECLARATION_RECORD_ID: &str = "general-declaration-record";
+const GENERAL_DECLARATION_NOTE: &str = "general-only declaration feedback";
+const GENERAL_DECLARATION_SOURCE: &str =
+    "/// Converts one value.\npub fn convert(value: u8) -> u8 {\n    value\n}\n";
 const ARGV_CALL_SEPARATOR: u8 = 0x01;
 const CONCURRENT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CONCURRENT_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -281,6 +291,69 @@ fn gh_pending_review_append_uses_thread_for_single_line() -> TestResult {
 #[test]
 fn gh_pending_review_append_uses_thread_for_multiline() -> TestResult {
     assert_pending_review_append(AnchorKind::MultilineLeft)
+}
+
+#[test]
+fn gh_fresh_pending_review_delivers_general_only_declaration_feedback() -> TestResult {
+    let fixture = general_declaration_fixture("github_fresh_general_declaration_delivery", false)?;
+
+    let output = fixture.run("success")?;
+    assert_success(&output)?;
+    assert_general_feedback_receipt(&fixture, GENERAL_DECLARATION_RECORD_ID)?;
+    assert_eq!(
+        general_feedback_delivery_count(&fixture, GENERAL_DECLARATION_NOTE)?,
+        1,
+        "fresh pending-review creation must send the general declaration note exactly once"
+    );
+    Ok(())
+}
+
+#[test]
+fn gh_existing_pending_review_delivers_general_only_declaration_feedback() -> TestResult {
+    let fixture =
+        general_declaration_fixture("github_existing_general_declaration_delivery", true)?;
+
+    let output = fixture.run("success")?;
+    assert_success(&output)?;
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Appended to trueflow pending review 101"),
+        "the CLI must select the append consumer for staged general feedback: stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_general_feedback_receipt(&fixture, GENERAL_DECLARATION_RECORD_ID)?;
+    assert_eq!(
+        general_feedback_delivery_count(&fixture, GENERAL_DECLARATION_NOTE)?,
+        1,
+        "appending general declaration feedback must perform one observable delivery mutation"
+    );
+    Ok(())
+}
+
+#[test]
+fn gh_successful_general_only_delivery_is_idempotent() -> TestResult {
+    let fixture =
+        general_declaration_fixture("github_general_declaration_delivery_idempotent", true)?;
+
+    let first = fixture.run("success")?;
+    assert_success(&first)?;
+    let delivered_after_first =
+        general_feedback_delivery_count(&fixture, GENERAL_DECLARATION_NOTE)?;
+
+    let second = fixture.run("success")?;
+    assert_success(&second)?;
+    let delivered_after_second =
+        general_feedback_delivery_count(&fixture, GENERAL_DECLARATION_NOTE)?;
+
+    assert_general_feedback_receipt(&fixture, GENERAL_DECLARATION_RECORD_ID)?;
+    assert_eq!(
+        delivered_after_first, 1,
+        "the first successful run must deliver the general declaration note exactly once"
+    );
+    assert_eq!(
+        delivered_after_second, delivered_after_first,
+        "a delivered general declaration record must not be replanned or redelivered"
+    );
+    Ok(())
 }
 
 #[test]
@@ -552,6 +625,111 @@ fn pending_review_fixture(anchor: AnchorKind) -> Result<PendingReviewFixture> {
     })
 }
 
+fn general_declaration_fixture(name: &str, seed_pending: bool) -> Result<PendingReviewFixture> {
+    let scenario = FeedbackScenario::new(name)?;
+    scenario.write("src/lib.rs", "")?;
+    let base_sha = scenario.commit_all("base")?;
+    scenario.write("src/lib.rs", GENERAL_DECLARATION_SOURCE)?;
+    let head_sha = scenario.commit_all("pull request head")?;
+
+    let snapshot = SourceSnapshot::new(
+        SnapshotId::new(format!("source:{name}")),
+        Path::new("src/lib.rs"),
+        Language::Rust,
+        GENERAL_DECLARATION_SOURCE,
+    );
+    let declaration = project_source(
+        Path::new("src/lib.rs"),
+        Language::Rust,
+        GENERAL_DECLARATION_SOURCE,
+    )?
+    .declarations()
+    .iter()
+    .find(|declaration| declaration.name == "convert")
+    .context("general-only fixture must project convert")?
+    .clone();
+    let reviewed_snapshot = ReviewedDeclarationSnapshot {
+        snapshot_id: snapshot.id.as_str().to_string(),
+        content_hash: snapshot.bytes_hash().clone(),
+    };
+    let ranges = [
+        SourceComponentRole::Documentation,
+        SourceComponentRole::Signature,
+    ]
+    .into_iter()
+    .map(|role| {
+        let component = declaration
+            .components
+            .iter()
+            .find(|component| component.role == role)
+            .with_context(|| format!("general-only fixture declaration must have {role:?}"))?;
+        let exact_text = snapshot
+            .source()
+            .get(component.source_range.clone())
+            .context("declaration component must be an exact source slice")?;
+        Ok(DeclarationAnchorRange {
+            start_byte: component.source_range.start,
+            end_byte: component.source_range.end,
+            exact_text: exact_text.to_string(),
+        })
+    })
+    .collect::<Result<Vec<_>>>()?;
+    let revision = CommitId::new(&head_sha)?;
+    let mut record = Record::new(
+        ReviewTargetRef::Declaration {
+            hash: declaration.projection_hash.clone(),
+        },
+        ReviewCheck::declaration(),
+        Verdict::Comment,
+        Identity::Email {
+            email: "reviewer@example.com".to_string(),
+        },
+        RepoRef::Vcs {
+            system: VcsSystem::Git,
+            revision,
+        },
+        BlockState::Committed,
+    );
+    record.id = GENERAL_DECLARATION_RECORD_ID.to_string();
+    record.timestamp = 1_700_000_000;
+    record.note = Some(GENERAL_DECLARATION_NOTE.to_string());
+    record.declaration_locator = Some(DeclarationRecordLocator {
+        path: RepoPath::new("src/lib.rs")?,
+        declaration_key: declaration.key.clone(),
+        source_ordinal: declaration.source_ordinal,
+        source_span: declaration.source_span.clone(),
+        reviewed_snapshot: reviewed_snapshot.clone(),
+        projection_hash: declaration.projection_hash.clone(),
+    });
+    record.comment_anchor = Some(CommentAnchor::Declaration(DeclarationCommentAnchor {
+        reviewed_snapshot,
+        projection_hash: declaration.projection_hash,
+        source_len_bytes: snapshot.source().len(),
+        ranges,
+    }));
+    record.validate()?;
+    scenario.write_reviews(&[record])?;
+
+    configure_github_shaped_origin(&scenario, &base_sha, &head_sha)?;
+    if seed_pending {
+        seed_pending_review_ledger(&scenario, &head_sha)?;
+    }
+
+    let fake_bin = temp_test_dir(name);
+    fs::create_dir_all(&fake_bin)
+        .with_context(|| format!("failed to create fake gh directory {}", fake_bin.display()))?;
+    let stdin_log = fake_bin.join("stdin.jsonl");
+    let argv_log = fake_bin.join("argv.bin");
+    write_fake_gh(&fake_bin.join("gh"))?;
+
+    Ok(PendingReviewFixture {
+        scenario,
+        stdin_log,
+        argv_log,
+        expected: AnchorKind::SingleRight.expected(),
+    })
+}
+
 fn configure_github_shaped_origin(
     scenario: &FeedbackScenario,
     base_sha: &str,
@@ -673,6 +851,18 @@ case " $* " in
 esac
 
 case " $* " in
+  *" repos/trueflow-test-owner/trueflow-test-repository/pulls/11/reviews "*)
+    operation_id="$(printf '%s' "$body" | sed -n 's/.*operation=\([^ ]*\) head=.*/\1/p')"
+    printf '{"id":202,"node_id":"PRR_created_review","html_url":"https://github.com/trueflow-test-owner/trueflow-test-repository/pull/11#pullrequestreview-202","state":"PENDING","body":"Pending trueflow feedback\\n<!-- trueflow:pending-review -->\\n<!-- trueflow:delivery:v1 kind=create-pending-review operation=%s head=%s -->","commit_id":"%s"}\n' "$operation_id" "$TRUEFLOW_FAKE_GH_HEAD" "$TRUEFLOW_FAKE_GH_HEAD"
+    exit 0
+    ;;
+  *" repos/trueflow-test-owner/trueflow-test-repository/pulls/11/reviews/101 "*)
+    printf '{"id":101,"node_id":"PRR_pending_review","html_url":"https://github.com/trueflow-test-owner/trueflow-test-repository/pull/11#pullrequestreview-101","state":"PENDING","body":%s}\n' "$TRUEFLOW_FAKE_GH_PENDING_BODY_JSON"
+    exit 0
+    ;;
+esac
+
+case " $* " in
   *" api repos/trueflow-test-owner/trueflow-test-repository/pulls/11/commits?per_page=100 "*)
     printf '[{"sha":"%s","commit":{"message":"pull request head"}}]\n' "$TRUEFLOW_FAKE_GH_HEAD"
     exit 0
@@ -751,6 +941,39 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions)
         .with_context(|| format!("failed to make fake gh executable {}", path.display()))
+}
+
+fn assert_general_feedback_receipt(fixture: &PendingReviewFixture, record_id: &str) -> TestResult {
+    let ledger = fixture.ledger()?;
+    let receipts = ledger["pending_reviews"]
+        .as_array()
+        .context("successful general delivery must retain a pending-review ledger")?
+        .iter()
+        .filter_map(|review| review["comments"].as_array())
+        .flatten()
+        .filter(|receipt| receipt["record_id"].as_str() == Some(record_id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "successful general declaration delivery must persist one durable record receipt; ledger: {ledger:#?}"
+    );
+    assert!(
+        receipts[0]["operation_id"]
+            .as_str()
+            .is_some_and(|operation| !operation.trim().is_empty()),
+        "the general declaration receipt must retain its delivery operation: {}",
+        receipts[0]
+    );
+    Ok(())
+}
+
+fn general_feedback_delivery_count(fixture: &PendingReviewFixture, note: &str) -> Result<usize> {
+    Ok(fixture
+        .graphql_requests()?
+        .iter()
+        .filter(|request| request.to_string().contains(note))
+        .count())
 }
 
 fn assert_captured_thread_request(fixture: &PendingReviewFixture) -> TestResult {

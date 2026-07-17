@@ -20,10 +20,11 @@ use crate::github::{
 #[cfg(test)]
 use crate::github_delivery::{GITHUB_DELIVERY_LEDGER_FILE, GITHUB_DELIVERY_LEDGER_LOCK_FILE};
 use crate::github_delivery::{
-    GitHubDeliveryComment, GitHubDeliveryCommentReceipt, GitHubDeliveryIntent,
-    GitHubDeliveryIntentStatus, GitHubDeliveryLedger, GitHubDeliveryLedgerSession,
-    GitHubDeliveryLedgerStore, GitHubDeliveryOperation, GitHubDeliveryOperationId,
-    GitHubDeliveryPendingReview, GitHubDeliveryPendingReviewReceipt, GitHubDeliveryTerminalReason,
+    GitHubDeliveryBodyRecord, GitHubDeliveryComment, GitHubDeliveryCommentReceipt,
+    GitHubDeliveryIntent, GitHubDeliveryIntentStatus, GitHubDeliveryLedger,
+    GitHubDeliveryLedgerSession, GitHubDeliveryLedgerStore, GitHubDeliveryOperation,
+    GitHubDeliveryOperationId, GitHubDeliveryPendingReview, GitHubDeliveryPendingReviewReceipt,
+    GitHubDeliveryTerminalReason,
 };
 use crate::store::{
     BlockState, CommentAnchor, CommitId, DeclarationCommentAnchor, DiffCommentAnchor, FileStore,
@@ -304,6 +305,7 @@ pub struct PullRequestFeedbackPlan {
     pub draft: GitHubReviewDraft,
     pub staged_record_ids: Vec<String>,
     staged_comments: Vec<StagedPullRequestComment>,
+    general_declaration_feedback: Vec<GeneralDeclarationFeedback>,
     skipped: Vec<SkippedPullRequestRecord>,
 }
 
@@ -657,10 +659,16 @@ where
 
     for operation in operations {
         let may_dispatch = match &operation.intent {
-            GitHubDeliveryIntent::CreatePendingReview { .. } => {
+            GitHubDeliveryIntent::CreatePendingReview { .. }
+            | GitHubDeliveryIntent::CreatePendingReviewWithGeneralFeedback { .. } => {
                 find_trueflow_pending_review(session.ledger(), metadata, snapshot)?.is_none()
             }
             GitHubDeliveryIntent::AppendReviewThread {
+                review_id,
+                review_node_id,
+                ..
+            }
+            | GitHubDeliveryIntent::AppendReviewBody {
                 review_id,
                 review_node_id,
                 ..
@@ -699,6 +707,11 @@ where
             review_body,
             comments,
             ..
+        }
+        | GitHubDeliveryIntent::CreatePendingReviewWithGeneralFeedback {
+            review_body,
+            comments,
+            ..
         } => {
             let draft = GitHubReviewDraft {
                 body: review_body.clone(),
@@ -728,15 +741,7 @@ where
                     review_id: review.id,
                     review_node_id,
                     html_url: review.html_url,
-                    comments: comments
-                        .iter()
-                        .map(|comment| GitHubDeliveryCommentReceipt {
-                            record_id: comment.record_id.clone(),
-                            operation_id: comment.operation_id,
-                            thread_node_id: None,
-                            comment_node_id: None,
-                        })
-                        .collect(),
+                    comments: delivery_record_receipts(&operation.intent),
                 },
             )?;
             session.save()
@@ -779,7 +784,52 @@ where
             )?;
             session.save()
         }
+        GitHubDeliveryIntent::AppendReviewBody {
+            review_id,
+            body,
+            records,
+            ..
+        } => {
+            client.update_pending_pull_request_review_body(&metadata.pr, *review_id, body)?;
+            session.ledger_mut().accept_append_body(
+                &operation.id,
+                records
+                    .iter()
+                    .map(|record| GitHubDeliveryCommentReceipt {
+                        record_id: record.record_id.clone(),
+                        operation_id: record.operation_id,
+                        thread_node_id: None,
+                        comment_node_id: None,
+                    })
+                    .collect(),
+            )?;
+            session.save()
+        }
     }
+}
+
+fn delivery_record_receipts(intent: &GitHubDeliveryIntent) -> Vec<GitHubDeliveryCommentReceipt> {
+    intent
+        .comments()
+        .iter()
+        .map(|comment| GitHubDeliveryCommentReceipt {
+            record_id: comment.record_id.clone(),
+            operation_id: comment.operation_id,
+            thread_node_id: None,
+            comment_node_id: None,
+        })
+        .chain(
+            intent
+                .body_records()
+                .iter()
+                .map(|record| GitHubDeliveryCommentReceipt {
+                    record_id: record.record_id.clone(),
+                    operation_id: record.operation_id,
+                    thread_node_id: None,
+                    comment_node_id: None,
+                }),
+        )
+        .collect()
 }
 
 fn reconcile_in_flight_delivery_operation(
@@ -790,6 +840,9 @@ fn reconcile_in_flight_delivery_operation(
 ) -> Result<()> {
     match &operation.intent {
         GitHubDeliveryIntent::CreatePendingReview {
+            head_sha, comments, ..
+        }
+        | GitHubDeliveryIntent::CreatePendingReviewWithGeneralFeedback {
             head_sha, comments, ..
         } => {
             let operation_id = operation.id.to_string();
@@ -817,20 +870,28 @@ fn reconcile_in_flight_delivery_operation(
                 return Err(unreconciled_in_flight_error(operation));
             };
 
-            let comments = comments
+            let mut receipts = comments
                 .iter()
                 .map(|comment| {
                     remote_comment_receipt(snapshot, &review.node_id, comment)?
                         .ok_or_else(|| unreconciled_in_flight_error(operation))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            receipts.extend(operation.intent.body_records().iter().map(|record| {
+                GitHubDeliveryCommentReceipt {
+                    record_id: record.record_id.clone(),
+                    operation_id: record.operation_id,
+                    thread_node_id: None,
+                    comment_node_id: None,
+                }
+            }));
             session.ledger_mut().accept_create(
                 &operation.id,
                 GitHubDeliveryPendingReviewReceipt {
                     review_id,
                     review_node_id: review.node_id.clone(),
                     html_url: review.html_url.clone(),
-                    comments,
+                    comments: receipts,
                 },
             )?;
             if review.state.is_terminal() {
@@ -862,6 +923,46 @@ fn reconcile_in_flight_delivery_operation(
             let receipt = remote_comment_receipt(snapshot, review_node_id, comment)?
                 .ok_or_else(|| unreconciled_in_flight_error(operation))?;
             session.ledger_mut().accept_append(&operation.id, receipt)?;
+            if review.state.is_terminal() {
+                session.ledger_mut().tombstone_pending_review(
+                    &metadata.pr,
+                    *review_id,
+                    GitHubDeliveryTerminalReason::Submitted,
+                )?;
+            }
+            Ok(())
+        }
+        GitHubDeliveryIntent::AppendReviewBody {
+            head_sha,
+            review_id,
+            review_node_id,
+            body,
+            records,
+            ..
+        } => {
+            let Some(review) = snapshot.reviews.iter().find(|review| {
+                review.node_id == *review_node_id
+                    && review.database_id == Some(*review_id)
+                    && (review.state == PullRequestReviewState::Pending
+                        || review.state.is_terminal())
+                    && review.viewer_did_author
+                    && review.head_sha.as_ref() == Some(head_sha)
+                    && review.body == *body
+            }) else {
+                return Err(unreconciled_in_flight_error(operation));
+            };
+            session.ledger_mut().accept_append_body(
+                &operation.id,
+                records
+                    .iter()
+                    .map(|record| GitHubDeliveryCommentReceipt {
+                        record_id: record.record_id.clone(),
+                        operation_id: record.operation_id,
+                        thread_node_id: None,
+                        comment_node_id: None,
+                    })
+                    .collect(),
+            )?;
             if review.state.is_terminal() {
                 session.ledger_mut().tombstone_pending_review(
                     &metadata.pr,
@@ -987,6 +1088,14 @@ where
         .iter()
         .map(materialize_delivery_comment)
         .collect::<Result<Vec<_>>>()?;
+    let general_records = plan
+        .general_declaration_feedback
+        .iter()
+        .map(|feedback| GitHubDeliveryBodyRecord {
+            record_id: feedback.record_id.clone(),
+            operation_id: GitHubDeliveryOperationId::new(),
+        })
+        .collect::<Vec<_>>();
     let review_body = materialize_pending_review_delivery_body(
         &plan.draft.body,
         &operation_id.to_string(),
@@ -999,15 +1108,23 @@ where
             .map(|comment| comment.comment.clone())
             .collect(),
     };
-    let operation = GitHubDeliveryOperation::prepared(
-        operation_id,
+    let intent = if general_records.is_empty() {
         GitHubDeliveryIntent::CreatePendingReview {
             pr: metadata.pr.clone(),
             head_sha: metadata.head_sha.clone(),
             review_body,
             comments,
-        },
-    );
+        }
+    } else {
+        GitHubDeliveryIntent::CreatePendingReviewWithGeneralFeedback {
+            pr: metadata.pr.clone(),
+            head_sha: metadata.head_sha.clone(),
+            review_body,
+            comments,
+            general_records,
+        }
+    };
+    let operation = GitHubDeliveryOperation::prepared(operation_id, intent);
 
     session.ledger_mut().prepare(operation.clone())?;
     session.save()?;
@@ -1028,24 +1145,14 @@ where
                 review.id
             )
         })?;
-    let comments = operation
-        .intent
-        .comments()
-        .iter()
-        .map(|comment| GitHubDeliveryCommentReceipt {
-            record_id: comment.record_id.clone(),
-            operation_id: comment.operation_id,
-            thread_node_id: None,
-            comment_node_id: None,
-        })
-        .collect();
+    let receipts = delivery_record_receipts(&operation.intent);
     session.ledger_mut().accept_create(
         &operation.id,
         GitHubDeliveryPendingReviewReceipt {
             review_id: review.id,
             review_node_id,
             html_url: review.html_url.clone(),
-            comments,
+            comments: receipts,
         },
     )?;
     session.save()?;
@@ -1078,6 +1185,42 @@ where
                 review.id
             )
         })?;
+
+    if let Some(general_body) =
+        build_general_declaration_feedback_body(&plan.general_declaration_feedback)
+    {
+        let body = format!("{}\n\n{general_body}", review.body.trim_end());
+        if body == review.body {
+            return Err(anyhow!(
+                "general feedback did not change pending review {}; refusing a no-op receipt",
+                review.id
+            ));
+        }
+        let operation_id = GitHubDeliveryOperationId::new();
+        let records = plan
+            .general_declaration_feedback
+            .iter()
+            .map(|feedback| GitHubDeliveryBodyRecord {
+                record_id: feedback.record_id.clone(),
+                operation_id: GitHubDeliveryOperationId::new(),
+            })
+            .collect();
+        let operation = GitHubDeliveryOperation::prepared(
+            operation_id,
+            GitHubDeliveryIntent::AppendReviewBody {
+                pr: metadata.pr.clone(),
+                head_sha: metadata.head_sha.clone(),
+                review_id: pending.review_id,
+                review_node_id: pending.review_node_id.clone(),
+                review_url: pending.html_url.clone(),
+                body,
+                records,
+            },
+        );
+        session.ledger_mut().prepare(operation.clone())?;
+        session.save()?;
+        dispatch_prepared_delivery_operation(session, metadata, &operation, client)?;
+    }
 
     for staged in &plan.staged_comments {
         let operation_id = GitHubDeliveryOperationId::new();
@@ -1221,6 +1364,7 @@ fn empty_pull_request_feedback_plan() -> PullRequestFeedbackPlan {
         },
         staged_record_ids: Vec::new(),
         staged_comments: Vec::new(),
+        general_declaration_feedback: Vec::new(),
         skipped: Vec::new(),
     }
 }
@@ -1457,6 +1601,7 @@ pub fn build_pull_request_feedback_plan(
         },
         staged_record_ids,
         staged_comments,
+        general_declaration_feedback,
         skipped,
     })
 }
@@ -2293,16 +2438,29 @@ fn build_pull_request_review_body(
         general_declaration_feedback.len(),
         skipped_comments,
     );
-    if !general_declaration_feedback.is_empty() {
-        body.push_str("\n\n## General declaration feedback");
-        for feedback in general_declaration_feedback {
-            body.push_str(&format!(
-                "\n\n### `{}`\nPath: `{}`  \nRecord: `{}`\n\n{}",
-                feedback.semantic_key, feedback.path, feedback.record_id, feedback.note,
-            ));
-        }
+    if let Some(general_body) =
+        build_general_declaration_feedback_body(general_declaration_feedback)
+    {
+        body.push_str("\n\n");
+        body.push_str(&general_body);
     }
     body
+}
+
+fn build_general_declaration_feedback_body(
+    feedback: &[GeneralDeclarationFeedback],
+) -> Option<String> {
+    if feedback.is_empty() {
+        return None;
+    }
+    let mut body = "## General declaration feedback".to_string();
+    for feedback in feedback {
+        body.push_str(&format!(
+            "\n\n### `{}`\nPath: `{}`  \nRecord: `{}`\n\n{}",
+            feedback.semantic_key, feedback.path, feedback.record_id, feedback.note,
+        ));
+    }
+    Some(body)
 }
 
 fn print_pull_request_feedback_outcome(
@@ -2563,10 +2721,7 @@ fn declaration_xml(
     xml
 }
 
-fn declaration_resolution_failure_xml(
-    reason: &str,
-    reviews: &[crate::store::Record],
-) -> String {
+fn declaration_resolution_failure_xml(reason: &str, reviews: &[crate::store::Record]) -> String {
     let mut xml = format!(
         "    <declaration target_kind=\"declaration\" resolution_error=\"{}\">\n",
         escape_xml(reason)

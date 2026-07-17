@@ -53,6 +53,13 @@ pub struct GitHubDeliveryComment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubDeliveryBodyRecord {
+    pub record_id: String,
+    pub operation_id: GitHubDeliveryOperationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GitHubDeliveryIntent {
     CreatePendingReview {
@@ -60,6 +67,13 @@ pub enum GitHubDeliveryIntent {
         head_sha: CommitId,
         review_body: String,
         comments: Vec<GitHubDeliveryComment>,
+    },
+    CreatePendingReviewWithGeneralFeedback {
+        pr: ResolvedPullRequestRef,
+        head_sha: CommitId,
+        review_body: String,
+        comments: Vec<GitHubDeliveryComment>,
+        general_records: Vec<GitHubDeliveryBodyRecord>,
     },
     AppendReviewThread {
         pr: ResolvedPullRequestRef,
@@ -69,65 +83,94 @@ pub enum GitHubDeliveryIntent {
         review_url: String,
         comment: GitHubDeliveryComment,
     },
+    AppendReviewBody {
+        pr: ResolvedPullRequestRef,
+        head_sha: CommitId,
+        review_id: u64,
+        review_node_id: String,
+        review_url: String,
+        body: String,
+        records: Vec<GitHubDeliveryBodyRecord>,
+    },
 }
 
 impl GitHubDeliveryIntent {
     pub fn pr(&self) -> &ResolvedPullRequestRef {
         match self {
-            Self::CreatePendingReview { pr, .. } | Self::AppendReviewThread { pr, .. } => pr,
+            Self::CreatePendingReview { pr, .. }
+            | Self::CreatePendingReviewWithGeneralFeedback { pr, .. }
+            | Self::AppendReviewThread { pr, .. }
+            | Self::AppendReviewBody { pr, .. } => pr,
         }
     }
 
     pub fn head_sha(&self) -> &CommitId {
         match self {
             Self::CreatePendingReview { head_sha, .. }
-            | Self::AppendReviewThread { head_sha, .. } => head_sha,
+            | Self::CreatePendingReviewWithGeneralFeedback { head_sha, .. }
+            | Self::AppendReviewThread { head_sha, .. }
+            | Self::AppendReviewBody { head_sha, .. } => head_sha,
         }
     }
 
     pub fn comments(&self) -> &[GitHubDeliveryComment] {
         match self {
-            Self::CreatePendingReview { comments, .. } => comments,
+            Self::CreatePendingReview { comments, .. }
+            | Self::CreatePendingReviewWithGeneralFeedback { comments, .. } => comments,
             Self::AppendReviewThread { comment, .. } => std::slice::from_ref(comment),
+            Self::AppendReviewBody { .. } => &[],
+        }
+    }
+
+    pub fn body_records(&self) -> &[GitHubDeliveryBodyRecord] {
+        match self {
+            Self::CreatePendingReviewWithGeneralFeedback {
+                general_records, ..
+            } => general_records,
+            Self::AppendReviewBody { records, .. } => records,
+            Self::CreatePendingReview { .. } | Self::AppendReviewThread { .. } => &[],
         }
     }
 
     pub fn is_create(&self) -> bool {
-        matches!(self, Self::CreatePendingReview { .. })
+        matches!(
+            self,
+            Self::CreatePendingReview { .. } | Self::CreatePendingReviewWithGeneralFeedback { .. }
+        )
     }
 
     fn validate(&self, parent_operation_id: GitHubDeliveryOperationId) -> Result<()> {
-        let comments = self.comments();
-        if comments.is_empty() {
-            bail!("a GitHub delivery intent must contain at least one comment");
+        if self.comments().is_empty() && self.body_records().is_empty() {
+            bail!("a GitHub delivery intent must contain at least one record");
         }
 
         let mut record_ids = HashSet::new();
-        let mut comment_operation_ids = HashSet::new();
-        for comment in comments {
+        let mut child_operation_ids = HashSet::new();
+        for comment in self.comments() {
             validate_comment(comment)?;
-            if !record_ids.insert(comment.record_id.as_str()) {
-                bail!(
-                    "delivery intent contains duplicate record ID {}",
-                    comment.record_id
-                );
-            }
-            if !comment_operation_ids.insert(comment.operation_id) {
-                bail!(
-                    "delivery intent contains duplicate comment operation ID {}",
-                    comment.operation_id
-                );
-            }
+            validate_delivery_record_identity(
+                &comment.record_id,
+                comment.operation_id,
+                &mut record_ids,
+                &mut child_operation_ids,
+            )?;
+        }
+        for record in self.body_records() {
+            validate_delivery_record_identity(
+                &record.record_id,
+                record.operation_id,
+                &mut record_ids,
+                &mut child_operation_ids,
+            )?;
         }
 
         match self {
-            Self::CreatePendingReview { review_body, .. } => {
-                if review_body.trim().is_empty() {
-                    bail!("create-pending-review intent has a blank marked review body");
-                }
-                if comment_operation_ids.contains(&parent_operation_id) {
+            Self::CreatePendingReview { review_body, .. }
+            | Self::CreatePendingReviewWithGeneralFeedback { review_body, .. } => {
+                validate_nonblank("create-pending-review marked review body", review_body)?;
+                if child_operation_ids.contains(&parent_operation_id) {
                     bail!(
-                        "create-pending-review operation ID {parent_operation_id} must differ from comment operation IDs"
+                        "create-pending-review operation ID {parent_operation_id} must differ from child operation IDs"
                     );
                 }
             }
@@ -138,13 +181,34 @@ impl GitHubDeliveryIntent {
                 comment,
                 ..
             } => {
-                if *review_id == 0 {
-                    bail!("append-review-thread intent has a zero review database ID");
-                }
-                validate_nonblank("append-review-thread review node ID", review_node_id)?;
-                validate_nonblank("append-review-thread review URL", review_url)?;
+                validate_review_target(
+                    *review_id,
+                    review_node_id,
+                    review_url,
+                    "append-review-thread",
+                )?;
                 if parent_operation_id != comment.operation_id {
                     bail!("append-review-thread operation ID must equal its comment operation ID");
+                }
+            }
+            Self::AppendReviewBody {
+                review_id,
+                review_node_id,
+                review_url,
+                body,
+                ..
+            } => {
+                validate_review_target(
+                    *review_id,
+                    review_node_id,
+                    review_url,
+                    "append-review-body",
+                )?;
+                validate_nonblank("append-review-body body", body)?;
+                if child_operation_ids.contains(&parent_operation_id) {
+                    bail!(
+                        "append-review-body operation ID {parent_operation_id} must differ from record operation IDs"
+                    );
                 }
             }
         }
@@ -170,18 +234,23 @@ impl GitHubDeliveryOperation {
     }
 
     fn persistent_operation_ids(&self) -> Vec<GitHubDeliveryOperationId> {
-        if self.intent.is_create() {
-            std::iter::once(self.id)
-                .chain(
-                    self.intent
-                        .comments()
-                        .iter()
-                        .map(|comment| comment.operation_id),
-                )
-                .collect()
-        } else {
-            vec![self.id]
+        if matches!(self.intent, GitHubDeliveryIntent::AppendReviewThread { .. }) {
+            return vec![self.id];
         }
+        std::iter::once(self.id)
+            .chain(
+                self.intent
+                    .comments()
+                    .iter()
+                    .map(|comment| comment.operation_id),
+            )
+            .chain(
+                self.intent
+                    .body_records()
+                    .iter()
+                    .map(|record| record.operation_id),
+            )
+            .collect()
     }
 }
 
@@ -335,6 +404,19 @@ impl GitHubDeliveryLedger {
                 );
             }
         }
+        for record in operation.intent.body_records() {
+            let key = (
+                operation.intent.pr().clone(),
+                operation.intent.head_sha().clone(),
+                record.record_id.clone(),
+            );
+            if reserved_records.contains(&key) {
+                bail!(
+                    "record ID {} is already reserved for this pull request and head",
+                    record.record_id
+                );
+            }
+        }
 
         self.active_operations.push(operation);
         Ok(())
@@ -391,18 +473,30 @@ impl GitHubDeliveryLedger {
             .cloned()
             .ok_or_else(|| anyhow!("cannot accept unknown delivery operation {operation_id}"))?;
         ensure_in_flight(&operation)?;
-        let GitHubDeliveryIntent::CreatePendingReview {
-            pr,
-            head_sha,
-            comments,
-            ..
-        } = &operation.intent
-        else {
-            bail!("delivery operation {operation_id} is not a pending-review create");
+        let (pr, head_sha, comments, body_records) = match &operation.intent {
+            GitHubDeliveryIntent::CreatePendingReview {
+                pr,
+                head_sha,
+                comments,
+                ..
+            } => (pr, head_sha, comments.as_slice(), &[][..]),
+            GitHubDeliveryIntent::CreatePendingReviewWithGeneralFeedback {
+                pr,
+                head_sha,
+                comments,
+                general_records,
+                ..
+            } => (
+                pr,
+                head_sha,
+                comments.as_slice(),
+                general_records.as_slice(),
+            ),
+            _ => bail!("delivery operation {operation_id} is not a pending-review create"),
         };
 
         validate_pending_review_receipt(&receipt)?;
-        validate_comment_receipts(comments, &receipt.comments)?;
+        validate_record_receipts(comments, body_records, &receipt.comments)?;
         if self
             .pending_reviews
             .iter()
@@ -497,6 +591,71 @@ impl GitHubDeliveryLedger {
             .ok_or_else(|| anyhow!("delivery operation {operation_id} disappeared"))?;
         self.active_operations.remove(operation_index);
         self.pending_reviews[pending_index].comments.push(receipt);
+        self.validate()
+    }
+
+    pub fn accept_append_body(
+        &mut self,
+        operation_id: &GitHubDeliveryOperationId,
+        receipts: Vec<GitHubDeliveryCommentReceipt>,
+    ) -> Result<()> {
+        let operation = self
+            .operation(operation_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("cannot accept unknown delivery operation {operation_id}"))?;
+        ensure_in_flight(&operation)?;
+        let GitHubDeliveryIntent::AppendReviewBody {
+            pr,
+            head_sha,
+            review_id,
+            review_node_id,
+            records,
+            ..
+        } = &operation.intent
+        else {
+            bail!("delivery operation {operation_id} is not a review-body append");
+        };
+
+        validate_record_receipts(&[], records, &receipts)?;
+        let pending_index = self
+            .pending_reviews
+            .iter()
+            .position(|review| {
+                review.pr == *pr
+                    && review.head_sha == *head_sha
+                    && review.review_id == *review_id
+                    && review.review_node_id == *review_node_id
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "append delivery operation {operation_id} has no matching pending review {review_id}"
+                )
+            })?;
+        let existing_operation_ids = self.pending_reviews[pending_index]
+            .comments
+            .iter()
+            .map(|receipt| receipt.operation_id)
+            .collect::<HashSet<_>>();
+        if let Some(duplicate) = receipts
+            .iter()
+            .find(|receipt| existing_operation_ids.contains(&receipt.operation_id))
+        {
+            bail!(
+                "pending review {} already contains record operation {}",
+                review_id,
+                duplicate.operation_id
+            );
+        }
+
+        let operation_index = self
+            .active_operations
+            .iter()
+            .position(|active| active.id == *operation_id)
+            .ok_or_else(|| anyhow!("delivery operation {operation_id} disappeared"))?;
+        self.active_operations.remove(operation_index);
+        self.pending_reviews[pending_index]
+            .comments
+            .extend(receipts);
         self.validate()
     }
 
@@ -623,6 +782,13 @@ impl GitHubDeliveryLedger {
                         head_sha: operation.intent.head_sha(),
                         record_id: &comment.record_id,
                     })
+                    .chain(operation.intent.body_records().iter().map(move |record| {
+                        DeliveryRecordEntry {
+                            pr: operation.intent.pr(),
+                            head_sha: operation.intent.head_sha(),
+                            record_id: &record.record_id,
+                        }
+                    }))
             })
             .chain(self.pending_reviews.iter().flat_map(|review| {
                 review
@@ -663,6 +829,35 @@ fn ensure_in_flight(operation: &GitHubDeliveryOperation) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_delivery_record_identity<'a>(
+    record_id: &'a str,
+    operation_id: GitHubDeliveryOperationId,
+    record_ids: &mut HashSet<&'a str>,
+    operation_ids: &mut HashSet<GitHubDeliveryOperationId>,
+) -> Result<()> {
+    validate_nonblank("delivery record ID", record_id)?;
+    if !record_ids.insert(record_id) {
+        bail!("delivery intent contains duplicate record ID {record_id}");
+    }
+    if !operation_ids.insert(operation_id) {
+        bail!("delivery intent contains duplicate child operation ID {operation_id}");
+    }
+    Ok(())
+}
+
+fn validate_review_target(
+    review_id: u64,
+    review_node_id: &str,
+    review_url: &str,
+    intent_label: &str,
+) -> Result<()> {
+    if review_id == 0 {
+        bail!("{intent_label} intent has a zero review database ID");
+    }
+    validate_nonblank(&format!("{intent_label} review node ID"), review_node_id)?;
+    validate_nonblank(&format!("{intent_label} review URL"), review_url)
 }
 
 fn validate_comment(comment: &GitHubDeliveryComment) -> Result<()> {
@@ -732,16 +927,30 @@ fn validate_comment_receipts(
     expected: &[GitHubDeliveryComment],
     actual: &[GitHubDeliveryCommentReceipt],
 ) -> Result<()> {
-    if expected.len() != actual.len() {
+    validate_record_receipts(expected, &[], actual)
+}
+
+fn validate_record_receipts(
+    expected_comments: &[GitHubDeliveryComment],
+    expected_body_records: &[GitHubDeliveryBodyRecord],
+    actual: &[GitHubDeliveryCommentReceipt],
+) -> Result<()> {
+    let expected_count = expected_comments.len() + expected_body_records.len();
+    if expected_count != actual.len() {
         bail!(
-            "accepted comment receipt count {} does not match intent count {}",
+            "accepted record receipt count {} does not match intent count {}",
             actual.len(),
-            expected.len()
+            expected_count
         );
     }
-    let expected = expected
+    let expected = expected_comments
         .iter()
         .map(|comment| (comment.record_id.as_str(), comment.operation_id))
+        .chain(
+            expected_body_records
+                .iter()
+                .map(|record| (record.record_id.as_str(), record.operation_id)),
+        )
         .collect::<HashSet<_>>();
     let mut actual_ids = HashSet::new();
     for receipt in actual {
