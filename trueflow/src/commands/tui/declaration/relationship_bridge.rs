@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::analysis::Language;
 use anyhow::{Context, Result, anyhow, ensure};
@@ -17,7 +19,7 @@ use crate::declaration::relationships::{
     plan_used_by, plan_uses_types, reconcile_relationship_execution,
 };
 use crate::declaration::snapshot::SnapshotId;
-use crate::declaration::{DeclarationId, TypeUseRole, project_source};
+use crate::declaration::{DeclarationId, SourceComponentRole, TypeUseRole, project_source};
 
 use super::{
     DeclarationAppRuntime, PreparedDeclarationLaunch, PreparedDeclarationTarget, Relationship,
@@ -26,6 +28,7 @@ use super::{
 
 const WORK_QUEUE_DEPTH: usize = 16;
 const RESULT_QUEUE_DEPTH: usize = 16;
+const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct DeclarationRelationshipDocument {
@@ -52,6 +55,7 @@ struct PreparedProviderDocument {
     uri: Url,
     version: i32,
     language: Language,
+    document_hash: DocumentHash,
     exact_source: String,
 }
 
@@ -97,11 +101,25 @@ impl RelationshipUpdate {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CatalogGeneration {
+    snapshot_id: SnapshotId,
+    document_hash: DocumentHash,
+}
+
+#[derive(Debug, Clone)]
+enum ExactSynchronization {
+    Supported,
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone)]
 struct CatalogEntry {
     target: PreparedDeclarationTarget,
     document: DeclarationRelationshipDocument,
     language: Language,
+    generation: CatalogGeneration,
+    synchronization: ExactSynchronization,
     selection_ranges: Vec<Range>,
 }
 
@@ -116,6 +134,7 @@ pub struct RelationshipBridge<P> {
     current: HashMap<DeclarationId, RelationshipRequestKey>,
     current_snapshots: HashMap<DeclarationId, SnapshotId>,
     latest_generations: HashMap<DeclarationId, SourceGeneration>,
+    issued: HashMap<RelationshipRequestKey, SnapshotId>,
     next_generation: u64,
     closed: bool,
 }
@@ -146,6 +165,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             let uri = Url::from_file_path(&absolute)
                 .map_err(|()| anyhow!("cannot create an LSP URI for {}", absolute.display()))?;
             let source = target.snapshot.source().to_owned();
+            let document_hash = DocumentHash::from_bytes(source.as_bytes());
             let facts = project_source(&target.snapshot.path, target.snapshot.language, &source)
                 .with_context(|| format!("cannot project exact relationship source for {path}"))?;
             projected.insert(
@@ -156,6 +176,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
                 uri,
                 version: 1,
                 language: target.snapshot.language,
+                document_hash,
                 exact_source: source,
             });
         }
@@ -170,8 +191,14 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             let uri = Url::from_file_path(&absolute)
                 .map_err(|()| anyhow!("cannot create an LSP URI for {}", absolute.display()))?;
             let exact_source = target.snapshot.source().to_owned();
+            let document_hash = DocumentHash::from_bytes(exact_source.as_bytes());
+            let generation = CatalogGeneration {
+                snapshot_id: target.snapshot.id.clone(),
+                document_hash: document_hash.clone(),
+            };
+            let synchronization = exact_synchronization(&absolute, &uri, &exact_source, &documents);
             let name_start = declaration_name_start(target)?;
-            let mut selection_ranges = Vec::with_capacity(3);
+            let mut selection_ranges = Vec::with_capacity(2);
             for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
                 let range = Range::new(
                     lsp_position_for_byte_offset(&exact_source, name_start, encoding)?,
@@ -197,6 +224,8 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
                         exact_source,
                     },
                     language: target.snapshot.language,
+                    generation,
+                    synchronization,
                     selection_ranges,
                 },
             );
@@ -212,6 +241,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             projection,
             current: HashMap::new(),
             current_snapshots: HashMap::new(),
+            issued: HashMap::new(),
             latest_generations: HashMap::new(),
             next_generation: 1,
             closed: false,
@@ -257,6 +287,9 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
                 entry.language
             )));
         }
+        if let ExactSynchronization::Unavailable(reason) = &entry.synchronization {
+            return Ok(unavailable(reason.clone()));
+        }
 
         let key = RelationshipRequestKey {
             source_generation: generation,
@@ -265,7 +298,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             declaration_key: entry.target.declaration.key.clone(),
             document_uri: entry.document.uri.clone(),
             document_version: entry.document.version,
-            document_hash: DocumentHash::from_bytes(entry.document.exact_source.as_bytes()),
+            document_hash: entry.generation.document_hash.clone(),
         };
         let request = DeclarationRelationshipRequest {
             workspace_root: self.workspace_root.clone(),
@@ -273,15 +306,16 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             snapshot_id: entry.target.snapshot.id.clone(),
             document: entry.document.clone(),
             target: entry.target.clone(),
-            documents: self.documents.clone(),
+            documents: provider_documents_for(&entry, &self.documents),
             projection: self.projection.clone(),
         };
-        self.current.insert(declaration_id.clone(), key);
-        self.current_snapshots
-            .insert(declaration_id.clone(), entry.target.snapshot.id.clone());
         if let Err(error) = self.provider.request(request) {
             return Ok(unavailable(error.to_string()));
         }
+        self.current.insert(declaration_id.clone(), key.clone());
+        self.current_snapshots
+            .insert(declaration_id.clone(), entry.target.snapshot.id.clone());
+        self.issued.insert(key, entry.target.snapshot.id.clone());
         Ok(RelationshipUpdate {
             declaration_id: entry.target.declaration.id,
             declaration_key: entry.target.declaration.key,
@@ -295,31 +329,44 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
         if self.closed {
             return None;
         }
-        let results = self.provider.poll()?;
-        let received = result_key(&results.call_hierarchy);
-        let expected = self.current.get(&received.declaration_id)?;
-        let expected_snapshot = self.current_snapshots.get(&received.declaration_id)?;
-        if expected != received
-            || expected_snapshot != &results.snapshot_id
-            || results.uses_types.key != *expected
-            || results.used_by.key != *expected
-        {
-            return None;
+        while let Some(results) = self.provider.poll() {
+            let received = result_key(&results.call_hierarchy).clone();
+            if results.uses_types.key != received || results.used_by.key != received {
+                return None;
+            }
+            let Some(issued_snapshot) = self.issued.get(&received) else {
+                return None;
+            };
+            if issued_snapshot != &results.snapshot_id {
+                return None;
+            }
+            let is_current = self.current.get(&received.declaration_id) == Some(&received)
+                && self.current_snapshots.get(&received.declaration_id)
+                    == Some(&results.snapshot_id);
+            if !is_current {
+                self.issued.remove(&received);
+                continue;
+            }
+            let entry = self.catalog.get(&received.declaration_id)?;
+            if entry.target.declaration.key != received.declaration_key
+                || entry.generation.snapshot_id != results.snapshot_id
+                || entry.generation.document_hash != received.document_hash
+            {
+                return None;
+            }
+            let state = normalize_results(&results, &self.catalog, &received);
+            self.issued.remove(&received);
+            self.current.remove(&received.declaration_id);
+            self.current_snapshots.remove(&received.declaration_id);
+            return Some(RelationshipUpdate {
+                declaration_id: received.declaration_id.clone(),
+                declaration_key: received.declaration_key.clone(),
+                snapshot_id: results.snapshot_id,
+                source_generation: received.source_generation,
+                state,
+            });
         }
-        let entry = self.catalog.get(&expected.declaration_id)?;
-        if entry.target.declaration.key != expected.declaration_key
-            || entry.target.snapshot.id != results.snapshot_id
-        {
-            return None;
-        }
-        let state = normalize_results(&results, &self.catalog);
-        Some(RelationshipUpdate {
-            declaration_id: expected.declaration_id.clone(),
-            declaration_key: expected.declaration_key.clone(),
-            snapshot_id: results.snapshot_id,
-            source_generation: expected.source_generation,
-            state,
-        })
+        None
     }
 
     pub fn apply<A>(
@@ -353,6 +400,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
         self.closed = true;
         self.current.clear();
         self.current_snapshots.clear();
+        self.issued.clear();
         self.latest_generations.clear();
         self.provider.shutdown()
     }
@@ -434,10 +482,11 @@ impl ProductionRelationshipCoordinator {
         };
         self.bridges[index].apply(runtime, update)
     }
-
     pub(crate) fn shutdown(&mut self) {
         for bridge in &mut self.bridges {
-            let _ = bridge.shutdown();
+            if let Err(error) = bridge.shutdown() {
+                eprintln!("relationship bridge shutdown failed: {error}");
+            }
         }
     }
 }
@@ -449,15 +498,109 @@ impl Drop for ProductionRelationshipCoordinator {
 }
 
 fn declaration_name_start(target: &PreparedDeclarationTarget) -> Result<usize> {
-    let source = target
-        .snapshot
-        .source()
-        .get(target.declaration.source_span.clone())
-        .context("declaration span is outside its exact snapshot")?;
-    let relative = source
-        .find(&target.declaration.name)
-        .context("declaration name is absent from its exact source span")?;
-    Ok(target.declaration.source_span.start + relative)
+    let declaration = &target.declaration;
+    for component in &declaration.components {
+        if matches!(
+            component.role,
+            SourceComponentRole::Documentation
+                | SourceComponentRole::Attribute
+                | SourceComponentRole::Layout
+        ) {
+            continue;
+        }
+        for (relative, _) in component.text.match_indices(&declaration.name) {
+            let start = component.source_range.start + relative;
+            let end = start + declaration.name.len();
+            if is_identifier_boundary(target.snapshot.source(), start, end)
+                && !declaration
+                    .type_use_sites
+                    .iter()
+                    .any(|site| site.source_range == (start..end))
+            {
+                return Ok(start);
+            }
+        }
+    }
+    Err(anyhow!(
+        "declaration identifier is absent from its projected source components"
+    ))
+}
+
+fn is_identifier_boundary(source: &str, start: usize, end: usize) -> bool {
+    let before = source
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back());
+    let after = source.get(end..).and_then(|suffix| suffix.chars().next());
+    !before.is_some_and(is_identifier_continue) && !after.is_some_and(is_identifier_continue)
+}
+
+fn is_identifier_continue(character: char) -> bool {
+    character == '_' || character == '$' || character.is_alphanumeric()
+}
+
+fn exact_synchronization(
+    absolute: &Path,
+    uri: &Url,
+    exact_source: &str,
+    documents: &[PreparedProviderDocument],
+) -> ExactSynchronization {
+    let live_bytes = match fs::read(absolute) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ExactSynchronization::Unavailable(format!(
+                "cannot verify the live workspace generation for {}: {error}",
+                absolute.display()
+            ));
+        }
+    };
+    if live_bytes == exact_source.as_bytes() {
+        return ExactSynchronization::Supported;
+    }
+    let live_hash = DocumentHash::from_bytes(&live_bytes);
+    if documents
+        .iter()
+        .any(|document| document.uri == *uri && document.document_hash == live_hash)
+    {
+        ExactSynchronization::Supported
+    } else {
+        ExactSynchronization::Unavailable(format!(
+            "the live workspace bytes for {} do not match any captured snapshot generation; exact semantic synchronization is unavailable",
+            absolute.display()
+        ))
+    }
+}
+
+fn provider_documents_for(
+    entry: &CatalogEntry,
+    documents: &[PreparedProviderDocument],
+) -> Vec<PreparedProviderDocument> {
+    let mut selected = vec![PreparedProviderDocument {
+        uri: entry.document.uri.clone(),
+        version: entry.document.version,
+        language: entry.language,
+        document_hash: entry.generation.document_hash.clone(),
+        exact_source: entry.document.exact_source.clone(),
+    }];
+    for document in documents {
+        if selected
+            .iter()
+            .any(|candidate| candidate.uri == document.uri)
+        {
+            continue;
+        }
+        let mut generations = documents
+            .iter()
+            .filter(|candidate| candidate.uri == document.uri)
+            .map(|candidate| &candidate.document_hash);
+        let Some(first_hash) = generations.next() else {
+            continue;
+        };
+        if generations.any(|hash| hash != first_hash) {
+            continue;
+        }
+        selected.push(document.clone());
+    }
+    selected
 }
 
 fn result_key(state: &ProviderCallHierarchyState) -> &RelationshipRequestKey {
@@ -473,6 +616,7 @@ fn result_key(state: &ProviderCallHierarchyState) -> &RelationshipRequestKey {
 fn normalize_results(
     results: &DeclarationRelationshipResults,
     catalog: &HashMap<DeclarationId, CatalogEntry>,
+    expected: &RelationshipRequestKey,
 ) -> RelationshipState {
     let mut grouped: BTreeMap<u8, Vec<Relationship>> = BTreeMap::new();
     let mut diagnostics = Vec::new();
@@ -480,12 +624,14 @@ fn normalize_results(
     let mut failures = Vec::new();
 
     match &results.call_hierarchy {
-        ProviderCallHierarchyState::Ready(bundle) => collect_calls(bundle, catalog, &mut grouped),
+        ProviderCallHierarchyState::Ready(bundle) => {
+            collect_calls(bundle, catalog, expected, &mut grouped);
+        }
         ProviderCallHierarchyState::Partial {
             bundle,
             diagnostics: partial,
         } => {
-            collect_calls(bundle, catalog, &mut grouped);
+            collect_calls(bundle, catalog, expected, &mut grouped);
             diagnostics.extend(partial.iter().cloned());
         }
         ProviderCallHierarchyState::Unsupported { capability, .. } => {
@@ -502,6 +648,7 @@ fn normalize_results(
         &results.uses_types.outcome,
         RelationshipKind::UsesType,
         catalog,
+        expected,
         &mut grouped,
         &mut diagnostics,
         &mut unsupported,
@@ -511,6 +658,7 @@ fn normalize_results(
         &results.used_by.outcome,
         RelationshipKind::UsedBy,
         catalog,
+        expected,
         &mut grouped,
         &mut diagnostics,
         &mut unsupported,
@@ -552,6 +700,7 @@ fn normalize_results(
 fn collect_calls(
     bundle: &CallHierarchyBundle,
     catalog: &HashMap<DeclarationId, CatalogEntry>,
+    expected: &RelationshipRequestKey,
     grouped: &mut BTreeMap<u8, Vec<Relationship>>,
 ) {
     for call in &bundle.incoming {
@@ -560,6 +709,7 @@ fn collect_calls(
             &call.from,
             &call.from_ranges,
             catalog,
+            expected,
         ));
     }
     for call in &bundle.outgoing {
@@ -568,6 +718,7 @@ fn collect_calls(
             &call.to,
             &call.from_ranges,
             catalog,
+            expected,
         ));
     }
 }
@@ -577,6 +728,7 @@ fn call_relationship(
     item: &CallHierarchyItem,
     call_ranges: &[Range],
     catalog: &HashMap<DeclarationId, CatalogEntry>,
+    expected: &RelationshipRequestKey,
 ) -> Relationship {
     let mut details = vec![format!("selection {}", display_range(item.selection_range))];
     if item.range != item.selection_range {
@@ -593,7 +745,7 @@ fn call_relationship(
         ));
     }
     let detail = details.join(" · ");
-    let destination = exact_call_target(item, catalog)
+    let destination = exact_call_target(item, catalog, expected)
         .map(|id| RelationshipDestination::InReview {
             declaration_id: id.as_str().to_owned(),
         })
@@ -617,11 +769,23 @@ fn call_relationship(
 fn exact_call_target<'a>(
     item: &CallHierarchyItem,
     catalog: &'a HashMap<DeclarationId, CatalogEntry>,
+    expected: &RelationshipRequestKey,
 ) -> Option<&'a DeclarationId> {
-    catalog.iter().find_map(|(id, entry)| {
-        (entry.document.uri == item.uri && entry.selection_ranges.contains(&item.selection_range))
-            .then_some(id)
-    })
+    let matches = catalog
+        .iter()
+        .filter(|(_, entry)| {
+            entry.document.uri == item.uri && entry.selection_ranges.contains(&item.selection_range)
+        })
+        .collect::<Vec<_>>();
+    if let Some((id, _)) = matches.iter().find(|(id, entry)| {
+        **id == expected.declaration_id && entry.generation.document_hash == expected.document_hash
+    }) {
+        return Some(id);
+    }
+    match matches.as_slice() {
+        [(id, _)] => Some(id),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -629,6 +793,7 @@ fn collect_outcome(
     outcome: &RelationshipOutcome,
     expected_kind: RelationshipKind,
     catalog: &HashMap<DeclarationId, CatalogEntry>,
+    expected: &RelationshipRequestKey,
     grouped: &mut BTreeMap<u8, Vec<Relationship>>,
     diagnostics: &mut Vec<String>,
     unsupported: &mut Vec<String>,
@@ -660,16 +825,24 @@ fn collect_outcome(
             ));
             continue;
         }
+        if edge.source != expected.declaration_id {
+            diagnostics.push(format!(
+                "provider returned an edge for a different declaration generation {}",
+                edge.source.as_str()
+            ));
+            continue;
+        }
         grouped
             .entry(group_order(edge.kind))
             .or_default()
-            .push(edge_relationship(edge, catalog));
+            .push(edge_relationship(edge, catalog, expected));
     }
 }
 
 fn edge_relationship(
     edge: &RelationshipEdge,
     catalog: &HashMap<DeclarationId, CatalogEntry>,
+    expected: &RelationshipRequestKey,
 ) -> Relationship {
     let location_details = edge
         .locations
@@ -683,13 +856,21 @@ fn edge_relationship(
                 .get(id)
                 .map(|entry| entry.target.declaration.name.clone())
                 .unwrap_or_else(|| id.as_str().to_owned());
-            (
-                label,
-                RelationshipDestination::InReview {
-                    declaration_id: id.as_str().to_owned(),
-                },
-                format!("review:{}", id.as_str()),
-            )
+            if catalog_target_is_exact(id, catalog, expected) {
+                (
+                    label,
+                    RelationshipDestination::InReview {
+                        declaration_id: id.as_str().to_owned(),
+                    },
+                    format!("review:{}", id.as_str()),
+                )
+            } else {
+                (
+                    label,
+                    RelationshipDestination::Unresolved,
+                    format!("unresolved-generation:{}", id.as_str()),
+                )
+            }
         }
         RelationshipTarget::External { uri, range } => (
             uri.to_string(),
@@ -714,6 +895,27 @@ fn edge_relationship(
         label,
         destination,
     }
+}
+
+fn catalog_target_is_exact(
+    id: &DeclarationId,
+    catalog: &HashMap<DeclarationId, CatalogEntry>,
+    expected: &RelationshipRequestKey,
+) -> bool {
+    let Some(entry) = catalog.get(id) else {
+        return false;
+    };
+    if id == &expected.declaration_id {
+        return entry.generation.document_hash == expected.document_hash;
+    }
+    !catalog.values().any(|candidate| {
+        candidate.generation != entry.generation
+            && candidate.document.uri == entry.document.uri
+            && candidate
+                .selection_ranges
+                .iter()
+                .any(|range| entry.selection_ranges.contains(range))
+    })
 }
 
 fn relationship_location_text(location: &RelationshipLocation) -> String {
@@ -836,6 +1038,7 @@ const fn scope_text(scope: RelationshipScope) -> &'static str {
 pub struct BackgroundRelationshipProvider {
     work_tx: Option<SyncSender<DeclarationRelationshipRequest>>,
     result_rx: Receiver<DeclarationRelationshipResults>,
+    worker: Option<JoinHandle<()>>,
     closed: bool,
 }
 
@@ -843,7 +1046,7 @@ impl BackgroundRelationshipProvider {
     pub fn new() -> std::result::Result<Self, ProviderError> {
         let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_DEPTH);
         let (result_tx, result_rx) = mpsc::sync_channel(RESULT_QUEUE_DEPTH);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("trueflow-relationship-coordinator".to_owned())
             .spawn(move || provider_worker(&work_rx, &result_tx))
             .map_err(|error| {
@@ -854,6 +1057,7 @@ impl BackgroundRelationshipProvider {
         Ok(Self {
             work_tx: Some(work_tx),
             result_rx,
+            worker: Some(worker),
             closed: false,
         })
     }
@@ -892,13 +1096,28 @@ impl DeclarationRelationshipProvider for BackgroundRelationshipProvider {
         self.closed = true;
         self.work_tx.take();
         while self.result_rx.try_recv().is_ok() {}
-        Ok(())
+        let Some(worker) = self.worker.as_ref() else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + BACKGROUND_SHUTDOWN_TIMEOUT;
+        while !worker.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !worker.is_finished() {
+            return Err(ProviderError::Timeout);
+        }
+        let worker = self.worker.take().expect("checked relationship worker");
+        worker.join().map_err(|_| {
+            ProviderError::Protocol("relationship coordinator worker panicked".to_owned())
+        })
     }
 }
 
 impl Drop for BackgroundRelationshipProvider {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        if let Err(error) = self.shutdown() {
+            eprintln!("relationship background shutdown failed: {error}");
+        }
     }
 }
 
@@ -906,43 +1125,79 @@ fn provider_worker(
     work_rx: &Receiver<DeclarationRelationshipRequest>,
     result_tx: &SyncSender<DeclarationRelationshipResults>,
 ) {
-    let mut providers: HashMap<(PathBuf, LspServerProfile, Language), RelationshipProvider> =
-        HashMap::new();
+    let mut providers: HashMap<ProviderSessionKey, RelationshipProvider> = HashMap::new();
     while let Ok(request) = work_rx.recv() {
         let result = execute_provider_request(&request, &mut providers);
-        if result_tx.send(result).is_err() {
-            break;
+        match result_tx.try_send(result) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => break,
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderSessionKey {
+    workspace_root: PathBuf,
+    profile: LspServerProfile,
+    language: Language,
+    snapshot_id: SnapshotId,
+    document_hash: DocumentHash,
+}
+
 fn execute_provider_request(
     request: &DeclarationRelationshipRequest,
-    providers: &mut HashMap<(PathBuf, LspServerProfile, Language), RelationshipProvider>,
+    providers: &mut HashMap<ProviderSessionKey, RelationshipProvider>,
 ) -> DeclarationRelationshipResults {
-    let session_key = (
-        request.workspace_root.clone(),
-        request.key.server_profile,
-        request.target.snapshot.language,
-    );
-    let provider = match providers.entry(session_key) {
-        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            match RelationshipProvider::launch(
-                request.key.server_profile,
-                request.target.snapshot.language,
-                &request.workspace_root,
-                WorkspaceTrust::TrustedForInvocation,
-            ) {
-                Ok(provider) => entry.insert(provider),
-                Err(error) => return failed_results(request, error.to_string()),
-            }
-        }
+    let session_key = ProviderSessionKey {
+        workspace_root: request.workspace_root.clone(),
+        profile: request.key.server_profile,
+        language: request.target.snapshot.language,
+        snapshot_id: request.snapshot_id.clone(),
+        document_hash: request.key.document_hash.clone(),
     };
+    if !providers.contains_key(&session_key) {
+        let provider = match RelationshipProvider::launch(
+            request.key.server_profile,
+            request.target.snapshot.language,
+            &request.workspace_root,
+            WorkspaceTrust::TrustedForInvocation,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => return failed_results(request, error.to_string()),
+        };
+        providers.insert(session_key.clone(), provider);
+    }
+    let result = execute_with_provider(
+        request,
+        providers
+            .get_mut(&session_key)
+            .expect("relationship provider was inserted"),
+    );
+    let replace = providers
+        .get(&session_key)
+        .is_some_and(|provider| !provider.session_available());
+    if replace
+        && let Some(mut provider) = providers.remove(&session_key)
+        && let Err(error) = provider.shutdown()
+    {
+        eprintln!("failed to retire an unhealthy relationship session: {error}");
+    }
+    result
+}
 
+fn execute_with_provider(
+    request: &DeclarationRelationshipRequest,
+    provider: &mut RelationshipProvider,
+) -> DeclarationRelationshipResults {
     for document in &request.documents {
         if document.language != provider.language() {
             continue;
+        }
+        if document.document_hash != DocumentHash::from_bytes(document.exact_source.as_bytes()) {
+            return failed_results(
+                request,
+                "prepared relationship document hash does not match its exact bytes".to_owned(),
+            );
         }
         if let Err(error) = provider.synchronize_document(DocumentSnapshot::new(
             document.uri.clone(),

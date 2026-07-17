@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
@@ -284,6 +285,7 @@ pub struct RelationshipProvider {
     text_sync: TextDocumentSync,
     capabilities: ProviderCapabilities,
     command_tx: mpsc::Sender<WorkerCommand>,
+    healthy: AtomicBool,
     thread: Option<JoinHandle<()>>,
     closed: bool,
 }
@@ -357,6 +359,7 @@ impl RelationshipProvider {
             text_sync,
             capabilities,
             command_tx,
+            healthy: AtomicBool::new(true),
             thread: Some(thread),
             closed: false,
         })
@@ -376,6 +379,10 @@ impl RelationshipProvider {
 
     pub const fn text_document_sync(&self) -> TextDocumentSync {
         self.text_sync
+    }
+
+    pub(crate) fn session_available(&self) -> bool {
+        !self.closed && self.healthy.load(Ordering::Acquire) && !self.command_tx.is_closed()
     }
 
     pub fn synchronize_document(
@@ -414,12 +421,16 @@ impl RelationshipProvider {
         }
         self.closed = true;
         let reply = self.request_even_if_closing(|reply| WorkerCommand::Shutdown { reply });
-        if reply.is_ok() {
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
+        let join_result = if reply.is_ok() {
+            self.thread.take().map(JoinHandle::join)
         } else {
-            self.thread.take();
+            self.thread
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+                .then(|| self.thread.take().expect("checked LSP worker").join())
+        };
+        if let Some(Err(_)) = join_result {
+            return Err(ProviderError::Protocol("LSP worker panicked".to_owned()));
         }
         reply?
     }
@@ -428,7 +439,7 @@ impl RelationshipProvider {
         &self,
         command: impl FnOnce(std_mpsc::SyncSender<T>) -> WorkerCommand,
     ) -> Result<T, ProviderError> {
-        if self.closed {
+        if self.closed || !self.healthy.load(Ordering::Acquire) {
             return Err(ProviderError::SessionClosed);
         }
         self.request_even_if_closing(command)
@@ -439,15 +450,21 @@ impl RelationshipProvider {
         command: impl FnOnce(std_mpsc::SyncSender<T>) -> WorkerCommand,
     ) -> Result<T, ProviderError> {
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-        self.command_tx
-            .blocking_send(command(reply_tx))
-            .map_err(|_error| ProviderError::SessionClosed)?;
-        reply_rx
-            .recv_timeout(COMMAND_REPLY_TIMEOUT)
-            .map_err(|error| match error {
-                std_mpsc::RecvTimeoutError::Timeout => ProviderError::Timeout,
-                std_mpsc::RecvTimeoutError::Disconnected => ProviderError::SessionClosed,
-            })
+        if self.command_tx.blocking_send(command(reply_tx)).is_err() {
+            self.healthy.store(false, Ordering::Release);
+            return Err(ProviderError::SessionClosed);
+        }
+        match reply_rx.recv_timeout(COMMAND_REPLY_TIMEOUT) {
+            Ok(reply) => Ok(reply),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                self.healthy.store(false, Ordering::Release);
+                Err(ProviderError::Timeout)
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                self.healthy.store(false, Ordering::Release);
+                Err(ProviderError::SessionClosed)
+            }
+        }
     }
 }
 impl RelationshipBackend for RelationshipProvider {

@@ -26,10 +26,12 @@ use trueflow::declaration::relationships::{
 use trueflow::declaration::{DeclarationId, TypeUseRole};
 use trueflow::repo_path::RepoPath;
 use trueflow::scanner::ScanOptions;
-use trueflow::store::{Identity, Record};
-use trueflow::targets::{ReviewContentSource, ReviewDiffSelection, ReviewPathSelection};
+use trueflow::store::{CommitId, Identity, Record};
+use trueflow::targets::{
+    CommitRange, ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
+};
 use trueflow::vcs::ChangedPath;
-use trueflow_test_support::TestRepo;
+use trueflow_test_support::{TestRepo, run_git_output};
 
 const A_BASE: &str = r#"pub fn alpha(config: &Config) -> u8 {
     config.value
@@ -56,6 +58,35 @@ const Z_BASE: &str = r#"pub fn beta(value: u8) -> u8 {
 
 const Z_HEAD: &str = r#"pub fn beta(value: u16) -> u16 {
     value
+}
+"#;
+
+const DOCUMENTED_A_BASE: &str = r#"/// alpha accepts a byte-sized configuration.
+pub fn alpha(config: &Config) -> u8 {
+    config.value
+}
+
+pub struct Config {
+    pub value: u8,
+}
+"#;
+
+const DOCUMENTED_A_HEAD: &str = r#"/// alpha accepts a widened configuration.
+pub fn alpha(config: &Config) -> u16 {
+    config.value
+}
+
+pub struct Config {
+    pub value: u16,
+}
+"#;
+
+const A_LIVE: &str = r#"pub fn alpha(config: &Config) -> u32 {
+    config.value
+}
+
+pub struct Config {
+    pub value: u32,
 }
 "#;
 
@@ -92,6 +123,22 @@ fn dirty_query(paths: &[&str]) -> Result<ResolvedReviewQuery> {
     })
 }
 
+fn historical_query(base: CommitId, head: CommitId) -> ResolvedReviewQuery {
+    ResolvedReviewQuery {
+        filters: BlockFilters::default(),
+        scan_options: ScanOptions::default(),
+        content_source: ReviewContentSource::Revision(head.clone()),
+        path_selection: ReviewPathSelection::All,
+        diff_selection: ReviewDiffSelection::Targets(vec![ReviewDiffTarget::RevisionRange(
+            CommitRange { start: base, end: head },
+        )]),
+    }
+}
+
+fn commit_id(repo: &TestRepo, revision: &str) -> Result<CommitId> {
+    CommitId::new(run_git_output(&repo.path, &["rev-parse", revision])?)
+}
+
 struct ReviewFixture {
     repo: TestRepo,
     prepared: trueflow::commands::tui::declaration::PreparedDeclarationLaunch,
@@ -104,12 +151,22 @@ struct ReviewFixture {
 
 impl ReviewFixture {
     fn new(name: &str) -> Result<Self> {
+        Self::with_sources(name, A_BASE, A_HEAD, Z_BASE, Z_HEAD)
+    }
+
+    fn with_sources(
+        name: &str,
+        a_base: &str,
+        a_head: &str,
+        z_base: &str,
+        z_head: &str,
+    ) -> Result<Self> {
         let repo = TestRepo::new(name)?;
-        repo.write("src/a.rs", A_BASE)?;
-        repo.write("src/z.rs", Z_BASE)?;
+        repo.write("src/a.rs", a_base)?;
+        repo.write("src/z.rs", z_base)?;
         repo.commit_all("base declaration surfaces")?;
-        repo.write("src/a.rs", A_HEAD)?;
-        repo.write("src/z.rs", Z_HEAD)?;
+        repo.write("src/a.rs", a_head)?;
+        repo.write("src/z.rs", z_head)?;
         let prepared = prepare_declaration_launch(
             &repo.path,
             &dirty_query(&["src/a.rs", "src/z.rs"])?,
@@ -190,6 +247,8 @@ enum Script {
     Full(Box<FullScript>),
     StaleThenCurrent(StaleDimension),
     NeverCompletes,
+    SelfCallAt(LspRange),
+    ReadyUnresolved,
 }
 
 #[derive(Debug)]
@@ -242,6 +301,50 @@ impl DeclarationRelationshipProvider for FakeProvider {
                 ));
             }
             Script::NeverCompletes => {}
+            Script::SelfCallAt(selection_range) => {
+                let item = call_item(
+                    &request.target.declaration.name,
+                    request.document.uri.clone(),
+                    selection_range,
+                    selection_range,
+                );
+                self.completions.push_back(results(
+                    &request,
+                    ProviderCallHierarchyState::Ready(CallHierarchyBundle {
+                        key: request.key.clone(),
+                        prepared: vec![item.clone()],
+                        incoming: vec![CallHierarchyIncomingCall {
+                            from: item,
+                            from_ranges: Vec::new(),
+                        }],
+                        outgoing: Vec::new(),
+                    }),
+                    RelationshipOutcome::Complete { edges: Vec::new() },
+                    RelationshipOutcome::Complete { edges: Vec::new() },
+                ));
+            }
+            Script::ReadyUnresolved => {
+                let edge = RelationshipEdge {
+                    kind: RelationshipKind::UsesType,
+                    source: request.key.declaration_id.clone(),
+                    target: RelationshipTarget::Unresolved {
+                        name: "CapturedOnlyType".to_owned(),
+                    },
+                    locations: vec![type_use_location(
+                        request.document.uri.clone(),
+                        LspRange::new(Position::new(0, 0), Position::new(0, 1)),
+                        None,
+                        RelationshipMethod::TypeDefinition,
+                        TypeUseRole::Other,
+                    )],
+                };
+                self.completions.push_back(results(
+                    &request,
+                    ProviderCallHierarchyState::Ready(empty_call_bundle(&request.key)),
+                    RelationshipOutcome::Complete { edges: vec![edge] },
+                    RelationshipOutcome::Complete { edges: Vec::new() },
+                ));
+            }
             Script::SupportedEmpty => self.completions.push_back(results(
                 &request,
                 ProviderCallHierarchyState::Ready(empty_call_bundle(&request.key)),
@@ -930,5 +1033,216 @@ fn shutdown_discards_in_flight_work_instead_of_applying_it_late() -> Result<()> 
         &GraphRelationshipState::NoRelationships,
         "fixture accidentally completed synchronously"
     );
+    Ok(())
+}
+
+#[test]
+fn documented_declaration_reconciles_the_projected_identifier_instead_of_its_prose_name()
+-> Result<()> {
+    let fixture = ReviewFixture::with_sources(
+        "relationship_bridge_documented_identifier",
+        DOCUMENTED_A_BASE,
+        DOCUMENTED_A_HEAD,
+        Z_BASE,
+        Z_HEAD,
+    )?;
+    let projected_identifier =
+        LspRange::new(Position::new(1, 7), Position::new(1, 12));
+    let provider = FakeProvider::new(
+        &fixture.repo.path,
+        [Script::SelfCallAt(projected_identifier)],
+    );
+    let mut bridge = RelationshipBridge::new(
+        &fixture.prepared,
+        &fixture.repo.path,
+        WorkspaceTrust::TrustedForInvocation,
+        Some(LspServerProfile::RustAnalyzer),
+        provider,
+    )?;
+
+    let checking = bridge.request(&fixture.alpha)?;
+    assert_eq!(checking.state(), &GraphRelationshipState::Checking);
+    let completed = bridge
+        .poll()
+        .context("missing documented declaration relationship completion")?;
+    let groups = match completed.state() {
+        GraphRelationshipState::Ready(groups) => groups,
+        other => bail!("documented declaration did not produce relationships: {other:?}"),
+    };
+    let caller = groups
+        .iter()
+        .find(|group| group.label == "Called by")
+        .and_then(|group| group.relationships.first())
+        .context("missing projected self-call")?;
+    assert_eq!(
+        caller.destination,
+        RelationshipDestination::InReview {
+            declaration_id: fixture.alpha.as_str().to_owned(),
+        },
+        "the identifier range on the declaration line must reconcile to the review target even when prose names it first"
+    );
+    Ok(())
+}
+
+#[test]
+fn historical_snapshot_cannot_become_ready_from_a_different_live_workspace_generation()
+-> Result<()> {
+    let repo = TestRepo::new("relationship_bridge_historical_live_generation")?;
+    repo.write("src/a.rs", A_BASE)?;
+    repo.commit_all("historical base")?;
+    let base = commit_id(&repo, "HEAD")?;
+    repo.write("src/a.rs", A_HEAD)?;
+    repo.commit_all("historical reviewed head")?;
+    let head = commit_id(&repo, "HEAD")?;
+    repo.write("src/a.rs", A_LIVE)?;
+
+    let prepared = prepare_declaration_launch(
+        &repo.path,
+        &historical_query(base, head),
+        Vec::new(),
+    )?;
+    let alpha = prepared
+        .targets()
+        .iter()
+        .find(|target| target.declaration.name == "alpha")
+        .map(|target| target.declaration.id.clone())
+        .context("missing historical alpha declaration")?;
+    let provider = FakeProvider::new(&repo.path, [Script::ReadyUnresolved]);
+    let mut bridge = RelationshipBridge::new(
+        &prepared,
+        &repo.path,
+        WorkspaceTrust::TrustedForInvocation,
+        Some(LspServerProfile::RustAnalyzer),
+        provider,
+    )?;
+
+    let initial = bridge.request(&alpha)?;
+    if !matches!(initial.state(), GraphRelationshipState::Unavailable { .. }) {
+        let completed = bridge
+            .poll()
+            .context("historical request remained Checking without a terminal state")?;
+        assert!(
+            matches!(completed.state(), GraphRelationshipState::Unavailable { .. }),
+            "captured historical bytes were reported from the unrelated live workspace generation as {:?}",
+            completed.state()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn same_uri_snapshots_with_distinct_hashes_reconcile_within_their_captured_generation()
+-> Result<()> {
+    let repo = TestRepo::new("relationship_bridge_same_uri_snapshots")?;
+    repo.write("src/a.rs", A_BASE)?;
+    repo.commit_all("snapshot base")?;
+    let base = commit_id(&repo, "HEAD")?;
+    repo.write("src/a.rs", A_HEAD)?;
+    repo.commit_all("first captured generation")?;
+    let first = commit_id(&repo, "HEAD")?;
+    repo.write("src/a.rs", A_LIVE)?;
+    repo.commit_all("second captured generation")?;
+    let second = commit_id(&repo, "HEAD")?;
+    let query = ResolvedReviewQuery {
+        filters: BlockFilters::default(),
+        scan_options: ScanOptions::default(),
+        content_source: ReviewContentSource::Revision(second.clone()),
+        path_selection: ReviewPathSelection::All,
+        diff_selection: ReviewDiffSelection::Targets(vec![
+            ReviewDiffTarget::RevisionRange(CommitRange {
+                start: base,
+                end: first.clone(),
+            }),
+            ReviewDiffTarget::RevisionRange(CommitRange {
+                start: first,
+                end: second,
+            }),
+        ]),
+    };
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+    let alphas = prepared
+        .targets()
+        .iter()
+        .filter(|target| target.declaration.name == "alpha")
+        .map(|target| target.declaration.id.clone())
+        .collect::<Vec<_>>();
+    ensure!(
+        alphas.len() == 2,
+        "fixture expected two captured alpha generations, got {}",
+        alphas.len()
+    );
+    ensure!(alphas[0] != alphas[1], "captured generations reused one declaration ID");
+
+    let identifier = LspRange::new(Position::new(0, 7), Position::new(0, 12));
+    let provider = FakeProvider::new(
+        &repo.path,
+        [Script::SelfCallAt(identifier), Script::SelfCallAt(identifier)],
+    );
+    let mut bridge = RelationshipBridge::new(
+        &prepared,
+        &repo.path,
+        WorkspaceTrust::TrustedForInvocation,
+        Some(LspServerProfile::RustAnalyzer),
+        provider,
+    )?;
+
+    for alpha in &alphas {
+        let checking = bridge.request(alpha)?;
+        assert_eq!(checking.state(), &GraphRelationshipState::Checking);
+        let completed = bridge
+            .poll()
+            .context("missing isolated captured-generation completion")?;
+        let destination = match completed.state() {
+            GraphRelationshipState::Ready(groups) => groups
+                .iter()
+                .find(|group| group.label == "Called by")
+                .and_then(|group| group.relationships.first())
+                .map(|relationship| &relationship.destination)
+                .context("missing captured-generation self-call")?,
+            other => bail!("captured generation did not produce relationships: {other:?}"),
+        };
+        assert_eq!(
+            destination,
+            &RelationshipDestination::InReview {
+                declaration_id: alpha.as_str().to_owned(),
+            },
+            "same-URI relationship escaped its snapshot/hash generation"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_requests_surface_the_latest_accepted_generation_without_stale_poll_barriers()
+-> Result<()> {
+    let fixture = ReviewFixture::new("relationship_bridge_repeated_generation")?;
+    let provider = FakeProvider::new(
+        &fixture.repo.path,
+        [
+            Script::SupportedEmpty,
+            Script::SupportedEmpty,
+            Script::SupportedEmpty,
+        ],
+    );
+    let mut bridge = RelationshipBridge::new(
+        &fixture.prepared,
+        &fixture.repo.path,
+        WorkspaceTrust::TrustedForInvocation,
+        Some(LspServerProfile::RustAnalyzer),
+        provider,
+    )?;
+
+    let _obsolete_first = bridge.request(&fixture.alpha)?;
+    let _obsolete_second = bridge.request(&fixture.alpha)?;
+    let latest = bridge.request(&fixture.alpha)?;
+    let completed = bridge.poll().context(
+        "the latest accepted generation was blocked behind an obsolete queued completion",
+    )?;
+    assert_eq!(
+        completed.source_generation(),
+        latest.source_generation(),
+        "the first surfaced completion must belong to the latest accepted request"
+    );
+    assert_eq!(completed.state(), &GraphRelationshipState::NoRelationships);
     Ok(())
 }
