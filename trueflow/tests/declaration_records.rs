@@ -7,10 +7,10 @@ use trueflow::declaration::{DeclarationKey, DeclarationProjectionHash};
 use trueflow::hashing::BytesHash;
 use trueflow::repo_path::RepoPath;
 use trueflow::store::{
-    BlockState, CURRENT_VERSION, CommentAnchor, CommitId, DeclarationAnchorRange,
-    DeclarationCommentAnchor, DeclarationRecordLocator, FileStore, Identity, Record, RepoRef,
-    ReviewCheck, ReviewStore, ReviewTargetRef, ReviewedDeclarationSnapshot, SourceCommentAnchor,
-    VcsSystem, Verdict,
+    BlockState, CommentAnchor, CommitId, DeclarationAnchorRange, DeclarationCommentAnchor,
+    DeclarationRecordLocator, FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore,
+    ReviewTargetRef, ReviewedDeclarationSnapshot, SourceCommentAnchor, VcsSystem, Verdict,
+    CURRENT_VERSION,
 };
 use trueflow_test_support::temp_test_dir;
 
@@ -417,8 +417,8 @@ fn declaration_anchor_rejects_empty_unordered_overlapping_or_out_of_bounds_range
 }
 
 #[test]
-fn declaration_anchor_proves_utf8_boundaries_exact_slices_and_snapshot_hash_against_source()
--> Result<()> {
+fn declaration_anchor_proves_utf8_boundaries_exact_slices_and_snapshot_hash_against_source(
+) -> Result<()> {
     declaration_anchor().validate_against_source(VALID_SOURCE)?;
 
     let mut split_code_point = declaration_anchor();
@@ -454,9 +454,6 @@ fn malformed_declaration_records_fail_during_deserialization() -> Result<()> {
     let mut unsupported_version = valid.clone();
     unsupported_version["version"] = json!(CURRENT_VERSION + 1);
 
-    let mut legacy_declaration = valid.clone();
-    legacy_declaration["version"] = json!(4);
-
     let mut hash_mismatch = valid.clone();
     hash_mismatch["declaration_locator"]["projection_hash"] = json!(OTHER_PROJECTION_HASH);
 
@@ -465,7 +462,6 @@ fn malformed_declaration_records_fail_during_deserialization() -> Result<()> {
 
     for (case, value) in [
         ("unsupported version", unsupported_version),
-        ("declaration shape before V5", legacy_declaration),
         ("projection hash mismatch", hash_mismatch),
         ("empty declaration anchor", missing_ranges),
     ] {
@@ -473,6 +469,49 @@ fn malformed_declaration_records_fail_during_deserialization() -> Result<()> {
             serde_json::from_value::<Record>(value).is_err(),
             "{case} must fail at the deserialization boundary"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn v2_v3_v4_declaration_signals_fail_during_deserialization() -> Result<()> {
+    let declaration = serde_json::to_value(declaration_record()?)?;
+    let signals = [
+        (
+            "declaration target",
+            "target",
+            declaration["target"].clone(),
+        ),
+        ("declaration check", "check", declaration["check"].clone()),
+        (
+            "non-null declaration locator",
+            "declaration_locator",
+            declaration["declaration_locator"].clone(),
+        ),
+        (
+            "declaration comment anchor",
+            "comment_anchor",
+            declaration["comment_anchor"].clone(),
+        ),
+    ];
+
+    for version in 2..=4 {
+        let mut complete_declaration = declaration.clone();
+        complete_declaration["version"] = json!(version);
+        assert!(
+            serde_json::from_value::<Record>(complete_declaration).is_err(),
+            "a complete declaration record must not deserialize as V{version}"
+        );
+
+        for (case, field, signal) in &signals {
+            let mut ordinary = serde_json::to_value(legacy_record(version)?)?;
+            ordinary[*field] = signal.clone();
+
+            assert!(
+                serde_json::from_value::<Record>(ordinary).is_err(),
+                "V{version} record with {case} must fail at the deserialization boundary"
+            );
+        }
     }
     Ok(())
 }
@@ -619,21 +658,17 @@ fn equal_projection_hashes_at_distinct_locators_remain_distinct_in_history() -> 
 
     assert_eq!(loaded.len(), 2);
     assert_eq!(locators.len(), 2);
-    assert!(
-        locators.contains(
-            first
-                .declaration_locator
-                .as_ref()
-                .context("first locator")?
-        )
-    );
-    assert!(
-        locators.contains(
-            second
-                .declaration_locator
-                .as_ref()
-                .context("second locator")?
-        )
-    );
+    assert!(locators.contains(
+        first
+            .declaration_locator
+            .as_ref()
+            .context("first locator")?
+    ));
+    assert!(locators.contains(
+        second
+            .declaration_locator
+            .as_ref()
+            .context("second locator")?
+    ));
     Ok(())
 }
