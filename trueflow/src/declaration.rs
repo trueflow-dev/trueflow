@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::Language;
 
+pub mod diff;
+pub mod snapshot;
 
 mod c_family;
 mod go;
