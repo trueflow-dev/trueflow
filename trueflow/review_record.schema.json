@@ -106,6 +106,40 @@
             "rows"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "projection_hash": {
+              "type": "string"
+            },
+            "ranges": {
+              "items": {
+                "$ref": "#/$defs/DeclarationAnchorRange"
+              },
+              "type": "array"
+            },
+            "reviewed_snapshot": {
+              "$ref": "#/$defs/ReviewedDeclarationSnapshot"
+            },
+            "source_len_bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "declaration",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reviewed_snapshot",
+            "projection_hash",
+            "source_len_bytes",
+            "ranges"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -134,6 +168,64 @@
       "required": [
         "start_line",
         "end_line"
+      ],
+      "type": "object"
+    },
+    "DeclarationAnchorRange": {
+      "additionalProperties": false,
+      "properties": {
+        "end_byte": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exact_text": {
+          "type": "string"
+        },
+        "start_byte": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_byte",
+        "end_byte",
+        "exact_text"
+      ],
+      "type": "object"
+    },
+    "DeclarationRecordLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "declaration_key": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "projection_hash": {
+          "type": "string"
+        },
+        "reviewed_snapshot": {
+          "$ref": "#/$defs/ReviewedDeclarationSnapshot"
+        },
+        "source_ordinal": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_span": {
+          "$ref": "#/$defs/Range_of_uint"
+        }
+      },
+      "required": [
+        "path",
+        "declaration_key",
+        "source_ordinal",
+        "source_span",
+        "reviewed_snapshot",
+        "projection_hash"
       ],
       "type": "object"
     },
@@ -188,6 +280,25 @@
           "type": "object"
         }
       ]
+    },
+    "Range_of_uint": {
+      "properties": {
+        "end": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "type": "object"
     },
     "RepoRef": {
       "oneOf": [
@@ -279,8 +390,41 @@
             "hash"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "hash": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "declaration",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "hash"
+          ],
+          "type": "object"
         }
       ]
+    },
+    "ReviewedDeclarationSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "content_hash": {
+          "type": "string"
+        },
+        "snapshot_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "content_hash"
+      ],
+      "type": "object"
     },
     "VcsSystem": {
       "enum": [
@@ -299,6 +443,141 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "declaration"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "then": {
+        "properties": {
+          "check": {
+            "const": "declaration"
+          },
+          "version": {
+            "const": 5
+          }
+        },
+        "required": [
+          "declaration_locator"
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "declaration_locator"
+        ]
+      },
+      "then": {
+        "properties": {
+          "check": {
+            "const": "declaration"
+          },
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "declaration"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "version": {
+            "const": 5
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "check": {
+            "const": "declaration"
+          }
+        },
+        "required": [
+          "check"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "declaration"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "version": {
+            "const": 5
+          }
+        },
+        "required": [
+          "declaration_locator"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "comment_anchor": {
+            "properties": {
+              "type": {
+                "const": "declaration"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        },
+        "required": [
+          "comment_anchor"
+        ]
+      },
+      "then": {
+        "properties": {
+          "check": {
+            "const": "declaration"
+          },
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "declaration"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "version": {
+            "const": 5
+          }
+        },
+        "required": [
+          "declaration_locator"
+        ]
+      }
+    }
+  ],
   "properties": {
     "attestations": {
       "items": {
@@ -335,6 +614,16 @@
       "anyOf": [
         {
           "$ref": "#/$defs/CommentScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "declaration_locator": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeclarationRecordLocator"
         },
         {
           "type": "null"
@@ -393,7 +682,8 @@
     },
     "version": {
       "format": "uint32",
-      "minimum": 0,
+      "maximum": 5,
+      "minimum": 2,
       "type": "integer"
     }
   },

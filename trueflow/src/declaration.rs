@@ -2,13 +2,17 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::Result;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Language;
 
+pub mod capture;
+pub mod coverage;
 pub mod diff;
 pub mod snapshot;
 pub mod relationships;
+pub mod review;
 
 mod c_family;
 mod go;
@@ -128,8 +132,9 @@ impl DeclarationId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
+#[schemars(transparent)]
 pub struct DeclarationKey(String);
 
 impl DeclarationKey {
@@ -142,8 +147,9 @@ impl DeclarationKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
+#[schemars(transparent)]
 pub struct DeclarationProjectionHash(String);
 
 impl DeclarationProjectionHash {

@@ -150,6 +150,9 @@ impl<'a> CoverageIndex<'a> {
         };
 
         for (record_index, record) in database.records().iter().enumerate() {
+            if matches!(record.target, ReviewTargetRef::Declaration { .. }) {
+                continue;
+            }
             match lookups.bind_record(record, options.workdir_prefix.as_deref()) {
                 Ok(binding) => {
                     let facts = coverage
@@ -785,6 +788,9 @@ impl CoverageLookups {
                 &self.tree_by_path_hash,
                 &self.tree_by_hash,
             ),
+            ReviewTargetRef::Declaration { .. } => {
+                unreachable!("declaration records are filtered before ordinary coverage binding")
+            }
         }
     }
 

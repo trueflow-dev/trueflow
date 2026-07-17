@@ -329,6 +329,7 @@ enum PullRequestFeedbackSkipReason {
     NotPresentInPrHeadDiff,
     MixedDiffRowsUnsupported,
     PathRemappingUnsupported,
+    DeclarationAnchorUnsupported,
 }
 
 impl std::fmt::Display for PullRequestFeedbackSkipReason {
@@ -353,6 +354,9 @@ impl std::fmt::Display for PullRequestFeedbackSkipReason {
             }
             Self::PathRemappingUnsupported => {
                 "anchor path moved across the pull request in an unsupported or ambiguous way"
+            }
+            Self::DeclarationAnchorUnsupported => {
+                "declaration comment delivery is not supported"
             }
         };
         f.write_str(message)
@@ -1426,6 +1430,9 @@ fn map_record_to_github_comment(
         CommentAnchor::Diff(anchor) => {
             map_diff_anchor_to_github_comment(repo, metadata, anchor, note)
         }
+        CommentAnchor::Declaration(_) => Ok(Err(
+            PullRequestFeedbackSkipReason::DeclarationAnchorUnsupported,
+        )),
     }
 }
 

@@ -279,6 +279,7 @@ fn resolve_feedback_records<'a>(
         .iter()
         .enumerate()
         .filter(|(_, record)| record_matches_allowed_revisions(record, allowed_revisions))
+        .filter(|(_, record)| !matches!(record.target, ReviewTargetRef::Declaration { .. }))
         .map(|(index, record)| {
             let context = resolver.resolve_context(record)?;
             let (file_path, block, entry_key, verdict_key) = feedback_entry_parts(record, &context);
@@ -472,6 +473,7 @@ fn feedback_comment_anchor_key(record: &Record) -> Option<FeedbackCommentAnchorK
                 })
                 .collect(),
         }),
+        crate::store::CommentAnchor::Declaration(_) => None,
     }
 }
 
@@ -512,6 +514,9 @@ fn feedback_verdict_key(
             target_hash: hash.clone(),
             path: record.path_hint.as_ref().map(RepoPath::to_string),
         },
+        ReviewTargetRef::Declaration { .. } => {
+            unreachable!("declaration records are filtered before ordinary feedback export")
+        }
     };
 
     FeedbackVerdictKey {
@@ -1355,6 +1360,7 @@ fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(Stri
             })
         }
         ReviewTargetRef::Tree { .. } => None,
+        ReviewTargetRef::Declaration { .. } => None,
     }
 }
 
@@ -1435,6 +1441,9 @@ fn feedback_target_hash(record: &Record) -> TreeHash {
         ReviewTargetRef::Block { hash }
         | ReviewTargetRef::File { hash }
         | ReviewTargetRef::Tree { hash } => hash.clone(),
+        ReviewTargetRef::Declaration { .. } => {
+            unreachable!("declaration records are filtered before ordinary feedback export")
+        }
     }
 }
 

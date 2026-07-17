@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use fs2::FileExt;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 
 use std::collections::{HashMap, HashSet};
@@ -9,15 +9,18 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::ops::Range;
 use std::str::FromStr;
 
+use crate::declaration::{DeclarationKey, DeclarationProjectionHash};
+use crate::hashing::BytesHash;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::vcs;
 
 const TRUEFLOW_DIR: &str = ".trueflow";
 const DB_FILE: &str = "reviews.jsonl";
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(tag = "type")]
@@ -122,6 +125,10 @@ impl ReviewCheck {
         Self("review".to_string())
     }
 
+    pub fn declaration() -> Self {
+        Self("declaration".to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -157,6 +164,7 @@ pub enum ReviewTargetRef {
     Block { hash: TreeHash },
     File { hash: TreeHash },
     Tree { hash: TreeHash },
+    Declaration { hash: DeclarationProjectionHash },
 }
 
 impl ReviewTargetRef {
@@ -165,6 +173,7 @@ impl ReviewTargetRef {
             ReviewTargetRef::Block { hash }
             | ReviewTargetRef::File { hash }
             | ReviewTargetRef::Tree { hash } => hash.as_str(),
+            ReviewTargetRef::Declaration { hash } => hash.as_str(),
         }
     }
 }
@@ -253,19 +262,252 @@ pub struct DiffCommentAnchor {
     pub rows: Vec<DiffCommentAnchorRow>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ReviewedDeclarationSnapshot {
+    pub snapshot_id: String,
+    pub content_hash: BytesHash,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DeclarationRecordLocator {
+    pub path: RepoPath,
+    pub declaration_key: DeclarationKey,
+    pub source_ordinal: usize,
+    pub source_span: Range<usize>,
+    pub reviewed_snapshot: ReviewedDeclarationSnapshot,
+    pub projection_hash: DeclarationProjectionHash,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DeclarationAnchorRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub exact_text: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DeclarationCommentAnchor {
+    pub reviewed_snapshot: ReviewedDeclarationSnapshot,
+    pub projection_hash: DeclarationProjectionHash,
+    pub source_len_bytes: usize,
+    pub ranges: Vec<DeclarationAnchorRange>,
+}
+
+fn validate_protocol_hash(kind: &str, value: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{kind} must be a 64-character hexadecimal hash"));
+    }
+    Ok(())
+}
+
+impl ReviewedDeclarationSnapshot {
+    fn validate(&self) -> Result<()> {
+        if self.snapshot_id.trim().is_empty() {
+            return Err(anyhow!("reviewed declaration snapshot id cannot be empty"));
+        }
+        validate_protocol_hash(
+            "reviewed declaration content hash",
+            self.content_hash.as_str(),
+        )
+    }
+
+    fn validate_against_source(&self, source: &str) -> Result<()> {
+        self.validate()?;
+        if self.content_hash != BytesHash::from_bytes(source.as_bytes()) {
+            return Err(anyhow!(
+                "reviewed declaration content hash does not match the supplied source"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DeclarationRecordLocator {
+    fn validate(&self) -> Result<()> {
+        if self.path.is_root() {
+            return Err(anyhow!("declaration locator path cannot be the repository root"));
+        }
+        if self.declaration_key.as_str().trim().is_empty() {
+            return Err(anyhow!("declaration locator key cannot be empty"));
+        }
+        if self.source_span.start >= self.source_span.end {
+            return Err(anyhow!("declaration locator source span must be non-empty"));
+        }
+        self.reviewed_snapshot.validate()?;
+        validate_protocol_hash(
+            "declaration locator projection hash",
+            self.projection_hash.as_str(),
+        )
+    }
+
+    fn validate_against_source(&self, source: &str) -> Result<()> {
+        self.validate()?;
+        self.reviewed_snapshot.validate_against_source(source)?;
+        if self.source_span.end > source.len()
+            || !source.is_char_boundary(self.source_span.start)
+            || !source.is_char_boundary(self.source_span.end)
+        {
+            return Err(anyhow!(
+                "declaration locator source span is not an exact UTF-8 range in the supplied source"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DeclarationCommentAnchor {
+    fn validate_structure(&self) -> Result<()> {
+        self.reviewed_snapshot.validate()?;
+        validate_protocol_hash(
+            "declaration comment anchor projection hash",
+            self.projection_hash.as_str(),
+        )?;
+        if self.ranges.is_empty() {
+            return Err(anyhow!("declaration comment anchor must contain a source range"));
+        }
+
+        let mut previous_end = None;
+        for range in &self.ranges {
+            if range.start_byte >= range.end_byte {
+                return Err(anyhow!("declaration comment anchor ranges must be non-empty"));
+            }
+            if range.end_byte > self.source_len_bytes {
+                return Err(anyhow!(
+                    "declaration comment anchor range exceeds the reviewed source"
+                ));
+            }
+            if previous_end.is_some_and(|end| range.start_byte < end) {
+                return Err(anyhow!(
+                    "declaration comment anchor ranges must be ordered and non-overlapping"
+                ));
+            }
+            if range.exact_text.len() != range.end_byte - range.start_byte {
+                return Err(anyhow!(
+                    "declaration comment anchor exact text must match its byte range width"
+                ));
+            }
+            previous_end = Some(range.end_byte);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_source(&self, source: &str) -> Result<()> {
+        self.validate_structure()?;
+        if source.len() != self.source_len_bytes {
+            return Err(anyhow!(
+                "declaration comment anchor source length does not match the supplied source"
+            ));
+        }
+        self.reviewed_snapshot.validate_against_source(source)?;
+        for range in &self.ranges {
+            let exact_slice = source
+                .get(range.start_byte..range.end_byte)
+                .ok_or_else(|| anyhow!("declaration comment anchor range splits UTF-8 source"))?;
+            if exact_slice != range.exact_text {
+                return Err(anyhow!(
+                    "declaration comment anchor exact text does not match the supplied source"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[schemars(deny_unknown_fields)]
 pub enum CommentAnchor {
     Source(SourceCommentAnchor),
     Diff(DiffCommentAnchor),
+    Declaration(DeclarationCommentAnchor),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+fn add_record_shape_constraints(schema: &mut schemars::Schema) {
+    schema.insert(
+        "allOf".to_string(),
+        serde_json::json!([
+            {
+                "if": {
+                    "properties": {
+                        "target": {
+                            "properties": { "kind": { "const": "declaration" } },
+                            "required": ["kind"]
+                        }
+                    },
+                    "required": ["target"]
+                },
+                "then": {
+                    "properties": {
+                        "version": { "const": 5 },
+                        "check": { "const": "declaration" }
+                    },
+                    "required": ["declaration_locator"]
+                }
+            },
+            {
+                "if": { "required": ["declaration_locator"] },
+                "then": {
+                    "properties": {
+                        "version": { "const": 5 },
+                        "target": {
+                            "properties": { "kind": { "const": "declaration" } },
+                            "required": ["kind"]
+                        },
+                        "check": { "const": "declaration" }
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": { "check": { "const": "declaration" } },
+                    "required": ["check"]
+                },
+                "then": {
+                    "properties": {
+                        "version": { "const": 5 },
+                        "target": {
+                            "properties": { "kind": { "const": "declaration" } },
+                            "required": ["kind"]
+                        }
+                    },
+                    "required": ["declaration_locator"]
+                }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "comment_anchor": {
+                            "properties": { "type": { "const": "declaration" } },
+                            "required": ["type"]
+                        }
+                    },
+                    "required": ["comment_anchor"]
+                },
+                "then": {
+                    "properties": {
+                        "version": { "const": 5 },
+                        "target": {
+                            "properties": { "kind": { "const": "declaration" } },
+                            "required": ["kind"]
+                        },
+                        "check": { "const": "declaration" }
+                    },
+                    "required": ["declaration_locator"]
+                }
+            }
+        ]),
+    );
+}
+
+#[derive(Serialize, Debug, Clone, JsonSchema)]
+#[schemars(deny_unknown_fields, transform = add_record_shape_constraints)]
 pub struct Record {
     pub id: String,
-    #[schemars(range(min = 0))]
+    #[schemars(range(min = 2, max = 5))]
     pub version: u32,
     pub target: ReviewTargetRef,
     pub check: ReviewCheck,
@@ -282,10 +524,70 @@ pub struct Record {
     pub comment_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment_anchor: Option<CommentAnchor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_locator: Option<DeclarationRecordLocator>,
     #[schemars(inner(length(min = 1)))]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attestations: Option<Vec<Attestation>>,
+}
+
+#[derive(Deserialize)]
+struct RecordWire {
+    id: String,
+    version: u32,
+    target: ReviewTargetRef,
+    check: ReviewCheck,
+    verdict: Verdict,
+    identity: Identity,
+    repo_ref: RepoRef,
+    block_state: BlockState,
+    timestamp: i64,
+    path_hint: Option<RepoPath>,
+    line_hint: Option<u32>,
+    note: Option<String>,
+    comment_scope: Option<CommentScope>,
+    comment_context: Option<String>,
+    comment_anchor: Option<CommentAnchor>,
+    declaration_locator: Option<DeclarationRecordLocator>,
+    tags: Option<Vec<String>>,
+    attestations: Option<Vec<Attestation>>,
+}
+
+impl From<RecordWire> for Record {
+    fn from(record: RecordWire) -> Self {
+        Self {
+            id: record.id,
+            version: record.version,
+            target: record.target,
+            check: record.check,
+            verdict: record.verdict,
+            identity: record.identity,
+            repo_ref: record.repo_ref,
+            block_state: record.block_state,
+            timestamp: record.timestamp,
+            path_hint: record.path_hint,
+            line_hint: record.line_hint,
+            note: record.note,
+            comment_scope: record.comment_scope,
+            comment_context: record.comment_context,
+            comment_anchor: record.comment_anchor,
+            declaration_locator: record.declaration_locator,
+            tags: record.tags,
+            attestations: record.attestations,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Record {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let record = Self::from(RecordWire::deserialize(deserializer)?);
+        record.validate().map_err(serde::de::Error::custom)?;
+        Ok(record)
+    }
 }
 
 #[derive(Serialize)]
@@ -344,6 +646,27 @@ struct SignableRecordV4<'a> {
     tags: &'a Option<Vec<String>>,
 }
 
+#[derive(Serialize)]
+struct SignableRecordV5<'a> {
+    id: &'a str,
+    version: u32,
+    target: &'a ReviewTargetRef,
+    check: &'a ReviewCheck,
+    verdict: &'a Verdict,
+    identity: &'a Identity,
+    repo_ref: &'a RepoRef,
+    block_state: &'a BlockState,
+    timestamp: i64,
+    path_hint: &'a Option<RepoPath>,
+    line_hint: &'a Option<u32>,
+    note: &'a Option<String>,
+    comment_scope: &'a Option<CommentScope>,
+    comment_context: &'a Option<String>,
+    comment_anchor: &'a Option<CommentAnchor>,
+    declaration_locator: &'a Option<DeclarationRecordLocator>,
+    tags: &'a Option<Vec<String>>,
+}
+
 impl Record {
     pub fn new(
         target: ReviewTargetRef,
@@ -369,14 +692,156 @@ impl Record {
             comment_scope: None,
             comment_context: None,
             comment_anchor: None,
+            declaration_locator: None,
             tags: None,
             attestations: None,
         }
     }
 
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.version, 2 | 3 | 4 | 5) {
+            return Err(anyhow!("unsupported review record version {}", self.version));
+        }
+
+        let declaration_target = matches!(self.target, ReviewTargetRef::Declaration { .. });
+        let declaration_anchor = matches!(
+            self.comment_anchor,
+            Some(CommentAnchor::Declaration(_))
+        );
+        let has_declaration_shape =
+            declaration_target || self.declaration_locator.is_some() || declaration_anchor;
+        if self.version < 5 && has_declaration_shape {
+            return Err(anyhow!(
+                "declaration record fields require review record version 5"
+            ));
+        }
+
+        if !declaration_target {
+            if self.check.as_str() == ReviewCheck::declaration().as_str() {
+                return Err(anyhow!(
+                    "the declaration review check requires a declaration target"
+                ));
+            }
+            if self.declaration_locator.is_some() || declaration_anchor {
+                return Err(anyhow!(
+                    "declaration locator and anchor require a declaration target"
+                ));
+            }
+            return Ok(());
+        }
+
+        if self.version != 5 {
+            return Err(anyhow!("declaration targets require review record version 5"));
+        }
+        if self.check.as_str() != ReviewCheck::declaration().as_str() {
+            return Err(anyhow!(
+                "declaration targets require the declaration review check"
+            ));
+        }
+
+        let target_hash = match &self.target {
+            ReviewTargetRef::Declaration { hash } => hash,
+            _ => unreachable!("declaration target checked above"),
+        };
+        validate_protocol_hash("declaration target projection hash", target_hash.as_str())?;
+
+        let locator = self
+            .declaration_locator
+            .as_ref()
+            .ok_or_else(|| anyhow!("declaration targets require a signed declaration locator"))?;
+        locator.validate()?;
+        if &locator.projection_hash != target_hash {
+            return Err(anyhow!(
+                "declaration target and locator projection hashes do not match"
+            ));
+        }
+
+        match &self.comment_anchor {
+            Some(CommentAnchor::Declaration(anchor)) => {
+                anchor.validate_structure()?;
+                if anchor.projection_hash != locator.projection_hash {
+                    return Err(anyhow!(
+                        "declaration anchor and locator projection hashes do not match"
+                    ));
+                }
+                if anchor.reviewed_snapshot != locator.reviewed_snapshot {
+                    return Err(anyhow!(
+                        "declaration anchor and locator reviewed snapshots do not match"
+                    ));
+                }
+                if locator.source_span.end > anchor.source_len_bytes {
+                    return Err(anyhow!(
+                        "declaration locator source span exceeds the reviewed source"
+                    ));
+                }
+                if anchor.ranges.iter().any(|range| {
+                    range.start_byte < locator.source_span.start
+                        || range.end_byte > locator.source_span.end
+                }) {
+                    return Err(anyhow!(
+                        "declaration anchor ranges must be contained by the declaration source span"
+                    ));
+                }
+            }
+            Some(_) => {
+                return Err(anyhow!(
+                    "declaration targets cannot use ordinary source or diff anchors"
+                ));
+            }
+            None => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_against_source(&self, source: &str) -> Result<()> {
+        self.validate()?;
+        let Some(locator) = &self.declaration_locator else {
+            return Ok(());
+        };
+        locator.validate_against_source(source)?;
+        if let Some(CommentAnchor::Declaration(anchor)) = &self.comment_anchor {
+            anchor.validate_against_source(source)?;
+        }
+        Ok(())
+    }
+
     pub fn signing_payload(&self) -> Result<String> {
-        if self.version >= 4 {
-            return Ok(serde_jcs::to_string(&SignableRecordV4 {
+        self.validate()?;
+        match self.version {
+            2 => Ok(serde_jcs::to_string(&SignableRecordV2 {
+                id: &self.id,
+                version: self.version,
+                target: &self.target,
+                check: &self.check,
+                verdict: &self.verdict,
+                identity: &self.identity,
+                repo_ref: &self.repo_ref,
+                block_state: &self.block_state,
+                timestamp: self.timestamp,
+                path_hint: &self.path_hint,
+                line_hint: &self.line_hint,
+                note: &self.note,
+                tags: &self.tags,
+            })?),
+            3 => Ok(serde_jcs::to_string(&SignableRecordV3 {
+                id: &self.id,
+                version: self.version,
+                target: &self.target,
+                check: &self.check,
+                verdict: &self.verdict,
+                identity: &self.identity,
+                repo_ref: &self.repo_ref,
+                block_state: &self.block_state,
+                timestamp: self.timestamp,
+                path_hint: &self.path_hint,
+                line_hint: &self.line_hint,
+                note: &self.note,
+                comment_scope: &self.comment_scope,
+                comment_context: &self.comment_context,
+                tags: &self.tags,
+            })?),
+            4 => Ok(serde_jcs::to_string(&SignableRecordV4 {
                 id: &self.id,
                 version: self.version,
                 target: &self.target,
@@ -393,11 +858,8 @@ impl Record {
                 comment_context: &self.comment_context,
                 comment_anchor: &self.comment_anchor,
                 tags: &self.tags,
-            })?);
-        }
-
-        if self.version >= 3 {
-            return Ok(serde_jcs::to_string(&SignableRecordV3 {
+            })?),
+            5 => Ok(serde_jcs::to_string(&SignableRecordV5 {
                 id: &self.id,
                 version: self.version,
                 target: &self.target,
@@ -412,25 +874,12 @@ impl Record {
                 note: &self.note,
                 comment_scope: &self.comment_scope,
                 comment_context: &self.comment_context,
+                comment_anchor: &self.comment_anchor,
+                declaration_locator: &self.declaration_locator,
                 tags: &self.tags,
-            })?);
+            })?),
+            _ => unreachable!("record version validated above"),
         }
-
-        Ok(serde_jcs::to_string(&SignableRecordV2 {
-            id: &self.id,
-            version: self.version,
-            target: &self.target,
-            check: &self.check,
-            verdict: &self.verdict,
-            identity: &self.identity,
-            repo_ref: &self.repo_ref,
-            block_state: &self.block_state,
-            timestamp: self.timestamp,
-            path_hint: &self.path_hint,
-            line_hint: &self.line_hint,
-            note: &self.note,
-            tags: &self.tags,
-        })?)
     }
 }
 
@@ -578,6 +1027,7 @@ impl ApprovedTargets {
             ReviewTargetRef::Tree { hash } => {
                 self.tree_targets.iter().any(|target| target.hash() == hash)
             }
+            ReviewTargetRef::Declaration { .. } => false,
         }
     }
 
@@ -631,6 +1081,9 @@ impl ReviewIndex {
             if check_filter.is_some_and(|check| &record.check != check) {
                 continue;
             }
+            if matches!(record.target, ReviewTargetRef::Declaration { .. }) {
+                continue;
+            }
 
             #[cfg(test)]
             {
@@ -679,6 +1132,7 @@ impl ReviewIndex {
                         record.verdict.clone(),
                     );
                 }
+                ReviewTargetRef::Declaration { .. } => {}
             }
         }
 
@@ -912,12 +1366,42 @@ struct JsonlParseReport {
     records: Vec<Record>,
     skipped_legacy_diff_target_records: usize,
     skipped_malformed_records: usize,
+    malformed_declaration_errors: Vec<String>,
 }
 
-fn parse_record_line(line: &str) -> Option<Result<Record, anyhow::Error>> {
+enum ParsedRecordLine {
+    Record(Record),
+    LegacyDiffTarget,
+    Malformed {
+        error: String,
+        declaration_shape: bool,
+    },
+}
+
+fn value_has_declaration_shape(value: &serde_json::Value) -> bool {
+    value
+        .get("target")
+        .and_then(|target| target.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("declaration")
+        || value.get("declaration_locator").is_some()
+        || value.get("check").and_then(serde_json::Value::as_str) == Some("declaration")
+        || value
+            .get("comment_anchor")
+            .and_then(|anchor| anchor.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("declaration")
+}
+
+fn parse_record_line(line: &str) -> ParsedRecordLine {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
-        Err(err) => return Some(Err(err.into())),
+        Err(error) => {
+            return ParsedRecordLine::Malformed {
+                error: error.to_string(),
+                declaration_shape: false,
+            };
+        }
     };
 
     let is_legacy_diff_target = value
@@ -926,10 +1410,17 @@ fn parse_record_line(line: &str) -> Option<Result<Record, anyhow::Error>> {
         .and_then(serde_json::Value::as_str)
         == Some("diff");
     if is_legacy_diff_target {
-        return None;
+        return ParsedRecordLine::LegacyDiffTarget;
     }
 
-    Some(serde_json::from_value(value).map_err(Into::into))
+    let declaration_shape = value_has_declaration_shape(&value);
+    match serde_json::from_value(value) {
+        Ok(record) => ParsedRecordLine::Record(record),
+        Err(error) => ParsedRecordLine::Malformed {
+            error: error.to_string(),
+            declaration_shape,
+        },
+    }
 }
 
 fn parse_records_jsonl_report_impl(content: &str) -> JsonlParseReport {
@@ -937,12 +1428,19 @@ fn parse_records_jsonl_report_impl(content: &str) -> JsonlParseReport {
 
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         match parse_record_line(line) {
-            Some(Ok(record)) => report.records.push(record),
-            Some(Err(err)) => {
+            ParsedRecordLine::Record(record) => report.records.push(record),
+            ParsedRecordLine::Malformed {
+                error,
+                declaration_shape,
+            } => {
                 report.skipped_malformed_records += 1;
-                warn!("Skipping malformed record: {err}");
+                if declaration_shape {
+                    report.malformed_declaration_errors.push(error);
+                } else {
+                    warn!("Skipping malformed record: {error}");
+                }
             }
-            None => {
+            ParsedRecordLine::LegacyDiffTarget => {
                 report.skipped_legacy_diff_target_records += 1;
             }
         }
@@ -1013,7 +1511,7 @@ impl StoreLocation {
     fn ensure_trueflow_dir(&self) -> Result<()> {
         let trueflow_dir = self.trueflow_dir();
         if !trueflow_dir.exists() {
-            fs::create_dir(&trueflow_dir)?;
+            fs::create_dir_all(&trueflow_dir)?;
         }
         Ok(())
     }
@@ -1047,10 +1545,17 @@ impl JsonlStoreBackend {
                 report.skipped_legacy_diff_target_records
             );
         }
+        if !report.malformed_declaration_errors.is_empty() {
+            return Err(anyhow!(
+                "review history contains malformed declaration record(s): {}",
+                report.malformed_declaration_errors.join("; ")
+            ));
+        }
         Ok(report.records)
     }
 
     fn append(&self, record: &Record) -> Result<()> {
+        record.validate()?;
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
