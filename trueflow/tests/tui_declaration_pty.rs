@@ -1,16 +1,18 @@
 #![cfg(feature = "tui-test-support")]
 
-use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{env, fs};
 
 use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use trueflow::store::{CommentAnchor, Record, ReviewCheck, ReviewTargetRef, Verdict};
-use trueflow_test_support::TestRepo;
+use trueflow_test_support::{TestRepo, run_git_output};
 use vt100::Parser;
 
 const BODY_SENTINEL: &str = "EXECUTABLE BODY SENTINEL MUST NEVER RENDER";
@@ -96,6 +98,30 @@ struct PtySession {
 
 impl PtySession {
     fn spawn(repo: &TestRepo) -> Result<Self> {
+        Self::spawn_with(repo, |_| {})
+    }
+
+    fn spawn_pull_request(fixture: &PullRequestFixture) -> Result<Self> {
+        let inherited_path = env::var_os("PATH").context("PATH must be set for PTY tests")?;
+        let mut child_paths = vec![fixture.fake_bin.clone()];
+        child_paths.extend(env::split_paths(&inherited_path));
+        let child_path =
+            env::join_paths(child_paths).context("failed to construct fake-gh PATH")?;
+
+        Self::spawn_with(&fixture.repo, |command| {
+            command.arg("--target");
+            command.arg("pr:11");
+            command.env("PATH", child_path);
+            command.env("TRUEFLOW_FAKE_GH_BASE", &fixture.base_sha);
+            command.env("TRUEFLOW_FAKE_GH_FIRST", &fixture.first_sha);
+            command.env("TRUEFLOW_FAKE_GH_SECOND", &fixture.second_sha);
+        })
+    }
+
+    fn spawn_with<F>(repo: &TestRepo, configure: F) -> Result<Self>
+    where
+        F: FnOnce(&mut CommandBuilder),
+    {
         let isolated_home = repo.path.join(".test-home");
         fs::create_dir_all(&isolated_home)?;
 
@@ -111,6 +137,7 @@ impl PtySession {
         command.arg("tui");
         command.arg("--mode");
         command.arg("declarations");
+        configure(&mut command);
         command.cwd(&repo.path);
         command.env("TERM", "xterm-256color");
         command.env(TUI_KEYBOARD_ENHANCEMENT_PROBE_ENV, "skip");
@@ -270,6 +297,115 @@ fn declaration_repo(name: &str, base: &str, head: &str) -> Result<TestRepo> {
     Ok(repo)
 }
 
+struct PullRequestFixture {
+    repo: TestRepo,
+    fake_bin: PathBuf,
+    base_sha: String,
+    first_sha: String,
+    second_sha: String,
+}
+
+fn modified_key_repo(name: &str) -> Result<TestRepo> {
+    declaration_repo(
+        name,
+        "pub fn alpha(value: u8) -> u8 { value }\n\npub fn beta(value: u8) -> u8 { value }\n\npub fn gamma(value: u8) -> u8 { value }\n\npub fn delta(value: u8) -> u8 { value }\n\npub fn epsilon(value: u8) -> u8 { value }\n",
+        "pub fn alpha(value: u16) -> u16 { value }\n\npub fn beta(value: u16) -> u16 { value }\n\npub fn gamma(value: u16) -> u16 { value }\n\npub fn delta(value: u16) -> u16 { value }\n\npub fn epsilon(value: u16) -> u16 { value }\n",
+    )
+}
+
+fn chained_pull_request_repo(
+    name: &str,
+    first_path: &str,
+    first_source: &str,
+    second_path: &str,
+    second_source: &str,
+) -> Result<PullRequestFixture> {
+    let repo = TestRepo::new(name)?;
+    repo.git(&["config", "--local", "user.email", "reviewer@example.com"])?;
+    repo.git(&["config", "--local", "user.name", "Declaration Reviewer"])?;
+    repo.git(&["config", "--local", "commit.gpgSign", "false"])?;
+    repo.write("README.txt", "declaration review fixture\n")?;
+    repo.commit_all("pull request base")?;
+    let base_sha = run_git_output(&repo.path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned();
+
+    repo.write(first_path, first_source)?;
+    repo.commit_all("First declaration scope")?;
+    let first_sha = run_git_output(&repo.path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned();
+
+    repo.write(second_path, second_source)?;
+    repo.commit_all("Second declaration scope")?;
+    let second_sha = run_git_output(&repo.path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned();
+
+    repo.git(&["update-ref", "refs/heads/trueflow-base", &base_sha])?;
+    repo.git(&["update-ref", "refs/pull/11/head", &second_sha])?;
+    let remote = "https://github.com/trueflow-test-owner/trueflow-test-repository.git";
+    repo.git(&["remote", "add", "origin", remote])?;
+    let rewrite_key = format!("url.{}.insteadOf", repo.path.display());
+    repo.git(&["config", "--local", &rewrite_key, remote])?;
+
+    let fake_bin = repo.path.join("fake-bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_gh(&fake_bin.join("gh"))?;
+
+    Ok(PullRequestFixture {
+        repo,
+        fake_bin,
+        base_sha,
+        first_sha,
+        second_sha,
+    })
+}
+
+fn write_fake_gh(path: &Path) -> Result<()> {
+    let script = r#"#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "--hostname" ]; then
+  [ "${2:-}" = "github.com" ] || exit 2
+  shift 2
+fi
+[ "${1:-}" = "api" ] || exit 2
+endpoint="${2:-}"
+
+case "$endpoint" in
+  repos/trueflow-test-owner/trueflow-test-repository/pulls/11/commits?per_page=100)
+    printf '[{"sha":"%s","commit":{"message":"First declaration scope"}},{"sha":"%s","commit":{"message":"Second declaration scope"}}]\n' "$TRUEFLOW_FAKE_GH_FIRST" "$TRUEFLOW_FAKE_GH_SECOND"
+    ;;
+  repos/trueflow-test-owner/trueflow-test-repository/pulls/11)
+    printf '{"title":"Chained declaration review","commits":2,"base":{"ref":"trueflow-base","sha":"%s","repo":{"name":"trueflow-test-repository","owner":{"login":"trueflow-test-owner"}}},"head":{"ref":"topic","sha":"%s","repo":{"name":"trueflow-test-repository","owner":{"login":"trueflow-test-owner"}}}}\n' "$TRUEFLOW_FAKE_GH_BASE" "$TRUEFLOW_FAKE_GH_SECOND"
+    ;;
+  *)
+    printf 'unexpected fake gh endpoint: %s\n' "$endpoint" >&2
+    exit 2
+    ;;
+esac
+"#;
+    fs::write(path, script)
+        .with_context(|| format!("failed to write fake gh at {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to make fake gh executable at {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn review_records_or_empty(path: &Path) -> Result<Vec<Record>> {
+    if path.exists() {
+        review_records(path)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn review_records(path: &Path) -> Result<Vec<Record>> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read review records from {}", path.display()))?;
@@ -415,6 +551,175 @@ fn body_only_change_reports_no_declaration_surface_changes_and_quits() -> Result
     assert!(
         !screen.contains("pub fn total"),
         "an unchanged declaration surface was presented as reviewable:\n{screen}"
+    );
+
+    session.send(b"q")?;
+    session.wait_for_success()?;
+    assert_terminal_restored(&session);
+    Ok(())
+}
+
+#[test]
+fn modified_approve_keys_do_not_approve_persist_or_advance() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo = modified_key_repo("tui_declaration_pty_modified_approve")?;
+    let records_path = repo.path.join(".trueflow/reviews.jsonl");
+    let mut session = PtySession::spawn(&repo)?;
+    session.wait_for_screen("to render alpha before modified approval keys", |screen| {
+        screen.contains("pub fn alpha(value: u16) -> u16")
+    })?;
+
+    // Legacy Control/Alt encodings and the CSI-u Super encoding must retain their modifiers.
+    session.send(b"\x01\x1ba\x1b[97;9uc")?;
+    let screen = session.wait_for_screen(
+        "to process modified approvals before opening comment",
+        |screen| screen.contains("[Enter] submit"),
+    )?;
+    assert!(
+        screen.contains("pub fn alpha(value: u16) -> u16"),
+        "a modified approval key advanced away from alpha:\n{screen}"
+    );
+    assert!(
+        !screen.contains("pub fn beta(value: u16) -> u16"),
+        "a modified approval key exposed the next declaration:\n{screen}"
+    );
+
+    session.send(b"\x1b")?;
+    session.wait_for_screen("to close the approval test comment editor", |screen| {
+        !screen.contains("[Enter] submit") && screen.contains("pub fn alpha(value: u16) -> u16")
+    })?;
+    session.send(b"q")?;
+    session.wait_for_success()?;
+    let records = review_records_or_empty(&records_path)?;
+    ensure!(
+        records.is_empty(),
+        "modified approval keys must not persist review records, got {records:#?}"
+    );
+    assert_terminal_restored(&session);
+    Ok(())
+}
+
+#[test]
+fn modified_space_keys_do_not_skip_or_advance() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo = modified_key_repo("tui_declaration_pty_modified_space")?;
+    let mut session = PtySession::spawn(&repo)?;
+    session.wait_for_screen("to render alpha before modified spaces", |screen| {
+        screen.contains("pub fn alpha(value: u16) -> u16")
+    })?;
+
+    // NUL is Ctrl+Space, ESC+Space is Alt+Space, and CSI-u modifier 9 is Super+Space.
+    session.send(b"\x00\x1b \x1b[32;9uc")?;
+    let screen = session.wait_for_screen(
+        "to process modified spaces before opening comment",
+        |screen| screen.contains("[Enter] submit"),
+    )?;
+    assert!(
+        screen.contains("pub fn alpha(value: u16) -> u16"),
+        "a modified Space skipped alpha:\n{screen}"
+    );
+    assert!(
+        !screen.contains("pub fn beta(value: u16) -> u16"),
+        "a modified Space exposed the next declaration:\n{screen}"
+    );
+
+    session.send(b"\x1b")?;
+    session.wait_for_screen(
+        "to close the modified-space test comment editor",
+        |screen| {
+            !screen.contains("[Enter] submit") && screen.contains("pub fn alpha(value: u16) -> u16")
+        },
+    )?;
+    session.send(b"q")?;
+    session.wait_for_success()?;
+    assert_terminal_restored(&session);
+    Ok(())
+}
+
+#[test]
+fn non_final_unsupported_scope_renders_until_acknowledged() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let fixture = chained_pull_request_repo(
+        "tui_declaration_pty_unsupported_scope",
+        "src/Only.java",
+        "public final class Only { public int id(); }\n",
+        "src/lib.rs",
+        "pub fn supported_scope(value: u8) -> u8 { value }\n",
+    )?;
+    let mut session = PtySession::spawn_pull_request(&fixture)?;
+
+    let screen = session.wait_for_screen("to render the first chained scope", |screen| {
+        screen.contains("Unsupported language") || screen.contains("pub fn supported_scope")
+    })?;
+    assert!(
+        screen.contains("Unsupported language") && screen.contains("Java"),
+        "the unsupported non-final scope auto-advanced before rendering:\n{screen}"
+    );
+    assert!(
+        !screen.contains("pub fn supported_scope"),
+        "the later scope rendered before the unsupported status was acknowledged:\n{screen}"
+    );
+
+    session.send(b" ")?;
+    session.wait_for_screen(
+        "to advance after acknowledging the unsupported scope",
+        |screen| screen.contains("pub fn supported_scope(value: u8) -> u8"),
+    )?;
+    session.send(b"q")?;
+    session.wait_for_success()?;
+    assert_terminal_restored(&session);
+    Ok(())
+}
+
+#[test]
+fn chained_declaration_scopes_render_distinct_scope_labels() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let fixture = chained_pull_request_repo(
+        "tui_declaration_pty_scope_labels",
+        "src/first.rs",
+        "pub fn first_scope(value: u8) -> u8 { value }\n",
+        "src/second.rs",
+        "pub fn second_scope(value: u16) -> u16 { value }\n",
+    )?;
+    let mut session = PtySession::spawn_pull_request(&fixture)?;
+
+    let first = session
+        .wait_for_screen("to render the first labeled declaration scope", |screen| {
+            screen.contains("pub fn first_scope(value: u8) -> u8")
+        })?;
+    assert!(
+        first.contains("[1/2]") && first.contains("First declaration scope"),
+        "the first commit screen lost its scope label:\n{first}"
+    );
+    assert!(
+        !first.contains("Second declaration scope"),
+        "the first commit screen displayed the later scope label:\n{first}"
+    );
+
+    session.send(b" ")?;
+    let second = session
+        .wait_for_screen("to render the second labeled declaration scope", |screen| {
+            screen.contains("pub fn second_scope(value: u16) -> u16")
+        })?;
+    assert!(
+        second.contains("[2/2]") && second.contains("Second declaration scope"),
+        "the second commit screen lost its distinct scope label:\n{second}"
+    );
+    assert!(
+        !second.contains("First declaration scope"),
+        "the second commit screen retained the previous scope label:\n{second}"
     );
 
     session.send(b"q")?;

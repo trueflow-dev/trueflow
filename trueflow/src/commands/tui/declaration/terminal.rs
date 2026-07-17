@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block as UiBlock, Borders, Paragraph, Wrap};
 
 use crate::commands::mark;
@@ -43,6 +44,7 @@ pub(in crate::commands::tui) fn run(
     let first_request = requests
         .pop_front()
         .context("declaration review produced no launch request")?;
+    let mut scope_label = first_request.scope_label;
     let first_launch = prepare_request(&repo_root, config, first_request.request)?;
 
     let mut session = TerminalSession::enter()?;
@@ -62,12 +64,13 @@ pub(in crate::commands::tui) fn run(
                 prepared,
                 identity,
                 area.width,
-                area.height,
+                area.height.saturating_sub(1),
             )?;
             let exit = run_runtime(
                 &mut session,
                 &mut runtime,
                 &mut relationships,
+                &scope_label,
                 !requests.is_empty(),
             )?;
             relationships.shutdown();
@@ -77,6 +80,7 @@ pub(in crate::commands::tui) fn run(
                     let request = requests
                         .pop_front()
                         .context("declaration scope queue ended unexpectedly")?;
+                    scope_label = request.scope_label;
                     prepared = prepare_request(&repo_root, config, request.request)?;
                 }
             }
@@ -127,20 +131,19 @@ fn run_runtime(
     session: &mut TerminalSession,
     runtime: &mut DeclarationAppRuntime<super::runtime::ExternalDeclarationPersistence>,
     relationships: &mut ProductionRelationshipCoordinator,
+    scope_label: &str,
     has_later_scope: bool,
 ) -> Result<RuntimeExit> {
-    if runtime.is_finished() && has_later_scope {
-        return Ok(RuntimeExit::AdvanceScope);
-    }
-
     loop {
         while let Some(update) = relationships.poll() {
             let _ = relationships.apply(runtime, update)?;
         }
         session.terminal_mut().draw(|frame| {
-            let area = frame.area();
+            let [scope_area, review_area] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(frame.area());
+            frame.render_widget(Paragraph::new(scope_label), scope_area);
             if let Some(controller) = runtime.controller() {
-                render_declaration_review(frame, area, controller);
+                render_declaration_review(frame, review_area, controller);
             } else {
                 let text = runtime.visible_text();
                 frame.render_widget(
@@ -151,7 +154,7 @@ fn run_runtime(
                                 .title("Declaration Review"),
                         )
                         .wrap(Wrap { trim: false }),
-                    area,
+                    review_area,
                 );
             }
         })?;
@@ -162,7 +165,7 @@ fn run_runtime(
         let event = event::read()?;
         match event {
             Event::Resize(width, height) => {
-                runtime.resize(width, height);
+                runtime.resize(width, height.saturating_sub(1));
             }
             Event::Paste(text) => {
                 if let Some(controller) = runtime.controller_mut()
@@ -175,12 +178,13 @@ fn run_runtime(
                 let editing = runtime
                     .controller()
                     .is_some_and(|controller| controller.is_editing());
-                if !editing
-                    && key.code == KeyCode::Char('q')
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
                 {
+                    continue;
+                }
+                if !editing && key.code == KeyCode::Char('q') {
                     return Ok(RuntimeExit::Quit);
                 }
                 let request_relationships = !editing
@@ -195,6 +199,13 @@ fn run_runtime(
                                     }
                                 )
                             })));
+                if !editing
+                    && runtime.is_finished()
+                    && has_later_scope
+                    && key.code == KeyCode::Char(' ')
+                {
+                    return Ok(RuntimeExit::AdvanceScope);
+                }
                 if !editing && !runtime.is_finished() && key.code == KeyCode::Char(' ') {
                     runtime.skip_current()?;
                 } else if let Some(controller) = runtime.controller_mut() {
