@@ -451,7 +451,7 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                     "properties": {
                         "version": { "const": 5 },
                         "check": { "const": "declaration" },
-                        "declaration_locator": declaration_locator.clone()
+                        "declaration_locator": declaration_locator
                     },
                     "required": ["declaration_locator"]
                 }
@@ -459,7 +459,7 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
             {
                 "if": {
                     "properties": {
-                        "declaration_locator": declaration_locator.clone()
+                        "declaration_locator": declaration_locator
                     },
                     "required": ["declaration_locator"]
                 },
@@ -486,7 +486,7 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                             "properties": { "kind": { "const": "declaration" } },
                             "required": ["kind"]
                         },
-                        "declaration_locator": declaration_locator.clone()
+                        "declaration_locator": declaration_locator
                     },
                     "required": ["declaration_locator"]
                 }
