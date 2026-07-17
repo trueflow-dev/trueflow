@@ -95,10 +95,10 @@ pub(crate) enum FileDiffUnavailableReason {
     External,
 }
 
-/// A confirmed tree change's old-tree lookup and new-tree display locations.
+/// A confirmed change's source-tree lookup and destination/current path.
 ///
-/// `location` is always the destination/current path. `source_location` differs
-/// only for rewrites emitted by gix.
+/// `source_location` differs from `location` only for an explicit rename. A
+/// retained-source copy is represented as a destination-only identity change.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChangedPath {
     pub source_location: RepoPath,
@@ -113,10 +113,20 @@ impl ChangedPath {
         }
     }
 
-    fn from_change(change: &gix::diff::tree_with_rewrites::ChangeRef<'_>) -> Result<Self> {
+    pub(crate) fn from_change(
+        change: &gix::diff::tree_with_rewrites::ChangeRef<'_>,
+    ) -> Result<Self> {
+        let location = RepoPath::new(change.location().to_str_lossy().as_ref())?;
+        if matches!(
+            change,
+            gix::diff::tree_with_rewrites::ChangeRef::Rewrite { copy: true, .. }
+        ) {
+            return Ok(Self::identity(location));
+        }
+
         Ok(Self {
             source_location: RepoPath::new(change.source_location().to_str_lossy().as_ref())?,
-            location: RepoPath::new(change.location().to_str_lossy().as_ref())?,
+            location,
         })
     }
 
@@ -124,6 +134,13 @@ impl ChangedPath {
         change: &gix::diff::tree_with_rewrites::ChangeRef<'_>,
         location: RepoPath,
     ) -> Result<Self> {
+        if matches!(
+            change,
+            gix::diff::tree_with_rewrites::ChangeRef::Rewrite { copy: true, .. }
+        ) {
+            return Ok(Self::identity(location));
+        }
+
         Ok(Self {
             source_location: RepoPath::new(change.source_location().to_str_lossy().as_ref())?,
             location,
@@ -399,7 +416,17 @@ pub fn dirty_files_from_workdir() -> Result<HashSet<RepoPath>> {
 }
 
 pub fn dirty_files(repo: &gix::Repository) -> Result<HashSet<RepoPath>> {
-    let mut dirty = HashSet::new();
+    let changed = dirty_changed_paths(repo)?;
+    let mut dirty = HashSet::with_capacity(changed.len());
+    for path in changed {
+        dirty.insert(path.location);
+        dirty.insert(path.source_location);
+    }
+    Ok(dirty)
+}
+
+pub fn dirty_changed_paths(repo: &gix::Repository) -> Result<HashSet<ChangedPath>> {
+    let mut changed = HashSet::new();
     let iter = repo
         .status(gix::progress::Discard)?
         .untracked_files(UntrackedFiles::Files)
@@ -408,36 +435,41 @@ pub fn dirty_files(repo: &gix::Repository) -> Result<HashSet<RepoPath>> {
         match entry? {
             gix::status::Item::IndexWorktree(item) => {
                 if item.summary().is_some() {
-                    insert_repo_path(&mut dirty, item.rela_path())?;
+                    changed.insert(ChangedPath::identity(repo_path(item.rela_path())?));
                 }
             }
             gix::status::Item::TreeIndex(change) => {
-                insert_tree_index_change_paths(&mut dirty, change)?;
+                changed.insert(changed_path_from_index_change(change)?);
             }
         }
     }
-    Ok(dirty)
+    Ok(changed)
 }
 
-fn insert_tree_index_change_paths(
-    dirty: &mut HashSet<RepoPath>,
-    change: gix::diff::index::Change,
-) -> Result<()> {
-    insert_repo_path(dirty, change.location())?;
-    if let gix::diff::index::ChangeRef::Rewrite {
-        source_location,
-        copy: false,
-        ..
-    } = change
-    {
-        insert_repo_path(dirty, source_location.as_ref())?;
+fn changed_path_from_index_change(
+    change: gix::diff::index::ChangeRef<'_, '_>,
+) -> Result<ChangedPath> {
+    let destination = repo_path(change.location())?;
+    match change {
+        gix::diff::index::ChangeRef::Rewrite {
+            source_location,
+            copy: false,
+            ..
+        } => Ok(ChangedPath {
+            source_location: repo_path(source_location.as_ref())?,
+            location: destination,
+        }),
+        gix::diff::index::ChangeRef::Addition { .. }
+        | gix::diff::index::ChangeRef::Deletion { .. }
+        | gix::diff::index::ChangeRef::Modification { .. }
+        | gix::diff::index::ChangeRef::Rewrite { copy: true, .. } => {
+            Ok(ChangedPath::identity(destination))
+        }
     }
-    Ok(())
 }
 
-fn insert_repo_path(dirty: &mut HashSet<RepoPath>, path: &gix::bstr::BStr) -> Result<()> {
-    dirty.insert(RepoPath::new(path.to_str_lossy().as_ref())?);
-    Ok(())
+fn repo_path(path: &gix::bstr::BStr) -> Result<RepoPath> {
+    RepoPath::new(path.to_str_lossy().as_ref())
 }
 
 pub fn block_state_for_path(

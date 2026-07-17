@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
-use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
 use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
@@ -104,8 +103,14 @@ where
     match &query.diff_selection {
         ReviewDiffSelection::Targets(targets) => {
             let mut batches = Vec::with_capacity(targets.len());
-            for target in targets {
-                batches.push(capture_immutable_target(&repo, query, target, &mut budget)?);
+            for (target_index, target) in targets.iter().enumerate() {
+                batches.push(capture_immutable_target(
+                    &repo,
+                    query,
+                    target,
+                    target_index,
+                    &mut budget,
+                )?);
             }
             hook()?;
             Ok(batches)
@@ -123,6 +128,7 @@ fn capture_immutable_target(
     repo: &gix::Repository,
     query: &ResolvedReviewQuery,
     target: &ReviewDiffTarget,
+    target_index: usize,
     budget: &mut CaptureBudget,
 ) -> Result<CaptureBatch> {
     let (base_commit, head_commit) = immutable_endpoints(repo, target)?;
@@ -132,7 +138,7 @@ fn capture_immutable_target(
     let base_id = base_commit.as_ref().map(commit_id).transpose()?;
     let head_id = commit_id(&head_commit)?;
     let target_key = format!(
-        "{}..{}",
+        "target:{target_index}:{}..{}",
         base_id.as_ref().map_or("empty", CommitId::as_str),
         head_id.as_str()
     );
@@ -250,10 +256,7 @@ fn changed_paths(
         if change.location().is_empty() || !is_blob_change(&change) {
             continue;
         }
-        paths.push(ChangedPath {
-            source_location: RepoPath::new(change.source_location().to_str_lossy().as_ref())?,
-            location: RepoPath::new(change.location().to_str_lossy().as_ref())?,
-        });
+        paths.push(ChangedPath::from_change(&change)?);
     }
     paths.sort_by(|left, right| {
         left.location

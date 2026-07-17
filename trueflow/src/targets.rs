@@ -297,14 +297,14 @@ impl ResolvedTargets {
 
 pub fn resolve_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargets> {
     let repo_cache = RefCell::new(None);
-    resolve_targets_with(
+    resolve_targets_with_changed(
         targets,
         |revision| {
             with_workdir_repo(&repo_cache, |repo| {
                 vcs::resolve_commit_id_in_repo(repo, revision.as_str())
             })
         },
-        || with_workdir_repo(&repo_cache, vcs::dirty_files),
+        || with_workdir_repo(&repo_cache, vcs::dirty_changed_paths),
         || with_workdir_repo(&repo_cache, vcs::files_changed_main_to_head_in_repo),
         |revision| {
             with_workdir_repo(&repo_cache, |repo| {
@@ -349,6 +349,38 @@ where
     RevisionFn: Fn(&str) -> Result<HashSet<ChangedPath>>,
     RangeFn: Fn(&str, &str) -> Result<HashSet<ChangedPath>>,
 {
+    resolve_targets_with_changed(
+        targets,
+        resolve_revision,
+        || {
+            dirty_files().map(|paths| {
+                paths
+                    .into_iter()
+                    .map(ChangedPath::identity)
+                    .collect::<HashSet<_>>()
+            })
+        },
+        main_diff_files,
+        revision_files,
+        range_files,
+    )
+}
+
+fn resolve_targets_with_changed<ResolveFn, DirtyFn, MainFn, RevisionFn, RangeFn>(
+    targets: &[ReviewTarget],
+    resolve_revision: ResolveFn,
+    dirty_files: DirtyFn,
+    main_diff_files: MainFn,
+    revision_files: RevisionFn,
+    range_files: RangeFn,
+) -> Result<ResolvedTargets>
+where
+    ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
+    DirtyFn: Fn() -> Result<HashSet<ChangedPath>>,
+    MainFn: Fn() -> Result<HashSet<ChangedPath>>,
+    RevisionFn: Fn(&str) -> Result<HashSet<ChangedPath>>,
+    RangeFn: Fn(&str, &str) -> Result<HashSet<ChangedPath>>,
+{
     reject_mixed_content_source_targets(targets)?;
     let resolved_targets = resolve_target_exprs(targets, &resolve_revision)?;
     let content_source = resolve_content_source(&resolved_targets)?;
@@ -362,7 +394,7 @@ where
         match target {
             ResolvedReviewTarget::DirtyWorktree => {
                 changed_target_requested = true;
-                changed.extend(dirty_files()?.into_iter().map(ChangedPath::identity));
+                changed.extend(dirty_files()?);
             }
             ResolvedReviewTarget::MainDiff => {
                 changed_target_requested = true;
