@@ -99,28 +99,16 @@ impl Projector<'_> {
                 continue;
             }
             if child.kind() == "namespace_definition" {
-                pending.clear();
+                let attachments = std::mem::take(&mut pending);
                 if let Some(body) = child.child_by_field_name("body") {
-                    let namespace = child
-                        .child_by_field_name("name")
-                        .and_then(|node| node_text(node, self.source))
-                        .filter(|name| !name.is_empty());
-                    let qualified = qualify(parent_name, namespace);
-                    if namespace.is_some() {
-                        self.collect_scope(
-                            body,
-                            parent_id,
-                            qualified.as_deref(),
-                            default_visibility,
-                        )?;
-                    } else {
-                        self.collect_scope(
-                            body,
-                            parent_id,
-                            qualified.as_deref(),
-                            &Visibility::Private,
-                        )?;
-                    }
+                    self.add_namespace(
+                        child,
+                        body,
+                        attachments,
+                        parent_id.cloned(),
+                        parent_name,
+                        default_visibility.clone(),
+                    )?;
                 }
                 continue;
             }
@@ -143,26 +131,323 @@ impl Projector<'_> {
                 continue;
             }
             if let Some(declarators) = callable_declarators(child) {
-                let attachments = std::mem::take(&mut pending);
-                for (index, declarator) in declarators.into_iter().enumerate() {
-                    self.add_callable(
-                        child,
-                        declarator,
-                        if index == 0 {
-                            attachments.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        parent_id.cloned(),
-                        parent_name,
-                        default_visibility.clone(),
-                        false,
-                    )?;
+                if declarators.len() != 1 {
+                    self.diagnostics.push(ProjectionDiagnostic::new(
+                        "multi-declarator callable declaration cannot be projected without duplicate ownership",
+                    ));
+                    pending.clear();
+                    continue;
                 }
+                self.add_callable(
+                    child,
+                    declarators[0],
+                    std::mem::take(&mut pending),
+                    parent_id.cloned(),
+                    parent_name,
+                    default_visibility.clone(),
+                    false,
+                )?;
+                continue;
+            }
+            if matches!(child.kind(), "type_definition" | "alias_declaration") {
+                self.add_type_alias(
+                    child,
+                    std::mem::take(&mut pending),
+                    parent_id.cloned(),
+                    parent_name,
+                    default_visibility.clone(),
+                )?;
+                continue;
+            }
+            if child.kind() == "declaration"
+                && let Some(kind) = file_scope_value_kind(child, self.source)
+            {
+                self.add_file_scope_value(
+                    child,
+                    kind,
+                    std::mem::take(&mut pending),
+                    parent_id.cloned(),
+                    parent_name,
+                    default_visibility.clone(),
+                )?;
                 continue;
             }
             pending.clear();
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_namespace(
+        &mut self,
+        item: Node<'_>,
+        body: Node<'_>,
+        mut attachments: Vec<Part>,
+        parent_id: Option<DeclarationId>,
+        parent_name: Option<&str>,
+        visibility: Visibility,
+    ) -> Result<()> {
+        let Some(name_node) = item.child_by_field_name("name") else {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "anonymous C++ namespace at byte {} has no representable declaration name; its children remain privately projected",
+                item.start_byte()
+            )));
+            return self.collect_scope(body, parent_id.as_ref(), parent_name, &Visibility::Private);
+        };
+        let Some(namespace_name) = node_text(name_node, self.source) else {
+            return Ok(());
+        };
+        let (qualifier, name) = namespace_name
+            .rsplit_once("::")
+            .map_or((None, namespace_name), |(qualifier, name)| {
+                (Some(qualifier), name)
+            });
+        let effective_parent = qualifier
+            .and_then(|qualifier| qualify(parent_name, Some(qualifier)))
+            .or_else(|| parent_name.map(str::to_owned));
+        let qualified_name = qualify(parent_name, Some(namespace_name));
+        let Some(signature_range) = namespace_signature_range(item, body, self.source) else {
+            return Ok(());
+        };
+        attachments.push(Part {
+            range: signature_range,
+            role: SourceComponentRole::Signature,
+        });
+        if self.parts_have_errors(item, &attachments) {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted C++ namespace {namespace_name} because its signature contains a syntax error"
+            )));
+            return Ok(());
+        }
+        let components = self.components(item, &attachments)?;
+        if components.is_empty() {
+            return Ok(());
+        }
+        let kind = DeclarationKind::Module;
+        let projection_text = component_text(&components);
+        let hash = projection_hash(self.language, kind, &components);
+        let source_ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        let source_start = attachments
+            .iter()
+            .map(|part| part.range.start)
+            .min()
+            .unwrap_or(item.start_byte());
+        let source_span = source_start..item.end_byte();
+        let id = declaration_id(
+            self.path,
+            kind,
+            name,
+            source_ordinal,
+            source_span.start,
+            &hash,
+        );
+        let key = declaration_key(
+            self.language,
+            kind,
+            name,
+            effective_parent.as_deref(),
+            &key_discriminator(&components),
+        );
+        let module_index = self.declarations.len();
+        self.declarations.push(DeclarationNode {
+            id: id.clone(),
+            key,
+            name: name.to_owned(),
+            kind,
+            visibility: visibility.clone(),
+            parent_part: parent_id,
+            source_ordinal,
+            source_span,
+            components,
+            projection_text,
+            projection_hash: hash,
+            review_owner: id.clone(),
+            children: Vec::new(),
+            type_use_sites: Vec::new(),
+        });
+
+        let children_start = self.declarations.len();
+        self.collect_scope(body, Some(&id), qualified_name.as_deref(), &visibility)?;
+        self.declarations[module_index].children = self.declarations[children_start..]
+            .iter()
+            .filter(|declaration| declaration.parent_part.as_ref() == Some(&id))
+            .map(|declaration| declaration.id.clone())
+            .collect();
+        Ok(())
+    }
+
+    fn add_type_alias(
+        &mut self,
+        item: Node<'_>,
+        attachments: Vec<Part>,
+        parent_id: Option<DeclarationId>,
+        parent_name: Option<&str>,
+        visibility: Visibility,
+    ) -> Result<()> {
+        let name_node = if item.kind() == "alias_declaration" {
+            item.child_by_field_name("name")
+        } else {
+            let declarators = direct_declarators(item);
+            if declarators.len() != 1 {
+                self.diagnostics.push(ProjectionDiagnostic::new(
+                    "multi-declarator typedef cannot be projected without duplicate ownership",
+                ));
+                return Ok(());
+            }
+            terminal_declarator_name(declarators[0])
+        };
+        let Some(name_node) = name_node else {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted C/C++ type alias at byte {} because its declarator has no reliable name",
+                item.start_byte()
+            )));
+            return Ok(());
+        };
+        let range = name_node.byte_range();
+        let Some(name) = self.source.get(range.clone()).map(str::to_owned) else {
+            return Ok(());
+        };
+        self.add_inventory_declaration(
+            item,
+            NameInfo {
+                name,
+                range,
+                qualifier: None,
+            },
+            DeclarationKind::TypeAlias,
+            SourceComponentRole::TypeAlias,
+            attachments,
+            parent_id,
+            parent_name,
+            visibility,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_file_scope_value(
+        &mut self,
+        item: Node<'_>,
+        kind: DeclarationKind,
+        attachments: Vec<Part>,
+        parent_id: Option<DeclarationId>,
+        parent_name: Option<&str>,
+        visibility: Visibility,
+    ) -> Result<()> {
+        let declarators = direct_declarators(item);
+        if declarators.len() != 1 {
+            self.diagnostics.push(ProjectionDiagnostic::new(
+                "multi-declarator C/C++ value declaration cannot be projected without duplicate ownership",
+            ));
+            return Ok(());
+        }
+        let Some(name_node) = terminal_declarator_name(declarators[0]) else {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted C/C++ file-scope value at byte {} because its declarator has no reliable name",
+                item.start_byte()
+            )));
+            return Ok(());
+        };
+        let range = name_node.byte_range();
+        let Some(name) = self.source.get(range.clone()).map(str::to_owned) else {
+            return Ok(());
+        };
+        let visibility = if kind == DeclarationKind::Static {
+            Visibility::Private
+        } else {
+            visibility
+        };
+        self.add_inventory_declaration(
+            item,
+            NameInfo {
+                name,
+                range,
+                qualifier: None,
+            },
+            kind,
+            SourceComponentRole::Value,
+            attachments,
+            parent_id,
+            parent_name,
+            visibility,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_inventory_declaration(
+        &mut self,
+        item: Node<'_>,
+        name_info: NameInfo,
+        kind: DeclarationKind,
+        role: SourceComponentRole,
+        mut attachments: Vec<Part>,
+        parent_id: Option<DeclarationId>,
+        parent_name: Option<&str>,
+        visibility: Visibility,
+    ) -> Result<()> {
+        attachments.push(Part {
+            range: item.byte_range(),
+            role,
+        });
+        if self.parts_have_errors(item, &attachments) {
+            self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                "omitted C/C++ {kind:?} {} because its projected surface contains a syntax error",
+                name_info.name
+            )));
+            return Ok(());
+        }
+        let components = self.components(item, &attachments)?;
+        if components.is_empty() {
+            return Ok(());
+        }
+        let projection_text = component_text(&components);
+        let hash = projection_hash(self.language, kind, &components);
+        let source_ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        let source_start = attachments
+            .iter()
+            .map(|part| part.range.start)
+            .min()
+            .unwrap_or(item.start_byte());
+        let source_span = source_start..item.end_byte();
+        let id = declaration_id(
+            self.path,
+            kind,
+            &name_info.name,
+            source_ordinal,
+            source_span.start,
+            &hash,
+        );
+        let discriminator = if matches!(kind, DeclarationKind::Constant | DeclarationKind::Static) {
+            value_key_discriminator(item, self.source)
+        } else {
+            key_discriminator(&components)
+        };
+        let key = declaration_key(
+            self.language,
+            kind,
+            &name_info.name,
+            parent_name,
+            &discriminator,
+        );
+        let type_use_sites =
+            collect_type_use_sites(item, self.source, &components, &name_info.range, kind)?;
+        self.declarations.push(DeclarationNode {
+            id: id.clone(),
+            key,
+            name: name_info.name,
+            kind,
+            visibility,
+            parent_part: parent_id,
+            source_ordinal,
+            source_span,
+            components,
+            projection_text,
+            projection_hash: hash,
+            review_owner: id,
+            children: Vec::new(),
+            type_use_sites,
+        });
         Ok(())
     }
 
@@ -232,7 +517,7 @@ impl Projector<'_> {
             kind,
             &name_info.name,
             parent_name,
-            &projection_text,
+            &key_discriminator(&components),
         );
         let type_use_sites =
             collect_type_use_sites(item, self.source, &components, &name_info.range, kind)?;
@@ -264,6 +549,7 @@ impl Projector<'_> {
             self.collect_member_scope(body, &id, &name_info.name, member_visibility)?;
             self.declarations[aggregate_index].children = self.declarations[children_start..]
                 .iter()
+                .filter(|declaration| declaration.parent_part.as_ref() == Some(&id))
                 .map(|declaration| declaration.id.clone())
                 .collect();
         }
@@ -306,27 +592,27 @@ impl Projector<'_> {
                 continue;
             }
             if let Some(declarators) = callable_declarators(child) {
-                let attachments = std::mem::take(&mut pending);
-                let friend = child.kind() == "friend_declaration";
-                for (index, declarator) in declarators.into_iter().enumerate() {
-                    self.add_callable(
-                        child,
-                        declarator,
-                        if index == 0 {
-                            attachments.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        (!friend).then(|| parent_id.clone()),
-                        (!friend).then_some(parent_name),
-                        if friend {
-                            Visibility::Public
-                        } else {
-                            visibility.clone()
-                        },
-                        !friend,
-                    )?;
+                if declarators.len() != 1 {
+                    self.diagnostics.push(ProjectionDiagnostic::new(
+                        "multi-declarator callable declaration cannot be projected without duplicate ownership",
+                    ));
+                    pending.clear();
+                    continue;
                 }
+                let friend = child.kind() == "friend_declaration";
+                self.add_callable(
+                    child,
+                    declarators[0],
+                    std::mem::take(&mut pending),
+                    (!friend).then(|| parent_id.clone()),
+                    (!friend).then_some(parent_name),
+                    if friend {
+                        Visibility::Public
+                    } else {
+                        visibility.clone()
+                    },
+                    !friend,
+                )?;
                 continue;
             }
             pending.clear();
@@ -408,7 +694,7 @@ impl Projector<'_> {
             kind,
             &name_info.name,
             effective_parent,
-            &projection_text,
+            &key_discriminator(&components),
         );
         let type_use_sites =
             collect_type_use_sites(item, self.source, &components, &name_info.range, kind)?;
@@ -507,12 +793,7 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
                 role: SourceComponentRole::AggregateShape,
             }),
             "field_declaration" => {
-                if contains_callable_declarator(member) {
-                    parts.push(Part {
-                        range: prefix_start..member.end_byte(),
-                        role: SourceComponentRole::AggregateShape,
-                    });
-                } else {
+                if !contains_callable_declarator(member) {
                     if prefix_start < member.start_byte() {
                         parts.push(Part {
                             range: prefix_start..member.start_byte(),
@@ -524,10 +805,7 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
             }
             "declaration" => {
                 if contains_callable_declarator(member) {
-                    parts.push(Part {
-                        range: prefix_start..member.end_byte(),
-                        role: SourceComponentRole::AggregateShape,
-                    });
+                    // A callable child exclusively owns its prototype.
                 } else if aggregate_specifier(member).is_none() {
                     if prefix_start < member.start_byte() {
                         parts.push(Part {
@@ -538,23 +816,9 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
                     parts.extend(field_shape_parts(member));
                 }
             }
-            "function_definition" => {
-                if member.child_by_field_name("body").is_none() {
-                    parts.push(Part {
-                        range: prefix_start..member.end_byte(),
-                        role: SourceComponentRole::AggregateShape,
-                    });
-                }
-            }
-            "template_declaration" => {
-                if let Some(function) = function_node(member)
-                    && function.child_by_field_name("body").is_none()
-                {
-                    parts.push(Part {
-                        range: prefix_start..member.end_byte(),
-                        role: SourceComponentRole::AggregateShape,
-                    });
-                }
+            "function_definition" | "template_declaration" => {
+                // Callable children exclusively own their signatures; bodies never enter
+                // aggregate shape projections.
             }
             _ => {}
         }
@@ -662,6 +926,48 @@ fn callable_signature_range(item: Node<'_>, source: &str) -> Option<Range<usize>
         end -= 1;
     }
     (end > item.start_byte()).then_some(item.start_byte()..end)
+}
+
+fn namespace_signature_range(item: Node<'_>, body: Node<'_>, source: &str) -> Option<Range<usize>> {
+    let mut end = body.start_byte();
+    while end > item.start_byte()
+        && source
+            .as_bytes()
+            .get(end - 1)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        end -= 1;
+    }
+    (end > item.start_byte()).then_some(item.start_byte()..end)
+}
+
+fn direct_declarators(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.children_by_field_name("declarator", &mut cursor)
+        .collect()
+}
+
+fn file_scope_value_kind(node: Node<'_>, source: &str) -> Option<DeclarationKind> {
+    let mut cursor = node.walk();
+    let modifiers = node
+        .named_children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "storage_class_specifier" | "type_qualifier"));
+    let mut constant = false;
+    for modifier in modifiers {
+        match node_text(modifier, source).map(str::trim) {
+            Some("static") => return Some(DeclarationKind::Static),
+            Some("const" | "constexpr") => constant = true,
+            _ => {}
+        }
+    }
+    constant.then_some(DeclarationKind::Constant)
+}
+
+fn value_key_discriminator(item: Node<'_>, source: &str) -> String {
+    field_shape_parts(item)
+        .into_iter()
+        .filter_map(|part| source.get(part.range))
+        .collect()
 }
 
 fn callable_declarators(node: Node<'_>) -> Option<Vec<Node<'_>>> {
@@ -1235,6 +1541,19 @@ fn qualify(parent: Option<&str>, child: Option<&str>) -> Option<String> {
         (None, Some(child)) => Some(child.to_owned()),
         (None, None) => None,
     }
+}
+
+fn key_discriminator(components: &[SourceComponent]) -> String {
+    components
+        .iter()
+        .filter(|component| {
+            !matches!(
+                component.role,
+                SourceComponentRole::Documentation | SourceComponentRole::Layout
+            )
+        })
+        .map(|component| component.text.as_str())
+        .collect()
 }
 
 fn component_text(components: &[SourceComponent]) -> String {
