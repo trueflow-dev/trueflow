@@ -28,7 +28,7 @@ tree-sitter-bash = "0.25.1"
 regex = "1.13.1"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-tree-sitter-rust = "0.24.0"
+tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 url = "2.5.4"
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
