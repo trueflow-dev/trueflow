@@ -34,7 +34,7 @@ url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 walkdir = "2.5.0"
 tree-sitter-asciidoc = "0.9.0"
-tree-sitter-md = { version = "0.5.2", features = ["parser"] }
+tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 tree-sitter-nix = "0.3.0"
 fs2 = "0.4.3"
 unicode-width = "0.1.14"
