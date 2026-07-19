@@ -6,6 +6,7 @@ use crate::declaration::{
     DeclarationKey, DeclarationNode, DeclarationProjectionHash, project_source,
 };
 use crate::feedback_since::ResolvedFeedbackSince as ParsedFeedbackSince;
+use crate::hashing::hex_digest;
 use crate::repo_path::RepoPath;
 use crate::scanner::{self, ScanOptions};
 use crate::store::{
@@ -1229,7 +1230,7 @@ fn feedback_cursor_prefix_digest(records: &[Record]) -> Result<String> {
         hasher.update(length.to_be_bytes());
         hasher.update(record.id.as_bytes());
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_digest(hasher.finalize()))
 }
 
 fn write_feedback_cursor_atomically(path: &Path, cursor: &FeedbackCursor) -> Result<()> {

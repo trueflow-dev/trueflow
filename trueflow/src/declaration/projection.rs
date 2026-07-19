@@ -3,6 +3,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::analysis::Language;
+use crate::hashing::hex_digest;
 
 use super::{
     DeclarationId, DeclarationKey, DeclarationKind, DeclarationProjectionHash, SourceComponent,
@@ -25,7 +26,7 @@ pub fn projection_hash(
         write_frame(&mut hasher, component.role.protocol_tag().as_bytes());
         write_frame(&mut hasher, component.text.as_bytes());
     }
-    DeclarationProjectionHash::new(format!("{:x}", hasher.finalize()))
+    DeclarationProjectionHash::new(hex_digest(hasher.finalize()))
 }
 
 pub(crate) fn declaration_id(
@@ -44,7 +45,7 @@ pub(crate) fn declaration_id(
     write_u64(&mut hasher, source_ordinal as u64);
     write_u64(&mut hasher, start_byte as u64);
     write_frame(&mut hasher, projection_hash.as_str().as_bytes());
-    DeclarationId::new(format!("{:x}", hasher.finalize()))
+    DeclarationId::new(hex_digest(hasher.finalize()))
 }
 
 pub(crate) fn declaration_key(
@@ -61,7 +62,7 @@ pub(crate) fn declaration_key(
     write_frame(&mut hasher, parent_name.unwrap_or_default().as_bytes());
     write_frame(&mut hasher, name.as_bytes());
     write_frame(&mut hasher, overload_discriminator.as_bytes());
-    DeclarationKey::new(format!("{:x}", hasher.finalize()))
+    DeclarationKey::new(hex_digest(hasher.finalize()))
 }
 
 fn write_frame(hasher: &mut Sha256, bytes: &[u8]) {

@@ -15,6 +15,7 @@ use crate::declaration::{
     DeclarationId, DeclarationKey, DeclarationKind, DeclarationNode, FileDeclarationFacts,
     TypeUseRole,
 };
+use crate::hashing::hex_digest;
 
 #[path = "relationships/client.rs"]
 mod client;
@@ -289,7 +290,7 @@ impl DocumentHash {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
-        Self(format!("{:x}", hasher.finalize()))
+        Self(hex_digest(hasher.finalize()))
     }
 
     pub fn as_str(&self) -> &str {

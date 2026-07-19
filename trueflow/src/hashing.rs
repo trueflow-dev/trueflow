@@ -3,6 +3,17 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
+pub(crate) fn hex_digest<D: AsRef<[u8]>>(digest: D) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = digest.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
 
 macro_rules! define_hash_type {
     ($name:ident) => {
@@ -97,7 +108,7 @@ impl TreeHash {
         for hash in hashes {
             hasher.update(hash.as_str());
         }
-        Self::new(format!("{:x}", hasher.finalize()))
+        Self::new(hex_digest(hasher.finalize()))
     }
 }
 
@@ -105,13 +116,13 @@ pub fn hash_str(input: &str) -> String {
     let mut hasher = Sha256::new();
     let normalized = canonicalize(input);
     hasher.update(normalized);
-    format!("{:x}", hasher.finalize())
+    hex_digest(hasher.finalize())
 }
 
 pub fn hash_bytes(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
-    format!("{:x}", hasher.finalize())
+    hex_digest(hasher.finalize())
 }
 
 /// Normalize content for hashing.
