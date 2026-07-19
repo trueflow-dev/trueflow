@@ -16,7 +16,7 @@ tui-test-support = []
 criterion = { version = "0.8.2", optional = true, default-features = false, features = ["cargo_bench_support"] }
 anyhow = "1.0.104"
 clap = { version = "4.6.2", features = ["derive", "env"] }
-chrono = "0.4.39"
+chrono = "0.4.45"
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 dirs = "6.0.0"
