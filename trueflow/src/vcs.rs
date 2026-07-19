@@ -1229,12 +1229,14 @@ fn file_diff_from_change(
         }
         gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } => {
             let input = prep.interned_input();
-            let sink = gix::diff::blob::UnifiedDiff::new(
+            let diff = gix::diff::blob::Diff::compute(algorithm, &input);
+            let unified = gix::diff::blob::UnifiedDiff::new(
+                &diff,
                 &input,
                 gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(String::new(), "\n"),
                 gix::diff::blob::unified_diff::ContextSize::symmetrical(3),
-            );
-            let unified = gix::diff::blob::diff(algorithm, &input, sink)?;
+            )
+            .consume()?;
             let mut hunks = Vec::new();
             collect_hunks(&mut hunks, &changed_path.location, &unified)?;
             if hunks.is_empty() {
