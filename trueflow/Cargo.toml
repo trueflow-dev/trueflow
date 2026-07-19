@@ -37,7 +37,7 @@ tree-sitter-asciidoc = "0.9.0"
 tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 tree-sitter-nix = "0.3.0"
 fs2 = "0.4.3"
-unicode-width = "0.1.14"
+unicode-width = "0.2.2"
 toml = "0.9.11"
 gix = { version = "0.78.0", default-features = false, features = ["revision", "status"] }
 schemars = { version = "1.2.0" }
