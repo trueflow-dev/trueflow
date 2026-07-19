@@ -14,7 +14,7 @@ tui-test-support = []
 
 [dependencies]
 criterion = { version = "0.8.2", optional = true, default-features = false, features = ["cargo_bench_support"] }
-anyhow = "1.0.100"
+anyhow = "1.0.104"
 clap = { version = "4.6.0", features = ["derive", "env"] }
 chrono = "0.4.39"
 ratatui = "0.30.0"
