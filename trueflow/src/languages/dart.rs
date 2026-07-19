@@ -65,31 +65,44 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
             continue;
         }
 
-        if matches!(
-            kind,
-            "function_signature" | "getter_signature" | "setter_signature"
-        ) && let Some(next) = children.get(index + 1).copied()
-            && next.kind() == "function_body"
+        if let Some((signature, body)) =
+            function_signature_and_body(child, children.get(index + 1).copied())
         {
-            let start = pending_start.unwrap_or(child.start_byte());
+            let start = pending_start.unwrap_or_else(|| {
+                if matches!(
+                    kind,
+                    "function_declaration" | "getter_declaration" | "setter_declaration"
+                ) {
+                    child.start_byte()
+                } else {
+                    signature.start_byte()
+                }
+            });
             push_non_empty_gap(&mut blocks, content, last_end, start, lang)?;
 
-            let end = next.end_byte();
+            let end = body.end_byte();
             blocks.push(create_file_block(
                 &content[start..end],
                 BlockKind::Function,
-                function_like_tags(child, content),
+                function_like_tags(signature, content),
                 content,
                 start,
                 end,
                 lang,
             )?);
-            blocks.extend(collect_test_invocation_blocks(next, content, lang)?);
+            blocks.extend(collect_test_invocation_blocks(body, content, lang)?);
 
             last_end = end;
             pending_start = None;
             pending_end = 0;
-            index += 2;
+            index += if matches!(
+                kind,
+                "function_declaration" | "getter_declaration" | "setter_declaration"
+            ) {
+                1
+            } else {
+                2
+            };
             continue;
         }
 
@@ -112,6 +125,17 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
                 kind: BlockKind::Import,
                 tags: Vec::new(),
             }),
+            "external_function_declaration"
+            | "external_getter_declaration"
+            | "external_setter_declaration" => {
+                let start = pending_start.unwrap_or(child.start_byte());
+                Some(SemanticSpan {
+                    start_byte: start,
+                    end_byte: child.end_byte(),
+                    kind: BlockKind::FunctionSignature,
+                    tags: function_like_tags(child, content),
+                })
+            }
             "function_signature" | "getter_signature" | "setter_signature" => {
                 let start = pending_start
                     .unwrap_or_else(|| declaration_start(content, last_end, child.start_byte()));
@@ -120,6 +144,16 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
                     end_byte: extend_to_semicolon(content, child.end_byte()),
                     kind: BlockKind::FunctionSignature,
                     tags: function_like_tags(child, content),
+                })
+            }
+            "top_level_variable_declaration" | "external_variable_declaration" => {
+                let start = pending_start.unwrap_or(child.start_byte());
+                let end = child.end_byte();
+                Some(SemanticSpan {
+                    start_byte: start,
+                    end_byte: end,
+                    kind: classify_variable_kind(&content[start..end]),
+                    tags: Vec::new(),
                 })
             }
             "static_final_declaration_list" | "initialized_identifier_list" | "identifier_list" => {
@@ -326,11 +360,19 @@ fn collect_test_invocation_spans(node: Node<'_>, content: &str, spans: &mut Vec<
 
 fn leading_invocation_name<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str> {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).find_map(|child| {
-        (child.kind() == "identifier")
-            .then(|| child.utf8_text(content.as_bytes()).ok())
-            .flatten()
-    })
+    let function = node.named_children(&mut cursor).find_map(|child| {
+        if child.kind() == "call_expression" {
+            child.child_by_field_name("function")
+        } else if child.kind() == "identifier" {
+            Some(child)
+        } else {
+            None
+        }
+    })?;
+
+    (function.kind() == "identifier")
+        .then(|| function.utf8_text(content.as_bytes()).ok())
+        .flatten()
 }
 
 fn is_stable_test_invocation(name: &str) -> bool {
@@ -349,6 +391,31 @@ fn is_top_level_fragment_node(kind: &str) -> bool {
         kind,
         "type_identifier" | "void_type" | "function_type" | "record_type" | "type_arguments"
     )
+}
+
+fn function_signature_and_body<'a>(
+    node: Node<'a>,
+    next: Option<Node<'a>>,
+) -> Option<(Node<'a>, Node<'a>)> {
+    if matches!(
+        node.kind(),
+        "function_declaration" | "getter_declaration" | "setter_declaration"
+    ) {
+        return Some((
+            node.child_by_field_name("signature")?,
+            node.child_by_field_name("body")?,
+        ));
+    }
+
+    if matches!(
+        node.kind(),
+        "function_signature" | "getter_signature" | "setter_signature"
+    ) {
+        let body = next.filter(|candidate| candidate.kind() == "function_body")?;
+        return Some((node, body));
+    }
+
+    None
 }
 
 fn declaration_start(content: &str, last_end: usize, node_start: usize) -> usize {
@@ -425,7 +492,7 @@ fn classify_class_member_kind(node: Node<'_>, content: &str) -> Option<BlockKind
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "annotation" => continue,
-            "method_signature" => return Some(BlockKind::Method),
+            "method_declaration" | "method_signature" => return Some(BlockKind::Method),
             "declaration" => return classify_member_declaration_kind(node, child, content),
             _ => {}
         }
@@ -848,5 +915,50 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rebuilt, source);
+    }
+    #[test]
+    fn split_top_level_handles_declaration_wrappers() -> Result<()> {
+        let source = "\
+external String externalSummary();\n\
+external int externalCount;\n\
+external String get externalName;\n\
+external set externalName(String value);\n\
+@Deprecated('use another name')\n\
+String get topLevelName => 'name';\n\
+set topLevelName(String value) {}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
+        let tree = parser
+            .parse(source, None)
+            .context("failed to parse Dart test")?;
+        let blocks = split_top_level(tree.root_node(), source, Language::Dart)?;
+
+        let find_kind = |needle: &str| {
+            blocks
+                .iter()
+                .find(|block| block.content.contains(needle))
+                .map(|block| block.kind)
+        };
+        assert_eq!(
+            find_kind("externalSummary"),
+            Some(BlockKind::FunctionSignature)
+        );
+        assert_eq!(find_kind("externalCount"), Some(BlockKind::Variable));
+        assert_eq!(
+            find_kind("externalName"),
+            Some(BlockKind::FunctionSignature)
+        );
+
+        let annotated_getter = blocks
+            .iter()
+            .find(|block| block.content.contains("topLevelName"))
+            .context("missing top-level getter")?;
+        assert_eq!(annotated_getter.kind, BlockKind::Function);
+        assert!(annotated_getter.content.starts_with("@Deprecated"));
+        assert!(
+            blocks.iter().any(|block| block.kind == BlockKind::Function
+                && block.content.contains("set topLevelName"))
+        );
+        Ok(())
     }
 }
