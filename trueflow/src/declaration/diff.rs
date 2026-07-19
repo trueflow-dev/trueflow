@@ -130,20 +130,18 @@ fn diff_pair(pair: &SnapshotPair, diff: &mut DeclarationDiff) -> Result<()> {
 
     let path_allows_matching = matching_paths_are_proven(pair, diff);
     let languages_match = match (&pair.base, &pair.head) {
-        (Some(base_snapshot), Some(head_snapshot)) => {
-            if base_snapshot.language != head_snapshot.language {
-                diff.diagnostics.push(DiffDiagnostic {
-                    snapshot_pair_id: pair.id.clone(),
-                    kind: DiffDiagnosticKind::IncompatibleSnapshotLanguages,
-                    message: format!(
-                        "cannot match declaration projections for {:?} and {:?}",
-                        base_snapshot.language, head_snapshot.language
-                    ),
-                });
-                false
-            } else {
-                true
-            }
+        (Some(base_snapshot), Some(head_snapshot))
+            if base_snapshot.language != head_snapshot.language =>
+        {
+            diff.diagnostics.push(DiffDiagnostic {
+                snapshot_pair_id: pair.id.clone(),
+                kind: DiffDiagnosticKind::IncompatibleSnapshotLanguages,
+                message: format!(
+                    "cannot match declaration projections for {:?} and {:?}",
+                    base_snapshot.language, head_snapshot.language
+                ),
+            });
+            false
         }
         _ => true,
     };

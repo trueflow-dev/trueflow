@@ -441,10 +441,8 @@ impl Projector<'_> {
         )?;
         collect_type_parameter_bounds(left, self.source, &mut type_use_sites)?;
         normalize_type_uses(&mut type_use_sites);
-        let key_discriminator = semantic_key_discriminator(
-            self.source,
-            [left.byte_range(), target.byte_range()].into_iter(),
-        )?;
+        let key_discriminator =
+            semantic_key_discriminator(self.source, [left.byte_range(), target.byte_range()])?;
         Ok(Some(self.push_declaration(
             statement,
             name,
@@ -546,7 +544,7 @@ impl Projector<'_> {
         } else {
             vec![annotation.byte_range()]
         };
-        let key_discriminator = semantic_key_discriminator(self.source, key_ranges.into_iter())?;
+        let key_discriminator = semantic_key_discriminator(self.source, key_ranges)?;
         Ok(Some(self.push_declaration(
             statement,
             name,
