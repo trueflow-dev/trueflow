@@ -279,11 +279,11 @@ data-structure shape; implementation bodies are never rendered or marked as
 reviewed. Diff scopes include only added, deleted, or changed declaration
 surfaces, so a body-only change produces no Declaration Review targets.
 
-The initial projectors support Rust, TypeScript, Python, Go, C, and C++. All
-visibilities are included. Approvals, comments, and rejections are stored as
-declaration-specific records and remain separate from ordinary block-review
-coverage. Declaration comments are available through JSON/XML feedback export
-and GitHub pull-request feedback.
+The initial projectors support Rust, TypeScript, Python, Go, C, C++, and shell
+function declarations. All visibilities are included. Approvals, comments, and
+rejections are stored as declaration-specific records and remain separate from
+ordinary block-review coverage. Declaration comments are available through
+JSON/XML feedback export and GitHub pull-request feedback.
 
 Declaration Review keys are intentionally fixed to its two-pane model:
 

@@ -20,6 +20,7 @@ mod python;
 
 mod projection;
 mod rust;
+mod shell;
 mod typescript;
 
 pub use projection::projection_hash;
@@ -278,6 +279,7 @@ pub fn project_source(
         Language::Python => python::project(path, source)?,
         Language::Go => go::project(path, source)?,
         Language::C | Language::Cpp => c_family::project(path, language, source)?,
+        Language::Shell => shell::project(path, source)?,
         _ => (
             Vec::new(),
             vec![ProjectionDiagnostic::new(format!(
@@ -324,9 +326,9 @@ pub fn capabilities_for(language: Language) -> DeclarationCapabilities {
         | Language::Elixir
         | Language::Clojure
         | Language::Sql
-        | Language::Shell
         | Language::Nix
         | Language::Just => partial_capabilities(language),
+        Language::Shell => shell_capabilities(),
     }
 }
 
@@ -355,6 +357,19 @@ fn partial_capabilities(language: Language) -> DeclarationCapabilities {
         callable_projection: facet(),
         aggregate_projection: facet(),
         type_use_sites: facet(),
+    }
+}
+
+fn shell_capabilities() -> DeclarationCapabilities {
+    let not_applicable = || Capability::NotApplicable {
+        reason: "shell has no aggregate or static type declaration surface".to_owned(),
+    };
+    DeclarationCapabilities {
+        inventory: Capability::Complete,
+        documentation_association: Capability::Complete,
+        callable_projection: Capability::Complete,
+        aggregate_projection: not_applicable(),
+        type_use_sites: not_applicable(),
     }
 }
 

@@ -533,6 +533,40 @@ fn empty_dirty_launches_preserve_explicit_reason_and_finish_without_a_controller
 }
 
 #[test]
+fn shell_function_declarations_are_reviewable_without_aborting_dirty_launch() -> Result<()> {
+    const BASE: &str = "#!/usr/bin/env bash\n\ndeploy() {\n    echo old\n}\n";
+    const HEAD: &str = "#!/usr/bin/env bash\n\ndeploy() {\n    echo new\n}\n\n# Reports service status.\nfunction healthcheck {\n    printf '%s\\n' healthy\n}\n";
+
+    let repo = TestRepo::new("declaration_tui_shell_functions")?;
+    repo.write("scripts/release.sh", BASE)?;
+    repo.commit_all("base shell declarations")?;
+    repo.write("scripts/release.sh", HEAD)?;
+
+    let query = dirty_query(&["scripts/release.sh"])?;
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+
+    assert_eq!(prepared.status(), &CollectionStatus::Ready);
+    assert_eq!(
+        prepared
+            .targets()
+            .iter()
+            .map(|target| (
+                target.declaration.kind,
+                target.declaration.name.as_str(),
+                target.declaration.projection_text.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            trueflow::declaration::DeclarationKind::Function,
+            "healthcheck",
+            "# Reports service status.\nfunction healthcheck",
+        )],
+        "the added function must be reviewable while deploy's body-only edit stays out of the declaration review"
+    );
+    Ok(())
+}
+
+#[test]
 fn resolved_declaration_mode_selects_the_declaration_runtime_route() -> Result<()> {
     let config: TrueflowConfig = toml::from_str("[tui]\nmode = \"blocks\"\n")?;
     let declarations = resolve_tui_launch(
