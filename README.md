@@ -28,15 +28,15 @@ stores review state in an append-only flat file database, e.g.
 ## Current model and status
 
 - The canonical review unit is a **block**, not a textual diff hunk.
-- Review targets are presented in a stable priority order.
-  - Today that includes heuristics like tests before library code before main
-    entrypoints, and higher-priority block kinds before lower-priority ones
-    within a file.
-  - The goal is a practical review invariant: if you stop early, you have seen
-    the highest-priority material first according to the tool's review-order
-    heuristics.
+- Canonical review order is deterministic: tests before library code before main
+  entrypoints, with higher-priority block kinds first within a file.
+- An optional session-local AI review plan can add a priority prefix. It never
+  removes or duplicates targets; every omitted block remains in canonical
+  relative order.
+- Pressing Esc on the AI briefing preserves canonical order.
 - Runtime config lives in `trueflow.toml`.
 - Current website-distributed binary support is Apple Silicon macOS and Linux x86_64.
+
 
 Still some rough edges.
 
@@ -212,6 +212,16 @@ directory, with closer files overriding earlier defaults key-by-key. CLI flags
 still take precedence over config values.
 
 ```toml
+[ai]
+# AI mode: off|review_plan|block_hints|review_plan_and_block_hints.
+mode = "off"
+# Provider: auto|anthropic|open_ai|claude_cli|codex_cli|none.
+provider = "auto"
+model = "auto"
+max_context_lines = 80
+# In-session cache for block-hint responses.
+cache = true
+
 [review]
 only = ["function", "struct"]
 exclude = ["comment"]
@@ -279,11 +289,14 @@ data-structure shape; implementation bodies are never rendered or marked as
 reviewed. Diff scopes include only added, deleted, or changed declaration
 surfaces, so a body-only change produces no Declaration Review targets.
 
-The initial projectors support Rust, TypeScript, Python, Go, C, C++, and shell
-function declarations. All visibilities are included. Approvals, comments, and
-rejections are stored as declaration-specific records and remain separate from
-ordinary block-review coverage. Declaration comments are available through
-JSON/XML feedback export and GitHub pull-request feedback.
+Complete projectors support Rust, TypeScript, Python, Go, C, and C++. Shell
+function declarations are also supported. Partial projectors cover root Nix
+let/output bindings and Just recipes/aliases; their limits remain visible as
+capability diagnostics. All source-visible visibilities are included.
+Approvals, comments, and rejections are stored as declaration-specific records
+and remain separate from ordinary block-review coverage. Declaration comments
+are available through JSON/XML feedback export and GitHub pull-request
+feedback.
 
 Declaration Review keys are intentionally fixed to its two-pane model:
 
