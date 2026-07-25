@@ -8,6 +8,7 @@ use gix::object::tree::{EntryKind, EntryMode};
 use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
 
+use super::{Capability, DeclarationFileCapability, capabilities_for};
 use crate::analysis::Language;
 use crate::commands::review::ResolvedReviewQuery;
 use crate::declaration::snapshot::{
@@ -75,6 +76,13 @@ pub struct CaptureBatch {
     pub pairs: Vec<SnapshotPair>,
     pub provenance: CaptureProvenance,
     pub diagnostics: Vec<CaptureDiagnostic>,
+    pub capability_notices: Vec<DeclarationFileCapability>,
+}
+
+#[derive(Debug)]
+struct WorktreeSources {
+    projected: Vec<(RepoPath, Language)>,
+    capability_notices: Vec<DeclarationFileCapability>,
 }
 
 pub fn capture_declaration_sources(
@@ -144,10 +152,19 @@ fn capture_immutable_target(
     );
 
     let mut pairs = Vec::new();
+    let mut capability_notices = Vec::new();
     for changed_path in changed {
         if !changed_pair_selected(&query.path_selection, &changed_path) {
             continue;
         }
+        if let Some(base_tree) = base_tree.as_ref() {
+            append_tree_capability_notice(
+                &mut capability_notices,
+                base_tree,
+                &changed_path.source_location,
+            )?;
+        }
+        append_tree_capability_notice(&mut capability_notices, &head_tree, &changed_path.location)?;
         let base_language = declaration_language(&changed_path.source_location);
         let head_language = declaration_language(&changed_path.location);
         if base_language.is_none() && head_language.is_none() {
@@ -186,6 +203,7 @@ fn capture_immutable_target(
         ));
     }
 
+    sort_capability_notices(&mut capability_notices);
     Ok(CaptureBatch {
         pairs,
         provenance: CaptureProvenance {
@@ -193,6 +211,7 @@ fn capture_immutable_target(
             head: endpoint(head_id, BlockState::Committed),
         },
         diagnostics: Vec::new(),
+        capability_notices,
     })
 }
 
@@ -293,6 +312,23 @@ where
     let head_id = commit_id(&head)?;
     let head_tree = head.tree()?;
     let status_before = vcs::dirty_files(repo)?;
+    let mut capability_notices = Vec::new();
+    for changed_path in changed
+        .iter()
+        .filter(|path| changed_pair_selected(&query.path_selection, path))
+    {
+        append_tree_capability_notice(
+            &mut capability_notices,
+            &head_tree,
+            &changed_path.source_location,
+        )?;
+        append_worktree_capability_notice(
+            &mut capability_notices,
+            workdir,
+            &changed_path.location,
+        )?;
+    }
+    sort_capability_notices(&mut capability_notices);
     let mut selected = changed
         .iter()
         .filter(|path| changed_pair_selected(&query.path_selection, path))
@@ -354,6 +390,7 @@ where
             head: endpoint(head_id, BlockState::Uncommitted),
         },
         diagnostics: Vec::new(),
+        capability_notices,
     })
 }
 
@@ -369,11 +406,14 @@ where
 {
     let head_id = commit_id(&repo.head_commit()?)?;
     let status_before = vcs::dirty_files(repo)?;
-    let paths = worktree_source_paths(workdir, query)?;
-    let mut pairs = Vec::with_capacity(paths.len());
-    let mut fingerprints = Vec::with_capacity(paths.len());
+    let WorktreeSources {
+        projected,
+        capability_notices,
+    } = worktree_source_paths(workdir, query)?;
+    let mut pairs = Vec::with_capacity(projected.len());
+    let mut fingerprints = Vec::with_capacity(projected.len());
     let target_key = format!("worktree:{}", head_id.as_str());
-    for (path, language) in paths {
+    for (path, language) in projected {
         let (head, fingerprint) =
             snapshot_from_worktree(workdir, &path, Some(language), "head", &target_key, budget)?;
         fingerprints.push((path.clone(), fingerprint));
@@ -407,13 +447,11 @@ where
             ),
         },
         diagnostics: Vec::new(),
+        capability_notices,
     })
 }
 
-fn worktree_source_paths(
-    workdir: &Path,
-    query: &ResolvedReviewQuery,
-) -> Result<Vec<(RepoPath, Language)>> {
+fn worktree_source_paths(workdir: &Path, query: &ResolvedReviewQuery) -> Result<WorktreeSources> {
     let mut glob_builder = GitignoreBuilder::new(workdir);
     glob_builder.allow_unclosed_class(false);
     for pattern in &query.scan_options.ignore_globs {
@@ -470,7 +508,8 @@ fn worktree_source_paths(
             .is_ignore()
     });
 
-    let mut paths = Vec::new();
+    let mut projected = Vec::new();
+    let mut capability_notices = Vec::new();
     for entry in builder.build() {
         let entry = entry?;
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -484,12 +523,18 @@ fn worktree_source_paths(
         if !worktree_path_selected(&query.path_selection, &path) {
             continue;
         }
-        if let Some(language) = declaration_language(&path) {
-            paths.push((path, language));
+        if let Some(notice) = declaration_file_capability(&path) {
+            capability_notices.push(notice);
+        } else if let Some(language) = declaration_language(&path) {
+            projected.push((path, language));
         }
     }
-    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
-    Ok(paths)
+    projected.sort_by(|(left, _), (right, _)| left.cmp(right));
+    sort_capability_notices(&mut capability_notices);
+    Ok(WorktreeSources {
+        projected,
+        capability_notices,
+    })
 }
 
 fn snapshot_from_tree(
@@ -628,46 +673,90 @@ fn endpoint(revision: CommitId, block_state: BlockState) -> CaptureEndpointProve
 }
 
 fn declaration_language(path: &RepoPath) -> Option<Language> {
+    let language = detected_language(path)?;
+    (!matches!(
+        capabilities_for(language).inventory,
+        Capability::NotApplicable { .. }
+    ))
+    .then_some(language)
+}
+
+fn declaration_file_capability(path: &RepoPath) -> Option<DeclarationFileCapability> {
+    let language = detected_language(path)?;
+    let inventory = capabilities_for(language).inventory;
+    matches!(&inventory, Capability::NotApplicable { .. }).then(|| DeclarationFileCapability {
+        path: path.clone(),
+        language,
+        inventory,
+    })
+}
+
+fn detected_language(path: &RepoPath) -> Option<Language> {
     let path = Path::new(path.as_str());
-    let language = path
-        .extension()
+    path.extension()
         .and_then(|extension| extension.to_str())
         .and_then(Language::from_extension)
         .or_else(|| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .and_then(Language::from_file_name)
-        })?;
-    matches!(
-        language,
-        Language::Rust
-            | Language::Swift
-            | Language::Elisp
-            | Language::JavaScript
-            | Language::TypeScript
-            | Language::Java
-            | Language::Kotlin
-            | Language::CSharp
-            | Language::Python
-            | Language::Ruby
-            | Language::Php
-            | Language::Go
-            | Language::C
-            | Language::Cpp
-            | Language::Zig
-            | Language::Lua
-            | Language::Dart
-            | Language::Scala
-            | Language::Haskell
-            | Language::OCaml
-            | Language::Elixir
-            | Language::Clojure
-            | Language::Sql
-            | Language::Shell
-            | Language::Nix
-            | Language::Just
-    )
-    .then_some(language)
+        })
+}
+
+fn append_tree_capability_notice(
+    notices: &mut Vec<DeclarationFileCapability>,
+    tree: &gix::Tree<'_>,
+    path: &RepoPath,
+) -> Result<()> {
+    let Some(notice) = declaration_file_capability(path) else {
+        return Ok(());
+    };
+    if tree_contains_source(tree, path)? {
+        append_capability_notice(notices, notice);
+    }
+    Ok(())
+}
+
+fn append_worktree_capability_notice(
+    notices: &mut Vec<DeclarationFileCapability>,
+    workdir: &Path,
+    path: &RepoPath,
+) -> Result<()> {
+    let Some(notice) = declaration_file_capability(path) else {
+        return Ok(());
+    };
+    if file_metadata(&workdir.join(path.as_str()))?.is_some_and(|metadata| metadata.is_file) {
+        append_capability_notice(notices, notice);
+    }
+    Ok(())
+}
+
+fn append_capability_notice(
+    notices: &mut Vec<DeclarationFileCapability>,
+    notice: DeclarationFileCapability,
+) {
+    if !notices
+        .iter()
+        .any(|existing| existing.path == notice.path && existing.language == notice.language)
+    {
+        notices.push(notice);
+    }
+}
+
+fn sort_capability_notices(notices: &mut Vec<DeclarationFileCapability>) {
+    notices.sort_by(|left, right| left.path.cmp(&right.path));
+    notices.dedup_by(|left, right| left.path == right.path && left.language == right.language);
+}
+
+fn tree_contains_source(tree: &gix::Tree<'_>, path: &RepoPath) -> Result<bool> {
+    Ok(tree
+        .lookup_entry_by_path(Path::new(path.as_str()))?
+        .is_some_and(|entry| {
+            matches!(
+                entry.mode().kind(),
+                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
+            )
+        }))
 }
 
 fn dirty_changed_paths(selection: &ReviewPathSelection) -> Option<&HashSet<ChangedPath>> {

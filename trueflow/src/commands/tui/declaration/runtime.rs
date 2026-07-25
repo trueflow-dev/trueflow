@@ -13,7 +13,9 @@ use crate::declaration::review::{
     CollectedDeclarationItem, DeclarationReviewDiffBatch, DeclarationReviewQuery,
     DeclarationReviewStatus as CollectionStatus, collect_declaration_review,
 };
-use crate::declaration::{DeclarationId, DeclarationNode, SourceComponentRole};
+use crate::declaration::{
+    DeclarationFileCapability, DeclarationId, DeclarationNode, SourceComponentRole,
+};
 use crate::repo_path::RepoPath;
 use crate::store::{
     CommentAnchor, DeclarationAnchorRange as RecordAnchorRange, DeclarationCommentAnchor,
@@ -61,6 +63,7 @@ pub struct PreparedDeclarationLaunch {
     status: CollectionStatus,
     documents: Vec<DeclarationDocument>,
     targets: Vec<PreparedDeclarationTarget>,
+    capability_notices: Vec<DeclarationFileCapability>,
     canonical_order: Vec<DeclarationId>,
 }
 
@@ -75,6 +78,9 @@ impl PreparedDeclarationLaunch {
 
     pub fn targets(&self) -> &[PreparedDeclarationTarget] {
         &self.targets
+    }
+    pub fn capability_notices(&self) -> &[DeclarationFileCapability] {
+        &self.capability_notices
     }
 
     pub fn canonical_order(&self) -> &[DeclarationId] {
@@ -98,7 +104,10 @@ pub fn prepare_declaration_launch(
     let mut review_batches = Vec::with_capacity(captures.len());
     for capture in &captures {
         let diff = diff_declarations(&capture.pairs)?;
-        review_batches.push(DeclarationReviewDiffBatch::new(capture.pairs.clone(), diff));
+        review_batches.push(
+            DeclarationReviewDiffBatch::new(capture.pairs.clone(), diff)
+                .with_capability_notices(capture.capability_notices.clone()),
+        );
     }
 
     let collection_query = DeclarationReviewQuery::new(review_batches).with_records(records);
@@ -114,6 +123,7 @@ pub fn prepare_declaration_launch(
         status: collected.status,
         documents,
         targets,
+        capability_notices: collected.capability_notices,
         canonical_order: collected.canonical_order,
     })
 }

@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Language;
+use crate::repo_path::RepoPath;
 
 pub mod capture;
 pub mod coverage;
@@ -16,6 +17,8 @@ pub mod snapshot;
 
 mod c_family;
 mod go;
+mod just;
+mod nix;
 mod python;
 
 mod projection;
@@ -237,6 +240,13 @@ pub struct DeclarationNode {
     pub type_use_sites: Vec<TypeUseSite>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationFileCapability {
+    pub path: RepoPath,
+    pub language: Language,
+    pub inventory: Capability,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDeclarationFacts {
     pub language: Language,
@@ -248,12 +258,13 @@ pub struct FileDeclarationFacts {
 impl FileDeclarationFacts {
     pub(crate) fn from_parts(
         language: Language,
+        capabilities: DeclarationCapabilities,
         declarations: Vec<DeclarationNode>,
         diagnostics: Vec<ProjectionDiagnostic>,
     ) -> Self {
         Self {
             language,
-            capabilities: capabilities_for(language),
+            capabilities,
             diagnostics,
             declarations,
         }
@@ -273,23 +284,75 @@ pub fn project_source(
     language: Language,
     source: &str,
 ) -> Result<FileDeclarationFacts> {
-    let (declarations, diagnostics) = match language {
-        Language::Rust => rust::project(path, source)?,
-        Language::TypeScript => typescript::project(path, source)?,
-        Language::Python => python::project(path, source)?,
-        Language::Go => go::project(path, source)?,
-        Language::C | Language::Cpp => c_family::project(path, language, source)?,
-        Language::Shell => shell::project(path, source)?,
+    let capabilities = capabilities_for(language);
+    let (declarations, mut diagnostics, capabilities) = match language {
+        Language::Rust => {
+            let (declarations, diagnostics, generated_declaration_gaps) =
+                rust::project(path, source)?;
+            (
+                declarations,
+                diagnostics,
+                rust_capabilities(generated_declaration_gaps),
+            )
+        }
+        Language::TypeScript => {
+            let (declarations, diagnostics) = typescript::project(path, source)?;
+            (declarations, diagnostics, capabilities)
+        }
+        Language::Python => {
+            let (declarations, diagnostics) = python::project(path, source)?;
+            (declarations, diagnostics, capabilities)
+        }
+        Language::Go => {
+            let (declarations, diagnostics) = go::project(path, source)?;
+            (declarations, diagnostics, capabilities)
+        }
+        Language::C | Language::Cpp => {
+            let (declarations, diagnostics) = c_family::project(path, language, source)?;
+            (declarations, diagnostics, capabilities)
+        }
+        Language::Nix => {
+            let (declarations, diagnostics) = nix::project(path, source)?;
+            (declarations, diagnostics, capabilities)
+        }
+        Language::Just => {
+            let (declarations, diagnostics) = just::project(path, source)?;
+            (declarations, diagnostics, capabilities)
+        }
+        Language::Shell => {
+            let (declarations, diagnostics) = shell::project(path, source)?;
+            (declarations, diagnostics, capabilities)
+        }
+        _ if matches!(capabilities.inventory, Capability::NotApplicable { .. }) => {
+            (Vec::new(), Vec::new(), capabilities)
+        }
         _ => (
             Vec::new(),
             vec![ProjectionDiagnostic::new(format!(
                 "{language:?} has no declaration projector"
             ))],
+            capabilities,
         ),
     };
 
+    if let Capability::Partial {
+        diagnostics: capability_diagnostics,
+        ..
+    } = &capabilities.inventory
+    {
+        for diagnostic in capability_diagnostics {
+            if !diagnostics
+                .iter()
+                .any(|existing| existing.message == diagnostic.message)
+            {
+                diagnostics.push(diagnostic.clone());
+            }
+        }
+    }
+
     Ok(FileDeclarationFacts::from_parts(
         language,
+        capabilities,
         declarations,
         diagnostics,
     ))
@@ -309,6 +372,8 @@ pub fn capabilities_for(language: Language) -> DeclarationCapabilities {
         | Language::Toml
         | Language::Text => not_applicable_capabilities(language),
         Language::Unknown => unsupported_capabilities("the source language is unknown"),
+        Language::Nix => nix_capabilities(),
+        Language::Just => just_capabilities(),
         Language::Swift
         | Language::Elisp
         | Language::JavaScript
@@ -325,9 +390,9 @@ pub fn capabilities_for(language: Language) -> DeclarationCapabilities {
         | Language::OCaml
         | Language::Elixir
         | Language::Clojure
-        | Language::Sql
-        | Language::Nix
-        | Language::Just => partial_capabilities(language),
+        | Language::Sql => unsupported_capabilities(&format!(
+            "{language:?} declaration extraction is not implemented"
+        )),
         Language::Shell => shell_capabilities(),
     }
 }
@@ -342,21 +407,73 @@ fn complete_capabilities() -> DeclarationCapabilities {
     }
 }
 
-fn partial_capabilities(language: Language) -> DeclarationCapabilities {
-    let missing = vec![format!("{language:?} declaration adapter")];
-    let diagnostics = vec![ProjectionDiagnostic::new(format!(
-        "{language:?} declaration extraction is not implemented"
-    ))];
-    let facet = || Capability::Partial {
-        missing_features: missing.clone(),
-        diagnostics: diagnostics.clone(),
+fn rust_capabilities(generated_declaration_gaps: bool) -> DeclarationCapabilities {
+    if !generated_declaration_gaps {
+        return complete_capabilities();
+    }
+    let generated = || {
+        partial_capability(
+            "macro- and derive-generated declarations",
+            "Rust projection is exact-source-only; declarations generated by macro invocations and derive attributes are not expanded",
+        )
     };
     DeclarationCapabilities {
-        inventory: facet(),
-        documentation_association: facet(),
-        callable_projection: facet(),
-        aggregate_projection: facet(),
-        type_use_sites: facet(),
+        inventory: generated(),
+        documentation_association: Capability::Complete,
+        callable_projection: generated(),
+        aggregate_projection: generated(),
+        type_use_sites: Capability::Complete,
+    }
+}
+
+fn nix_capabilities() -> DeclarationCapabilities {
+    DeclarationCapabilities {
+        inventory: partial_capability(
+            "nested and dynamic attribute declarations",
+            "Nix projection inventories root let bindings and root output attributes; nested attributes, dynamic names, and multi-name inherit statements remain aggregate-owned or explicitly diagnosed",
+        ),
+        documentation_association: partial_capability(
+            "non-contiguous comment association",
+            "Nix projection associates only contiguous leading comments with a binding",
+        ),
+        callable_projection: partial_capability(
+            "nested function bindings",
+            "Nix projection excludes function bodies only for root bindings whose value is a direct function expression",
+        ),
+        aggregate_projection: partial_capability(
+            "nested attribute member inventory",
+            "Nested Nix attribute sets are projected as the exact value surface owned by their root binding",
+        ),
+        type_use_sites: Capability::NotApplicable {
+            reason: "Nix has no static type-use declaration syntax".to_owned(),
+        },
+    }
+}
+
+fn just_capabilities() -> DeclarationCapabilities {
+    DeclarationCapabilities {
+        inventory: partial_capability(
+            "variable, setting, import, and module declarations",
+            "Just projection inventories recipes and aliases; variables, settings, imports, and modules are not review targets",
+        ),
+        documentation_association: partial_capability(
+            "detached recipe comments",
+            "Just projection associates only contiguous leading comments with recipes and aliases",
+        ),
+        callable_projection: Capability::Complete,
+        aggregate_projection: Capability::NotApplicable {
+            reason: "Just recipes do not define aggregate type shapes".to_owned(),
+        },
+        type_use_sites: Capability::NotApplicable {
+            reason: "Just recipe parameters have no static type-use syntax".to_owned(),
+        },
+    }
+}
+
+fn partial_capability(missing_feature: &str, diagnostic: &str) -> Capability {
+    Capability::Partial {
+        missing_features: vec![missing_feature.to_owned()],
+        diagnostics: vec![ProjectionDiagnostic::new(diagnostic)],
     }
 }
 

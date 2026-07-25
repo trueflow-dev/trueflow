@@ -50,12 +50,13 @@ struct Projector<'a> {
     declaration_qualifiers: Vec<String>,
     impl_links: Vec<ImplLink>,
     diagnostics: Vec<ProjectionDiagnostic>,
+    generated_declaration_gaps: bool,
 }
 
 pub(super) fn project(
     path: &Path,
     source: &str,
-) -> Result<(Vec<DeclarationNode>, Vec<ProjectionDiagnostic>)> {
+) -> Result<(Vec<DeclarationNode>, Vec<ProjectionDiagnostic>, bool)> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -75,6 +76,7 @@ pub(super) fn project(
         declaration_qualifiers: Vec::new(),
         impl_links: Vec::new(),
         diagnostics: Vec::new(),
+        generated_declaration_gaps: false,
     };
     projector.collect_scope(tree.root_node(), ScopeKind::File, None, "")?;
     projector.resolve_impl_lineage();
@@ -83,7 +85,11 @@ pub(super) fn project(
             "Rust source contains syntax errors; declarations with errors in projected surfaces were omitted",
         ));
     }
-    Ok((projector.declarations, projector.diagnostics))
+    Ok((
+        projector.declarations,
+        projector.diagnostics,
+        projector.generated_declaration_gaps,
+    ))
 }
 
 impl Projector<'_> {
@@ -108,6 +114,13 @@ impl Projector<'_> {
                     }
                 }
                 "attribute_item" => {
+                    if is_derive_attribute(child, self.source) {
+                        self.generated_declaration_gaps = true;
+                        self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                            "Rust derive attribute at byte {} may generate declarations; exact-source projection does not expand derives",
+                            child.start_byte()
+                        )));
+                    }
                     let role = if is_doc_attribute(child, self.source) {
                         SourceComponentRole::Documentation
                     } else {
@@ -317,6 +330,14 @@ impl Projector<'_> {
                     )? {
                         direct_children.push(index);
                     }
+                }
+                "macro_invocation" => {
+                    self.generated_declaration_gaps = true;
+                    self.diagnostics.push(ProjectionDiagnostic::new(format!(
+                        "Rust macro invocation at byte {} may generate declarations; exact-source projection does not expand invocations",
+                        child.start_byte()
+                    )));
+                    pending.clear();
                 }
                 _ => pending.clear(),
             }
@@ -824,6 +845,21 @@ fn is_doc_attribute(node: Node<'_>, source: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|character| character.is_whitespace() || matches!(character, '=' | '(' | ']'))
+}
+
+fn is_derive_attribute(node: Node<'_>, source: &str) -> bool {
+    let Some(text) = node_text(node, source)
+        .map(str::trim_start)
+        .and_then(|text| text.strip_prefix("#["))
+    else {
+        return false;
+    };
+    let attribute = text.trim_start();
+    attribute
+        .strip_prefix("derive")
+        .and_then(|suffix| suffix.chars().next())
+        .is_some_and(|character| character.is_whitespace() || character == '(')
+        || (attribute.starts_with("cfg_attr") && attribute.contains("derive"))
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {

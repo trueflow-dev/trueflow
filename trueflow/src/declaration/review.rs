@@ -11,13 +11,17 @@ use super::diff::{
     DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic, DiffDiagnosticKind,
 };
 use super::snapshot::{SnapshotPair, SnapshotPairId, SourceSnapshot};
-use super::{Capability, DeclarationId, DeclarationKind, DeclarationNode, capabilities_for};
+use super::{
+    Capability, DeclarationFileCapability, DeclarationId, DeclarationKind, DeclarationNode,
+    capabilities_for,
+};
 
 /// One already-captured comparison and its declaration diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationReviewDiffBatch {
     snapshot_pairs: Vec<SnapshotPair>,
     diff: DeclarationDiff,
+    capability_notices: Vec<DeclarationFileCapability>,
 }
 
 impl DeclarationReviewDiffBatch {
@@ -25,7 +29,15 @@ impl DeclarationReviewDiffBatch {
         Self {
             snapshot_pairs,
             diff,
+            capability_notices: Vec::new(),
         }
+    }
+    pub fn with_capability_notices(
+        mut self,
+        capability_notices: Vec<DeclarationFileCapability>,
+    ) -> Self {
+        self.capability_notices = capability_notices;
+        self
     }
 
     pub fn snapshot_pairs(&self) -> &[SnapshotPair] {
@@ -34,6 +46,9 @@ impl DeclarationReviewDiffBatch {
 
     pub fn diff(&self) -> &DeclarationDiff {
         &self.diff
+    }
+    pub fn capability_notices(&self) -> &[DeclarationFileCapability] {
+        &self.capability_notices
     }
 }
 
@@ -97,6 +112,7 @@ pub struct CollectedDeclarationReview {
     pub status: DeclarationReviewStatus,
     pub items: Vec<CollectedDeclarationItem>,
     pub diagnostics: Vec<DiffDiagnostic>,
+    pub capability_notices: Vec<DeclarationFileCapability>,
     pub canonical_order: Vec<DeclarationId>,
 }
 
@@ -115,12 +131,14 @@ pub fn collect_declaration_review(
 ) -> Result<CollectedDeclarationReview> {
     let mut ordered_items = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut capability_notices = Vec::new();
     let mut unsupported_languages = Vec::new();
     let mut reviewable_unit_count = 0usize;
     let coverage = DeclarationCoverageIndex::build(&query.batches, &query.records)?;
 
     for (batch_ordinal, batch) in query.batches.iter().enumerate() {
         diagnostics.extend(batch.diff.diagnostics.iter().cloned());
+        capability_notices.extend(batch.capability_notices.iter().cloned());
         collect_unsupported_languages(batch, &mut unsupported_languages);
 
         for unit in &batch.diff.units {
@@ -191,6 +209,9 @@ pub fn collect_declaration_review(
 
     unsupported_languages.sort_unstable_by_key(|language| language_sort_key(*language));
     unsupported_languages.dedup();
+    capability_notices.sort_by(|left, right| left.path.cmp(&right.path));
+    capability_notices
+        .dedup_by(|left, right| left.path == right.path && left.language == right.language);
 
     let items = ordered_items
         .into_iter()
@@ -220,6 +241,7 @@ pub fn collect_declaration_review(
         status,
         items,
         diagnostics,
+        capability_notices,
         canonical_order,
     })
 }
