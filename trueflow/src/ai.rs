@@ -3,6 +3,7 @@ use crate::block::BlockKind;
 use crate::config::{AiConfig, AiProviderConfig};
 use crate::hashing::TreeHash;
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -54,7 +55,7 @@ impl AiAvailability {
         match self {
             Self::Disabled { detected } if detected.is_empty() => "AI: off".to_string(),
             Self::Disabled { detected } => format!(
-                "AI: off ({} detected; set [ai].enabled = true)",
+                "AI: off ({} detected; set [ai].mode = \"review_plan\")",
                 provider_list(detected)
             ),
             Self::Ready { provider, model } if model == "auto" => {
@@ -164,6 +165,276 @@ impl AiSuggestionRequest {
             context,
             prompt,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReviewPlanBlock {
+    pub block_id: String,
+    pub path: String,
+    pub language: Language,
+    pub block_kind: BlockKind,
+    pub block_hash: TreeHash,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReviewPlanCoverage {
+    pub total_blocks: usize,
+    pub presented_blocks: usize,
+    pub excerpted_blocks: usize,
+    pub excerpt_lines: usize,
+}
+
+impl AiReviewPlanCoverage {
+    pub const fn is_partial(&self) -> bool {
+        self.presented_blocks < self.total_blocks || self.excerpted_blocks < self.presented_blocks
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReviewPlanRequest {
+    pub review_set_hash: TreeHash,
+    pub coverage: AiReviewPlanCoverage,
+    pub prompt: String,
+}
+
+impl AiReviewPlanRequest {
+    pub fn new(
+        review_set_hash: TreeHash,
+        scope_label: &str,
+        blocks: &[AiReviewPlanBlock],
+        max_context_lines: usize,
+    ) -> Self {
+        const MAX_BLOCKS: usize = 120;
+        const MAX_LINES_PER_BLOCK: usize = 12;
+
+        let total_blocks = blocks.len();
+        let presented_blocks = total_blocks.min(MAX_BLOCKS);
+        let mut remaining_lines = max_context_lines.max(1);
+        let mut excerpted_blocks = 0;
+        let mut excerpt_lines = 0;
+        let presented = blocks
+            .iter()
+            .take(presented_blocks)
+            .enumerate()
+            .map(|(index, source)| {
+                let mut block = source.clone();
+                block.block_id = format!("B{:04}", index + 1);
+                let lines = block
+                    .content
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let included_lines = lines.len().min(MAX_LINES_PER_BLOCK).min(remaining_lines);
+                if included_lines > 0 {
+                    excerpted_blocks += 1;
+                    excerpt_lines += included_lines;
+                    remaining_lines -= included_lines;
+                }
+                (
+                    block,
+                    lines.into_iter().take(included_lines).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let coverage = AiReviewPlanCoverage {
+            total_blocks,
+            presented_blocks,
+            excerpted_blocks,
+            excerpt_lines,
+        };
+        let prompt = build_review_plan_prompt(&review_set_hash, scope_label, &coverage, &presented);
+
+        Self {
+            review_set_hash,
+            coverage,
+            prompt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReviewPlan {
+    pub summary: String,
+    pub global_checks: Vec<String>,
+    pub priority_blocks: Vec<AiReviewPlanPriority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReviewPlanPriority {
+    pub block_id: String,
+    pub reason: String,
+    pub checks: Vec<String>,
+}
+
+impl AiReviewPlan {
+    pub fn from_provider_text(raw: &str) -> Result<Self> {
+        let wire: AiReviewPlanWire = serde_json::from_str(raw.trim())
+            .map_err(|error| anyhow!("AI review plan must be exactly one JSON object: {error}"))?;
+        let summary = normalize_plan_value(&wire.summary, 240);
+        if summary.is_empty() {
+            return Err(anyhow!("AI review plan returned a blank summary"));
+        }
+
+        let mut global_checks = Vec::new();
+        for check in wire.global_checks {
+            let check = normalize_plan_value(&check, 160);
+            if !check.is_empty() && !global_checks.contains(&check) {
+                global_checks.push(check);
+            }
+            if global_checks.len() == 6 {
+                break;
+            }
+        }
+
+        let mut priority_blocks = Vec::new();
+        for priority in wire.priority_blocks {
+            let block_id = normalize_plan_value(&priority.block_id, 160);
+            let reason = normalize_plan_value(&priority.reason, 160);
+            if block_id.is_empty() || reason.is_empty() {
+                continue;
+            }
+            let mut checks = Vec::new();
+            for check in priority.checks {
+                let check = normalize_plan_value(&check, 160);
+                if !check.is_empty() && !checks.contains(&check) {
+                    checks.push(check);
+                }
+                if checks.len() == 3 {
+                    break;
+                }
+            }
+            priority_blocks.push(AiReviewPlanPriority {
+                block_id,
+                reason,
+                checks,
+            });
+            if priority_blocks.len() == 8 {
+                break;
+            }
+        }
+
+        Ok(Self {
+            summary,
+            global_checks,
+            priority_blocks,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiReviewPlanWire {
+    summary: String,
+    global_checks: Vec<String>,
+    priority_blocks: Vec<AiReviewPlanPriorityWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiReviewPlanPriorityWire {
+    block_id: String,
+    reason: String,
+    checks: Vec<String>,
+}
+
+fn normalize_plan_value(raw: &str, max_chars: usize) -> String {
+    truncate_for_modeline(&collapse_whitespace(raw), max_chars)
+}
+
+fn build_review_plan_prompt(
+    review_set_hash: &TreeHash,
+    scope_label: &str,
+    coverage: &AiReviewPlanCoverage,
+    presented: &[(AiReviewPlanBlock, Vec<String>)],
+) -> String {
+    let suffix = if coverage.is_partial() {
+        " (partial)"
+    } else {
+        " (all)"
+    };
+    let mut manifest = String::new();
+    for (block, excerpt) in presented {
+        let line_start = block.start_line.saturating_add(1);
+        let line_end = block.end_line.max(block.start_line.saturating_add(1));
+        manifest.push_str(&format!(
+            "\n- {}\n  Path: {}\n  Language: {:?}\n  Block kind: {}\n  Block hash: {}\n  Lines: {line_start}-{line_end}\n",
+            block.block_id,
+            block.path,
+            block.language,
+            block.block_kind.as_str(),
+            block.block_hash,
+        ));
+        if excerpt.is_empty() {
+            manifest.push_str("  Excerpt: (excerpt omitted by context budget)\n");
+        } else {
+            manifest.push_str("  Excerpt:\n```\n");
+            for line in excerpt {
+                manifest.push_str(line);
+                manifest.push('\n');
+            }
+            manifest.push_str("```\n");
+        }
+    }
+
+    format!(
+        "Prepare a targeted review briefing using only the supplied context.\n\
+Review-set hash: {review_set_hash}\n\
+Scope: {scope_label}\n\
+Context: {presented}/{total} blocks listed{suffix}; {excerpt_lines} excerpt lines across {excerpted} blocks\n\
+Manifest:{manifest}\n\
+Return exactly one JSON object with no Markdown and exactly these keys:\n\
+{{\n\
+  \"summary\": \"one concise review briefing\",\n\
+  \"global_checks\": [\"cross-cutting invariant to verify\"],\n\
+  \"priority_blocks\": [\n\
+    {{\n\
+      \"block_id\": \"B0001\",\n\
+      \"reason\": \"why this block should be reviewed early\",\n\
+      \"checks\": [\"specific question or invariant for this block\"]\n\
+    }}\n\
+  ]\n\
+}}\n\
+Use only the supplied context. Do not run tools or inspect other files. Copy block IDs verbatim.\n\
+Return at most eight priority blocks. Avoid style-only or speculative advice.\n\
+Do not include Markdown fences or any text outside the JSON object.",
+        presented = coverage.presented_blocks,
+        total = coverage.total_blocks,
+        excerpt_lines = coverage.excerpt_lines,
+        excerpted = coverage.excerpted_blocks,
+    )
+}
+
+pub trait AiReviewPlanProvider: Send + Sync {
+    fn plan(&self, request: &AiReviewPlanRequest) -> Result<AiReviewPlan>;
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandAiReviewPlanProvider {
+    provider: AiProvider,
+    model: String,
+}
+
+impl CommandAiReviewPlanProvider {
+    pub fn new(provider: AiProvider, model: String) -> Result<Self> {
+        if !matches!(provider, AiProvider::ClaudeCli | AiProvider::CodexCli) {
+            return Err(anyhow!(
+                "{} does not have a CLI review-plan provider",
+                provider.label()
+            ));
+        }
+        Ok(Self { provider, model })
+    }
+}
+
+impl AiReviewPlanProvider for CommandAiReviewPlanProvider {
+    fn plan(&self, request: &AiReviewPlanRequest) -> Result<AiReviewPlan> {
+        let invocation = cli_invocation_for_review_plan(self.provider, &self.model, request)?;
+        let output = run_cli_invocation(&invocation)?;
+        AiReviewPlan::from_provider_text(&output.text)
     }
 }
 
@@ -340,6 +611,22 @@ pub fn cli_invocation_for_request(
     cli_invocation_for_request_with_session(provider, model, request, None)
 }
 
+pub fn cli_invocation_for_review_plan(
+    provider: AiProvider,
+    model: &str,
+    request: &AiReviewPlanRequest,
+) -> Result<AiCliInvocation> {
+    let prompt = request.prompt.clone();
+    match provider {
+        AiProvider::CodexCli => Ok(codex_review_plan_invocation(model, prompt)),
+        AiProvider::ClaudeCli => Ok(claude_invocation(model, prompt, None)),
+        AiProvider::Anthropic | AiProvider::OpenAi => Err(anyhow!(
+            "{} direct API review plans are not implemented yet",
+            provider.label()
+        )),
+    }
+}
+
 fn cli_invocation_for_request_with_session(
     provider: AiProvider,
     model: &str,
@@ -424,13 +711,46 @@ fn codex_invocation(model: &str, prompt: String, session_id: Option<&str>) -> Ai
     }
 }
 
+fn codex_review_plan_invocation(model: &str, prompt: String) -> AiCliInvocation {
+    let final_message_path = temporary_codex_final_message_path_with_prefix("review-plan");
+    let mut args = vec![
+        "exec".to_string(),
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "--color".to_string(),
+        "never".to_string(),
+        "--json".to_string(),
+        "-c".to_string(),
+        "model_reasoning_effort=\"medium\"".to_string(),
+        "--output-last-message".to_string(),
+        final_message_path.to_string_lossy().to_string(),
+    ];
+    if model != "auto" {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    args.push("-".to_string());
+    AiCliInvocation {
+        program: "codex".to_string(),
+        args,
+        stdin: prompt,
+        final_message_path: Some(final_message_path),
+        output_format: AiCliOutputFormat::CodexJson,
+    }
+}
+
 fn temporary_codex_final_message_path() -> PathBuf {
+    temporary_codex_final_message_path_with_prefix("hint")
+}
+
+fn temporary_codex_final_message_path_with_prefix(prefix: &str) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     std::env::temp_dir().join(format!(
-        "trueflow-codex-hint-{}-{now}.txt",
+        "trueflow-codex-{prefix}-{}-{now}.txt",
         std::process::id()
     ))
 }
@@ -824,7 +1144,7 @@ impl AiEnvironment {
 
 pub fn resolve_ai_availability(config: &AiConfig, env: &AiEnvironment) -> AiAvailability {
     let detected = env.detected_providers();
-    if !config.enabled {
+    if !config.mode.review_plan_enabled() && !config.mode.block_hints_enabled() {
         return AiAvailability::Disabled { detected };
     }
 
@@ -945,10 +1265,11 @@ fn executable_candidate_exists(directory: &Path, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AiMode;
 
-    fn config(enabled: bool, provider: AiProviderConfig) -> AiConfig {
+    fn config(mode: AiMode, provider: AiProviderConfig) -> AiConfig {
         AiConfig {
-            enabled,
+            mode,
             provider,
             model: "auto".to_string(),
             max_context_lines: 80,
@@ -1333,6 +1654,137 @@ mod tests {
         );
     }
 
+    fn review_plan_block(index: usize, content: String) -> AiReviewPlanBlock {
+        AiReviewPlanBlock {
+            block_id: String::new(),
+            path: format!("src/file_{index}.rs"),
+            language: Language::Rust,
+            block_kind: BlockKind::Function,
+            block_hash: TreeHash::from_content(&content),
+            start_line: index + 1,
+            end_line: index + 3,
+            content,
+        }
+    }
+
+    fn review_plan_request(
+        blocks: &[AiReviewPlanBlock],
+        max_context_lines: usize,
+    ) -> AiReviewPlanRequest {
+        AiReviewPlanRequest::new(
+            TreeHash::from_content("review-set"),
+            "changed files",
+            blocks,
+            max_context_lines,
+        )
+    }
+
+    #[test]
+    fn review_plan_prompt_contains_scope_hash_coverage_manifest_and_json_contract() {
+        let blocks = vec![review_plan_block(0, "fn first() {}\n".to_string())];
+        let request = review_plan_request(&blocks, 80);
+
+        assert!(request.prompt.contains("Review-set hash:"));
+        assert!(request.prompt.contains("Scope: changed files"));
+        assert!(request.prompt.contains("Context: 1/1 blocks listed (all)"));
+        assert!(request.prompt.contains("B0001"));
+        assert!(request.prompt.contains("src/file_0.rs"));
+        assert!(request.prompt.contains("\"summary\""));
+        assert!(request.prompt.contains("\"global_checks\""));
+        assert!(request.prompt.contains("\"priority_blocks\""));
+        assert!(request.prompt.contains("exactly one JSON object"));
+        assert!(request.prompt.contains("Do not run tools"));
+    }
+
+    #[test]
+    fn review_plan_request_enforces_block_and_excerpt_bounds() {
+        let blocks = (0..125)
+            .map(|index| review_plan_block(index, "a\nb\nc\nd\ne\nf\n".to_string()))
+            .collect::<Vec<_>>();
+        let request = review_plan_request(&blocks, 5);
+
+        assert_eq!(request.coverage.total_blocks, 125);
+        assert_eq!(request.coverage.presented_blocks, 120);
+        assert_eq!(request.coverage.excerpted_blocks, 1);
+        assert_eq!(request.coverage.excerpt_lines, 5);
+        assert!(request.coverage.is_partial());
+        assert!(request.prompt.contains("B0001"));
+        assert!(request.prompt.contains("B0120"));
+        assert!(!request.prompt.contains("B0121"));
+        assert!(
+            request
+                .prompt
+                .contains("(excerpt omitted by context budget)")
+        );
+        assert!(!request.prompt.contains("B0001\nPath: src/file_0.rs"));
+    }
+
+    #[test]
+    fn review_plan_response_is_strictly_parsed_and_normalized() {
+        let plan = AiReviewPlan::from_provider_text(
+            r#"{
+                "summary": "  concise briefing  ",
+                "global_checks": [" check one ", "check one", " ", "check two"],
+                "priority_blocks": [{
+                    "block_id": " B0001 ",
+                    "reason": " reason ",
+                    "checks": [" check ", "check", ""]
+                }]
+            }"#,
+        )
+        .unwrap_or_else(|error| panic!("parse review plan: {error}"));
+
+        assert_eq!(plan.summary, "concise briefing");
+        assert_eq!(plan.global_checks, vec!["check one", "check two"]);
+        assert_eq!(plan.priority_blocks[0].block_id, "B0001");
+        assert_eq!(plan.priority_blocks[0].checks, vec!["check"]);
+
+        let unknown = AiReviewPlan::from_provider_text(
+            r#"{"summary":"ok","global_checks":[],"priority_blocks":[],"extra":true}"#,
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn review_plan_response_rejects_malformed_or_blank_summary() {
+        for raw in [
+            "",
+            "not json",
+            r#"{"summary":" ","global_checks":[],"priority_blocks":[]}"#,
+        ] {
+            assert!(
+                AiReviewPlan::from_provider_text(raw).is_err(),
+                "expected rejection for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_plan_cli_invocation_is_fresh_read_only_medium_effort() {
+        let blocks = vec![review_plan_block(0, "fn first() {}".to_string())];
+        let request = review_plan_request(&blocks, 80);
+        let invocation =
+            cli_invocation_for_review_plan(AiProvider::CodexCli, "gpt-5.6-sol", &request)
+                .unwrap_or_else(|error| panic!("build review-plan invocation: {error}"));
+
+        assert_eq!(invocation.program, "codex");
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|args| args == ["--sandbox", "read-only"])
+        );
+        assert!(
+            invocation
+                .args
+                .iter()
+                .any(|arg| arg == r#"model_reasoning_effort="medium""#)
+        );
+        assert!(!invocation.args.iter().any(|arg| arg == "resume"));
+        assert!(invocation.stdin.contains("B0001"));
+    }
+
     #[test]
     fn effective_model_uses_fast_provider_default_for_auto_model() {
         assert_eq!(
@@ -1367,18 +1819,20 @@ mod tests {
     #[test]
     fn disabled_modeline_mentions_detected_providers_without_enabling_calls() {
         let env = AiEnvironment::for_tests(true, false, ["claude"]);
-        let availability = resolve_ai_availability(&config(false, AiProviderConfig::Auto), &env);
+        let availability =
+            resolve_ai_availability(&config(AiMode::Off, AiProviderConfig::Auto), &env);
 
         assert_eq!(
             availability.modeline_text(),
-            "AI: off (Anthropic, Claude CLI detected; set [ai].enabled = true)"
+            "AI: off (Anthropic, Claude CLI detected; set [ai].mode = \"review_plan\")"
         );
     }
 
     #[test]
     fn auto_provider_selects_first_detected_provider_when_enabled() {
         let env = AiEnvironment::for_tests(false, true, ["claude"]);
-        let availability = resolve_ai_availability(&config(true, AiProviderConfig::Auto), &env);
+        let availability =
+            resolve_ai_availability(&config(AiMode::ReviewPlan, AiProviderConfig::Auto), &env);
 
         assert_eq!(
             availability,
@@ -1396,8 +1850,10 @@ mod tests {
     #[test]
     fn explicit_provider_reports_unavailable_when_missing() {
         let env = AiEnvironment::for_tests(false, false, []);
-        let availability =
-            resolve_ai_availability(&config(true, AiProviderConfig::Anthropic), &env);
+        let availability = resolve_ai_availability(
+            &config(AiMode::ReviewPlan, AiProviderConfig::Anthropic),
+            &env,
+        );
 
         assert_eq!(
             availability,

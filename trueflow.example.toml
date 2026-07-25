@@ -28,6 +28,16 @@ ignore_path_prefixes = []
 # Additional gitignore-style glob ignores.
 ignore_globs = []
 
+[ai]
+# AI behavior: off|review_plan|block_hints|review_plan_and_block_hints.
+mode = "off"
+# Provider selection: auto|anthropic|open_ai|claude_cli|codex_cli|none.
+provider = "auto"
+model = "auto"
+max_context_lines = 80
+# Cache block-hint responses for this session.
+cache = true
+
 [tui]
 # Review modality: blocks|declarations. Default preserves ordinary block review.
 mode = "blocks"

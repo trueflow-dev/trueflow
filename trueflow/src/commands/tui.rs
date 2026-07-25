@@ -7,9 +7,11 @@ use super::tui_terminal::{
 };
 use super::tui_terminal::{TerminalSession, TuiTerminal};
 use crate::ai::{
-    AiAvailability, AiEnvironment, AiProvider, AiReviewContext, AiReviewSetContext, AiSuggestion,
-    AiSuggestionKey, AiSuggestionProvider, AiSuggestionRequest, CommandAiSuggestionProvider,
-    DEFAULT_AI_RESPONSE_CHAR_LIMIT, resolve_ai_availability,
+    AiAvailability, AiEnvironment, AiProvider, AiReviewContext, AiReviewPlan, AiReviewPlanBlock,
+    AiReviewPlanCoverage, AiReviewPlanProvider, AiReviewPlanRequest, AiReviewSetContext,
+    AiSuggestion, AiSuggestionKey, AiSuggestionProvider, AiSuggestionRequest,
+    CommandAiReviewPlanProvider, CommandAiSuggestionProvider, DEFAULT_AI_RESPONSE_CHAR_LIMIT,
+    resolve_ai_availability,
 };
 use crate::analysis::Language;
 use crate::block::BlockKind;
@@ -21,7 +23,7 @@ use crate::commands::review::{
     review_request_from_cli_targets,
 };
 use crate::config::{
-    BatchConfirmPolicy, BlockFilters, TrueflowConfig, TuiConfig, TuiDiffFocusMode,
+    AiMode, BatchConfirmPolicy, BlockFilters, TrueflowConfig, TuiConfig, TuiDiffFocusMode,
     TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
 };
 use crate::context::TrueflowContext;
@@ -846,11 +848,14 @@ struct ReviewStateBuildOptions {
 }
 
 struct TuiAiState {
+    mode: AiMode,
     availability: Option<AiAvailability>,
     review_set: Option<AiReviewSetContext>,
     max_context_lines: usize,
     cache_enabled: bool,
-    provider: Option<Arc<dyn AiSuggestionProvider>>,
+    review_plan_provider: Option<Arc<dyn AiReviewPlanProvider>>,
+    suggestion_provider: Option<Arc<dyn AiSuggestionProvider>>,
+    priority_prefix: Vec<TreeNodeId>,
     cache: HashMap<AiSuggestionKey, AiSuggestion>,
     pending: Option<PendingAiSuggestion>,
     status: TuiAiStatus,
@@ -901,29 +906,38 @@ enum TuiAiStatus {
 impl TuiAiState {
     #[cfg(any(test, feature = "tui-test-support"))]
     fn empty() -> Self {
-        Self {
-            availability: None,
-            review_set: None,
-            max_context_lines: 80,
-            cache_enabled: true,
-            provider: None,
-            cache: HashMap::new(),
-            pending: None,
-            status: TuiAiStatus::Availability,
-        }
+        Self::for_mode(AiMode::Off, None, 80, true)
     }
 
+    #[cfg(test)]
     fn from_availability(
         availability: AiAvailability,
         max_context_lines: usize,
         cache_enabled: bool,
     ) -> Self {
+        Self::for_mode(
+            AiMode::BlockHints,
+            Some(availability),
+            max_context_lines,
+            cache_enabled,
+        )
+    }
+
+    fn for_mode(
+        mode: AiMode,
+        availability: Option<AiAvailability>,
+        max_context_lines: usize,
+        cache_enabled: bool,
+    ) -> Self {
         Self {
-            availability: Some(availability),
+            mode,
+            availability,
             review_set: None,
             max_context_lines,
             cache_enabled,
-            provider: None,
+            review_plan_provider: None,
+            suggestion_provider: None,
+            priority_prefix: Vec::new(),
             cache: HashMap::new(),
             pending: None,
             status: TuiAiStatus::Availability,
@@ -931,9 +945,12 @@ impl TuiAiState {
     }
 
     fn hint_line_text(&self) -> Option<String> {
+        if !self.mode.block_hints_enabled() {
+            return None;
+        }
         match &self.status {
             TuiAiStatus::Availability => self.availability.as_ref().map(|availability| {
-                if self.provider.is_none()
+                if self.suggestion_provider.is_none()
                     && let AiAvailability::Ready { provider, .. } = availability
                     && !matches!(provider, AiProvider::ClaudeCli | AiProvider::CodexCli)
                 {
@@ -953,6 +970,9 @@ impl TuiAiState {
     }
 
     fn current_suggestion_sentence(&self) -> Option<&str> {
+        if !self.mode.block_hints_enabled() {
+            return None;
+        }
         let TuiAiStatus::Suggestion { suggestion, .. } = &self.status else {
             return None;
         };
@@ -1370,7 +1390,7 @@ fn run_tui_review_loop(
                 return Ok(());
             };
 
-            let state = build_review_state(
+            let mut state = build_review_state(
                 context,
                 launch.review,
                 launch.scope,
@@ -1386,6 +1406,11 @@ fn run_tui_review_loop(
                     ai: tui_ai_state_for_config(config),
                 },
             )?;
+
+            match run_ai_review_kickoff(session.terminal_mut(), &mut state)? {
+                AiReviewKickoffExit::Quit => return Ok(()),
+                AiReviewKickoffExit::Continue => {}
+            }
 
             match run_app(context, &mut session, state)? {
                 AppExit::Quit => return Ok(()),
@@ -1685,14 +1710,16 @@ fn build_review_state(
     }
 
     let mut ai = options.ai;
-    ai.review_set = Some(ai_review_set_context_for_tree(
-        &navigator.tree,
-        &reviewable_nodes,
-        &diff_block_sides,
-        &review_scope,
-        &options.scope_label,
-        ai.max_context_lines,
-    ));
+    if ai.mode.block_hints_enabled() {
+        ai.review_set = Some(ai_review_set_context_for_tree(
+            &navigator.tree,
+            &reviewable_nodes,
+            &diff_block_sides,
+            &review_scope,
+            &options.scope_label,
+            ai.max_context_lines,
+        ));
+    }
 
     Ok(AppState {
         review_scope,
@@ -1743,9 +1770,20 @@ fn build_review_state(
 
 fn tui_ai_state_for_config(config: &TrueflowConfig) -> TuiAiState {
     let availability = resolve_ai_availability(&config.ai, &AiEnvironment::detect_current());
-    let mut state =
-        TuiAiState::from_availability(availability, config.ai.max_context_lines, config.ai.cache);
-    state.provider = ai_suggestion_provider_for_availability(state.availability.as_ref());
+    let mut state = TuiAiState::for_mode(
+        config.ai.mode,
+        Some(availability),
+        config.ai.max_context_lines,
+        config.ai.cache,
+    );
+    if config.ai.mode.block_hints_enabled() {
+        state.suggestion_provider =
+            ai_suggestion_provider_for_availability(state.availability.as_ref());
+    }
+    if config.ai.mode.review_plan_enabled() {
+        state.review_plan_provider =
+            ai_review_plan_provider_for_availability(state.availability.as_ref());
+    }
     state
 }
 
@@ -1761,6 +1799,635 @@ fn ai_suggestion_provider_for_availability(
     CommandAiSuggestionProvider::new(*provider, model.clone())
         .map(|provider| Arc::new(provider) as Arc<dyn AiSuggestionProvider>)
         .ok()
+}
+
+fn ai_review_plan_provider_for_availability(
+    availability: Option<&AiAvailability>,
+) -> Option<Arc<dyn AiReviewPlanProvider>> {
+    let Some(AiAvailability::Ready { provider, model }) = availability else {
+        return None;
+    };
+    CommandAiReviewPlanProvider::new(*provider, model.clone())
+        .map(|provider| Arc::new(provider) as Arc<dyn AiReviewPlanProvider>)
+        .ok()
+}
+
+fn ai_review_plan_blocks_for_state(state: &AppState) -> Vec<(TreeNodeId, AiReviewPlanBlock)> {
+    let canonical_order = ReviewOrder::from_tree(&state.navigator.tree, &state.reviewable_nodes);
+    canonical_order
+        .iter_node_ids()
+        .filter_map(|node_id| {
+            let node = state.navigator.tree.node(node_id);
+            let block = node.block.as_ref()?;
+            Some((
+                node_id,
+                AiReviewPlanBlock {
+                    block_id: String::new(),
+                    path: node.path.as_str().to_string(),
+                    language: node.language.unwrap_or_default(),
+                    block_kind: block.kind,
+                    block_hash: block.hash.clone(),
+                    start_line: block.start_line,
+                    end_line: block.end_line,
+                    content: ai_block_context_content(
+                        &block.content,
+                        state.diff_block_sides.get(&node_id),
+                    ),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn ai_review_plan_hash(state: &AppState, blocks: &[(TreeNodeId, AiReviewPlanBlock)]) -> TreeHash {
+    let mut input = format!(
+        "scope:{:?}\nlabel:{}\n",
+        state.review_scope, state.scope_label
+    );
+    for (node_id, block) in blocks {
+        input.push_str(&format!(
+            "{:?}:{}:{}:{}:{}:{}:{}\n",
+            node_id,
+            block.path,
+            block.start_line,
+            block.end_line,
+            block.block_kind.as_str(),
+            block.block_hash,
+            hash_str(&block.content),
+        ));
+    }
+    TreeHash::new(hash_str(&input))
+}
+
+fn ai_review_plan_request_for_state(state: &AppState) -> Option<AiReviewPlanRequest> {
+    if !state.ai.mode.review_plan_enabled() {
+        return None;
+    }
+    let blocks = ai_review_plan_blocks_for_state(state);
+    if blocks.is_empty() {
+        return None;
+    }
+    let review_set_hash = ai_review_plan_hash(state, &blocks);
+    let plan_blocks = blocks
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect::<Vec<_>>();
+    Some(AiReviewPlanRequest::new(
+        review_set_hash,
+        &state.scope_label,
+        &plan_blocks,
+        state.ai.max_context_lines,
+    ))
+}
+
+fn ai_review_plan_presented_node_ids(state: &AppState) -> Vec<TreeNodeId> {
+    ai_review_plan_blocks_for_state(state)
+        .into_iter()
+        .take(120)
+        .map(|(node_id, _)| node_id)
+        .collect()
+}
+
+fn apply_ai_review_plan_priorities(state: &mut AppState, plan: &AiReviewPlan) {
+    let presented = ai_review_plan_presented_node_ids(state);
+    let mut seen = HashSet::new();
+    let mut prefix = Vec::new();
+    for priority in &plan.priority_blocks {
+        let Some(node_id) = presented
+            .iter()
+            .enumerate()
+            .find(|(index, _)| format!("B{:04}", index + 1) == priority.block_id)
+            .map(|(_, node_id)| *node_id)
+        else {
+            continue;
+        };
+        if seen.insert(node_id) {
+            prefix.push(node_id);
+        }
+    }
+
+    state.ai.priority_prefix = prefix.clone();
+    state.review_order = ReviewOrder::from_tree_with_priority_prefix(
+        &state.navigator.tree,
+        &state.reviewable_nodes,
+        &prefix,
+    );
+    reset_review_focus_to_first_block(state);
+}
+
+fn clear_ai_review_plan_priorities(state: &mut AppState) {
+    state.ai.priority_prefix.clear();
+    state.review_order = ReviewOrder::from_tree(&state.navigator.tree, &state.reviewable_nodes);
+    reset_review_focus_to_first_block(state);
+}
+
+fn reset_review_focus_to_first_block(state: &mut AppState) {
+    let Some(first_block) = state.review_order.first_reviewable_block() else {
+        state.focus_block = None;
+        state.root_cursor = None;
+        state.navigator.jump_root();
+        state.scroll_offset = 0;
+        state.pending_focus_scroll = false;
+        return;
+    };
+    state.navigator.set_current(first_block);
+    state.root_cursor = root_child_for_node(&state.navigator.tree, first_block);
+    state.focus_block = Some(first_block);
+    state.scroll_offset = 0;
+    state.pending_focus_scroll = true;
+    sync_speed_read_focus(state);
+}
+
+fn ai_review_plan_coverage_line(coverage: &AiReviewPlanCoverage) -> String {
+    let suffix = if coverage.is_partial() {
+        " (partial)"
+    } else {
+        " (all)"
+    };
+    format!(
+        "Context: {}/{} blocks listed{}; {} excerpt lines across {} blocks",
+        coverage.presented_blocks,
+        coverage.total_blocks,
+        suffix,
+        coverage.excerpt_lines,
+        coverage.excerpted_blocks,
+    )
+}
+
+fn ai_review_plan_lines(
+    state: &AppState,
+    plan: &AiReviewPlan,
+    coverage: &AiReviewPlanCoverage,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(ai_review_plan_coverage_line(coverage)),
+        Line::from(""),
+        Line::from("Review summary"),
+        Line::from(plan.summary.clone()),
+        Line::from(""),
+        Line::from("Things to look at"),
+    ];
+    if plan.global_checks.is_empty() {
+        lines.push(Line::from("(none)"));
+    } else {
+        lines.extend(
+            plan.global_checks
+                .iter()
+                .map(|check| Line::from(format!("• {check}"))),
+        );
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Targeted order"));
+
+    let presented = ai_review_plan_presented_node_ids(state);
+    let mut rendered_priority = 0;
+    for priority in &plan.priority_blocks {
+        let Some((_, node_id)) = presented
+            .iter()
+            .enumerate()
+            .find(|(index, _)| format!("B{:04}", index + 1) == priority.block_id)
+        else {
+            continue;
+        };
+        rendered_priority += 1;
+        let node = state.navigator.tree.node(*node_id);
+        let block = node.block.as_ref();
+        let (line_start, line_end) = block
+            .map(|block| {
+                (
+                    block.start_line.saturating_add(1),
+                    block.end_line.max(block.start_line.saturating_add(1)),
+                )
+            })
+            .unwrap_or((0, 0));
+        lines.push(Line::from(format!(
+            "{}. {} — lines {line_start}-{line_end}",
+            rendered_priority, node.path,
+        )));
+        lines.push(Line::from(format!("   {}", priority.reason)));
+        for check in &priority.checks {
+            lines.push(Line::from(format!("   • {check}")));
+        }
+    }
+    if rendered_priority == 0 {
+        lines.push(Line::from("(none; canonical order unchanged)"));
+    }
+    lines
+}
+
+fn render_ai_review_plan_screen(
+    frame: &mut Frame,
+    state: &AppState,
+    plan: &AiReviewPlan,
+    coverage: &AiReviewPlanCoverage,
+    scroll: u16,
+) {
+    let area = frame.area();
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let palette = UiPalette::default();
+    frame.render_widget(
+        Paragraph::new(ai_review_plan_lines(state, plan, coverage))
+            .block(
+                UiBlock::default()
+                    .title(" AI review briefing ")
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .style(Style::default().bg(palette.code_bg).fg(palette.fg)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(ai_review_plan_ready_footer(&state.keybinds))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(palette.bg).fg(palette.fg)),
+        chunks[1],
+    );
+}
+
+fn ai_review_plan_ready_footer(keybinds: &TuiKeybindsConfig) -> String {
+    format!(
+        "{}/{} scroll  •  Enter start targeted order  •  Esc canonical order  •  {} quit",
+        keybinds.scroll_down, keybinds.scroll_up, keybinds.quit,
+    )
+}
+
+fn ai_review_plan_scroll_limit(
+    area: Rect,
+    state: &AppState,
+    plan: &AiReviewPlan,
+    coverage: &AiReviewPlanCoverage,
+) -> u16 {
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let lines = ai_review_plan_lines(state, plan, coverage);
+    let (content_lines, _) =
+        wrapped_display_metrics_for_lines(&lines, None, chunks[0].width.saturating_sub(2));
+    usize_to_u16_saturating(content_lines.saturating_sub(chunks[0].height.saturating_sub(2).into()))
+}
+
+fn ai_review_plan_viewport_height(area: Rect) -> u16 {
+    Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area)[0]
+        .height
+        .saturating_sub(2)
+}
+
+fn render_ai_review_kickoff_status(
+    frame: &mut Frame,
+    _state: &AppState,
+    coverage: &AiReviewPlanCoverage,
+    title: &str,
+    message: &str,
+    footer: &str,
+) {
+    let area = frame.area();
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let palette = UiPalette::default();
+    let lines = vec![
+        Line::from(message.to_string()),
+        Line::from(""),
+        Line::from(ai_review_plan_coverage_line(coverage)),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                UiBlock::default()
+                    .title(format!(" {title} "))
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .style(Style::default().bg(palette.code_bg).fg(palette.fg)),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(footer.to_string())
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(palette.bg).fg(palette.fg)),
+        chunks[1],
+    );
+}
+
+fn render_ai_review_kickoff_loading(
+    frame: &mut Frame,
+    state: &AppState,
+    coverage: &AiReviewPlanCoverage,
+    frame_index: usize,
+) {
+    let message = format!(
+        "{}  Planning a targeted review…",
+        ai_loading_hint_text(frame_index)
+    );
+    let footer = format!("Esc canonical order  •  {} quit", state.keybinds.quit);
+    render_ai_review_kickoff_status(
+        frame,
+        state,
+        coverage,
+        "AI review briefing",
+        &message,
+        &footer,
+    );
+}
+
+fn render_ai_review_plan_unavailable(
+    frame: &mut Frame,
+    state: &AppState,
+    coverage: &AiReviewPlanCoverage,
+    message: &str,
+) {
+    let message = format!("AI review plan unavailable: {message}");
+    let footer = format!("Enter/Esc canonical order  •  {} quit", state.keybinds.quit);
+    render_ai_review_kickoff_status(
+        frame,
+        state,
+        coverage,
+        "AI review briefing",
+        &message,
+        &footer,
+    );
+}
+
+enum AiReviewKickoffExit {
+    Continue,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiReviewKickoffKeyAction {
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    StartTargeted,
+    StartCanonical,
+    Quit,
+    Ignore,
+}
+
+fn ai_review_kickoff_key_action(
+    key_code: KeyCode,
+    keybinds: &TuiKeybindsConfig,
+) -> AiReviewKickoffKeyAction {
+    match key_code {
+        KeyCode::Char(ch) if ch == keybinds.quit => AiReviewKickoffKeyAction::Quit,
+        KeyCode::Enter => AiReviewKickoffKeyAction::StartTargeted,
+        KeyCode::Esc => AiReviewKickoffKeyAction::StartCanonical,
+        KeyCode::Char(ch) if ch == keybinds.scroll_down => AiReviewKickoffKeyAction::ScrollDown,
+        KeyCode::Down => AiReviewKickoffKeyAction::ScrollDown,
+        KeyCode::Char(ch) if ch == keybinds.scroll_up => AiReviewKickoffKeyAction::ScrollUp,
+        KeyCode::Up => AiReviewKickoffKeyAction::ScrollUp,
+        KeyCode::PageDown => AiReviewKickoffKeyAction::PageDown,
+        KeyCode::PageUp => AiReviewKickoffKeyAction::PageUp,
+        KeyCode::Home => AiReviewKickoffKeyAction::Home,
+        KeyCode::End => AiReviewKickoffKeyAction::End,
+        _ => AiReviewKickoffKeyAction::Ignore,
+    }
+}
+
+fn ai_review_kickoff_key_action_for_event(
+    key_event: KeyEvent,
+    keybinds: &TuiKeybindsConfig,
+) -> Option<AiReviewKickoffKeyAction> {
+    if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    Some(ai_review_kickoff_key_action(key_event.code, keybinds))
+}
+
+type AiReviewPlanWorkerResult = std::result::Result<AiReviewPlan, String>;
+
+fn start_ai_review_plan_worker<SpawnFn, WorkerHandle>(
+    provider: Arc<dyn AiReviewPlanProvider>,
+    request: AiReviewPlanRequest,
+    spawn: SpawnFn,
+) -> std::result::Result<mpsc::Receiver<AiReviewPlanWorkerResult>, String>
+where
+    SpawnFn: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<WorkerHandle>,
+{
+    let (sender, receiver) = mpsc::channel();
+    let worker = Box::new(move || {
+        let result = provider
+            .plan(&request)
+            .map_err(|error| truncate_ai_error(&error.to_string()));
+        let _ = sender.send(result);
+    });
+    spawn(worker)
+        .map_err(|error| truncate_ai_error(&format!("failed to start provider worker: {error}")))?;
+    Ok(receiver)
+}
+
+fn ai_review_plan_unavailable_message(state: &AppState) -> String {
+    match state.ai.availability.as_ref() {
+        Some(AiAvailability::Unavailable { reason, .. }) => reason.clone(),
+        Some(AiAvailability::Ready { provider, .. }) => format!(
+            "{} review plans are not available through the configured direct API provider",
+            provider.label()
+        ),
+        Some(AiAvailability::Disabled { .. }) | None => {
+            "AI review plan provider unavailable".to_string()
+        }
+    }
+}
+
+fn run_ai_review_kickoff(
+    terminal: &mut TuiTerminal,
+    state: &mut AppState,
+) -> Result<AiReviewKickoffExit> {
+    if !state.ai.mode.review_plan_enabled() || state.reviewable_nodes.is_empty() {
+        return Ok(AiReviewKickoffExit::Continue);
+    }
+    let Some(request) = ai_review_plan_request_for_state(state) else {
+        return Ok(AiReviewKickoffExit::Continue);
+    };
+    let coverage = request.coverage.clone();
+    let Some(provider) = state.ai.review_plan_provider.clone() else {
+        let message = ai_review_plan_unavailable_message(state);
+        return run_ai_review_plan_unavailable(terminal, state, &coverage, &message);
+    };
+    let receiver = match start_ai_review_plan_worker(provider, request, |worker| {
+        thread::Builder::new()
+            .name("trueflow-ai-review-plan".to_string())
+            .spawn(worker)
+    }) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            return run_ai_review_plan_unavailable(terminal, state, &coverage, &error);
+        }
+    };
+
+    let mut event_pump = EventPump::default();
+    let mut frame_index = 0;
+    let mut next_frame_at = Instant::now() + AI_LOADING_FRAME_INTERVAL;
+    loop {
+        terminal.draw(|frame| {
+            render_ai_review_kickoff_loading(frame, state, &coverage, frame_index);
+        })?;
+
+        match receiver.try_recv() {
+            Ok(Ok(plan)) => {
+                apply_ai_review_plan_priorities(state, &plan);
+                return run_ai_review_plan_ready(terminal, state, &coverage, &plan);
+            }
+            Ok(Err(error)) => {
+                return run_ai_review_plan_unavailable(terminal, state, &coverage, &error);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return run_ai_review_plan_unavailable(
+                    terminal,
+                    state,
+                    &coverage,
+                    "provider worker disconnected",
+                );
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        let event = event_pump.read_with_deadline(Some(next_frame_at))?;
+        match event {
+            Some(Event::Key(key_event)) if key_event.kind == KeyEventKind::Press => {
+                match ai_review_kickoff_key_action(key_event.code, &state.keybinds) {
+                    AiReviewKickoffKeyAction::Quit => {
+                        return Ok(AiReviewKickoffExit::Quit);
+                    }
+                    AiReviewKickoffKeyAction::StartCanonical => {
+                        clear_ai_review_plan_priorities(state);
+                        return Ok(AiReviewKickoffExit::Continue);
+                    }
+                    _ => {}
+                }
+            }
+            Some(Event::Resize(_, _)) | Some(_) => {}
+            None => {
+                frame_index = frame_index.saturating_add(1);
+                next_frame_at = Instant::now() + AI_LOADING_FRAME_INTERVAL;
+            }
+        }
+    }
+}
+
+fn run_ai_review_plan_ready(
+    terminal: &mut TuiTerminal,
+    state: &mut AppState,
+    coverage: &AiReviewPlanCoverage,
+    plan: &AiReviewPlan,
+) -> Result<AiReviewKickoffExit> {
+    let mut scroll = 0;
+    let mut needs_render = true;
+    loop {
+        if needs_render {
+            terminal.draw(|frame| {
+                render_ai_review_plan_screen(frame, state, plan, coverage, scroll);
+            })?;
+            needs_render = false;
+        }
+        let event = event::read()?;
+        match event {
+            Event::Key(key_event) => {
+                let Some(action) =
+                    ai_review_kickoff_key_action_for_event(key_event, &state.keybinds)
+                else {
+                    continue;
+                };
+                match action {
+                    AiReviewKickoffKeyAction::Quit => {
+                        return Ok(AiReviewKickoffExit::Quit);
+                    }
+                    AiReviewKickoffKeyAction::StartTargeted => {
+                        return Ok(AiReviewKickoffExit::Continue);
+                    }
+                    AiReviewKickoffKeyAction::StartCanonical => {
+                        clear_ai_review_plan_priorities(state);
+                        return Ok(AiReviewKickoffExit::Continue);
+                    }
+                    AiReviewKickoffKeyAction::ScrollDown => {
+                        let size = terminal.size()?;
+                        let limit = ai_review_plan_scroll_limit(
+                            Rect::new(0, 0, size.width, size.height),
+                            state,
+                            plan,
+                            coverage,
+                        );
+                        scroll = scroll.saturating_add(1).min(limit);
+                        needs_render = true;
+                    }
+                    AiReviewKickoffKeyAction::ScrollUp => {
+                        scroll = scroll.saturating_sub(1);
+                        needs_render = true;
+                    }
+                    AiReviewKickoffKeyAction::PageDown => {
+                        let size = terminal.size()?;
+                        let area = Rect::new(0, 0, size.width, size.height);
+                        let limit = ai_review_plan_scroll_limit(area, state, plan, coverage);
+                        scroll = scroll
+                            .saturating_add(ai_review_plan_viewport_height(area))
+                            .min(limit);
+                        needs_render = true;
+                    }
+                    AiReviewKickoffKeyAction::PageUp => {
+                        let size = terminal.size()?;
+                        scroll = scroll.saturating_sub(ai_review_plan_viewport_height(Rect::new(
+                            0,
+                            0,
+                            size.width,
+                            size.height,
+                        )));
+                        needs_render = true;
+                    }
+                    AiReviewKickoffKeyAction::Home => {
+                        scroll = 0;
+                        needs_render = true;
+                    }
+                    AiReviewKickoffKeyAction::End => {
+                        let size = terminal.size()?;
+                        scroll = ai_review_plan_scroll_limit(
+                            Rect::new(0, 0, size.width, size.height),
+                            state,
+                            plan,
+                            coverage,
+                        );
+                        needs_render = true;
+                    }
+                    AiReviewKickoffKeyAction::Ignore => {}
+                }
+            }
+            Event::Resize(_, _) => needs_render = true,
+            _ => {}
+        }
+    }
+}
+
+fn run_ai_review_plan_unavailable(
+    terminal: &mut TuiTerminal,
+    state: &mut AppState,
+    coverage: &AiReviewPlanCoverage,
+    message: &str,
+) -> Result<AiReviewKickoffExit> {
+    let mut needs_render = true;
+    loop {
+        if needs_render {
+            terminal.draw(|frame| {
+                render_ai_review_plan_unavailable(frame, state, coverage, message);
+            })?;
+            needs_render = false;
+        }
+        match event::read()? {
+            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                match ai_review_kickoff_key_action(key_event.code, &state.keybinds) {
+                    AiReviewKickoffKeyAction::Quit => {
+                        return Ok(AiReviewKickoffExit::Quit);
+                    }
+                    AiReviewKickoffKeyAction::StartTargeted
+                    | AiReviewKickoffKeyAction::StartCanonical => {
+                        clear_ai_review_plan_priorities(state);
+                        return Ok(AiReviewKickoffExit::Continue);
+                    }
+                    _ => {}
+                }
+            }
+            Event::Resize(_, _) => needs_render = true,
+            _ => {}
+        }
+    }
 }
 
 fn root_child_for_node(tree: &Tree, node_id: TreeNodeId) -> Option<TreeNodeId> {
@@ -2340,6 +3007,9 @@ fn earliest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<In
 }
 
 fn refresh_ai_suggestion_state(state: &mut AppState) -> bool {
+    if !state.ai.mode.block_hints_enabled() {
+        return false;
+    }
     let mut changed = poll_ai_suggestion_result(state);
     if ensure_ai_suggestion_for_current_focus(state) {
         changed = true;
@@ -2411,7 +3081,7 @@ fn ensure_ai_suggestion_for_current_focus(state: &mut AppState) -> bool {
         return true;
     }
 
-    let Some(provider) = state.ai.provider.clone() else {
+    let Some(provider) = state.ai.suggestion_provider.clone() else {
         return reset_ai_status_to_availability(state);
     };
 
@@ -2690,6 +3360,9 @@ fn ai_block_context_content(display_content: &str, sides: Option<&DiffBlockSides
 }
 
 fn ai_suggestion_request_for_current_focus(state: &AppState) -> Option<AiSuggestionRequest> {
+    if !state.ai.mode.block_hints_enabled() {
+        return None;
+    }
     let AiAvailability::Ready { provider, model } = state.ai.availability.as_ref()? else {
         return None;
     };
@@ -3423,7 +4096,11 @@ fn refresh_review_state_after_refinement(state: &mut AppState, previous_remainin
         state.initial_remaining_blocks = state.initial_remaining_blocks.saturating_sub(delta);
     }
     state.remaining_blocks = next_remaining;
-    state.review_order = ReviewOrder::from_tree(&state.navigator.tree, &state.reviewable_nodes);
+    state.review_order = ReviewOrder::from_tree_with_priority_prefix(
+        &state.navigator.tree,
+        &state.reviewable_nodes,
+        &state.ai.priority_prefix,
+    );
 }
 
 fn handle_scroll_line_up(state: &mut AppState) {
@@ -7623,6 +8300,10 @@ mod focus_layout_tests {
 #[cfg(test)]
 mod diff_scope_tests {
     use super::*;
+    use crate::ai::{
+        AiReviewPlan, AiReviewPlanCoverage, AiReviewPlanPriority, AiReviewPlanProvider,
+        AiReviewPlanRequest,
+    };
     use crate::analysis::Language;
     use crate::block::{Block, BlockKind, FileState};
     use crate::block_splitter;
@@ -7642,9 +8323,405 @@ mod diff_scope_tests {
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Condvar, mpsc};
+    use std::sync::{Condvar, atomic::AtomicUsize, mpsc};
 
     struct StaticAiSuggestionProvider;
+
+    struct CountingAiSuggestionProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AiSuggestionProvider for CountingAiSuggestionProvider {
+        fn suggest(&self, _request: &AiSuggestionRequest) -> Result<AiSuggestion> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(AiSuggestion {
+                explanation: None,
+                proposed_change: Some("unexpected suggestion call".to_string()),
+            })
+        }
+    }
+
+    struct StaticAiReviewPlanProvider {
+        plan: AiReviewPlan,
+    }
+
+    impl AiReviewPlanProvider for StaticAiReviewPlanProvider {
+        fn plan(&self, _request: &AiReviewPlanRequest) -> Result<AiReviewPlan> {
+            Ok(self.plan.clone())
+        }
+    }
+
+    fn test_review_plan() -> AiReviewPlan {
+        AiReviewPlan {
+            summary: "Review the changed invariants first.".to_string(),
+            global_checks: vec!["Preserve error propagation.".to_string()],
+            priority_blocks: vec![AiReviewPlanPriority {
+                block_id: "B0001".to_string(),
+                reason: "This block establishes the shared state.".to_string(),
+                checks: vec!["Verify the state transition.".to_string()],
+            }],
+        }
+    }
+
+    #[test]
+    fn ai_review_plan_request_walks_canonical_order_and_keeps_local_coverage() {
+        let (mut state, _file, _blocks) = build_state_with_file_block_count(2);
+        state.ai.mode = crate::config::AiMode::ReviewPlan;
+        let request = ai_review_plan_request_for_state(&state)
+            .unwrap_or_else(|| panic!("expected review-plan request"));
+
+        assert_eq!(request.coverage.total_blocks, 2);
+        assert_eq!(request.coverage.presented_blocks, 2);
+        assert!(request.prompt.contains("B0001"));
+        assert!(request.prompt.contains("B0002"));
+        assert!(request.prompt.contains("Context: 2/2 blocks listed (all)"));
+    }
+
+    #[test]
+    fn ai_review_plan_applies_known_first_priorities_and_resets_focus() {
+        let (mut state, _file, block_ids) = build_state_with_file_block_count(3);
+        let plan = AiReviewPlan {
+            summary: "summary".to_string(),
+            global_checks: Vec::new(),
+            priority_blocks: vec![
+                AiReviewPlanPriority {
+                    block_id: "B0003".to_string(),
+                    reason: "late".to_string(),
+                    checks: Vec::new(),
+                },
+                AiReviewPlanPriority {
+                    block_id: "B0003".to_string(),
+                    reason: "duplicate".to_string(),
+                    checks: Vec::new(),
+                },
+                AiReviewPlanPriority {
+                    block_id: "B9999".to_string(),
+                    reason: "unknown".to_string(),
+                    checks: Vec::new(),
+                },
+                AiReviewPlanPriority {
+                    block_id: "B0001".to_string(),
+                    reason: "first".to_string(),
+                    checks: Vec::new(),
+                },
+            ],
+        };
+
+        apply_ai_review_plan_priorities(&mut state, &plan);
+
+        assert_eq!(
+            state.review_order.iter_node_ids().collect::<Vec<_>>(),
+            vec![block_ids[2], block_ids[0], block_ids[1]]
+        );
+        assert_eq!(state.focus_block, Some(block_ids[2]));
+        assert_eq!(state.navigator.current_id(), block_ids[2]);
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn ai_review_ready_screen_renders_summary_checks_and_targeted_paths() {
+        let (state, _file, _blocks) = build_state_with_file_block_count(1);
+        let plan = test_review_plan();
+        let coverage = AiReviewPlanCoverage {
+            total_blocks: 1,
+            presented_blocks: 1,
+            excerpted_blocks: 1,
+            excerpt_lines: 1,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| {
+                render_ai_review_plan_screen(frame, &state, &plan, &coverage, 0);
+            })
+            .unwrap_or_else(|error| panic!("failed to render review plan: {error}"));
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let screen = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            screen.contains("Review summary"),
+            "missing summary section:\n{screen}"
+        );
+        assert!(
+            screen.contains("Things to look at"),
+            "missing checks section:\n{screen}"
+        );
+        assert!(
+            screen.contains("Targeted order"),
+            "missing target section:\n{screen}"
+        );
+        assert!(
+            screen.contains("src/lib.rs"),
+            "missing target path:\n{screen}"
+        );
+        assert!(
+            screen.contains("shared state"),
+            "missing target reason:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn ai_review_ready_screen_numbers_targets_by_priority_order() {
+        let (state, _file, _blocks) = build_state_with_file_block_count(2);
+        let plan = AiReviewPlan {
+            summary: "Review the prioritized block.".to_string(),
+            global_checks: Vec::new(),
+            priority_blocks: vec![AiReviewPlanPriority {
+                block_id: "B0002".to_string(),
+                reason: "Review this block first.".to_string(),
+                checks: Vec::new(),
+            }],
+        };
+        let coverage = AiReviewPlanCoverage {
+            total_blocks: 2,
+            presented_blocks: 2,
+            excerpted_blocks: 2,
+            excerpt_lines: 2,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| {
+                render_ai_review_plan_screen(frame, &state, &plan, &coverage, 0);
+            })
+            .unwrap_or_else(|error| panic!("failed to render review plan: {error}"));
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            screen.contains("1. src/lib.rs"),
+            "missing first target:\n{screen}"
+        );
+        assert!(
+            !screen.contains("2. src/lib.rs"),
+            "used manifest numbering:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn review_plan_mode_does_not_start_block_hint_provider() {
+        let file_path = temp_test_file_path("tui_review_plan_mode_no_provider");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file, _block) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        state.ai = TuiAiState::for_mode(
+            crate::config::AiMode::ReviewPlan,
+            Some(AiAvailability::Ready {
+                provider: AiProvider::CodexCli,
+                model: "auto".to_string(),
+            }),
+            80,
+            true,
+        );
+        state.ai.suggestion_provider = Some(Arc::new(CountingAiSuggestionProvider {
+            calls: Arc::clone(&calls),
+        }));
+
+        assert!(!refresh_ai_suggestion_state(&mut state));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(state.ai.pending.is_none());
+    }
+
+    #[test]
+    fn refinement_rebuild_keeps_surviving_priority_prefix_ids() {
+        let (mut state, _file, block_ids) = build_state_with_file_block_count(3);
+        state.ai.priority_prefix = vec![block_ids[2], block_ids[0]];
+        state.review_order = ReviewOrder::from_tree_with_priority_prefix(
+            &state.navigator.tree,
+            &state.reviewable_nodes,
+            &state.ai.priority_prefix,
+        );
+        state.reviewable_nodes.remove(&block_ids[2]);
+
+        refresh_review_state_after_refinement(&mut state, 3);
+
+        assert_eq!(
+            state.review_order.iter_node_ids().collect::<Vec<_>>(),
+            vec![block_ids[0], block_ids[1]]
+        );
+    }
+
+    #[test]
+    fn ai_review_kickoff_key_actions_use_configured_navigation() {
+        let keybinds = TuiKeybindsConfig::default();
+
+        assert_eq!(
+            ai_review_plan_ready_footer(&keybinds),
+            "j/k scroll  •  Enter start targeted order  •  Esc canonical order  •  q quit"
+        );
+
+        assert_eq!(ai_review_plan_viewport_height(Rect::new(0, 0, 80, 24)), 21);
+
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::Char('j'), &keybinds),
+            AiReviewKickoffKeyAction::ScrollDown
+        );
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::Down, &keybinds),
+            AiReviewKickoffKeyAction::ScrollDown
+        );
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::Char('k'), &keybinds),
+            AiReviewKickoffKeyAction::ScrollUp
+        );
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::PageDown, &keybinds),
+            AiReviewKickoffKeyAction::PageDown
+        );
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::Enter, &keybinds),
+            AiReviewKickoffKeyAction::StartTargeted
+        );
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::Esc, &keybinds),
+            AiReviewKickoffKeyAction::StartCanonical
+        );
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::Char('q'), &keybinds),
+            AiReviewKickoffKeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn ai_review_kickoff_ignores_release_keys() {
+        let keybinds = TuiKeybindsConfig::default();
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+
+        assert_eq!(
+            ai_review_kickoff_key_action_for_event(release, &keybinds),
+            None
+        );
+    }
+
+    #[test]
+    fn ai_review_plan_worker_returns_provider_plan_and_reports_spawn_failure() {
+        let (mut state, _file, _blocks) = build_state_with_file_block_count(1);
+        state.ai.mode = crate::config::AiMode::ReviewPlan;
+        let request = ai_review_plan_request_for_state(&state)
+            .unwrap_or_else(|| panic!("expected review-plan request"));
+        let provider = Arc::new(StaticAiReviewPlanProvider {
+            plan: test_review_plan(),
+        });
+        let receiver = start_ai_review_plan_worker(provider, request.clone(), |worker| {
+            Ok(thread::spawn(worker))
+        })
+        .unwrap_or_else(|error| panic!("expected worker spawn: {error}"));
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_else(|error| panic!("expected provider result: {error}"))
+            .unwrap_or_else(|error| panic!("provider failed: {error}"));
+        assert_eq!(result.summary, "Review the changed invariants first.");
+
+        let provider = Arc::new(StaticAiReviewPlanProvider {
+            plan: test_review_plan(),
+        });
+        let error = match start_ai_review_plan_worker(provider, request, |_worker| {
+            Err(std::io::Error::other("thread budget exhausted"))
+                as std::io::Result<thread::JoinHandle<()>>
+        }) {
+            Ok(_) => panic!("expected worker spawn failure"),
+            Err(error) => error,
+        };
+        assert!(error.contains("thread budget exhausted"));
+    }
+
+    #[test]
+    fn ai_review_kickoff_status_screens_render_loading_and_unavailable_states() {
+        let (state, _file, _blocks) = build_state_with_file_block_count(1);
+        let coverage = AiReviewPlanCoverage {
+            total_blocks: 3,
+            presented_blocks: 2,
+            excerpted_blocks: 1,
+            excerpt_lines: 4,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 12))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+
+        terminal
+            .draw(|frame| {
+                render_ai_review_kickoff_loading(frame, &state, &coverage, 0);
+            })
+            .unwrap_or_else(|error| panic!("failed to render loading screen: {error}"));
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("AI review briefing"));
+        assert!(screen.contains("Planning a targeted review"));
+        assert!(screen.contains("Context: 2/3 blocks listed (partial)"));
+        assert!(screen.contains("Esc canonical order"));
+
+        terminal
+            .draw(|frame| {
+                render_ai_review_plan_unavailable(
+                    frame,
+                    &state,
+                    &coverage,
+                    "provider worker disconnected",
+                );
+            })
+            .unwrap_or_else(|error| panic!("failed to render unavailable screen: {error}"));
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("AI review plan unavailable: provider worker disconnected"));
+        assert!(screen.contains("Enter/Esc canonical order"));
+    }
+
+    #[test]
+    fn review_plan_mode_renders_no_per_block_ai_hint_row() {
+        let file_path = temp_test_file_path("tui_review_plan_mode_no_hint");
+        let file_content = "fn checked() {}\n";
+        let (mut state, _file, _block) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.ai = TuiAiState::for_mode(
+            crate::config::AiMode::ReviewPlan,
+            Some(AiAvailability::Ready {
+                provider: AiProvider::CodexCli,
+                model: "auto".to_string(),
+            }),
+            80,
+            true,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| ui(frame, &mut state))
+            .unwrap_or_else(|error| panic!("failed to render review-plan mode: {error}"));
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!screen.contains("AI:"));
+        assert!(!screen.contains("Suggestion"));
+        assert!(!screen.contains("✦"));
+    }
 
     impl AiSuggestionProvider for StaticAiSuggestionProvider {
         fn suggest(&self, _request: &AiSuggestionRequest) -> Result<AiSuggestion> {

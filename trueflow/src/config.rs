@@ -201,8 +201,8 @@ fn validate_tui_keybinds(config: &TuiKeybindsConfig) -> std::result::Result<(), 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiConfig {
-    #[serde(default = "default_ai_enabled")]
-    pub enabled: bool,
+    #[serde(default = "default_ai_mode")]
+    pub mode: AiMode,
     #[serde(default = "default_ai_provider")]
     pub provider: AiProviderConfig,
     #[serde(default = "default_ai_model")]
@@ -211,6 +211,25 @@ pub struct AiConfig {
     pub max_context_lines: usize,
     #[serde(default = "default_ai_cache")]
     pub cache: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiMode {
+    Off,
+    ReviewPlan,
+    BlockHints,
+    ReviewPlanAndBlockHints,
+}
+
+impl AiMode {
+    pub const fn review_plan_enabled(self) -> bool {
+        matches!(self, Self::ReviewPlan | Self::ReviewPlanAndBlockHints)
+    }
+
+    pub const fn block_hints_enabled(self) -> bool {
+        matches!(self, Self::BlockHints | Self::ReviewPlanAndBlockHints)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -511,7 +530,7 @@ impl Default for TuiSpeedReadConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            enabled: default_ai_enabled(),
+            mode: default_ai_mode(),
             provider: default_ai_provider(),
             model: default_ai_model(),
             max_context_lines: default_ai_max_context_lines(),
@@ -662,8 +681,8 @@ fn default_speed_read_punctuation_dwell_multiplier() -> f64 {
     1.15
 }
 
-fn default_ai_enabled() -> bool {
-    false
+fn default_ai_mode() -> AiMode {
+    AiMode::Off
 }
 
 fn default_ai_provider() -> AiProviderConfig {
@@ -1018,12 +1037,12 @@ mod tests {
     use crate::feedback_since::FeedbackSinceExpr;
 
     #[test]
-    fn ai_config_defaults_to_opt_in_auto_detection() {
+    fn ai_config_defaults_to_off() {
         let cfg: TrueflowConfig = match toml::from_str("") {
             Ok(config) => config,
             Err(err) => panic!("parse config: {err}"),
         };
-        assert!(!cfg.ai.enabled);
+        assert_eq!(cfg.ai.mode, AiMode::Off);
         assert_eq!(cfg.ai.provider, AiProviderConfig::Auto);
         assert_eq!(cfg.ai.model, "auto");
         assert_eq!(cfg.ai.max_context_lines, 80);
@@ -1031,11 +1050,37 @@ mod tests {
     }
 
     #[test]
+    fn ai_config_parses_all_modes() {
+        for (literal, expected) in [
+            ("off", AiMode::Off),
+            ("review_plan", AiMode::ReviewPlan),
+            ("block_hints", AiMode::BlockHints),
+            (
+                "review_plan_and_block_hints",
+                AiMode::ReviewPlanAndBlockHints,
+            ),
+        ] {
+            let cfg: TrueflowConfig = toml::from_str(&format!("[ai]\nmode = \"{literal}\"\n"))
+                .unwrap_or_else(|err| panic!("parse mode {literal}: {err}"));
+            assert_eq!(cfg.ai.mode, expected);
+        }
+    }
+
+    #[test]
+    fn ai_config_rejects_removed_enabled_key() {
+        let err = toml::from_str::<TrueflowConfig>("[ai]\nenabled = true\n").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected enabled-key error: {err}"
+        );
+    }
+
+    #[test]
     fn ai_config_parses_overrides() {
         let cfg: TrueflowConfig = match toml::from_str(
             r#"
 [ai]
-enabled = true
+mode = "review_plan"
 provider = "anthropic"
 model = "claude-3-5-haiku-latest"
 max_context_lines = 40
@@ -1045,7 +1090,7 @@ cache = false
             Ok(config) => config,
             Err(err) => panic!("parse config: {err}"),
         };
-        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.mode, AiMode::ReviewPlan);
         assert_eq!(cfg.ai.provider, AiProviderConfig::Anthropic);
         assert_eq!(cfg.ai.model, "claude-3-5-haiku-latest");
         assert_eq!(cfg.ai.max_context_lines, 40);
@@ -1161,7 +1206,7 @@ cache = false
                 .abs()
                 <= f64::EPSILON
         );
-        assert_eq!(cfg.ai.enabled, defaults.ai.enabled);
+        assert_eq!(cfg.ai.mode, defaults.ai.mode);
         assert_eq!(cfg.ai.provider, defaults.ai.provider);
         assert_eq!(cfg.ai.model, defaults.ai.model);
         assert_eq!(cfg.ai.max_context_lines, defaults.ai.max_context_lines);
@@ -1638,7 +1683,7 @@ ignore_path_prefix = ["vendor"]
             &home.join(".trueflow.toml"),
             r#"
 [ai]
-enabled = true
+mode = "review_plan"
 "#,
         );
         write_config(
@@ -1667,7 +1712,7 @@ enabld = false
             &home.join(".trueflow.toml"),
             r#"
 [ai]
-enabled = true
+mode = "review_plan"
 provider = "claude_cli"
 model = "claude-3-5-haiku-latest"
 
@@ -1679,7 +1724,7 @@ diff_line_numbers = "old_new"
         let cfg = load_from_start_dir(&workdir, Some(&home))
             .unwrap_or_else(|err| panic!("load config: {err}"));
 
-        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.mode, AiMode::ReviewPlan);
         assert_eq!(cfg.ai.provider, AiProviderConfig::ClaudeCli);
         assert_eq!(cfg.ai.model, "claude-3-5-haiku-latest");
         assert_eq!(cfg.tui.diff_line_numbers, TuiDiffLineNumbers::OldNew);
@@ -1697,7 +1742,7 @@ diff_line_numbers = "old_new"
             &home.join(".trueflow.toml"),
             r#"
 [ai]
-enabled = true
+mode = "review_plan"
 provider = "claude_cli"
 model = "global-model"
 max_context_lines = 11
@@ -1728,7 +1773,7 @@ max_context_lines = 24
         let cfg = load_from_start_dir(&workdir, Some(&home))
             .unwrap_or_else(|err| panic!("load config: {err}"));
 
-        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.mode, AiMode::ReviewPlan);
         assert_eq!(cfg.ai.provider, AiProviderConfig::ClaudeCli);
         assert_eq!(cfg.ai.model, "repo-model");
         assert_eq!(cfg.ai.max_context_lines, 24);

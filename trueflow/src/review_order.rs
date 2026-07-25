@@ -39,7 +39,14 @@ pub struct ReviewOrder {
 
 impl ReviewOrder {
     pub fn from_tree(tree: &Tree, unreviewed_block_nodes: &HashSet<TreeNodeId>) -> Self {
-        let mut ordered = Vec::with_capacity(unreviewed_block_nodes.len());
+        Self::from_tree_with_priority_prefix(tree, unreviewed_block_nodes, &[])
+    }
+
+    pub fn from_tree_with_priority_prefix(
+        tree: &Tree,
+        unreviewed_block_nodes: &HashSet<TreeNodeId>,
+        priority_prefix: &[TreeNodeId],
+    ) -> Self {
         let mut items: Vec<_> = unreviewed_block_nodes
             .iter()
             .copied()
@@ -89,18 +96,43 @@ impl ReviewOrder {
                 ))
         });
 
-        let mut index_by_node = HashMap::with_capacity(items.len());
-        for (index, (cursor, _)) in items.into_iter().enumerate() {
-            index_by_node.insert(cursor.node_id, index);
-            ordered.push(cursor);
+        let canonical = items
+            .into_iter()
+            .map(|(cursor, _)| cursor)
+            .collect::<Vec<_>>();
+        let cursor_by_node = canonical
+            .iter()
+            .map(|cursor| (cursor.node_id, cursor))
+            .collect::<HashMap<_, _>>();
+        let mut accepted = HashSet::with_capacity(priority_prefix.len());
+        let mut ordered = Vec::with_capacity(canonical.len());
+        for node_id in priority_prefix.iter().copied() {
+            if accepted.insert(node_id)
+                && let Some(cursor) = cursor_by_node.get(&node_id)
+            {
+                ordered.push((*cursor).clone());
+            }
+        }
+        for cursor in canonical {
+            if accepted.insert(cursor.node_id) {
+                ordered.push(cursor);
+            }
         }
 
+        let index_by_node = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, cursor)| (cursor.node_id, index))
+            .collect::<HashMap<_, _>>();
         Self {
             ordered,
             index_by_node,
         }
     }
 
+    pub fn iter_node_ids(&self) -> impl Iterator<Item = TreeNodeId> + '_ {
+        self.ordered.iter().map(|cursor| cursor.node_id)
+    }
     pub fn first_reviewable_block(&self) -> Option<TreeNodeId> {
         self.ordered.first().map(|cursor| cursor.node_id)
     }
@@ -494,6 +526,74 @@ mod tests {
         assert_eq!(
             order.next_remaining_after(ReviewAnchor::Subtree(&subtree), &remaining),
             Some(tail)
+        );
+    }
+
+    #[test]
+    fn priority_prefix_leads_and_preserves_canonical_tail() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let tests = builder.add_dir(root, "tests".to_string(), "tests".to_string());
+        let test_file = builder.add_file(
+            tests,
+            "unit.rs".to_string(),
+            "tests/unit.rs".to_string(),
+            "file-test".to_string(),
+            Language::Rust,
+        );
+        let lib_file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-lib".to_string(),
+            Language::Rust,
+        );
+        let main_file = builder.add_file(
+            src,
+            "main.rs".to_string(),
+            "src/main.rs".to_string(),
+            "file-main".to_string(),
+            Language::Rust,
+        );
+        let test_id = builder.add_block(
+            test_file,
+            "test".to_string(),
+            "tests/unit.rs".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Rust,
+        );
+        let lib_id = builder.add_block(
+            lib_file,
+            "lib".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Rust,
+        );
+        let main_id = builder.add_block(
+            main_file,
+            "main".to_string(),
+            "src/main.rs".to_string(),
+            test_block(BlockKind::Function, 1, &[]),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let unreviewed = HashSet::from([test_id, lib_id, main_id]);
+
+        let canonical = ReviewOrder::from_tree(&tree, &unreviewed);
+        assert_eq!(
+            canonical.iter_node_ids().collect::<Vec<_>>(),
+            vec![test_id, lib_id, main_id]
+        );
+
+        let prioritized = ReviewOrder::from_tree_with_priority_prefix(
+            &tree,
+            &unreviewed,
+            &[main_id, main_id, tree.root(), test_id],
+        );
+        assert_eq!(
+            prioritized.iter_node_ids().collect::<Vec<_>>(),
+            vec![main_id, test_id, lib_id]
         );
     }
 }
