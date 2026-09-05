@@ -1,5 +1,4 @@
 use crate::block::{Block, ByteSpan};
-use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::{Identity, Record, ReviewCheck, ReviewDatabase, ReviewTargetRef, Verdict};
 use crate::sub_splitter::{self, SubSplitSemantics};
@@ -7,11 +6,6 @@ use crate::tree::{Tree, TreeNode, TreeNodeId, TreeNodeKind};
 use anyhow::Context;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-
-#[derive(Debug, Clone, Default)]
-pub struct CoverageBuildOptions {
-    pub workdir_prefix: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum BindingRelation {
@@ -135,11 +129,7 @@ pub struct CoverageIndex<'a> {
 }
 
 impl<'a> CoverageIndex<'a> {
-    pub fn build(
-        tree: &'a Tree,
-        database: &'a ReviewDatabase,
-        options: &CoverageBuildOptions,
-    ) -> anyhow::Result<Self> {
+    pub fn build(tree: &'a Tree, database: &'a ReviewDatabase) -> anyhow::Result<Self> {
         let lookups = CoverageLookups::from_tree(tree);
         let mut coverage = Self {
             tree,
@@ -158,20 +148,16 @@ impl<'a> CoverageIndex<'a> {
                     })?;
                     continue;
                 }
-                ReviewTargetRef::Block { hash } => {
-                    lookups.bind_block_record(record, hash, options.workdir_prefix.as_deref())
-                }
+                ReviewTargetRef::Block { hash } => lookups.bind_block_record(record, hash),
                 ReviewTargetRef::File { hash } => lookups.bind_path_target_record(
                     record,
                     hash,
-                    options.workdir_prefix.as_deref(),
                     &lookups.file_by_path_hash,
                     &lookups.file_by_hash,
                 ),
                 ReviewTargetRef::Tree { hash } => lookups.bind_path_target_record(
                     record,
                     hash,
-                    options.workdir_prefix.as_deref(),
                     &lookups.tree_by_path_hash,
                     &lookups.tree_by_hash,
                 ),
@@ -794,20 +780,13 @@ impl CoverageLookups {
         &self,
         record: &Record,
         hash: &crate::store::TreeHash,
-        workdir_prefix: Option<&str>,
     ) -> Result<RecordBinding, RecordBindingFailure> {
         if let (Some(path_hint), Some(line_hint)) = (&record.path_hint, record.line_hint) {
             let candidates = unique_unit_candidates(
-                collect_path_candidates(path_hint, workdir_prefix)
-                    .into_iter()
-                    .flat_map(|path| {
-                        self.block_exact
-                            .get(&(path, hash.clone(), line_hint))
-                            .into_iter()
-                            .flatten()
-                            .cloned()
-                    })
-                    .collect(),
+                self.block_exact
+                    .get(&(path_hint.clone(), hash.clone(), line_hint))
+                    .cloned()
+                    .unwrap_or_default(),
             );
             match candidates.as_slice() {
                 [unit_id] => {
@@ -823,16 +802,10 @@ impl CoverageLookups {
 
         if let Some(path_hint) = &record.path_hint {
             let candidates = unique_unit_candidates(
-                collect_path_candidates(path_hint, workdir_prefix)
-                    .into_iter()
-                    .flat_map(|path| {
-                        self.block_by_path_hash
-                            .get(&(path, hash.clone()))
-                            .into_iter()
-                            .flatten()
-                            .cloned()
-                    })
-                    .collect(),
+                self.block_by_path_hash
+                    .get(&(path_hint.clone(), hash.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
             );
             match candidates.as_slice() {
                 [unit_id] => {
@@ -841,7 +814,11 @@ impl CoverageLookups {
                         relation: BindingRelation::PathScoped,
                     });
                 }
-                [] => {}
+                [] => {
+                    return Err(RecordBindingFailure::Unresolved {
+                        record_id: record.id.clone(),
+                    });
+                }
                 _ => return Err(self.ambiguous_failure(record, candidates)),
             }
         }
@@ -864,22 +841,15 @@ impl CoverageLookups {
         &self,
         record: &Record,
         hash: &crate::store::TreeHash,
-        workdir_prefix: Option<&str>,
         by_path_hash: &HashMap<(RepoPath, crate::store::TreeHash), Vec<CoverageUnitId>>,
         by_hash: &HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
     ) -> Result<RecordBinding, RecordBindingFailure> {
         if let Some(path_hint) = &record.path_hint {
             let candidates = unique_unit_candidates(
-                collect_path_candidates(path_hint, workdir_prefix)
-                    .into_iter()
-                    .flat_map(|path| {
-                        by_path_hash
-                            .get(&(path, hash.clone()))
-                            .into_iter()
-                            .flatten()
-                            .cloned()
-                    })
-                    .collect(),
+                by_path_hash
+                    .get(&(path_hint.clone(), hash.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
             );
             match candidates.as_slice() {
                 [unit_id] => {
@@ -888,7 +858,11 @@ impl CoverageLookups {
                         relation: BindingRelation::TargetNode,
                     });
                 }
-                [] => {}
+                [] => {
+                    return Err(RecordBindingFailure::Unresolved {
+                        record_id: record.id.clone(),
+                    });
+                }
                 _ => return Err(self.ambiguous_failure(record, candidates)),
             }
         }
@@ -959,32 +933,6 @@ fn unique_sorted_record_indices(record_indices: Vec<usize>, records: &[Record]) 
     let mut sorted = sort_record_indices(record_indices, records);
     sorted.dedup();
     sorted
-}
-
-fn collect_path_candidates(path_hint: &RepoPath, workdir_prefix: Option<&str>) -> Vec<RepoPath> {
-    if path_hint.is_root() {
-        return vec![RepoPath::root()];
-    }
-
-    let mut candidates = Vec::new();
-    for candidate in path_utils::repo_path_candidates(path_hint.as_str(), workdir_prefix, None)
-        .into_iter()
-        .chain(path_utils::tree_path_candidates_for_repo_path(
-            path_hint.as_str(),
-            workdir_prefix,
-        ))
-    {
-        let Ok(candidate) = RepoPath::new(candidate) else {
-            continue;
-        };
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    if candidates.is_empty() {
-        candidates.push(path_hint.clone());
-    }
-    candidates
 }
 
 fn unique_unit_candidates(unit_ids: Vec<CoverageUnitId>) -> Vec<CoverageUnitId> {
@@ -1125,8 +1073,7 @@ mod tests {
                 .with_check("security"),
         ];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
         let security = ReviewCheck::new("security").unwrap();
 
         assert_eq!(
@@ -1182,8 +1129,7 @@ mod tests {
             1,
         )];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert!(
             !coverage
@@ -1208,8 +1154,7 @@ mod tests {
             1,
         )];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(
             coverage
@@ -1223,6 +1168,34 @@ mod tests {
                 .effective_latest_verdict_for(&ReviewCheck::review()),
             None
         );
+    }
+
+    #[test]
+    fn scoped_approvals_do_not_rebind_when_original_path_is_outside_review() {
+        let (tree, file_id, function_id, _, _) = build_function_tree();
+        for target in [
+            ReviewTargetRef::Block {
+                hash: tree.node(function_id).hash.clone(),
+            },
+            ReviewTargetRef::File {
+                hash: tree.node(file_id).hash.clone(),
+            },
+            ReviewTargetRef::Tree {
+                hash: tree.node(tree.root()).hash.clone(),
+            },
+        ] {
+            let record =
+                TestRecord::approved("1", target, "alice@example.com", 1).with_path_hint("outside");
+            let database = ReviewDatabase::from_records(vec![record]);
+            let coverage = CoverageIndex::build(&tree, &database).unwrap();
+            assert_eq!(
+                coverage
+                    .node(function_id)
+                    .effective_latest_verdict_for(&ReviewCheck::review()),
+                None,
+                "an absent scoped locator must not approve another occurrence"
+            );
+        }
     }
 
     #[test]
@@ -1241,8 +1214,7 @@ mod tests {
             approved_block_record("2", function_hash, "src/lib.rs", 1, "bob@example.com", 2),
         ];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(
             coverage
@@ -1268,8 +1240,7 @@ mod tests {
             rejected,
         ];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(
             coverage
@@ -1297,8 +1268,7 @@ mod tests {
             approved_block_record("2", function_hash, "src/lib.rs", 1, "bob@example.com", 2),
         ];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(
             coverage
@@ -1339,8 +1309,7 @@ mod tests {
             approved_block_record("3", function_hash, "src/lib.rs", 1, "bob@example.com", 3),
         ];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
         let function_coverage = coverage.node(function_id);
 
         assert_eq!(
@@ -1362,8 +1331,7 @@ mod tests {
             1,
         )];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(coverage.diagnostics().len(), 1);
         assert_eq!(coverage.binding_relation_for_record("1"), None);
@@ -1452,8 +1420,7 @@ mod tests {
             ),
         ];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         for record_id in ["hash-only", "path-only", "persisted-exact"] {
             assert_eq!(coverage.binding_relation_for_record(record_id), None);
@@ -1514,8 +1481,7 @@ mod tests {
             approved_block_record("2", second_hash, "src/lib.rs", 4, "bob@example.com", 2),
         ];
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(
             coverage
@@ -1567,8 +1533,7 @@ mod tests {
         );
         let tree = builder.finalize();
         let database = ReviewDatabase::from_records(Vec::new());
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(
             coverage
@@ -1623,8 +1588,7 @@ mod tests {
         );
         let tree = builder.finalize();
         let database = ReviewDatabase::from_records(Vec::new());
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
 
         assert_eq!(
             coverage

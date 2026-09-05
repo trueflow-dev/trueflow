@@ -60,7 +60,7 @@ pub enum Commands {
         #[arg(long)]
         note: Option<String>,
 
-        /// Path hint for debugging/UI
+        /// Path identifying the reviewed occurrence; coverage never moves to another file
         #[arg(long)]
         path: Option<RepoPath>,
 

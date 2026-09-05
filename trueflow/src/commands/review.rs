@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
-use crate::coverage::{CoverageBuildOptions, CoverageIndex};
+use crate::coverage::CoverageIndex;
 use crate::policy::{
     should_skip_container_by_default, should_skip_imports_by_default,
     should_skip_whitespace_only_by_default,
@@ -149,7 +149,6 @@ struct DiffReviewContext<'a> {
     repo: &'a gix::Repository,
     database: &'a crate::store::ReviewDatabase,
     diff_targets: &'a [ReviewDiffTarget],
-    workdir_prefix: Option<&'a str>,
     review_check: &'a ReviewCheck,
 }
 
@@ -333,15 +332,13 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             repo,
             database: &database,
             diff_targets,
-            workdir_prefix: workdir_prefix.as_deref(),
             review_check: &review_check,
         };
         return collect_diff_scoped_review(query, &diff_context, files, diagnostics);
     }
 
     let tree = tree::build_tree_from_files(&files);
-    let coverage =
-        CoverageIndex::build(&tree, &database, &CoverageBuildOptions { workdir_prefix })?;
+    let coverage = CoverageIndex::build(&tree, &database)?;
 
     let mut unreviewed_files = Vec::new();
     let mut total_blocks = 0;
@@ -464,13 +461,7 @@ fn collect_diff_scoped_review(
     )?;
     let (tree, diff_block_sides, file_change_kinds, block_change_kinds) =
         build_tree_from_diff_review_files(&review_files)?;
-    let coverage = CoverageIndex::build(
-        &tree,
-        diff_context.database,
-        &CoverageBuildOptions {
-            workdir_prefix: diff_context.workdir_prefix.map(ToOwned::to_owned),
-        },
-    )?;
+    let coverage = CoverageIndex::build(&tree, diff_context.database)?;
     let DiffReviewPresentation {
         unreviewed_files,
         total_blocks,
@@ -1833,8 +1824,7 @@ mod tests {
             .map(|block| approved_record_for_block(block, "src/model.go"))
             .collect::<Vec<_>>();
         let database = ReviewDatabase::from_records(records);
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
         let query = ResolvedReviewQuery {
             filters: BlockFilters::default(),
             scan_options: ScanOptions::default(),
@@ -1931,8 +1921,7 @@ mod tests {
         }];
         let (tree, _, _, _) = build_tree_from_diff_review_files(&review_files)
             .unwrap_or_else(|error| panic!("complete changed diff tree should build: {error:#}"));
-        let coverage =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions::default()).unwrap();
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
         let review_check = ReviewCheck::review();
         let file_path = RepoPath::new("notes.txt").unwrap();
         let modes = [

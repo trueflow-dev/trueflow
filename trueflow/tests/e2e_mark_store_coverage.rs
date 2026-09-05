@@ -110,6 +110,29 @@ fn test_mark_committed_state_normalizes_subdir_relative_path_hint() -> Result<()
 }
 
 #[test]
+fn narrowing_review_scope_does_not_transfer_another_files_approval() -> Result<()> {
+    let repo = TestRepo::new("scoped_approval_identity")?;
+    repo.write("src/a.rs", "pub fn same() {}\n")?;
+    repo.write("src/b.rs", "pub fn same() {}\n")?;
+    repo.commit_all("Identical occurrences")?;
+    let hash = first_block_hash(&repo.run(&["review", "--target", "file:src/a.rs", "--json"])?)?;
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &hash,
+        "--path",
+        "src/a.rs",
+        "--quiet",
+    ])?;
+    let all: serde_json::Value = serde_json::from_str(&repo.run(&["review", "--all", "--json"])?)?;
+    let scoped: serde_json::Value =
+        serde_json::from_str(&repo.run(&["review", "--target", "file:src/b.rs", "--json"])?)?;
+    assert_eq!(all[0]["path"], "src/b.rs");
+    assert_eq!(scoped, all);
+    Ok(())
+}
+
+#[test]
 fn test_mark_unknown_state_no_path() -> Result<()> {
     let repo = TestRepo::new("unknown_state")?;
 

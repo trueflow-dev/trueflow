@@ -1,14 +1,12 @@
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::coverage::{
-    BindingRelation, CoverageBuildOptions, CoverageDiagnostic, CoverageIndex, CoveragePolicy,
-    CoverageScope,
+    BindingRelation, CoverageDiagnostic, CoverageIndex, CoveragePolicy, CoverageScope,
 };
 use crate::repo_path::RepoPath;
 use crate::scanner;
 use crate::store::{FileStore, Record, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
-use crate::targets::workdir_prefix_from_git_root;
 use crate::tree;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -84,9 +82,8 @@ pub fn run(
     if split {
         let sub_blocks = sub_splitter::split(&matched.block, matched.language)?;
         if coverage {
-            let (tree, database, workdir_prefix) = load_coverage_inputs(&files)?;
-            let coverage_index =
-                CoverageIndex::build(&tree, &database, &CoverageBuildOptions { workdir_prefix })?;
+            let (tree, database) = load_coverage_inputs(&files)?;
+            let coverage_index = CoverageIndex::build(&tree, &database)?;
             let outputs = sub_blocks
                 .into_iter()
                 .map(|block| InspectCoverageOutput {
@@ -99,9 +96,8 @@ pub fn run(
             println!("{}", serde_json::to_string_pretty(&sub_blocks)?);
         }
     } else if coverage {
-        let (tree, database, workdir_prefix) = load_coverage_inputs(&files)?;
-        let coverage_index =
-            CoverageIndex::build(&tree, &database, &CoverageBuildOptions { workdir_prefix })?;
+        let (tree, database) = load_coverage_inputs(&files)?;
+        let coverage_index = CoverageIndex::build(&tree, &database)?;
         let output = InspectCoverageOutput {
             coverage: build_coverage_summary(&coverage_index, &matched.path, &matched.block),
             block: matched.block,
@@ -165,12 +161,11 @@ fn find_matching_block(
 
 fn load_coverage_inputs(
     files: &[crate::block::FileState],
-) -> Result<(tree::Tree, crate::store::ReviewDatabase, Option<String>)> {
+) -> Result<(tree::Tree, crate::store::ReviewDatabase)> {
     let tree = tree::build_tree_from_files(files);
     let store = FileStore::new()?;
     let database = store.load_database()?;
-    let workdir_prefix = workdir_prefix_from_git_root();
-    Ok((tree, database, workdir_prefix))
+    Ok((tree, database))
 }
 
 fn build_coverage_summary(

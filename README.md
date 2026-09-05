@@ -367,6 +367,11 @@ identity surface is not fully unified yet.
 Review records can also carry metadata such as reviewer identity and review
 labels.
 
+Records with a path bind only to that repository path and matching content.
+Moving lines within the same file can preserve coverage; narrowing review scope
+or removing the original file never transfers its approval to another file.
+Records without a path use content-only identity and must resolve unambiguously.
+
 ### GitHub pull requests
 
 Pull request review is fetch-only. `trueflow tui --target pr:11` resolves the
