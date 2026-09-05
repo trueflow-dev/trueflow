@@ -323,7 +323,14 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             } else {
                 vcs::file_states_in_revision(repo, revision.as_str(), workdir_prefix.as_deref())?
             };
-            (files, Vec::new())
+            (
+                files.files,
+                files
+                    .diagnostics
+                    .into_iter()
+                    .map(ReviewDiagnostic::from)
+                    .collect(),
+            )
         }
     };
     info!("scanned {} files", files.len());
@@ -453,13 +460,14 @@ fn collect_diff_scoped_review(
     query: &ResolvedReviewQuery,
     diff_context: &DiffReviewContext<'_>,
     files: Vec<crate::block::FileState>,
-    diagnostics: Vec<ReviewDiagnostic>,
+    mut diagnostics: Vec<ReviewDiagnostic>,
 ) -> Result<CollectedReview> {
     let review_files = collect_diff_review_files(
         &query.path_selection,
         diff_context.repo,
         files,
         diff_context.diff_targets,
+        &mut diagnostics,
     )?;
     let (tree, diff_block_sides, file_change_kinds, block_change_kinds) =
         build_tree_from_diff_review_files(&review_files)?;
@@ -672,6 +680,7 @@ fn collect_diff_review_files(
     repo: &gix::Repository,
     files: Vec<crate::block::FileState>,
     diff_targets: &[ReviewDiffTarget],
+    diagnostics: &mut Vec<ReviewDiagnostic>,
 ) -> Result<Vec<DiffReviewFile>> {
     let mut head_files_by_path = files
         .into_iter()
@@ -703,6 +712,15 @@ fn collect_diff_review_files(
                     )?
                 }
             };
+            let base = base.map(|parsed| {
+                diagnostics.extend(parsed.diagnostics.into_iter().map(|diagnostic| {
+                    ReviewDiagnostic::from(ScanDiagnostic::new(
+                        Some(parsed.file_state.path.clone()),
+                        diagnostic.reason,
+                    ))
+                }));
+                parsed.file_state
+            });
             target_inputs.push(TargetFileDiffInput { base, file_diff });
         }
 

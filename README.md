@@ -141,6 +141,10 @@ Notes:
 - `🚧` languages still work today through heuristic or text-oriented fallback,
   but they are not yet at the same official semantic/AST support level.
 
+Worktree files and Git revision blobs share byte-based language detection,
+semantic splitting, hashing, and parser diagnostics. Extensionless shell scripts
+are recognized by their shebang in either source.
+
 ## Operator docs
 
 Website/deployment/infrastructure docs live in `infra/README.md`.

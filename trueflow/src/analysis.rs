@@ -1,3 +1,7 @@
+use crate::block::FileState;
+use crate::block_splitter::{self, BlockSplitDiagnostic};
+use crate::repo_path::RepoPath;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -155,6 +159,40 @@ fn language_from_shebang(header: &[u8]) -> Option<Language> {
         "sh" | "bash" | "zsh" | "dash" | "ksh" => Some(Language::Shell),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedFile {
+    pub file_state: FileState,
+    pub diagnostics: Vec<BlockSplitDiagnostic>,
+}
+
+/// Classifies and parses exact file bytes independently of their storage backend.
+pub fn parse_file(path: &RepoPath, bytes: &[u8]) -> Result<ParsedFile> {
+    let file_type = analyze_file(Path::new(path.as_str()), bytes);
+    let language = match file_type {
+        FileType::Code(code) => code.language,
+        FileType::Text => Language::Text,
+        FileType::Markup => Language::Unknown,
+        FileType::Binary => {
+            return Ok(ParsedFile {
+                file_state: FileState::from_binary(path.clone(), bytes),
+                diagnostics: Vec::new(),
+            });
+        }
+    };
+    let content = std::str::from_utf8(bytes)?;
+    let mut split = block_splitter::split(content, language);
+    let diagnostics = std::mem::take(&mut split.diagnostics);
+    Ok(ParsedFile {
+        file_state: FileState::from_text(
+            path.clone(),
+            language,
+            bytes,
+            split.into_review_blocks(content),
+        ),
+        diagnostics,
+    })
 }
 
 #[cfg(test)]

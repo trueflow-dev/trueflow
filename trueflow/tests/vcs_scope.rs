@@ -109,7 +109,11 @@ fn test_revision_file_states_recognize_canonical_file_names() -> Result<()> {
 
     let git_repo = gix::open(&repo.path)?;
     let files = trueflow::vcs::file_states_in_revision(&git_repo, "HEAD", None)?;
-    let Some(justfile) = files.iter().find(|file| file.path.as_str() == "Justfile") else {
+    let Some(justfile) = files
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "Justfile")
+    else {
         anyhow::bail!("expected committed Justfile");
     };
 

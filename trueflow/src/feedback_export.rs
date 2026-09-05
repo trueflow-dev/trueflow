@@ -1556,7 +1556,7 @@ fn load_snapshot_files_strict(
             } else {
                 vcs::repo_from_workdir()?
             };
-            vcs::file_states_in_revision(&repo, revision, workdir_prefix)
+            Ok(vcs::file_states_in_revision(&repo, revision, workdir_prefix)?.files)
         }
     }
 }
@@ -1585,7 +1585,10 @@ fn load_snapshot_files_for_paths_strict(
             } else {
                 vcs::repo_from_workdir()?
             };
-            vcs::file_states_for_paths_in_revision(&repo, revision, paths, workdir_prefix)
+            Ok(
+                vcs::file_states_for_paths_in_revision(&repo, revision, paths, workdir_prefix)?
+                    .files,
+            )
         }
     }
 }

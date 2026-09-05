@@ -1,8 +1,8 @@
-use crate::analysis::Language;
+use crate::analysis::{self, ParsedFile};
 use crate::block::{Block, FileState};
-use crate::block_splitter;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
+use crate::scanner::ScanDiagnostic;
 use crate::store::CommitId;
 use crate::targets::CommitRange;
 use anyhow::{Context, Result};
@@ -552,9 +552,23 @@ pub fn head_blocks_for_path(repo: &gix::Repository, path: &RepoPath) -> Result<V
         return Ok(Vec::new());
     }
     let blob = entry.object()?.try_into_blob()?;
-    let content = std::str::from_utf8(&blob.data).context("utf8")?;
-    let language = language_for_tree_path(tree_path);
-    Ok(split_blocks(content, language))
+    Ok(analysis::parse_file(path, &blob.data)?.file_state.blocks)
+}
+
+#[derive(Debug, Default)]
+pub struct RevisionFiles {
+    pub files: Vec<FileState>,
+    pub diagnostics: Vec<ScanDiagnostic>,
+}
+
+impl RevisionFiles {
+    fn push(&mut self, parsed: ParsedFile) {
+        self.diagnostics
+            .extend(parsed.diagnostics.into_iter().map(|diagnostic| {
+                ScanDiagnostic::new(Some(parsed.file_state.path.clone()), diagnostic.reason)
+            }));
+        self.files.push(parsed.file_state);
+    }
 }
 
 pub fn file_states_for_paths_in_revision(
@@ -562,7 +576,7 @@ pub fn file_states_for_paths_in_revision(
     revision: &str,
     paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
-) -> Result<Vec<FileState>> {
+) -> Result<RevisionFiles> {
     let tree = tree_for_revision(repo, revision)?;
     file_states_for_paths_in_tree(&tree, paths, workdir_prefix)
 }
@@ -571,11 +585,13 @@ pub fn file_states_in_revision(
     repo: &gix::Repository,
     revision: &str,
     workdir_prefix: Option<&str>,
-) -> Result<Vec<FileState>> {
+) -> Result<RevisionFiles> {
     let tree = tree_for_revision(repo, revision)?;
-    let mut files = Vec::new();
+    let mut files = RevisionFiles::default();
     collect_file_states_in_tree(&tree, "", workdir_prefix, &mut files)?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 
@@ -584,7 +600,7 @@ pub(crate) fn file_state_for_path_in_revision(
     revision: &str,
     repo_relative_path: &RepoPath,
     output_path: &RepoPath,
-) -> Result<Option<FileState>> {
+) -> Result<Option<ParsedFile>> {
     let tree = tree_for_revision(repo, revision)?;
     file_state_for_path_in_tree(&tree, repo_relative_path.as_str(), output_path)
 }
@@ -609,7 +625,7 @@ pub(crate) fn file_state_for_path_in_revision_base(
     revision: &str,
     repo_relative_path: &RepoPath,
     output_path: &RepoPath,
-) -> Result<Option<FileState>> {
+) -> Result<Option<ParsedFile>> {
     let object = repo.rev_parse_single(revision)?;
     let commit = object
         .object()?
@@ -639,11 +655,11 @@ fn file_states_for_paths_in_tree(
     tree: &gix::Tree<'_>,
     paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
-) -> Result<Vec<FileState>> {
+) -> Result<RevisionFiles> {
     let mut ordered_paths = paths.iter().collect::<Vec<_>>();
     ordered_paths.sort();
 
-    let mut files = Vec::new();
+    let mut files = RevisionFiles::default();
     for requested_path in ordered_paths {
         let candidates =
             path_utils::tree_path_candidates_for_repo_path(requested_path.as_str(), workdir_prefix);
@@ -663,7 +679,7 @@ fn file_state_for_path_in_tree(
     tree: &gix::Tree<'_>,
     tree_path_str: &str,
     output_path: &RepoPath,
-) -> Result<Option<FileState>> {
+) -> Result<Option<ParsedFile>> {
     let tree_path = Path::new(tree_path_str);
     let Some(entry) = tree.lookup_entry_by_path(tree_path)? else {
         return Ok(None);
@@ -677,7 +693,7 @@ fn file_state_for_path_in_tree(
         &blob,
         tree_path,
         output_path.clone(),
-    )))
+    )?))
 }
 
 fn file_text_for_path_in_tree(tree: &gix::Tree<'_>, tree_path_str: &str) -> Result<Option<String>> {
@@ -700,7 +716,7 @@ fn collect_file_states_in_tree(
     tree: &gix::Tree<'_>,
     prefix: &str,
     workdir_prefix: Option<&str>,
-    files: &mut Vec<FileState>,
+    files: &mut RevisionFiles,
 ) -> Result<()> {
     let mut pending = vec![(tree.clone(), prefix.to_string())];
 
@@ -732,7 +748,7 @@ fn collect_file_states_in_tree(
                         &blob,
                         Path::new(&full_path),
                         output_path,
-                    ));
+                    )?);
                 }
                 _ => {}
             }
@@ -747,32 +763,16 @@ fn display_path_for_tree_entry(path: &str, _workdir_prefix: Option<&str>) -> Res
     RepoPath::new(normalized_path)
 }
 
-fn language_for_tree_path(path: &Path) -> Language {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .and_then(Language::from_extension)
-        .or_else(|| {
-            path.file_name()
-                .and_then(|file_name| file_name.to_str())
-                .and_then(Language::from_file_name)
-        })
-        .unwrap_or(Language::Unknown)
-}
-
 fn file_state_from_blob(
     blob: &gix::Blob<'_>,
     tree_path: &Path,
     output_path: RepoPath,
-) -> FileState {
-    let content = match std::str::from_utf8(&blob.data) {
-        Ok(content) => content,
-        Err(_) => return FileState::from_binary(output_path, &blob.data),
-    };
-
-    let language = language_for_tree_path(tree_path);
-    let blocks = split_blocks(content, language);
-
-    FileState::from_text(output_path, language, &blob.data, blocks)
+) -> Result<ParsedFile> {
+    let source_path = RepoPath::new(tree_path.to_string_lossy().as_ref())?;
+    let mut parsed = analysis::parse_file(&source_path, &blob.data)
+        .with_context(|| format!("failed to parse revision file {source_path}"))?;
+    parsed.file_state.path = output_path;
+    Ok(parsed)
 }
 
 pub fn diff_hunks_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<DiffHunk>> {
@@ -1364,10 +1364,6 @@ fn parse_hunk_start(range: &str) -> Option<u32> {
 struct HunkHeader {
     before_start: u32,
     after_start: u32,
-}
-
-fn split_blocks(content: &str, language: Language) -> Vec<Block> {
-    block_splitter::split(content, language).into_review_blocks(content)
 }
 
 fn usize_to_u32_saturating(value: usize) -> u32 {

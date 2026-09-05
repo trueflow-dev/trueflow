@@ -1,6 +1,5 @@
-use crate::analysis::{self, FileType, Language};
+use crate::analysis;
 use crate::block::FileState;
-use crate::block_splitter;
 use crate::hashing::hash_str;
 use crate::repo_path::RepoPath;
 use anyhow::{Result, anyhow};
@@ -803,10 +802,14 @@ fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
         return rejection;
     }
 
-    let outcome = match process_file(&input.path, &bytes) {
+    let outcome = match analysis::parse_file(&input.path, &bytes) {
         Ok(file_scan) => CachedFileOutcome::Included {
             file_state: file_scan.file_state,
-            diagnostics: file_scan.diagnostics,
+            diagnostics: file_scan
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| ScanDiagnostic::new(Some(input.path.clone()), diagnostic.reason))
+                .collect(),
         },
         Err(err) => {
             let diagnostic =
@@ -1019,51 +1022,11 @@ fn changed_during_scan_diagnostic(path: &RepoPath) -> ScanDiagnostic {
     ScanDiagnostic::new(Some(path.clone()), "skipped file changed during scan")
 }
 
-#[derive(Debug, Clone)]
-struct ProcessedFile {
-    file_state: FileState,
-    diagnostics: Vec<ScanDiagnostic>,
-}
-
-fn process_file(normalized_path: &RepoPath, bytes: &[u8]) -> Result<ProcessedFile> {
-    let file_type = analysis::analyze_file(Path::new(normalized_path.as_str()), bytes);
-
-    if matches!(file_type, FileType::Binary) {
-        return Ok(ProcessedFile {
-            file_state: FileState::from_binary(normalized_path.clone(), bytes),
-            diagnostics: Vec::new(),
-        });
-    }
-
-    let content = std::str::from_utf8(bytes)?;
-    let language = match file_type {
-        FileType::Code(code_file) => code_file.language,
-        FileType::Text => Language::Text,
-        _ => Language::Unknown,
-    };
-    let split_result = block_splitter::split(content, language);
-    let diagnostics = split_result
-        .diagnostics
-        .iter()
-        .map(|diagnostic| {
-            ScanDiagnostic::new(Some(normalized_path.clone()), diagnostic.reason.clone())
-        })
-        .collect();
-
-    Ok(ProcessedFile {
-        file_state: FileState::from_text(
-            normalized_path.clone(),
-            language,
-            bytes,
-            split_result.into_review_blocks(content),
-        ),
-        diagnostics,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::Language;
+
     use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
     use crate::test_git::temp_test_dir;
     use std::process::Command;
