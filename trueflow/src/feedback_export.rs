@@ -1302,13 +1302,10 @@ pub fn resolve_allowed_revisions(
     let mut allowed = HashSet::new();
     for target in diff_targets {
         match target {
-            ReviewDiffTarget::MainDiff => {
-                allowed.extend(revisions_in_main_to_head(&repo)?);
-            }
             ReviewDiffTarget::Revision(revision) => {
                 allowed.insert(resolve_revision_id(&repo, revision.as_str())?);
             }
-            ReviewDiffTarget::RevisionRange(range) => {
+            ReviewDiffTarget::MainDiff(range) | ReviewDiffTarget::RevisionRange(range) => {
                 allowed.extend(revisions_in_range(
                     &repo,
                     range.start.as_str(),
@@ -1359,12 +1356,6 @@ fn revisions_in_range(repo: &gix::Repository, start: &str, end: &str) -> Result<
     let start_id = resolve_revision_id(repo, start)?;
     let end_id = resolve_revision_id(repo, end)?;
     revisions_reachable_from_tip_with_hidden(repo, &end_id, &[start_id])
-}
-
-fn revisions_in_main_to_head(repo: &gix::Repository) -> Result<HashSet<String>> {
-    let head_id = repo.head_commit()?.id().detach().to_string();
-    let main_id = crate::vcs::mainline_commit(repo)?.id().detach().to_string();
-    revisions_reachable_from_tip_with_hidden(repo, &head_id, &[main_id])
 }
 
 fn revisions_reachable_from_tip_with_hidden(

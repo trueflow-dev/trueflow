@@ -4,6 +4,7 @@ use crate::block_splitter;
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::CommitId;
+use crate::targets::CommitRange;
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 use gix::object::tree::{EntryKind, EntryMode};
@@ -578,15 +579,6 @@ pub fn file_states_in_revision(
     Ok(files)
 }
 
-pub(crate) fn file_state_for_path_in_main_base(
-    repo: &gix::Repository,
-    repo_relative_path: &RepoPath,
-    output_path: &RepoPath,
-) -> Result<Option<FileState>> {
-    let (base_tree, _) = main_and_head_trees(repo)?;
-    file_state_for_path_in_tree(&base_tree, repo_relative_path.as_str(), output_path)
-}
-
 pub(crate) fn file_state_for_path_in_revision(
     repo: &gix::Repository,
     revision: &str,
@@ -1116,6 +1108,24 @@ pub fn files_changed_main_to_head() -> Result<HashSet<ChangedPath>> {
     files_changed_main_to_head_in_repo(&repo)
 }
 
+pub(crate) fn resolved_main_diff(
+    repo: &gix::Repository,
+) -> Result<(CommitRange, HashSet<ChangedPath>)> {
+    let range = main_diff_range(repo)?;
+    let paths = files_changed_in_range_in_repo(repo, range.start.as_str(), range.end.as_str())?;
+    Ok((range, paths))
+}
+
+pub fn main_diff_range(repo: &gix::Repository) -> Result<CommitRange> {
+    let head = repo.head_commit()?.id().detach();
+    let main = mainline_commit(repo)?.id().detach();
+    let base = repo.merge_base(head, main).map_or(main, |id| id.detach());
+    Ok(CommitRange {
+        start: CommitId::new(base.to_string())?,
+        end: CommitId::new(head.to_string())?,
+    })
+}
+
 pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<HashSet<ChangedPath>> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
     collect_changed_paths(repo, Some(&base_tree), Some(&head_tree))
@@ -1264,18 +1274,11 @@ pub(crate) fn mainline_commit(repo: &gix::Repository) -> Result<gix::Commit<'_>>
 fn main_and_head_trees<'repo>(
     repo: &'repo gix::Repository,
 ) -> Result<(gix::Tree<'repo>, gix::Tree<'repo>)> {
-    let head_commit = repo.head_commit()?;
-    let head_tree = head_commit.tree()?;
-
-    let main_commit = mainline_commit(repo)?;
-    let main_id = main_commit.id().detach();
-
-    let base_tree = match repo.merge_base(head_commit.id().detach(), main_id) {
-        Ok(base_id) => repo.find_commit(base_id.detach())?.tree()?,
-        Err(_) => main_commit.tree()?,
-    };
-
-    Ok((base_tree, head_tree))
+    let range = main_diff_range(repo)?;
+    Ok((
+        tree_for_revision(repo, range.start.as_str())?,
+        tree_for_revision(repo, range.end.as_str())?,
+    ))
 }
 
 fn collect_changed_paths(

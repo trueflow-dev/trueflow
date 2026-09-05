@@ -204,6 +204,12 @@ trueflow tui --target https://github.com/owner/repo/pull/11
 Block kinds are case-insensitive and match the semantic kinds shown in JSON
 output.
 
+`main` reviews committed changes from the mainline merge base to the HEAD
+captured when the review starts. Uncommitted edits are excluded; use `dirty`
+to review the working tree. Historical comparisons cannot be mixed with `dirty`
+in one target list. Source views, diffs, and comment anchors retain the captured
+revision even if branches move during the session.
+
 ## Runtime config
 
 Trueflow first loads `~/.trueflow.toml` as global defaults, if present. It then

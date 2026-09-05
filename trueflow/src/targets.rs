@@ -200,7 +200,7 @@ pub struct CommitRange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDiffTarget {
-    MainDiff,
+    MainDiff(CommitRange),
     Revision(CommitId),
     RevisionRange(CommitRange),
 }
@@ -305,7 +305,7 @@ pub fn resolve_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargets> {
             })
         },
         || with_workdir_repo(&repo_cache, vcs::dirty_changed_paths),
-        || with_workdir_repo(&repo_cache, vcs::files_changed_main_to_head_in_repo),
+        || with_workdir_repo(&repo_cache, vcs::resolved_main_diff),
         |revision| {
             with_workdir_repo(&repo_cache, |repo| {
                 vcs::files_changed_in_revision_in_repo(repo, revision)
@@ -345,7 +345,7 @@ pub(crate) fn resolve_targets_with<ResolveFn, DirtyFn, MainFn, RevisionFn, Range
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<RepoPath>>,
-    MainFn: Fn() -> Result<HashSet<ChangedPath>>,
+    MainFn: Fn() -> Result<(CommitRange, HashSet<ChangedPath>)>,
     RevisionFn: Fn(&str) -> Result<HashSet<ChangedPath>>,
     RangeFn: Fn(&str, &str) -> Result<HashSet<ChangedPath>>,
 {
@@ -377,12 +377,21 @@ fn resolve_targets_with_changed<ResolveFn, DirtyFn, MainFn, RevisionFn, RangeFn>
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<ChangedPath>>,
-    MainFn: Fn() -> Result<HashSet<ChangedPath>>,
+    MainFn: Fn() -> Result<(CommitRange, HashSet<ChangedPath>)>,
     RevisionFn: Fn(&str) -> Result<HashSet<ChangedPath>>,
     RangeFn: Fn(&str, &str) -> Result<HashSet<ChangedPath>>,
 {
     reject_mixed_content_source_targets(targets)?;
-    let resolved_targets = resolve_target_exprs(targets, &resolve_revision)?;
+    let main_diff = targets
+        .iter()
+        .any(|target| matches!(target, ReviewTarget::MainDiff))
+        .then(main_diff_files)
+        .transpose()?;
+    let resolved_targets = resolve_target_exprs(
+        targets,
+        &resolve_revision,
+        main_diff.as_ref().map(|(range, _)| range),
+    )?;
     let content_source = resolve_content_source(&resolved_targets)?;
     let diff_selection = resolve_diff_selection(&resolved_targets);
     let mut files = HashSet::new();
@@ -396,9 +405,13 @@ where
                 changed_target_requested = true;
                 changed.extend(dirty_files()?);
             }
-            ResolvedReviewTarget::MainDiff => {
+            ResolvedReviewTarget::MainDiff(_) => {
                 changed_target_requested = true;
-                changed.extend(main_diff_files()?);
+                changed.extend(
+                    main_diff
+                        .iter()
+                        .flat_map(|(_, paths)| paths.iter().cloned()),
+                );
             }
             ResolvedReviewTarget::File(path) => {
                 files.insert(path);
@@ -432,7 +445,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedReviewTarget {
     DirtyWorktree,
-    MainDiff,
+    MainDiff(CommitRange),
     File(RepoPath),
     Dir(RepoPath),
     Revision(CommitId),
@@ -443,18 +456,18 @@ impl ResolvedReviewTarget {
     fn historical_content_revision(&self) -> Option<&CommitId> {
         match self {
             Self::Revision(revision) => Some(revision),
-            Self::RevisionRange(range) => Some(&range.end),
-            Self::DirtyWorktree | Self::MainDiff | Self::File(_) | Self::Dir(_) => None,
+            Self::MainDiff(range) | Self::RevisionRange(range) => Some(&range.end),
+            Self::DirtyWorktree | Self::File(_) | Self::Dir(_) => None,
         }
     }
 
     fn is_worktree_content_target(&self) -> bool {
-        matches!(self, Self::DirtyWorktree | Self::MainDiff)
+        matches!(self, Self::DirtyWorktree)
     }
 
     fn diff_target(&self) -> Option<ReviewDiffTarget> {
         match self {
-            Self::MainDiff => Some(ReviewDiffTarget::MainDiff),
+            Self::MainDiff(range) => Some(ReviewDiffTarget::MainDiff(range.clone())),
             Self::Revision(revision) => Some(ReviewDiffTarget::Revision(revision.clone())),
             Self::RevisionRange(range) => Some(ReviewDiffTarget::RevisionRange(range.clone())),
             Self::DirtyWorktree | Self::File(_) | Self::Dir(_) => None,
@@ -465,11 +478,11 @@ impl ResolvedReviewTarget {
 fn reject_mixed_content_source_targets(targets: &[ReviewTarget]) -> Result<()> {
     let saw_worktree = targets
         .iter()
-        .any(|target| matches!(target, ReviewTarget::DirtyWorktree | ReviewTarget::MainDiff));
+        .any(|target| matches!(target, ReviewTarget::DirtyWorktree));
     let saw_historical = targets.iter().any(|target| {
         matches!(
             target,
-            ReviewTarget::Revision(_) | ReviewTarget::RevisionRange(_)
+            ReviewTarget::MainDiff | ReviewTarget::Revision(_) | ReviewTarget::RevisionRange(_)
         )
     });
 
@@ -485,6 +498,7 @@ fn reject_mixed_content_source_targets(targets: &[ReviewTarget]) -> Result<()> {
 fn resolve_target_exprs<ResolveFn>(
     targets: &[ReviewTarget],
     resolve_revision: &ResolveFn,
+    main_diff: Option<&CommitRange>,
 ) -> Result<Vec<ResolvedReviewTarget>>
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
@@ -495,7 +509,11 @@ where
     for target in targets {
         let target = match target {
             ReviewTarget::DirtyWorktree => ResolvedReviewTarget::DirtyWorktree,
-            ReviewTarget::MainDiff => ResolvedReviewTarget::MainDiff,
+            ReviewTarget::MainDiff => ResolvedReviewTarget::MainDiff(
+                main_diff
+                    .cloned()
+                    .ok_or_else(|| anyhow!("main comparison was not resolved"))?,
+            ),
             ReviewTarget::File(path) => ResolvedReviewTarget::File(path.clone()),
             ReviewTarget::Dir(path) => ResolvedReviewTarget::Dir(path.clone()),
             ReviewTarget::Revision(revision) => ResolvedReviewTarget::Revision(
@@ -612,6 +630,16 @@ mod tests {
     use crate::vcs::ChangedPath;
     use std::collections::HashSet;
 
+    fn empty_main_diff() -> anyhow::Result<(super::CommitRange, HashSet<ChangedPath>)> {
+        Ok((
+            super::CommitRange {
+                start: CommitId::new("aaaaaaa")?,
+                end: CommitId::new("bbbbbbb")?,
+            },
+            HashSet::new(),
+        ))
+    }
+
     #[test]
     fn dir_target_parses() {
         let target = ReviewTarget::from_cli("dir:website")
@@ -670,7 +698,7 @@ mod tests {
             &[target],
             |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
-            || Ok(HashSet::new()),
+            empty_main_diff,
             |_revision| Ok(HashSet::new()),
             |_start, _end| Ok(HashSet::new()),
         )
@@ -779,7 +807,7 @@ mod tests {
     #[test]
     fn resolve_targets_rejects_mixed_historical_and_worktree_content_sources() {
         let targets = vec![
-            ReviewTarget::MainDiff,
+            ReviewTarget::DirtyWorktree,
             ReviewTarget::Revision(RevisionExpr::new("abc1234").unwrap()),
         ];
 
@@ -787,7 +815,7 @@ mod tests {
             &targets,
             |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
-            || Ok(HashSet::new()),
+            empty_main_diff,
             |_revision| Ok(HashSet::new()),
             |_start, _end| Ok(HashSet::new()),
         )
@@ -809,7 +837,7 @@ mod tests {
             &targets,
             |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
-            || Ok(HashSet::new()),
+            empty_main_diff,
             |_revision| Ok(HashSet::new()),
             |_start, _end| Ok(HashSet::new()),
         )
@@ -838,7 +866,7 @@ mod tests {
             &targets,
             |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
-            || Ok(HashSet::new()),
+            empty_main_diff,
             |_revision| Ok(HashSet::new()),
             |_start, _end| Ok(HashSet::from([ChangedPath::identity(other.clone())])),
         )
@@ -856,7 +884,7 @@ mod tests {
             &[ReviewTarget::MainDiff],
             |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
-            || Ok(HashSet::new()),
+            empty_main_diff,
             |_revision| Ok(HashSet::new()),
             |_start, _end| Ok(HashSet::new()),
         )
@@ -873,7 +901,7 @@ mod tests {
             &[ReviewTarget::DirtyWorktree],
             |revision| CommitId::new(revision.as_str()),
             || Err(anyhow::anyhow!("dirty file query failed")),
-            || Ok(HashSet::new()),
+            empty_main_diff,
             |_revision| Ok(HashSet::new()),
             |_start, _end| Ok(HashSet::new()),
         )
@@ -892,7 +920,7 @@ mod tests {
             ],
             |revision| CommitId::new(revision.as_str()),
             || Ok(HashSet::new()),
-            || Ok(HashSet::new()),
+            empty_main_diff,
             |_revision| Ok(HashSet::new()),
             |_start, _end| Ok(HashSet::new()),
         )

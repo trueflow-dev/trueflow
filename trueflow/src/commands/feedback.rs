@@ -264,7 +264,7 @@ fn resolve_local_feedback_targets(targets: &[ReviewTarget]) -> Result<ResolvedTa
         targets,
         |revision| vcs::resolve_commit_id_from_workdir(revision.as_str()),
         vcs::dirty_files_from_workdir,
-        vcs::files_changed_main_to_head,
+        || vcs::resolved_main_diff(&vcs::repo_from_workdir()?),
     )
 }
 
@@ -277,7 +277,10 @@ fn resolve_local_feedback_targets_with<ResolveFn, DirtyFn, MainFn>(
 where
     ResolveFn: Fn(&crate::targets::RevisionExpr) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<crate::repo_path::RepoPath>>,
-    MainFn: Fn() -> Result<HashSet<crate::vcs::ChangedPath>>,
+    MainFn: Fn() -> Result<(
+        crate::targets::CommitRange,
+        HashSet<crate::vcs::ChangedPath>,
+    )>,
 {
     resolve_targets_with(
         targets,
@@ -2843,9 +2846,12 @@ mod tests {
         let changed = crate::repo_path::RepoPath::new("src/changed.rs")?;
         let unchanged = crate::repo_path::RepoPath::new("src/unchanged.rs")?;
         let resolved_targets = ResolvedTargets::new(
-            crate::targets::ReviewContentSource::Workdir,
+            crate::targets::ReviewContentSource::Revision(CommitId::new("bbbbbbb")?),
             crate::targets::ReviewDiffSelection::Targets(vec![
-                crate::targets::ReviewDiffTarget::MainDiff,
+                crate::targets::ReviewDiffTarget::MainDiff(crate::targets::CommitRange {
+                    start: CommitId::new("aaaaaaa")?,
+                    end: CommitId::new("bbbbbbb")?,
+                }),
             ]),
             HashSet::new(),
             Vec::new(),
@@ -2912,9 +2918,7 @@ mod tests {
             || -> Result<HashSet<crate::repo_path::RepoPath>> {
                 Err(anyhow!("dirty files should not be resolved"))
             },
-            || -> Result<HashSet<crate::vcs::ChangedPath>> {
-                Err(anyhow!("main diff files should not be resolved"))
-            },
+            || Err(anyhow!("main diff files should not be resolved")),
         )?;
 
         assert_eq!(resolved_revision_exprs.into_inner(), vec!["start", "end"]);

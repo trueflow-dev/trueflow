@@ -1678,6 +1678,7 @@ fn build_review_state(
 ) -> Result<AppState> {
     let CollectedReview {
         summary,
+        diff_selection,
         tree,
         unreviewed_block_nodes,
         commented_block_nodes,
@@ -1685,6 +1686,21 @@ fn build_review_state(
         file_change_kinds,
         block_change_kinds,
     } = review;
+    // Presentation and comment anchors must use the same pinned comparison as collection.
+    let review_scope = match diff_selection.targets().and_then(|targets| targets.first()) {
+        Some(
+            crate::targets::ReviewDiffTarget::MainDiff(range)
+            | crate::targets::ReviewDiffTarget::RevisionRange(range),
+        ) => ScopePreset::RevisionRange {
+            start: range.start.to_string(),
+            end: range.end.to_string(),
+        },
+        Some(crate::targets::ReviewDiffTarget::Revision(revision)) => ScopePreset::Commit {
+            id: revision.to_string(),
+            summary: String::new(),
+        },
+        None => review_scope,
+    };
     let reviewable_nodes: HashSet<TreeNodeId> = unreviewed_block_nodes
         .iter()
         .copied()
@@ -10807,6 +10823,7 @@ mod diff_scope_tests {
         );
         let tree = builder.finalize();
         let review = CollectedReview {
+            diff_selection: crate::targets::ReviewDiffSelection::None,
             summary: ReviewSummary {
                 files: vec![UnreviewedFile {
                     path: RepoPath::new("src/lib.rs").unwrap(),

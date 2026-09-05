@@ -220,15 +220,6 @@ fn immutable_endpoints<'repo>(
     target: &ReviewDiffTarget,
 ) -> Result<(Option<gix::Commit<'repo>>, gix::Commit<'repo>)> {
     match target {
-        ReviewDiffTarget::MainDiff => {
-            let head = repo.head_commit()?;
-            let main = vcs::mainline_commit(repo)?;
-            let base = match repo.merge_base(head.id().detach(), main.id().detach()) {
-                Ok(id) => repo.find_commit(id.detach())?,
-                Err(_) => main,
-            };
-            Ok((Some(base), head))
-        }
         ReviewDiffTarget::Revision(revision) => {
             let head = resolved_commit(repo, revision, "revision")?;
             let base = head
@@ -238,7 +229,7 @@ fn immutable_endpoints<'repo>(
                 .transpose()?;
             Ok((base, head))
         }
-        ReviewDiffTarget::RevisionRange(range) => Ok((
+        ReviewDiffTarget::MainDiff(range) | ReviewDiffTarget::RevisionRange(range) => Ok((
             Some(resolved_commit(repo, &range.start, "start revision")?),
             resolved_commit(repo, &range.end, "end revision")?,
         )),

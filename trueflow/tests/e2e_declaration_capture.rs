@@ -306,9 +306,11 @@ fn main_diff_uses_the_existing_mainline_precedence_and_merge_base() -> Result<()
     let capture = capture_declaration_sources(
         &repo.path,
         &query(
-            ReviewContentSource::Workdir,
+            ReviewContentSource::Revision(feature.clone()),
             ReviewPathSelection::All,
-            ReviewDiffSelection::Targets(vec![ReviewDiffTarget::MainDiff]),
+            ReviewDiffSelection::Targets(vec![ReviewDiffTarget::MainDiff(
+                trueflow::vcs::main_diff_range(&gix::discover(&repo.path)?)?,
+            )]),
         ),
     )?;
     let batch = one_batch(&capture)?;

@@ -66,6 +66,33 @@ fn scan_contains_path(scan: &ScanResult, path: &str) -> bool {
 }
 
 #[test]
+fn main_review_uses_committed_coordinates_despite_dirty_line_shifts() -> Result<()> {
+    let repo = TestRepo::new("main_review_pinned_content")?;
+    let base = "pub fn original() {}\n";
+    let head = format!("{base}\npub fn added() -> u32 {{\n    42\n}}\n");
+    repo.write("src/lib.rs", base)?;
+    repo.commit_all("base")?;
+    repo.git(&["branch", "-M", "main"])?;
+    repo.git(&["switch", "-c", "feature"])?;
+    repo.write("src/lib.rs", &head)?;
+    repo.commit_all("add function")?;
+    let before = repo.run(&["review", "--target", "main", "--json"])?;
+    let expected: Value = serde_json::from_str(&before)?;
+    assert!(
+        expected[0]["blocks"]
+            .as_array()
+            .context("blocks")?
+            .iter()
+            .any(|block| block["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("fn added")))
+    );
+    repo.write("src/lib.rs", &format!("{}{head}", "\n".repeat(12)))?;
+    let after: Value = serde_json::from_str(&repo.run(&["review", "--target", "main", "--json"])?)?;
+    assert_eq!(after, expected);
+    Ok(())
+}
+#[test]
 fn test_optimizer_source_integrity_preserves_omitted_import_gap() -> Result<()> {
     let source = "use std::fmt;\n\nuse std::io;\n";
     let repo = TestRepo::new("optimizer_source_integrity_import_gap")?;
@@ -2258,7 +2285,7 @@ fn assert_external_symlink_is_not_reviewed(output: std::process::Output) -> Resu
 
 #[cfg(unix)]
 #[test]
-fn review_main_rejects_stable_external_symlink_sentinel() -> Result<()> {
+fn review_main_reads_committed_link_blob_without_following_external_symlink() -> Result<()> {
     let repo = TestRepo::new("review_main_external_symlink")?;
     repo.write("src/base.rs", "pub fn base() {}\n")?;
     repo.commit_all("Base")?;
@@ -2268,9 +2295,20 @@ fn review_main_rejects_stable_external_symlink_sentinel() -> Result<()> {
     repo.add("src/link.rs")?;
     repo.commit("Add external link")?;
 
-    assert_external_symlink_is_not_reviewed(
-        repo.run_raw(&["review", "--target", "main", "--json"])?,
-    )?;
+    let committed = repo.run(&["review", "--target", "main", "--json"])?;
+    let committed_files = json_array(&committed)?;
+    let link = committed_files
+        .iter()
+        .find(|file| file["path"] == "src/link.rs")
+        .context("committed link blob should be reviewable")?;
+    let link_target = fs::read_link(repo.path.join("src/link.rs"))?;
+    assert_eq!(
+        link["blocks"][0]["content"]
+            .as_str()
+            .context("link blob content")?,
+        link_target.to_str().context("link target must be UTF-8")?,
+    );
+    assert!(!committed.contains(EXTERNAL_SYMLINK_SENTINEL));
 
     let full = repo.run_raw(&["review", "--all", "--json"])?;
     assert!(full.status.success(), "full review should succeed");

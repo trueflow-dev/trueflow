@@ -97,6 +97,7 @@ pub enum BlockChangeKind {
 
 pub struct CollectedReview {
     pub summary: ReviewSummary,
+    pub diff_selection: ReviewDiffSelection,
     pub tree: tree::Tree,
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
     pub commented_block_nodes: HashSet<tree::TreeNodeId>,
@@ -433,6 +434,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     });
 
     Ok(CollectedReview {
+        diff_selection: query.diff_selection.clone(),
         summary: ReviewSummary {
             files: unreviewed_files,
             total_blocks,
@@ -476,6 +478,7 @@ fn collect_diff_scoped_review(
     );
 
     Ok(CollectedReview {
+        diff_selection: query.diff_selection.clone(),
         summary: ReviewSummary {
             files: unreviewed_files,
             total_blocks,
@@ -612,6 +615,7 @@ fn preselected_paths_for_review(path_selection: &ReviewPathSelection) -> Option<
 
 fn empty_collected_review() -> CollectedReview {
     CollectedReview {
+        diff_selection: ReviewDiffSelection::None,
         summary: ReviewSummary {
             files: Vec::new(),
             total_blocks: 0,
@@ -646,18 +650,17 @@ fn collect_target_diff_batches<'a>(
         .iter()
         .map(|target| {
             let diffs = match target {
-                ReviewDiffTarget::MainDiff => {
-                    vcs::file_diffs_for_main_to_head(repo, selected_destinations)?
-                }
                 ReviewDiffTarget::Revision(revision) => {
                     vcs::file_diffs_for_revision(repo, revision.as_str(), selected_destinations)?
                 }
-                ReviewDiffTarget::RevisionRange(range) => vcs::file_diffs_for_range(
-                    repo,
-                    range.start.as_str(),
-                    range.end.as_str(),
-                    selected_destinations,
-                )?,
+                ReviewDiffTarget::MainDiff(range) | ReviewDiffTarget::RevisionRange(range) => {
+                    vcs::file_diffs_for_range(
+                        repo,
+                        range.start.as_str(),
+                        range.end.as_str(),
+                        selected_destinations,
+                    )?
+                }
             };
             Ok(TargetDiffBatch { target, diffs })
         })
@@ -685,23 +688,20 @@ fn collect_diff_review_files(
         for target_batch in &mut target_batches {
             let file_diff = target_batch.diffs.take(&display_path);
             let base = match target_batch.target {
-                ReviewDiffTarget::MainDiff => vcs::file_state_for_path_in_main_base(
-                    repo,
-                    &file_diff.changed_path().source_location,
-                    &file_diff.changed_path().location,
-                )?,
                 ReviewDiffTarget::Revision(revision) => vcs::file_state_for_path_in_revision_base(
                     repo,
                     revision.as_str(),
                     &file_diff.changed_path().source_location,
                     &file_diff.changed_path().location,
                 )?,
-                ReviewDiffTarget::RevisionRange(range) => vcs::file_state_for_path_in_revision(
-                    repo,
-                    range.start.as_str(),
-                    &file_diff.changed_path().source_location,
-                    &file_diff.changed_path().location,
-                )?,
+                ReviewDiffTarget::MainDiff(range) | ReviewDiffTarget::RevisionRange(range) => {
+                    vcs::file_state_for_path_in_revision(
+                        repo,
+                        range.start.as_str(),
+                        &file_diff.changed_path().source_location,
+                        &file_diff.changed_path().location,
+                    )?
+                }
             };
             target_inputs.push(TargetFileDiffInput { base, file_diff });
         }
@@ -2119,7 +2119,7 @@ mod tests {
             scan_options: ScanOptions::default(),
             content_source: ReviewContentSource::Workdir,
             path_selection: ReviewPathSelection::Empty,
-            diff_selection: ReviewDiffSelection::Targets(vec![ReviewDiffTarget::MainDiff]),
+            diff_selection: ReviewDiffSelection::None,
         };
 
         let collected = collect_review(&query)
@@ -2133,7 +2133,7 @@ mod tests {
     #[test]
     fn resolve_review_request_rejects_mixed_historical_and_worktree_content_sources() {
         let targets = vec![
-            ReviewTarget::MainDiff,
+            ReviewTarget::DirtyWorktree,
             ReviewTarget::Revision(RevisionExpr::new("abc1234").unwrap()),
         ];
 
@@ -2931,6 +2931,50 @@ mod tests {
                 .is_some_and(|block| block.content.contains("mod common;"))
         );
         assert!(sides.head.is_none());
+    }
+
+    #[test]
+    fn resolved_main_comparison_survives_head_and_main_advancing() -> Result<()> {
+        let repo_root = temp_git_repo("pinned_main_comparison");
+        let path = repo_root.join("lib.rs");
+        fs::write(&path, "pub fn value() -> u8 { 1 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "base"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        run_git(&repo_root, &["switch", "-c", "feature"]);
+        fs::write(&path, "pub fn value() -> u8 { 2 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "reviewed snapshot"]);
+        let _guard = CurrentDirGuard::push(&repo_root);
+        let query = resolve_review_request(
+            ReviewRequest::Targets(vec![ReviewTarget::MainDiff]),
+            BlockFilters::default(),
+            ScanOptions::default(),
+        )?;
+        fs::write(&path, "pub fn value() -> u8 { 3 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "later snapshot"]);
+        run_git(&repo_root, &["branch", "-f", "main", "HEAD"]);
+        let collected = collect_review(&query)?;
+        let sides = collected
+            .diff_block_sides
+            .values()
+            .find(|sides| {
+                sides
+                    .head
+                    .as_ref()
+                    .is_some_and(|block| block.kind == BlockKind::Function)
+            })
+            .ok_or_else(|| anyhow!("pinned comparison lost its changed function"))?;
+        assert_eq!(
+            sides.base.as_ref().unwrap().content,
+            "pub fn value() -> u8 { 1 }"
+        );
+        assert_eq!(
+            sides.head.as_ref().unwrap().content,
+            "pub fn value() -> u8 { 2 }"
+        );
+        Ok(())
     }
 
     #[test]
