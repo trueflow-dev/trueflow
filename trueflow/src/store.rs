@@ -2,7 +2,6 @@ use anyhow::{Result, anyhow};
 use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
-use tracing::warn;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1380,101 +1379,20 @@ where
     all_records
 }
 
-#[derive(Debug, Clone, Default)]
-struct JsonlParseReport {
-    records: Vec<Record>,
-    skipped_legacy_diff_target_records: usize,
-    skipped_malformed_records: usize,
-    malformed_declaration_errors: Vec<String>,
-}
-
-enum ParsedRecordLine {
-    Record(Box<Record>),
-    LegacyDiffTarget,
-    Malformed {
-        error: String,
-        declaration_shape: bool,
-    },
-}
-
-fn value_has_declaration_shape(value: &serde_json::Value) -> bool {
-    value
-        .get("target")
-        .and_then(|target| target.get("kind"))
-        .and_then(serde_json::Value::as_str)
-        == Some("declaration")
-        || value.get("declaration_locator").is_some()
-        || value.get("check").and_then(serde_json::Value::as_str) == Some("declaration")
-        || value
-            .get("comment_anchor")
-            .and_then(|anchor| anchor.get("type"))
-            .and_then(serde_json::Value::as_str)
-            == Some("declaration")
-}
-
-fn parse_record_line(line: &str) -> ParsedRecordLine {
-    let value: serde_json::Value = match serde_json::from_str(line) {
-        Ok(value) => value,
-        Err(error) => {
-            return ParsedRecordLine::Malformed {
-                error: error.to_string(),
-                declaration_shape: false,
-            };
-        }
-    };
-
-    let declaration_shape = value_has_declaration_shape(&value);
-    let is_legacy_diff_target = value
-        .get("target")
-        .and_then(|target| target.get("kind"))
-        .and_then(serde_json::Value::as_str)
-        == Some("diff");
-    if is_legacy_diff_target && !declaration_shape {
-        return ParsedRecordLine::LegacyDiffTarget;
-    }
-    match serde_json::from_value(value) {
-        Ok(record) => ParsedRecordLine::Record(Box::new(record)),
-        Err(error) => ParsedRecordLine::Malformed {
-            error: error.to_string(),
-            declaration_shape,
-        },
-    }
-}
-
-fn parse_records_jsonl_report_impl(content: &str) -> JsonlParseReport {
-    let mut report = JsonlParseReport::default();
-
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        match parse_record_line(line) {
-            ParsedRecordLine::Record(record) => report.records.push(*record),
-            ParsedRecordLine::Malformed {
-                error,
-                declaration_shape,
-            } => {
-                report.skipped_malformed_records += 1;
-                if declaration_shape {
-                    report.malformed_declaration_errors.push(error);
-                } else {
-                    warn!("Skipping malformed record: {error}");
-                }
-            }
-            ParsedRecordLine::LegacyDiffTarget => {
-                report.skipped_legacy_diff_target_records += 1;
-            }
-        }
-    }
-
-    report
-}
-
-#[cfg(test)]
-fn parse_records_jsonl_report(content: &str) -> JsonlParseReport {
-    parse_records_jsonl_report_impl(content)
-}
-
-#[cfg(test)]
-pub fn parse_records_jsonl(content: &str) -> Vec<Record> {
-    parse_records_jsonl_report_impl(content).records
+fn parse_records_jsonl(content: &str) -> Result<Vec<Record>> {
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line).map_err(|error| {
+                anyhow!(
+                    "review history contains malformed record at line {}: {error}",
+                    index + 1
+                )
+            })
+        })
+        .collect()
 }
 
 pub trait ReviewStore {
@@ -1556,20 +1474,7 @@ impl JsonlStoreBackend {
         let mut content = String::new();
         file.read_to_string(&mut content)?;
 
-        let report = parse_records_jsonl_report_impl(&content);
-        if report.skipped_legacy_diff_target_records > 0 {
-            warn!(
-                "Skipped {} legacy diff-target review records for compatibility",
-                report.skipped_legacy_diff_target_records
-            );
-        }
-        if !report.malformed_declaration_errors.is_empty() {
-            return Err(anyhow!(
-                "review history contains malformed declaration record(s): {}",
-                report.malformed_declaration_errors.join("; ")
-            ));
-        }
-        Ok(report.records)
+        parse_records_jsonl(&content)
     }
 
     fn append(&self, record: &Record) -> Result<()> {
@@ -1770,15 +1675,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_records_jsonl_reports_skipped_legacy_diff_target_records() {
+    fn parse_records_jsonl_rejects_unsupported_diff_target_records() {
         let content = concat!(
             "{\"id\":\"legacy-diff\",\"version\":2,\"target\":{\"kind\":\"diff\",\"fingerprint\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},\"check\":\"review\",\"verdict\":\"approved\",\"identity\":{\"type\":\"email\",\"email\":\"dev@example.com\"},\"repo_ref\":{\"type\":\"vcs\",\"system\":\"git\",\"revision\":\"0123456789abcdef\"},\"block_state\":\"committed\",\"timestamp\":1,\"path_hint\":null,\"line_hint\":null,\"note\":null,\"tags\":null}\n",
             "{\"id\":\"typed\",\"version\":2,\"target\":{\"kind\":\"block\",\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},\"check\":\"review\",\"verdict\":\"approved\",\"identity\":{\"type\":\"email\",\"email\":\"dev@example.com\"},\"repo_ref\":{\"type\":\"vcs\",\"system\":\"git\",\"revision\":\"0123456789abcdef\"},\"block_state\":\"committed\",\"timestamp\":2,\"path_hint\":null,\"line_hint\":null,\"note\":null,\"tags\":null}\n"
         );
 
-        let report = parse_records_jsonl_report(content);
-        assert_eq!(report.records.len(), 1);
-        assert_eq!(report.skipped_legacy_diff_target_records, 1);
+        assert!(
+            parse_records_jsonl(content).is_err(),
+            "unsupported events must not be skipped to load partial history"
+        );
     }
 
     #[test]

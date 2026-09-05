@@ -378,6 +378,10 @@ Moving lines within the same file can preserve coverage; narrowing review scope
 or removing the original file never transfers its approval to another file.
 Records without a path use content-only identity and must resolve unambiguously.
 
+Malformed or unsupported history records stop review loading with the offending
+line number. Trueflow does not silently discard records or repair truncated
+history: restore or correct the log before relying on its review coverage.
+
 ### GitHub pull requests
 
 Pull request review is fetch-only. `trueflow tui --target pr:11` resolves the
