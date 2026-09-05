@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 
 use trueflow::store::{FileStore, ReviewStore};
@@ -53,7 +53,8 @@ fn test_review_fails_closed_after_malformed_rejection() -> Result<()> {
     );
     let error = store
         .read_history()
-        .expect_err("a malformed rejection must not leave the earlier approval authoritative");
+        .err()
+        .context("a malformed rejection must not leave the earlier approval authoritative")?;
     assert!(
         error.to_string().contains("line 3"),
         "history corruption must identify its physical line: {error:#}"
@@ -79,7 +80,8 @@ fn test_review_fails_closed_on_truncated_db_tail() -> Result<()> {
     );
     let error = store
         .read_history()
-        .expect_err("syntactically malformed JSON must fail history loading");
+        .err()
+        .context("syntactically malformed JSON must fail history loading")?;
     assert!(
         error.to_string().contains("line 2"),
         "the truncated tail must identify its physical line: {error:#}"
