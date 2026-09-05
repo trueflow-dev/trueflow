@@ -236,8 +236,17 @@ fn in_review_relationship_navigation_crosses_prepared_targets_and_back_restores_
 
     controller.handle_key(KeyCode::Enter)?;
     let after_activation = controller.state_snapshot();
-    controller.handle_key(KeyCode::Backspace)?;
-    let after_back = controller.state_snapshot();
+    let relationship_request_target = runtime
+        .selected_target()
+        .map(|target| target.declaration.id.as_str().to_owned());
+    runtime
+        .controller_mut()
+        .context("navigation lost the declaration controller")?
+        .handle_key(KeyCode::Backspace)?;
+    let after_back = runtime
+        .controller()
+        .context("back navigation lost the declaration controller")?
+        .state_snapshot();
 
     assert_eq!(
         after_activation.active_declaration,
@@ -245,9 +254,214 @@ fn in_review_relationship_navigation_crosses_prepared_targets_and_back_restores_
         "activating an in-review relationship must open its prepared destination target"
     );
     assert_eq!(
+        relationship_request_target.as_deref(),
+        Some(destination.as_str()),
+        "relationship requests and live updates must target the inspected beta, not queued alpha"
+    );
+    assert_eq!(
         after_back, before_activation,
         "Backspace must restore the prior target, pane, and row selection"
     );
+    Ok(())
+}
+
+#[test]
+fn approving_relationship_destination_preserves_pending_queue_and_exact_binding() -> Result<()> {
+    let (repo, query) = two_file_dirty_repo("declaration_tui_relationship_approval")?;
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+    let alpha = prepared
+        .targets()
+        .iter()
+        .find(|target| target.declaration.name == "alpha")
+        .context("missing prepared alpha target")?
+        .clone();
+    let beta = prepared
+        .targets()
+        .iter()
+        .find(|target| target.declaration.name == "beta")
+        .context("missing prepared beta target")?
+        .clone();
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
+    runtime.apply_relationship_state(
+        alpha.declaration.id.as_str(),
+        RelationshipState::Ready(vec![RelationshipGroup {
+            label: "Calls".to_owned(),
+            relationships: vec![Relationship {
+                id: "alpha.calls.beta".to_owned(),
+                label: "beta".to_owned(),
+                destination: RelationshipDestination::InReview {
+                    declaration_id: beta.declaration.id.as_str().to_owned(),
+                },
+            }],
+        }]),
+    )?;
+    let controller = runtime
+        .controller_mut()
+        .context("prepared runtime has no declaration controller")?;
+    for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Enter, KeyCode::Tab] {
+        controller.handle_key(key)?;
+    }
+    let inspected = controller.state_snapshot();
+    assert_eq!(inspected.active_declaration, beta.declaration.id.as_str());
+    assert_eq!(inspected.active_pane, DeclarationPane::Outline);
+    controller.handle_key(KeyCode::Char('a'))?;
+    let mut actions = controller.take_actions();
+    ensure!(actions.len() == 1, "approving beta must produce one action");
+    let action = actions.remove(0);
+    let mut persisted = Vec::new();
+    runtime.submit_action_with_persistence(&action, |record| {
+        record.validate()?;
+        persisted.push(record.clone());
+        Ok(())
+    })?;
+    let record = only_record(persisted)?;
+    assert_eq!(
+        record.target,
+        ReviewTargetRef::Declaration {
+            hash: beta.declaration.projection_hash.clone(),
+        }
+    );
+    assert_eq!(record.verdict, Verdict::Approved);
+    let locator = record
+        .declaration_locator
+        .as_ref()
+        .context("beta approval locator")?;
+    assert_eq!(locator.path, beta.display_path);
+    assert_eq!(locator.declaration_key, beta.declaration.key);
+    assert_eq!(locator.source_ordinal, beta.declaration.source_ordinal);
+    assert_eq!(locator.source_span, beta.declaration.source_span);
+    assert_eq!(locator.projection_hash, beta.declaration.projection_hash);
+    assert_eq!(
+        locator.reviewed_snapshot.snapshot_id,
+        beta.snapshot.id.as_str()
+    );
+    assert_eq!(
+        &locator.reviewed_snapshot.content_hash,
+        beta.snapshot.bytes_hash()
+    );
+    let anchor = match record.comment_anchor.as_ref() {
+        Some(CommentAnchor::Declaration(anchor)) => anchor,
+        other => bail!("beta approval must retain its declaration anchor, got {other:?}"),
+    };
+    assert_eq!(anchor.reviewed_snapshot, locator.reviewed_snapshot);
+    assert_eq!(anchor.projection_hash, beta.declaration.projection_hash);
+    assert_eq!(anchor.source_len_bytes, beta.snapshot.source().len());
+    assert_eq!(anchor.ranges.len(), beta.declaration.components.len());
+    for (actual, component) in anchor.ranges.iter().zip(&beta.declaration.components) {
+        assert_eq!(actual.start_byte..actual.end_byte, component.source_range);
+        assert_eq!(actual.exact_text, component.text);
+    }
+    assert_eq!(
+        runtime.queue_current().map(|target| &target.declaration.id),
+        Some(&alpha.declaration.id),
+        "approving an inspected destination must leave the original queue item pending"
+    );
+    assert_eq!(
+        runtime
+            .controller()
+            .context("alpha must remain reviewable")?
+            .state_snapshot()
+            .active_declaration,
+        alpha.declaration.id.as_str(),
+        "successful approval must return to pending alpha"
+    );
+    let reloaded = prepare_declaration_launch(&repo.path, &query, vec![record])?;
+    assert_eq!(
+        reloaded
+            .targets()
+            .iter()
+            .map(|target| target.declaration.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha"],
+        "persisted beta approval must not mark alpha reviewed"
+    );
+    runtime.submit(DeclarationReviewActionKind::Approve, None)?;
+    assert!(
+        runtime.is_finished(),
+        "later canonical traversal must skip already-reviewed beta"
+    );
+    assert!(runtime.queue_current().is_none());
+    let alpha_record = only_record(runtime.into_appender().records)?;
+    assert_eq!(
+        alpha_record
+            .declaration_locator
+            .context("alpha approval locator")?
+            .declaration_key,
+        alpha.declaration.key
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_relationship_approval_preserves_inspection_and_leaves_destination_pending() -> Result<()>
+{
+    let (repo, query) = two_file_dirty_repo("declaration_tui_relationship_append_failure")?;
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+    let alpha = prepared.targets()[0].declaration.id.clone();
+    let beta = prepared.targets()[1].declaration.id.clone();
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
+    runtime.apply_relationship_state(
+        alpha.as_str(),
+        RelationshipState::Ready(vec![RelationshipGroup {
+            label: "Calls".to_owned(),
+            relationships: vec![Relationship {
+                id: "alpha.calls.beta".to_owned(),
+                label: "beta".to_owned(),
+                destination: RelationshipDestination::InReview {
+                    declaration_id: beta.as_str().to_owned(),
+                },
+            }],
+        }]),
+    )?;
+    let controller = runtime.controller_mut().context("missing controller")?;
+    for key in [
+        KeyCode::Tab,
+        KeyCode::Down,
+        KeyCode::Enter,
+        KeyCode::Tab,
+        KeyCode::Char('a'),
+    ] {
+        controller.handle_key(key)?;
+    }
+    let action = controller
+        .take_actions()
+        .pop()
+        .context("missing approval")?;
+    let before = controller.state_snapshot();
+    let before_text = runtime.visible_text();
+    let mut append_attempted = false;
+    let result = runtime.submit_action_with_persistence(&action, |_| {
+        append_attempted = true;
+        bail!("injected append failure")
+    });
+    assert!(
+        append_attempted,
+        "the inspected action must reach persistence"
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        runtime
+            .controller()
+            .context("lost controller")?
+            .state_snapshot(),
+        before,
+        "failed persistence must retain the inspected target and navigation"
+    );
+    assert_eq!(runtime.visible_text(), before_text);
+    assert_eq!(
+        runtime.queue_current().map(|target| &target.declaration.id),
+        Some(&alpha)
+    );
+    runtime.skip_current()?;
+    assert_eq!(
+        runtime.queue_current().map(|target| &target.declaration.id),
+        Some(&beta),
+        "skipping queued alpha must not skip the unsuccessfully persisted beta"
+    );
+    runtime.submit(DeclarationReviewActionKind::Approve, None)?;
+    assert!(runtime.is_finished());
     Ok(())
 }
 
@@ -272,12 +486,12 @@ fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result
     let mut runtime =
         DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
     assert_eq!(
-        runtime.current().map(|target| &target.declaration.id),
+        runtime.queue_current().map(|target| &target.declaration.id),
         Some(&approved.declaration.id)
     );
     runtime.submit(DeclarationReviewActionKind::Approve, None)?;
     assert_eq!(
-        runtime.current().map(|target| &target.declaration.id),
+        runtime.queue_current().map(|target| &target.declaration.id),
         Some(&successor),
         "a successful append must advance to the canonical successor"
     );
@@ -378,7 +592,7 @@ fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result
     };
     assert!(format!("{error:#}").contains("injected append failure"));
     assert_eq!(
-        failing.current().map(|target| &target.declaration.id),
+        failing.queue_current().map(|target| &target.declaration.id),
         Some(&original)
     );
     assert_eq!(failing.into_appender().attempts, 1);
@@ -430,7 +644,7 @@ fn comment_and_rejection_persist_then_remain_reviewable_with_status() -> Result<
         )?;
         runtime.submit(action, Some(note.to_owned()))?;
         assert_eq!(
-            runtime.current().map(|target| &target.declaration.id),
+            runtime.queue_current().map(|target| &target.declaration.id),
             Some(&second_id),
             "successful {verdict:?} append must advance within the current session"
         );
@@ -487,7 +701,7 @@ fn empty_dirty_launches_preserve_explicit_reason_and_finish_without_a_controller
     let body_runtime =
         DeclarationAppRuntime::new(body, identity(), RecordingAppender::default(), 100, 12)?;
     assert_eq!(body_runtime.status(), &CollectionStatus::NoSurfaceChanges);
-    assert!(body_runtime.current().is_none());
+    assert!(body_runtime.queue_current().is_none());
     assert!(body_runtime.is_finished());
     assert!(
         body_runtime
@@ -524,7 +738,7 @@ fn empty_dirty_launches_preserve_explicit_reason_and_finish_without_a_controller
             languages: vec![Language::Java],
         }
     );
-    assert!(unsupported_runtime.current().is_none());
+    assert!(unsupported_runtime.queue_current().is_none());
     assert!(unsupported_runtime.is_finished());
     let visible = unsupported_runtime.visible_text();
     assert!(visible.contains("Unsupported language"));

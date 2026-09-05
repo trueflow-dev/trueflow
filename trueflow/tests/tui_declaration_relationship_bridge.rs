@@ -12,9 +12,9 @@ use crossterm::event::KeyCode;
 use trueflow::commands::review::ResolvedReviewQuery;
 use trueflow::commands::tui::declaration::{
     DeclarationAppRuntime, DeclarationRecordAppender, DeclarationRelationshipProvider,
-    DeclarationRelationshipRequest, DeclarationRelationshipResults, RelationshipBridge,
-    RelationshipDestination, RelationshipState as GraphRelationshipState, RelationshipUpdate,
-    prepare_declaration_launch,
+    DeclarationRelationshipRequest, DeclarationRelationshipResults, Relationship,
+    RelationshipBridge, RelationshipDestination, RelationshipGroup,
+    RelationshipState as GraphRelationshipState, RelationshipUpdate, prepare_declaration_launch,
 };
 use trueflow::config::BlockFilters;
 use trueflow::declaration::relationships::{
@@ -191,9 +191,10 @@ impl ReviewFixture {
             [alpha.clone(), config.clone(), beta.clone()],
             "fixture must put Config, not the graph's beta edge, after alpha"
         );
-        let a_uri = Url::from_file_path(repo.path.join("src/a.rs"))
+        let uri_root = repo.path.canonicalize()?;
+        let a_uri = Url::from_file_path(uri_root.join("src/a.rs"))
             .map_err(|()| anyhow::anyhow!("cannot make src/a.rs URI"))?;
-        let z_uri = Url::from_file_path(repo.path.join("src/z.rs"))
+        let z_uri = Url::from_file_path(uri_root.join("src/z.rs"))
             .map_err(|()| anyhow::anyhow!("cannot make src/z.rs URI"))?;
         Ok(Self {
             repo,
@@ -760,7 +761,7 @@ fn loading_empty_unsupported_partial_and_provider_failure_reach_distinct_live_gr
         )?;
         let mut runtime = fixture.runtime()?;
         let before = runtime
-            .current()
+            .queue_current()
             .context("missing current declaration")?
             .declaration
             .id
@@ -801,11 +802,61 @@ fn loading_empty_unsupported_partial_and_provider_failure_reach_distinct_live_gr
             runtime.visible_text()
         );
         assert_eq!(
-            runtime.current().map(|target| &target.declaration.id),
+            runtime.queue_current().map(|target| &target.declaration.id),
             Some(&before),
             "{case} relationship state moved the canonical review cursor"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn inspected_relationship_destination_accepts_its_updates_without_advancing_queue() -> Result<()> {
+    let fixture = ReviewFixture::new("relationship_bridge_inspected_target")?;
+    let provider = FakeProvider::new(&fixture.repo.path, [Script::SupportedEmpty]);
+    let mut bridge = RelationshipBridge::new(
+        &fixture.prepared,
+        &fixture.repo.path,
+        WorkspaceTrust::TrustedForInvocation,
+        Some(LspServerProfile::RustAnalyzer),
+        provider,
+    )?;
+    let mut runtime = fixture.runtime()?;
+    runtime.apply_relationship_state(
+        fixture.alpha.as_str(),
+        GraphRelationshipState::Ready(vec![RelationshipGroup {
+            label: "Calls".to_owned(),
+            relationships: vec![Relationship {
+                id: "alpha.calls.beta".to_owned(),
+                label: "beta".to_owned(),
+                destination: RelationshipDestination::InReview {
+                    declaration_id: fixture.beta.as_str().to_owned(),
+                },
+            }],
+        }]),
+    )?;
+    let controller = runtime.controller_mut().context("missing controller")?;
+    for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Enter] {
+        controller.handle_key(key)?;
+    }
+    let selected = runtime
+        .selected_target()
+        .context("missing inspected destination")?
+        .declaration
+        .id
+        .clone();
+    assert_eq!(selected, fixture.beta);
+    let loading = bridge.request(&selected)?;
+    assert!(apply(&mut bridge, &mut runtime, loading)?);
+    assert!(runtime.visible_text().contains("Checking…"));
+    let completed = bridge.poll().context("missing beta completion")?;
+    assert!(apply(&mut bridge, &mut runtime, completed)?);
+    assert!(runtime.visible_text().contains("No relationships found"));
+    assert_eq!(
+        runtime.queue_current().map(|target| &target.declaration.id),
+        Some(&fixture.alpha),
+        "updates to inspected beta must leave queued alpha pending"
+    );
     Ok(())
 }
 
@@ -931,7 +982,7 @@ fn provider_results_map_exact_targets_into_stable_advisory_groups_without_reorde
 
     assert!(apply(&mut bridge, &mut runtime, completed)?);
     assert_eq!(
-        runtime.current().map(|target| &target.declaration.id),
+        runtime.queue_current().map(|target| &target.declaration.id),
         Some(&fixture.alpha),
         "graph application changed the runtime's canonical cursor"
     );
@@ -953,7 +1004,7 @@ fn provider_results_map_exact_targets_into_stable_advisory_groups_without_reorde
 
     runtime.skip_current()?;
     assert_eq!(
-        runtime.current().map(|target| &target.declaration.id),
+        runtime.queue_current().map(|target| &target.declaration.id),
         Some(&fixture.config),
         "graph order replaced alpha's canonical successor with beta"
     );

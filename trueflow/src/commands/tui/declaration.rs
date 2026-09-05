@@ -647,6 +647,10 @@ impl DeclarationController {
         }
     }
 
+    pub fn active_declaration_id(&self) -> &str {
+        &self.active_declaration
+    }
+
     pub fn state_snapshot(&self) -> DeclarationStateSnapshot {
         DeclarationStateSnapshot {
             active_declaration: self.active_declaration.clone(),

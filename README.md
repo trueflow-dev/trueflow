@@ -313,6 +313,11 @@ Declaration Review keys are intentionally fixed to its two-pane model:
 - `a` approves, `c` comments, `r` rejects, and Space skips the current declaration
 - `q` quits
 
+Actions on a relationship detour apply to the inspected declaration, then return
+to the pending review queue. The original queue item remains pending, and the
+completed detour is skipped when the queue later reaches it. Space skips the
+queue item rather than marking the inspected declaration.
+
 Relationship expansion is advisory and on demand. It never changes review
 order or creates review targets. Trueflow launches only the fixed language
 server profile for the declaration's language, and only when the current

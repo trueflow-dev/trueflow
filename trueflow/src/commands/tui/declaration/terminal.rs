@@ -222,7 +222,7 @@ fn run_runtime(
 
                 if request_relationships
                     && let Some(declaration_id) = runtime
-                        .current()
+                        .selected_target()
                         .map(|target| target.declaration.id.clone())
                 {
                     let update = relationships.request(&declaration_id)?;

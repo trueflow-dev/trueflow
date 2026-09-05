@@ -327,7 +327,8 @@ pub struct DeclarationAppRuntime<A> {
     prepared: PreparedDeclarationLaunch,
     identity: Identity,
     appender: A,
-    current_index: usize,
+    queue_index: usize,
+    completed: Vec<bool>,
     controller: Option<DeclarationController>,
     inner_width: u16,
     inner_height: u16,
@@ -371,11 +372,13 @@ impl<A> DeclarationAppRuntime<A> {
                 )
             })
             .transpose()?;
+        let completed = vec![false; prepared.targets.len()];
         Ok(Self {
             prepared,
             identity,
             appender,
-            current_index: 0,
+            queue_index: 0,
+            completed,
             controller,
             inner_width,
             inner_height,
@@ -386,12 +389,21 @@ impl<A> DeclarationAppRuntime<A> {
         self.prepared.status()
     }
 
-    pub fn current(&self) -> Option<&PreparedDeclarationTarget> {
-        self.prepared.targets.get(self.current_index)
+    pub fn queue_current(&self) -> Option<&PreparedDeclarationTarget> {
+        self.prepared.targets.get(self.queue_index)
     }
 
-    pub fn active_declaration_id(&self) -> Option<&str> {
-        self.current().map(|target| target.declaration.id.as_str())
+    pub fn selected_target(&self) -> Option<&PreparedDeclarationTarget> {
+        self.selected_target_index()
+            .map(|index| &self.prepared.targets[index])
+    }
+
+    fn selected_target_index(&self) -> Option<usize> {
+        let owner = self.controller.as_ref()?.active_declaration_id();
+        self.prepared
+            .targets
+            .iter()
+            .position(|target| target.declaration.id.as_str() == owner)
     }
 
     pub fn controller(&self) -> Option<&DeclarationController> {
@@ -403,7 +415,7 @@ impl<A> DeclarationAppRuntime<A> {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.current().is_none()
+        self.queue_current().is_none()
     }
 
     pub fn visible_text(&self) -> String {
@@ -442,7 +454,7 @@ impl<A> DeclarationAppRuntime<A> {
             !self.is_finished(),
             "declaration review is already finished"
         );
-        self.current_index += 1;
+        self.queue_index += 1;
         self.rebuild_controller()
     }
 
@@ -466,21 +478,21 @@ impl<A> DeclarationAppRuntime<A> {
     where
         F: FnOnce(&Record) -> Result<()>,
     {
-        let target = self
-            .current()
-            .cloned()
-            .context("declaration review is already finished")?;
-        validate_action_for_target(action, &target)?;
-        let record = build_record(&target, self.identity.clone(), action)?;
+        let target_index = self
+            .selected_target_index()
+            .context("declaration review has no selected target")?;
+        let target = &self.prepared.targets[target_index];
+        validate_action_for_target(action, target)?;
+        let record = build_record(target, self.identity.clone(), action)?;
 
         // Atomicity boundary: neither status nor cursor changes until persistence succeeds.
         persist(&record)?;
-        self.finish_submission(&target, action.kind)
+        self.finish_submission(target_index, action.kind)
     }
 
     fn finish_submission(
         &mut self,
-        target: &PreparedDeclarationTarget,
+        target_index: usize,
         action: DeclarationReviewActionKind,
     ) -> Result<()> {
         let status = match action {
@@ -489,15 +501,21 @@ impl<A> DeclarationAppRuntime<A> {
             DeclarationReviewActionKind::Reject => DeclarationReviewStatus::Rejected,
         };
         if let Some(controller) = &mut self.controller {
-            controller.apply_review_status(target.declaration.id.as_str(), status);
+            controller.apply_review_status(
+                self.prepared.targets[target_index].declaration.id.as_str(),
+                status,
+            );
         }
-        self.current_index += 1;
+        self.completed[target_index] = true;
         self.rebuild_controller()
     }
 
     fn rebuild_controller(&mut self) -> Result<()> {
+        while self.completed.get(self.queue_index) == Some(&true) {
+            self.queue_index += 1;
+        }
         let Some(declaration_id) = self
-            .current()
+            .queue_current()
             .map(|target| target.declaration.id.as_str().to_owned())
         else {
             self.controller = None;
@@ -526,15 +544,15 @@ impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
         kind: DeclarationReviewActionKind,
         note: Option<String>,
     ) -> Result<()> {
-        let target = self
-            .current()
-            .cloned()
-            .context("declaration review is already finished")?;
-        let action = full_declaration_action(&target, kind, note);
-        validate_action_for_target(&action, &target)?;
-        let record = build_record(&target, self.identity.clone(), &action)?;
+        let target_index = self
+            .selected_target_index()
+            .context("declaration review has no selected target")?;
+        let target = &self.prepared.targets[target_index];
+        let action = full_declaration_action(target, kind, note);
+        validate_action_for_target(&action, target)?;
+        let record = build_record(target, self.identity.clone(), &action)?;
         self.appender.append(&record)?;
-        self.finish_submission(&target, kind)
+        self.finish_submission(target_index, kind)
     }
 
     pub fn into_appender(self) -> A {
