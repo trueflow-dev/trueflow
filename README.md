@@ -407,6 +407,10 @@ trueflow feedback --pr pr:11
 trueflow feedback --pr pr:11 --submit
 ```
 
+After resuming an interrupted feedback operation, Trueflow reloads and validates
+the remote PR state before further delivery or submission. Recovered feedback
+is preserved when new notes are appended in the same invocation.
+
 ## Contributing
 
 Contributor/developer workflow docs live in `CONTRIBUTING.md`.
