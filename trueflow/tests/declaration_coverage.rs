@@ -319,6 +319,85 @@ fn proven_file_rename_and_declaration_match_carry_approval() -> Result<()> {
 }
 
 #[test]
+fn repeated_rename_sources_for_one_occurrence_remain_unique() -> Result<()> {
+    let source = "pub fn stable(value: u8) -> u8 { value }\n";
+    let first_base = snapshot("first-base", "src/old.rs", source);
+    let second_base = snapshot("second-base", "src/old.rs", &format!("\n{source}"));
+    let head = snapshot("head", "src/new.rs", source);
+    let (first_batch, first_diff) = batch(vec![pair(
+        "rename-pair",
+        Some(first_base.clone()),
+        Some(head.clone()),
+        PathPairEvidence::ExplicitRename,
+    )])?;
+    let (second_batch, _) = batch(vec![pair(
+        "rename-pair",
+        Some(second_base),
+        Some(head),
+        PathPairEvidence::ExplicitRename,
+    )])?;
+    let declaration_match = first_diff.matches.first().context("rename match")?;
+    let approval = record(
+        "base-approval",
+        &first_base,
+        &declaration_match.base,
+        Verdict::Approved,
+        10,
+    )?;
+    let (unrelated, _, unrelated_declaration) =
+        added_target("other-pair", "other-head", "src/other.rs", source, "stable")?;
+
+    let index = DeclarationCoverageIndex::build(
+        &[first_batch.clone(), second_batch, first_batch, unrelated],
+        &[approval],
+    )?;
+    assert_binding(
+        &index,
+        "rename-pair",
+        &declaration_match.head.id,
+        0,
+        CoverageBindingKind::ProvenRenameMatch,
+        &Verdict::Approved,
+    );
+    assert!(binding(&index, "other-pair", &unrelated_declaration.id).is_none());
+    Ok(())
+}
+
+#[test]
+fn ambiguous_same_path_matches_block_a_unique_proven_rename() -> Result<()> {
+    let source = "pub fn stable(value: u8) -> u8 { value }\n";
+    let base = snapshot("old-base", "src/old.rs", source);
+    let (rename_batch, rename_diff) = batch(vec![pair(
+        "rename-pair",
+        Some(base.clone()),
+        Some(snapshot("renamed-head", "src/new.rs", source)),
+        PathPairEvidence::ExplicitRename,
+    )])?;
+    let declaration_match = rename_diff.matches.first().context("rename match")?;
+    let approval = record(
+        "old-approval",
+        &base,
+        &declaration_match.base,
+        Verdict::Approved,
+        10,
+    )?;
+    let (first, _, first_declaration) =
+        added_target("first-pair", "first-head", "src/old.rs", source, "stable")?;
+    let (second, _, second_declaration) =
+        added_target("second-pair", "second-head", "src/old.rs", source, "stable")?;
+
+    let index = DeclarationCoverageIndex::build(&[rename_batch, first, second], &[approval])?;
+    for (pair_id, declaration_id) in [
+        ("rename-pair", &declaration_match.head.id),
+        ("first-pair", &first_declaration.id),
+        ("second-pair", &second_declaration.id),
+    ] {
+        assert!(binding(&index, pair_id, declaration_id).is_none());
+    }
+    Ok(())
+}
+
+#[test]
 fn unproven_move_and_declaration_rename_do_not_transfer_coverage() -> Result<()> {
     let unchanged_source = "pub fn stable(value: u8) -> u8 { value }\n";
     let old_path = snapshot("move-base", "src/old.rs", unchanged_source);

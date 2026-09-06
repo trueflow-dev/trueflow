@@ -11,7 +11,7 @@ use crate::store::{
 use super::diff::{DeclarationChangeKind, DeclarationDiffUnit, DeclarationMatch};
 use super::review::DeclarationReviewDiffBatch;
 use super::snapshot::{PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId, SourceSnapshot};
-use super::{DeclarationId, DeclarationNode};
+use super::{DeclarationId, DeclarationKey, DeclarationNode, DeclarationProjectionHash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverageBindingKind {
@@ -59,9 +59,113 @@ struct CandidateOccurrence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateMatch {
-    None,
     Unique(usize),
     Ambiguous,
+}
+
+type PathKeyHash<'a> = (
+    &'a RepoPath,
+    &'a DeclarationKey,
+    &'a DeclarationProjectionHash,
+);
+
+struct CandidateLookup<'a> {
+    exact: HashMap<&'a DeclarationRecordLocator, CandidateMatch>,
+    same_path: HashMap<PathKeyHash<'a>, CandidateMatch>,
+    rename: HashMap<PathKeyHash<'a>, CandidateMatch>,
+    key_hash: HashMap<(&'a DeclarationKey, &'a DeclarationProjectionHash), CandidateMatch>,
+    hash: HashMap<&'a DeclarationProjectionHash, CandidateMatch>,
+}
+
+impl<'a> CandidateLookup<'a> {
+    fn new(candidates: &'a [CandidateOccurrence]) -> Self {
+        let mut lookup = Self {
+            exact: HashMap::with_capacity(candidates.len()),
+            same_path: HashMap::with_capacity(candidates.len()),
+            rename: HashMap::new(),
+            key_hash: HashMap::with_capacity(candidates.len()),
+            hash: HashMap::with_capacity(candidates.len()),
+        };
+        for (index, candidate) in candidates.iter().enumerate() {
+            let locator = &candidate.locator;
+            insert_match(&mut lookup.exact, locator, index);
+            insert_match(
+                &mut lookup.same_path,
+                (
+                    &locator.path,
+                    &locator.declaration_key,
+                    &locator.projection_hash,
+                ),
+                index,
+            );
+            for source in &candidate.rename_sources {
+                insert_match(
+                    &mut lookup.rename,
+                    (
+                        &source.path,
+                        &source.declaration_key,
+                        &source.projection_hash,
+                    ),
+                    index,
+                );
+            }
+            insert_match(
+                &mut lookup.key_hash,
+                (&locator.declaration_key, &locator.projection_hash),
+                index,
+            );
+            insert_match(&mut lookup.hash, &locator.projection_hash, index);
+        }
+        lookup
+    }
+
+    fn find(
+        &self,
+        locator: &DeclarationRecordLocator,
+        hash: &DeclarationProjectionHash,
+    ) -> Option<(CoverageBindingKind, CandidateMatch)> {
+        let path_key_hash = (&locator.path, &locator.declaration_key, hash);
+        // An ambiguous stronger tier is still a match: never fall through it.
+        self.exact
+            .get(locator)
+            .map(|matched| (CoverageBindingKind::ExactLocator, *matched))
+            .or_else(|| {
+                self.same_path
+                    .get(&path_key_hash)
+                    .map(|matched| (CoverageBindingKind::SamePathKeyHash, *matched))
+            })
+            .or_else(|| {
+                self.rename
+                    .get(&path_key_hash)
+                    .map(|matched| (CoverageBindingKind::ProvenRenameMatch, *matched))
+            })
+            .or_else(|| {
+                self.key_hash
+                    .get(&(&locator.declaration_key, hash))
+                    .map(|matched| (CoverageBindingKind::UniqueKeyHash, *matched))
+            })
+            .or_else(|| {
+                self.hash
+                    .get(hash)
+                    .map(|matched| (CoverageBindingKind::UniqueHash, *matched))
+            })
+    }
+}
+
+fn insert_match<K: Eq + std::hash::Hash>(
+    index: &mut HashMap<K, CandidateMatch>,
+    key: K,
+    candidate_index: usize,
+) {
+    index
+        .entry(key)
+        .and_modify(|matched| {
+            // Distinct rename locators can share a relaxed key for one occurrence.
+            if *matched != CandidateMatch::Unique(candidate_index) {
+                *matched = CandidateMatch::Ambiguous;
+            }
+        })
+        .or_insert(CandidateMatch::Unique(candidate_index));
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +177,7 @@ pub struct DeclarationCoverageIndex {
 impl DeclarationCoverageIndex {
     pub fn build(batches: &[DeclarationReviewDiffBatch], records: &[Record]) -> Result<Self> {
         let candidates = collect_candidates(batches)?;
+        let lookup = CandidateLookup::new(&candidates);
         let mut bindings = HashMap::<OccurrenceKey, DeclarationCoverageBinding>::new();
 
         for (record_index, record) in records.iter().enumerate() {
@@ -95,48 +200,8 @@ impl DeclarationCoverageIndex {
                 )
             })?;
 
-            let tiers = [
-                (
-                    CoverageBindingKind::ExactLocator,
-                    find_candidates(&candidates, |candidate| candidate.locator == *locator),
-                ),
-                (
-                    CoverageBindingKind::SamePathKeyHash,
-                    find_candidates(&candidates, |candidate| {
-                        candidate.locator.path == locator.path
-                            && candidate.locator.declaration_key == locator.declaration_key
-                            && candidate.locator.projection_hash == *hash
-                    }),
-                ),
-                (
-                    CoverageBindingKind::ProvenRenameMatch,
-                    find_candidates(&candidates, |candidate| {
-                        candidate.rename_sources.iter().any(|source| {
-                            source.path == locator.path
-                                && source.declaration_key == locator.declaration_key
-                                && source.projection_hash == *hash
-                        })
-                    }),
-                ),
-                (
-                    CoverageBindingKind::UniqueKeyHash,
-                    find_candidates(&candidates, |candidate| {
-                        candidate.locator.declaration_key == locator.declaration_key
-                            && candidate.locator.projection_hash == *hash
-                    }),
-                ),
-                (
-                    CoverageBindingKind::UniqueHash,
-                    find_candidates(&candidates, |candidate| {
-                        candidate.locator.projection_hash == *hash
-                    }),
-                ),
-            ];
-
-            let selected = tiers
-                .into_iter()
-                .find(|(_, candidate_match)| *candidate_match != CandidateMatch::None);
-            let Some((kind, CandidateMatch::Unique(candidate_index))) = selected else {
+            let Some((kind, CandidateMatch::Unique(candidate_index))) = lookup.find(locator, hash)
+            else {
                 continue;
             };
             let candidate = &candidates[candidate_index];
@@ -186,23 +251,6 @@ impl DeclarationCoverageIndex {
         }
         self.bindings.get(&occurrences[0])
     }
-}
-
-fn find_candidates(
-    candidates: &[CandidateOccurrence],
-    predicate: impl Fn(&CandidateOccurrence) -> bool,
-) -> CandidateMatch {
-    let mut matched = None;
-    for (index, candidate) in candidates.iter().enumerate() {
-        if !predicate(candidate) {
-            continue;
-        }
-        if matched.is_some() {
-            return CandidateMatch::Ambiguous;
-        }
-        matched = Some(index);
-    }
-    matched.map_or(CandidateMatch::None, CandidateMatch::Unique)
 }
 
 fn collect_candidates(batches: &[DeclarationReviewDiffBatch]) -> Result<Vec<CandidateOccurrence>> {
