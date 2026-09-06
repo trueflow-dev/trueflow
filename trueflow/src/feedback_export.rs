@@ -474,13 +474,6 @@ enum DeclarationFeedbackResolution {
     Failed(String),
 }
 
-struct ResolvedDeclarationFeedbackRecord<'a> {
-    index: usize,
-    record: &'a Record,
-    locator: DeclarationRecordLocator,
-    resolution: DeclarationFeedbackResolution,
-}
-
 fn resolve_feedback_records<'a>(
     records: &'a [Record],
     allowed_revisions: Option<&HashSet<String>>,
@@ -642,16 +635,41 @@ fn collect_declaration_feedback_entries(
     validated_cursor: Option<&ValidatedFeedbackCursor>,
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<FeedbackEntry>> {
-    let mut resolved = Vec::new();
+    let mut candidates = Vec::new();
+    let mut latest = HashMap::<&DeclarationRecordLocator, (i64, usize, &'static str)>::new();
     for (index, record) in records.iter().enumerate() {
         if !matches!(record.target, ReviewTargetRef::Declaration { .. })
             || !record_matches_allowed_revisions(record, query.allowed_revisions.as_ref())
         {
             continue;
         }
-        let Some(locator) = record.declaration_locator.clone() else {
+        let Some(locator) = record.declaration_locator.as_ref() else {
             continue;
         };
+        candidates.push((index, record, locator));
+        if latest
+            .get(locator)
+            .is_none_or(|(timestamp, existing_index, _)| {
+                record.timestamp > *timestamp
+                    || (record.timestamp == *timestamp && index > *existing_index)
+            })
+        {
+            latest.insert(locator, (record.timestamp, index, record.verdict.as_str()));
+        }
+    }
+
+    let mut grouped = HashMap::<DeclarationFeedbackEntryKey, FeedbackEntry>::new();
+    for (index, record, locator) in candidates {
+        let latest_verdict = latest
+            .get(locator)
+            .map_or("unreviewed", |(_, _, verdict)| *verdict);
+        // Historical verdicts still participate above, but excluded records need
+        // neither source IO nor semantic projection.
+        if !record_matches_since(record, index, since_filter, validated_cursor)
+            || (!query.include_approved && latest_verdict == "approved")
+        {
+            continue;
+        }
         let resolution = match resolver.resolve_declaration_context(record) {
             Ok(Some(declaration)) => DeclarationFeedbackResolution::Resolved(declaration),
             Ok(None) => DeclarationFeedbackResolution::Failed(
@@ -659,65 +677,22 @@ fn collect_declaration_feedback_entries(
             ),
             Err(error) => DeclarationFeedbackResolution::Failed(format!("{error:#}")),
         };
-        resolved.push(ResolvedDeclarationFeedbackRecord {
-            index,
-            record,
-            locator,
-            resolution,
-        });
-    }
-
-    let mut latest = HashMap::<DeclarationRecordLocator, (i64, usize, &'static str)>::new();
-    for resolved in &resolved {
-        let record = resolved.record;
-        let should_replace =
-            latest
-                .get(&resolved.locator)
-                .is_none_or(|(timestamp, existing_index, _)| {
-                    record.timestamp > *timestamp
-                        || (record.timestamp == *timestamp && resolved.index > *existing_index)
-                });
-        if should_replace {
-            latest.insert(
-                resolved.locator.clone(),
-                (record.timestamp, resolved.index, record.verdict.as_str()),
-            );
-        }
-    }
-    let latest = latest
-        .into_iter()
-        .map(|(locator, (_, _, verdict))| (locator, verdict))
-        .collect::<HashMap<_, _>>();
-    let mut grouped = HashMap::<DeclarationFeedbackEntryKey, FeedbackEntry>::new();
-    for resolved in resolved {
-        let display_path = match &resolved.resolution {
+        let display_path = match &resolution {
             DeclarationFeedbackResolution::Resolved(declaration) => declaration.path.as_str(),
-            DeclarationFeedbackResolution::Failed(_) => resolved.locator.path.as_str(),
+            DeclarationFeedbackResolution::Failed(_) => locator.path.as_str(),
         };
-        if !record_matches_since(
-            resolved.record,
-            resolved.index,
-            since_filter,
-            validated_cursor,
-        ) || !path_matches_feedback_selections(
+        if !path_matches_feedback_selections(
             display_path,
             query.explicit_selection.as_ref(),
             query.changed_selection.as_ref(),
         ) {
             continue;
         }
-        let latest_verdict = latest
-            .get(&resolved.locator)
-            .copied()
-            .unwrap_or("unreviewed");
-        if !query.include_approved && latest_verdict == "approved" {
-            continue;
-        }
 
-        match resolved.resolution {
+        match resolution {
             DeclarationFeedbackResolution::Resolved(declaration) => {
                 let key = DeclarationFeedbackEntryKey::Resolved {
-                    locator: resolved.locator,
+                    locator: locator.clone(),
                     ranges: declaration.ranges.clone(),
                     context: declaration.context.clone(),
                 };
@@ -730,12 +705,12 @@ fn collect_declaration_feedback_entries(
                     reviews: Vec::new(),
                     latest_verdict: latest_verdict.to_string(),
                 });
-                entry.reviews.push(resolved.record.clone());
+                entry.reviews.push(record.clone());
             }
             DeclarationFeedbackResolution::Failed(reason) => {
-                let file_path = resolved.locator.path.to_string();
+                let file_path = locator.path.to_string();
                 let key = DeclarationFeedbackEntryKey::ResolutionFailed {
-                    locator: resolved.locator,
+                    locator: locator.clone(),
                     reason: reason.clone(),
                 };
                 let entry = grouped.entry(key).or_insert_with(|| FeedbackEntry {
@@ -746,7 +721,7 @@ fn collect_declaration_feedback_entries(
                     reviews: Vec::new(),
                     latest_verdict: latest_verdict.to_string(),
                 });
-                entry.reviews.push(resolved.record.clone());
+                entry.reviews.push(record.clone());
             }
         }
     }
