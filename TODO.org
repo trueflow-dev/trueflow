@@ -230,6 +230,30 @@
      by `gpg::tests`, `commands::mark::tests`, and `commands::verify::tests`.
 
 * Product & Platform Roadmap
+** TODO Browser review UI (WASM or webpage)
+   Goal: bring the `trueflow tui` review workflow into the browser with better
+   readability, navigation, and commenting, not just terminal emulation.
+   - [ ] Evaluate a WASM-rendered Rust UI versus a native webpage backed by a
+     local Rust service. Compare code reuse, filesystem/Git access, accessibility,
+     text selection, startup cost, and packaging before choosing dependencies.
+     - Starting recommendation: a local-service-backed webpage; keep repository
+       access and review persistence in Rust, with WASM optional where useful.
+   - [ ] Reuse the existing review model and actions across terminal and browser
+     frontends; keep review semantics and persisted records consistent.
+   - [ ] Provide file/block navigation, review status and progress, searchable
+     selection, syntax-highlighted diff/new-content views, and resizable panes.
+   - [ ] Support approve/reject/comment actions with inline comment context,
+     keyboard shortcuts, mouse navigation, selectable text, and accessible focus.
+   - [ ] Define local launch and browser connection behavior. Keep local code
+     private; protect any local service against unauthorized browser requests.
+   - [ ] Verify an end-to-end review in a real browser: select a scope, inspect
+     changes, record verdicts/comments, reload, and resume. Confirm those records
+     and coverage agree with the CLI/TUI, including after repository changes.
+   - [ ] Compare the same review task with the TUI; verify desktop/narrow layouts,
+     keyboard-only use, large diffs, and visible connection/save failures.
+   Acceptance: users can complete and resume a review in the browser without
+   losing review state, with demonstrably better reading and commenting UX.
+
 ** TODO [High] Coverage mode + heatmap
    - [ ] Add `trueflow coverage` command that shells out to `cargo llvm-cov` or `just coverage`.
    - [ ] Add coverage mode to show least-reviewed files.
