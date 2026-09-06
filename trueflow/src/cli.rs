@@ -208,6 +208,8 @@ pub enum Commands {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Generate a focused first-pass review of the repository's fundamental code
+    Onboard(crate::commands::onboard::OnboardArgs),
     /// Launch the TUI
     Tui {
         /// Review surface to launch (defaults to [tui].mode)

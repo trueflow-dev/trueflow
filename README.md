@@ -155,6 +155,9 @@ Website/deployment/infrastructure docs live in `infra/README.md`.
 # Launch the TUI. The main way to use trueflow.
 trueflow tui
 
+# Start a short, LLM-generated first-pass review of this repository
+trueflow onboard
+
 # Review a GitHub pull request in the TUI
 trueflow tui --target pr:11
 
@@ -180,6 +183,84 @@ trueflow feedback --pr pr:11 --dry-run
 # Export recent feedback for one subtree
 trueflow feedback --format json --since 1h --target dir:trueflow/src
 ```
+
+### Onboard a repository
+
+`trueflow onboard` asks an LLM CLI to identify foundational abstractions,
+functions, types, and core flows among the repository's unreviewed blocks, then
+opens the first selected card directly in the TUI. Each card includes an opening
+description explaining its importance and review focus. There is no setup wizard
+or second AI briefing.
+
+The default is **Codex CLI, `gpt-6`, high reasoning**. Install and authenticate
+`codex` first (`codex login`). Explicit `[ai].provider` and `[ai].model` settings
+still apply; onboarding requires a CLI provider (`codex_cli` or `claude_cli`).
+Invoking onboarding requests generation even when ordinary TUI AI is off.
+Generation sends selected repository context to the configured provider and
+allows its CLI to inspect the repository; Codex runs in its read-only sandbox.
+
+The model is asked to aim for 8–24 cards, with a hard maximum of 64. Trueflow
+also enforces a 14-minute **reading estimate**: two seconds per source line plus
+ten seconds per card. Actual review time depends on complexity and reading pace.
+This is a focused first pass, not an exhaustive review or a security assessment.
+Scan diagnostics remain visible; unsupported or omitted content is not certified.
+
+Use `a` to approve, `c` to comment, `l` or Space to skip/advance, `h` for a
+previous pending card, and `q` to quit (configured action keys still apply).
+Cards stay in the generated order and source mode. Parent, child, and root
+navigation are disabled so a batch action cannot approve unrelated code.
+Approvals and comments use the ordinary review store. Skipping does not approve.
+The final recap ends this pass rather than opening the repository scope picker.
+
+#### Portable review specifications
+
+The same versioned JSON format can be generated, shared, edited, or authored by
+another tool. It does not depend on a particular LLM:
+
+```sh
+# Generate without launching the TUI; save stdout wherever you keep review plans.
+trueflow onboard --json
+
+# Open an existing plan without invoking an LLM.
+trueflow onboard --plan /path/to/review.json
+
+# Resolve and check a plan without opening the TUI or writing review records.
+trueflow onboard --plan /path/to/review.json --json
+
+# Query the same unreviewed candidates available to the LLM; no LLM required.
+trueflow onboard --candidates --path src --offset 0 --limit 64
+```
+
+A specification is an object with these required fields; unknown fields are
+rejected:
+
+- `version`: `1`.
+- `title`: nonblank text, at most 120 characters.
+- `description`: nonblank opening text, at most 1,000 characters.
+- `steps`: an ordered array of 1–64 objects, each containing:
+  - `description`: nonblank card introduction, at most 600 characters.
+  - `target`: copy a candidate's complete `target` object:
+    - `path`: repository-relative file path.
+    - `start_line`, `end_line`: one-based, inclusive line range.
+    - `start_byte`, `end_byte`: zero-based, half-open UTF-8 byte range.
+    - `content_hash`: lowercase SHA-256 of the exact block bytes, without
+      whitespace normalization. This differs from the review `fingerprint`.
+
+Targets name complete, distinct, non-overlapping leaf review blocks. The byte
+range disambiguates multiple blocks on the same line. Source locations and hashes
+are checked before execution; stale or invented targets fail rather than being
+silently substituted. Previously approved or currently filtered-out targets are
+not queued. Selected source files are captured before the TUI opens, so later
+worktree edits do not replace the code under an existing card's identity.
+
+Candidate queries return `total_candidates`, `offset`, `next_offset` (null at
+the end), `diagnostics`, and `candidates`. Each candidate includes its `target`,
+review `fingerprint`, `kind`, `estimated_seconds`, and a bounded source `excerpt`.
+Pages use stable path/source order, not importance order; the LLM can query
+different paths and read full source before selecting. Queries always cover the
+repository root, even when invoked from a subdirectory, and honor scan/review
+filters and existing approval coverage. Pagination reflects current worktree and
+review state; final target resolution is authoritative.
 
 ## Filter and scope review
 
@@ -226,8 +307,9 @@ still take precedence over config values.
 # AI mode: off|review_plan|block_hints|review_plan_and_block_hints.
 mode = "off"
 # Provider: auto|anthropic|open_ai|claude_cli|codex_cli|none.
-provider = "auto"
+provider = "codex_cli"
 model = "auto"
+# Codex's "auto" model resolves to gpt-6; Codex reasoning effort is high.
 max_context_lines = 80
 # In-session cache for block-hint responses.
 cache = true

@@ -21,6 +21,7 @@ pub mod hashing;
 pub(crate) mod languages;
 pub mod logging;
 pub(crate) mod nix_blocks;
+pub mod onboarding;
 pub mod optimizer;
 pub mod path_utils;
 pub mod policy;

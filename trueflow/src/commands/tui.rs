@@ -829,6 +829,14 @@ struct AppState {
     highlighted_line_cache: HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     speed_read: SpeedReadController,
     ai: TuiAiState,
+    onboarding: Option<OnboardingState>,
+}
+
+struct OnboardingState {
+    title: String,
+    description: String,
+    cards: Vec<crate::onboarding::OnboardingCard>,
+    finished: bool,
 }
 
 const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
@@ -1337,6 +1345,148 @@ pub fn run(context: &TrueflowContext, request: TuiRunRequest<'_>) -> Result<()> 
     )
 }
 
+pub fn run_onboarding(
+    context: &TrueflowContext,
+    config: &TrueflowConfig,
+    prepared: crate::onboarding::PreparedOnboarding,
+) -> Result<()> {
+    let mut state = build_onboarding_state(context, config, prepared)?;
+    // Pin source before entering the terminal so later cards cannot display changed
+    // worktree bytes under the plan's captured approval identities.
+    let plan = state
+        .onboarding
+        .as_ref()
+        .context("onboarding state is unavailable")?;
+    for card in &plan.cards {
+        let node = state.navigator.tree.node(card.node_id);
+        let path = PathBuf::from(node.path.as_str());
+        if state.file_cache.contains_key(&path) {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to capture onboarding source {}", path.display()))?;
+        for selected in &plan.cards {
+            let selected_node = state.navigator.tree.node(selected.node_id);
+            if selected_node.path == node.path {
+                let block = selected_node
+                    .block
+                    .as_ref()
+                    .context("onboarding target is not a source block")?;
+                anyhow::ensure!(
+                    content.get(block.start_byte..block.end_byte) == Some(block.content.as_str()),
+                    "stale onboarding source {}; regenerate the plan",
+                    path.display()
+                );
+            }
+        }
+        state.file_cache.insert(
+            path,
+            content
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    let mut session = TerminalSession::enter()?;
+    let run_result = run_app(context, &mut session, state).map(|_| ());
+    let restore_result = session.restore();
+    match (run_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(restore)) => Err(anyhow!(
+            "{primary:#}\nterminal restore also failed: {restore:#}"
+        )),
+    }
+}
+
+fn build_onboarding_state(
+    context: &TrueflowContext,
+    config: &TrueflowConfig,
+    prepared: crate::onboarding::PreparedOnboarding,
+) -> Result<AppState> {
+    let crate::onboarding::PreparedOnboarding {
+        review,
+        title,
+        description,
+        cards,
+    } = prepared;
+    let mut state = build_review_state(
+        context,
+        review,
+        ScopePreset::All,
+        ReviewStateBuildOptions {
+            confirm_batch: config.tui.confirm_batch_sub_blocks,
+            block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
+            diff_line_numbers: config.tui.diff_line_numbers,
+            keybinds: config.tui.keybinds,
+            scope_label: format!("Onboarding: {title}"),
+            initial_view_mode: ViewMode::Source,
+            speed_read_config: config.tui.speed_read.clone(),
+            speed_read_config_path: speed_read_config_path_for_repo_root(),
+            ai: TuiAiState::for_mode(AiMode::Off, None, config.ai.max_context_lines, false),
+        },
+    )?;
+    configure_onboarding(&mut state, title, description, cards)?;
+    Ok(state)
+}
+
+fn configure_onboarding(
+    state: &mut AppState,
+    title: String,
+    description: String,
+    cards: Vec<crate::onboarding::OnboardingCard>,
+) -> Result<()> {
+    let selected = cards
+        .iter()
+        .map(|card| card.node_id)
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        !cards.is_empty()
+            && selected.len() == cards.len()
+            && selected.is_subset(&state.reviewable_nodes),
+        "onboarding cards must be distinct pending review blocks"
+    );
+    anyhow::ensure!(
+        selected
+            .iter()
+            .all(|&id| !state.navigator.tree.is_container_block(id)),
+        "onboarding cards must be leaf blocks: container approvals cover unselected descendants"
+    );
+    // Keep the captured tree for source context, but never expose its other targets.
+    let excluded = state
+        .reviewable_nodes
+        .difference(&selected)
+        .copied()
+        .collect::<Vec<_>>();
+    for node_id in excluded {
+        state.navigator.remove_visible_block(node_id);
+    }
+    state.reviewable_nodes = selected;
+    state
+        .commented_nodes
+        .retain(|id| state.reviewable_nodes.contains(id));
+    state.total_blocks = cards.len();
+    state.initial_remaining_blocks = cards.len();
+    state.remaining_blocks = cards.len();
+    let order = cards.iter().map(|card| card.node_id).collect::<Vec<_>>();
+    state.review_order = ReviewOrder::from_tree_with_priority_prefix(
+        &state.navigator.tree,
+        &state.reviewable_nodes,
+        &order,
+    );
+    state.navigator.set_current(cards[0].node_id);
+    state.focus_block = Some(cards[0].node_id);
+    state.pending_focus_scroll = true;
+    state.onboarding = Some(OnboardingState {
+        title,
+        description,
+        cards,
+        finished: false,
+    });
+    Ok(())
+}
+
 fn run_tui_review_loop(
     context: &TrueflowContext,
     config: &TrueflowConfig,
@@ -1781,6 +1931,7 @@ fn build_review_state(
             options.speed_read_config_path,
         ),
         ai,
+        onboarding: None,
     })
 }
 
@@ -2885,6 +3036,7 @@ fn run_app(
                         KeybindAction::Note => {
                             handle_note_action(&mut state)?;
                         }
+                        KeybindAction::ToggleView if state.onboarding.is_some() => {}
                         KeybindAction::ToggleView => {
                             state.view_mode = match state.view_mode {
                                 ViewMode::Source => ViewMode::Diff,
@@ -2894,6 +3046,7 @@ fn run_app(
                             set_focus_for_current_node(&mut state, preferred_focus);
                         }
                         KeybindAction::SpeedRead => toggle_speed_read_mode(&mut state),
+                        KeybindAction::Root if state.onboarding.is_some() => {}
                         KeybindAction::Root => {
                             state.navigator.jump_root();
                             clear_focus_scroll(&mut state);
@@ -3963,7 +4116,9 @@ fn handle_mouse_event(state: &mut AppState, mouse_event: MouseEvent) -> bool {
 }
 
 fn is_recap_mode(state: &AppState) -> bool {
-    matches!(state.input_mode, InputMode::Normal) && state.remaining_blocks == 0
+    matches!(state.input_mode, InputMode::Normal)
+        && (state.remaining_blocks == 0
+            || state.onboarding.as_ref().is_some_and(|plan| plan.finished))
 }
 
 fn recap_done_key(keybinds: &TuiKeybindsConfig) -> char {
@@ -4002,6 +4157,9 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
 }
 
 fn handle_parent(state: &mut AppState) {
+    if state.onboarding.is_some() {
+        return;
+    }
     let previous_current = state.navigator.current_id();
     if previous_current == state.navigator.tree.root() {
         return;
@@ -4013,6 +4171,9 @@ fn handle_parent(state: &mut AppState) {
 }
 
 fn handle_child(state: &mut AppState) {
+    if state.onboarding.is_some() {
+        return;
+    }
     if state.navigator.current_id() == state.navigator.tree.root() {
         let root = state.navigator.tree.root();
         state.root_cursor = state
@@ -4136,6 +4297,23 @@ fn handle_scroll_line_down(state: &mut AppState) {
 }
 
 fn handle_prev(state: &mut AppState) {
+    if let Some(plan) = &state.onboarding {
+        let current = state.navigator.current_id();
+        let previous = plan
+            .cards
+            .iter()
+            .take_while(|card| card.node_id != current)
+            .filter(|card| state.reviewable_nodes.contains(&card.node_id))
+            .last()
+            .map(|card| card.node_id);
+        if let Some(previous) = previous {
+            state.navigator.set_current(previous);
+            state.scroll_offset = 0;
+            set_focus_for_current_node(state, None);
+            sync_speed_read_focus(state);
+        }
+        return;
+    }
     if state.navigator.current_id() == state.navigator.tree.root() {
         return;
     }
@@ -4156,6 +4334,10 @@ fn mark_focused_block_temporarily_skipped(state: &mut AppState) {
 }
 
 fn handle_next(state: &mut AppState) {
+    if state.onboarding.is_some() {
+        handle_advance_review_target(state);
+        return;
+    }
     if state.navigator.current_id() == state.navigator.tree.root() {
         handle_child(state);
         return;
@@ -4634,6 +4816,13 @@ fn mark_params_for_action(
     verdict: Verdict,
     note: Option<String>,
 ) -> Result<mark::MarkParams> {
+    if state.onboarding.is_some() {
+        anyhow::ensure!(
+            state.reviewable_nodes.contains(&node_id)
+                && matches!(state.navigator.tree.node(node_id).kind, TreeNodeKind::Block),
+            "onboarding actions may only mark a selected pending card"
+        );
+    }
     let node = state.navigator.tree.node(node_id);
     let (fingerprint, target_kind) = fingerprint_and_target_kind_for_node(node);
 
@@ -4794,7 +4983,11 @@ fn apply_action_locally(
     verdict: &Verdict,
     next_id: Option<TreeNodeId>,
 ) -> ActionImpact {
-    let block_ids = review_session::action_block_ids(&state.navigator, node_id);
+    let block_ids = if state.onboarding.is_some() {
+        vec![node_id]
+    } else {
+        review_session::action_block_ids(&state.navigator, node_id)
+    };
     let affected_blocks = block_ids.len();
 
     let mut removed_reviewable = 0;
@@ -4830,6 +5023,9 @@ fn apply_action_locally(
         state.scroll_offset = 0;
         set_focus_for_current_node(state, None);
     } else {
+        if let Some(plan) = &mut state.onboarding {
+            plan.finished = true;
+        }
         state.navigator.jump_root();
         state.scroll_offset = 0;
         clear_focus_scroll(state);
@@ -4843,6 +5039,11 @@ fn apply_action_locally(
 }
 
 fn compute_next_review_target(state: &AppState, node_id: TreeNodeId) -> Option<TreeNodeId> {
+    if state.onboarding.is_some() {
+        return state
+            .review_order
+            .next_remaining_after(ReviewAnchor::Block(node_id), &state.reviewable_nodes);
+    }
     review_session::next_review_target(
         &state.navigator,
         &state.review_order,
@@ -4874,6 +5075,9 @@ fn handle_advance_review_target(state: &mut AppState) {
         mark_focused_block_temporarily_skipped(state);
     }
     let Some(next_id) = next_id else {
+        if let Some(plan) = &mut state.onboarding {
+            plan.finished = true;
+        }
         return;
     };
 
@@ -5101,7 +5305,16 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
 
     if is_recap_mode(state) {
         render_recap_view(frame, state, content_area, &palette);
-        render_recap_footer(frame, footer_area, &palette, &state.keybinds);
+        let hint = if state.onboarding.is_some() {
+            format!(
+                "Press [{}] finish onboarding or [{}/Esc] exit",
+                recap_done_key(&state.keybinds),
+                state.keybinds.quit
+            )
+        } else {
+            recap_footer_hint_text(&state.keybinds)
+        };
+        render_recap_footer(frame, footer_area, &palette, hint);
     } else {
         render_active_node(frame, state, content_area, &palette);
         render_footer(frame, state, footer_area, &palette);
@@ -5122,10 +5335,31 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     let header_lines = build_header_lines(node, state, palette);
     let mode_banner_line = build_mode_banner_line(state, palette);
     let ai_hint_width = focus_code_width(area);
-    let ai_hint_lines = state
-        .ai
-        .hint_line_text()
-        .map(|text| build_ai_hint_lines_from_text(&text, palette, ai_hint_width));
+    let ai_hint_lines = if let Some(plan) = &state.onboarding {
+        let card = plan
+            .cards
+            .iter()
+            .enumerate()
+            .find(|(_, card)| card.node_id == node.id);
+        card.map(|(index, card)| {
+            build_ai_hint_lines_from_text(
+                &format!(
+                    "Onboarding: {} · Card {}/{}\n{}",
+                    plan.title,
+                    index + 1,
+                    plan.cards.len(),
+                    card.description
+                ),
+                palette,
+                ai_hint_width,
+            )
+        })
+    } else {
+        state
+            .ai
+            .hint_line_text()
+            .map(|text| build_ai_hint_lines_from_text(&text, palette, ai_hint_width))
+    };
     let ai_hint_line_count = usize_to_u16_saturating(ai_hint_lines.as_ref().map_or(0, Vec::len));
 
     let focus_layout = compute_focus_layout(
@@ -5134,12 +5368,30 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         ai_hint_line_count,
     );
     let ui_mode = current_ui_mode(state);
-    let actions_lines = build_action_lines(
-        focus_layout.actions.width,
-        ui_mode,
-        &state.keybinds,
-        palette,
-    );
+    let actions_lines = if state.onboarding.is_some() && !matches!(ui_mode, UiMode::SpeedRead) {
+        let keys = &state.keybinds;
+        pack_action_phrases(
+            focus_layout.actions.width,
+            &[
+                format_key_action(keys.approve, "approve"),
+                format_key_action(keys.note, note_action_label(keys.note)),
+                format_key_action(keys.prev, "prev card"),
+                format!("[{}/Space]skip/next", keys.next),
+                "[PgUp/PgDown]scroll".to_string(),
+                format_key_action(keys.quit, "quit"),
+            ],
+        )
+        .into_iter()
+        .map(|line| styled_ai_hint_line(line, palette))
+        .collect()
+    } else {
+        build_action_lines(
+            focus_layout.actions.width,
+            ui_mode,
+            &state.keybinds,
+            palette,
+        )
+    };
     let node_snapshot = ContentNodeSnapshot::from_node(node);
     let full_code_width = focus_layout.code.width.max(1);
     let mut render_code_width = full_code_width;
@@ -6410,15 +6662,10 @@ fn recap_footer_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     )
 }
 
-fn render_recap_footer(
-    frame: &mut Frame,
-    area: Rect,
-    palette: &UiPalette,
-    keybinds: &TuiKeybindsConfig,
-) {
+fn render_recap_footer(frame: &mut Frame, area: Rect, palette: &UiPalette, hint: String) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            recap_footer_hint_text(keybinds),
+            hint,
             Style::default()
                 .fg(palette.fg)
                 .bg(palette.bg)
@@ -6431,6 +6678,24 @@ fn render_recap_footer(
 }
 
 fn recap_summary_lines(state: &AppState) -> Vec<String> {
+    if let Some(plan) = &state.onboarding {
+        return vec![
+            "Onboarding pass complete".to_string(),
+            format!("Plan: {}", plan.title),
+            plan.description.clone(),
+            String::new(),
+            format!("Selected cards: {}", plan.cards.len()),
+            format!("Approvals: {} blocks", state.session_recap.approved_blocks),
+            format!("Notes: {}", state.session_recap.comments),
+            format!("Skipped: {} cards", state.skipped_nodes.len()),
+            format!(
+                "Still unreviewed in this pass: {} cards",
+                state.remaining_blocks
+            ),
+            "This completes only the selected onboarding pass, not the repository review."
+                .to_string(),
+        ];
+    }
     let mut lines = vec![
         "All Done".to_string(),
         format!("Scope: {}", state.scope_label),
@@ -8739,6 +9004,165 @@ mod diff_scope_tests {
         assert!(!screen.contains("✦"));
     }
 
+    fn onboarding_test_state() -> (AppState, TreeNodeId, Vec<TreeNodeId>) {
+        let (base, file, ids) = build_state_with_file_block_count(3);
+        let prepared = crate::onboarding::PreparedOnboarding {
+            review: CollectedReview {
+                tree: base.navigator.tree,
+                summary: ReviewSummary {
+                    files: Vec::new(),
+                    total_blocks: 3,
+                    diagnostics: Vec::new(),
+                },
+                diff_selection: crate::targets::ReviewDiffSelection::None,
+                unreviewed_block_nodes: base.reviewable_nodes,
+                commented_block_nodes: HashSet::from([ids[0]]),
+                diff_block_sides: HashMap::new(),
+                file_change_kinds: HashMap::new(),
+                block_change_kinds: HashMap::new(),
+            },
+            title: "Trust boundaries".to_string(),
+            description: "A selected first pass, not an exhaustive audit.".to_string(),
+            cards: vec![
+                crate::onboarding::OnboardingCard {
+                    node_id: ids[2],
+                    description: "Trace the request across the trust boundary before accepting caller controlled values.".to_string(),
+                },
+                crate::onboarding::OnboardingCard {
+                    node_id: ids[0],
+                    description: "Check the fallback path.".to_string(),
+                },
+            ],
+        };
+        let context = TrueflowContext::new(Cli::parse_from(["trueflow", "tui"]));
+        let mut config = TrueflowConfig::default();
+        config.ai.mode = AiMode::ReviewPlan;
+        let state = build_onboarding_state(&context, &config, prepared).unwrap();
+        (state, file, ids)
+    }
+
+    #[test]
+    fn onboarding_stays_in_selected_plan_order_without_refining_or_restarting_ai() {
+        let (mut state, _file, ids) = onboarding_test_state();
+        assert_eq!(state.navigator.current_id(), ids[2]);
+        assert_eq!(state.view_mode, ViewMode::Source);
+        assert!(!state.navigator.is_visible(ids[1]));
+        assert!(state.commented_nodes.contains(&ids[0]));
+        assert!(ai_review_plan_request_for_state(&state).is_none());
+        assert!(!refresh_ai_suggestion_state(&mut state));
+
+        handle_parent(&mut state);
+        handle_child(&mut state);
+        assert_eq!(state.navigator.current_id(), ids[2]);
+        assert_eq!(state.reviewable_nodes, HashSet::from([ids[2], ids[0]]));
+        handle_next(&mut state);
+        assert_eq!(state.navigator.current_id(), ids[0]);
+        handle_prev(&mut state);
+        assert_eq!(state.navigator.current_id(), ids[2]);
+        handle_advance_review_target(&mut state);
+        assert_eq!(state.navigator.current_id(), ids[0]);
+        handle_advance_review_target(&mut state);
+        assert!(is_recap_mode(&state));
+        assert_eq!(state.remaining_blocks, 2);
+        assert!(!state.navigator.is_visible(ids[1]));
+    }
+
+    #[test]
+    fn onboarding_rejects_container_cards_that_would_inherit_approval_to_children() {
+        let (mut state, _file, ids) = build_state_with_file_block_count(1);
+        state.navigator.tree.insert_block_children(
+            ids[0],
+            vec![test_block("child".to_string(), BlockKind::Code, 0, 1)],
+        );
+        let result = configure_onboarding(
+            &mut state,
+            "Unsafe".to_string(),
+            String::new(),
+            vec![crate::onboarding::OnboardingCard {
+                node_id: ids[0],
+                description: "A container cannot be a standalone approval target.".to_string(),
+            }],
+        );
+        assert!(result.is_err());
+        assert!(state.onboarding.is_none());
+    }
+
+    #[test]
+    fn onboarding_approvals_reject_scope_widening_and_finish_after_selected_cards() {
+        let (mut state, file, ids) = onboarding_test_state();
+        for forbidden in [state.navigator.tree.root(), file, ids[1]] {
+            let action =
+                PendingAction::from_node(&state.navigator.tree, forbidden, Verdict::Approved);
+            let result = execute_action_with(&mut state, action, |_| {
+                panic!("an unselected or parent target must never reach the review store")
+            });
+            assert!(result.is_err());
+        }
+        let comment = PendingAction::Single {
+            node_id: ids[2],
+            verdict: Verdict::Comment,
+            note: Some("Verify the caller boundary.".to_string()),
+        };
+        execute_action_with(&mut state, comment, |_| Ok(())).unwrap();
+        assert_eq!(state.navigator.current_id(), ids[2]);
+        assert!(state.commented_nodes.contains(&ids[2]));
+        assert_eq!(state.remaining_blocks, 2);
+        for selected in [ids[2], ids[0]] {
+            assert_eq!(state.navigator.current_id(), selected);
+            let action =
+                PendingAction::from_node(&state.navigator.tree, selected, Verdict::Approved);
+            execute_action_with(&mut state, action, |_| Ok(())).unwrap();
+            assert!(!state.reviewable_nodes.contains(&selected));
+        }
+        assert!(is_recap_mode(&state));
+        assert_eq!(state.session_recap.approved_blocks, 2);
+        assert_eq!(state.session_recap.comments, 1);
+        assert!(!state.navigator.is_visible(ids[1]));
+    }
+
+    #[test]
+    fn onboarding_annotations_wrap_persist_while_scrolling_and_change_with_cards() {
+        let (mut state, _file, ids) = onboarding_test_state();
+        state.file_cache.insert(
+            PathBuf::from("src/lib.rs"),
+            Arc::from(
+                (0..80)
+                    .map(|index| format!("fn block_{index}() {{}}"))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(52, 30)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, state: &mut AppState| {
+            terminal.draw(|frame| ui(frame, state)).unwrap();
+            let buffer = terminal.backend().buffer();
+            buffer
+                .content()
+                .chunks(usize::from(buffer.area.width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let first = render(&mut terminal, &mut state);
+        handle_scroll_page_down(&mut state);
+        let scrolled = render(&mut terminal, &mut state);
+        for screen in [&first, &scrolled] {
+            let words = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("Trust boundaries"));
+            assert!(words.contains("Trace the request across the trust boundary before accepting caller controlled values."));
+            assert!(!words.contains("Check the fallback path."));
+        }
+        handle_next(&mut state);
+        assert_eq!(state.navigator.current_id(), ids[0]);
+        let second = render(&mut terminal, &mut state);
+        assert!(second.contains("Check the fallback path."));
+        assert!(!second.contains("Trace the request"));
+        handle_next(&mut state);
+        let recap = render(&mut terminal, &mut state);
+        assert!(recap.contains("Onboarding pass complete"));
+        assert!(recap.contains("finish onboarding"));
+        assert!(!recap.contains("review something else"));
+    }
+
     impl AiSuggestionProvider for StaticAiSuggestionProvider {
         fn suggest(&self, _request: &AiSuggestionRequest) -> Result<AiSuggestion> {
             Ok(AiSuggestion {
@@ -8827,6 +9251,7 @@ mod diff_scope_tests {
                 PathBuf::from("trueflow.toml"),
             ),
             ai: TuiAiState::empty(),
+            onboarding: None,
         }
     }
 
@@ -8900,6 +9325,7 @@ mod diff_scope_tests {
                 PathBuf::from("trueflow.toml"),
             ),
             ai: TuiAiState::empty(),
+            onboarding: None,
         };
 
         (state, block_id)
@@ -9047,6 +9473,7 @@ mod diff_scope_tests {
                 PathBuf::from("trueflow.toml"),
             ),
             ai: TuiAiState::empty(),
+            onboarding: None,
         };
 
         (state, first_file, second_file)
@@ -9173,6 +9600,7 @@ mod diff_scope_tests {
                 PathBuf::from("trueflow.toml"),
             ),
             ai: TuiAiState::empty(),
+            onboarding: None,
         };
 
         (state, file, block_id)
@@ -9257,6 +9685,7 @@ mod diff_scope_tests {
                 PathBuf::from("trueflow.toml"),
             ),
             ai: TuiAiState::empty(),
+            onboarding: None,
         };
 
         (state, file, block_ids)
@@ -9369,6 +9798,7 @@ mod diff_scope_tests {
                 PathBuf::from("trueflow.toml"),
             ),
             ai: TuiAiState::empty(),
+            onboarding: None,
         };
         set_focus_for_current_node(&mut state, None);
 

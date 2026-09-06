@@ -32,7 +32,8 @@ ignore_globs = []
 # AI behavior: off|review_plan|block_hints|review_plan_and_block_hints.
 mode = "off"
 # Provider selection: auto|anthropic|open_ai|claude_cli|codex_cli|none.
-provider = "auto"
+provider = "codex_cli"
+# Codex auto selects gpt-6; Codex invocations use high reasoning.
 model = "auto"
 max_context_lines = 80
 # Cache block-hint responses for this session.

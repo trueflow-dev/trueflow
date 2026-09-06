@@ -2,6 +2,7 @@ pub mod check;
 pub mod feedback;
 pub mod inspect;
 pub mod mark;
+pub mod onboard;
 pub mod review;
 pub mod scan;
 pub mod tui;

@@ -109,6 +109,7 @@ fn main() -> Result<()> {
         Commands::Verify { all, id } => commands::verify::run(
             commands::verify::VerifySelection::from_clap_args(*all, id.as_deref()),
         ),
+        Commands::Onboard(args) => commands::onboard::run(&context, args),
         Commands::Tui {
             mode,
             trust_lsp_workspace,

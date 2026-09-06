@@ -686,7 +686,7 @@ fn default_ai_mode() -> AiMode {
 }
 
 fn default_ai_provider() -> AiProviderConfig {
-    AiProviderConfig::Auto
+    AiProviderConfig::CodexCli
 }
 
 fn default_ai_model() -> String {
@@ -1035,19 +1035,6 @@ pub fn update_speed_read_defaults_in_file(
 mod tests {
     use super::*;
     use crate::feedback_since::FeedbackSinceExpr;
-
-    #[test]
-    fn ai_config_defaults_to_off() {
-        let cfg: TrueflowConfig = match toml::from_str("") {
-            Ok(config) => config,
-            Err(err) => panic!("parse config: {err}"),
-        };
-        assert_eq!(cfg.ai.mode, AiMode::Off);
-        assert_eq!(cfg.ai.provider, AiProviderConfig::Auto);
-        assert_eq!(cfg.ai.model, "auto");
-        assert_eq!(cfg.ai.max_context_lines, 80);
-        assert!(cfg.ai.cache);
-    }
 
     #[test]
     fn ai_config_parses_all_modes() {

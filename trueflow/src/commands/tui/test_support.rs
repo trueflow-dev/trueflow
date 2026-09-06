@@ -636,6 +636,7 @@ where
             PathBuf::from("trueflow.toml"),
         ),
         ai: TuiAiState::empty(),
+        onboarding: None,
     })
 }
 
@@ -732,5 +733,6 @@ fn build_state_with_single_rust_block_file(
             PathBuf::from("trueflow.toml"),
         ),
         ai: TuiAiState::empty(),
+        onboarding: None,
     })
 }

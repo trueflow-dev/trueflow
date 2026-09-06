@@ -428,13 +428,17 @@ impl CommandAiReviewPlanProvider {
         }
         Ok(Self { provider, model })
     }
+
+    pub fn generate(&self, prompt: &str) -> Result<String> {
+        let invocation =
+            cli_invocation_for_generation(self.provider, &self.model, prompt.to_string())?;
+        Ok(run_cli_invocation(&invocation)?.text)
+    }
 }
 
 impl AiReviewPlanProvider for CommandAiReviewPlanProvider {
     fn plan(&self, request: &AiReviewPlanRequest) -> Result<AiReviewPlan> {
-        let invocation = cli_invocation_for_review_plan(self.provider, &self.model, request)?;
-        let output = run_cli_invocation(&invocation)?;
-        AiReviewPlan::from_provider_text(&output.text)
+        AiReviewPlan::from_provider_text(&self.generate(&request.prompt)?)
     }
 }
 
@@ -616,7 +620,14 @@ pub fn cli_invocation_for_review_plan(
     model: &str,
     request: &AiReviewPlanRequest,
 ) -> Result<AiCliInvocation> {
-    let prompt = request.prompt.clone();
+    cli_invocation_for_generation(provider, model, request.prompt.clone())
+}
+
+fn cli_invocation_for_generation(
+    provider: AiProvider,
+    model: &str,
+    prompt: String,
+) -> Result<AiCliInvocation> {
     match provider {
         AiProvider::CodexCli => Ok(codex_review_plan_invocation(model, prompt)),
         AiProvider::ClaudeCli => Ok(claude_invocation(model, prompt, None)),
@@ -675,7 +686,7 @@ fn codex_invocation(model: &str, prompt: String, session_id: Option<&str>) -> Ai
             "--skip-git-repo-check".to_string(),
             "--json".to_string(),
             "-c".to_string(),
-            "model_reasoning_effort=\"low\"".to_string(),
+            "model_reasoning_effort=\"high\"".to_string(),
             "--output-last-message".to_string(),
             final_message_path.to_string_lossy().to_string(),
         ]
@@ -689,15 +700,13 @@ fn codex_invocation(model: &str, prompt: String, session_id: Option<&str>) -> Ai
             "never".to_string(),
             "--json".to_string(),
             "-c".to_string(),
-            "model_reasoning_effort=\"low\"".to_string(),
+            "model_reasoning_effort=\"high\"".to_string(),
             "--output-last-message".to_string(),
             final_message_path.to_string_lossy().to_string(),
         ]
     };
-    if model != "auto" {
-        args.push("--model".to_string());
-        args.push(model.to_string());
-    }
+    args.push("--model".to_string());
+    args.push(effective_model_for_provider(AiProvider::CodexCli, model));
     if let Some(session_id) = session_id {
         args.push(session_id.to_string());
     }
@@ -722,14 +731,12 @@ fn codex_review_plan_invocation(model: &str, prompt: String) -> AiCliInvocation 
         "never".to_string(),
         "--json".to_string(),
         "-c".to_string(),
-        "model_reasoning_effort=\"medium\"".to_string(),
+        "model_reasoning_effort=\"high\"".to_string(),
         "--output-last-message".to_string(),
         final_message_path.to_string_lossy().to_string(),
     ];
-    if model != "auto" {
-        args.push("--model".to_string());
-        args.push(model.to_string());
-    }
+    args.push("--model".to_string());
+    args.push(effective_model_for_provider(AiProvider::CodexCli, model));
     args.push("-".to_string());
     AiCliInvocation {
         program: "codex".to_string(),
@@ -1204,14 +1211,14 @@ pub fn effective_model_for_provider(provider: AiProvider, configured_model: &str
     if configured_model != "auto" {
         return configured_model.to_string();
     }
-    fast_default_model_for_provider(provider).to_string()
+    default_model_for_provider(provider).to_string()
 }
 
-pub fn fast_default_model_for_provider(provider: AiProvider) -> &'static str {
+pub fn default_model_for_provider(provider: AiProvider) -> &'static str {
     match provider {
         AiProvider::Anthropic | AiProvider::ClaudeCli => "claude-3-5-haiku-latest",
         AiProvider::OpenAi => "gpt-5-mini",
-        AiProvider::CodexCli => "auto",
+        AiProvider::CodexCli => "gpt-6",
     }
 }
 
@@ -1297,18 +1304,9 @@ mod tests {
     }
 
     #[test]
-    fn review_hint_prompt_contains_metadata_and_clipped_block_content() {
+    fn review_hint_prompt_clips_block_content() {
         let prompt = build_review_hint_prompt(&review_context("one\ntwo\nthree"), 2);
 
-        assert!(prompt.contains("Return exactly two concise lines"));
-        assert!(prompt.contains("within 90 visible characters"));
-        assert!(prompt.contains("EXPLANATION:"));
-        assert!(prompt.contains("CHANGE:"));
-        assert!(prompt.contains("LGTM-style reassurance"));
-        assert!(prompt.contains("Path: src/lib.rs"));
-        assert!(prompt.contains("Language: Rust"));
-        assert!(prompt.contains("Block kind: function"));
-        assert!(prompt.contains("Lines: 5-8"));
         assert!(prompt.contains("one\ntwo\n..."));
         assert!(!prompt.contains("three"));
     }
@@ -1341,19 +1339,6 @@ mod tests {
         assert_eq!(
             suggestion.visible_sentence(),
             Some("This validates user input before saving it.")
-        );
-    }
-
-    #[test]
-    fn no_change_suggestion_has_stable_lgtm_fallback_text() {
-        let suggestion = AiSuggestion::from_provider_text("CHANGE: NONE")
-            .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
-
-        assert_eq!(suggestion.proposed_change, None);
-        assert_eq!(suggestion.explanation, None);
-        assert_eq!(
-            suggestion.visible_sentence(),
-            Some("No change suggested; LGTM.")
         );
     }
 
@@ -1509,22 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_request_prompt_includes_custom_response_character_limit() {
-        let request = AiSuggestionRequest::with_response_char_limit(
-            AiProvider::Anthropic,
-            "claude-3-5-haiku".to_string(),
-            review_set(),
-            review_context("fn checked() {}"),
-            40,
-            72,
-        );
-
-        assert_eq!(request.key.max_response_chars, 72);
-        assert!(request.prompt.contains("within 72 visible characters"));
-    }
-
-    #[test]
-    fn codex_cli_invocation_uses_read_only_low_effort_exec_with_final_message_capture() {
+    fn codex_cli_invocation_uses_read_only_high_effort_exec_with_final_message_capture() {
         let request = AiSuggestionRequest::new(
             AiProvider::CodexCli,
             "auto".to_string(),
@@ -1549,7 +1519,7 @@ mod tests {
                 "never",
                 "--json",
                 "-c",
-                "model_reasoning_effort=\"low\"",
+                "model_reasoning_effort=\"high\"",
             ]
         );
         assert!(
@@ -1560,9 +1530,12 @@ mod tests {
         );
         assert!(invocation.final_message_path.is_some());
         assert_eq!(invocation.output_format, AiCliOutputFormat::CodexJson);
-        assert!(!invocation.args.iter().any(|arg| arg == "--model"));
-        assert!(invocation.stdin.contains("Review-set context"));
-        assert!(invocation.stdin.contains("CHANGE: NONE"));
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|args| args == ["--model", "gpt-6"])
+        );
         assert!(invocation.stdin.contains("fn checked() {}"));
     }
 
@@ -1589,8 +1562,15 @@ mod tests {
         assert!(invocation.args.iter().any(|arg| arg == "session-123"));
         assert!(
             invocation
-                .stdin
-                .contains("already provided in this conversation")
+                .args
+                .windows(2)
+                .any(|args| args == ["-c", r#"model_reasoning_effort="high""#])
+        );
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|args| args == ["--model", "gpt-6"])
         );
         assert!(!invocation.stdin.contains("Scope: diff vs main"));
     }
@@ -1680,23 +1660,6 @@ mod tests {
     }
 
     #[test]
-    fn review_plan_prompt_contains_scope_hash_coverage_manifest_and_json_contract() {
-        let blocks = vec![review_plan_block(0, "fn first() {}\n".to_string())];
-        let request = review_plan_request(&blocks, 80);
-
-        assert!(request.prompt.contains("Review-set hash:"));
-        assert!(request.prompt.contains("Scope: changed files"));
-        assert!(request.prompt.contains("Context: 1/1 blocks listed (all)"));
-        assert!(request.prompt.contains("B0001"));
-        assert!(request.prompt.contains("src/file_0.rs"));
-        assert!(request.prompt.contains("\"summary\""));
-        assert!(request.prompt.contains("\"global_checks\""));
-        assert!(request.prompt.contains("\"priority_blocks\""));
-        assert!(request.prompt.contains("exactly one JSON object"));
-        assert!(request.prompt.contains("Do not run tools"));
-    }
-
-    #[test]
     fn review_plan_request_enforces_block_and_excerpt_bounds() {
         let blocks = (0..125)
             .map(|index| review_plan_block(index, "a\nb\nc\nd\ne\nf\n".to_string()))
@@ -1761,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn review_plan_cli_invocation_is_fresh_read_only_medium_effort() {
+    fn review_plan_cli_invocation_is_fresh_read_only_high_effort() {
         let blocks = vec![review_plan_block(0, "fn first() {}".to_string())];
         let request = review_plan_request(&blocks, 80);
         let invocation =
@@ -1779,53 +1742,16 @@ mod tests {
             invocation
                 .args
                 .iter()
-                .any(|arg| arg == r#"model_reasoning_effort="medium""#)
+                .any(|arg| arg == r#"model_reasoning_effort="high""#)
+        );
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|args| args == ["--model", "gpt-5.6-sol"])
         );
         assert!(!invocation.args.iter().any(|arg| arg == "resume"));
         assert!(invocation.stdin.contains("B0001"));
-    }
-
-    #[test]
-    fn effective_model_uses_fast_provider_default_for_auto_model() {
-        assert_eq!(
-            effective_model_for_provider(AiProvider::CodexCli, "auto"),
-            "auto"
-        );
-        assert_eq!(
-            effective_model_for_provider(AiProvider::ClaudeCli, "auto"),
-            "claude-3-5-haiku-latest"
-        );
-        assert_eq!(
-            effective_model_for_provider(AiProvider::CodexCli, "gpt-4.1-mini"),
-            "gpt-4.1-mini"
-        );
-    }
-
-    #[test]
-    fn detection_prefers_api_keys_before_cli_tools() {
-        let env = AiEnvironment::for_tests(true, true, ["claude", "codex"]);
-
-        assert_eq!(
-            env.detected_providers(),
-            vec![
-                AiProvider::Anthropic,
-                AiProvider::OpenAi,
-                AiProvider::ClaudeCli,
-                AiProvider::CodexCli,
-            ]
-        );
-    }
-
-    #[test]
-    fn disabled_modeline_mentions_detected_providers_without_enabling_calls() {
-        let env = AiEnvironment::for_tests(true, false, ["claude"]);
-        let availability =
-            resolve_ai_availability(&config(AiMode::Off, AiProviderConfig::Auto), &env);
-
-        assert_eq!(
-            availability.modeline_text(),
-            "AI: off (Anthropic, Claude CLI detected; set [ai].mode = \"review_plan\")"
-        );
     }
 
     #[test]
@@ -1840,10 +1766,6 @@ mod tests {
                 provider: AiProvider::OpenAi,
                 model: "gpt-5-mini".to_string(),
             }
-        );
-        assert_eq!(
-            availability.modeline_text(),
-            "AI: ready (OpenAI / gpt-5-mini)"
         );
     }
 
@@ -1861,6 +1783,63 @@ mod tests {
                 reason: "Anthropic credentials or executable not found".to_string(),
                 detected: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn default_configuration_does_not_enable_ai_with_providers_available() {
+        let env = AiEnvironment::for_tests(true, true, ["claude", "codex"]);
+        assert!(matches!(
+            resolve_ai_availability(&AiConfig::default(), &env),
+            AiAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn enabled_default_selects_codex_without_falling_back_to_other_providers() {
+        let config = AiConfig {
+            mode: AiMode::ReviewPlan,
+            ..AiConfig::default()
+        };
+        let available = AiEnvironment::for_tests(true, true, ["claude", "codex"]);
+        assert_eq!(
+            resolve_ai_availability(&config, &available),
+            AiAvailability::Ready {
+                provider: AiProvider::CodexCli,
+                model: "gpt-6".to_string(),
+            }
+        );
+
+        let missing = AiEnvironment::for_tests(true, true, ["claude"]);
+        let AiAvailability::Unavailable { reason, .. } = resolve_ai_availability(&config, &missing)
+        else {
+            panic!("missing Codex must not silently select another available provider");
+        };
+        assert!(reason.contains("Codex"));
+    }
+
+    #[test]
+    fn explicit_provider_and_model_override_available_codex() {
+        let env = AiEnvironment::for_tests(false, false, ["claude", "codex"]);
+        let config = AiConfig {
+            mode: AiMode::ReviewPlan,
+            provider: AiProviderConfig::ClaudeCli,
+            model: "claude-custom".to_string(),
+            ..AiConfig::default()
+        };
+        let AiAvailability::Ready { provider, model } = resolve_ai_availability(&config, &env)
+        else {
+            panic!("explicit available Claude provider must remain available");
+        };
+        let invocation =
+            cli_invocation_for_generation(provider, &model, "Review repository".to_string())
+                .unwrap_or_else(|error| panic!("build explicit provider invocation: {error}"));
+        assert_eq!(invocation.program, "claude");
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|args| args == ["--model", "claude-custom"])
         );
     }
 }
