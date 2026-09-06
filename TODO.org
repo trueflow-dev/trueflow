@@ -254,6 +254,85 @@
    Acceptance: users can complete and resume a review in the browser without
    losing review state, with demonstrably better reading and commenting UX.
 
+** TODO Time-budgeted, LLM-curated high-signal review command (name TBD)
+   Goal: ask how long the user wants to review, then have an LLM generate an
+   ordered "top hits" set of existing code worth human attention within that
+   budget. This is review discovery, not an automated verdict or only a diff view.
+   Command suggestions (not decided):
+   - `trueflow focus` (recommended): short, targeted review sessions.
+   - `trueflow triage`: emphasizes risk prioritization.
+   - `trueflow hotspots`: emphasizes code with concentrated warning signals.
+   - `trueflow spotlight`: emphasizes guided discovery.
+   - [ ] Prompt at the beginning for a target duration: 5m, 10m, 15m, 30m, or a
+     custom duration. Support an explicit duration argument for scripted use;
+     proposed spelling: `trueflow focus --duration 10m`.
+   - [ ] Gather evidence for candidate review blocks across the selected
+     repository scope, not only recent changes. Include these signal families:
+     - A: Unreadable/sketchy code: tangled control flow, excessive nesting,
+       misleading names, surprising side effects, hidden invariants, suspicious
+       workarounds, or comments that contradict behavior.
+     - B: Important code with absent or stale review coverage: public entry
+       points, high-fan-in/shared utilities, critical business rules, and paths
+       handling sensitive data or irreversible actions.
+     - C: Historical churn associated with likely bug fixes: repeated corrective
+       edits, reverts, regressions, and recurring fixes in the same block.
+       Inspect patches as well as commit messages; "fix" alone is weak evidence.
+     - Trust boundaries: authentication/authorization, untrusted input, command
+       execution, deserialization, path handling, and secret exposure.
+     - Data integrity: persistence, migrations, transactions, destructive writes,
+       and recovery after partially completed operations.
+     - Concurrency/lifecycle hazards: shared state, locking, cancellation,
+       resource cleanup, retries, and idempotency.
+     - Error-path hazards: swallowed failures, unchecked assumptions, fallback
+       success, inconsistent error handling, and missing boundary checks.
+     - Weak test evidence on consequential paths: missing edge/error cases,
+       flaky/regression history, or changed behavior without relevant tests.
+       Keep test coverage distinct from human review coverage.
+     - Change coupling: code repeatedly changed alongside distant modules,
+       duplicated logic with diverging fixes, or interface/implementation drift.
+     - Large or concentrated semantic changes since the last valid review,
+       especially where complexity or dependency reach has increased.
+     - Unresolved human concerns: rejected reviews, open review comments, and
+       linked defects where available; never fabricate issue/history evidence.
+   - [ ] Reuse existing semantic blocks, review coverage, and repository/history
+     facilities. Distinguish unavailable evidence from a clean result; discount
+     mechanical/generated/vendor churn and avoid duplicate overlapping targets.
+   - [ ] Have the LLM select and order the actual review set, rather than merely
+     explain a fixed heuristic ranking. Supply bounded candidate evidence and
+     request structured output: exact target, reason to inspect, cited evidence,
+     uncertainty, suggested inspection questions, and estimated review minutes.
+     Favor expected review value per minute, accounting for code context and
+     navigation overhead; treat estimates as estimates, not guarantees.
+   - [ ] Resolve every proposed target and evidence reference against the same
+     repository snapshot before presenting the queue. Reject invented/stale
+     references; re-evaluate changed targets before recording review actions.
+   - [ ] Show the proposed queue, per-item reasons and time estimates, and total
+     estimated duration. Let the user accept, skip, or adjust the scope/budget.
+     Prefer a coherent set that fits over padding the queue with weak candidates;
+     identify oversized valuable items rather than hiding them.
+   - [ ] Open the queue in the existing review workflow; reuse verdict/comment
+     persistence and make the queue usable by the planned browser frontend.
+     Proposed timer behavior: start on review, exclude LLM generation time,
+     support pause, and offer stop/extend at the target without discarding work
+     or forcing an exit. Summarize reviewed, skipped, and remaining targets.
+   - [ ] Decide model/provider configuration and code-sharing consent before
+     implementation; evaluate local and remote options without choosing new
+     dependencies yet. Bound history/context, generation cost, and latency.
+     Treat repository text as untrusted model input; grant no tool execution or
+     automatic review authority. Surface generation failures without silently
+     substituting a non-LLM queue or marking anything reviewed.
+   - [ ] Verify with fixtures containing unreadable code, important unreviewed
+     code, and repeated bug-fix churn, plus a noisy mechanical-change control.
+     Exercise a real 5m/10m session, skipped items, pause/extend, persistence,
+     missing history, model failure, invented references, and repository changes.
+     Evaluate live-model usefulness separately from deterministic contract tests;
+     do not assert one exact LLM ranking.
+   Acceptance: duration selection precedes generation; the LLM produces a
+   grounded, time-budgeted review queue with inspectable reasons; human review
+   actions persist normally. Compare against ordinary review ordering to assess
+   whether reviewers find more actionable concerns per minute, not just more
+   alarming descriptions.
+
 ** TODO [High] Coverage mode + heatmap
    - [ ] Add `trueflow coverage` command that shells out to `cargo llvm-cov` or `just coverage`.
    - [ ] Add coverage mode to show least-reviewed files.
