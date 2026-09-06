@@ -125,6 +125,7 @@ pub struct CoverageIndex<'a> {
     diagnostics: Vec<CoverageDiagnostic>,
     unit_facts: HashMap<CoverageUnitId, CoverageFacts>,
     block_units: HashMap<CoverageBlockLocator, CoverageUnitId>,
+    block_nodes_by_path: HashMap<&'a RepoPath, Vec<&'a TreeNode>>,
     record_bindings: HashMap<String, RecordBinding>,
 }
 
@@ -137,6 +138,7 @@ impl<'a> CoverageIndex<'a> {
             diagnostics: Vec::new(),
             unit_facts: HashMap::new(),
             block_units: lookups.block_units.clone(),
+            block_nodes_by_path: HashMap::new(),
             record_bindings: HashMap::new(),
         };
 
@@ -199,6 +201,7 @@ impl<'a> CoverageIndex<'a> {
         for facts in coverage.unit_facts.values_mut() {
             facts.finalize(database.records());
         }
+        coverage.block_nodes_by_path = lookups.block_nodes_by_path;
 
         Ok(coverage)
     }
@@ -278,10 +281,9 @@ impl<'a> CoverageIndex<'a> {
     }
 
     fn smallest_covering_block_node(&self, path: &RepoPath, block: &Block) -> Option<TreeNodeId> {
-        self.tree
-            .nodes()
+        self.block_nodes_by_path
+            .get(path)?
             .iter()
-            .filter(|node| matches!(node.kind, TreeNodeKind::Block) && node.path == *path)
             .filter_map(|node| {
                 let candidate = node.block.as_ref()?;
                 let byte_span = candidate.byte_span();
@@ -649,8 +651,9 @@ impl CoverageFacts {
 }
 
 #[derive(Debug, Default)]
-struct CoverageLookups {
+struct CoverageLookups<'a> {
     block_units: HashMap<CoverageBlockLocator, CoverageUnitId>,
+    block_nodes_by_path: HashMap<&'a RepoPath, Vec<&'a TreeNode>>,
     block_exact: HashMap<(RepoPath, crate::store::TreeHash, u32), Vec<CoverageUnitId>>,
     block_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<CoverageUnitId>>,
     block_by_hash: HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
@@ -661,13 +664,22 @@ struct CoverageLookups {
     candidate_descriptions: HashMap<CoverageUnitId, CoverageCandidate>,
 }
 
-impl CoverageLookups {
-    fn from_tree(tree: &Tree) -> Self {
+impl<'a> CoverageLookups<'a> {
+    fn from_tree(tree: &'a Tree) -> Self {
         let mut lookups = Self::default();
 
         for node in tree.nodes() {
             match node.kind {
-                TreeNodeKind::Block => lookups.register_tree_block(node),
+                TreeNodeKind::Block => {
+                    // Keep node-vector order: equal containing spans select the
+                    // first inserted node, which need not be first in a traversal.
+                    lookups
+                        .block_nodes_by_path
+                        .entry(&node.path)
+                        .or_default()
+                        .push(node);
+                    lookups.register_tree_block(node);
+                }
                 TreeNodeKind::File => {
                     let unit_id = lookups.register_tree_node(node);
                     push_lookup(
@@ -1595,6 +1607,107 @@ mod tests {
                 .block(&RepoPath::new("src/Main.java").unwrap(), &probe)
                 .container_node_id,
             Some(outer_id)
+        );
+    }
+
+    #[test]
+    fn generated_block_equal_containers_keep_node_insertion_order() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(root, "a.rs".into(), "a.rs", "file", Language::Rust);
+        let outer = builder.add_block(
+            file,
+            "outer".into(),
+            "a.rs",
+            test_block_at("o".repeat(20), BlockKind::Code, 0, 1, 0),
+            Language::Rust,
+        );
+        let first = test_block_at("a".repeat(10), BlockKind::Code, 0, 1, 5);
+        builder.add_block(file, "first".into(), "a.rs", first.clone(), Language::Rust);
+        let mut tree = builder.finalize();
+        // Traversing the outer block's descendants would encounter this later
+        // insertion before its equal-span sibling.
+        let nested = test_block_at("b".repeat(10), BlockKind::Code, 0, 1, 5);
+        tree.insert_block_children(outer, vec![nested.clone()]);
+        let mut first_record =
+            approved_block_record("first", first.hash, "a.rs", 0, "a@example.com", 1);
+        first_record.verdict = Verdict::Rejected;
+        let database = ReviewDatabase::from_records(vec![
+            first_record,
+            approved_block_record("nested", nested.hash, "a.rs", 0, "b@example.com", 2),
+        ]);
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
+        let path = RepoPath::new("a.rs").unwrap();
+        let probe = test_block_at("x".into(), BlockKind::Code, 0, 1, 8);
+        let result = coverage.block(&path, &probe);
+
+        assert_eq!(result.resolved_node_id(), None);
+        assert_eq!(
+            result.direct_latest_verdict_for(&ReviewCheck::review()),
+            None
+        );
+        assert_eq!(
+            result.effective_latest_verdict_for(&ReviewCheck::review()),
+            Some(&Verdict::Rejected)
+        );
+    }
+
+    #[test]
+    fn generated_empty_blocks_keep_nested_path_and_endpoint_containment() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(root, "a.rs".into(), "a.rs", "file-a", Language::Rust);
+        let outer = test_block_at("o".repeat(20), BlockKind::Code, 0, 1, 0);
+        let outer_id =
+            builder.add_block(file, "outer".into(), "a.rs", outer.clone(), Language::Rust);
+        let other = builder.add_file(root, "b.rs".into(), "b.rs", "file-b", Language::Rust);
+        let empty = test_block_at(String::new(), BlockKind::Code, 0, 0, 10);
+        builder.add_block(other, "empty".into(), "b.rs", empty.clone(), Language::Rust);
+        let mut tree = builder.finalize();
+        let nested = test_block_at("n".repeat(5), BlockKind::Code, 0, 1, 5);
+        tree.insert_block_children(outer_id, vec![nested.clone()]);
+        let mut outer_record =
+            approved_block_record("outer", outer.hash, "a.rs", 0, "a@example.com", 1);
+        outer_record.verdict = Verdict::Rejected;
+        let mut other_record =
+            approved_block_record("other", empty.hash.clone(), "b.rs", 0, "a@example.com", 3);
+        other_record.verdict = Verdict::Rejected;
+        let database = ReviewDatabase::from_records(vec![
+            approved_file_record(
+                "file",
+                tree.node(file).hash.clone(),
+                "a.rs",
+                "a@example.com",
+                0,
+            ),
+            outer_record,
+            approved_block_record("nested", nested.hash, "a.rs", 0, "a@example.com", 2),
+            other_record,
+        ]);
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
+        let path = RepoPath::new("a.rs").unwrap();
+
+        for (offset, expected) in [
+            (0, Verdict::Rejected),
+            (5, Verdict::Approved),
+            (10, Verdict::Approved),
+            (20, Verdict::Rejected),
+            (21, Verdict::Approved),
+        ] {
+            let probe = test_block_at(String::new(), BlockKind::Code, 0, 0, offset);
+            let result = coverage.block(&path, &probe);
+            assert_eq!(result.resolved_node_id(), None);
+            assert_eq!(
+                result.effective_latest_verdict_for(&ReviewCheck::review()),
+                Some(&expected),
+                "empty generated block at byte {offset}"
+            );
+        }
+        assert_eq!(
+            coverage
+                .block(&RepoPath::new("missing.rs").unwrap(), &empty)
+                .effective_latest_verdict_for(&ReviewCheck::review()),
+            None
         );
     }
 
