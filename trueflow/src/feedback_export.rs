@@ -235,6 +235,8 @@ pub struct RepoFeedbackContextResolver<'a> {
     workdir_prefix: Option<&'a str>,
     repo_root: Option<PathBuf>,
     snapshot_files: HashMap<FeedbackSnapshot, SnapshotFileCache>,
+    committed_declaration_sources:
+        HashMap<gix::ObjectId, HashMap<RepoPath, HashMap<String, DeclarationFeedbackSource>>>,
 }
 
 #[derive(Debug, Default)]
@@ -281,6 +283,7 @@ impl<'a> RepoFeedbackContextResolver<'a> {
             workdir_prefix,
             repo_root,
             snapshot_files,
+            committed_declaration_sources: HashMap::new(),
         })
     }
 }
@@ -312,12 +315,23 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
             None => gix::discover(".")?,
         };
         let path = Path::new(locator.path.as_str());
-        let bytes = match &record.block_state {
+        let (commit_id, bytes) = match &record.block_state {
             BlockState::Committed => {
                 let commit = repo
                     .rev_parse_single(revision.as_str())?
                     .object()?
                     .peel_to_commit()?;
+                let commit_id = commit.id().detach();
+                if let Some(source) = self
+                    .committed_declaration_sources
+                    .get(&commit_id)
+                    .and_then(|paths| paths.get(&locator.path))
+                    .and_then(|snapshots| snapshots.get(&locator.reviewed_snapshot.snapshot_id))
+                {
+                    // Cache immutable sources, not record resolutions: each caller's
+                    // content hash, locator, anchor and context must still be checked.
+                    return resolve_declaration_feedback(record, std::slice::from_ref(source));
+                }
                 let tree = commit.tree()?;
                 let Some(entry) = tree.lookup_entry_by_path(path)? else {
                     return Ok(None);
@@ -326,7 +340,7 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
                     Ok(blob) => blob,
                     Err(_) => return Ok(None),
                 };
-                blob.data.clone()
+                (Some(commit_id), blob.data.clone())
             }
             BlockState::Uncommitted => {
                 let workdir = repo
@@ -341,8 +355,9 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
                 if !metadata.file_type().is_file() {
                     return Ok(None);
                 }
-                fs::read(&absolute)
-                    .with_context(|| format!("failed to read {}", locator.path.as_str()))?
+                let bytes = fs::read(&absolute)
+                    .with_context(|| format!("failed to read {}", locator.path.as_str()))?;
+                (None, bytes)
             }
             BlockState::Unknown => return Ok(None),
         };
@@ -367,7 +382,18 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
             source,
         );
         let source = DeclarationFeedbackSource::from_snapshot(snapshot)?;
-        resolve_declaration_feedback(record, std::slice::from_ref(&source))
+        let resolved = resolve_declaration_feedback(record, std::slice::from_ref(&source))?;
+        if let Some(commit_id) = commit_id
+            && resolved.is_some()
+        {
+            self.committed_declaration_sources
+                .entry(commit_id)
+                .or_default()
+                .entry(locator.path.clone())
+                .or_default()
+                .insert(locator.reviewed_snapshot.snapshot_id.clone(), source);
+        }
+        Ok(resolved)
     }
 }
 

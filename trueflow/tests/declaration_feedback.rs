@@ -18,8 +18,8 @@ use trueflow::declaration::{
 };
 use trueflow::feedback_export::{
     DeclarationFeedbackSource, FeedbackContextResolver, FeedbackEntry, FeedbackEntryKind,
-    FeedbackQuery, FeedbackSinceFilter, ResolvedFeedbackContext, collect_feedback_entries,
-    resolve_declaration_feedback,
+    FeedbackQuery, FeedbackSinceFilter, RepoFeedbackContextResolver, ResolvedFeedbackContext,
+    collect_feedback_entries, resolve_declaration_feedback,
 };
 use trueflow::github::{
     GitHubCommentSide, PullRequestCommit, PullRequestMetadata, ResolvedPullRequestRef,
@@ -916,6 +916,147 @@ fn exact_resolution_rejects_same_snapshot_id_with_wrong_source_hash() -> TestRes
         )?
         .is_none(),
         "snapshot ID equality must not bypass the persisted content hash"
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_committed_resolution_keeps_record_validation_and_revision_identity() -> TestResult {
+    let repo = TestRepo::new("declaration_source_reuse")?;
+    repo.write(PATH, DECLARATION_SOURCE)?;
+    repo.commit_all("initial declaration")?;
+    let revision = commit_id(&repo, "HEAD")?;
+    let (snapshot, declaration) = projected_snapshot("capture", PATH, DECLARATION_SOURCE)?;
+    let record = declaration_record(
+        "original",
+        &revision,
+        &snapshot,
+        &declaration,
+        AnchorSelection::Signature,
+        "first note",
+    )?;
+    let options = ScanOptions::default();
+    let mut resolver = RepoFeedbackContextResolver::new_for_repo_root(
+        &ReviewContentSource::Workdir,
+        &options,
+        None,
+        &repo.path,
+    )?;
+    let original = resolver
+        .resolve_declaration_context(&record)?
+        .context("original must resolve")?;
+    assert_eq!(original.projection_text, declaration.projection_text);
+
+    let mut wrong_hash = record.clone();
+    let hash = BytesHash::from_bytes(b"not the captured source");
+    locator_mut(&mut wrong_hash)?.reviewed_snapshot.content_hash = hash.clone();
+    declaration_anchor_mut(&mut wrong_hash)?
+        .reviewed_snapshot
+        .content_hash = hash;
+    wrong_hash.validate()?;
+    assert!(resolver.resolve_declaration_context(&wrong_hash)?.is_none());
+
+    let mut wrong_text = record.clone();
+    let range = &mut declaration_anchor_mut(&mut wrong_text)?.ranges[0];
+    range.exact_text = "x".repeat(range.exact_text.len());
+    wrong_text.validate()?;
+    assert!(resolver.resolve_declaration_context(&wrong_text).is_err());
+
+    let mut other_anchor = declaration_record(
+        "other-anchor",
+        &revision,
+        &snapshot,
+        &declaration,
+        AnchorSelection::DocumentationAndSignature,
+        "second note",
+    )?;
+    other_anchor.comment_context = Some("a different relationship".to_owned());
+    let resolved = resolver
+        .resolve_declaration_context(&other_anchor)?
+        .context("other anchor must resolve")?;
+    assert_eq!(resolved.context, other_anchor.comment_context);
+    assert_eq!(
+        resolved.ranges,
+        declaration_anchor_mut(&mut other_anchor)?.ranges
+    );
+    assert_ne!(resolved.ranges, original.ranges);
+
+    let (other_snapshot, _) = projected_snapshot("another capture", PATH, DECLARATION_SOURCE)?;
+    let other_capture = declaration_record(
+        "other-capture",
+        &revision,
+        &other_snapshot,
+        &declaration,
+        AnchorSelection::Signature,
+        "another capture of the same bytes",
+    )?;
+    assert_eq!(
+        resolver.resolve_declaration_context(&other_capture)?,
+        Some(original.clone())
+    );
+
+    let changed = DECLARATION_SOURCE.replace("u8", "u16");
+    repo.write(PATH, &changed)?;
+    repo.commit_all("change declaration")?;
+    let changed_revision = commit_id(&repo, "HEAD")?;
+    let (changed_snapshot, changed_declaration) = projected_snapshot("capture", PATH, &changed)?;
+    let changed_record = declaration_record(
+        "changed",
+        &changed_revision,
+        &changed_snapshot,
+        &changed_declaration,
+        AnchorSelection::Signature,
+        "new revision",
+    )?;
+    let resolved = resolver
+        .resolve_declaration_context(&changed_record)?
+        .context("new commit must resolve")?;
+    assert_eq!(
+        resolved.projection_text,
+        changed_declaration.projection_text
+    );
+    assert_ne!(resolved.projection_text, original.projection_text);
+    assert_eq!(
+        resolver.resolve_declaration_context(&record)?,
+        Some(original)
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_worktree_resolution_observes_edits_and_recovers_from_mismatched_source() -> TestResult {
+    let repo = TestRepo::new("declaration_worktree_freshness")?;
+    repo.write(PATH, DECLARATION_SOURCE)?;
+    repo.commit_all("initial declaration")?;
+    let revision = commit_id(&repo, "HEAD")?;
+    let (snapshot, declaration) = projected_snapshot("worktree", PATH, DECLARATION_SOURCE)?;
+    let mut record = declaration_record(
+        "worktree",
+        &revision,
+        &snapshot,
+        &declaration,
+        AnchorSelection::Signature,
+        "dirty note",
+    )?;
+    record.block_state = BlockState::Uncommitted;
+    let options = ScanOptions::default();
+    let mut resolver = RepoFeedbackContextResolver::new_for_repo_root(
+        &ReviewContentSource::Workdir,
+        &options,
+        None,
+        &repo.path,
+    )?;
+    let original = resolver
+        .resolve_declaration_context(&record)?
+        .context("original must resolve")?;
+    assert_eq!(original.projection_text, declaration.projection_text);
+
+    repo.write(PATH, &DECLARATION_SOURCE.replace("u8", "u16"))?;
+    assert!(resolver.resolve_declaration_context(&record)?.is_none());
+    repo.write(PATH, DECLARATION_SOURCE)?;
+    assert_eq!(
+        resolver.resolve_declaration_context(&record)?,
+        Some(original)
     );
     Ok(())
 }
