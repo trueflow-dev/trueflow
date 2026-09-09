@@ -131,7 +131,7 @@ pub fn run(context: &TrueflowContext, args: &OnboardArgs) -> Result<()> {
     tui::run_onboarding(context, &config, prepared)
 }
 
-fn collect(config: &TrueflowConfig, read_only: bool) -> Result<review::CollectedReview> {
+pub(crate) fn collect(config: &TrueflowConfig, read_only: bool) -> Result<review::CollectedReview> {
     let mut scan_options = config.scan.resolve_options();
     if read_only {
         scan_options.cache_mode = match scan_options.cache_mode {

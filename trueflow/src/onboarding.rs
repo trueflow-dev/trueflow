@@ -76,6 +76,33 @@ impl ReviewSpecification {
         );
         let wire: ReviewSpecificationWire = serde_json::from_str(text)
             .context("onboarding specification must be one versioned JSON object")?;
+        Self::from_wire(wire, MAX_ESTIMATED_SECONDS)
+    }
+
+    pub(crate) fn from_targets(
+        title: String,
+        description: String,
+        steps: Vec<(ReviewLocation, String)>,
+        max_estimated_seconds: usize,
+    ) -> Result<Self> {
+        Self::from_wire(
+            ReviewSpecificationWire {
+                version: 1,
+                title,
+                description,
+                steps: steps
+                    .into_iter()
+                    .map(|(target, description)| ReviewStep {
+                        target,
+                        description,
+                    })
+                    .collect(),
+            },
+            max_estimated_seconds,
+        )
+    }
+
+    fn from_wire(wire: ReviewSpecificationWire, max_estimated_seconds: usize) -> Result<Self> {
         ensure!(
             wire.version == 1,
             "unsupported onboarding specification version {}",
@@ -119,8 +146,8 @@ impl ReviewSpecification {
             estimated_seconds = estimated_seconds.saturating_add(target.estimated_seconds());
         }
         ensure!(
-            estimated_seconds <= MAX_ESTIMATED_SECONDS,
-            "onboarding reading budget exceeded: estimated {estimated_seconds}s; maximum {MAX_ESTIMATED_SECONDS}s (14 minutes)"
+            estimated_seconds <= max_estimated_seconds,
+            "review reading budget exceeded: estimated {estimated_seconds}s; maximum {max_estimated_seconds}s"
         );
         Ok(Self(wire))
     }
@@ -179,6 +206,7 @@ impl ReviewSpecification {
                 cards.push(OnboardingCard {
                     node_id,
                     description: step.description.clone(),
+                    details: None,
                 });
             }
         }
@@ -211,6 +239,7 @@ impl ReviewSpecification {
             title: self.0.title.clone(),
             description: self.0.description.clone(),
             cards,
+            purpose: ReviewPurpose::Onboarding,
         })
     }
 }
@@ -231,9 +260,25 @@ fn check_description(text: &str, label: &str, max_chars: usize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewPurpose {
+    Onboarding,
+    Focus,
+}
+
+impl ReviewPurpose {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Onboarding => "Onboarding",
+            Self::Focus => "Focus",
+        }
+    }
+}
+
 pub struct OnboardingCard {
     pub node_id: TreeNodeId,
     pub description: String,
+    pub details: Option<String>,
 }
 
 pub struct PreparedOnboarding {
@@ -241,6 +286,7 @@ pub struct PreparedOnboarding {
     pub title: String,
     pub description: String,
     pub cards: Vec<OnboardingCard>,
+    pub purpose: ReviewPurpose,
 }
 
 #[derive(Serialize)]

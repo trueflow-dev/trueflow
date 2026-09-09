@@ -837,6 +837,8 @@ struct OnboardingState {
     description: String,
     cards: Vec<crate::onboarding::OnboardingCard>,
     finished: bool,
+    purpose: crate::onboarding::ReviewPurpose,
+    details_scroll: Option<u16>,
 }
 
 const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
@@ -1410,6 +1412,7 @@ fn build_onboarding_state(
         title,
         description,
         cards,
+        purpose,
     } = prepared;
     let mut state = build_review_state(
         context,
@@ -1420,14 +1423,14 @@ fn build_onboarding_state(
             block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
             diff_line_numbers: config.tui.diff_line_numbers,
             keybinds: config.tui.keybinds,
-            scope_label: format!("Onboarding: {title}"),
+            scope_label: format!("{}: {title}", purpose.label()),
             initial_view_mode: ViewMode::Source,
             speed_read_config: config.tui.speed_read.clone(),
             speed_read_config_path: speed_read_config_path_for_repo_root(),
             ai: TuiAiState::for_mode(AiMode::Off, None, config.ai.max_context_lines, false),
         },
     )?;
-    configure_onboarding(&mut state, title, description, cards)?;
+    configure_onboarding(&mut state, title, description, cards, purpose)?;
     Ok(state)
 }
 
@@ -1436,6 +1439,7 @@ fn configure_onboarding(
     title: String,
     description: String,
     cards: Vec<crate::onboarding::OnboardingCard>,
+    purpose: crate::onboarding::ReviewPurpose,
 ) -> Result<()> {
     let selected = cards
         .iter()
@@ -1483,6 +1487,8 @@ fn configure_onboarding(
         description,
         cards,
         finished: false,
+        purpose,
+        details_scroll: None,
     });
     Ok(())
 }
@@ -2994,6 +3000,10 @@ fn run_app(
                 };
                 let key_code = key_event.code;
                 let ui_mode = current_ui_mode(&state);
+                if handle_selected_review_details_key(&mut state, key_code) {
+                    needs_render = true;
+                    continue;
+                }
 
                 if matches!(ui_mode, UiMode::Recap) {
                     if key_event.kind == KeyEventKind::Press
@@ -5305,10 +5315,11 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
 
     if is_recap_mode(state) {
         render_recap_view(frame, state, content_area, &palette);
-        let hint = if state.onboarding.is_some() {
+        let hint = if let Some(plan) = &state.onboarding {
             format!(
-                "Press [{}] finish onboarding or [{}/Esc] exit",
+                "Press [{}] finish {} or [{}/Esc] exit",
                 recap_done_key(&state.keybinds),
+                plan.purpose.label().to_ascii_lowercase(),
                 state.keybinds.quit
             )
         } else {
@@ -5327,6 +5338,72 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
     ) {
         render_input_overlay(frame, state, area, &palette);
     }
+    render_selected_review_details(frame, state, area, &palette);
+}
+
+fn handle_selected_review_details_key(state: &mut AppState, key: KeyCode) -> bool {
+    let current = state.navigator.current_id();
+    let Some(plan) = state.onboarding.as_mut() else {
+        return false;
+    };
+    if !plan.cards.iter().any(|card| card.node_id == current) || plan.finished {
+        return false;
+    }
+    if let Some(scroll) = &mut plan.details_scroll {
+        match key {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => plan.details_scroll = None,
+            KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => *scroll = scroll.saturating_add(10),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+            KeyCode::Home => *scroll = 0,
+            KeyCode::End => *scroll = u16::MAX,
+            _ => {}
+        }
+        return true;
+    }
+    if key == KeyCode::F(1) {
+        plan.details_scroll = Some(0);
+        return true;
+    }
+    false
+}
+
+fn render_selected_review_details(
+    frame: &mut Frame,
+    state: &mut AppState,
+    area: Rect,
+    palette: &UiPalette,
+) {
+    let current = state.navigator.current_id();
+    let Some(plan) = state.onboarding.as_mut() else {
+        return;
+    };
+    let Some(scroll) = plan.details_scroll.as_mut() else {
+        return;
+    };
+    let Some(card) = plan.cards.iter().find(|card| card.node_id == current) else {
+        return;
+    };
+    let text: String = card
+        .details
+        .as_deref()
+        .unwrap_or(&card.description)
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect();
+    let panel = UiBlock::bordered()
+        .title("Review evidence · arrows/j/k/PgUp/PgDown scroll · Esc/F1 close")
+        .style(Style::default().bg(palette.bg));
+    let inner = panel.inner(area);
+    let lines = build_ai_hint_lines_from_text(&text, palette, inner.width);
+    let max_scroll = usize_to_u16_saturating(lines.len()).saturating_sub(inner.height);
+    *scroll = (*scroll).min(max_scroll);
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((*scroll, 0)).block(panel),
+        area,
+    );
 }
 
 fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palette: &UiPalette) {
@@ -5344,7 +5421,8 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         card.map(|(index, card)| {
             build_ai_hint_lines_from_text(
                 &format!(
-                    "Onboarding: {} · Card {}/{}\n{}",
+                    "{}: {} · Card {}/{}\n{}",
+                    plan.purpose.label(),
                     plan.title,
                     index + 1,
                     plan.cards.len(),
@@ -5359,6 +5437,12 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
             .ai
             .hint_line_text()
             .map(|text| build_ai_hint_lines_from_text(&text, palette, ai_hint_width))
+    };
+    // The full annotation remains accessible in the scrollable F1 panel.
+    let ai_hint_lines = if state.onboarding.is_some() {
+        ai_hint_lines.map(|lines| lines.into_iter().take(4).collect::<Vec<_>>())
+    } else {
+        ai_hint_lines
     };
     let ai_hint_line_count = usize_to_u16_saturating(ai_hint_lines.as_ref().map_or(0, Vec::len));
 
@@ -5378,6 +5462,7 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
                 format_key_action(keys.prev, "prev card"),
                 format!("[{}/Space]skip/next", keys.next),
                 "[PgUp/PgDown]scroll".to_string(),
+                "[F1]evidence/details".to_string(),
                 format_key_action(keys.quit, "quit"),
             ],
         )
@@ -6680,7 +6765,7 @@ fn render_recap_footer(frame: &mut Frame, area: Rect, palette: &UiPalette, hint:
 fn recap_summary_lines(state: &AppState) -> Vec<String> {
     if let Some(plan) = &state.onboarding {
         return vec![
-            "Onboarding pass complete".to_string(),
+            format!("{} pass complete", plan.purpose.label()),
             format!("Plan: {}", plan.title),
             plan.description.clone(),
             String::new(),
@@ -6692,8 +6777,7 @@ fn recap_summary_lines(state: &AppState) -> Vec<String> {
                 "Still unreviewed in this pass: {} cards",
                 state.remaining_blocks
             ),
-            "This completes only the selected onboarding pass, not the repository review."
-                .to_string(),
+            "This completes only the selected pass, not the repository review.".to_string(),
         ];
     }
     let mut lines = vec![
@@ -9038,14 +9122,17 @@ mod diff_scope_tests {
             },
             title: "Trust boundaries".to_string(),
             description: "A selected first pass, not an exhaustive audit.".to_string(),
+            purpose: crate::onboarding::ReviewPurpose::Onboarding,
             cards: vec![
                 crate::onboarding::OnboardingCard {
                     node_id: ids[2],
                     description: "Trace the request across the trust boundary before accepting caller controlled values.".to_string(),
+                    details: None,
                 },
                 crate::onboarding::OnboardingCard {
                     node_id: ids[0],
                     description: "Check the fallback path.".to_string(),
+                    details: None,
                 },
             ],
         };
@@ -9096,7 +9183,9 @@ mod diff_scope_tests {
             vec![crate::onboarding::OnboardingCard {
                 node_id: ids[0],
                 description: "A container cannot be a standalone approval target.".to_string(),
+                details: None,
             }],
+            crate::onboarding::ReviewPurpose::Onboarding,
         );
         assert!(result.is_err());
         assert!(state.onboarding.is_none());

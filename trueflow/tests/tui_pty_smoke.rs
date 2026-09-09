@@ -1,6 +1,6 @@
 #![cfg(feature = "tui-test-support")]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::fs;
 use std::io::{Read, Write};
@@ -579,5 +579,309 @@ fn pty_smoke_ctrl_j_submits_multiline_note() -> Result<()> {
         "expected PTY smoke test to capture some terminal output"
     );
 
+    Ok(())
+}
+
+struct FocusPty {
+    child: Box<dyn Child + Send + Sync>,
+    writer: Option<Box<dyn Write + Send>>,
+    output: Arc<PtyOutput>,
+    reader: Option<thread::JoinHandle<()>>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl FocusPty {
+    const ROWS: u16 = 24;
+    const COLS: u16 = 120;
+
+    fn open(repo: &TestRepo) -> Result<Self> {
+        let pair = native_pty_system().openpty(PtySize {
+            rows: Self::ROWS,
+            cols: Self::COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
+        cmd.args(["focus", "--plan", "focus.json", "--duration", "5m"]);
+        cmd.cwd(&repo.path);
+        configure_tui_pty_command(&mut cmd, repo);
+        // Acquire fallible handles before spawning so setup errors cannot orphan a child.
+        let writer = pair.master.take_writer()?;
+        let reader = pair.master.try_clone_reader()?;
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let output = PtyOutput::new();
+        let reader = spawn_reader_thread(reader, Arc::clone(&output));
+        Ok(Self {
+            child,
+            writer: Some(writer),
+            output,
+            reader: Some(reader),
+            _master: pair.master,
+        })
+    }
+
+    fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        send_and_flush(
+            &mut **self.writer.as_mut().context("PTY input closed")?,
+            bytes,
+        )
+    }
+
+    fn screen(&self) -> String {
+        parsed_screen_contents(&self.output, Self::ROWS, Self::COLS)
+    }
+
+    fn wait_screen(&mut self, description: &str, predicate: impl Fn(&str) -> bool) -> Result<()> {
+        wait_for_screen_predicate(
+            &self.output,
+            Self::ROWS,
+            Self::COLS,
+            description,
+            Duration::from_secs(10),
+            &mut *self.child,
+            predicate,
+        )
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.writer.take();
+        wait_for_child_success(&mut *self.child, &self.output)?;
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .map_err(|_panic| anyhow::anyhow!("PTY reader panicked"))?;
+        }
+        assert!(
+            alternate_screen_leave_count(&self.output) > 0,
+            "focus must restore the terminal's main screen on exit"
+        );
+        let (bytes, _) = self.output.snapshot();
+        let mut parser = Parser::new(Self::ROWS, Self::COLS, 0);
+        parser.process(&bytes);
+        assert!(
+            !parser.screen().alternate_screen(),
+            "focus left the terminal in the alternate screen"
+        );
+        assert!(
+            !parser.screen().hide_cursor(),
+            "focus left the terminal cursor hidden"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for FocusPty {
+    fn drop(&mut self) {
+        self.writer.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[test]
+fn pty_focus_preserves_selected_order_evidence_approvals_and_resume_scope() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let repo = TestRepo::new("focus_pty")?;
+    repo.write(
+        "trueflow.toml",
+        "[scan]\nuse_cache = false\nwrite_cache = false\n[ai]\nmode = \"off\"\n",
+    )?;
+    let names = ["a_unselected", "b_second", "c_third", "z_first"];
+    for name in names {
+        repo.write(
+            &format!("src/{name}.rs"),
+            &format!("pub fn {name}(balance: &mut u64) {{ *balance += 1; }}\n"),
+        )?;
+    }
+    let home = repo.path.to_str().context("home path")?;
+    let inventory = trueflow_test_support::json(&repo.run_with_env(
+        &["focus", "--candidates", "--path", "src"],
+        &[("HOME", home)],
+    )?)?;
+    let candidates = inventory["candidates"]
+        .as_array()
+        .context("focus candidates")?;
+    let selected: Vec<_> = ["z_first", "b_second", "c_third"]
+        .into_iter()
+        .map(|name| {
+            candidates
+                .iter()
+                .find(|candidate| candidate["target"]["path"] == format!("src/{name}.rs"))
+                .with_context(|| format!("complete candidate for {name}"))
+        })
+        .collect::<Result<_>>()?;
+    let evidence_id = selected[0]["evidence"][0]["id"]
+        .as_str()
+        .context("evidence id")?;
+    let provenance: String = selected[0]["evidence"][0]["provenance"]
+        .as_str()
+        .context("evidence provenance")?
+        .split_whitespace()
+        .collect();
+    let uncertainty: String = (0..20)
+        .map(|n| format!("detail_context_{n:02}\n"))
+        .collect();
+    let steps: Vec<_> = selected
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "target": candidate["target"],
+                "reason": "Inspect arithmetic at the public boundary.",
+                "evidence": [candidate["evidence"][0]["id"]],
+                "uncertainty": uncertainty,
+                "checks": ["Could balance overflow?", "Which callers constrain the input?"]
+            })
+        })
+        .collect();
+    let plan = serde_json::json!({
+        "version": 1, "duration_seconds": 300, "title": "Selected balance checks",
+        "description": "Read selected arithmetic only; no safety certification.", "steps": steps
+    });
+    repo.write("focus.json", &plan.to_string())?;
+    let onboard = trueflow_test_support::json(&repo.run_with_env(
+        &["onboard", "--candidates", "--path", "src"],
+        &[("HOME", home)],
+    )?)?;
+    let first_fingerprint = onboard["candidates"]
+        .as_array()
+        .context("onboard candidates")?
+        .iter()
+        .find(|candidate| candidate["target"] == selected[0]["target"])
+        .context("first fingerprint candidate")?["fingerprint"]
+        .as_str()
+        .context("fingerprint")?;
+
+    let mut session = FocusPty::open(&repo)?;
+    session.wait_screen(
+        "to show the first plan target rather than filesystem order",
+        |screen| {
+            screen.contains("pub fn z_first")
+                && !screen.contains("pub fn a_unselected")
+                && !screen.contains("pub fn b_second")
+        },
+    )?;
+    session.send(b"\x1bOP")?; // xterm F1
+    session.wait_screen("to open full focus details", |screen| {
+        screen.contains("detail_context_00")
+    })?;
+    assert!(
+        !session.screen().contains(evidence_id),
+        "fixture must require scrolling to reach evidence"
+    );
+    for _ in 0..80 {
+        if session
+            .screen()
+            .split_whitespace()
+            .collect::<String>()
+            .contains(&provenance)
+        {
+            break;
+        }
+        let previous = session.screen();
+        session.send(b"j")?;
+        session.wait_screen("to scroll focus evidence", |screen| screen != previous)?;
+    }
+    assert!(
+        session.screen().contains(evidence_id),
+        "scrolling must reveal the actual referenced evidence, not just the plan summary"
+    );
+    assert!(
+        session
+            .screen()
+            .split_whitespace()
+            .collect::<String>()
+            .contains(&provenance),
+        "the reviewer must be able to inspect the complete cited provenance"
+    );
+    session.send(b"\x1b")?;
+    session.wait_screen("to close evidence without leaving the card", |screen| {
+        screen.contains("pub fn z_first") && !screen.contains(evidence_id)
+    })?;
+    session.send(b"a")?;
+    session.wait_screen(
+        "to advance approval to the second selected target",
+        |screen| screen.contains("pub fn b_second") && !screen.contains("pub fn z_first"),
+    )?;
+    let record_path = repo.path.join(".trueflow/reviews.jsonl");
+    let records = read_review_records(&record_path)?;
+    assert_eq!(
+        records.len(),
+        1,
+        "one card approval must persist exactly one review"
+    );
+    assert_eq!(
+        trueflow_test_support::record_target_key(&records[0]),
+        first_fingerprint
+    );
+    let approved_records = fs::read(&record_path)?;
+
+    session.send(b"l")?;
+    session.wait_screen("to skip to the third selected target", |screen| {
+        screen.contains("pub fn c_third") && !screen.contains("pub fn b_second")
+    })?;
+    session.send(b" d")?; // Space skips the last card; d finishes its recap.
+    session.finish()?;
+    assert_eq!(
+        fs::read(&record_path)?,
+        approved_records,
+        "skip and finish must not approve remaining cards"
+    );
+
+    let pending = trueflow_test_support::json(&repo.run_with_env(
+        &["focus", "--candidates", "--path", "src"],
+        &[("HOME", home)],
+    )?)?;
+    let pending = pending["candidates"]
+        .as_array()
+        .context("pending candidates")?;
+    assert_eq!(pending.len(), 3);
+    assert!(
+        !pending
+            .iter()
+            .any(|candidate| candidate["target"] == selected[0]["target"])
+    );
+    for name in ["a_unselected", "b_second", "c_third"] {
+        assert!(
+            pending
+                .iter()
+                .any(|candidate| candidate["target"]["path"] == format!("src/{name}.rs")),
+            "{name} must remain unreviewed"
+        );
+    }
+
+    let mut resumed = FocusPty::open(&repo)?;
+    resumed.wait_screen(
+        "to resume at the first still-unreviewed selected card",
+        |screen| {
+            screen.contains("pub fn b_second")
+                && !screen.contains("pub fn z_first")
+                && !screen.contains("pub fn a_unselected")
+        },
+    )?;
+    resumed.send(b"l")?;
+    resumed.wait_screen(
+        "to retain the remaining selected order after reopen",
+        |screen| screen.contains("pub fn c_third"),
+    )?;
+    resumed.send(b"q")?;
+    resumed.finish()?;
+    assert_eq!(
+        fs::read(&record_path)?,
+        approved_records,
+        "reopening and exiting must not manufacture approvals"
+    );
+    for name in names {
+        assert_eq!(
+            fs::read_to_string(repo.path.join(format!("src/{name}.rs")))?,
+            format!("pub fn {name}(balance: &mut u64) {{ *balance += 1; }}\n"),
+            "focus must preserve selected and unselected source"
+        );
+    }
     Ok(())
 }
