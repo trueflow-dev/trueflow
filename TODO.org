@@ -254,18 +254,24 @@
    Acceptance: users can complete and resume a review in the browser without
    losing review state, with demonstrably better reading and commenting UX.
 
-** TODO Time-budgeted, LLM-curated high-signal review command (name TBD)
+** TODO Complete focus review evidence depth and timing
    Goal: ask how long the user wants to review, then have an LLM generate an
    ordered "top hits" set of existing code worth human attention within that
    budget. This is review discovery, not an automated verdict or only a diff view.
-   Command suggestions (not decided):
-   - `trueflow focus` (recommended): short, targeted review sessions.
-   - `trueflow triage`: emphasizes risk prioritization.
-   - `trueflow hotspots`: emphasizes code with concentrated warning signals.
-   - `trueflow spotlight`: emphasizes guided discovery.
-   - [ ] Prompt at the beginning for a target duration: 5m, 10m, 15m, 30m, or a
-     custom duration. Support an explicit duration argument for scripted use;
-     proposed spelling: `trueflow focus --duration 10m`.
+   Implemented: `trueflow focus --duration 5m|10m` (or an interactive duration
+   prompt), source-pinned candidate/evidence queries, bounded LLM shortlisting
+   across the scoped candidate set, locally enforced reading estimates, portable
+   plans, F1 evidence details, and the existing selected-card review workflow.
+   Evidence includes lexical/complexity observations, effective human records,
+   heuristic test links, and up to eight first-parent file-local Git patches.
+   No call-graph or executed-test coverage is claimed. Source/review/evidence
+   drift is checked after generation; saved plans resume remaining targets.
+   Deterministic CLI/provider/PTY regressions and an opt-in synthetic live-model
+   comparison harness exist. Selection quality still needs representative human
+   evaluation; fixture spans selected are not bugs discovered.
+   Timer/pause/extend and queue-adjustment UI remain deliberately out of scope.
+   - [X] Prompt before generation for a duration, with explicit units and a
+     scripted `trueflow focus --duration 10m` interface.
    - [ ] Gather evidence for candidate review blocks across the selected
      repository scope, not only recent changes. Include these signal families:
      - A: Unreadable/sketchy code: tangled control flow, excessive nesting,
@@ -294,13 +300,13 @@
        especially where complexity or dependency reach has increased.
      - Unresolved human concerns: rejected reviews, open review comments, and
        linked defects where available; never fabricate issue/history evidence.
-   - [ ] Reuse existing semantic blocks, review coverage, and repository/history
+   - [X] Reuse existing semantic blocks, review coverage, and repository/history
      facilities. Distinguish unavailable evidence from a clean result; discount
      mechanical/generated/vendor churn and avoid duplicate overlapping targets.
-   - [ ] Have the LLM select and order the actual review set, rather than merely
+   - [X] Have the LLM select and order the actual review set, rather than merely
      explain a fixed heuristic ranking. Supply bounded candidate evidence and
      request structured output: exact target, reason to inspect, cited evidence,
-     uncertainty, suggested inspection questions, and estimated review minutes.
+     uncertainty and inspection questions; compute reading estimates locally.
      Favor expected review value per minute, accounting for code context and
      navigation overhead; treat estimates as estimates, not guarantees.
    - [ ] Resolve every proposed target and evidence reference against the same
@@ -318,8 +324,10 @@
    - [ ] Decide model/provider configuration and code-sharing consent before
      implementation; evaluate local and remote options without choosing new
      dependencies yet. Bound history/context, generation cost, and latency.
-     Treat repository text as untrusted model input; grant no tool execution or
-     automatic review authority. Surface generation failures without silently
+     Treat repository text as untrusted model input. Claude disables tools;
+     Codex uses the explicitly accepted weaker read-only sandbox with supported
+     tool features disabled. Grant no automatic review authority.
+     Surface generation failures without silently
      substituting a non-LLM queue or marking anything reviewed.
    - [ ] Verify with fixtures containing unreadable code, important unreviewed
      code, and repeated bug-fix churn, plus a noisy mechanical-change control.

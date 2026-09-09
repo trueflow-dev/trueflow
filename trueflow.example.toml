@@ -34,7 +34,10 @@ mode = "off"
 # Provider selection: auto|anthropic|open_ai|claude_cli|codex_cli|none.
 provider = "codex_cli"
 # Codex auto selects gpt-6; Codex invocations use high reasoning.
+# Claude auto uses the installed CLI's default model.
 model = "auto"
+# Shared ordinary-plan source excerpt budget across the selected manifest.
+# Focus uses separate bounded evidence batches.
 max_context_lines = 80
 # Cache block-hint responses for this session.
 cache = true

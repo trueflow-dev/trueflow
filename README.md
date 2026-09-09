@@ -262,6 +262,83 @@ repository root, even when invoked from a subdirectory, and honor scan/review
 filters and existing approval coverage. Pagination reflects current worktree and
 review state; final target resolution is authoritative.
 
+### Focus a short review on consequential code
+
+```sh
+trueflow focus --duration 5m
+trueflow focus --duration 10m --path src
+trueflow focus                         # asks for a duration before generation
+trueflow focus --duration 5m --json    # generate a portable specification
+trueflow focus --plan review.json     # reopen without invoking an LLM
+trueflow focus --plan review.json --json
+trueflow focus --candidates --path src --offset 0 --limit 64
+```
+
+Unlike `onboard` (an architectural first pass), `focus` asks the LLM to select
+code worth human attention for its expected review value per minute. It considers
+all unreviewed leaf candidates in the selected scope, including commented or
+rejected code; valid approvals remain excluded. Scan/review filters still apply.
+Durations accept explicit `m` or `s` units, from one second through 60 minutes.
+Non-interactive generation requires `--duration`.
+
+Trueflow supplies source-pinned evidence: existing complexity metadata, lexical
+entry-point/trust-boundary/write/error/concurrency signals, effective review
+records and notes, heuristic related-test links, and recent immutable Git patch
+excerpts. These are observations, **not findings**. Related tests are not measured
+test coverage; review records are not independently verified reviewer identities.
+History inspects up to eight first-parent commits and is file-local, not precise
+historical-to-current block attribution. Missing/truncated evidence is explicit.
+Generated/vendor/test-heavy content and mechanical whitespace churn are labeled
+for discounting. There is no whole-program call graph or executed test analysis.
+
+Every model-selected card must cite evidence IDs for its exact target and include
+a reason, uncertainty, and concrete inspection questions. Bounded multi-pass
+selection visits every in-budget candidate before reducing model-selected
+shortlists; it does not silently take the first files. Each pass selects at most
+eight cards. Generation has a shared 120-second deadline (`--timeout 1..600`) and
+at most 32 calls with 64 KiB prompts. Excessive scope fails explicitly; narrow
+`--path`. No partial or heuristic fallback queue is substituted on failure.
+
+The application enforces a **reading estimate**, not a timer: two seconds per
+source line plus ten seconds per complete card. Oversized blocks are reported,
+not truncated. There are no elapsed-time, pause, or extend controls. Actual
+review can take longer. Source, review state, and evidence are rechecked after
+generation; stale/invented references fail. Saved plans revalidate their remaining
+cards and omit already-approved cards.
+
+In the TUI, `F1` opens full reasons, uncertainty, questions, and cited evidence.
+Use arrows, `j`/`k`, or PageUp/PageDown to scroll; Escape/F1 closes the panel.
+Approve/comment/skip and persistence work as in onboarding. The queue cannot
+widen to unrelated blocks, and its recap does not claim repository completion.
+
+Focus specifications have `version: 1`, `duration_seconds`, `title`, `description`,
+and `steps`. Each step has an exact onboarding-style `target`, `reason`,
+`evidence` (1–6 candidate evidence IDs), `uncertainty`, and `checks` (1–4 questions).
+Targets must be distinct, non-overlapping complete blocks. Saved specifications
+allow at most 64 cards within the declared estimate. Inspect `--candidates` for
+the current evidence catalogue and estimates; its pages use stable source order,
+not a risk ranking.
+
+Focus uses the configured CLI provider even when ordinary TUI AI is off.
+**Codex uses a read-only sandbox with supported tool features disabled**, ignores
+user configuration/rules, and disables web search. This is weaker than tool-free
+generation and is not a confidentiality boundary. Claude disables tools, MCP,
+and customizations; `model = "auto"` uses Claude CLI's own default model.
+Both send evidence to the configured service; neither automatically records a verdict.
+
+An opt-in synthetic live-model comparison is available:
+
+```sh
+cargo build --manifest-path trueflow/Cargo.toml --bin trueflow --example evaluate_focus
+cargo run --manifest-path trueflow/Cargo.toml --example evaluate_focus -- --provider claude_cli
+```
+
+It compares real 5m/10m focus selections against ordinary `ReviewOrder`, including
+planted consequential paths and noisy controls. The JSON report measures concern
+spans *selected*, not bugs discovered or demonstrated human productivity. It
+requires provider authentication and may incur charges; CI uses isolated fake
+providers and actual PTY/persistence regressions instead.
+
 ## Filter and scope review
 
 ```sh
@@ -351,6 +428,12 @@ default_chunk_words = 2
 ```
 
 See `trueflow.example.toml` for the default settings.
+
+Ordinary AI review plans distribute their bounded manifest across files and
+source/test groups, share excerpt space, and retain changed-head context.
+Clipped source is labeled partial; priorities only reorder the ordinary queue.
+CLI provider execution has a 120-second default timeout and bounded output.
+Leaving the AI-plan loading screen cancels its provider process group.
 
 ## Interfaces
 
