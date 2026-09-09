@@ -1321,11 +1321,18 @@ fn run_cli_invocation_with_options(
     let stdout = String::from_utf8(stdout)
         .with_context(|| format!("{} returned non-UTF-8 stdout", invocation.program))?;
     if !status.success() {
+        let diagnostic = match invocation.output_format {
+            AiCliOutputFormat::ClaudeJson => serde_json::from_str(&stdout)
+                .ok()
+                .as_ref()
+                .and_then(claude_error_message),
+            _ => None,
+        };
         return Err(anyhow!(
             "{} exited with {}: {}",
             invocation.program,
             status,
-            collapse_whitespace(&String::from_utf8_lossy(&stderr))
+            diagnostic.unwrap_or_else(|| collapse_whitespace(&String::from_utf8_lossy(&stderr)))
         ));
     }
     let session_id = match invocation.output_format {
@@ -1543,9 +1550,46 @@ fn is_no_change_text(text: &str) -> bool {
         || lower.contains("looks fine")
 }
 
+fn claude_error_message(value: &serde_json::Value) -> Option<String> {
+    if value.get("is_error").and_then(serde_json::Value::as_bool) != Some(true)
+        && !value
+            .get("subtype")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.starts_with("error"))
+    {
+        return None;
+    }
+    let result = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned);
+    let errors = || {
+        value
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|text| !text.is_empty())
+    };
+    let message = result
+        .or_else(errors)
+        .unwrap_or_else(|| "Claude reported an error without details".to_string());
+    Some(collapse_whitespace(&message).chars().take(2000).collect())
+}
+
 fn parse_claude_json_result(stdout: &str) -> Result<String> {
     let value: serde_json::Value = serde_json::from_str(stdout.trim())
         .with_context(|| "failed to parse claude JSON output")?;
+    if let Some(message) = claude_error_message(&value) {
+        return Err(anyhow!("{message}"));
+    }
     value
         .get("result")
         .or_else(|| value.get("message"))
@@ -1725,7 +1769,8 @@ pub fn effective_model_for_provider(provider: AiProvider, configured_model: &str
 
 pub fn default_model_for_provider(provider: AiProvider) -> &'static str {
     match provider {
-        AiProvider::Anthropic | AiProvider::ClaudeCli => "claude-3-5-haiku-latest",
+        AiProvider::Anthropic => "claude-3-5-haiku-latest",
+        AiProvider::ClaudeCli => "auto",
         AiProvider::OpenAi => "gpt-5-mini",
         AiProvider::CodexCli => "gpt-6",
     }
@@ -2344,6 +2389,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(unknown.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_structured_errors_remain_actionable_on_any_exit_status() {
+        for status in [0, 1] {
+            let mut invocation = fake_invocation(&format!(
+                "printf '%s' '{{\"is_error\":true,\"result\":\"Authentication expired: log in again\"}}'; exit {status}"
+            ));
+            invocation.output_format = AiCliOutputFormat::ClaudeJson;
+            let error =
+                run_cli_invocation_with_options(&invocation, &AiExecutionOptions::default())
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("Authentication expired"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
