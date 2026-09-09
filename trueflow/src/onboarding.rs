@@ -27,7 +27,7 @@ pub struct ReviewLocation {
 }
 
 impl ReviewLocation {
-    fn for_block(path: &RepoPath, block: &Block) -> Self {
+    pub(crate) fn for_block(path: &RepoPath, block: &Block) -> Self {
         Self {
             path: path.clone(),
             start_line: block.start_line + 1,
@@ -38,7 +38,7 @@ impl ReviewLocation {
         }
     }
 
-    fn estimated_seconds(&self) -> usize {
+    pub(crate) fn estimated_seconds(&self) -> usize {
         self.end_line
             .saturating_sub(self.start_line)
             .saturating_add(1)
