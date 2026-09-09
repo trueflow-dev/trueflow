@@ -1990,6 +1990,7 @@ fn ai_review_plan_blocks_for_state(state: &AppState) -> Vec<(TreeNodeId, AiRevie
                 node_id,
                 AiReviewPlanBlock {
                     block_id: String::new(),
+                    is_test: crate::review_order::is_test_block(&node.path, node),
                     path: node.path.as_str().to_string(),
                     language: node.language.unwrap_or_default(),
                     block_kind: block.kind,
@@ -2047,11 +2048,12 @@ fn ai_review_plan_request_for_state(state: &AppState) -> Option<AiReviewPlanRequ
     ))
 }
 
-fn ai_review_plan_presented_node_ids(state: &AppState) -> Vec<TreeNodeId> {
-    ai_review_plan_blocks_for_state(state)
+fn ai_review_plan_presented_node_ids(state: &AppState) -> HashMap<String, TreeNodeId> {
+    let (nodes, blocks): (Vec<_>, Vec<_>) =
+        ai_review_plan_blocks_for_state(state).into_iter().unzip();
+    crate::ai::review_plan_manifest_indices(&blocks, 120)
         .into_iter()
-        .take(120)
-        .map(|(node_id, _)| node_id)
+        .map(|index| (format!("B{:04}", index + 1), nodes[index]))
         .collect()
 }
 
@@ -2060,12 +2062,7 @@ fn apply_ai_review_plan_priorities(state: &mut AppState, plan: &AiReviewPlan) {
     let mut seen = HashSet::new();
     let mut prefix = Vec::new();
     for priority in &plan.priority_blocks {
-        let Some(node_id) = presented
-            .iter()
-            .enumerate()
-            .find(|(index, _)| format!("B{:04}", index + 1) == priority.block_id)
-            .map(|(_, node_id)| *node_id)
-        else {
+        let Some(&node_id) = presented.get(&priority.block_id) else {
             continue;
         };
         if seen.insert(node_id) {
@@ -2148,14 +2145,14 @@ fn ai_review_plan_lines(
 
     let presented = ai_review_plan_presented_node_ids(state);
     let mut rendered_priority = 0;
+    let mut seen = HashSet::new();
     for priority in &plan.priority_blocks {
-        let Some((_, node_id)) = presented
-            .iter()
-            .enumerate()
-            .find(|(index, _)| format!("B{:04}", index + 1) == priority.block_id)
-        else {
+        let Some(node_id) = presented.get(&priority.block_id) else {
             continue;
         };
+        if !seen.insert(*node_id) {
+            continue;
+        }
         rendered_priority += 1;
         let node = state.navigator.tree.node(*node_id);
         let block = node.block.as_ref();
@@ -2366,6 +2363,7 @@ type AiReviewPlanWorkerResult = std::result::Result<AiReviewPlan, String>;
 fn start_ai_review_plan_worker<SpawnFn, WorkerHandle>(
     provider: Arc<dyn AiReviewPlanProvider>,
     request: AiReviewPlanRequest,
+    options: crate::ai::AiExecutionOptions,
     spawn: SpawnFn,
 ) -> std::result::Result<mpsc::Receiver<AiReviewPlanWorkerResult>, String>
 where
@@ -2374,7 +2372,7 @@ where
     let (sender, receiver) = mpsc::channel();
     let worker = Box::new(move || {
         let result = provider
-            .plan(&request)
+            .plan(&request, &options)
             .map_err(|error| truncate_ai_error(&error.to_string()));
         let _ = sender.send(result);
     });
@@ -2411,7 +2409,9 @@ fn run_ai_review_kickoff(
         let message = ai_review_plan_unavailable_message(state);
         return run_ai_review_plan_unavailable(terminal, state, &coverage, &message);
     };
-    let receiver = match start_ai_review_plan_worker(provider, request, |worker| {
+    let options = crate::ai::AiExecutionOptions::default();
+    let _cancel_on_exit = options.cancellation.cancel_on_drop();
+    let receiver = match start_ai_review_plan_worker(provider, request, options, |worker| {
         thread::Builder::new()
             .name("trueflow-ai-review-plan".to_string())
             .spawn(worker)
@@ -8627,7 +8627,11 @@ mod diff_scope_tests {
     }
 
     impl AiReviewPlanProvider for StaticAiReviewPlanProvider {
-        fn plan(&self, _request: &AiReviewPlanRequest) -> Result<AiReviewPlan> {
+        fn plan(
+            &self,
+            _request: &AiReviewPlanRequest,
+            _options: &crate::ai::AiExecutionOptions,
+        ) -> Result<AiReviewPlan> {
             Ok(self.plan.clone())
         }
     }
@@ -8707,6 +8711,7 @@ mod diff_scope_tests {
             total_blocks: 1,
             presented_blocks: 1,
             excerpted_blocks: 1,
+            fully_excerpted_blocks: 1,
             excerpt_lines: 1,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -8763,6 +8768,7 @@ mod diff_scope_tests {
             total_blocks: 2,
             presented_blocks: 2,
             excerpted_blocks: 2,
+            fully_excerpted_blocks: 2,
             excerpt_lines: 2,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -8899,9 +8905,12 @@ mod diff_scope_tests {
         let provider = Arc::new(StaticAiReviewPlanProvider {
             plan: test_review_plan(),
         });
-        let receiver = start_ai_review_plan_worker(provider, request.clone(), |worker| {
-            Ok(thread::spawn(worker))
-        })
+        let receiver = start_ai_review_plan_worker(
+            provider,
+            request.clone(),
+            crate::ai::AiExecutionOptions::default(),
+            |worker| Ok(thread::spawn(worker)),
+        )
         .unwrap_or_else(|error| panic!("expected worker spawn: {error}"));
         let result = receiver
             .recv_timeout(Duration::from_secs(1))
@@ -8912,10 +8921,15 @@ mod diff_scope_tests {
         let provider = Arc::new(StaticAiReviewPlanProvider {
             plan: test_review_plan(),
         });
-        let error = match start_ai_review_plan_worker(provider, request, |_worker| {
-            Err(std::io::Error::other("thread budget exhausted"))
-                as std::io::Result<thread::JoinHandle<()>>
-        }) {
+        let error = match start_ai_review_plan_worker(
+            provider,
+            request,
+            crate::ai::AiExecutionOptions::default(),
+            |_worker| {
+                Err(std::io::Error::other("thread budget exhausted"))
+                    as std::io::Result<thread::JoinHandle<()>>
+            },
+        ) {
             Ok(_) => panic!("expected worker spawn failure"),
             Err(error) => error,
         };
@@ -8929,6 +8943,7 @@ mod diff_scope_tests {
             total_blocks: 3,
             presented_blocks: 2,
             excerpted_blocks: 1,
+            fully_excerpted_blocks: 1,
             excerpt_lines: 4,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12))

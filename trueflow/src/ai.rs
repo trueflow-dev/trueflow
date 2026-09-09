@@ -6,11 +6,12 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
@@ -171,6 +172,7 @@ impl AiSuggestionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiReviewPlanBlock {
     pub block_id: String,
+    pub is_test: bool,
     pub path: String,
     pub language: Language,
     pub block_kind: BlockKind,
@@ -186,11 +188,13 @@ pub struct AiReviewPlanCoverage {
     pub presented_blocks: usize,
     pub excerpted_blocks: usize,
     pub excerpt_lines: usize,
+    pub fully_excerpted_blocks: usize,
 }
 
 impl AiReviewPlanCoverage {
     pub const fn is_partial(&self) -> bool {
-        self.presented_blocks < self.total_blocks || self.excerpted_blocks < self.presented_blocks
+        self.presented_blocks < self.total_blocks
+            || self.fully_excerpted_blocks < self.presented_blocks
     }
 }
 
@@ -208,44 +212,55 @@ impl AiReviewPlanRequest {
         blocks: &[AiReviewPlanBlock],
         max_context_lines: usize,
     ) -> Self {
-        const MAX_BLOCKS: usize = 120;
-        const MAX_LINES_PER_BLOCK: usize = 12;
-
-        let total_blocks = blocks.len();
-        let presented_blocks = total_blocks.min(MAX_BLOCKS);
-        let mut remaining_lines = max_context_lines.max(1);
-        let mut excerpted_blocks = 0;
-        let mut excerpt_lines = 0;
-        let presented = blocks
+        let selected = review_plan_manifest_indices(blocks, 120);
+        let sources = selected
             .iter()
-            .take(presented_blocks)
-            .enumerate()
-            .map(|(index, source)| {
-                let mut block = source.clone();
-                block.block_id = format!("B{:04}", index + 1);
-                let lines = block
-                    .content
-                    .lines()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                let included_lines = lines.len().min(MAX_LINES_PER_BLOCK).min(remaining_lines);
-                if included_lines > 0 {
-                    excerpted_blocks += 1;
-                    excerpt_lines += included_lines;
-                    remaining_lines -= included_lines;
-                }
+            .map(|&index| PlanSource::new(&blocks[index].content))
+            .collect::<Vec<_>>();
+        let mut allowances = vec![0; selected.len()];
+        let mut remaining = max_context_lines;
+        // Water-fill: every presented block gets a line before any gets a second.
+        for depth in 0..12 {
+            let eligible = sources
+                .iter()
+                .enumerate()
+                .filter_map(|(index, source)| (source.line_count() > depth).then_some(index))
+                .collect::<Vec<_>>();
+            let count = remaining.min(eligible.len());
+            for slot in 0..count {
+                let offset = if count <= 1 {
+                    eligible.len() - 1
+                } else {
+                    slot * (eligible.len() - 1) / (count - 1)
+                };
+                allowances[eligible[offset]] += 1;
+            }
+            remaining -= count;
+            if remaining == 0 {
+                break;
+            }
+        }
+        let mut coverage = AiReviewPlanCoverage {
+            total_blocks: blocks.len(),
+            presented_blocks: selected.len(),
+            excerpted_blocks: 0,
+            excerpt_lines: max_context_lines - remaining,
+            fully_excerpted_blocks: 0,
+        };
+        let presented = selected
+            .iter()
+            .zip(sources.iter())
+            .zip(allowances)
+            .map(|((&index, source), allowance)| {
+                coverage.excerpted_blocks += usize::from(allowance > 0);
+                coverage.fully_excerpted_blocks += usize::from(allowance == source.line_count());
                 (
-                    block,
-                    lines.into_iter().take(included_lines).collect::<Vec<_>>(),
+                    &blocks[index],
+                    format!("B{:04}", index + 1),
+                    source.excerpt(allowance),
                 )
             })
             .collect::<Vec<_>>();
-        let coverage = AiReviewPlanCoverage {
-            total_blocks,
-            presented_blocks,
-            excerpted_blocks,
-            excerpt_lines,
-        };
         let prompt = build_review_plan_prompt(&review_set_hash, scope_label, &coverage, &presented);
 
         Self {
@@ -253,6 +268,163 @@ impl AiReviewPlanRequest {
             coverage,
             prompt,
         }
+    }
+}
+
+pub(crate) fn review_plan_manifest_indices(
+    blocks: &[AiReviewPlanBlock],
+    limit: usize,
+) -> Vec<usize> {
+    let mut groups: [Vec<Vec<usize>>; 2] = [Vec::new(), Vec::new()];
+    let mut files = HashMap::new();
+    let mut totals = [0usize; 2];
+    for (index, block) in blocks.iter().enumerate() {
+        let group = usize::from(block.is_test);
+        let file = *files
+            .entry((group, block.path.as_str()))
+            .or_insert_with(|| {
+                groups[group].push(Vec::new());
+                groups[group].len() - 1
+            });
+        groups[group][file].push(index);
+        totals[group] += 1;
+    }
+    let mut quotas = [0usize; 2];
+    for _ in 0..limit.min(blocks.len()) {
+        let group = if quotas[0] < totals[0] && (quotas[0] <= quotas[1] || quotas[1] == totals[1]) {
+            0
+        } else {
+            1
+        };
+        quotas[group] += 1;
+    }
+    let mut selections: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    for group in 0..2 {
+        let mut depth = 0;
+        while selections[group].len() < quotas[group] {
+            let round = groups[group]
+                .iter()
+                .filter_map(|file| file.get(depth).copied())
+                .collect::<Vec<_>>();
+            let count = round.len().min(quotas[group] - selections[group].len());
+            for slot in 0..count {
+                // Sample the whole file range, not a prefix, when the manifest is full.
+                let offset = if count <= 1 {
+                    round.len() - 1
+                } else {
+                    slot * (round.len() - 1) / (count - 1)
+                };
+                selections[group].push(round[offset]);
+            }
+            depth += 1;
+        }
+    }
+    let mut selected = Vec::with_capacity(limit.min(blocks.len()));
+    for index in 0..selections[0].len().max(selections[1].len()) {
+        for group in &selections {
+            if let Some(&block) = group.get(index) {
+                selected.push(block);
+            }
+        }
+    }
+    selected
+}
+
+struct PlanSource<'a> {
+    base: Option<Vec<&'a str>>,
+    head: Vec<&'a str>,
+    single_side_label: Option<&'static str>,
+}
+
+impl<'a> PlanSource<'a> {
+    fn new(content: &'a str) -> Self {
+        if let Some((base, head)) = content
+            .strip_prefix("[base]\n")
+            .and_then(|text| text.split_once("[head]\n"))
+        {
+            Self {
+                base: Some(base.lines().collect()),
+                head: head.lines().collect(),
+                single_side_label: None,
+            }
+        } else if let Some(head) = content.strip_prefix("[head]\n") {
+            Self {
+                base: None,
+                head: head.lines().collect(),
+                single_side_label: Some("head"),
+            }
+        } else if let Some(base) = content.strip_prefix("[base]\n") {
+            Self {
+                base: None,
+                head: base.lines().collect(),
+                single_side_label: Some("base"),
+            }
+        } else {
+            Self {
+                base: None,
+                head: content.lines().collect(),
+                single_side_label: None,
+            }
+        }
+    }
+
+    fn line_count(&self) -> usize {
+        self.head.len() + self.base.as_ref().map_or(0, Vec::len)
+    }
+
+    fn excerpt(&self, allowance: usize) -> Vec<String> {
+        if allowance == 0 {
+            return Vec::new();
+        }
+        let Some(base) = &self.base else {
+            let mut lines = self
+                .head
+                .iter()
+                .take(allowance)
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>();
+            if let Some(label) = self.single_side_label {
+                lines.insert(0, format!("[{label}]"));
+            }
+            if allowance < self.head.len() {
+                lines.push("[source partial; remaining lines omitted]".to_string());
+            }
+            return lines;
+        };
+        let head_count = self.head.len().min(allowance.div_ceil(2));
+        let base_count = base.len().min(allowance - head_count);
+        let head_count = self.head.len().min(allowance - base_count);
+        let change = base
+            .iter()
+            .zip(&self.head)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let mut lines = Vec::new();
+        for (label, source, count) in [("base", base, base_count), ("head", &self.head, head_count)]
+        {
+            lines.push(format!("[{label}]"));
+            if source.is_empty() {
+                lines.push(format!("[{label} empty]"));
+            } else if count == 0 {
+                lines.push(format!("[{label} omitted by context budget]"));
+            } else {
+                let start = change.saturating_sub(count / 3).min(source.len() - count);
+                if start > 0 {
+                    lines.push(format!(
+                        "[{label} partial; {start} preceding lines omitted]"
+                    ));
+                }
+                lines.extend(
+                    source[start..start + count]
+                        .iter()
+                        .map(|line| (*line).to_string()),
+                );
+                if start + count < source.len() {
+                    lines.push(format!("[{label} partial; remaining lines omitted]"));
+                }
+            }
+        }
+        lines
     }
 }
 
@@ -349,7 +521,7 @@ fn build_review_plan_prompt(
     review_set_hash: &TreeHash,
     scope_label: &str,
     coverage: &AiReviewPlanCoverage,
-    presented: &[(AiReviewPlanBlock, Vec<String>)],
+    presented: &[(&AiReviewPlanBlock, String, Vec<String>)],
 ) -> String {
     let suffix = if coverage.is_partial() {
         " (partial)"
@@ -357,12 +529,12 @@ fn build_review_plan_prompt(
         " (all)"
     };
     let mut manifest = String::new();
-    for (block, excerpt) in presented {
+    for (block, block_id, excerpt) in presented {
         let line_start = block.start_line.saturating_add(1);
         let line_end = block.end_line.max(block.start_line.saturating_add(1));
         manifest.push_str(&format!(
             "\n- {}\n  Path: {}\n  Language: {:?}\n  Block kind: {}\n  Block hash: {}\n  Lines: {line_start}-{line_end}\n",
-            block.block_id,
+            block_id,
             block.path,
             block.language,
             block.block_kind.as_str(),
@@ -409,7 +581,11 @@ Do not include Markdown fences or any text outside the JSON object.",
 }
 
 pub trait AiReviewPlanProvider: Send + Sync {
-    fn plan(&self, request: &AiReviewPlanRequest) -> Result<AiReviewPlan>;
+    fn plan(
+        &self,
+        request: &AiReviewPlanRequest,
+        options: &AiExecutionOptions,
+    ) -> Result<AiReviewPlan>;
 }
 
 #[derive(Debug, Clone)]
@@ -430,15 +606,125 @@ impl CommandAiReviewPlanProvider {
     }
 
     pub fn generate(&self, prompt: &str) -> Result<String> {
+        self.generate_with_options(prompt, &AiExecutionOptions::default())
+    }
+
+    pub fn generate_with_timeout(&self, prompt: &str, timeout: Duration) -> Result<String> {
+        self.generate_with_options(
+            prompt,
+            &AiExecutionOptions {
+                timeout,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn generate_with_options(
+        &self,
+        prompt: &str,
+        options: &AiExecutionOptions,
+    ) -> Result<String> {
         let invocation =
             cli_invocation_for_generation(self.provider, &self.model, prompt.to_string())?;
-        Ok(run_cli_invocation(&invocation)?.text)
+        Ok(run_cli_invocation_with_options(&invocation, options)?.text)
+    }
+
+    pub fn generate_from_evidence(&self, prompt: &str, timeout: Duration) -> Result<String> {
+        self.generate_from_evidence_with_options(
+            prompt,
+            &AiExecutionOptions {
+                timeout,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn generate_from_evidence_with_options(
+        &self,
+        prompt: &str,
+        options: &AiExecutionOptions,
+    ) -> Result<String> {
+        let mut invocation =
+            cli_invocation_for_generation(self.provider, &self.model, prompt.to_string())?;
+        restrict_evidence_generation_tools(self.provider, &mut invocation)?;
+        Ok(run_cli_invocation_with_options(&invocation, options)?.text)
+    }
+}
+
+fn restrict_evidence_generation_tools(
+    provider: AiProvider,
+    invocation: &mut AiCliInvocation,
+) -> Result<()> {
+    match provider {
+        AiProvider::ClaudeCli => {
+            // Official print-mode controls: no built-ins, configured MCP servers,
+            // customizations, slash commands, or browser integration.
+            invocation.args.extend(
+                [
+                    "--tools",
+                    "",
+                    "--strict-mcp-config",
+                    "--safe-mode",
+                    "--disable-slash-commands",
+                    "--no-chrome",
+                ]
+                .map(str::to_string),
+            );
+            Ok(())
+        }
+        AiProvider::CodexCli => {
+            // Explicitly weaker than Claude's tools-off mode: retain the existing
+            // read-only sandbox and remove supported execution/integration features.
+            // Ignore user configuration so MCP servers, hooks and rules cannot widen it.
+            invocation.args.extend(
+                [
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--ephemeral",
+                    "--strict-config",
+                    "-c",
+                    "web_search=\"disabled\"",
+                ]
+                .map(str::to_string),
+            );
+            for feature in [
+                "shell_tool",
+                "unified_exec",
+                "apps",
+                "plugins",
+                "hooks",
+                "multi_agent",
+                "multi_agent_v2",
+                "browser_use",
+                "browser_use_external",
+                "computer_use",
+                "code_mode",
+                "code_mode_host",
+                "image_generation",
+                "skill_mcp_dependency_install",
+                "skill_search",
+                "workspace_dependencies",
+            ] {
+                invocation
+                    .args
+                    .extend(["--disable".to_string(), feature.to_string()]);
+            }
+            Ok(())
+        }
+        AiProvider::Anthropic | AiProvider::OpenAi => Err(anyhow!(
+            "{} has no tool-free CLI provider",
+            provider.label()
+        )),
     }
 }
 
 impl AiReviewPlanProvider for CommandAiReviewPlanProvider {
-    fn plan(&self, request: &AiReviewPlanRequest) -> Result<AiReviewPlan> {
-        AiReviewPlan::from_provider_text(&self.generate(&request.prompt)?)
+    fn plan(
+        &self,
+        request: &AiReviewPlanRequest,
+        options: &AiExecutionOptions,
+    ) -> Result<AiReviewPlan> {
+        AiReviewPlan::from_provider_text(&self.generate_with_options(&request.prompt, options)?)
     }
 }
 
@@ -533,6 +819,7 @@ pub struct CommandAiSuggestionProvider {
     provider: AiProvider,
     model: String,
     conversations: Arc<Mutex<HashMap<AiConversationKey, AiConversationState>>>,
+    cancellation: AiCancellationToken,
 }
 
 impl CommandAiSuggestionProvider {
@@ -547,7 +834,13 @@ impl CommandAiSuggestionProvider {
             provider,
             model,
             conversations: Arc::new(Mutex::new(HashMap::new())),
+            cancellation: AiCancellationToken::default(),
         })
+    }
+
+    pub fn with_cancellation(mut self, cancellation: AiCancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     fn cached_session_id(&self, key: &AiConversationKey) -> Option<String> {
@@ -575,6 +868,11 @@ impl CommandAiSuggestionProvider {
 
 impl AiSuggestionProvider for CommandAiSuggestionProvider {
     fn suggest(&self, request: &AiSuggestionRequest) -> Result<AiSuggestion> {
+        let started = Instant::now();
+        let mut options = AiExecutionOptions {
+            cancellation: self.cancellation.clone(),
+            ..Default::default()
+        };
         let conversation_key = AiConversationKey::from_request(self.provider, &self.model, request);
         let cached_session_id = self.cached_session_id(&conversation_key);
         let invocation = cli_invocation_for_request_with_session(
@@ -583,9 +881,12 @@ impl AiSuggestionProvider for CommandAiSuggestionProvider {
             request,
             cached_session_id.as_deref(),
         )?;
-        let output = match run_cli_invocation(&invocation) {
+        let output = match run_cli_invocation_with_options(&invocation, &options) {
             Ok(output) => output,
-            Err(error) if cached_session_id.is_some() => {
+            Err(error)
+                if cached_session_id.is_some()
+                    && error.downcast_ref::<AiExecutionStopped>().is_none() =>
+            {
                 self.forget_session_id(&conversation_key);
                 let fresh_invocation = cli_invocation_for_request_with_session(
                     self.provider,
@@ -593,7 +894,8 @@ impl AiSuggestionProvider for CommandAiSuggestionProvider {
                     request,
                     None,
                 )?;
-                run_cli_invocation(&fresh_invocation)
+                options.timeout = options.timeout.saturating_sub(started.elapsed());
+                run_cli_invocation_with_options(&fresh_invocation, &options)
                     .with_context(|| format!("failed to resume cached AI conversation ({error})"))?
             }
             Err(error) => return Err(error),
@@ -791,59 +1093,266 @@ struct AiCliRunOutput {
     session_id: Option<String>,
 }
 
-fn run_cli_invocation(invocation: &AiCliInvocation) -> Result<AiCliRunOutput> {
-    let mut child = Command::new(&invocation.program)
+pub const DEFAULT_AI_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_AI_OUTPUT_BYTE_LIMIT: usize = 1024 * 1024;
+
+/// One-shot cancellation shared between the UI and its provider worker.
+#[derive(Debug, Clone, Default)]
+pub struct AiCancellationToken(Arc<AtomicBool>);
+
+impl AiCancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Keep this guard in the owning UI scope so errors and early returns cancel
+    /// the worker too. Dropping a receiver alone does not stop a provider.
+    pub fn cancel_on_drop(&self) -> AiCancellationGuard {
+        AiCancellationGuard(self.clone())
+    }
+}
+
+#[derive(Debug)]
+pub struct AiCancellationGuard(AiCancellationToken);
+
+impl Drop for AiCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AiExecutionOptions {
+    pub timeout: Duration,
+    pub cancellation: AiCancellationToken,
+    /// Independent cap for stdout, stderr, and the final-message file.
+    pub max_output_bytes: usize,
+}
+
+impl Default for AiExecutionOptions {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_AI_TIMEOUT,
+            cancellation: AiCancellationToken::default(),
+            max_output_bytes: DEFAULT_AI_OUTPUT_BYTE_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum AiExecutionStopped {
+    Timeout,
+    Cancelled,
+    OutputLimit,
+}
+
+impl std::fmt::Display for AiExecutionStopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Timeout => "AI provider timed out",
+            Self::Cancelled => "AI provider cancelled",
+            Self::OutputLimit => "AI provider exceeded output limit",
+        })
+    }
+}
+
+impl std::error::Error for AiExecutionStopped {}
+
+struct FinalMessageCleanup<'a>(Option<&'a PathBuf>);
+
+impl Drop for FinalMessageCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct ProviderProcess(std::process::Child, bool);
+
+impl ProviderProcess {
+    fn terminate(&mut self) {
+        if !self.1 {
+            return;
+        }
+        self.1 = false;
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            if let Ok(pid) = i32::try_from(self.0.id()) {
+                // The child starts its own process group. Negative PID targets
+                // that group, including grandchildren retaining our pipes.
+                unsafe {
+                    kill(-pid, 9);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &self.0.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for ProviderProcess {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn read_bounded_output(
+    mut pipe: impl Read,
+    limit: usize,
+    overflow: &AtomicBool,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = pipe.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if count > limit.saturating_sub(bytes.len()) {
+            overflow.store(true, Ordering::Release);
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn run_cli_invocation_with_options(
+    invocation: &AiCliInvocation,
+    options: &AiExecutionOptions,
+) -> Result<AiCliRunOutput> {
+    let _cleanup = FinalMessageCleanup(invocation.final_message_path.as_ref());
+    if options.cancellation.is_cancelled() {
+        return Err(AiExecutionStopped::Cancelled.into());
+    }
+    if options.timeout.is_zero() {
+        return Err(AiExecutionStopped::Timeout.into());
+    }
+    let started = Instant::now();
+    let mut command = Command::new(&invocation.program);
+    command
         .args(&invocation.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start {}", invocation.program))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(invocation.stdin.as_bytes())
-            .with_context(|| format!("failed to write prompt to {}", invocation.program))?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to wait for {}", invocation.program))?;
-    let stdout = String::from_utf8(output.stdout)
+    let mut process = ProviderProcess(
+        command
+            .spawn()
+            .with_context(|| format!("failed to start {}", invocation.program))?,
+        true,
+    );
+    let mut stdin = process.0.stdin.take().context("provider stdin missing")?;
+    let stdout = process.0.stdout.take().context("provider stdout missing")?;
+    let stderr = process.0.stderr.take().context("provider stderr missing")?;
+    let overflow = AtomicBool::new(false);
+    let (status, stdout, stderr) = std::thread::scope(|scope| -> Result<_> {
+        // Drop inside the scope, before it joins any workers, even if starting
+        // another worker panics. Otherwise a live provider can keep pipes open.
+        let mut process = process;
+        // Concurrent drains avoid both large-prompt and full-output pipe deadlocks.
+        // Moving stdin into the writer ensures EOF as soon as the prompt is sent.
+        let writer = scope.spawn(move || stdin.write_all(invocation.stdin.as_bytes()));
+        let stdout_reader =
+            scope.spawn(|| read_bounded_output(stdout, options.max_output_bytes, &overflow));
+        let stderr_reader =
+            scope.spawn(|| read_bounded_output(stderr, options.max_output_bytes, &overflow));
+        let status: Result<std::process::ExitStatus> = loop {
+            let file_overflow = invocation
+                .final_message_path
+                .as_ref()
+                .and_then(|path| fs::metadata(path).ok())
+                .is_some_and(|metadata| metadata.len() > options.max_output_bytes as u64);
+            if options.cancellation.is_cancelled() {
+                break Err(AiExecutionStopped::Cancelled.into());
+            }
+            if overflow.load(Ordering::Acquire) || file_overflow {
+                break Err(AiExecutionStopped::OutputLimit.into());
+            }
+            if started.elapsed() >= options.timeout {
+                break Err(AiExecutionStopped::Timeout.into());
+            }
+            match process.0.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) => break Err(error.into()),
+            }
+        };
+        // Also stop descendants after a successful leader exits; otherwise they
+        // could retain output/stdin pipes forever. Always reap before joining I/O.
+        process.terminate();
+        let write_result = writer
+            .join()
+            .map_err(|_panic| anyhow!("provider stdin worker panicked"))?;
+        let stdout_result = stdout_reader
+            .join()
+            .map_err(|_panic| anyhow!("provider stdout worker panicked"))?;
+        let stderr_result = stderr_reader
+            .join()
+            .map_err(|_panic| anyhow!("provider stderr worker panicked"))?;
+        let status = status?;
+        if overflow.load(Ordering::Acquire) {
+            return Err(AiExecutionStopped::OutputLimit.into());
+        }
+        if status.success() {
+            write_result.context("failed to send AI prompt")?;
+        }
+        Ok((status, stdout_result?, stderr_result?))
+    })?;
+    let stdout = String::from_utf8(stdout)
         .with_context(|| format!("{} returned non-UTF-8 stdout", invocation.program))?;
-    if !output.status.success() {
+    if !status.success() {
         return Err(anyhow!(
             "{} exited with {}: {}",
             invocation.program,
-            output.status,
-            collapse_whitespace(&String::from_utf8_lossy(&output.stderr))
+            status,
+            collapse_whitespace(&String::from_utf8_lossy(&stderr))
         ));
     }
-
     let session_id = match invocation.output_format {
         AiCliOutputFormat::Text => None,
         AiCliOutputFormat::CodexJson | AiCliOutputFormat::ClaudeJson => {
             extract_session_id_from_json_text(&stdout)
         }
     };
-
     let text = if let Some(path) = invocation.final_message_path.as_ref() {
-        let final_message = fs::read_to_string(path).with_context(|| {
+        let file = fs::File::open(path).with_context(|| {
             format!(
                 "failed to read {} final message from {}",
                 invocation.program,
                 path.display()
             )
         })?;
-        let _cleanup = fs::remove_file(path);
-        final_message
+        let bytes = read_bounded_output(file, options.max_output_bytes, &overflow)?;
+        if overflow.load(Ordering::Acquire) {
+            return Err(AiExecutionStopped::OutputLimit.into());
+        }
+        String::from_utf8(bytes).context("provider final message is not UTF-8")?
     } else {
         match invocation.output_format {
             AiCliOutputFormat::Text | AiCliOutputFormat::CodexJson => stdout,
             AiCliOutputFormat::ClaudeJson => parse_claude_json_result(&stdout)?,
         }
     };
-
     Ok(AiCliRunOutput { text, session_id })
 }
 
@@ -1494,88 +2003,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_cli_invocation_uses_read_only_high_effort_exec_with_final_message_capture() {
-        let request = AiSuggestionRequest::new(
-            AiProvider::CodexCli,
-            "auto".to_string(),
-            review_set(),
-            review_context("fn checked() {}"),
-            80,
-        );
-        let invocation = match cli_invocation_for_request(AiProvider::CodexCli, "auto", &request) {
-            Ok(invocation) => invocation,
-            Err(error) => panic!("expected codex invocation: {error}"),
-        };
-
-        assert_eq!(invocation.program, "codex");
-        assert_eq!(
-            invocation.args[..9],
-            [
-                "exec",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "--color",
-                "never",
-                "--json",
-                "-c",
-                "model_reasoning_effort=\"high\"",
-            ]
-        );
-        assert!(
-            invocation
-                .args
-                .iter()
-                .any(|arg| arg == "--output-last-message")
-        );
-        assert!(invocation.final_message_path.is_some());
-        assert_eq!(invocation.output_format, AiCliOutputFormat::CodexJson);
-        assert!(
-            invocation
-                .args
-                .windows(2)
-                .any(|args| args == ["--model", "gpt-6"])
-        );
-        assert!(invocation.stdin.contains("fn checked() {}"));
-    }
-
-    #[test]
-    fn codex_resume_invocation_reuses_cached_session_without_resending_review_set_context() {
-        let request = AiSuggestionRequest::new(
-            AiProvider::CodexCli,
-            "auto".to_string(),
-            review_set(),
-            review_context("fn checked() {}"),
-            80,
-        );
-        let invocation = cli_invocation_for_request_with_session(
-            AiProvider::CodexCli,
-            "auto",
-            &request,
-            Some("session-123"),
-        )
-        .unwrap_or_else(|error| panic!("expected codex resume invocation: {error}"));
-
-        assert_eq!(invocation.program, "codex");
-        assert_eq!(invocation.args[0], "exec");
-        assert_eq!(invocation.args[1], "resume");
-        assert!(invocation.args.iter().any(|arg| arg == "session-123"));
-        assert!(
-            invocation
-                .args
-                .windows(2)
-                .any(|args| args == ["-c", r#"model_reasoning_effort="high""#])
-        );
-        assert!(
-            invocation
-                .args
-                .windows(2)
-                .any(|args| args == ["--model", "gpt-6"])
-        );
-        assert!(!invocation.stdin.contains("Scope: diff vs main"));
-    }
-
-    #[test]
     fn json_session_extraction_reads_codex_and_claude_shapes() {
         assert_eq!(
             extract_session_id_from_json_text(
@@ -1591,26 +2018,6 @@ mod tests {
             .as_deref(),
             Some("claude-session")
         );
-    }
-
-    #[test]
-    fn claude_cli_invocation_uses_print_mode_and_omits_auto_model_arg() {
-        let request = AiSuggestionRequest::new(
-            AiProvider::ClaudeCli,
-            "auto".to_string(),
-            review_set(),
-            review_context("fn checked() {}"),
-            80,
-        );
-        let invocation = match cli_invocation_for_request(AiProvider::ClaudeCli, "auto", &request) {
-            Ok(invocation) => invocation,
-            Err(error) => panic!("expected claude invocation: {error}"),
-        };
-
-        assert_eq!(invocation.program, "claude");
-        assert_eq!(invocation.args, vec!["--print", "--output-format", "json"]);
-        assert_eq!(invocation.output_format, AiCliOutputFormat::ClaudeJson);
-        assert!(!invocation.args.iter().any(|arg| arg == "--model"));
     }
 
     #[test]
@@ -1637,6 +2044,7 @@ mod tests {
     fn review_plan_block(index: usize, content: String) -> AiReviewPlanBlock {
         AiReviewPlanBlock {
             block_id: String::new(),
+            is_test: false,
             path: format!("src/file_{index}.rs"),
             language: Language::Rust,
             block_kind: BlockKind::Function,
@@ -1660,26 +2068,255 @@ mod tests {
     }
 
     #[test]
-    fn review_plan_request_enforces_block_and_excerpt_bounds() {
-        let blocks = (0..125)
-            .map(|index| review_plan_block(index, "a\nb\nc\nd\ne\nf\n".to_string()))
+    fn review_plan_spreads_manifest_across_files_and_preserves_canonical_ids() {
+        let mut blocks = (0..140)
+            .map(|index| {
+                let mut block = review_plan_block(index, "source".to_string());
+                block.path = "a.rs".to_string();
+                block.is_test = true;
+                block
+            })
             .collect::<Vec<_>>();
-        let request = review_plan_request(&blocks, 5);
-
-        assert_eq!(request.coverage.total_blocks, 125);
+        blocks.push(review_plan_block(140, "late source".to_string()));
+        let request = review_plan_request(&blocks, 120);
         assert_eq!(request.coverage.presented_blocks, 120);
-        assert_eq!(request.coverage.excerpted_blocks, 1);
-        assert_eq!(request.coverage.excerpt_lines, 5);
+        assert!(request.prompt.contains("- B0141\n  Path: src/file_140.rs"));
+        assert!(request.prompt.contains("- B0001\n  Path: a.rs"));
+        assert_eq!(request.coverage.excerpted_blocks, 120);
         assert!(request.coverage.is_partial());
-        assert!(request.prompt.contains("B0001"));
-        assert!(request.prompt.contains("B0120"));
-        assert!(!request.prompt.contains("B0121"));
-        assert!(
-            request
-                .prompt
-                .contains("(excerpt omitted by context budget)")
+        assert_eq!(request, review_plan_request(&blocks, 120));
+    }
+
+    #[test]
+    fn review_plan_samples_late_files_even_when_files_exceed_manifest_limit() {
+        let blocks = (0..240)
+            .map(|index| review_plan_block(index, format!("source_{index}")))
+            .collect::<Vec<_>>();
+        let request = review_plan_request(&blocks, 240);
+        assert!(request.prompt.contains("- B0240\n  Path: src/file_239.rs"));
+        assert_eq!(request.coverage.presented_blocks, 120);
+    }
+
+    #[test]
+    fn review_plan_shares_excerpt_lines_and_reports_clipped_source() {
+        let blocks = (0..3)
+            .map(|index| {
+                review_plan_block(
+                    index,
+                    format!("first_{index}\nsecond_{index}\nthird_{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let request = review_plan_request(&blocks, 6);
+        for index in 0..3 {
+            assert!(
+                request
+                    .prompt
+                    .contains(&format!("first_{index}\nsecond_{index}"))
+            );
+            assert!(!request.prompt.contains(&format!("third_{index}")));
+        }
+        assert_eq!(request.coverage.excerpt_lines, 6);
+        assert_eq!(request.coverage.excerpted_blocks, 3);
+        assert!(request.coverage.is_partial());
+        assert!(!review_plan_request(&blocks, 9).coverage.is_partial());
+        assert_eq!(review_plan_request(&blocks, 0).coverage.excerpt_lines, 0);
+    }
+
+    #[test]
+    fn review_plan_keeps_changed_head_visible_after_long_base() {
+        let content = format!(
+            "[base]\n{}[head]\nnew_behavior();\n",
+            "old_behavior();\n".repeat(100)
         );
-        assert!(!request.prompt.contains("B0001\nPath: src/file_0.rs"));
+        let blocks = [review_plan_block(0, content)];
+        let request = review_plan_request(&blocks, 2);
+        assert!(request.prompt.contains("[head]\nnew_behavior();"));
+        assert!(request.prompt.contains("[base]\nold_behavior();"));
+        assert!(request.prompt.contains("base partial"));
+        assert_eq!(request.coverage.excerpt_lines, 2);
+        assert!(request.coverage.is_partial());
+        let narrow = review_plan_request(&blocks, 1);
+        assert!(narrow.prompt.contains("[head]\nnew_behavior();"));
+        assert!(narrow.prompt.contains("base omitted"));
+    }
+
+    #[test]
+    fn review_plan_head_excerpt_targets_change_after_common_prefix() {
+        let prefix = "unchanged();\n".repeat(50);
+        let blocks = [review_plan_block(
+            0,
+            format!("[base]\n{prefix}old();\n[head]\n{prefix}new();"),
+        )];
+        let request = review_plan_request(&blocks, 2);
+        assert!(request.prompt.contains("new();"));
+        assert!(request.prompt.contains("old();"));
+        assert!(request.coverage.is_partial());
+    }
+
+    #[cfg(unix)]
+    fn fake_invocation(script: &str) -> AiCliInvocation {
+        AiCliInvocation {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            stdin: String::new(),
+            final_message_path: None,
+            output_format: AiCliOutputFormat::Text,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subprocess_drains_output_while_writing_prompt_and_closes_stdin() {
+        let mut invocation = fake_invocation(
+            "dd if=/dev/zero bs=1024 count=128 2>/dev/null; cat >/dev/null; printf done",
+        );
+        invocation.stdin = "x".repeat(256 * 1024);
+        let options = AiExecutionOptions {
+            timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let output = run_cli_invocation_with_options(&invocation, &options).unwrap();
+        assert!(output.text.ends_with("done"));
+        assert_eq!(output.text.len(), 128 * 1024 + 4);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subprocess_timeout_and_cancellation_terminate_descendants() {
+        for cancel in [false, true] {
+            let marker = temporary_codex_final_message_path_with_prefix("child-pid");
+            let invocation = fake_invocation(&format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                marker.display()
+            ));
+            let options = AiExecutionOptions {
+                timeout: if cancel {
+                    Duration::from_secs(3)
+                } else {
+                    Duration::from_millis(100)
+                },
+                ..Default::default()
+            };
+            let token = options.cancellation.clone();
+            let start = Instant::now();
+            let cancel_worker = std::thread::spawn(move || {
+                if cancel {
+                    std::thread::sleep(Duration::from_millis(100));
+                    token.cancel();
+                }
+            });
+            let error = run_cli_invocation_with_options(&invocation, &options).unwrap_err();
+            cancel_worker.join().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains(if cancel { "cancelled" } else { "timed out" })
+            );
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let pid = fs::read_to_string(&marker).unwrap();
+            let _ = fs::remove_file(marker);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let output = Command::new("ps")
+                    .args(["-o", "stat=", "-p", pid.trim()])
+                    .output()
+                    .unwrap();
+                let state = String::from_utf8_lossy(&output.stdout);
+                if state.trim().is_empty() || state.trim().starts_with('Z') {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant remains alive: {state}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subprocess_bounds_both_output_pipes_and_final_message() {
+        for script in ["yes x", "yes x >&2"] {
+            let options = AiExecutionOptions {
+                max_output_bytes: 1024,
+                timeout: Duration::from_secs(2),
+                ..Default::default()
+            };
+            let start = Instant::now();
+            let error =
+                run_cli_invocation_with_options(&fake_invocation(script), &options).unwrap_err();
+            assert!(error.to_string().contains("output limit"));
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+        let path = temporary_codex_final_message_path_with_prefix("overflow");
+        let mut invocation = fake_invocation(&format!(
+            "dd if=/dev/zero of='{}' bs=2048 count=1 2>/dev/null; sleep 30",
+            path.display()
+        ));
+        invocation.final_message_path = Some(path.clone());
+        let options = AiExecutionOptions {
+            max_output_bytes: 1024,
+            timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let error = run_cli_invocation_with_options(&invocation, &options).unwrap_err();
+        assert!(error.to_string().contains("output limit"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subprocess_reads_final_message_and_session_and_cleans_up_on_failure() {
+        let path = temporary_codex_final_message_path_with_prefix("result");
+        let mut invocation = fake_invocation(&format!(
+            "cat >/dev/null; printf answer > '{}'; printf '%s' '{{\"thread_id\":\"conversation\"}}'",
+            path.display()
+        ));
+        invocation.final_message_path = Some(path.clone());
+        invocation.output_format = AiCliOutputFormat::CodexJson;
+        let output =
+            run_cli_invocation_with_options(&invocation, &AiExecutionOptions::default()).unwrap();
+        assert_eq!(output.text, "answer");
+        assert_eq!(output.session_id.as_deref(), Some("conversation"));
+        assert!(!path.exists());
+        invocation.args = vec![
+            "-c".to_string(),
+            format!("printf partial > '{}'; exit 1", path.display()),
+        ];
+        assert!(
+            run_cli_invocation_with_options(&invocation, &AiExecutionOptions::default()).is_err()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn review_plan_limits_each_excerpt_and_keeps_single_side_source() {
+        let blocks = [review_plan_block(0, "source\n".repeat(30))];
+        let request = review_plan_request(&blocks, 100);
+        assert_eq!(request.coverage.excerpt_lines, 12);
+        assert!(request.coverage.is_partial());
+        for side in ["base", "head"] {
+            let blocks = [review_plan_block(0, format!("[{side}]\nchanged();"))];
+            let request = review_plan_request(&blocks, 1);
+            assert!(request.prompt.contains(&format!("[{side}]\nchanged();")));
+            assert!(!request.coverage.is_partial());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellation_guard_prevents_spawn_after_owner_exits() {
+        let marker = temporary_codex_final_message_path_with_prefix("not-started");
+        let invocation = fake_invocation(&format!("touch '{}'", marker.display()));
+        let options = AiExecutionOptions::default();
+        {
+            let _guard = options.cancellation.cancel_on_drop();
+        }
+        let error = run_cli_invocation_with_options(&invocation, &options).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -1721,37 +2358,6 @@ mod tests {
                 "expected rejection for {raw:?}"
             );
         }
-    }
-
-    #[test]
-    fn review_plan_cli_invocation_is_fresh_read_only_high_effort() {
-        let blocks = vec![review_plan_block(0, "fn first() {}".to_string())];
-        let request = review_plan_request(&blocks, 80);
-        let invocation =
-            cli_invocation_for_review_plan(AiProvider::CodexCli, "gpt-5.6-sol", &request)
-                .unwrap_or_else(|error| panic!("build review-plan invocation: {error}"));
-
-        assert_eq!(invocation.program, "codex");
-        assert!(
-            invocation
-                .args
-                .windows(2)
-                .any(|args| args == ["--sandbox", "read-only"])
-        );
-        assert!(
-            invocation
-                .args
-                .iter()
-                .any(|arg| arg == r#"model_reasoning_effort="high""#)
-        );
-        assert!(
-            invocation
-                .args
-                .windows(2)
-                .any(|args| args == ["--model", "gpt-5.6-sol"])
-        );
-        assert!(!invocation.args.iter().any(|arg| arg == "resume"));
-        assert!(invocation.stdin.contains("B0001"));
     }
 
     #[test]
@@ -1831,15 +2437,7 @@ mod tests {
         else {
             panic!("explicit available Claude provider must remain available");
         };
-        let invocation =
-            cli_invocation_for_generation(provider, &model, "Review repository".to_string())
-                .unwrap_or_else(|error| panic!("build explicit provider invocation: {error}"));
-        assert_eq!(invocation.program, "claude");
-        assert!(
-            invocation
-                .args
-                .windows(2)
-                .any(|args| args == ["--model", "claude-custom"])
-        );
+        assert_eq!(provider, AiProvider::ClaudeCli);
+        assert_eq!(model, "claude-custom");
     }
 }

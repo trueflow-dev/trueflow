@@ -217,7 +217,7 @@ fn is_library_path(path: &RepoPath) -> bool {
         || path.as_str().starts_with("Sources/")
 }
 
-fn is_test_block(path: &RepoPath, node: &TreeNode) -> bool {
+pub(crate) fn is_test_block(path: &RepoPath, node: &TreeNode) -> bool {
     if is_test_path(path) {
         return true;
     }
