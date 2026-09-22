@@ -63,42 +63,45 @@ impl ReviewOrder {
                 } else {
                     node.path.clone()
                 };
+                let group_rank = review_group_rank(review_group(&file_path, node));
+                let kind_rank = block.kind.default_review_priority();
+                let band_rank = review_band_rank(review_band_from_kind_rank(kind_rank));
                 let cursor = ReviewCursor {
                     file_path,
-                    kind_rank: block.kind.default_review_priority(),
+                    kind_rank,
                     start_line: block.start_line,
                     node_id,
                 };
-                Some((cursor, node))
+                Some((group_rank, band_rank, cursor))
             })
             .collect();
 
-        items.sort_by(|(a_cursor, a_node), (b_cursor, b_node)| {
-            let a_group = review_group(&a_cursor.file_path, a_node);
-            let b_group = review_group(&b_cursor.file_path, b_node);
-            let a_band = review_band_from_kind_rank(a_cursor.kind_rank);
-            let b_band = review_band_from_kind_rank(b_cursor.kind_rank);
+        // Group classification inspects path components and allocates, so it is
+        // computed once per item above rather than inside the comparator. The
+        // unique node id makes this a total order, so an unstable sort is
+        // deterministic.
+        items.sort_unstable_by(|(a_group, a_band, a), (b_group, b_band, b)| {
             (
-                review_group_rank(a_group),
-                &a_cursor.file_path,
-                review_band_rank(a_band),
-                a_cursor.kind_rank,
-                a_cursor.start_line,
-                a_cursor.node_id,
+                a_group,
+                &a.file_path,
+                a_band,
+                a.kind_rank,
+                a.start_line,
+                a.node_id,
             )
                 .cmp(&(
-                    review_group_rank(b_group),
-                    &b_cursor.file_path,
-                    review_band_rank(b_band),
-                    b_cursor.kind_rank,
-                    b_cursor.start_line,
-                    b_cursor.node_id,
+                    b_group,
+                    &b.file_path,
+                    b_band,
+                    b.kind_rank,
+                    b.start_line,
+                    b.node_id,
                 ))
         });
 
         let canonical = items
             .into_iter()
-            .map(|(cursor, _)| cursor)
+            .map(|(_, _, cursor)| cursor)
             .collect::<Vec<_>>();
         let cursor_by_node = canonical
             .iter()
