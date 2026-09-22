@@ -2238,9 +2238,12 @@ fn pure_rename_path(
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("rename remapping requires a non-bare git repository"))?;
+    // `-z` emits verbatim paths; otherwise git quotes non-ASCII or special
+    // characters (core.quotePath) and the paths never match.
     let output = Command::new("git")
         .args([
             "diff",
+            "-z",
             "--name-status",
             "--find-renames=100%",
             "--diff-filter=R",
@@ -2259,13 +2262,16 @@ fn pure_rename_path(
     }
 
     let stdout = String::from_utf8(output.stdout)?;
+    let mut fields = stdout.split_terminator('\0');
     let mut matches = Vec::new();
-    for line in stdout.lines() {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        let [status, old_path, new_path] = fields.as_slice() else {
-            continue;
+    // Each rename entry is `R<score>\0<old>\0<new>\0`.
+    while let Some(status) = fields.next() {
+        let (Some(old_path), Some(new_path)) = (fields.next(), fields.next()) else {
+            return Err(anyhow!(
+                "git diff --name-status -z returned a truncated rename entry"
+            ));
         };
-        if *status == "R100"
+        if status == "R100"
             && let Some(remapped_path) = direction.remapped_path(old_path, new_path, path)
         {
             matches.push(crate::repo_path::RepoPath::new(remapped_path)?);
@@ -3372,6 +3378,34 @@ mod tests {
         );
         assert_eq!(comment.line, 1);
         assert_eq!(comment.side, GitHubCommentSide::Right);
+        Ok(())
+    }
+
+    #[test]
+    fn pure_rename_path_matches_non_ascii_paths() -> Result<()> {
+        let repo_root = temp_git_repo("feedback_plan_non_ascii_rename");
+        let old_path = repo_root.join("src/café.rs");
+        fs::create_dir_all(old_path.parent().unwrap())?;
+        fs::write(&old_path, "pub fn value() -> u32 { 1 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+        let start = commit_id_at_head(&repo_root)?;
+        fs::rename(&old_path, repo_root.join("src/naïve.rs"))?;
+        run_git(&repo_root, &["add", "-A"]);
+        run_git(&repo_root, &["commit", "-m", "Rename"]);
+        let end = commit_id_at_head(&repo_root)?;
+        let repo = gix::discover(&repo_root)?;
+        let old = crate::repo_path::RepoPath::new("src/café.rs")?;
+        let new = crate::repo_path::RepoPath::new("src/naïve.rs")?;
+
+        assert_eq!(
+            pure_rename_path(&repo, &start, &end, &old, PureRenameDirection::Target)?,
+            Some(new.clone())
+        );
+        assert_eq!(
+            pure_rename_path(&repo, &start, &end, &new, PureRenameDirection::Source)?,
+            Some(old)
+        );
         Ok(())
     }
 
