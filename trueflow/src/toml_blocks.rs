@@ -562,13 +562,31 @@ fn skip_ascii_whitespace(source: &str, start: usize) -> usize {
 
 fn line_starts_with_header_at(source: &str, line_start: usize) -> bool {
     let line_end = next_line_start(source, line_start);
-    let line = &source[line_start..line_end];
-    let trimmed = line.trim_start();
-    !trimmed.is_empty()
-        && !trimmed.starts_with('#')
-        && trimmed.starts_with('[')
-        && !trimmed.contains('=')
-        && (trimmed.trim_end().ends_with(']') || trimmed.trim_end().ends_with("]]"))
+    let line = source[line_start..line_end].trim_start();
+    let header = line[..comment_start_outside_strings(line)].trim_end();
+    header.starts_with('[') && header.ends_with(']') && !header.contains('=')
+}
+
+/// Byte offset of a `#` comment on a single line, ignoring `#` inside basic or
+/// literal strings (e.g. quoted table keys), or the line length if none.
+fn comment_start_outside_strings(line: &str) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in line.bytes().enumerate() {
+        match (quote, byte) {
+            (Some(b'"'), b'\\') if !escaped => {
+                escaped = true;
+                continue;
+            }
+            (Some(open), _) if byte == open && !escaped => quote = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(byte),
+            (None, b'#') => return index,
+            (None, _) => {}
+        }
+        escaped = false;
+    }
+    line.len()
 }
 
 fn line_is_blank(source: &str, line_start: usize) -> bool {
@@ -608,6 +626,36 @@ mod tests {
         assert_eq!(
             &source[spans[0].start..spans[0].end],
             "title = \"deploy\"\n"
+        );
+    }
+
+    #[test]
+    fn split_document_recognizes_headers_with_trailing_comments() {
+        let source = "[package] # crate metadata\nname = \"demo\"\n\n[[bin]] # entry\nname = \"cli\"\n\n[deps]\nserde = \"1\"\n";
+        let spans = split_document(source).unwrap();
+        let sections = spans
+            .iter()
+            .map(|span| (span.kind, &source[span.start..span.end]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sections,
+            vec![
+                (
+                    BlockKind::Section,
+                    "[package] # crate metadata\nname = \"demo\"\n\n"
+                ),
+                (BlockKind::Section, "[[bin]] # entry\nname = \"cli\"\n\n"),
+                (BlockKind::Section, "[deps]\nserde = \"1\"\n"),
+            ]
+        );
+
+        let children = split_section_children(sections[0].1).unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|span| &sections[0].1[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec!["name = \"demo\"\n"]
         );
     }
 
