@@ -327,6 +327,96 @@ fn pty_smoke_scope_selector_prechecks_deep_commit_without_stack_overflow() -> Re
 }
 
 #[test]
+fn pty_smoke_scope_selector_scrolls_past_first_commit_page() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo = TestRepo::new("tui_pty_smoke_scope_selector_deep_history")?;
+    let commit_count = 65;
+    for index in 1..=commit_count {
+        repo.write(
+            "src/lib.rs",
+            &format!("pub fn value() -> u32 {{ {index} }}\n"),
+        )?;
+        repo.commit_all(&format!("history {index:03}"))?;
+    }
+
+    let rows = 24;
+    let cols = 100;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
+    cmd.arg("tui");
+    cmd.cwd(&repo.path);
+    configure_tui_pty_command(&mut cmd, &repo);
+
+    let mut child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer()?;
+    let reader = pair.master.try_clone_reader()?;
+    let output = PtyOutput::new();
+    let reader_thread = spawn_reader_thread(reader, Arc::clone(&output));
+
+    wait_for_screen_predicate(
+        &output,
+        rows,
+        cols,
+        "to show the scope selector",
+        Duration::from_secs(10),
+        &mut *child,
+        |screen| screen.contains("Select review scope"),
+    )?;
+
+    // Move well past the first page of loaded commits, down to the root commit.
+    for _ in 0..commit_count + 5 {
+        send_and_flush(&mut *writer, b"\x1b[B")?;
+    }
+    wait_for_screen_predicate(
+        &output,
+        rows,
+        cols,
+        "to select the root commit",
+        Duration::from_secs(20),
+        &mut *child,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains("> Commit") && line.contains("history 001"))
+        },
+    )?;
+    wait_for_screen_predicate(
+        &output,
+        rows,
+        cols,
+        "to check the status of the visible root commit",
+        Duration::from_secs(20),
+        &mut *child,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains("history 001") && line.contains("left]"))
+        },
+    )?;
+
+    send_and_flush(&mut *writer, b"q")?;
+    drop(writer);
+    wait_for_child_success(&mut *child, &output)?;
+
+    if let Err(_panic) = reader_thread.join() {
+        bail!("reader thread panicked");
+    }
+
+    Ok(())
+}
+
+#[test]
 fn pty_smoke_commit_diff_deep_nesting_does_not_stack_overflow() -> Result<()> {
     if cfg!(windows) {
         return Ok(());

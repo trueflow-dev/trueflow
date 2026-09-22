@@ -110,7 +110,7 @@ pub fn default_scope_options(commits: &[CommitInfo]) -> Vec<ScopeOption> {
     options
 }
 
-fn commit_scope_option(commit: &CommitInfo) -> ScopeOption {
+pub fn commit_scope_option(commit: &CommitInfo) -> ScopeOption {
     let short_id = short_commit_id(commit.id.as_str());
     let summary = truncate_text(&commit.summary, 60);
     let label = if summary.is_empty() {

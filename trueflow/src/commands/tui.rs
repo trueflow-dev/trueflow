@@ -38,7 +38,9 @@ use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::{ReviewAnchor, ReviewOrder};
-use crate::review_scope::{DiffQuery, ScopeOption, ScopePreset, default_scope_options};
+use crate::review_scope::{
+    DiffQuery, ScopeOption, ScopePreset, commit_scope_option, default_scope_options,
+};
 use crate::review_session;
 use crate::review_speedread::PlaybackState;
 use crate::store::{
@@ -83,13 +85,21 @@ const REVIEW_COVERAGE_STATUS_CACHE_MAX_ENTRIES: usize = 128;
 const SCOPE_SELECTOR_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SCOPE_SELECTOR_STATUS_WORKER_COUNT: usize = 1;
 const SCOPE_SELECTOR_STATUS_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// Commits added to the scope selector per history page.
+const SCOPE_SELECTOR_COMMIT_PAGE_SIZE: usize = 50;
+/// Bounds the first-parent walk per page when a workdir prefix filters commits, so
+/// loading a page cannot stall on history that rarely touches the subdirectory.
+const SCOPE_SELECTOR_MAX_COMMITS_SCANNED_PER_PAGE: usize = 10 * SCOPE_SELECTOR_COMMIT_PAGE_SIZE;
+/// Load the next page once the selection is this close to the last loaded row.
+const SCOPE_SELECTOR_HISTORY_LOAD_AHEAD_ROWS: usize = 10;
 
 // --- Core Structs ---
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ScopeSelector {
     options: Vec<ScopeSelectorOption>,
     selected: usize,
+    history: Option<CommitHistoryPager>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,16 +107,125 @@ struct ScopeSelectorOption {
     label: String,
     scope: ScopePreset,
     status: ScopeSelectorStatus,
+    status_check: ScopeStatusCheck,
+}
+
+/// Background status work for one selector row. Rows are checked only while visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeStatusCheck {
+    NotNeeded,
+    Needed { cache_key: String },
+    Queued,
 }
 
 impl ScopeSelectorOption {
-    fn from_scope_option(option: ScopeOption, status: ScopeSelectorStatus) -> Self {
+    fn from_scope_option(
+        option: ScopeOption,
+        status: ScopeSelectorStatus,
+        status_check: ScopeStatusCheck,
+    ) -> Self {
         Self {
             label: option.label,
             scope: option.scope,
             status,
+            status_check,
         }
     }
+}
+
+/// Lazily pages HEAD's first-parent history into the scope selector.
+#[derive(Debug)]
+struct CommitHistoryPager {
+    repo: gix::Repository,
+    history: vcs::FirstParentHistory,
+    workdir_prefix: Option<String>,
+    state: CommitHistoryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommitHistoryState {
+    More,
+    End,
+    Failed(String),
+}
+
+impl CommitHistoryPager {
+    fn open(repo: gix::Repository, workdir_prefix: Option<String>) -> Self {
+        let history = vcs::FirstParentHistory::from_head(&repo);
+        let state = if history.is_exhausted() {
+            CommitHistoryState::End
+        } else {
+            CommitHistoryState::More
+        };
+        Self {
+            repo,
+            history,
+            workdir_prefix,
+            state,
+        }
+    }
+
+    fn has_more(&self) -> bool {
+        self.state == CommitHistoryState::More
+    }
+
+    fn next_page(&mut self) -> Vec<vcs::CommitInfo> {
+        if !self.has_more() {
+            return Vec::new();
+        }
+        let Self {
+            repo,
+            history,
+            workdir_prefix,
+            state,
+        } = self;
+        let (commits, next_state) = collect_commit_page(
+            || history.next_commit(repo),
+            |commit| {
+                commit_touches_workdir_prefix(
+                    commit.id.as_str(),
+                    workdir_prefix.as_deref(),
+                    |revision| vcs::files_changed_in_revision_in_repo(repo, revision),
+                )
+            },
+            SCOPE_SELECTOR_COMMIT_PAGE_SIZE,
+            SCOPE_SELECTOR_MAX_COMMITS_SCANNED_PER_PAGE,
+        );
+        *state = match next_state {
+            CommitHistoryState::More if history.is_exhausted() => CommitHistoryState::End,
+            next_state => next_state,
+        };
+        commits
+    }
+}
+
+/// Collects up to `page_size` relevant commits, consulting at most `scan_limit` commits.
+fn collect_commit_page<N, R>(
+    mut next_commit: N,
+    mut is_relevant: R,
+    page_size: usize,
+    scan_limit: usize,
+) -> (Vec<vcs::CommitInfo>, CommitHistoryState)
+where
+    N: FnMut() -> Result<Option<vcs::CommitInfo>>,
+    R: FnMut(&vcs::CommitInfo) -> bool,
+{
+    let mut page = Vec::new();
+    for _ in 0..scan_limit {
+        match next_commit() {
+            Ok(Some(commit)) => {
+                if is_relevant(&commit) {
+                    page.push(commit);
+                    if page.len() >= page_size {
+                        break;
+                    }
+                }
+            }
+            Ok(None) => return (page, CommitHistoryState::End),
+            Err(error) => return (page, CommitHistoryState::Failed(format!("{error:#}"))),
+        }
+    }
+    (page, CommitHistoryState::More)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,11 +284,26 @@ impl ScopeSelectorStatus {
     }
 }
 
-#[derive(Debug)]
 struct LoadedScopeSelector {
     selector: ScopeSelector,
-    status_poller: Option<ScopeSelectorStatusPoller>,
+    status_poller: ScopeSelectorStatusPoller,
 }
+
+/// Everything besides the scope itself that identifies a cached selector status.
+#[derive(Debug, Clone, Default)]
+struct ScopeStatusKeyContext {
+    filters: BlockFilters,
+    scan_options: crate::scanner::ScanOptions,
+    workdir_prefix: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ScopeStatusQueue {
+    jobs: VecDeque<ScopeSelectorStatusJob>,
+    active_workers: usize,
+}
+
+type ScopeStatusLoader = dyn Fn(ScopePreset) -> ScopeSelectorStatus + Send + Sync;
 
 #[derive(Debug, Clone)]
 struct ScopeSelectorStatusJob {
@@ -323,24 +457,31 @@ impl ReviewCoverageStatusCacheStore {
     }
 }
 
-#[derive(Debug)]
+/// Computes selector row statuses in the background, but only for rows the user can see.
+/// Workers are spawned on demand and retire when the queue drains.
 struct ScopeSelectorStatusPoller {
     receiver: mpsc::Receiver<ScopeSelectorStatusUpdate>,
+    sender: mpsc::Sender<ScopeSelectorStatusUpdate>,
+    queue: Arc<Mutex<ScopeStatusQueue>>,
+    load_status: Arc<ScopeStatusLoader>,
+    key_context: ScopeStatusKeyContext,
+    /// Queued plus in-flight jobs whose updates have not been applied yet.
     pending_jobs: usize,
     cache: Option<ReviewCoverageStatusCacheStore>,
+    /// Whether the cache matched the review database when the selector opened; later
+    /// records mark the in-memory cache fresh without refreshing older entries.
+    cache_fresh_at_load: bool,
     cancelled: Arc<AtomicBool>,
 }
 
 impl ScopeSelectorStatusPoller {
-    fn spawn(
-        jobs: Vec<ScopeSelectorStatusJob>,
-        filters: &BlockFilters,
-        scan_options: &crate::scanner::ScanOptions,
+    fn for_review(
+        key_context: ScopeStatusKeyContext,
         cache: Option<ReviewCoverageStatusCacheStore>,
-    ) -> Option<Self> {
-        let filters = Arc::new(filters.clone());
-        let scan_options = Arc::new(scan_options.clone());
-        Self::spawn_with_loader(jobs, cache, move |scope| {
+    ) -> Self {
+        let filters = key_context.filters.clone();
+        let scan_options = key_context.scan_options.clone();
+        Self::new(key_context, cache, move |scope| {
             match load_review_summary(&scope, &filters, &scan_options) {
                 Ok(summary) => ScopeSelectorStatus::from_summary(&summary),
                 Err(_) => ScopeSelectorStatus::Unavailable,
@@ -348,82 +489,128 @@ impl ScopeSelectorStatusPoller {
         })
     }
 
-    fn spawn_with_loader<L>(
-        jobs: Vec<ScopeSelectorStatusJob>,
+    fn new<L>(
+        key_context: ScopeStatusKeyContext,
         cache: Option<ReviewCoverageStatusCacheStore>,
         load_status: L,
-    ) -> Option<Self>
+    ) -> Self
     where
         L: Fn(ScopePreset) -> ScopeSelectorStatus + Send + Sync + 'static,
     {
-        if jobs.is_empty() {
-            return None;
+        let (sender, receiver) = mpsc::channel();
+        let cache_fresh_at_load = cache.as_ref().is_some_and(|cache| cache.fresh);
+        Self {
+            receiver,
+            sender,
+            queue: Arc::new(Mutex::new(ScopeStatusQueue::default())),
+            load_status: Arc::new(load_status),
+            key_context,
+            pending_jobs: 0,
+            cache,
+            cache_fresh_at_load,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Builds a selector row, seeding its status from the cache and recording whether
+    /// it still needs a background check once visible.
+    fn selector_option(&self, option: ScopeOption) -> ScopeSelectorOption {
+        if matches!(option.scope, ScopePreset::All) {
+            return ScopeSelectorOption::from_scope_option(
+                option,
+                ScopeSelectorStatus::Deferred,
+                ScopeStatusCheck::NotNeeded,
+            );
         }
 
-        let pending_jobs = jobs.len();
-        let jobs = Arc::new(Mutex::new(VecDeque::from(jobs)));
-        let load_status = Arc::new(load_status);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = mpsc::channel();
-        let worker_count = pending_jobs.min(SCOPE_SELECTOR_STATUS_WORKER_COUNT);
-        for worker_index in 0..worker_count {
-            let sender = sender.clone();
-            let jobs = Arc::clone(&jobs);
-            let load_status = Arc::clone(&load_status);
-            let worker_cancelled = Arc::clone(&cancelled);
-            let spawn_result = thread::Builder::new()
-                .name(format!("trueflow-scope-selector-status-{worker_index}"))
-                .stack_size(SCOPE_SELECTOR_STATUS_WORKER_STACK_BYTES)
-                .spawn(move || {
-                    loop {
-                        if worker_cancelled.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let job = {
-                            let Ok(mut jobs) = jobs.lock() else {
-                                break;
-                            };
-                            jobs.pop_front()
-                        };
-                        let Some(job) = job else {
-                            break;
-                        };
-                        if worker_cancelled.load(Ordering::Relaxed) {
-                            break;
-                        }
+        let cache_key = review_coverage_status_cache_key(
+            &option.scope,
+            &self.key_context.filters,
+            &self.key_context.scan_options,
+            self.key_context.workdir_prefix.as_deref(),
+        );
+        let cached_status = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.cached_status(&cache_key));
+        let should_refresh = cached_status.is_none()
+            || !self.cache_fresh_at_load
+            || scope_selector_status_should_refresh_when_cached(&option.scope);
+        let status_check = if should_refresh {
+            ScopeStatusCheck::Needed { cache_key }
+        } else {
+            ScopeStatusCheck::NotNeeded
+        };
+        ScopeSelectorOption::from_scope_option(
+            option,
+            cached_status.unwrap_or(ScopeSelectorStatus::Checking),
+            status_check,
+        )
+    }
 
-                        let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            load_status(job.scope.clone())
-                        }))
-                        .unwrap_or(ScopeSelectorStatus::Unavailable);
-                        if worker_cancelled.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if sender
-                            .send(ScopeSelectorStatusUpdate {
-                                index: job.index,
-                                status,
-                                cache_key: job.cache_key,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
+    /// Restricts queued checks to `visible` rows, top to bottom. Rows that scrolled out
+    /// of view before a worker started them go back to needing a check.
+    fn sync_visible(&mut self, selector: &mut ScopeSelector, visible: std::ops::Range<usize>) {
+        let visible =
+            visible.start.min(selector.options.len())..visible.end.min(selector.options.len());
+        let mut queue = lock_scope_status_queue(&self.queue);
+        let mut dequeued = Vec::new();
+        queue.jobs.retain(|job| {
+            let keep = visible.contains(&job.index);
+            if !keep {
+                dequeued.push((job.index, job.cache_key.clone()));
+            }
+            keep
+        });
+        for (index, cache_key) in dequeued {
+            self.pending_jobs = self.pending_jobs.saturating_sub(1);
+            selector.options[index].status_check = ScopeStatusCheck::Needed { cache_key };
+        }
+
+        for index in visible {
+            let option = &mut selector.options[index];
+            let ScopeStatusCheck::Needed { cache_key } =
+                std::mem::replace(&mut option.status_check, ScopeStatusCheck::Queued)
+            else {
+                continue;
+            };
+            queue.jobs.push_back(ScopeSelectorStatusJob {
+                index,
+                scope: option.scope.clone(),
+                cache_key,
+            });
+            self.pending_jobs += 1;
+        }
+
+        let workers_wanted = SCOPE_SELECTOR_STATUS_WORKER_COUNT.min(queue.jobs.len());
+        while queue.active_workers < workers_wanted {
+            queue.active_workers += 1;
+            if self.spawn_worker().is_err() {
+                // Without a worker, no queued row would ever leave `Checking`.
+                queue.active_workers -= 1;
+                if queue.active_workers == 0 {
+                    for job in queue.jobs.drain(..) {
+                        self.pending_jobs = self.pending_jobs.saturating_sub(1);
+                        let option = &mut selector.options[job.index];
+                        option.status = ScopeSelectorStatus::Unavailable;
+                        option.status_check = ScopeStatusCheck::NotNeeded;
                     }
-                });
-            if spawn_result.is_err() {
-                cancelled.store(true, Ordering::Relaxed);
-                return None;
+                }
+                break;
             }
         }
-        drop(sender);
+    }
 
-        Some(Self {
-            receiver,
-            pending_jobs,
-            cache,
-            cancelled,
-        })
+    fn spawn_worker(&self) -> std::io::Result<()> {
+        let queue = Arc::clone(&self.queue);
+        let load_status = Arc::clone(&self.load_status);
+        let sender = self.sender.clone();
+        let cancelled = Arc::clone(&self.cancelled);
+        thread::Builder::new()
+            .name("trueflow-scope-selector-status".to_string())
+            .stack_size(SCOPE_SELECTOR_STATUS_WORKER_STACK_BYTES)
+            .spawn(move || run_scope_status_worker(&queue, &*load_status, &sender, &cancelled))
+            .map(drop)
     }
 
     fn cancel(&self) {
@@ -438,6 +625,7 @@ impl ScopeSelectorStatusPoller {
         self.pending_jobs = self.pending_jobs.saturating_sub(1);
         if let Some(option) = selector.options.get_mut(update.index) {
             option.status = update.status;
+            option.status_check = ScopeStatusCheck::NotNeeded;
         }
         if let Some(cache) = self.cache.as_mut() {
             cache.record(&update.cache_key, update.status);
@@ -452,24 +640,10 @@ impl ScopeSelectorStatusPoller {
 
     fn drain_updates(&mut self, selector: &mut ScopeSelector) -> bool {
         let mut updated = false;
-        loop {
-            match self.receiver.try_recv() {
-                Ok(update) => {
-                    self.apply_update(selector, &update);
-                    updated = true;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.pending_jobs = 0;
-                    for option in &mut selector.options {
-                        if option.status == ScopeSelectorStatus::Checking {
-                            option.status = ScopeSelectorStatus::Unavailable;
-                            updated = true;
-                        }
-                    }
-                    break;
-                }
-            }
+        // The poller owns a sender, so the channel never disconnects while it lives.
+        while let Ok(update) = self.receiver.try_recv() {
+            self.apply_update(selector, &update);
+            updated = true;
         }
 
         self.flush_cache_after_update(updated);
@@ -483,23 +657,55 @@ impl ScopeSelectorStatusPoller {
                 self.apply_update(selector, &update);
                 true
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => false,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.pending_jobs = 0;
-                let mut changed = false;
-                for option in &mut selector.options {
-                    if option.status == ScopeSelectorStatus::Checking {
-                        option.status = ScopeSelectorStatus::Unavailable;
-                        changed = true;
-                    }
-                }
-                changed
-            }
+            Err(_) => false,
         };
         let drained = self.drain_updates(selector);
         let updated = updated || drained;
         self.flush_cache_after_update(updated);
         updated
+    }
+}
+
+fn lock_scope_status_queue(
+    queue: &Mutex<ScopeStatusQueue>,
+) -> std::sync::MutexGuard<'_, ScopeStatusQueue> {
+    queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn run_scope_status_worker(
+    queue: &Mutex<ScopeStatusQueue>,
+    load_status: &ScopeStatusLoader,
+    sender: &mpsc::Sender<ScopeSelectorStatusUpdate>,
+    cancelled: &AtomicBool,
+) {
+    loop {
+        let job = {
+            let mut queue = lock_scope_status_queue(queue);
+            // Retire under the same lock that observed the empty queue, so a concurrent
+            // `sync_visible` either sees this worker active or spawns a replacement.
+            match queue.jobs.pop_front() {
+                Some(job) if !cancelled.load(Ordering::Relaxed) => job,
+                _ => {
+                    queue.active_workers -= 1;
+                    return;
+                }
+            }
+        };
+
+        let status =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_status(job.scope)))
+                .unwrap_or(ScopeSelectorStatus::Unavailable);
+        let update = ScopeSelectorStatusUpdate {
+            index: job.index,
+            status,
+            cache_key: job.cache_key,
+        };
+        if cancelled.load(Ordering::Relaxed) || sender.send(update).is_err() {
+            lock_scope_status_queue(queue).active_workers -= 1;
+            return;
+        }
     }
 }
 
@@ -580,60 +786,22 @@ fn scope_selector_status_should_refresh_when_cached(scope: &ScopePreset) -> bool
     )
 }
 
-fn build_scope_selector_with_status_jobs(
-    options: Vec<ScopeOption>,
-    filters: &BlockFilters,
-    scan_options: &crate::scanner::ScanOptions,
-    workdir_prefix: Option<&str>,
-    cache: Option<&ReviewCoverageStatusCacheStore>,
-) -> (ScopeSelector, Vec<ScopeSelectorStatusJob>) {
-    let mut selector_options = Vec::with_capacity(options.len());
-    let mut jobs = Vec::new();
-
-    for (index, option) in options.into_iter().enumerate() {
-        if matches!(option.scope, ScopePreset::All) {
-            selector_options.push(ScopeSelectorOption::from_scope_option(
-                option,
-                ScopeSelectorStatus::Deferred,
-            ));
-            continue;
-        }
-
-        let cache_key =
-            review_coverage_status_cache_key(&option.scope, filters, scan_options, workdir_prefix);
-        let cached_status = cache.and_then(|cache| cache.cached_status(&cache_key));
-        let should_refresh = cached_status.is_none()
-            || cache.is_none_or(|cache| !cache.fresh)
-            || scope_selector_status_should_refresh_when_cached(&option.scope);
-        let status = cached_status.unwrap_or(ScopeSelectorStatus::Checking);
-        if should_refresh {
-            jobs.push(ScopeSelectorStatusJob {
-                index,
-                scope: option.scope.clone(),
-                cache_key,
-            });
-        }
-        selector_options.push(ScopeSelectorOption::from_scope_option(option, status));
-    }
-    jobs.sort_by_key(|job| (scope_selector_status_job_priority(&job.scope), job.index));
-
-    (ScopeSelector::new(selector_options), jobs)
-}
-
-fn scope_selector_status_job_priority(scope: &ScopePreset) -> u8 {
-    match scope {
-        ScopePreset::MainDiff | ScopePreset::Commit { .. } | ScopePreset::RevisionRange { .. } => 0,
-        ScopePreset::All => 1,
-    }
-}
-
 impl ScopeSelector {
     fn new(options: Vec<ScopeSelectorOption>) -> Self {
         let selected = options
             .iter()
             .position(|option| matches!(option.scope, ScopePreset::MainDiff))
             .unwrap_or(0);
-        Self { options, selected }
+        Self {
+            options,
+            selected,
+            history: None,
+        }
+    }
+
+    fn with_history(mut self, history: Option<CommitHistoryPager>) -> Self {
+        self.history = history;
+        self
     }
 
     fn move_next(&mut self) {
@@ -654,6 +822,27 @@ impl ScopeSelector {
         self.options
             .get(self.selected)
             .map(|option| option.scope.clone())
+    }
+
+    fn history_state(&self) -> Option<&CommitHistoryState> {
+        self.history.as_ref().map(|history| &history.state)
+    }
+
+    /// Appends the next page of older commits once the selection nears the last row.
+    fn load_more_history_if_near_end(&mut self, poller: &ScopeSelectorStatusPoller) {
+        let near_end = self.selected + SCOPE_SELECTOR_HISTORY_LOAD_AHEAD_ROWS >= self.options.len();
+        let Some(history) = self.history.as_mut().filter(|history| history.has_more()) else {
+            return;
+        };
+        if !near_end {
+            return;
+        }
+        let commits = history.next_page();
+        self.options.extend(
+            commits
+                .iter()
+                .map(|commit| poller.selector_option(commit_scope_option(commit))),
+        );
     }
 }
 
@@ -1523,7 +1712,7 @@ fn run_tui_review_loop(
                 let LoadedScopeSelector {
                     selector,
                     status_poller,
-                } = load_scope_selector(filters, scan_options)?;
+                } = load_scope_selector(filters, scan_options);
                 let selection = run_scope_selector(
                     session.terminal_mut(),
                     selector,
@@ -2663,36 +2852,35 @@ fn keybind_action_for_key_event(
     keybind_action_for_key_code(keybinds, key_event.code)
 }
 
-fn load_scope_options() -> Result<Vec<ScopeOption>> {
-    let commits = vcs::recent_commits(8).unwrap_or_default();
-    let workdir_prefix = workdir_prefix_from_git_root();
-    let commits = filter_commits_for_prefix(
-        commits,
-        workdir_prefix.as_deref(),
-        vcs::files_changed_in_revision,
-    );
-    Ok(default_scope_options(&commits))
-}
-
 fn load_scope_selector(
     filters: &BlockFilters,
     scan_options: &crate::scanner::ScanOptions,
-) -> Result<LoadedScopeSelector> {
-    let options = load_scope_options()?;
+) -> LoadedScopeSelector {
     let workdir_prefix = workdir_prefix_from_git_root();
-    let cache = ReviewCoverageStatusCacheStore::load();
-    let (selector, jobs) = build_scope_selector_with_status_jobs(
-        options,
-        filters,
-        scan_options,
-        workdir_prefix.as_deref(),
-        cache.as_ref(),
+    let status_poller = ScopeSelectorStatusPoller::for_review(
+        ScopeStatusKeyContext {
+            filters: filters.clone(),
+            scan_options: scan_options.clone(),
+            workdir_prefix: workdir_prefix.clone(),
+        },
+        ReviewCoverageStatusCacheStore::load(),
     );
-    let status_poller = ScopeSelectorStatusPoller::spawn(jobs, filters, scan_options, cache);
-    Ok(LoadedScopeSelector {
-        selector,
+    // Outside a git repository there is simply no commit history to offer.
+    let mut history = vcs::repo_from_workdir()
+        .ok()
+        .map(|repo| CommitHistoryPager::open(repo, workdir_prefix));
+    let commits = history
+        .as_mut()
+        .map(CommitHistoryPager::next_page)
+        .unwrap_or_default();
+    let options = default_scope_options(&commits)
+        .into_iter()
+        .map(|option| status_poller.selector_option(option))
+        .collect();
+    LoadedScopeSelector {
+        selector: ScopeSelector::new(options).with_history(history),
         status_poller,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -2712,40 +2900,36 @@ where
                 Ok(summary) => ScopeSelectorStatus::from_summary(&summary),
                 Err(_) => ScopeSelectorStatus::Unavailable,
             };
-            ScopeSelectorOption::from_scope_option(option, status)
+            ScopeSelectorOption::from_scope_option(option, status, ScopeStatusCheck::NotNeeded)
         })
         .collect();
     Ok(ScopeSelector::new(options))
 }
 
-fn filter_commits_for_prefix<F>(
-    commits: Vec<vcs::CommitInfo>,
+/// Whether a commit touched the workdir prefix the TUI was launched from.
+fn commit_touches_workdir_prefix<F>(
+    revision: &str,
     workdir_prefix: Option<&str>,
-    mut changed_paths_for_revision: F,
-) -> Vec<vcs::CommitInfo>
+    changed_paths_for_revision: F,
+) -> bool
 where
-    F: FnMut(&str) -> Result<HashSet<vcs::ChangedPath>>,
+    F: FnOnce(&str) -> Result<HashSet<vcs::ChangedPath>>,
 {
     let Some(prefix) = workdir_prefix
         .map(path_utils::normalize_path_str)
         .filter(|p| !p.is_empty())
     else {
-        return commits;
+        return true;
     };
 
-    commits
-        .into_iter()
-        .filter(|commit| {
-            match changed_paths_for_revision(commit.id.as_str()) {
-                Ok(paths) => paths.iter().any(|path| {
-                    path_utils::path_matches_workdir_prefix(path.source_location.as_str(), &prefix)
-                        || path_utils::path_matches_workdir_prefix(path.location.as_str(), &prefix)
-                }),
-                // If we can't resolve changed paths, keep the option instead of hiding it.
-                Err(_) => true,
-            }
-        })
-        .collect()
+    match changed_paths_for_revision(revision) {
+        Ok(paths) => paths.iter().any(|path| {
+            path_utils::path_matches_workdir_prefix(path.source_location.as_str(), &prefix)
+                || path_utils::path_matches_workdir_prefix(path.location.as_str(), &prefix)
+        }),
+        // If we can't resolve changed paths, keep the option instead of hiding it.
+        Err(_) => true,
+    }
 }
 
 fn speed_read_config_path_for_repo_root() -> PathBuf {
@@ -2836,28 +3020,26 @@ where
 fn run_scope_selector(
     terminal: &mut TuiTerminal,
     mut selector: ScopeSelector,
-    mut status_poller: Option<ScopeSelectorStatusPoller>,
+    mut status_poller: ScopeSelectorStatusPoller,
     keybinds: &TuiKeybindsConfig,
 ) -> Result<ScopeSelection> {
     let mut needs_render = true;
     let mut event_pump = EventPump::default();
 
+    // Dropping the poller on return cancels any queued status checks.
     loop {
-        if let Some(poller) = status_poller.as_mut()
-            && poller.drain_updates(&mut selector)
-        {
+        if status_poller.drain_updates(&mut selector) {
             needs_render = true;
         }
 
         if needs_render {
-            terminal.draw(|f| render_scope_selector(f, &selector, keybinds))?;
+            let mut visible_options = 0..0;
+            terminal.draw(|f| visible_options = render_scope_selector(f, &selector, keybinds))?;
+            status_poller.sync_visible(&mut selector, visible_options);
             needs_render = false;
         }
 
-        let event = if status_poller
-            .as_ref()
-            .is_some_and(ScopeSelectorStatusPoller::has_pending_jobs)
-        {
+        let event = if status_poller.has_pending_jobs() {
             event_pump
                 .read_with_deadline(Some(Instant::now() + SCOPE_SELECTOR_STATUS_POLL_INTERVAL))?
         } else {
@@ -2890,16 +3072,12 @@ fn run_scope_selector(
                     continue;
                 }
                 KeybindAction::Down => {
+                    selector.load_more_history_if_near_end(&status_poller);
                     selector.move_next();
                     needs_render = true;
                     continue;
                 }
-                KeybindAction::Quit => {
-                    if let Some(poller) = status_poller.as_ref() {
-                        poller.cancel();
-                    }
-                    return Ok(ScopeSelection::Quit);
-                }
+                KeybindAction::Quit => return Ok(ScopeSelection::Quit),
                 KeybindAction::Prev
                 | KeybindAction::Next
                 | KeybindAction::Parent
@@ -2917,17 +3095,9 @@ fn run_scope_selector(
         }
 
         match key_code {
-            KeyCode::Esc => {
-                if let Some(poller) = status_poller.as_ref() {
-                    poller.cancel();
-                }
-                return Ok(ScopeSelection::Quit);
-            }
+            KeyCode::Esc => return Ok(ScopeSelection::Quit),
             KeyCode::Enter => {
                 if let Some(scope) = selector.selected_scope() {
-                    if let Some(poller) = status_poller.as_ref() {
-                        poller.cancel();
-                    }
                     return Ok(ScopeSelection::Selected(scope));
                 }
             }
@@ -5112,11 +5282,12 @@ fn detect_repo_name(context: &TrueflowContext) -> String {
 
 // --- UI Rendering ---
 
+/// Renders the scope selector and returns the option rows that are on screen.
 fn render_scope_selector(
     frame: &mut Frame,
     selector: &ScopeSelector,
     keybinds: &TuiKeybindsConfig,
-) {
+) -> std::ops::Range<usize> {
     let palette = UiPalette::default();
     let area = frame.area();
 
@@ -5143,14 +5314,29 @@ fn render_scope_selector(
             .bg(palette.bg)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(""));
+    // The spacer row doubles as the place to report that older history failed to load.
+    let history_note = match selector.history_state() {
+        Some(CommitHistoryState::Failed(error)) => truncate_text_to_width(
+            &format!("Older commits unavailable: {error}"),
+            usize::from(layout.content.width),
+        ),
+        Some(CommitHistoryState::More | CommitHistoryState::End) | None => String::new(),
+    };
+    lines.push(Line::from(Span::styled(
+        history_note,
+        Style::default().fg(palette.dim).bg(palette.bg),
+    )));
 
-    let visible_options = visible_scope_selector_option_range(
-        selector.options.len(),
-        selector.selected,
-        usize::from(layout.content.height).saturating_sub(2),
-    );
-    for idx in visible_options {
+    let visible_options = if layout.content.height > 0 && layout.content.width > 0 {
+        visible_scope_selector_option_range(
+            selector.options.len(),
+            selector.selected,
+            usize::from(layout.content.height).saturating_sub(2),
+        )
+    } else {
+        0..0
+    };
+    for idx in visible_options.clone() {
         let option = &selector.options[idx];
         let prefix = if idx == selector.selected { "> " } else { "  " };
         let style = if idx == selector.selected {
@@ -5187,6 +5373,8 @@ fn render_scope_selector(
             layout.hints,
         );
     }
+
+    visible_options
 }
 
 fn visible_scope_selector_option_range(
@@ -9982,33 +10170,170 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn filter_commits_for_prefix_keeps_only_commits_touching_prefix() {
-        let commits = vec![
-            vcs::CommitInfo {
-                id: CommitId::new("aaaaaaa").unwrap(),
-                summary: "touches subtree".to_string(),
-            },
-            vcs::CommitInfo {
-                id: CommitId::new("bbbbbbb").unwrap(),
-                summary: "outside subtree".to_string(),
-            },
-        ];
-
-        let filtered = filter_commits_for_prefix(commits, Some("trueflow"), |revision| {
-            let paths = match revision {
-                "aaaaaaa" => HashSet::from([vcs::ChangedPath::identity(
-                    RepoPath::new("trueflow/src/lib.rs").unwrap(),
-                )]),
-                "bbbbbbb" => HashSet::from([vcs::ChangedPath::identity(
-                    RepoPath::new("README.md").unwrap(),
-                )]),
-                _ => HashSet::new(),
+    fn commit_touches_workdir_prefix_keeps_only_commits_touching_prefix() {
+        let changed_paths = |revision: &str| {
+            let path = match revision {
+                "aaaaaaa" => "trueflow/src/lib.rs",
+                "bbbbbbb" => "README.md",
+                _ => return Err(anyhow::anyhow!("unknown revision")),
             };
-            Ok(paths)
-        });
+            Ok(HashSet::from([vcs::ChangedPath::identity(
+                RepoPath::new(path).unwrap(),
+            )]))
+        };
 
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, CommitId::new("aaaaaaa").unwrap());
+        assert!(commit_touches_workdir_prefix(
+            "aaaaaaa",
+            Some("trueflow"),
+            changed_paths
+        ));
+        assert!(!commit_touches_workdir_prefix(
+            "bbbbbbb",
+            Some("trueflow"),
+            changed_paths
+        ));
+        assert!(
+            commit_touches_workdir_prefix("ccccccc", Some("trueflow"), changed_paths),
+            "unresolvable commits stay visible rather than silently disappearing"
+        );
+        assert!(commit_touches_workdir_prefix(
+            "bbbbbbb",
+            None,
+            changed_paths
+        ));
+    }
+
+    fn numbered_commit(index: usize) -> vcs::CommitInfo {
+        vcs::CommitInfo {
+            id: CommitId::new(format!("{index:07x}")).unwrap(),
+            summary: format!("commit {index}"),
+        }
+    }
+
+    #[test]
+    fn collect_commit_page_fills_page_within_scan_bound() {
+        let mut history = (0..100).map(numbered_commit);
+        let mut scanned = 0;
+
+        let (page, state) = collect_commit_page(
+            || {
+                scanned += 1;
+                Ok(history.next())
+            },
+            |commit| commit.summary.ends_with('0'),
+            3,
+            25,
+        );
+
+        assert_eq!(
+            page.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(),
+            ["commit 0", "commit 10", "commit 20"]
+        );
+        assert_eq!(state, CommitHistoryState::More);
+        assert_eq!(scanned, 21, "stops as soon as the page is full");
+
+        let mut sparse = (0..100).map(numbered_commit);
+        let mut scanned = 0;
+        let (page, state) = collect_commit_page(
+            || {
+                scanned += 1;
+                Ok(sparse.next())
+            },
+            |commit| commit.summary == "commit 99",
+            3,
+            25,
+        );
+        assert!(page.is_empty());
+        assert_eq!(state, CommitHistoryState::More);
+        assert_eq!(scanned, 25, "a sparse history never scans past the bound");
+    }
+
+    #[test]
+    fn collect_commit_page_reports_end_and_failure() {
+        let mut short = (0..2).map(numbered_commit);
+        let (page, state) = collect_commit_page(|| Ok(short.next()), |_| true, 5, 50);
+        assert_eq!(page.len(), 2);
+        assert_eq!(state, CommitHistoryState::End);
+
+        let mut calls = 0;
+        let (page, state) = collect_commit_page(
+            || {
+                calls += 1;
+                if calls == 2 {
+                    Err(anyhow::anyhow!("object missing"))
+                } else {
+                    Ok(Some(numbered_commit(calls)))
+                }
+            },
+            |_| true,
+            5,
+            50,
+        );
+        assert_eq!(page.len(), 1, "commits before the failure are kept");
+        assert_eq!(
+            state,
+            CommitHistoryState::Failed("object missing".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_selector_pages_older_commits_as_selection_nears_end() {
+        let repo_root = temp_git_repo("scope_selector_history_paging");
+        let commit_count = SCOPE_SELECTOR_COMMIT_PAGE_SIZE + 12;
+        for index in 1..=commit_count {
+            run_git(
+                &repo_root,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    &format!("history {index:03}"),
+                ],
+            );
+        }
+        let repo = gix::open(&repo_root).unwrap();
+        let poller = ScopeSelectorStatusPoller::new(ScopeStatusKeyContext::default(), None, |_| {
+            ScopeSelectorStatus::Empty
+        });
+        let mut history = CommitHistoryPager::open(repo, None);
+        let first_page = history.next_page();
+        let options = default_scope_options(&first_page)
+            .into_iter()
+            .map(|option| poller.selector_option(option))
+            .collect();
+        let mut selector = ScopeSelector::new(options).with_history(Some(history));
+        let base_rows = 2;
+        assert_eq!(
+            selector.options.len(),
+            base_rows + SCOPE_SELECTOR_COMMIT_PAGE_SIZE
+        );
+
+        selector.load_more_history_if_near_end(&poller);
+        assert_eq!(
+            selector.options.len(),
+            base_rows + SCOPE_SELECTOR_COMMIT_PAGE_SIZE,
+            "no page loads while the selection is far from the end"
+        );
+
+        while selector.selected + 1 < selector.options.len() {
+            selector.load_more_history_if_near_end(&poller);
+            selector.move_next();
+        }
+
+        assert_eq!(selector.options.len(), base_rows + commit_count);
+        assert_eq!(selector.history_state(), Some(&CommitHistoryState::End));
+        assert!(
+            selector.options[selector.selected]
+                .label
+                .ends_with("history 001"),
+            "the root commit is reachable: {}",
+            selector.options[selector.selected].label
+        );
+        assert!(matches!(
+            selector.options[selector.selected].status_check,
+            ScopeStatusCheck::Needed { .. }
+        ));
     }
 
     #[test]
@@ -10282,6 +10607,7 @@ mod diff_scope_tests {
                     summary: format!("Commit {index:02}"),
                 },
                 status: ScopeSelectorStatus::Deferred,
+                status_check: ScopeStatusCheck::NotNeeded,
             })
             .collect::<Vec<_>>();
         let mut selector = ScopeSelector::new(options);
@@ -10289,9 +10615,14 @@ mod diff_scope_tests {
 
         let mut terminal = Terminal::new(TestBackend::new(80, 20))
             .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        let mut visible = 0..0;
         terminal
-            .draw(|frame| render_scope_selector(frame, &selector, &TuiKeybindsConfig::default()))
+            .draw(|frame| {
+                visible = render_scope_selector(frame, &selector, &TuiKeybindsConfig::default());
+            })
             .unwrap_or_else(|error| panic!("failed to render scope selector: {error}"));
+        assert!(visible.contains(&9), "visible rows: {visible:?}");
+        assert!(!visible.contains(&0), "visible rows: {visible:?}");
 
         let buffer = terminal.backend().buffer();
         let width = usize::from(buffer.area.width);
@@ -10370,11 +10701,13 @@ mod diff_scope_tests {
                 label: "All files".to_string(),
                 scope: ScopePreset::All,
                 status: ScopeSelectorStatus::Deferred,
+                status_check: ScopeStatusCheck::NotNeeded,
             },
             ScopeSelectorOption {
                 label: "Diff vs main".to_string(),
                 scope: ScopePreset::MainDiff,
                 status: ScopeSelectorStatus::Checking,
+                status_check: ScopeStatusCheck::NotNeeded,
             },
         ]);
 
@@ -10382,338 +10715,323 @@ mod diff_scope_tests {
         assert_eq!(selector.selected_scope(), Some(ScopePreset::MainDiff));
     }
 
-    #[test]
-    fn build_scope_selector_with_status_jobs_uses_cached_commit_statuses() {
-        let filters = BlockFilters::default();
-        let scan_options = ScanOptions::default();
-        let options = vec![
-            ScopeOption {
-                label: "All files".to_string(),
-                scope: ScopePreset::All,
+    fn commit_scope(id: &str) -> ScopeOption {
+        ScopeOption {
+            label: format!("Commit {id}"),
+            scope: ScopePreset::Commit {
+                id: id.to_string(),
+                summary: "Update".to_string(),
             },
-            ScopeOption {
-                label: "Commit abc1234".to_string(),
-                scope: ScopePreset::Commit {
-                    id: "abc1234".to_string(),
-                    summary: "Update".to_string(),
-                },
-            },
-        ];
-        let cache_key = review_coverage_status_cache_key(
-            &options[1].scope,
-            &filters,
-            &scan_options,
-            Some("src"),
-        );
-        let cache = ReviewCoverageStatusCacheStore {
-            path: PathBuf::from("/tmp/review_coverage_status.json"),
-            fingerprint: ReviewDatabaseFingerprint {
-                size_bytes: 0,
-                modified_unix_ms: 0,
-            },
-            entries: HashMap::from([(
-                cache_key.clone(),
-                ScopeSelectorStatus::Reviewed { total_blocks: 7 },
-            )]),
-            entry_updated_unix_ms: HashMap::from([(cache_key, 1234)]),
-            fresh: true,
-            dirty: false,
-        };
-
-        let (selector, jobs) = build_scope_selector_with_status_jobs(
-            options,
-            &filters,
-            &scan_options,
-            Some("src"),
-            Some(&cache),
-        );
-
-        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Deferred);
-        assert_eq!(
-            selector.options[1].status,
-            ScopeSelectorStatus::Reviewed { total_blocks: 7 }
-        );
-        assert!(jobs.is_empty());
+        }
     }
 
-    #[test]
-    fn stale_scope_selector_cache_seeds_statuses_but_refreshes_them() {
-        let filters = BlockFilters::default();
-        let scan_options = ScanOptions::default();
-        let options = vec![
-            ScopeOption {
-                label: "All files".to_string(),
-                scope: ScopePreset::All,
-            },
-            ScopeOption {
-                label: "Commit abc1234".to_string(),
-                scope: ScopePreset::Commit {
-                    id: "abc1234".to_string(),
-                    summary: "Update".to_string(),
-                },
-            },
-        ];
-        let all_cache_key =
-            review_coverage_status_cache_key(&options[0].scope, &filters, &scan_options, None);
-        let commit_cache_key =
-            review_coverage_status_cache_key(&options[1].scope, &filters, &scan_options, None);
-        let cache = ReviewCoverageStatusCacheStore {
-            path: PathBuf::from("/tmp/review_coverage_status.json"),
-            fingerprint: ReviewDatabaseFingerprint {
-                size_bytes: 99,
-                modified_unix_ms: 99,
-            },
-            entries: HashMap::from([
-                (
-                    all_cache_key,
-                    ScopeSelectorStatus::Pending {
-                        remaining_blocks: 2,
-                        total_blocks: 3,
-                    },
-                ),
-                (
-                    commit_cache_key,
-                    ScopeSelectorStatus::Reviewed { total_blocks: 7 },
-                ),
-            ]),
+    fn status_cache(
+        path: PathBuf,
+        entries: Vec<(String, ScopeSelectorStatus)>,
+        fresh: bool,
+    ) -> ReviewCoverageStatusCacheStore {
+        ReviewCoverageStatusCacheStore {
+            path,
+            fingerprint: ReviewDatabaseFingerprint::default(),
+            entries: entries.into_iter().collect(),
             entry_updated_unix_ms: HashMap::new(),
-            fresh: false,
+            fresh,
             dirty: false,
-        };
+        }
+    }
 
-        let (selector, jobs) = build_scope_selector_with_status_jobs(
-            options,
-            &filters,
-            &scan_options,
-            None,
-            Some(&cache),
+    fn unused_status_loader(_: ScopePreset) -> ScopeSelectorStatus {
+        panic!("status loader should not run")
+    }
+
+    #[test]
+    fn selector_option_uses_fresh_cached_commit_statuses_without_rechecking() {
+        let key_context = ScopeStatusKeyContext {
+            workdir_prefix: Some("src".to_string()),
+            ..ScopeStatusKeyContext::default()
+        };
+        let commit = commit_scope("abc1234");
+        let cache_key = review_coverage_status_cache_key(
+            &commit.scope,
+            &key_context.filters,
+            &key_context.scan_options,
+            Some("src"),
+        );
+        let poller = ScopeSelectorStatusPoller::new(
+            key_context,
+            Some(status_cache(
+                PathBuf::from("/tmp/review_coverage_status.json"),
+                vec![(cache_key, ScopeSelectorStatus::Reviewed { total_blocks: 7 })],
+                true,
+            )),
+            unused_status_loader,
         );
 
-        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Deferred);
+        let all = poller.selector_option(ScopeOption {
+            label: "All files".to_string(),
+            scope: ScopePreset::All,
+        });
+        let commit = poller.selector_option(commit);
+
+        assert_eq!(all.status, ScopeSelectorStatus::Deferred);
+        assert_eq!(all.status_check, ScopeStatusCheck::NotNeeded);
         assert_eq!(
-            selector.options[1].status,
+            commit.status,
             ScopeSelectorStatus::Reviewed { total_blocks: 7 }
         );
-        assert_eq!(jobs.len(), 1);
-        assert!(matches!(jobs[0].scope, ScopePreset::Commit { .. }));
+        assert_eq!(commit.status_check, ScopeStatusCheck::NotNeeded);
     }
 
     #[test]
-    fn scope_selector_status_jobs_skip_expensive_all_scope() {
-        let filters = BlockFilters::default();
-        let scan_options = ScanOptions::default();
-        let options = vec![
-            ScopeOption {
-                label: "All files".to_string(),
-                scope: ScopePreset::All,
-            },
-            ScopeOption {
-                label: "Diff vs main".to_string(),
-                scope: ScopePreset::MainDiff,
-            },
-            ScopeOption {
-                label: "Commit abc1234".to_string(),
-                scope: ScopePreset::Commit {
-                    id: "abc1234".to_string(),
-                    summary: "Update".to_string(),
-                },
-            },
-        ];
-
-        let (_selector, jobs) =
-            build_scope_selector_with_status_jobs(options, &filters, &scan_options, None, None);
-
-        assert_eq!(jobs.len(), 2);
-        assert!(matches!(jobs[0].scope, ScopePreset::MainDiff));
-        assert!(matches!(jobs[1].scope, ScopePreset::Commit { .. }));
-    }
-
-    #[test]
-    fn fresh_volatile_scope_selector_cache_seeds_statuses_but_still_refreshes() {
-        let filters = BlockFilters::default();
-        let scan_options = ScanOptions::default();
-        let options = vec![ScopeOption {
+    fn selector_option_seeds_stale_volatile_or_missing_cache_but_still_rechecks() {
+        let key_context = ScopeStatusKeyContext::default();
+        let commit = commit_scope("abc1234");
+        let main_diff = ScopeOption {
             label: "Diff vs main".to_string(),
             scope: ScopePreset::MainDiff,
-        }];
-        let cache_key =
-            review_coverage_status_cache_key(&options[0].scope, &filters, &scan_options, None);
-        let cache = ReviewCoverageStatusCacheStore {
-            path: PathBuf::from("/tmp/review_coverage_status.json"),
-            fingerprint: ReviewDatabaseFingerprint::default(),
-            entries: HashMap::from([(cache_key, ScopeSelectorStatus::Empty)]),
-            entry_updated_unix_ms: HashMap::new(),
-            fresh: true,
-            dirty: false,
         };
+        let key = |scope: &ScopePreset| {
+            review_coverage_status_cache_key(
+                scope,
+                &key_context.filters,
+                &key_context.scan_options,
+                None,
+            )
+        };
+        let entries = vec![
+            (
+                key(&commit.scope),
+                ScopeSelectorStatus::Reviewed { total_blocks: 7 },
+            ),
+            (key(&main_diff.scope), ScopeSelectorStatus::Empty),
+        ];
+        let cache_path = PathBuf::from("/tmp/review_coverage_status.json");
 
-        let (selector, jobs) = build_scope_selector_with_status_jobs(
-            options,
-            &filters,
-            &scan_options,
-            None,
-            Some(&cache),
+        let stale = ScopeSelectorStatusPoller::new(
+            key_context.clone(),
+            Some(status_cache(cache_path.clone(), entries.clone(), false)),
+            unused_status_loader,
         );
+        let stale_commit = stale.selector_option(commit.clone());
+        assert_eq!(
+            stale_commit.status,
+            ScopeSelectorStatus::Reviewed { total_blocks: 7 }
+        );
+        assert!(matches!(
+            stale_commit.status_check,
+            ScopeStatusCheck::Needed { .. }
+        ));
 
-        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Empty);
-        assert_eq!(jobs.len(), 1);
-        assert!(matches!(jobs[0].scope, ScopePreset::MainDiff));
+        let fresh = ScopeSelectorStatusPoller::new(
+            key_context.clone(),
+            Some(status_cache(cache_path, entries, true)),
+            unused_status_loader,
+        );
+        let main_diff = fresh.selector_option(main_diff);
+        assert_eq!(main_diff.status, ScopeSelectorStatus::Empty);
+        assert!(matches!(
+            main_diff.status_check,
+            ScopeStatusCheck::Needed { .. }
+        ));
+
+        let uncached = ScopeSelectorStatusPoller::new(key_context, None, unused_status_loader);
+        let uncached_commit = uncached.selector_option(commit);
+        assert_eq!(uncached_commit.status, ScopeSelectorStatus::Checking);
+        assert!(matches!(
+            uncached_commit.status_check,
+            ScopeStatusCheck::Needed { .. }
+        ));
     }
 
     #[test]
-    fn scope_selector_status_poller_applies_updates_and_writes_commit_cache_entries() {
+    fn scope_selector_status_poller_checks_visible_row_and_writes_cache_entry() {
         let cache_dir = temp_test_dir("scope_selector_status_cache");
         fs::create_dir_all(&cache_dir)
             .unwrap_or_else(|error| panic!("failed to create cache dir {cache_dir:?}: {error}"));
         let cache_path = cache_dir.join("review_coverage_status.json");
-        let (sender, receiver) = mpsc::channel();
-        let mut selector = ScopeSelector::new(vec![ScopeSelectorOption {
-            label: "Commit abc1234".to_string(),
-            scope: ScopePreset::Commit {
-                id: "abc1234".to_string(),
-                summary: "Update".to_string(),
-            },
-            status: ScopeSelectorStatus::Checking,
-        }]);
-        let fingerprint = ReviewDatabaseFingerprint {
-            size_bytes: 42,
-            modified_unix_ms: 1234,
+        let mut poller = ScopeSelectorStatusPoller::new(
+            ScopeStatusKeyContext::default(),
+            Some(status_cache(cache_path.clone(), Vec::new(), true)),
+            |_| ScopeSelectorStatus::Reviewed { total_blocks: 3 },
+        );
+        let option = poller.selector_option(commit_scope("abc1234"));
+        let ScopeStatusCheck::Needed { cache_key } = option.status_check.clone() else {
+            panic!("uncached commit should need a check");
         };
-        let mut poller = ScopeSelectorStatusPoller {
-            receiver,
-            pending_jobs: 1,
-            cache: Some(ReviewCoverageStatusCacheStore {
-                path: cache_path.clone(),
-                fingerprint,
-                entries: HashMap::new(),
-                entry_updated_unix_ms: HashMap::new(),
-                fresh: true,
-                dirty: false,
-            }),
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+        let mut selector = ScopeSelector::new(vec![option]);
 
-        sender
-            .send(ScopeSelectorStatusUpdate {
-                index: 0,
-                status: ScopeSelectorStatus::Reviewed { total_blocks: 3 },
-                cache_key: "commit:abc1234".to_string(),
-            })
-            .unwrap_or_else(|error| panic!("failed to send selector update: {error}"));
-        drop(sender);
+        poller.sync_visible(&mut selector, 0..1);
+        assert!(poller.has_pending_jobs());
+        assert!(poller.wait_for_update(&mut selector, Duration::from_secs(5)));
 
-        assert!(poller.drain_updates(&mut selector));
-        assert_eq!(poller.pending_jobs, 0);
+        assert!(!poller.has_pending_jobs());
         assert_eq!(
             selector.options[0].status,
             ScopeSelectorStatus::Reviewed { total_blocks: 3 }
         );
-
+        assert_eq!(
+            selector.options[0].status_check,
+            ScopeStatusCheck::NotNeeded
+        );
         let cache_contents = fs::read_to_string(&cache_path)
             .unwrap_or_else(|error| panic!("failed to read cache file {cache_path:?}: {error}"));
         let cache_file: ReviewCoverageStatusCacheFile = serde_json::from_str(&cache_contents)
             .unwrap_or_else(|error| panic!("failed to parse cache json: {error}"));
-        assert_eq!(cache_file.review_db_fingerprint, fingerprint);
         assert_eq!(
-            cache_file.entries.get("commit:abc1234"),
+            cache_file.entries.get(&cache_key),
             Some(&ScopeSelectorStatus::Reviewed { total_blocks: 3 })
         );
-        assert!(
-            cache_file
-                .entry_updated_unix_ms
-                .contains_key("commit:abc1234")
-        );
+        assert!(cache_file.entry_updated_unix_ms.contains_key(&cache_key));
     }
 
     #[test]
     fn scope_selector_status_poller_reports_unavailable_when_status_loader_panics() {
-        let jobs = vec![ScopeSelectorStatusJob {
-            index: 0,
-            scope: ScopePreset::MainDiff,
-            cache_key: "main-diff".to_string(),
-        }];
-        let mut selector = ScopeSelector::new(vec![ScopeSelectorOption {
+        let mut poller =
+            ScopeSelectorStatusPoller::new(ScopeStatusKeyContext::default(), None, |_| {
+                panic!("simulated diff status panic");
+            });
+        let mut selector = ScopeSelector::new(vec![poller.selector_option(ScopeOption {
             label: "Diff vs main".to_string(),
             scope: ScopePreset::MainDiff,
-            status: ScopeSelectorStatus::Checking,
-        }]);
-        let mut poller = ScopeSelectorStatusPoller::spawn_with_loader(jobs, None, move |_| {
-            panic!("simulated diff status panic");
-        })
-        .unwrap_or_else(|| panic!("expected status poller"));
+        })]);
 
-        let changed = poller.wait_for_update(&mut selector, Duration::from_secs(1));
+        poller.sync_visible(&mut selector, 0..1);
+        let changed = poller.wait_for_update(&mut selector, Duration::from_secs(5));
 
         assert!(changed, "expected panic to produce status update");
-        assert_eq!(poller.pending_jobs, 0);
+        assert!(!poller.has_pending_jobs());
         assert_eq!(selector.options[0].status, ScopeSelectorStatus::Unavailable);
     }
 
-    #[test]
-    fn scope_selector_status_poller_marks_checking_rows_unavailable_on_worker_disconnect() {
-        let (sender, receiver) = mpsc::channel::<ScopeSelectorStatusUpdate>();
-        drop(sender);
-        let mut selector = ScopeSelector::new(vec![ScopeSelectorOption {
-            label: "Diff vs main".to_string(),
-            scope: ScopePreset::MainDiff,
-            status: ScopeSelectorStatus::Checking,
-        }]);
-        let mut poller = ScopeSelectorStatusPoller {
-            receiver,
-            pending_jobs: 1,
-            cache: None,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+    /// Records which commits a status loader checked and blocks on `commit-0` until
+    /// released, so tests control what is in flight versus still queued.
+    struct BlockingStatusLoader {
+        started: Arc<Mutex<Vec<String>>>,
+        first_started: Arc<TestSignal>,
+        release_first: Arc<TestSignal>,
+    }
 
-        assert!(poller.drain_updates(&mut selector));
-        assert_eq!(poller.pending_jobs, 0);
-        assert_eq!(selector.options[0].status, ScopeSelectorStatus::Unavailable);
+    impl BlockingStatusLoader {
+        fn new() -> Self {
+            Self {
+                started: Arc::new(Mutex::new(Vec::new())),
+                first_started: Arc::new(TestSignal::new()),
+                release_first: Arc::new(TestSignal::new()),
+            }
+        }
+
+        fn loader(&self) -> impl Fn(ScopePreset) -> ScopeSelectorStatus + Send + Sync + 'static {
+            let started = Arc::clone(&self.started);
+            let first_started = Arc::clone(&self.first_started);
+            let release_first = Arc::clone(&self.release_first);
+            move |scope| {
+                let ScopePreset::Commit { id, .. } = scope else {
+                    panic!("unexpected scope");
+                };
+                started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(id.clone());
+                if id == "commit-0" {
+                    first_started.notify();
+                    release_first.wait(Duration::from_secs(5), "first-job release");
+                }
+                ScopeSelectorStatus::Reviewed { total_blocks: 1 }
+            }
+        }
+
+        fn started(&self) -> Vec<String> {
+            self.started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    fn wait_for_all_status_updates(
+        poller: &mut ScopeSelectorStatusPoller,
+        selector: &mut ScopeSelector,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while poller.has_pending_jobs() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for status updates"
+            );
+            poller.wait_for_update(selector, Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn scope_selector_status_poller_only_checks_rows_while_they_are_visible() {
+        let loader = BlockingStatusLoader::new();
+        let mut poller =
+            ScopeSelectorStatusPoller::new(ScopeStatusKeyContext::default(), None, loader.loader());
+        let options = (0..4)
+            .map(|index| poller.selector_option(commit_scope(&format!("commit-{index}"))))
+            .collect();
+        let mut selector = ScopeSelector::new(options);
+
+        poller.sync_visible(&mut selector, 0..3);
+        loader
+            .first_started
+            .wait(Duration::from_secs(5), "first job to start");
+        assert!(
+            matches!(
+                selector.options[3].status_check,
+                ScopeStatusCheck::Needed { .. }
+            ),
+            "off-screen rows are never queued"
+        );
+
+        // Row 1 scrolls away before a worker reaches it; row 2 stays on screen.
+        poller.sync_visible(&mut selector, 2..3);
+        assert!(matches!(
+            selector.options[1].status_check,
+            ScopeStatusCheck::Needed { .. }
+        ));
+        loader.release_first.notify();
+        wait_for_all_status_updates(&mut poller, &mut selector);
+
+        assert_eq!(loader.started(), ["commit-0", "commit-2"]);
+        assert_eq!(selector.options[1].status, ScopeSelectorStatus::Checking);
+        assert_eq!(
+            selector.options[2].status,
+            ScopeSelectorStatus::Reviewed { total_blocks: 1 }
+        );
+
+        // The worker retired once the queue drained; scrolling back starts a new one.
+        poller.sync_visible(&mut selector, 1..2);
+        wait_for_all_status_updates(&mut poller, &mut selector);
+        assert_eq!(loader.started(), ["commit-0", "commit-2", "commit-1"]);
+        assert_eq!(
+            selector.options[1].status,
+            ScopeSelectorStatus::Reviewed { total_blocks: 1 }
+        );
     }
 
     #[test]
     fn scope_selector_status_poller_bounds_background_checkers_and_cancels_queued_jobs() {
-        let jobs = (0..3)
-            .map(|index| ScopeSelectorStatusJob {
-                index,
-                scope: ScopePreset::Commit {
-                    id: format!("commit-{index}"),
-                    summary: "Update".to_string(),
-                },
-                cache_key: format!("commit:{index}"),
-            })
-            .collect::<Vec<_>>();
-        let started_jobs = Arc::new(AtomicBool::new(false));
-        let started_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let first_job_started = Arc::new(TestSignal::new());
-        let release_first_job = Arc::new(TestSignal::new());
-        let first_job_finished = Arc::new(TestSignal::new());
-        let started_count_for_loader = Arc::clone(&started_count);
-        let started_jobs_for_loader = Arc::clone(&started_jobs);
-        let first_job_started_for_loader = Arc::clone(&first_job_started);
-        let release_first_job_for_loader = Arc::clone(&release_first_job);
-        let first_job_finished_for_loader = Arc::clone(&first_job_finished);
-        let poller = ScopeSelectorStatusPoller::spawn_with_loader(jobs, None, move |_| {
-            started_jobs_for_loader.store(true, Ordering::Relaxed);
-            let previous_starts = started_count_for_loader.fetch_add(1, Ordering::Relaxed);
-            if previous_starts == 0 {
-                first_job_started_for_loader.notify();
-                release_first_job_for_loader.wait(Duration::from_secs(1), "first-job release");
-                first_job_finished_for_loader.notify();
-            }
-            ScopeSelectorStatus::Reviewed { total_blocks: 1 }
-        })
-        .unwrap_or_else(|| panic!("expected status poller"));
+        let loader = BlockingStatusLoader::new();
+        let mut poller =
+            ScopeSelectorStatusPoller::new(ScopeStatusKeyContext::default(), None, loader.loader());
+        let options = (0..3)
+            .map(|index| poller.selector_option(commit_scope(&format!("commit-{index}"))))
+            .collect();
+        let mut selector = ScopeSelector::new(options);
 
-        first_job_started.wait(Duration::from_secs(1), "first job to start");
-        assert!(started_jobs.load(Ordering::Relaxed));
-        assert_eq!(started_count.load(Ordering::Relaxed), 1);
+        poller.sync_visible(&mut selector, 0..3);
+        loader
+            .first_started
+            .wait(Duration::from_secs(5), "first job to start");
+        assert_eq!(loader.started(), ["commit-0"]);
 
-        poller.cancel();
         drop(poller);
-        release_first_job.notify();
-        first_job_finished.wait(Duration::from_secs(1), "first job to finish");
+        loader.release_first.notify();
+        // Give a wrongly surviving worker time to pick up the queued jobs.
+        thread::sleep(Duration::from_millis(100));
 
-        assert_eq!(started_count.load(Ordering::Relaxed), 1);
+        assert_eq!(loader.started(), ["commit-0"]);
     }
 
     #[test]

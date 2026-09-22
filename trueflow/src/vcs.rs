@@ -1131,44 +1131,53 @@ pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<Hash
     collect_changed_paths(repo, Some(&base_tree), Some(&head_tree))
 }
 
-pub fn recent_commits(limit: usize) -> Result<Vec<CommitInfo>> {
-    let repo = repo_from_workdir()?;
-    recent_commits_in_repo(&repo, limit)
+pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Vec<CommitInfo>> {
+    let mut history = FirstParentHistory::from_head(repo);
+    let mut commits = Vec::new();
+    while commits.len() < limit {
+        let Some(commit) = history.next_commit(repo)? else {
+            break;
+        };
+        commits.push(commit);
+    }
+    Ok(commits)
 }
 
-pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Vec<CommitInfo>> {
-    if limit == 0 {
-        return Ok(Vec::new());
+/// Resumable walk of HEAD's first-parent chain, newest first.
+#[derive(Debug, Clone)]
+pub struct FirstParentHistory {
+    next: Option<gix::ObjectId>,
+}
+
+impl FirstParentHistory {
+    /// Starts at HEAD; an unborn or unreadable HEAD yields an empty history.
+    pub fn from_head(repo: &gix::Repository) -> Self {
+        Self {
+            next: repo.head_commit().ok().map(|commit| commit.id),
+        }
     }
 
-    let Ok(head_commit) = repo.head_commit() else {
-        return Ok(Vec::new());
-    };
+    pub fn is_exhausted(&self) -> bool {
+        self.next.is_none()
+    }
 
-    let mut commits = Vec::new();
-    let mut current = head_commit;
-
-    loop {
-        let summary = current.message().map_or_else(
+    /// Returns the next older commit, or `None` once the root has been returned.
+    pub fn next_commit(&mut self, repo: &gix::Repository) -> Result<Option<CommitInfo>> {
+        let Some(id) = self.next else {
+            return Ok(None);
+        };
+        let commit = repo.find_commit(id)?;
+        let summary = commit.message().map_or_else(
             |_| "(no message)".to_string(),
             |message| message.summary().to_str_lossy().to_string(),
         );
-        commits.push(CommitInfo {
-            id: CommitId::new(current.id().detach().to_string())?,
+        let info = CommitInfo {
+            id: CommitId::new(id.to_string())?,
             summary,
-        });
-
-        if commits.len() >= limit {
-            break;
-        }
-
-        let Some(parent_id) = current.parent_ids().next() else {
-            break;
         };
-        current = repo.find_commit(parent_id)?;
+        self.next = commit.parent_ids().next().map(gix::Id::detach);
+        Ok(Some(info))
     }
-
-    Ok(commits)
 }
 
 pub fn files_changed_in_revision(revision: &str) -> Result<HashSet<ChangedPath>> {

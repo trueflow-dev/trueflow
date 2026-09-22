@@ -439,6 +439,13 @@ Leaving the AI-plan loading screen cancels its provider process group.
 
 ### TUI
 
+Without `--target`, the TUI opens a review scope selector listing all files,
+the diff against main, and HEAD's first-parent commits. Older commits load in
+pages of 50 as the selection nears the end of the list, so `j`/Down reaches any
+commit back to the root. When launched from a subdirectory, only commits that
+touch it are listed. Each commit's remaining-review status is computed in the
+background only while its row is on screen.
+
 Main review actions:
 
 - In the root view, `j`/`k` and Up/Down move the selection through the visible file/dir list
