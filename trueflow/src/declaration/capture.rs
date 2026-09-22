@@ -775,12 +775,9 @@ fn changed_pair_selected(selection: &ReviewPathSelection, changed_path: &Changed
                 || explicit_path_selected(files, dirs, &changed_path.source_location)
                 || explicit_path_selected(files, dirs, &changed_path.location);
             explicitly_selected
-                && changed.as_ref().is_none_or(|selected| {
-                    selected.iter().any(|candidate| {
-                        candidate.source_location == changed_path.source_location
-                            && candidate.location == changed_path.location
-                    })
-                })
+                && changed
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(changed_path))
         }
     }
 }
