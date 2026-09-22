@@ -106,11 +106,14 @@ pub fn set_wpm(model: &mut SpeedReadModel, new_wpm: u16, min: u16, max: u16) {
 }
 
 pub fn rechunk_preserving_progress(model: &mut SpeedReadModel, new_chunk_words: u8) {
+    let current_word = model
+        .phrases
+        .get(model.cursor)
+        .map_or(0, |phrase| phrase.start_word_index);
     model.settings.chunk_words = new_chunk_words.max(1);
     model.phrases = build_phrases(&model.tokens, model.settings.chunk_words);
-    if model.cursor >= model.phrases.len() {
-        model.cursor = model.phrases.len().saturating_sub(1);
-    }
+    model.cursor = (current_word / usize::from(model.settings.chunk_words))
+        .min(model.phrases.len().saturating_sub(1));
 }
 
 pub fn tick_interval_ms(wpm: u16, chunk_words: u8) -> u64 {
@@ -223,12 +226,22 @@ mod tests {
 
     #[test]
     fn rechunk_preserves_current_word_progress() {
-        let mut model = new_model("one two three four five six", 320, 2);
+        let text = "one two three four five six seven eight nine";
+
+        let mut model = new_model(text, 320, 1);
+        model.cursor = 4; // "five"
+        rechunk_preserving_progress(&mut model, 2);
+        assert_eq!(model.phrases[model.cursor].text, "five six");
+
+        let mut model = new_model(text, 320, 3);
+        model.cursor = 1; // "four five six"
+        rechunk_preserving_progress(&mut model, 1);
+        assert_eq!(model.phrases[model.cursor].text, "four");
+
+        let mut model = new_model(text, 320, 2);
         model.cursor = 1; // "three four"
         rechunk_preserving_progress(&mut model, 3);
-        assert_eq!(model.phrases.len(), 2);
-        assert_eq!(model.cursor, 1);
-        assert_eq!(model.phrases[1].text, "four five six");
+        assert_eq!(model.phrases[model.cursor].text, "one two three");
     }
 
     #[test]
