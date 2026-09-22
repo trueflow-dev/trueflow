@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -48,11 +48,19 @@ pub(crate) trait GpgRunner {
 
     fn export_public_key(&self, key_id: Option<&str>) -> Result<GpgCommandOutput>;
 
-    fn import_public_key(&self, homedir: &Path, key_path: &Path) -> Result<GpgCommandOutput>;
+    /// Convert an ASCII-armored public key into a binary keyring file.
+    fn dearmor_public_key(
+        &self,
+        homedir: &Path,
+        armored_path: &Path,
+        keyring_path: &Path,
+    ) -> Result<GpgCommandOutput>;
 
+    /// Verify a detached signature against exactly the keys in `keyring_path`.
     fn verify_signature(
         &self,
         homedir: &Path,
+        keyring_path: &Path,
         signature_path: &Path,
         payload_path: &Path,
     ) -> Result<GpgCommandOutput>;
@@ -120,19 +128,29 @@ impl GpgRunner for SystemGpgRunner {
         })
     }
 
-    fn import_public_key(&self, homedir: &Path, key_path: &Path) -> Result<GpgCommandOutput> {
-        let mut import = Command::new("gpg");
-        import
+    fn dearmor_public_key(
+        &self,
+        homedir: &Path,
+        armored_path: &Path,
+        keyring_path: &Path,
+    ) -> Result<GpgCommandOutput> {
+        let mut dearmor = Command::new("gpg");
+        dearmor
             .arg("--batch")
             .arg("--no-tty")
+            .arg("--yes")
             .arg("--homedir")
             .arg(homedir)
-            .arg("--import")
-            .arg(key_path)
+            .arg("--dearmor")
+            .arg("--output")
+            .arg(keyring_path)
+            .arg(armored_path)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        let output = import.output().context("Failed to import gpg public key")?;
+        let output = dearmor
+            .output()
+            .context("Failed to dearmor gpg public key")?;
         Ok(GpgCommandOutput {
             success: output.status.success(),
             stdout: output.stdout,
@@ -140,25 +158,28 @@ impl GpgRunner for SystemGpgRunner {
         })
     }
 
+    // gpgv checks only the given keyring and needs no agent or trust
+    // database; `gpg --import` fails when it cannot reach an agent (e.g. when
+    // the socket path under a long macOS TMPDIR exceeds the platform limit).
     fn verify_signature(
         &self,
         homedir: &Path,
+        keyring_path: &Path,
         signature_path: &Path,
         payload_path: &Path,
     ) -> Result<GpgCommandOutput> {
-        let mut verify = Command::new("gpg");
+        let mut verify = Command::new("gpgv");
         verify
-            .arg("--batch")
-            .arg("--no-tty")
             .arg("--homedir")
             .arg(homedir)
-            .arg("--verify")
+            .arg("--keyring")
+            .arg(keyring_path)
             .arg(signature_path)
             .arg(payload_path)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        let output = verify.output().context("Failed to verify gpg signature")?;
+        let output = verify.output().context("Failed to run gpgv")?;
         Ok(GpgCommandOutput {
             success: output.status.success(),
             stdout: output.stdout,
@@ -170,7 +191,9 @@ impl GpgRunner for SystemGpgRunner {
 pub(crate) struct GpgClient<R = SystemGpgRunner> {
     runner: R,
     verify_home: Option<PathBuf>,
-    imported_public_keys: HashSet<String>,
+    /// One keyring per distinct attestation public key, so a signature only
+    /// verifies against the key its own attestation claims.
+    keyrings: HashMap<String, PathBuf>,
 }
 
 impl GpgClient<SystemGpgRunner> {
@@ -184,7 +207,7 @@ impl<R: GpgRunner> GpgClient<R> {
         Self {
             runner,
             verify_home: None,
-            imported_public_keys: HashSet::new(),
+            keyrings: HashMap::new(),
         }
     }
 
@@ -209,9 +232,9 @@ impl<R: GpgRunner> GpgClient<R> {
         signature: &str,
         public_key: &str,
     ) -> Result<bool> {
-        if !self.ensure_public_key_imported(public_key)? {
+        let Some(keyring_path) = self.ensure_public_key_keyring(public_key)? else {
             return Ok(false);
-        }
+        };
 
         let verify_home = self.ensure_verify_home()?;
         let signature_path = verify_home.join("signature.asc");
@@ -220,27 +243,34 @@ impl<R: GpgRunner> GpgClient<R> {
         fs::write(&signature_path, signature)?;
         fs::write(&payload_path, payload)?;
 
-        let output = self
-            .runner
-            .verify_signature(&verify_home, &signature_path, &payload_path)?;
+        let output = self.runner.verify_signature(
+            &verify_home,
+            &keyring_path,
+            &signature_path,
+            &payload_path,
+        )?;
         Ok(output.success)
     }
 
-    fn ensure_public_key_imported(&mut self, public_key: &str) -> Result<bool> {
-        if self.imported_public_keys.contains(public_key) {
-            return Ok(true);
+    fn ensure_public_key_keyring(&mut self, public_key: &str) -> Result<Option<PathBuf>> {
+        if let Some(keyring_path) = self.keyrings.get(public_key) {
+            return Ok(Some(keyring_path.clone()));
         }
 
         let verify_home = self.ensure_verify_home()?;
         let key_path = verify_home.join("pubkey.asc");
+        let keyring_path = verify_home.join(format!("keyring-{}.gpg", self.keyrings.len()));
         fs::write(&key_path, public_key)?;
-        let output = self.runner.import_public_key(&verify_home, &key_path)?;
+        let output = self
+            .runner
+            .dearmor_public_key(&verify_home, &key_path, &keyring_path)?;
         if !output.success {
-            return Ok(false);
+            return Ok(None);
         }
 
-        self.imported_public_keys.insert(public_key.to_string());
-        Ok(true)
+        self.keyrings
+            .insert(public_key.to_string(), keyring_path.clone());
+        Ok(Some(keyring_path))
     }
 
     fn ensure_verify_home(&mut self) -> Result<PathBuf> {
@@ -297,7 +327,7 @@ mod tests {
     struct FakeGpgRunner {
         sign_output: RefCell<Option<GpgCommandOutput>>,
         export_output: RefCell<Option<GpgCommandOutput>>,
-        imported_keys: RefCell<Vec<String>>,
+        dearmored_keys: RefCell<Vec<String>>,
         verified_payloads: RefCell<Vec<String>>,
     }
 
@@ -323,23 +353,37 @@ mod tests {
                 .unwrap_or_else(|| GpgCommandOutput::success("public key\n")))
         }
 
-        fn import_public_key(&self, _homedir: &Path, key_path: &Path) -> Result<GpgCommandOutput> {
-            self.imported_keys
-                .borrow_mut()
-                .push(fs::read_to_string(key_path)?);
+        fn dearmor_public_key(
+            &self,
+            _homedir: &Path,
+            armored_path: &Path,
+            keyring_path: &Path,
+        ) -> Result<GpgCommandOutput> {
+            let key = fs::read_to_string(armored_path)?;
+            fs::write(keyring_path, &key)?;
+            self.dearmored_keys.borrow_mut().push(key);
             Ok(GpgCommandOutput::success(Vec::new()))
         }
 
+        /// Models gpgv: a signature `signed-by:<key>` is good only when that
+        /// key is in the supplied keyring.
         fn verify_signature(
             &self,
             _homedir: &Path,
-            _signature_path: &Path,
+            keyring_path: &Path,
+            signature_path: &Path,
             payload_path: &Path,
         ) -> Result<GpgCommandOutput> {
             self.verified_payloads
                 .borrow_mut()
                 .push(fs::read_to_string(payload_path)?);
-            Ok(GpgCommandOutput::success(Vec::new()))
+            let keyring = fs::read_to_string(keyring_path)?;
+            let signature = fs::read_to_string(signature_path)?;
+            Ok(if signature == format!("signed-by:{keyring}") {
+                GpgCommandOutput::success(Vec::new())
+            } else {
+                GpgCommandOutput::failure("BAD signature")
+            })
         }
     }
 
@@ -374,25 +418,43 @@ mod tests {
     }
 
     #[test]
-    fn verify_imports_each_public_key_once() {
+    fn verify_dearmors_each_public_key_once() {
         let runner = Rc::new(FakeGpgRunner::default());
         let mut client = GpgClient::with_runner(Rc::clone(&runner));
 
         assert!(
             client
-                .verify("payload one", "signature one", "public key")
+                .verify("payload one", "signed-by:public key", "public key")
                 .unwrap()
         );
         assert!(
             client
-                .verify("payload two", "signature two", "public key")
+                .verify("payload two", "signed-by:public key", "public key")
                 .unwrap()
         );
 
-        assert_eq!(runner.imported_keys.borrow().as_slice(), ["public key"]);
+        assert_eq!(runner.dearmored_keys.borrow().as_slice(), ["public key"]);
         assert_eq!(
             runner.verified_payloads.borrow().as_slice(),
             ["payload one", "payload two"]
+        );
+    }
+
+    #[test]
+    fn verify_rejects_signature_by_another_attestations_key() {
+        let runner = Rc::new(FakeGpgRunner::default());
+        let mut client = GpgClient::with_runner(Rc::clone(&runner));
+
+        assert!(
+            client
+                .verify("payload", "signed-by:mallory", "mallory")
+                .unwrap()
+        );
+        assert!(
+            !client
+                .verify("payload", "signed-by:mallory", "alice")
+                .unwrap(),
+            "a signature must only verify against its own attestation's public key"
         );
     }
 }
