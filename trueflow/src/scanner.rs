@@ -623,8 +623,20 @@ fn write_cache(root: &Path, options: &ScanOptions, files: Vec<CachedFileEntry>) 
     };
 
     let contents = serde_json::to_string(&entry)?;
-    fs::write(cache_path, contents)?;
-    Ok(())
+    // Readers and concurrent scans (other processes, TUI status workers) must
+    // never observe a truncated or interleaved cache, so publish atomically.
+    let file_name = cache_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary_path =
+        cache_path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = fs::write(&temporary_path, contents)
+        .and_then(|()| fs::rename(&temporary_path, &cache_path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    Ok(result?)
 }
 
 fn scan_options_fingerprint(options: &ScanOptions) -> String {
