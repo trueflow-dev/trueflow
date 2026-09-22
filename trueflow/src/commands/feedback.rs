@@ -1656,20 +1656,14 @@ fn declaration_range_source_anchor(
     {
         return None;
     }
-    let start_line = u32::try_from(
-        source[..start_byte]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count(),
-    )
-    .ok()?;
-    let last_line = u32::try_from(
-        source[..end_byte - 1]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count(),
-    )
-    .ok()?;
+    let newlines_before = |end: usize| {
+        source.as_bytes()[..end]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+    };
+    let start_line = u32::try_from(newlines_before(start_byte)).ok()?;
+    let last_line = u32::try_from(newlines_before(end_byte - 1)).ok()?;
     Some(SourceCommentAnchor {
         revision: revision.clone(),
         path: path.clone(),
@@ -3162,6 +3156,26 @@ mod tests {
                 Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange)
             );
         }
+    }
+
+    #[test]
+    fn declaration_range_source_anchor_accepts_range_ending_in_multibyte_char() {
+        let revision = CommitId::new("aaaaaaaa").unwrap();
+        let path = crate::repo_path::RepoPath::new("src/lib.rs").unwrap();
+        let source = "fn a() {}\nconst S: &str = \"é\";\nconst T: u8 = 0;\n";
+        let start_byte = source.find("const S").unwrap();
+        let end_byte = source.find(';').unwrap() - 1;
+        assert!(!source.is_char_boundary(end_byte - 1));
+
+        assert_eq!(
+            declaration_range_source_anchor(&revision, &path, source, start_byte, end_byte),
+            Some(SourceCommentAnchor {
+                revision: revision.clone(),
+                path: path.clone(),
+                start_line: 1,
+                end_line: 2,
+            })
+        );
     }
 
     #[test]
