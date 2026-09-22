@@ -196,6 +196,47 @@
    - Fixed by dropping `pair.slave` immediately after each spawned TUI child.
    - Verified by
      `nix develop -c cargo test --manifest-path trueflow/Cargo.toml --test tui_pty_smoke --features tui-test-support`.
+** DONE DEF_TODO [High] Bind each PGP attestation to its own public key
+   - `trueflow/src/gpg.rs` imported every attestation's public key into one
+     shared verification keyring, so a signature by any previously seen key
+     verified a record that claims a different key. `gpg --import` also exits
+     2 when it cannot reach gpg-agent (socket path under a long macOS TMPDIR),
+     so every signed record was reported invalid on macOS.
+   - Repro: two real keys Alice and Mallory; verify Mallory's signature with
+     Mallory's key, then the same signature claiming Alice's key. Before: both
+     false on macOS (import failure); on a working import both would pass.
+   - Fixed by dearmoring each distinct public key into its own keyring and
+     verifying with `gpgv --keyring <that keyring>`.
+   - Verified by
+     `cargo nextest run --features tui-test-support -E 'test(gpg) | binary(e2e_verify) | test(verify)'`
+     plus a real-gpg signed `mark` + `verify --all` smoke test.
+** DONE DEF_TODO [High] Avoid UTF-8 panic mapping declaration anchors to GitHub
+   - `declaration_range_source_anchor` sliced `source[..end_byte - 1]`, which
+     panics when a declaration ends with a multibyte character.
+   - Fixed by counting newlines over bytes.
+   - Verified by
+     `cargo nextest run --features tui-test-support --lib declaration_range_source_anchor`.
+** DONE DEF_TODO [Medium] Remap PR feedback across renames of non-ASCII paths
+   - `pure_rename_path` parsed `git diff --name-status` without `-z`; git
+     quotes non-ASCII paths under `core.quotePath`, so they never matched.
+   - Fixed by requesting `-z` and parsing NUL-delimited entries.
+   - Verified by
+     `cargo nextest run --features tui-test-support --lib pure_rename_path_matches_non_ascii_paths`.
+** DONE DEF_TODO [Medium] Detect TOML table headers with trailing comments
+   - `[package] # comment` failed the header check, so the table became a root
+     key and its keys leaked into the preceding scope.
+   - Verified by
+     `cargo nextest run --features tui-test-support --lib toml_blocks`.
+** DONE DEF_TODO [Medium] Publish the scan cache atomically
+   - `write_cache` truncated and rewrote the shared cache in place; concurrent
+     scans could read a partial file or interleave writes.
+   - Fixed with a unique temporary file renamed over the cache. A throwaway
+     two-writer/one-reader probe saw 2/500 failed reads before, 0/1500 after.
+** DONE DEF_TODO [Low] Keep the current word when rechunking speed-read
+   - `rechunk_preserving_progress` kept the phrase index, jumping the reader
+     when the chunk size changed; the existing test pinned the jump.
+   - Verified by
+     `cargo nextest run --features tui-test-support --lib rechunk`.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of
