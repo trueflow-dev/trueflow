@@ -338,46 +338,68 @@ struct ReviewCoverageStatusCacheFile {
 struct ReviewCoverageStatusCacheStore {
     path: PathBuf,
     fingerprint: ReviewDatabaseFingerprint,
+    /// Statuses computed against `fingerprint`; the only entries ever persisted.
     entries: HashMap<String, ScopeSelectorStatus>,
     entry_updated_unix_ms: HashMap<String, u64>,
-    fresh: bool,
+    /// Statuses read from a cache written for an older review database. They seed
+    /// the display until each row is re-checked, and are never written back.
+    stale_entries: HashMap<String, ScopeSelectorStatus>,
     dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedScopeStatus {
+    /// Computed against the current review database.
+    Current(ScopeSelectorStatus),
+    /// Computed against an older review database; display only.
+    Stale(ScopeSelectorStatus),
 }
 
 impl ReviewCoverageStatusCacheStore {
     fn load() -> Option<Self> {
         let store = FileStore::new().ok()?;
-        let path = store.trueflow_dir().join(REVIEW_COVERAGE_STATUS_CACHE_FILE);
-        let fingerprint = review_database_fingerprint(&store.db_path());
+        Some(Self::open(
+            store.trueflow_dir().join(REVIEW_COVERAGE_STATUS_CACHE_FILE),
+            review_database_fingerprint(&store.db_path()),
+        ))
+    }
+
+    fn open(path: PathBuf, fingerprint: ReviewDatabaseFingerprint) -> Self {
         let cache = read_review_coverage_status_cache_file(&path);
-        let fresh = cache
-            .as_ref()
-            .is_some_and(|cache| cache.review_db_fingerprint == fingerprint);
+        let (entries, entry_updated_unix_ms, stale_entries) = match cache {
+            Some(cache) if cache.review_db_fingerprint == fingerprint => {
+                (cache.entries, cache.entry_updated_unix_ms, HashMap::new())
+            }
+            Some(cache) => (HashMap::new(), HashMap::new(), cache.entries),
+            None => (HashMap::new(), HashMap::new(), HashMap::new()),
+        };
         let mut store = Self {
             path,
             fingerprint,
-            entries: cache
-                .as_ref()
-                .map(|cache| cache.entries.clone())
-                .unwrap_or_default(),
-            entry_updated_unix_ms: cache
-                .map(|cache| cache.entry_updated_unix_ms)
-                .unwrap_or_default(),
-            fresh,
+            entries,
+            entry_updated_unix_ms,
+            stale_entries,
             dirty: false,
         };
         if store.prune_to_bound() {
             store.dirty = true;
             store.flush();
         }
-        Some(store)
+        store
     }
 
-    fn cached_status(&self, cache_key: &str) -> Option<ScopeSelectorStatus> {
+    fn cached_status(&self, cache_key: &str) -> Option<CachedScopeStatus> {
+        let cacheable = |status: &&ScopeSelectorStatus| status.is_cacheable();
         self.entries
             .get(cache_key)
-            .copied()
-            .filter(|status| status.is_cacheable())
+            .filter(cacheable)
+            .map(|status| CachedScopeStatus::Current(*status))
+            .or_else(|| {
+                self.stale_entries
+                    .get(cache_key)
+                    .filter(cacheable)
+                    .map(|status| CachedScopeStatus::Stale(*status))
+            })
     }
 
     fn record(&mut self, cache_key: &str, status: ScopeSelectorStatus) {
@@ -385,15 +407,13 @@ impl ReviewCoverageStatusCacheStore {
             return;
         }
 
-        let now = current_unix_ms();
-        let previous = self.entries.insert(cache_key.to_string(), status);
-        let previous_updated = self
-            .entry_updated_unix_ms
-            .insert(cache_key.to_string(), now);
-        if previous != Some(status) || previous_updated != Some(now) || !self.fresh {
-            self.dirty = true;
-        }
-        self.fresh = true;
+        self.stale_entries.remove(cache_key);
+        self.entries.insert(cache_key.to_string(), status);
+        // A new timestamp is always a change: it keeps recently checked rows
+        // ahead of eviction and stamps the current review database fingerprint.
+        self.entry_updated_unix_ms
+            .insert(cache_key.to_string(), current_unix_ms());
+        self.dirty = true;
     }
 
     fn prune_to_bound(&mut self) -> bool {
@@ -468,9 +488,6 @@ struct ScopeSelectorStatusPoller {
     /// Queued plus in-flight jobs whose updates have not been applied yet.
     pending_jobs: usize,
     cache: Option<ReviewCoverageStatusCacheStore>,
-    /// Whether the cache matched the review database when the selector opened; later
-    /// records mark the in-memory cache fresh without refreshing older entries.
-    cache_fresh_at_load: bool,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -498,7 +515,6 @@ impl ScopeSelectorStatusPoller {
         L: Fn(ScopePreset) -> ScopeSelectorStatus + Send + Sync + 'static,
     {
         let (sender, receiver) = mpsc::channel();
-        let cache_fresh_at_load = cache.as_ref().is_some_and(|cache| cache.fresh);
         Self {
             receiver,
             sender,
@@ -507,7 +523,6 @@ impl ScopeSelectorStatusPoller {
             key_context,
             pending_jobs: 0,
             cache,
-            cache_fresh_at_load,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -533,19 +548,20 @@ impl ScopeSelectorStatusPoller {
             .cache
             .as_ref()
             .and_then(|cache| cache.cached_status(&cache_key));
-        let should_refresh = cached_status.is_none()
-            || !self.cache_fresh_at_load
-            || scope_selector_status_should_refresh_when_cached(&option.scope);
+        let (status, should_refresh) = match cached_status {
+            Some(CachedScopeStatus::Current(status)) => (
+                status,
+                scope_selector_status_should_refresh_when_cached(&option.scope),
+            ),
+            Some(CachedScopeStatus::Stale(status)) => (status, true),
+            None => (ScopeSelectorStatus::Checking, true),
+        };
         let status_check = if should_refresh {
             ScopeStatusCheck::Needed { cache_key }
         } else {
             ScopeStatusCheck::NotNeeded
         };
-        ScopeSelectorOption::from_scope_option(
-            option,
-            cached_status.unwrap_or(ScopeSelectorStatus::Checking),
-            status_check,
-        )
+        ScopeSelectorOption::from_scope_option(option, status, status_check)
     }
 
     /// Restricts queued checks to `visible` rows, top to bottom. Rows that scrolled out
@@ -10730,12 +10746,18 @@ mod diff_scope_tests {
         entries: Vec<(String, ScopeSelectorStatus)>,
         fresh: bool,
     ) -> ReviewCoverageStatusCacheStore {
+        let entries = entries.into_iter().collect::<HashMap<_, _>>();
+        let (entries, stale_entries) = if fresh {
+            (entries, HashMap::new())
+        } else {
+            (HashMap::new(), entries)
+        };
         ReviewCoverageStatusCacheStore {
             path,
             fingerprint: ReviewDatabaseFingerprint::default(),
-            entries: entries.into_iter().collect(),
+            entries,
             entry_updated_unix_ms: HashMap::new(),
-            fresh,
+            stale_entries,
             dirty: false,
         }
     }
@@ -11047,12 +11069,12 @@ mod diff_scope_tests {
         let mut cache = ReviewCoverageStatusCacheStore {
             path: cache_path.clone(),
             fingerprint,
-            entries: HashMap::from([(
+            entries: HashMap::new(),
+            entry_updated_unix_ms: HashMap::new(),
+            stale_entries: HashMap::from([(
                 "commit:abc1234".to_string(),
                 ScopeSelectorStatus::Reviewed { total_blocks: 3 },
             )]),
-            entry_updated_unix_ms: HashMap::new(),
-            fresh: false,
             dirty: false,
         };
 
@@ -11067,6 +11089,86 @@ mod diff_scope_tests {
         let cache_file: ReviewCoverageStatusCacheFile = serde_json::from_str(&cache_contents)
             .unwrap_or_else(|error| panic!("failed to parse cache json: {error}"));
         assert_eq!(cache_file.review_db_fingerprint, fingerprint);
+    }
+
+    #[test]
+    fn stale_cache_entries_are_not_promoted_to_current_by_an_unrelated_record() {
+        let cache_dir = temp_test_dir("scope_selector_status_cache_stale_promotion");
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("failed to create cache dir {cache_dir:?}: {error}"));
+        let cache_path = cache_dir.join("review_coverage_status.json");
+        let old_fingerprint = ReviewDatabaseFingerprint {
+            size_bytes: 1,
+            modified_unix_ms: 1,
+        };
+        let current_fingerprint = ReviewDatabaseFingerprint {
+            size_bytes: 2,
+            modified_unix_ms: 2,
+        };
+        let key_context = ScopeStatusKeyContext::default();
+        let key = |scope: &ScopePreset| {
+            review_coverage_status_cache_key(
+                scope,
+                &key_context.filters,
+                &key_context.scan_options,
+                None,
+            )
+        };
+        let rechecked = commit_scope("aaaaaaa");
+        let unchecked = commit_scope("bbbbbbb");
+        let stale_file = ReviewCoverageStatusCacheFile {
+            format_version: REVIEW_COVERAGE_STATUS_CACHE_FORMAT_VERSION,
+            review_db_fingerprint: old_fingerprint,
+            entries: HashMap::from([
+                (
+                    key(&rechecked.scope),
+                    ScopeSelectorStatus::Reviewed { total_blocks: 1 },
+                ),
+                (
+                    key(&unchecked.scope),
+                    ScopeSelectorStatus::Reviewed { total_blocks: 9 },
+                ),
+            ]),
+            entry_updated_unix_ms: HashMap::new(),
+        };
+        fs::write(&cache_path, serde_json::to_string(&stale_file).unwrap())
+            .unwrap_or_else(|error| panic!("failed to write stale cache file: {error}"));
+
+        // First launch after the review database changed re-checks one commit only.
+        let mut first_launch =
+            ReviewCoverageStatusCacheStore::open(cache_path.clone(), current_fingerprint);
+        first_launch.record(
+            &key(&rechecked.scope),
+            ScopeSelectorStatus::Pending {
+                remaining_blocks: 1,
+                total_blocks: 1,
+            },
+        );
+        first_launch.flush();
+
+        let second_launch = ScopeSelectorStatusPoller::new(
+            key_context.clone(),
+            Some(ReviewCoverageStatusCacheStore::open(
+                cache_path,
+                current_fingerprint,
+            )),
+            unused_status_loader,
+        );
+        let rechecked = second_launch.selector_option(rechecked);
+        let unchecked = second_launch.selector_option(unchecked);
+
+        assert_eq!(
+            rechecked.status,
+            ScopeSelectorStatus::Pending {
+                remaining_blocks: 1,
+                total_blocks: 1,
+            }
+        );
+        assert_eq!(rechecked.status_check, ScopeStatusCheck::NotNeeded);
+        assert!(
+            matches!(unchecked.status_check, ScopeStatusCheck::Needed { .. }),
+            "a status computed against an older review database must be re-checked: {unchecked:?}"
+        );
     }
 
     #[test]
@@ -11087,7 +11189,7 @@ mod diff_scope_tests {
                 ScopeSelectorStatus::Reviewed { total_blocks: 3 },
             )]),
             entry_updated_unix_ms: HashMap::from([("commit:abc1234".to_string(), 1)]),
-            fresh: true,
+            stale_entries: HashMap::new(),
             dirty: false,
         };
 
@@ -11116,7 +11218,7 @@ mod diff_scope_tests {
             fingerprint: ReviewDatabaseFingerprint::default(),
             entries: HashMap::new(),
             entry_updated_unix_ms: HashMap::new(),
-            fresh: true,
+            stale_entries: HashMap::new(),
             dirty: false,
         };
 
