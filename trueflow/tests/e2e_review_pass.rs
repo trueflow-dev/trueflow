@@ -109,6 +109,44 @@ fn review_focused_pass_skips_blocks_the_reviewer_already_commented() -> Result<(
 }
 
 #[test]
+fn review_focused_pass_with_only_commented_blocks_says_nothing_is_new() -> Result<()> {
+    let (repo, target) = changed_repo("review_focused_pass_all_commented")?;
+    let full = json_array(&repo.run(&["review", "--target", &target, "--json"])?)?;
+    let fingerprints = full[0]["blocks"]
+        .as_array()
+        .context("blocks")?
+        .iter()
+        .map(|block| block["hash"].as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .context("block hashes")?;
+    assert_eq!(fingerprints.len(), 7);
+    for fingerprint in &fingerprints {
+        repo.run(&[
+            "mark",
+            "--fingerprint",
+            fingerprint,
+            "--verdict",
+            "comment",
+            "--note",
+            "Revisit.",
+        ])?;
+    }
+
+    let output = repo.run(&["review", "--target", &target, "--pass", "focused"])?;
+
+    assert!(!output.contains("All clear"), "{output}");
+    assert!(
+        output.contains("Nothing new for a focused pass"),
+        "{output}"
+    );
+    assert!(
+        output.contains("All 7 pending blocks have unresolved comments"),
+        "{output}"
+    );
+    Ok(())
+}
+
+#[test]
 fn review_full_pass_output_is_unchanged_and_budget_needs_a_focused_pass() -> Result<()> {
     let (repo, target) = changed_repo("review_full_pass_json")?;
 

@@ -1178,12 +1178,29 @@ impl CardQueuePurpose {
     const fn allows_view_toggle(self) -> bool {
         matches!(self, Self::FocusedPass { .. })
     }
+}
 
-    /// Pending blocks a full review of the same scope would still show.
-    const fn continuable_remainder(self) -> Option<usize> {
-        match self {
-            Self::FocusedPass { remainder } if remainder > 0 => Some(remainder),
-            Self::FocusedPass { .. } | Self::Plan(_) => None,
+/// What a finished focused pass can continue into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassContinuation {
+    /// Every pending block of the scope was part of the pass.
+    Nothing,
+    /// Pending blocks remain, but none a pass would pick.
+    FullReview,
+    /// Pending blocks remain and another pass may pick some of them.
+    FullReviewOrNextPass,
+}
+
+impl OnboardingState {
+    /// `None` for portable plans, which have no scope to continue.
+    fn pass_continuation(&self) -> Option<PassContinuation> {
+        match self.purpose {
+            CardQueuePurpose::Plan(_) => None,
+            CardQueuePurpose::FocusedPass { remainder: 0 } => Some(PassContinuation::Nothing),
+            CardQueuePurpose::FocusedPass { .. } if self.cards.is_empty() => {
+                Some(PassContinuation::FullReview)
+            }
+            CardQueuePurpose::FocusedPass { .. } => Some(PassContinuation::FullReviewOrNextPass),
         }
     }
 }
@@ -2560,13 +2577,33 @@ fn ai_pass_for_state(
     crate::review_pass::ai_pass(&focused_pass_candidates(state), picks, budget)
 }
 
-/// Restricts the session to the pass's cards. An empty plan leaves the full queue.
+/// Restricts the session to the pass's cards. When pending blocks exist but a
+/// pass picks none of them, the session opens on a recap that says why and
+/// offers the full review; it never turns into a full review silently.
 fn start_focused_pass(state: &mut AppState, plan: &PassPlan<TreeNodeId>) -> Result<()> {
-    if plan.cards.is_empty() {
-        return Ok(());
-    }
     let title = state.scope_label.clone();
     let pending_blocks = state.reviewable_nodes.len();
+    if plan.cards.is_empty() {
+        if pending_blocks > 0 {
+            state.onboarding = Some(OnboardingState {
+                title,
+                description: crate::review_pass::nothing_new_reason(
+                    pending_blocks,
+                    state
+                        .commented_nodes
+                        .intersection(&state.reviewable_nodes)
+                        .count(),
+                ),
+                cards: Vec::new(),
+                finished: true,
+                purpose: CardQueuePurpose::FocusedPass {
+                    remainder: pending_blocks,
+                },
+                details_scroll: None,
+            });
+        }
+        return Ok(());
+    }
     configure_onboarding(
         state,
         title,
@@ -4816,16 +4853,21 @@ fn recap_done_action_text(keybinds: &TuiKeybindsConfig) -> String {
 }
 
 /// Recap keys for the current session; a focused pass with a remainder adds
-/// Enter (continue the full review) and the focused-pass key (another pass).
+/// Enter (continue the full review) and, when another pass could pick
+/// something, the focused-pass key.
 fn recap_action_for_state(state: &AppState, key_code: KeyCode) -> Option<RecapAction> {
-    let continuable = state
+    let continuation = state
         .onboarding
         .as_ref()
-        .and_then(|queue| queue.purpose.continuable_remainder())
-        .is_some();
-    match key_code {
-        KeyCode::Enter if continuable => Some(RecapAction::ContinueFullReview),
-        KeyCode::Char(key) if continuable && key == state.keybinds.focused_pass => {
+        .and_then(OnboardingState::pass_continuation);
+    match (key_code, continuation) {
+        (
+            KeyCode::Enter,
+            Some(PassContinuation::FullReview | PassContinuation::FullReviewOrNextPass),
+        ) => Some(RecapAction::ContinueFullReview),
+        (KeyCode::Char(key), Some(PassContinuation::FullReviewOrNextPass))
+            if key == state.keybinds.focused_pass =>
+        {
             Some(RecapAction::NextFocusedPass)
         }
         _ => recap_action_for_key_code(&state.keybinds, key_code),
@@ -6099,9 +6141,13 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
                 purpose.label().to_ascii_lowercase(),
                 state.keybinds.quit
             ),
-            Some(purpose @ CardQueuePurpose::FocusedPass { .. }) => {
-                focused_pass_recap_hint_text(&state.keybinds, purpose.continuable_remainder())
-            }
+            Some(CardQueuePurpose::FocusedPass { .. }) => focused_pass_recap_hint_text(
+                &state.keybinds,
+                state
+                    .onboarding
+                    .as_ref()
+                    .and_then(OnboardingState::pass_continuation),
+            ),
             None => recap_footer_hint_text(&state.keybinds),
         };
         match &state.action_error {
@@ -7668,18 +7714,24 @@ fn recap_footer_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     )
 }
 
-fn focused_pass_recap_hint_text(keybinds: &TuiKeybindsConfig, remainder: Option<usize>) -> String {
+fn focused_pass_recap_hint_text(
+    keybinds: &TuiKeybindsConfig,
+    continuation: Option<PassContinuation>,
+) -> String {
     let rest = format!(
         "[{}] review something else  [{}/Esc] exit",
         recap_done_key(keybinds),
         keybinds.quit
     );
-    match remainder {
-        Some(_) => format!(
+    match continuation {
+        Some(PassContinuation::FullReviewOrNextPass) => format!(
             "Press [Enter] continue full review  [{}] next focused pass  {rest}",
             keybinds.focused_pass
         ),
-        None => format!("Press {rest}"),
+        Some(PassContinuation::FullReview) => {
+            format!("Press [Enter] continue full review  {rest}")
+        }
+        Some(PassContinuation::Nothing) | None => format!("Press {rest}"),
     }
 }
 
@@ -7700,6 +7752,13 @@ fn render_recap_footer(frame: &mut Frame, area: Rect, palette: &UiPalette, hint:
 
 fn recap_summary_lines(state: &AppState) -> Vec<String> {
     if let Some(plan) = &state.onboarding {
+        if plan.pass_continuation() == Some(PassContinuation::FullReview) {
+            return vec![
+                "Nothing new for a focused pass".to_string(),
+                format!("Scope: {}", plan.title),
+                plan.description.clone(),
+            ];
+        }
         let (completed, heading, outside) = match plan.purpose {
             CardQueuePurpose::Plan(purpose) => (
                 format!("{} pass complete", purpose.label()),
@@ -10458,6 +10517,40 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn focused_pass_with_nothing_new_explains_itself_instead_of_starting_a_full_review() {
+        let (mut state, _file, ids) = build_state_with_file_block_count(3);
+        state.commented_nodes.extend(ids.iter().copied());
+        let budget = crate::focus::ReviewDuration::from_seconds(300).unwrap();
+        let plan = heuristic_pass_for_state(&state, budget);
+        assert!(plan.cards.is_empty());
+
+        start_focused_pass(&mut state, &plan).unwrap();
+
+        assert!(
+            is_recap_mode(&state),
+            "an empty pass must not become a full review"
+        );
+        let recap = recap_summary_lines(&state).join("\n");
+        assert!(recap.contains("Nothing new for a focused pass"), "{recap}");
+        assert!(
+            recap.contains("All 3 pending blocks have unresolved comments"),
+            "{recap}"
+        );
+        assert_eq!(
+            recap_action_for_state(&state, KeyCode::Enter),
+            Some(RecapAction::ContinueFullReview)
+        );
+        assert_eq!(
+            recap_action_for_state(&state, KeyCode::Char('f')),
+            None,
+            "another pass would be just as empty"
+        );
+        let screen = render_screen(&mut state, 120, 30);
+        assert!(screen.contains("[Enter] continue full review"), "{screen}");
+        assert!(!screen.contains("next focused pass"), "{screen}");
+    }
+
+    #[test]
     fn focused_pass_covering_the_whole_scope_does_not_offer_continuation() {
         let (mut state, _file, ids) = focused_pass_test_state(300);
         for selected in [ids[0], ids[1], ids[2]] {
@@ -10518,19 +10611,6 @@ mod diff_scope_tests {
                 .contains("• Lock order")
         );
         assert_eq!(state.navigator.current_id(), ids[2]);
-    }
-
-    #[test]
-    fn empty_focused_pass_leaves_the_full_queue() {
-        let (mut state, _file, ids) = build_state_with_file_block_count(2);
-        let empty = crate::review_pass::ai_pass(
-            &focused_pass_candidates(&state),
-            Vec::new(),
-            crate::review_pass::DEFAULT_PASS_BUDGET,
-        );
-        start_focused_pass(&mut state, &empty).unwrap();
-        assert!(state.onboarding.is_none());
-        assert_eq!(state.reviewable_nodes, ids.into_iter().collect());
     }
 
     #[test]

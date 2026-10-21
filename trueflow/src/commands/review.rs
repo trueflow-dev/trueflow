@@ -12,6 +12,7 @@ use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_pass::{
     PassScope, PassSource, PassWhy, ReviewPass, format_reading_estimate, heuristic_pass,
+    nothing_new_reason,
 };
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
@@ -1342,9 +1343,23 @@ fn run_focused_pass(
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    if report.cards.is_empty() {
-        println!("All clear! No unreviewed blocks found.");
-        return Ok(());
+    match (report.cards.is_empty(), report.remainder) {
+        (true, 0) => {
+            println!("All clear! No unreviewed blocks found.");
+            return Ok(());
+        }
+        (true, remainder) => {
+            println!(
+                "Nothing new for a focused pass: {}",
+                nothing_new_reason(
+                    remainder,
+                    review.commented_block_nodes.intersection(&pending).count()
+                )
+            );
+            println!("Run without --pass focused to review them.");
+            return Ok(());
+        }
+        (false, _) => {}
     }
     println!(
         "Focused pass: {} of {} pending blocks, ~{} of {} (chosen by {})",

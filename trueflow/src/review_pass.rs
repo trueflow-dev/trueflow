@@ -297,6 +297,21 @@ impl<Id> PassPlan<Id> {
     }
 }
 
+/// Why a scope with `pending` blocks yields no pass candidates: every pending
+/// block is commented (`commented` of them), or is a container whose approval
+/// would cover commented blocks.
+pub fn nothing_new_reason(pending: usize, commented: usize) -> String {
+    match pending.saturating_sub(commented) {
+        0 if pending == 1 => {
+            "The only pending block has an unresolved comment on unchanged content.".to_string()
+        }
+        0 => format!("All {pending} pending blocks have unresolved comments on unchanged content."),
+        containers => format!(
+            "{commented} pending blocks have unresolved comments on unchanged content; the other {containers} contain them."
+        ),
+    }
+}
+
 /// An AI-proposed priority, already resolved to a candidate id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiPick<Id> {
