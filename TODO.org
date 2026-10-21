@@ -330,45 +330,45 @@
      class `#ifdef`/`extern "C"`, C field docs, Rust inline module docs, and TS
      anonymous default exports. `--test declaration_projection_*`
 *** AI and Emacs
-  - [High] Emacs marks sent no `--path`/`--line`, `s` (split) always errored,
-    committing a comment never refreshed the view, and CLI stderr was written
-    into the repo. `emacs -Q --batch -L emacs -l emacs/trueflow-test.el -f
-    ert-run-tests-batch-and-exit`
-  - [Medium] AI hints and the review-set overview dropped the head side of
-    long changed blocks; `auto` picked unimplemented API providers; hint
-    sentences were cut at `?`/`.` inside code.
-    `--lib block_hint_prompt_keeps_head_side auto_provider suggestion_sentences`
+   - [High] Emacs marks sent no `--path`/`--line`, `s` (split) always errored,
+     committing a comment never refreshed the view, and CLI stderr was written
+     into the repo. `emacs -Q --batch -L emacs -l emacs/trueflow-test.el -f
+     ert-run-tests-batch-and-exit`
+   - [Medium] AI hints and the review-set overview dropped the head side of
+     long changed blocks; `auto` picked unimplemented API providers; hint
+     sentences were cut at `?`/`.` inside code.
+     `--lib block_hint_prompt_keeps_head_side auto_provider suggestion_sentences`
 *** GitHub PR delivery
-  - [High] GraphQL BigInt `fullDatabaseId` strings failed to parse; delivery
-    beside a foreign or stale pending review now refuses before writing the
-    ledger. `--lib delivery_snapshot pull_request_feedback_refuses`
-  - [Medium] Left-side anchors use the merge base; remotes match
-    case-insensitively; SSH host aliases resolve via `ssh -G`; base-branch
-    merges leave the PR queue; PR URLs accept `/files`-style suffixes.
-    `--lib merge_base pull_request_review_commits --test github_pending_review_delivery`
+   - [High] GraphQL BigInt `fullDatabaseId` strings failed to parse; delivery
+     beside a foreign or stale pending review now refuses before writing the
+     ledger. `--lib delivery_snapshot pull_request_feedback_refuses`
+   - [Medium] Left-side anchors use the merge base; remotes match
+     case-insensitively; SSH host aliases resolve via `ssh -G`; base-branch
+     merges leave the PR queue; PR URLs accept `/files`-style suffixes.
+     `--lib merge_base pull_request_review_commits --test github_pending_review_delivery`
 *** Config and store
-  - [High] Saving speed-read defaults ignored other config layers (and could
-    write invalid merged config); inline tables were rejected.
-    `--lib speed_read config::tests::update_speed_read_defaults`
-  - [Medium] `~/.trueflow` was taken for a project store outside git; CLI
-    `--only` now overrides a config `exclude`; `inspect --path/--line` picks
-    duplicate blocks; failing `check` prints its summary to stderr.
-    `--test e2e_mark_store_coverage store_discovery --test e2e_inspect --test e2e_diff`
+   - [High] Saving speed-read defaults ignored other config layers (and could
+     write invalid merged config); inline tables were rejected.
+     `--lib speed_read config::tests::update_speed_read_defaults`
+   - [Medium] `~/.trueflow` was taken for a project store outside git; CLI
+     `--only` now overrides a config `exclude`; `inspect --path/--line` picks
+     duplicate blocks; failing `check` prints its summary to stderr.
+     `--test e2e_mark_store_coverage store_discovery --test e2e_inspect --test e2e_diff`
 *** Splitters
-  - [High] Bodied modules/namespaces and schema DDL were hidden as imports;
-    containers whose own lines changed were hidden behind approved children.
-    `--test bug_regressions inline_module changed_container_header`
-  - [Medium] Rust impl/Swift/C type units now tile their parent; Go grouped
-    types expose every spec; Elisp `use-package` with code is reviewable;
-    SQL ERROR gaps and `COMMENT ON` are code; hashing keeps whitespace after a
-    continuation backslash. `--lib review_units_cover use_package sql hash_str`
+   - [High] Bodied modules/namespaces and schema DDL were hidden as imports;
+     containers whose own lines changed were hidden behind approved children.
+     `--test bug_regressions inline_module changed_container_header`
+   - [Medium] Rust impl/Swift/C type units now tile their parent; Go grouped
+     types expose every spec; Elisp `use-package` with code is reviewable;
+     SQL ERROR gaps and `COMMENT ON` are code; hashing keeps whitespace after a
+     continuation backslash. `--lib review_units_cover use_package sql hash_str`
 *** TUI rendering
-  - [High] Shifted keys under the Kitty protocol, wrapped row counts, and
-    `--target dirty` Diff mode (now HEAD vs worktree).
-    `--lib tui_keyboard_enhancement source_view_metrics dirty_target_diff_mode`
-  - [Medium] Pasted CR line breaks, source views past 65,535 rows, the editor
-    cursor after a full row, and oversized sub-block headers.
-    `--lib handle_paste_event source_view_focus_on_block_past_u16 editing_cursor block_header_caps`
+   - [High] Shifted keys under the Kitty protocol, wrapped row counts, and
+     `--target dirty` Diff mode (now HEAD vs worktree).
+     `--lib tui_keyboard_enhancement source_view_metrics dirty_target_diff_mode`
+   - [Medium] Pasted CR line breaks, source views past 65,535 rows, the editor
+     cursor after a full row, and oversized sub-block headers.
+     `--lib handle_paste_event source_view_focus_on_block_past_u16 editing_cursor block_header_caps`
 ** TODO DEF_TODO Follow-ups found by the 2026-10-21 sweep
    - [ ] Deleting previously approved code passes `check`: base-only diff units
      bind to the old content approval. Needs a deletion review identity.
@@ -383,15 +383,15 @@
    - [ ] The scripted TUI harness duplicates `run_app` key dispatch and has
      already diverged (onboarding guards); share one dispatcher.
    - [ ] Wrapped expressions continuing with `* x` are labelled comments; Nix
-    structural children drop leading comments and closing delimiters.
-  - [ ] Emacs: approving a sub-block in the split view redraws the status view
-    into `*trueflow-focus*`.
-  - [ ] `inspect --path` takes scan-relative paths while `mark --path` takes
-    repo-relative ones; they disagree when run from a subdirectory.
-  - [ ] The default scan cache lives in `~/.trueflow/cache`, the same folder
-    name as project stores.
-  - [ ] Root-view cursor scrolling still counts one row per line, short
-    status messages count as one row, and wrapping counts chars, not graphemes.
+     structural children drop leading comments and closing delimiters.
+   - [ ] Emacs: approving a sub-block in the split view redraws the status view
+     into `*trueflow-focus*`.
+   - [ ] `inspect --path` takes scan-relative paths while `mark --path` takes
+     repo-relative ones; they disagree when run from a subdirectory.
+   - [ ] The default scan cache lives in `~/.trueflow/cache`, the same folder
+     name as project stores.
+   - [ ] Root-view cursor scrolling still counts one row per line, short
+     status messages count as one row, and wrapping counts chars, not graphemes.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of
@@ -435,9 +435,9 @@
      heuristic pass ranked by signal weight per reading second.
    - [X] Unselected blocks stay pending; the recap offers a full review of the
      same scope. Verified by `--test tui_pty_smoke pty_focused_pass`.
-  - [X] `review --pass focused [--budget] [--json]` lists the same subset for
-    agents (`--test e2e_review_pass`); the AI plan prompt states each block's
-    reading estimate and the pass budget (`--lib review_plan_prompt_states`).
+   - [X] `review --pass focused [--budget] [--json]` lists the same subset for
+     agents (`--test e2e_review_pass`); the AI plan prompt states each block's
+     reading estimate and the pass budget (`--lib review_plan_prompt_states`).
 ** TODO Browser review UI (WASM or webpage)
    Goal: bring the `trueflow tui` review workflow into the browser with better
    readability, navigation, and commenting, not just terminal emulation.
