@@ -97,11 +97,48 @@ fn type_like_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
 }
 
 fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<NestedBlock> {
+    if node.kind() == "type_declaration" {
+        return collect_type_declaration_blocks(node, content);
+    }
+
     let Some(type_node) = type_like_node(node) else {
         return Vec::new();
     };
 
     collect_container_member_spans(type_node, content)
+}
+
+fn type_declaration_specs(declaration: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = declaration.walk();
+    declaration
+        .named_children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "type_spec" | "type_alias"))
+        .collect()
+}
+
+/// A grouped `type ( A ...; B ... )` declaration exposes every spec as its
+/// own block (with its members); a single spec exposes only its members.
+fn collect_type_declaration_blocks(declaration: Node<'_>, content: &str) -> Vec<NestedBlock> {
+    match type_declaration_specs(declaration).as_slice() {
+        [] => Vec::new(),
+        [spec] => type_like_node(*spec)
+            .map(|type_node| collect_container_member_spans(type_node, content))
+            .unwrap_or_default(),
+        specs => specs
+            .iter()
+            .flat_map(|spec| {
+                let spec_block = NestedBlock {
+                    start_byte: spec.start_byte(),
+                    end_byte: spec.end_byte(),
+                    kind: classify_type_declaration(*spec),
+                };
+                let members = type_like_node(*spec)
+                    .map(|type_node| collect_container_member_spans(type_node, content))
+                    .unwrap_or_default();
+                std::iter::once(spec_block).chain(members)
+            })
+            .collect(),
+    }
 }
 
 fn collect_container_member_spans(type_node: Node<'_>, content: &str) -> Vec<NestedBlock> {
@@ -208,6 +245,22 @@ fn split_function_like(block: &Block) -> Result<Vec<Block>> {
 fn split_type_like(block: &Block) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse Go type-like block")?;
     let root = tree.root_node();
+    if let Some(declaration) = find_named_descendant_any(root, &["type_declaration"])
+        && let specs @ [_, _, ..] = type_declaration_specs(declaration).as_slice()
+    {
+        return specs
+            .iter()
+            .map(|spec| {
+                create_sub_block_with_kind(
+                    block,
+                    &block.content[spec.start_byte()..spec.end_byte()],
+                    spec.start_byte(),
+                    classify_type_declaration(*spec),
+                )
+            })
+            .collect();
+    }
+
     let Some(type_node) = find_type_like_descendant(root) else {
         return crate::sub_splitter::split_code_review_units(block);
     };

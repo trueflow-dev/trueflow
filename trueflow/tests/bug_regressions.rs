@@ -2588,3 +2588,23 @@ fn sql_alter_role_is_reviewable() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn go_grouped_type_declaration_exposes_every_spec() -> Result<()> {
+    let repo = TestRepo::new("go_grouped_type_specs")?;
+    repo.write(
+        "model.go",
+        "package model\n\ntype (\n\tA struct{ X int }\n\tB struct{ Hook func() }\n)\n",
+    )?;
+    repo.commit_all("Add grouped types")?;
+
+    let summary = review_all(&repo)?;
+    let contents = unreviewed_contents(&summary);
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("Hook func()")),
+        "every grouped spec must be reviewable: {contents:?}"
+    );
+    Ok(())
+}
