@@ -182,6 +182,65 @@ mod tests {
         );
     }
 
+    /// The line-by-line algorithm that defined canonical text before hashing
+    /// streamed borrowed runs. Block hashes persist in review records, so the
+    /// streaming form must never diverge from it.
+    fn canonicalize_reference(input: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        let bytes = input.as_bytes();
+        let mut line_start = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            if matches!(bytes[index], b'\r' | b'\n') {
+                output.push_str(input[line_start..index].trim_end());
+                output.push('\n');
+                if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+                line_start = index + 1;
+            }
+            index += 1;
+        }
+        if line_start < input.len() {
+            output.push_str(input[line_start..].trim_end());
+            output.push('\n');
+        }
+        output
+    }
+
+    #[test]
+    fn streamed_canonical_hash_matches_reference_for_every_short_string() {
+        const ALPHABET: [char; 6] = ['a', ' ', '\t', '\r', '\n', '\u{a0}'];
+        let mut digits = Vec::new();
+        loop {
+            let input = digits
+                .iter()
+                .map(|&digit| ALPHABET[digit])
+                .collect::<String>();
+            let reference = canonicalize_reference(&input);
+            assert_eq!(canonicalize(&input), reference, "{input:?}");
+            assert_eq!(
+                hash_str(&input),
+                hex_digest(Sha256::digest(reference.as_bytes())),
+                "{input:?}"
+            );
+
+            // Odometer over every string of up to six alphabet characters.
+            let Some(position) = digits.iter().rposition(|&digit| digit + 1 < ALPHABET.len())
+            else {
+                if digits.len() == 6 {
+                    break;
+                }
+                digits = vec![0; digits.len() + 1];
+                continue;
+            };
+            digits[position] += 1;
+            for digit in &mut digits[position + 1..] {
+                *digit = 0;
+            }
+        }
+    }
+
     #[test]
     fn test_hash_str_is_whitespace_insensitive_for_formatting() {
         let base = hash_str("line");
