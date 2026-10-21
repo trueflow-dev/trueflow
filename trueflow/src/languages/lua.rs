@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration, default_code_sub_split, no_attribute_nodes, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 
 use crate::sub_splitter;
 use crate::text_split::paragraph_break_regex;
@@ -350,7 +350,7 @@ fn sub_split(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_function_like(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse(&block.content).context("Failed to parse lua function-like block")?;
     let root = tree.root_node();
     let signature_end = primary_function_node(root)
@@ -394,7 +394,7 @@ fn primary_function_node(root: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn split_module_like(block: &Block) -> Result<Vec<Block>> {
+fn split_module_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse(&block.content).context("Failed to parse lua module-like block")?;
     let root = tree.root_node();
     let Some(top_level) = first_module_statement(root) else {
@@ -501,7 +501,7 @@ fn signature_end_before_body(content: &str, body_start: usize) -> usize {
 }
 
 fn split_function_body_review_units(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     content: &str,
     base_offset: usize,
 ) -> Result<Vec<Block>> {
@@ -548,7 +548,7 @@ fn split_function_body_review_units(
 
 fn push_review_chunk(
     blocks: &mut Vec<Block>,
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     source: &str,
     base_offset: usize,
     start: usize,
@@ -675,14 +675,13 @@ fn classify_review_chunk(chunk: &str) -> BlockKind {
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     content: &str,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
 ) -> Result<Block> {
-    let mut block =
-        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    let mut block = parent.child(kind, ByteSpan::new(start_offset, end_offset))?;
     assert_eq!(
         block.content, content,
         "Lua sub-split range must name content"
@@ -703,7 +702,7 @@ mod tests {
             Block::from_file_range(source, BlockKind::Namespace, ByteSpan::new(0, source.len()))
                 .unwrap();
 
-        let blocks = split_module_like(&block).unwrap();
+        let blocks = split_module_like(&ParentBlock::new(&block)).unwrap();
         let rebuilt = blocks
             .iter()
             .map(|block| block.content.as_str())

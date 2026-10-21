@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::code_comments::{self, CommentSyntax};
 use crate::review_units::{MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES, MAX_REVIEW_UNIT_SPAN_LINES};
 use crate::text_split::paragraph_break_regex;
@@ -132,6 +132,48 @@ pub fn child_navigation_split(block: &Block, lang: Language) -> Result<SubSplitR
     })
 }
 
+/// Whether `split_result(block, lang)` can yield review units other than
+/// `block` itself. When it cannot, the split returns the block alone or
+/// structural children, or fails, so callers that only consume review units
+/// skip it and its parse. Mirrors the branch order of
+/// `split_result_with_options` without `force_expand_children`.
+pub fn may_split_into_review_units(block: &Block, lang: Language) -> bool {
+    if let Some(language_registration) = languages::registration(lang) {
+        let registration = (language_registration.sub_split)(block.kind);
+        return matches!(
+            registration.semantics,
+            languages::LanguageSubSplitSemantics::ReviewUnits
+        ) && block.line_span().len() > MAX_REVIEW_UNIT_SPAN_LINES;
+    }
+    if is_toml_structural_kind(lang, block.kind) {
+        return false;
+    }
+    if is_nix_structural_candidate(lang, block.kind) {
+        // Only the parse tells whether Nix structural children exist.
+        return true;
+    }
+    let plan = determine_split_plan(block.kind, lang);
+    !matches!(plan, SplitPlan::IdentityReviewUnit)
+        && !should_keep_parent_review_unit(plan, block)
+        && plan.semantics() == SubSplitSemantics::ReviewUnits
+}
+
+fn is_toml_structural_kind(lang: Language, kind: BlockKind) -> bool {
+    matches!(lang, Language::Toml) && matches!(kind, BlockKind::Section | BlockKind::List)
+}
+
+fn is_nix_structural_candidate(lang: Language, kind: BlockKind) -> bool {
+    matches!(lang, Language::Nix)
+        && matches!(
+            kind,
+            BlockKind::Variable
+                | BlockKind::Section
+                | BlockKind::List
+                | BlockKind::Code
+                | BlockKind::Function
+        )
+}
+
 fn split_result_with_options(
     block: &Block,
     lang: Language,
@@ -145,6 +187,7 @@ fn split_result_with_options(
         block.hash,
         options.force_expand_children
     );
+    let parent = &ParentBlock::new(block);
 
     if let Some(language_registration) = languages::registration(lang) {
         let registration = (language_registration.sub_split)(block.kind);
@@ -168,7 +211,7 @@ fn split_result_with_options(
         }
 
         let result = SubSplitResult {
-            blocks: (registration.splitter)(block)?,
+            blocks: (registration.splitter)(parent)?,
             semantics: match registration.semantics {
                 languages::LanguageSubSplitSemantics::ReviewUnits => SubSplitSemantics::ReviewUnits,
                 languages::LanguageSubSplitSemantics::StructuralChildren => {
@@ -185,9 +228,8 @@ fn split_result_with_options(
         return Ok(result);
     }
 
-    if matches!(lang, Language::Toml) && matches!(block.kind, BlockKind::Section | BlockKind::List)
-    {
-        let blocks = split_toml_structural_children(block, block.kind)?;
+    if is_toml_structural_kind(lang, block.kind) {
+        let blocks = split_toml_structural_children(parent, block.kind)?;
         let result = SubSplitResult {
             blocks,
             semantics: SubSplitSemantics::StructuralChildren,
@@ -200,16 +242,8 @@ fn split_result_with_options(
         return Ok(result);
     }
 
-    if matches!(lang, Language::Nix)
-        && matches!(
-            block.kind,
-            BlockKind::Variable
-                | BlockKind::Section
-                | BlockKind::List
-                | BlockKind::Code
-                | BlockKind::Function
-        )
-        && let Some(blocks) = split_nix_structural_children(block)?
+    if is_nix_structural_candidate(lang, block.kind)
+        && let Some(blocks) = split_nix_structural_children(parent)?
     {
         let result = SubSplitResult {
             blocks,
@@ -238,29 +272,29 @@ fn split_result_with_options(
     }
     let blocks = match plan {
         SplitPlan::IdentityReviewUnit => vec![block.clone()],
-        SplitPlan::MarkdownChildren => split_markdown_tree(block)?,
-        SplitPlan::MarkdownReviewUnits => split_markdown_sentences(block)?,
-        SplitPlan::SentenceReviewUnits => split_sentences(block)?,
-        SplitPlan::CodeReviewUnits => split_code(block)?,
-        SplitPlan::RustFunctionReviewUnits => split_rust_function(block)?,
-        SplitPlan::ElispFunctionReviewUnits => split_elisp_function(block)?,
-        SplitPlan::RustImplReviewUnits => split_rust_impl(block)?,
-        SplitPlan::SwiftFunctionReviewUnits => split_swift_function(block)?,
-        SplitPlan::SwiftTypeReviewUnits => split_swift_type(block)?,
-        SplitPlan::KotlinFunctionReviewUnits => split_kotlin_function(block)?,
-        SplitPlan::KotlinTypeReviewUnits => split_kotlin_type(block)?,
-        SplitPlan::PythonFunctionReviewUnits => split_python_function(block)?,
-        SplitPlan::RubyMethodReviewUnits => split_ruby_method(block)?,
-        SplitPlan::RubyScopeReviewUnits => split_ruby_scope(block)?,
-        SplitPlan::JsFunctionReviewUnits => split_js_function(block, lang)?,
-        SplitPlan::JavaFunctionReviewUnits => split_java_function(block)?,
-        SplitPlan::JavaTypeReviewUnits => split_java_type(block)?,
-        SplitPlan::CSharpFunctionReviewUnits => split_csharp_function(block)?,
-        SplitPlan::CSharpTypeReviewUnits => split_csharp_type(block)?,
-        SplitPlan::PhpFunctionReviewUnits => split_php_function(block)?,
-        SplitPlan::PhpTypeReviewUnits => split_php_type(block)?,
-        SplitPlan::CFunctionReviewUnits => split_c_function(block)?,
-        SplitPlan::CTypeReviewUnits => split_c_type(block)?,
+        SplitPlan::MarkdownChildren => split_markdown_tree(parent)?,
+        SplitPlan::MarkdownReviewUnits => split_markdown_sentences(parent)?,
+        SplitPlan::SentenceReviewUnits => split_sentences(parent)?,
+        SplitPlan::CodeReviewUnits => split_code(parent)?,
+        SplitPlan::RustFunctionReviewUnits => split_rust_function(parent)?,
+        SplitPlan::ElispFunctionReviewUnits => split_elisp_function(parent)?,
+        SplitPlan::RustImplReviewUnits => split_rust_impl(parent)?,
+        SplitPlan::SwiftFunctionReviewUnits => split_swift_function(parent)?,
+        SplitPlan::SwiftTypeReviewUnits => split_swift_type(parent)?,
+        SplitPlan::KotlinFunctionReviewUnits => split_kotlin_function(parent)?,
+        SplitPlan::KotlinTypeReviewUnits => split_kotlin_type(parent)?,
+        SplitPlan::PythonFunctionReviewUnits => split_python_function(parent)?,
+        SplitPlan::RubyMethodReviewUnits => split_ruby_method(parent)?,
+        SplitPlan::RubyScopeReviewUnits => split_ruby_scope(parent)?,
+        SplitPlan::JsFunctionReviewUnits => split_js_function(parent, lang)?,
+        SplitPlan::JavaFunctionReviewUnits => split_java_function(parent)?,
+        SplitPlan::JavaTypeReviewUnits => split_java_type(parent)?,
+        SplitPlan::CSharpFunctionReviewUnits => split_csharp_function(parent)?,
+        SplitPlan::CSharpTypeReviewUnits => split_csharp_type(parent)?,
+        SplitPlan::PhpFunctionReviewUnits => split_php_function(parent)?,
+        SplitPlan::PhpTypeReviewUnits => split_php_type(parent)?,
+        SplitPlan::CFunctionReviewUnits => split_c_function(parent)?,
+        SplitPlan::CTypeReviewUnits => split_c_type(parent)?,
     };
 
     let result = SubSplitResult {
@@ -401,7 +435,7 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
     }
 }
 
-pub(crate) fn split_code_review_units(block: &Block) -> Result<Vec<Block>> {
+pub(crate) fn split_code_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = &block.content;
     Ok(collect_valid_paragraph_blocks(
         content,
@@ -455,11 +489,11 @@ where
     blocks
 }
 
-fn split_code(block: &Block) -> Result<Vec<Block>> {
+fn split_code(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_code_review_units(block)
 }
 
-fn split_toml_structural_children(block: &Block, kind: BlockKind) -> Result<Vec<Block>> {
+fn split_toml_structural_children(block: &ParentBlock<'_>, kind: BlockKind) -> Result<Vec<Block>> {
     let spans = match kind {
         BlockKind::Section => toml_blocks::split_section_children(&block.content)?,
         BlockKind::List => toml_blocks::split_list_children(&block.content)?,
@@ -469,14 +503,14 @@ fn split_toml_structural_children(block: &Block, kind: BlockKind) -> Result<Vec<
     spans_to_sub_blocks(block, &spans)
 }
 
-fn split_nix_structural_children(block: &Block) -> Result<Option<Vec<Block>>> {
+fn split_nix_structural_children(block: &ParentBlock<'_>) -> Result<Option<Vec<Block>>> {
     let Some(spans) = nix_blocks::split_structural_children(&block.content, block.kind)? else {
         return Ok(None);
     };
     Ok(Some(spans_to_sub_blocks(block, &spans)?))
 }
 
-fn spans_to_sub_blocks<T>(block: &Block, spans: &[T]) -> Result<Vec<Block>>
+fn spans_to_sub_blocks<T>(block: &ParentBlock<'_>, spans: &[T]) -> Result<Vec<Block>>
 where
     T: StructuralSpan,
 {
@@ -528,7 +562,7 @@ impl StructuralSpan for nix_blocks::NixSpan {
     }
 }
 
-fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
+fn split_markdown_tree(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser
@@ -557,7 +591,7 @@ fn split_markdown_tree(block: &Block) -> Result<Vec<Block>> {
     if child_sections.is_empty() {
         let body = content.get(root_heading.end..).unwrap_or_default();
         if body.trim().is_empty() {
-            return Ok(vec![block.clone()]);
+            return Ok(vec![block.block().clone()]);
         }
         let attached_blocks = split_markdown_flat_range_attaching_heading(
             block,
@@ -625,12 +659,16 @@ struct MarkdownFlatPart {
     kind: BlockKind,
 }
 
-fn split_markdown_flat_range(block: &Block, start: usize, end: usize) -> Result<Vec<Block>> {
+fn split_markdown_flat_range(
+    block: &ParentBlock<'_>,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Block>> {
     split_markdown_flat_range_with_attached_heading(block, None, start, end)
 }
 
 fn split_markdown_flat_range_attaching_heading(
-    block: &Block,
+    block: &ParentBlock<'_>,
     heading_start: usize,
     body_start: usize,
     end: usize,
@@ -639,7 +677,7 @@ fn split_markdown_flat_range_attaching_heading(
 }
 
 fn split_markdown_flat_range_with_attached_heading(
-    block: &Block,
+    block: &ParentBlock<'_>,
     attached_heading_start: Option<usize>,
     start: usize,
     end: usize,
@@ -797,7 +835,7 @@ fn immediate_markdown_child_sections(
     sections
 }
 
-fn split_markdown_sentences(block: &Block) -> Result<Vec<Block>> {
+fn split_markdown_sentences(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut spans = Vec::new();
     let mut start = 0;
@@ -851,7 +889,7 @@ fn split_markdown_sentences(block: &Block) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_sentences(block: &Block) -> Result<Vec<Block>> {
+fn split_sentences(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_markdown_sentences(block)
 }
 
@@ -866,7 +904,7 @@ struct FunctionSplitConfig<'a> {
     trailing_delimiters: &'a [&'a str],
 }
 
-fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
+fn split_rust_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -882,7 +920,7 @@ fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_rust_impl(block: &Block) -> Result<Vec<Block>> {
+fn split_rust_impl(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
@@ -905,7 +943,7 @@ fn split_rust_impl(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_elisp_function(block: &Block) -> Result<Vec<Block>> {
+fn split_elisp_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_elisp::LANGUAGE.into())?;
@@ -1026,7 +1064,7 @@ fn collect_rust_impl_items(impl_node: tree_sitter::Node<'_>) -> Vec<MemberSpan> 
         .collect()
 }
 
-fn split_python_function(block: &Block) -> Result<Vec<Block>> {
+fn split_python_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -1042,7 +1080,7 @@ fn split_python_function(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_ruby_method(block: &Block) -> Result<Vec<Block>> {
+fn split_ruby_method(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -1058,7 +1096,7 @@ fn split_ruby_method(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
+fn split_js_function(block: &ParentBlock<'_>, lang: Language) -> Result<Vec<Block>> {
     let language = match lang {
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         _ => tree_sitter_javascript::LANGUAGE.into(),
@@ -1078,7 +1116,7 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
     )
 }
 
-fn split_swift_function(block: &Block) -> Result<Vec<Block>> {
+fn split_swift_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -1094,7 +1132,7 @@ fn split_swift_function(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
+fn split_swift_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_swift::LANGUAGE.into())?;
@@ -1121,7 +1159,7 @@ fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_kotlin_function(block: &Block) -> Result<Vec<Block>> {
+fn split_kotlin_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -1137,7 +1175,7 @@ fn split_kotlin_function(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_kotlin_type(block: &Block) -> Result<Vec<Block>> {
+fn split_kotlin_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())?;
@@ -1160,7 +1198,7 @@ fn split_kotlin_type(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_java_function(block: &Block) -> Result<Vec<Block>> {
+fn split_java_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -1180,7 +1218,7 @@ fn split_java_function(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_java_type(block: &Block) -> Result<Vec<Block>> {
+fn split_java_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
@@ -1212,7 +1250,7 @@ fn split_java_type(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
+fn split_csharp_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let Some(body_start) = content.find('{') else {
         return split_code(block);
@@ -1303,7 +1341,7 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_csharp_type(block: &Block) -> Result<Vec<Block>> {
+fn split_csharp_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
@@ -1335,7 +1373,7 @@ fn split_csharp_type(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
+fn split_ruby_scope(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_ruby::LANGUAGE.into())?;
@@ -1355,7 +1393,7 @@ fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_php_function(block: &Block) -> Result<Vec<Block>> {
+fn split_php_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -1371,7 +1409,7 @@ fn split_php_function(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_php_type(block: &Block) -> Result<Vec<Block>> {
+fn split_php_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_php::LANGUAGE_PHP_ONLY.into())?;
@@ -1402,7 +1440,7 @@ fn split_php_type(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_c_function(block: &Block) -> Result<Vec<Block>> {
+fn split_c_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     split_function_with_parser(
         block,
         &FunctionSplitConfig {
@@ -1418,7 +1456,7 @@ fn split_c_function(block: &Block) -> Result<Vec<Block>> {
     )
 }
 
-fn split_c_type(block: &Block) -> Result<Vec<Block>> {
+fn split_c_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
@@ -1447,7 +1485,7 @@ fn split_c_type(block: &Block) -> Result<Vec<Block>> {
 }
 
 fn split_function_with_parser(
-    block: &Block,
+    block: &ParentBlock<'_>,
     config: &FunctionSplitConfig<'_>,
 ) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
@@ -1713,7 +1751,7 @@ impl MemberSpan {
 /// initializers, unrecognised members) become their own units so that
 /// approving every unit really covers the whole parent.
 fn review_unit_blocks_from_member_spans(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     members: Vec<MemberSpan>,
     syntax: CommentSyntax,
 ) -> Result<Vec<Block>> {
@@ -1945,14 +1983,13 @@ fn classify_code_chunk(chunk: &str, syntax: CommentSyntax) -> BlockKind {
 }
 
 fn create_sub_block_with_kind(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     content: &str,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
 ) -> Result<Block> {
-    let mut block =
-        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    let mut block = parent.child(kind, ByteSpan::new(start_offset, end_offset))?;
     assert_eq!(block.content, content, "sub-split range must name content");
     block.tags = parent.tags.clone();
     Ok(block)
@@ -1968,6 +2005,122 @@ mod tests {
         match Block::from_file_range(content, kind, ByteSpan::new(0, content.len())) {
             Ok(block) => block,
             Err(error) => panic!("test source range must be valid: {error}"),
+        }
+    }
+
+    /// Coverage and review skip the split whenever the predicate says it
+    /// cannot yield new review units, so for every language, kind, and size
+    /// on either side of the review-unit limits the split must fail, return
+    /// structural children, or return the block itself.
+    #[test]
+    fn skipped_splits_never_yield_new_review_units() {
+        const LANGUAGES: [Language; 34] = [
+            Language::Rust,
+            Language::Swift,
+            Language::Elisp,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Java,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Python,
+            Language::Ruby,
+            Language::Php,
+            Language::Go,
+            Language::C,
+            Language::Cpp,
+            Language::Zig,
+            Language::Lua,
+            Language::Dart,
+            Language::Scala,
+            Language::Haskell,
+            Language::OCaml,
+            Language::Elixir,
+            Language::Clojure,
+            Language::Sql,
+            Language::Yaml,
+            Language::Json,
+            Language::Html,
+            Language::Css,
+            Language::Shell,
+            Language::Markdown,
+            Language::Toml,
+            Language::Nix,
+            Language::Just,
+            Language::Text,
+            Language::Unknown,
+        ];
+        const KINDS: [BlockKind; 36] = [
+            BlockKind::TextBlock,
+            BlockKind::Code,
+            BlockKind::Gap,
+            BlockKind::Comment,
+            BlockKind::Section,
+            BlockKind::Preamble,
+            BlockKind::Function,
+            BlockKind::Struct,
+            BlockKind::Enum,
+            BlockKind::Impl,
+            BlockKind::Module,
+            BlockKind::Modules,
+            BlockKind::Import,
+            BlockKind::Const,
+            BlockKind::Static,
+            BlockKind::Macro,
+            BlockKind::Class,
+            BlockKind::Export,
+            BlockKind::Variable,
+            BlockKind::Decorator,
+            BlockKind::Interface,
+            BlockKind::Type,
+            BlockKind::Method,
+            BlockKind::Command,
+            BlockKind::CodeParagraph,
+            BlockKind::Header,
+            BlockKind::Paragraph,
+            BlockKind::CodeBlock,
+            BlockKind::List,
+            BlockKind::ListItem,
+            BlockKind::Quote,
+            BlockKind::Element,
+            BlockKind::Content,
+            BlockKind::Sentence,
+            BlockKind::Imports,
+            BlockKind::FunctionSignature,
+        ];
+
+        for line_count in [
+            1,
+            MAX_REVIEW_UNIT_SPAN_LINES + 1,
+            MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES + 1,
+        ] {
+            // Blank-line-separated statements: every code, paragraph, and
+            // sentence splitter cuts this into several review units, so a
+            // wrongly skipped split cannot pass as "only itself".
+            let content = (0..line_count)
+                .map(|line| if line % 2 == 0 { "x = 1.\n" } else { "\n" })
+                .collect::<String>();
+            for kind in KINDS {
+                let block = make_block(&content, kind);
+                for lang in LANGUAGES {
+                    if may_split_into_review_units(&block, lang) {
+                        continue;
+                    }
+                    let Ok(result) = split_result(&block, lang) else {
+                        continue;
+                    };
+                    let only_itself = matches!(
+                        result.blocks.as_slice(),
+                        [unit] if unit.content == block.content
+                            && unit.byte_span() == block.byte_span()
+                    );
+                    assert!(
+                        result.semantics == SubSplitSemantics::StructuralChildren || only_itself,
+                        "{lang:?} {kind:?} with {line_count} lines was skipped but splits into {} review units",
+                        result.blocks.len()
+                    );
+                }
+            }
         }
     }
 

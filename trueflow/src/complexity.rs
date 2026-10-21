@@ -6,7 +6,6 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         return None;
     }
 
-    let mut parser = Parser::new();
     let language = match lang {
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
         Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
@@ -30,6 +29,7 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         _ => None,
     }?;
 
+    let mut parser = Parser::new();
     if parser.set_language(&language).is_err() {
         return None;
     }

@@ -28,6 +28,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
 use tracing::info;
 
 pub use crate::targets::{ReviewTarget, RevisionExpr, RevisionRangeExpr};
@@ -410,15 +411,14 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                 continue;
             }
 
-            if is_subblock_covered(
-                &block,
+            let subblocks = SubblockCoverage {
                 language,
                 query,
-                &coverage,
-                &review_check,
-                &file.path,
-                None,
-            ) {
+                coverage: &coverage,
+                review_check: &review_check,
+                file_path: &file.path,
+            };
+            if subblocks.is_covered(&block, node_id, None) {
                 continue;
             }
 
@@ -563,15 +563,14 @@ fn collect_diff_review_presentation(
                 continue;
             }
 
-            if is_subblock_covered(
-                &display_block,
-                file.language,
+            let subblocks = SubblockCoverage {
+                language: file.language,
                 query,
                 coverage,
                 review_check,
-                &file.path,
-                None,
-            ) {
+                file_path: &file.path,
+            };
+            if subblocks.is_covered(&display_block, Some(node_id), None) {
                 continue;
             }
 
@@ -1212,24 +1211,28 @@ pub fn print_review_summary(summary: ReviewSummary, json: bool) -> Result<()> {
         unreviewed_files.len(),
         total_blocks
     );
+    let mut out = BufWriter::new(std::io::stdout().lock());
     if json {
-        println!("{}", serde_json::to_string_pretty(&unreviewed_files)?);
+        serde_json::to_writer_pretty(&mut out, &unreviewed_files)?;
+        writeln!(out)?;
     } else if unreviewed_files.is_empty() {
-        println!("All clear! No unreviewed blocks found.");
+        writeln!(out, "All clear! No unreviewed blocks found.")?;
     } else {
         for file in unreviewed_files {
-            println!("File: {}", file.path);
+            writeln!(out, "File: {}", file.path)?;
             for block in file.blocks {
-                println!(
+                writeln!(
+                    out,
                     "  [Unreviewed] L{}-L{} (Hash: {}) Kind: {}",
                     block.start_line, block.end_line, block.hash, block.kind
-                );
+                )?;
                 if let Some(first_line) = block.content.lines().next() {
-                    println!("    > {}", first_line.trim());
+                    writeln!(out, "    > {}", first_line.trim())?;
                 }
             }
         }
     }
+    out.flush()?;
 
     Ok(())
 }
@@ -1428,102 +1431,108 @@ fn kind_rank(block: &Block) -> u8 {
     block.kind.default_review_priority()
 }
 
-/// Whether `block` is covered: skipped by the filters, approved itself, or
-/// split into review units that are all covered by approvals newer than the
-/// block's own comment or rejection, so approving every child expanded in the
-/// TUI after commenting on their parent covers the parent. Verdicts not newer
-/// than `after` (an enclosing block's comment or rejection) are ignored.
-fn is_subblock_covered(
-    block: &Block,
+/// The file-level context a sub-block coverage check needs besides the
+/// block itself.
+#[derive(Clone, Copy)]
+struct SubblockCoverage<'a, 'tree> {
     language: Language,
-    query: &ResolvedReviewQuery,
-    coverage: &CoverageIndex<'_>,
-    review_check: &ReviewCheck,
-    file_path: &RepoPath,
-    after: Option<RecordOrder>,
-) -> bool {
-    if !query.filters.allows_subblock(block.kind)
-        || should_skip_whitespace_only_by_default(block, &query.filters)
-    {
-        return true;
-    }
-    let latest = coverage
-        .block(file_path, block)
-        .direct_latest_for(review_check)
-        .filter(|latest| after.is_none_or(|after| latest.order > after));
-    match latest {
-        Some(LatestVerdict {
-            verdict: Verdict::Approved,
-            ..
-        }) => true,
-        Some(LatestVerdict {
-            verdict: Verdict::Comment | Verdict::Rejected,
-            order,
-        }) => are_review_units_covered(
-            block,
-            language,
-            query,
-            coverage,
-            review_check,
-            file_path,
-            Some(order),
-        ),
-        None => are_review_units_covered(
-            block,
-            language,
-            query,
-            coverage,
-            review_check,
-            file_path,
-            after,
-        ),
-    }
+    query: &'a ResolvedReviewQuery,
+    coverage: &'a CoverageIndex<'tree>,
+    review_check: &'a ReviewCheck,
+    file_path: &'a RepoPath,
 }
 
-/// Whether `block` splits into review units that are all covered. Records
-/// bound strictly inside the block (for example, approvals of children
-/// expanded with the TUI's `C`, also of short blocks and of children of
-/// children) select the TUI's child-navigation split, so coverage agrees with
-/// the units the TUI showed; otherwise the default review-unit split applies.
-/// Structural children never cover their parent, since they omit its header.
-fn are_review_units_covered(
-    block: &Block,
-    language: Language,
-    query: &ResolvedReviewQuery,
-    coverage: &CoverageIndex<'_>,
-    review_check: &ReviewCheck,
-    file_path: &RepoPath,
-    after: Option<RecordOrder>,
-) -> bool {
-    let split = if coverage.has_block_records_within(file_path, block) {
-        sub_splitter::child_navigation_split(block, language)
-    } else {
-        sub_splitter::split_result(block, language)
-    };
-    let Ok(split) = split else {
-        return false;
-    };
-    match split.semantics {
-        sub_splitter::SubSplitSemantics::ReviewUnits => {
-            let mut units = split
-                .blocks
-                .iter()
-                .filter(|unit| unit.byte_span() != block.byte_span())
-                .peekable();
-            units.peek().is_some()
-                && units.all(|unit| {
-                    is_subblock_covered(
-                        unit,
-                        language,
-                        query,
-                        coverage,
-                        review_check,
-                        file_path,
-                        after,
-                    )
-                })
+impl SubblockCoverage<'_, '_> {
+    /// Whether `block` is covered: skipped by the filters, approved itself, or
+    /// split into review units that are all covered by approvals newer than
+    /// the block's own comment or rejection, so approving every child expanded
+    /// in the TUI after commenting on their parent covers the parent. Verdicts
+    /// not newer than `after` (an enclosing block's comment or rejection) are
+    /// ignored.
+    fn is_covered(
+        &self,
+        block: &Block,
+        node_id: Option<tree::TreeNodeId>,
+        after: Option<RecordOrder>,
+    ) -> bool {
+        if !self.query.filters.allows_subblock(block.kind)
+            || should_skip_whitespace_only_by_default(block, &self.query.filters)
+        {
+            return true;
         }
-        sub_splitter::SubSplitSemantics::StructuralChildren => false,
+        let latest = self
+            .coverage
+            .block(self.file_path, block)
+            .direct_latest_for(self.review_check)
+            .filter(|latest| after.is_none_or(|after| latest.order > after));
+        match latest {
+            Some(LatestVerdict {
+                verdict: Verdict::Approved,
+                ..
+            }) => true,
+            Some(LatestVerdict {
+                verdict: Verdict::Comment | Verdict::Rejected,
+                order,
+            }) => self.are_review_units_covered(block, node_id, Some(order)),
+            None => self.are_review_units_covered(block, node_id, after),
+        }
+    }
+
+    /// Whether `block` splits into review units that are all covered. Records
+    /// bound strictly inside the block (for example, approvals of children
+    /// expanded with the TUI's `C`, also of short blocks and of children of
+    /// children) select the TUI's child-navigation split, so coverage agrees
+    /// with the units the TUI showed; otherwise the default review-unit split
+    /// applies, reusing the units coverage indexing already cut from tree
+    /// block `node_id`. Structural children never cover their parent, since
+    /// they omit its header.
+    fn are_review_units_covered(
+        &self,
+        block: &Block,
+        node_id: Option<tree::TreeNodeId>,
+        after: Option<RecordOrder>,
+    ) -> bool {
+        let split_now;
+        let units = if self
+            .coverage
+            .has_block_records_within(self.file_path, block)
+        {
+            let Ok(split) = sub_splitter::child_navigation_split(block, self.language) else {
+                return false;
+            };
+            if split.semantics != sub_splitter::SubSplitSemantics::ReviewUnits {
+                return false;
+            }
+            split_now = split.blocks;
+            split_now.as_slice()
+        } else {
+            // A block that stays whole, or splits only into structural
+            // children, has no review units of its own to approve.
+            if !sub_splitter::may_split_into_review_units(block, self.language) {
+                return false;
+            }
+            match node_id.and_then(|node_id| {
+                self.coverage
+                    .review_units_for(node_id, block, self.language)
+            }) {
+                Some(units) => units,
+                None => {
+                    let Ok(split) = sub_splitter::split_result(block, self.language) else {
+                        return false;
+                    };
+                    if split.semantics != sub_splitter::SubSplitSemantics::ReviewUnits {
+                        return false;
+                    }
+                    split_now = split.blocks;
+                    split_now.as_slice()
+                }
+            }
+        };
+        let mut units = units
+            .iter()
+            .filter(|unit| unit.byte_span() != block.byte_span())
+            .peekable();
+        units.peek().is_some() && units.all(|unit| self.is_covered(unit, None, after))
     }
 }
 
@@ -2167,6 +2176,87 @@ mod tests {
         .unwrap()
     }
 
+    /// A long block is covered exactly when every review unit is approved,
+    /// and the units indexed during coverage build must give the same answer
+    /// as splitting the block again.
+    #[test]
+    fn approved_review_units_cover_long_block_through_indexed_split() {
+        let body = (0..20)
+            .map(|index| format!("    let value_{index} = {index};\n\n"))
+            .collect::<String>();
+        let source = format!("fn long() {{\n{body}}}\n");
+        let function =
+            Block::from_file_range(&source, BlockKind::Function, ByteSpan::new(0, source.len()))
+                .unwrap_or_else(|error| panic!("function source range should be valid: {error}"));
+        let units = sub_splitter::split_result(&function, Language::Rust)
+            .unwrap_or_else(|error| panic!("long function should split: {error:#}"));
+        assert_eq!(
+            units.semantics,
+            sub_splitter::SubSplitSemantics::ReviewUnits
+        );
+        assert!(units.blocks.len() > 2, "{:#?}", units.blocks);
+
+        let mut builder = crate::tree::TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file,
+            "long".to_string(),
+            "src/lib.rs".to_string(),
+            function.clone(),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let file_path = RepoPath::new("src/lib.rs").unwrap();
+        let node_id = tree.find_block_node(file_path.as_str(), &function);
+        assert!(node_id.is_some());
+        let query = ResolvedReviewQuery {
+            filters: BlockFilters::default(),
+            scan_options: ScanOptions::default(),
+            content_source: ReviewContentSource::Workdir,
+            path_selection: ReviewPathSelection::All,
+            diff_selection: ReviewDiffSelection::None,
+        };
+        let review_check = ReviewCheck::review();
+        // Exactly the units coverage requires, so dropping one must uncover.
+        let approvals = units
+            .blocks
+            .iter()
+            .filter(|unit| {
+                query.filters.allows_subblock(unit.kind)
+                    && !should_skip_whitespace_only_by_default(unit, &query.filters)
+            })
+            .map(|unit| approved_record_for_block(unit, "src/lib.rs"))
+            .collect::<Vec<_>>();
+        assert!(approvals.len() > 1);
+
+        for (approved, expected) in [(approvals.len(), true), (approvals.len() - 1, false)] {
+            let database = ReviewDatabase::from_records(approvals[..approved].to_vec());
+            let coverage = CoverageIndex::build(&tree, &database).unwrap();
+            for node in [node_id, None] {
+                assert_eq!(
+                    SubblockCoverage {
+                        language: Language::Rust,
+                        query: &query,
+                        coverage: &coverage,
+                        review_check: &review_check,
+                        file_path: &file_path,
+                    }
+                    .is_covered(&function, node, None),
+                    expected,
+                    "{approved} of {} units approved, node {node:?}",
+                    approvals.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn structural_child_coverage_does_not_cover_container_header() {
         let source = "type User struct {\n\tName string\n\tAge int\n}\n";
@@ -2218,13 +2308,16 @@ mod tests {
         let file_path = RepoPath::new("src/model.go").unwrap();
 
         assert!(
-            !is_subblock_covered(
+            !SubblockCoverage {
+                language: Language::Go,
+                query: &query,
+                coverage: &coverage,
+                review_check: &review_check,
+                file_path: &file_path,
+            }
+            .is_covered(
                 &container,
-                Language::Go,
-                &query,
-                &coverage,
-                &review_check,
-                &file_path,
+                tree.find_block_node(file_path.as_str(), &container),
                 None,
             ),
             "approved structural children must not cover omitted container header"
@@ -2361,18 +2454,22 @@ mod tests {
                 None,
                 "{mode} must retain the hidden shared generated unit as an ambiguous candidate"
             );
-            assert!(
-                !is_subblock_covered(
-                    &visible_parent,
-                    Language::Text,
-                    &query,
-                    &coverage,
-                    &review_check,
-                    &file_path,
-                    None,
-                ),
-                "{mode} must not clear the visible parent from the shared coarse approval"
-            );
+            let visible_node = tree.find_block_node(file_path.as_str(), &visible_parent);
+            assert!(visible_node.is_some());
+            for node in [visible_node, None] {
+                assert!(
+                    !SubblockCoverage {
+                        language: Language::Text,
+                        query: &query,
+                        coverage: &coverage,
+                        review_check: &review_check,
+                        file_path: &file_path,
+                    }
+                    .is_covered(&visible_parent, node, None),
+                    "{mode} must not clear the visible parent from the shared coarse approval \
+                     (node {node:?})"
+                );
+            }
             let presentation = collect_diff_review_presentation(
                 &query,
                 &review_files,

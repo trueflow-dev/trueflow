@@ -1931,6 +1931,69 @@ fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
     Ok(())
 }
 
+/// A function over the review-unit line limit is reviewed through its units:
+/// it stays listed while any unit lacks approval and is covered once every
+/// unit is approved. This runs the review against a populated database,
+/// through the review units the coverage index cut.
+#[test]
+fn test_approving_every_review_unit_covers_a_long_function() -> Result<()> {
+    let repo = TestRepo::new("long_function_review_units")?;
+    let body = (0..20)
+        .map(|index| format!("    let value_{index} = {index};\n\n"))
+        .collect::<String>();
+    repo.write("src/main.rs", &format!("fn main() {{\n{body}}}\n"))?;
+    repo.commit_all("Add main")?;
+
+    let scan = repo.scan_without_cache()?;
+    let file = scan.files.first().context("Expected file in output")?;
+    let function = file
+        .blocks
+        .iter()
+        .find(|block| block.kind == BlockKind::Function)
+        .context("Expected function block")?;
+    let required = sub_splitter::split(function, file.language)?
+        .into_iter()
+        .filter(|unit| unit.kind != BlockKind::Gap && !unit.content.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        required.len() > 2,
+        "long function should split into review units: {required:#?}"
+    );
+    let approvals = required
+        .iter()
+        .map(|unit| -> Result<Value> {
+            Ok(build_review_record(
+                unit.hash.as_str(),
+                ReviewRecordOverrides {
+                    path_hint: Some("src/main.rs"),
+                    line_hint: Some(u32::try_from(unit.start_line)?),
+                    ..ReviewRecordOverrides::default()
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let trueflow_dir = repo.path.join(".trueflow");
+
+    write_reviews_jsonl(&trueflow_dir, &approvals[1..])?;
+    assert!(
+        !review_all(&repo)?.files.is_empty(),
+        "an unapproved review unit must keep the function listed"
+    );
+
+    write_reviews_jsonl(&trueflow_dir, &approvals)?;
+    let summary = review_all(&repo)?;
+    assert!(
+        summary.files.is_empty(),
+        "approving every review unit must cover the function, still listed: {:?}",
+        summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 #[test]
 fn test_scan_skips_unreadable_entries() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;

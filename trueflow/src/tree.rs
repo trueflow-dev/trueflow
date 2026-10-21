@@ -45,8 +45,11 @@ impl TreeNodeKind {
         matches!(self, TreeNodeKind::Directory | TreeNodeKind::File)
     }
 
-    fn sort_key(self, name: &str) -> String {
-        format!("{}:{}", self.entry_prefix(), name)
+    /// Children order by `"{prefix}:{name}"`. The prefixes differ in their
+    /// first byte, so comparing `(prefix, name)` gives the same order without
+    /// building either string.
+    fn sort_key(self, name: &str) -> (&'static str, &str) {
+        (self.entry_prefix(), name)
     }
 
     fn can_contain(self, child: TreeNodeKind) -> bool {

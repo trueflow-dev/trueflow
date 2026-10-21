@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
@@ -209,7 +209,7 @@ fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
     Ok(ranges)
 }
 
-fn split_function_like_block(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_elixir::LANGUAGE.into())?;
@@ -253,7 +253,7 @@ fn split_function_like_block(block: &Block) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_module_like_block(block: &Block) -> Result<Vec<Block>> {
+fn split_module_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_elixir::LANGUAGE.into())?;
@@ -302,7 +302,7 @@ fn split_module_like_block(block: &Block) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_review_tail(parent: &Block, start_offset: usize) -> Result<Vec<Block>> {
+fn split_review_tail(parent: &ParentBlock<'_>, start_offset: usize) -> Result<Vec<Block>> {
     let rest = &parent.content[start_offset..];
     let re = paragraph_break_regex();
     let mut blocks = Vec::new();
@@ -393,7 +393,7 @@ fn leading_hash_comment_prefix_len(chunk: &str) -> Option<usize> {
 }
 
 fn push_non_child_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
     blocks: &mut Vec<Block>,
@@ -518,12 +518,13 @@ fn signature_end_offset(content: &str, do_start: usize) -> usize {
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
 ) -> Result<Block> {
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("Elixir sub-split range must be a valid parent UTF-8 slice")?;
     block.tags = parent.tags.clone();
     Ok(block)

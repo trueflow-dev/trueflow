@@ -3,7 +3,7 @@ use super::{
     no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, SourceText};
 use crate::complexity;
 
 use anyhow::Result;
@@ -27,7 +27,7 @@ fn parser_language(_content: &str) -> TsLanguage {
     tree_sitter_sql::LANGUAGE.into()
 }
 
-fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
+fn split_top_level(root: Node<'_>, content: &SourceText<'_>, lang: Language) -> Result<Vec<Block>> {
     let mut cursor = root.walk();
     let children: Vec<_> = root.children(&mut cursor).collect();
 
@@ -268,7 +268,7 @@ fn is_comment_kind(kind: &str) -> bool {
 /// is SQL, so it must stay reviewable rather than become a hidden gap.
 fn push_leftover_code(
     blocks: &mut Vec<Block>,
-    content: &str,
+    content: &SourceText<'_>,
     start: usize,
     end: usize,
     lang: Language,
@@ -299,12 +299,12 @@ fn push_leftover_code(
 fn create_file_block(
     text: &str,
     kind: BlockKind,
-    full_source: &str,
+    full_source: &SourceText<'_>,
     start_byte: usize,
     end_byte: usize,
     lang: Language,
 ) -> Result<Block> {
-    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    let mut block = full_source.block(kind, ByteSpan::new(start_byte, end_byte))?;
     assert_eq!(block.content, text, "SQL top-level range must name content");
     block.complexity = complexity::calculate(&block.content, lang);
     Ok(block)
@@ -328,7 +328,7 @@ mod tests {
     fn split_top_level_attaches_leading_comment_to_following_statement() {
         let source = "-- docs for report\nSELECT id FROM accounts;\n";
         let tree = parse_tree(source);
-        let blocks = split_top_level(tree.root_node(), source, Language::Sql)
+        let blocks = split_top_level(tree.root_node(), &SourceText::new(source), Language::Sql)
             .unwrap_or_else(|error| panic!("split SQL comments: {error}"));
         let select = blocks
             .iter()
@@ -342,7 +342,7 @@ mod tests {
     fn split_source(source: &str) -> (String, Vec<Block>) {
         let tree = parse_tree(source);
         let root_kind = tree.root_node().kind().to_string();
-        let blocks = split_top_level(tree.root_node(), source, Language::Sql)
+        let blocks = split_top_level(tree.root_node(), &SourceText::new(source), Language::Sql)
             .unwrap_or_else(|error| panic!("split SQL source: {error}"));
         (root_kind, blocks)
     }

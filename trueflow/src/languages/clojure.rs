@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration, default_code_sub_split, no_attribute_nodes,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 
 use crate::sub_splitter;
 use crate::text_split::paragraph_break_regex;
@@ -113,7 +113,7 @@ fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
     Ok(ranges)
 }
 
-fn split_function_like_block(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse(&block.content).context("Failed to parse Clojure function-like block")?;
     let root = tree.root_node();
     let Some(form) = primary_form(root) else {
@@ -137,7 +137,7 @@ fn split_function_like_block(block: &Block) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_container_like_block(block: &Block) -> Result<Vec<Block>> {
+fn split_container_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse(&block.content).context("Failed to parse Clojure container block")?;
     let root = tree.root_node();
     let Some(form) = primary_form(root) else {
@@ -338,7 +338,7 @@ fn callable_list_has_parameter_vector(node: Node<'_>) -> bool {
         && matches!(values.get(1).map(|value| value.kind()), Some("vec_lit"))
 }
 
-fn split_review_tail(parent: &Block, start_offset: usize) -> Result<Vec<Block>> {
+fn split_review_tail(parent: &ParentBlock<'_>, start_offset: usize) -> Result<Vec<Block>> {
     let rest = &parent.content[start_offset..];
     let re = paragraph_break_regex();
     let mut blocks = Vec::new();
@@ -440,7 +440,7 @@ fn chunk_is_clojure_comment_only(chunk: &str) -> bool {
 }
 
 fn push_non_child_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
     blocks: &mut Vec<Block>,
@@ -463,12 +463,13 @@ fn push_non_child_chunk(
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
 ) -> Result<Block> {
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("Clojure sub-split range must be a valid parent UTF-8 slice")?;
     block.tags = parent.tags.clone();
     Ok(block)
@@ -609,7 +610,7 @@ mod tests {
             Block::from_file_range(source, BlockKind::Module, ByteSpan::new(0, source.len()))
                 .unwrap();
 
-        let blocks = split_container_like_block(&block).unwrap();
+        let blocks = split_container_like_block(&ParentBlock::new(&block)).unwrap();
         let Some(import) = blocks.iter().find(|block| block.kind == BlockKind::Import) else {
             panic!("expected import block");
         };

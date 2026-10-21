@@ -114,8 +114,7 @@ impl TreeHash {
 
 pub fn hash_str(input: &str) -> String {
     let mut hasher = Sha256::new();
-    let normalized = canonicalize(input);
-    hasher.update(normalized);
+    emit_canonical(input, |piece| hasher.update(piece));
     hex_digest(hasher.finalize())
 }
 
@@ -130,23 +129,34 @@ pub fn hash_bytes(input: &[u8]) -> String {
 ///   line-continuation backslash, where trailing whitespace changes meaning.
 /// - Replaces Windows/Mac line endings with \n.
 /// - Ensures a single trailing newline.
-pub fn canonicalize(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-
+#[cfg(test)]
+fn canonicalize(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
+    emit_canonical(input, |piece| output.push_str(piece));
+    output
+}
+
+/// Emits the canonical form of `input` (see `canonicalize`) as consecutive
+/// pieces. Runs of lines that canonicalization leaves unchanged are emitted
+/// as one borrowed slice, so hashing a block needs no copy of its content.
+fn emit_canonical<'a>(input: &'a str, mut emit: impl FnMut(&'a str)) {
     let bytes = input.as_bytes();
+    let mut run_start = 0;
     let mut line_start = 0;
     let mut index = 0;
 
     while index < bytes.len() {
-        if matches!(bytes[index], b'\r' | b'\n') {
-            output.push_str(canonical_line(&input[line_start..index]));
-            output.push('\n');
-
-            if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
-                index += 1;
+        let terminator = bytes[index];
+        if matches!(terminator, b'\r' | b'\n') {
+            let line = &input[line_start..index];
+            let kept_len = canonical_line(line).len();
+            if terminator == b'\r' || kept_len != line.len() {
+                emit(&input[run_start..line_start + kept_len]);
+                emit("\n");
+                if terminator == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+                run_start = index + 1;
             }
             line_start = index + 1;
         }
@@ -154,11 +164,11 @@ pub fn canonicalize(input: &str) -> String {
     }
 
     if line_start < input.len() {
-        output.push_str(canonical_line(&input[line_start..]));
-        output.push('\n');
+        emit(&input[run_start..line_start + canonical_line(&input[line_start..]).len()]);
+        emit("\n");
+    } else {
+        emit(&input[run_start..]);
     }
-
-    output
 }
 
 fn canonical_line(line: &str) -> &str {
@@ -180,6 +190,65 @@ mod tests {
             hash_str("hello").as_str(),
             "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
         );
+    }
+
+    /// Builds canonical text line by line, the way it is defined. Hashing
+    /// streams borrowed runs instead, and block hashes persist in review
+    /// records, so the streaming form must never diverge from this.
+    fn canonicalize_reference(input: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        let bytes = input.as_bytes();
+        let mut line_start = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            if matches!(bytes[index], b'\r' | b'\n') {
+                output.push_str(canonical_line(&input[line_start..index]));
+                output.push('\n');
+                if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+                line_start = index + 1;
+            }
+            index += 1;
+        }
+        if line_start < input.len() {
+            output.push_str(canonical_line(&input[line_start..]));
+            output.push('\n');
+        }
+        output
+    }
+
+    #[test]
+    fn streamed_canonical_hash_matches_reference_for_every_short_string() {
+        const ALPHABET: [char; 7] = ['a', ' ', '\t', '\r', '\n', '\u{a0}', '\\'];
+        let mut digits = Vec::new();
+        loop {
+            let input = digits
+                .iter()
+                .map(|&digit| ALPHABET[digit])
+                .collect::<String>();
+            let reference = canonicalize_reference(&input);
+            assert_eq!(canonicalize(&input), reference, "{input:?}");
+            assert_eq!(
+                hash_str(&input),
+                hex_digest(Sha256::digest(reference.as_bytes())),
+                "{input:?}"
+            );
+
+            // Odometer over every string of up to six alphabet characters.
+            let Some(position) = digits.iter().rposition(|&digit| digit + 1 < ALPHABET.len())
+            else {
+                if digits.len() == 6 {
+                    break;
+                }
+                digits = vec![0; digits.len() + 1];
+                continue;
+            };
+            digits[position] += 1;
+            for digit in &mut digits[position + 1..] {
+                *digit = 0;
+            }
+        }
     }
 
     #[test]
@@ -213,6 +282,13 @@ mod tests {
         assert_eq!(canonicalize("foo  \n"), "foo\n");
         assert_eq!(canonicalize("  foo"), "  foo\n");
         assert_eq!(canonicalize(""), "");
+        // Changed lines between unchanged runs must splice back exactly.
+        assert_eq!(canonicalize("a\nb \nc\n"), "a\nb\nc\n");
+        assert_eq!(canonicalize("a\r\nb\nc"), "a\nb\nc\n");
+        assert_eq!(canonicalize("a\n  \n"), "a\n\n");
+        assert_eq!(canonicalize("\n\n"), "\n\n");
+        assert_eq!(canonicalize("x\u{a0}\ny\t"), "x\u{a0}\ny\n");
+        assert_eq!(hash_str("a\nb \nc"), hash_str("a\nb\nc\n"));
     }
 
     #[test]

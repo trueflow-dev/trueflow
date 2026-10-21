@@ -1,4 +1,4 @@
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, SourceText};
 use crate::review_units::MAX_REVIEW_UNIT_SPAN_LINES;
 use std::mem;
 
@@ -9,13 +9,14 @@ const SMALL_FILE_MAX_SPAN_LINES: usize = MAX_REVIEW_UNIT_SPAN_LINES;
 const SMALL_FILE_MAX_NON_TRIVIAL_BLOCKS: usize = 12;
 
 pub fn optimize(blocks: Vec<Block>, source: &str) -> Vec<Block> {
+    let source = &SourceText::new(source);
     let blocks = optimize_imports(blocks, source);
     let blocks = optimize_modules(blocks, source);
     let blocks = optimize_code_paragraphs(blocks, source);
     optimize_small_files(blocks, source)
 }
 
-fn optimize_imports(blocks: Vec<Block>, source: &str) -> Vec<Block> {
+fn optimize_imports(blocks: Vec<Block>, source: &SourceText<'_>) -> Vec<Block> {
     optimize_sequence(
         blocks,
         |block, buffer| {
@@ -63,7 +64,7 @@ fn optimize_imports(blocks: Vec<Block>, source: &str) -> Vec<Block> {
     )
 }
 
-fn optimize_code_paragraphs(blocks: Vec<Block>, source: &str) -> Vec<Block> {
+fn optimize_code_paragraphs(blocks: Vec<Block>, source: &SourceText<'_>) -> Vec<Block> {
     optimize_sequence(
         blocks,
         |block, buffer| {
@@ -101,7 +102,7 @@ fn optimize_code_paragraphs(blocks: Vec<Block>, source: &str) -> Vec<Block> {
     )
 }
 
-fn optimize_modules(blocks: Vec<Block>, source: &str) -> Vec<Block> {
+fn optimize_modules(blocks: Vec<Block>, source: &SourceText<'_>) -> Vec<Block> {
     optimize_sequence(
         blocks,
         |block, buffer| {
@@ -134,7 +135,7 @@ fn optimize_modules(blocks: Vec<Block>, source: &str) -> Vec<Block> {
     )
 }
 
-fn optimize_small_files(blocks: Vec<Block>, source: &str) -> Vec<Block> {
+fn optimize_small_files(blocks: Vec<Block>, source: &SourceText<'_>) -> Vec<Block> {
     if !should_merge_small_file(&blocks) {
         return blocks;
     }
@@ -189,7 +190,7 @@ fn flush_blocks(
     buffer: Vec<Block>,
     target_kind: BlockKind,
     merged_kind: BlockKind,
-    source: &str,
+    source: &SourceText<'_>,
 ) -> Vec<Block> {
     let target_count = buffer.iter().filter(|b| b.kind == target_kind).count();
     if target_count < 2 {
@@ -217,7 +218,11 @@ fn flush_blocks(
 
 /// Merges a source-ordered, pairwise-disjoint sequence only when every input is
 /// proven to be an exact UTF-8 slice of `source`.
-fn exact_source_merge(source: &str, blocks: &[Block], merged_kind: BlockKind) -> Option<Block> {
+fn exact_source_merge(
+    source: &SourceText<'_>,
+    blocks: &[Block],
+    merged_kind: BlockKind,
+) -> Option<Block> {
     let first = blocks.first()?;
     let mut previous_end = None;
 
@@ -240,8 +245,9 @@ fn exact_source_merge(source: &str, blocks: &[Block], merged_kind: BlockKind) ->
     }
 
     let end = previous_end?;
-    let mut merged =
-        Block::from_file_range(source, merged_kind, ByteSpan::new(first.start_byte, end)).ok()?;
+    let mut merged = source
+        .block(merged_kind, ByteSpan::new(first.start_byte, end))
+        .ok()?;
     let (tags, complexity) = merged_metadata(blocks);
     merged.tags = tags;
     merged.complexity = complexity;
@@ -695,7 +701,11 @@ mod tests {
         second.tags = vec!["shared".to_string(), "integration".to_string()];
         second.complexity = Some(5);
 
-        let Some(merged) = exact_source_merge(source, &[first, second], BlockKind::Imports) else {
+        let Some(merged) = exact_source_merge(
+            &SourceText::new(source),
+            &[first, second],
+            BlockKind::Imports,
+        ) else {
             panic!("disjoint source blocks should merge");
         };
 
@@ -765,7 +775,7 @@ mod tests {
                 blocks.clone(),
                 BlockKind::Import,
                 BlockKind::Imports,
-                case_source,
+                &SourceText::new(case_source),
             );
             assert_blocks_unchanged(&result, &blocks);
         }
@@ -804,7 +814,7 @@ mod tests {
             blocks.clone(),
             BlockKind::Import,
             BlockKind::Imports,
-            source,
+            &SourceText::new(source),
         );
         assert_blocks_unchanged(&result, &blocks);
     }
@@ -816,7 +826,7 @@ mod tests {
         code.start_byte = 8;
         let blocks = vec![source_block(source, BlockKind::Import, 0, 9), code];
 
-        let result = optimize_small_files(blocks.clone(), source);
+        let result = optimize_small_files(blocks.clone(), &SourceText::new(source));
         assert_blocks_unchanged(&result, &blocks);
     }
 

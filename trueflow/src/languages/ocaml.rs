@@ -4,7 +4,7 @@ use super::{
     no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock, SourceText};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
@@ -28,7 +28,11 @@ fn parser_language(_content: &str) -> TsLanguage {
     tree_sitter_ocaml::LANGUAGE_OCAML.into()
 }
 
-fn split_top_level(_root: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
+fn split_top_level(
+    _root: Node<'_>,
+    content: &SourceText<'_>,
+    lang: Language,
+) -> Result<Vec<Block>> {
     let tree = parse_best_tree(content).context("Failed to parse OCaml source")?;
     let root = tree.root_node();
 
@@ -174,7 +178,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_function_like(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_best_tree(&block.content).context("Failed to parse OCaml function block")?;
     let root = tree.root_node();
     let Some(value_definition) = find_named_descendant_any(root, &["value_definition"]) else {
@@ -195,7 +199,7 @@ fn split_function_like(block: &Block) -> Result<Vec<Block>> {
     split_review_units_after_signature(block, signature_end)
 }
 
-fn split_module_like(block: &Block) -> Result<Vec<Block>> {
+fn split_module_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree =
         parse_best_tree(&block.content).context("Failed to parse OCaml module-like block")?;
     let root = tree.root_node();
@@ -222,7 +226,7 @@ fn split_module_like(block: &Block) -> Result<Vec<Block>> {
     build_child_preserving_review_units(block, &children)
 }
 
-fn split_type_like(block: &Block) -> Result<Vec<Block>> {
+fn split_type_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_best_tree(&block.content).context("Failed to parse OCaml type-like block")?;
     let root = tree.root_node();
     let Some(type_definition) = find_named_descendant_any(root, &["type_definition"]) else {
@@ -252,7 +256,11 @@ fn split_type_like(block: &Block) -> Result<Vec<Block>> {
     build_child_preserving_review_units(block, &children)
 }
 
-fn collect_nested_file_blocks(node: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
+fn collect_nested_file_blocks(
+    node: Node<'_>,
+    content: &SourceText<'_>,
+    lang: Language,
+) -> Result<Vec<Block>> {
     enum Work<'tree> {
         Visit(Node<'tree>),
         Emit(NestedBlock),
@@ -351,7 +359,7 @@ fn collect_variant_constructors(variant: Node<'_>) -> Vec<NestedBlock> {
 }
 
 fn build_child_preserving_review_units(
-    block: &Block,
+    block: &ParentBlock<'_>,
     children: &[NestedBlock],
 ) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
@@ -378,7 +386,10 @@ fn build_child_preserving_review_units(
     Ok(blocks)
 }
 
-fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Result<Vec<Block>> {
+fn split_review_units_after_signature(
+    block: &ParentBlock<'_>,
+    signature_end: usize,
+) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut blocks = vec![create_sub_block(
         block,
@@ -417,7 +428,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
 }
 
 fn push_review_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     blocks: &mut Vec<Block>,
     chunk: &str,
     start_offset: usize,
@@ -458,7 +469,7 @@ fn push_review_chunk(
 }
 
 fn push_non_child_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
     blocks: &mut Vec<Block>,
@@ -475,7 +486,7 @@ fn push_non_child_chunk(
 
 fn push_non_whitespace_gap(
     blocks: &mut Vec<Block>,
-    content: &str,
+    content: &SourceText<'_>,
     start: usize,
     end: usize,
     lang: Language,
@@ -762,12 +773,12 @@ fn syntax_error_score(node: Node<'_>) -> usize {
 fn create_file_block(
     text: &str,
     kind: BlockKind,
-    full_source: &str,
+    full_source: &SourceText<'_>,
     start_byte: usize,
     end_byte: usize,
     lang: Language,
 ) -> Result<Block> {
-    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    let mut block = full_source.block(kind, ByteSpan::new(start_byte, end_byte))?;
     assert_eq!(
         block.content, text,
         "OCaml top-level range must name content"
@@ -777,13 +788,12 @@ fn create_file_block(
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
 ) -> Result<Block> {
-    let mut block =
-        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    let mut block = parent.child(kind, ByteSpan::new(start_offset, end_offset))?;
     block.tags = parent.tags.clone();
     Ok(block)
 }
