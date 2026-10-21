@@ -237,6 +237,113 @@
      when the chunk size changed; the existing test pinned the jump.
    - Verified by
      `cargo nextest run --features tui-test-support --lib rechunk`.
+** DONE DEF_TODO 2026-10-21 review sweep (each fix has a failing-then-passing test)
+   Run tests with `cargo nextest run --features tui-test-support <args>`.
+*** Review collection and TUI
+   - [High] Overlapping historical targets (`--target main --target rev:HEAD`)
+     panicked on duplicate head blocks; candidates now merge per displayed
+     block. `--lib collect_review_overlapping_historical_targets_shares_head_block`
+   - [High] `C` on a block whose forced split yields one whole-span child
+     panicked. `--lib handle_child_on_unsplittable_rust_struct_is_noop`
+   - [High] Approvals of TUI-expanded children were unresolved after restart,
+     in `review`, and in `check`. `--test e2e_mark_store_coverage
+     approvals_of_tui_expanded_children_cover_their_short_parent`
+   - [Medium] A failed save closed the TUI and dropped the typed note.
+     `--test tui_vt100 failed_note_submit_keeps_editor_open_and_preserves_note`
+   - [Medium] Expanded children scattered through review order and lost the
+     AI priority slot. `--lib child_refinement_keeps_children_contiguous_in_review_order`
+   - [Medium] Long notes hid the typed line, cursor, and submit hint.
+     `--test tui_vt100 long_note_keeps_typed_line_and_submit_hint_visible`
+   - [Medium] A scope that failed to load ended the TUI; it now reopens the
+     selector with the error. `--lib select_loaded_scope_reopens_selector_after_load_failure`
+   - [Medium] From a subdirectory, deleted files borrowed a same-named root
+     file and `dir:` targets dropped `file:` targets.
+     `--test bug_regressions test_review_d`
+   - [Medium] A file replaced by a same-named directory panicked; it now
+     errors with a narrowing hint.
+     `--lib collect_review_revision_replacing_file_with_directory_does_not_panic`
+   - [Medium] Block headers named declarations from leading doc comments,
+     decorators, or annotations. `--lib semantic_block_identifier_skips_leading_doc_comments`
+   - [Low] Cancelling batch confirmation dropped a typed note; the root cursor
+     skipped a row after its file was approved.
+     `--lib confirm_cancel_of_batch_note_returns_to_editor_with_note root_cursor_reseats`
+*** Scanning and diff relevance
+   - [High] Java/Kotlin/C#/PHP/Ruby review units omitted headers and
+     non-member code, so approving every unit covered unreviewed changes.
+     `--lib review_units_cover`
+   - [High] Moved or reordered statements were suppressed as formatting churn.
+     `--lib block_has_changed_lines_keeps_moved_statement_reviewable`
+   - [High] A bare Clojure `(ns)` or `(defprotocol)` panicked the scan.
+     `--lib test_split_tolerates_bare_ns_and_defprotocol_forms`
+   - [Medium] Indentation-only changes in Python, YAML, Haskell, and Markdown
+     were suppressed. `--lib block_has_changed_lines_keeps_python_dedent_reviewable`
+   - [Medium] One non-UTF-8 blob failed a whole revision review; it is now a
+     per-file diagnostic. `--test bug_regressions invalid_utf8`
+   - [Medium] The scan cache survived splitter changes; it is now keyed on the
+     crate version and `SPLITTER_REVISION`. `--lib scan_cache_rejects_entries_from_another_producer`
+   - [Medium] Setext Markdown headings and YAML/JSON comments between values
+     were misclassified. `--lib test_split_markdown_setext_headers`,
+     `--test e2e_yaml --test e2e_json comments_between`
+   - [Low] Zig top-level comments, Rust `cfg(not(test))`/`cfg_attr` test tags,
+     TOML strings closing with 4-5 quotes, and C-family `*out = v;`/`#define`
+     lines were misclassified. `--lib test_rust_test_tagging toml_blocks
+     test_c_family_code_lines_are_not_comment_units`, `--test e2e_zig`
+*** Store, mark, and feedback
+   - [High] SSH/X.509 git signing configs made every mark run `gpg`; only
+     OpenPGP keys sign now. `--lib git_config_`
+   - [High] An approval at a later commit did not suppress an earlier
+     comment; feedback verdicts are revision-independent. `--test e2e_feedback feedback_`
+   - [Medium] Path-hinted feedback could move to a same-hash file elsewhere.
+     `--test e2e_feedback feedback_uncommitted_copy_stays_on_its_own_path`
+   - [Medium] `mark` inferred targets with default scan options and silently
+     wrote unbindable records. `--test e2e_mark_store_coverage mark_`
+   - [Medium] XML feedback could contain XML-forbidden control characters.
+     `--test bug_regressions test_feedback_xml`
+   - [Low] Feedback entries sharing a start line came out in random order.
+     `--lib collect_feedback_entries_orders_same_start_entries_deterministically`
+*** Focus and onboarding
+   - [Medium] Ctrl-C/SIGTERM/SIGHUP during generation left the provider
+     process group running; signals are deferred until it is killed.
+     `--test e2e_focus_generation interrupt`
+   - [Medium] `onboard` was cut off at 120s with a 1 MiB output cap; it has
+     `--timeout` (default 600s). `--test e2e_onboarding onboarding_generation`
+   - [Medium] Saved plans could not reopen in large repos, after comments, or
+     after unrelated commits. `--test e2e_focus focus_plan_`
+   - [Medium] Repository-wide diagnostics could exceed the prompt budget and
+     blame a candidate. `--lib many_repository_diagnostics_fit_the_prompt_budget`
+   - [Low] Empty scopes were reported as budget problems; lexical signals
+     matched inside words (`requested`). `--lib empty_inventory lexical_signal`
+*** Declaration Review
+   - [High] TypeScript callable consts and C++ lambda globals rendered bodies;
+     nested C++ classes became fake methods. `--test declaration_projection_typescript_regressions
+     --test declaration_projection_c_family_regressions`
+   - [High] Multi-line surfaces were flattened and truncated in the outline.
+     `--test tui_declaration multi_line_outline`
+   - [High] More than 32 same-language files broke every relationship request;
+     one language server now serves a workspace and quitting kills servers.
+     `--lib relationship_bridge more_same_language_files shutdown_kills`
+   - [Medium] Narrow relationship jumps, doc-comment name lookup, overlapping
+     targets, and results for left targets.
+     `--test tui_declaration narrow_in_review --test e2e_declaration_relationships documented_type
+     --test e2e_declaration_tui_integration overlapping`
+   - [Medium] Go grouped `var`, shell and Nix doc comments, C `#elif`, C++
+     class `#ifdef`/`extern "C"`, C field docs, Rust inline module docs, and TS
+     anonymous default exports. `--test declaration_projection_*`
+** TODO DEF_TODO Follow-ups found by the 2026-10-21 sweep
+   - [ ] Deleting previously approved code passes `check`: base-only diff units
+     bind to the old content approval. Needs a deletion review identity.
+   - [ ] A merged duplicate declaration records its review against the first
+     occurrence only; the other occurrence reappears next launch.
+   - [ ] Focus plans citing Git patch evidence become unopenable once eight
+     newer commits push the cited commit out of the history window.
+   - [ ] Focus generation checks for an LLM before reporting an empty scope;
+     `onboard --candidates --path <typo>` silently returns zero candidates.
+   - [ ] A diff where a file becomes a same-named directory cannot be reviewed
+     in one tree (it errors with a narrowing hint).
+   - [ ] The scripted TUI harness duplicates `run_app` key dispatch and has
+     already diverged (onboarding guards); share one dispatcher.
+   - [ ] Wrapped expressions continuing with `* x` are labelled comments; Nix
+     structural children drop leading comments and closing delimiters.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of
@@ -271,6 +378,17 @@
      by `gpg::tests`, `commands::mark::tests`, and `commands::verify::tests`.
 
 * Product & Platform Roadmap
+** DONE Focused review passes (lean subset review)
+   Goal: reviews are increasingly high-level; let a reviewer read the most
+   consequential slice of any scope first instead of every block.
+   - [X] `tui --pass focused [--budget 5m]`, `[tui] pass`/`pass_budget`, `f` in
+     the scope selector and on the AI briefing.
+   - [X] AI review plan picks when available; otherwise an explicitly labelled
+     heuristic pass ranked by signal weight per reading second.
+   - [X] Unselected blocks stay pending; the recap offers a full review of the
+     same scope. Verified by `--test tui_pty_smoke pty_focused_pass`.
+   - [ ] Consider `review --pass focused --json` so agents can request the same
+     subset, and teaching the AI plan prompt the reading budget.
 ** TODO Browser review UI (WASM or webpage)
    Goal: bring the `trueflow tui` review workflow into the browser with better
    readability, navigation, and commenting, not just terminal emulation.
