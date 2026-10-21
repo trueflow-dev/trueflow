@@ -1476,6 +1476,12 @@ pub fn build_pull_request_feedback_plan(
     let mut staged_comments = Vec::new();
     let mut general_declaration_feedback = Vec::new();
     let mut skipped = Vec::new();
+    // GitHub diffs a PR from the merge base, not from the base-branch tip.
+    let merge_base = vcs::merge_base_in_repo(
+        repo,
+        metadata.base_sha.as_str(),
+        metadata.head_sha.as_str(),
+    )?;
 
     for record in records {
         if excluded_ids.contains(&record.id) {
@@ -1489,7 +1495,7 @@ pub fn build_pull_request_feedback_plan(
             record.target,
             crate::store::ReviewTargetRef::Declaration { .. }
         ) {
-            match map_record_to_github_comment(repo, metadata, record, note)? {
+            match map_record_to_github_comment(repo, metadata, &merge_base, record, note)? {
                 Ok(comment) => staged_comments.push(StagedPullRequestComment {
                     record_id: record.id.clone(),
                     comment,
@@ -1515,7 +1521,7 @@ pub fn build_pull_request_feedback_plan(
         if !pull_request_contains_revision(metadata, record_revision) {
             continue;
         }
-        match map_record_to_github_comment(repo, metadata, record, note)? {
+        match map_record_to_github_comment(repo, metadata, &merge_base, record, note)? {
             Ok(comment) => staged_comments.push(StagedPullRequestComment {
                 record_id: record.id.clone(),
                 comment,
@@ -1578,6 +1584,7 @@ pub fn build_pull_request_feedback_plan(
 fn map_record_to_github_comment(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
     record: &Record,
     note: &str,
 ) -> Result<std::result::Result<GitHubInlineComment, PullRequestFeedbackSkipReason>> {
@@ -1587,20 +1594,21 @@ fn map_record_to_github_comment(
 
     match anchor {
         CommentAnchor::Source(anchor) => {
-            map_source_anchor_to_github_comment(repo, metadata, anchor, note)
+            map_source_anchor_to_github_comment(repo, metadata, merge_base, anchor, note)
         }
         CommentAnchor::Diff(anchor) => {
-            map_diff_anchor_to_github_comment(repo, metadata, anchor, note)
+            map_diff_anchor_to_github_comment(repo, metadata, merge_base, anchor, note)
         }
-        CommentAnchor::Declaration(anchor) => {
-            map_declaration_anchor_to_github_comment(repo, metadata, record, anchor, note)
-        }
+        CommentAnchor::Declaration(anchor) => map_declaration_anchor_to_github_comment(
+            repo, metadata, merge_base, record, anchor, note,
+        ),
     }
 }
 
 fn map_declaration_anchor_to_github_comment(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
     record: &Record,
     anchor: &DeclarationCommentAnchor,
     note: &str,
@@ -1662,7 +1670,7 @@ fn map_declaration_anchor_to_github_comment(
     ) else {
         return Ok(Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange));
     };
-    map_source_anchor_to_github_comment(repo, metadata, &source_anchor, note)
+    map_source_anchor_to_github_comment(repo, metadata, merge_base, &source_anchor, note)
 }
 
 fn declaration_range_source_anchor(
@@ -1698,6 +1706,7 @@ fn declaration_range_source_anchor(
 fn map_source_anchor_to_github_comment(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
     anchor: &SourceCommentAnchor,
     note: &str,
 ) -> Result<std::result::Result<GitHubInlineComment, PullRequestFeedbackSkipReason>> {
@@ -1714,6 +1723,7 @@ fn map_source_anchor_to_github_comment(
     if !head_diff_contains_right_side_range(
         repo,
         metadata,
+        merge_base,
         &translated.path,
         first_line,
         last_line,
@@ -1734,6 +1744,7 @@ fn map_source_anchor_to_github_comment(
 fn map_diff_anchor_to_github_comment(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
     anchor: &DiffCommentAnchor,
     note: &str,
 ) -> Result<std::result::Result<GitHubInlineComment, PullRequestFeedbackSkipReason>> {
@@ -1748,7 +1759,13 @@ fn map_diff_anchor_to_github_comment(
             start_line: mapped_lines[0].saturating_sub(1),
             end_line: *mapped_lines.last().unwrap_or(&mapped_lines[0]),
         };
-        return map_source_anchor_to_github_comment(repo, metadata, &source_anchor, note);
+        return map_source_anchor_to_github_comment(
+            repo,
+            metadata,
+            merge_base,
+            &source_anchor,
+            note,
+        );
     }
 
     let left_lines = match diff_anchor_lines_for_side(anchor, GitHubCommentSide::Left) {
@@ -1756,16 +1773,22 @@ fn map_diff_anchor_to_github_comment(
         Err(reason) => return Ok(Err(reason)),
     };
     if let Some(mapped_lines) = left_lines {
-        let translated =
-            match translate_left_diff_anchor_to_base(repo, metadata, anchor, &mapped_lines)? {
-                Ok(translated) => translated,
-                Err(reason) => return Ok(Err(reason)),
-            };
+        let translated = match translate_left_diff_anchor_to_base(
+            repo,
+            metadata,
+            merge_base,
+            anchor,
+            &mapped_lines,
+        )? {
+            Ok(translated) => translated,
+            Err(reason) => return Ok(Err(reason)),
+        };
         let first_line = translated.first_line;
         let last_line = translated.last_line;
         if !head_diff_contains_left_side_range(
             repo,
             metadata,
+            merge_base,
             &translated.path,
             first_line,
             last_line,
@@ -1812,6 +1835,7 @@ fn diff_anchor_lines_for_side(
 fn translate_left_diff_anchor_to_base(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
     anchor: &DiffCommentAnchor,
     lines: &[u32],
 ) -> Result<std::result::Result<TranslatedSourceAnchor, PullRequestFeedbackSkipReason>> {
@@ -1823,7 +1847,7 @@ fn translate_left_diff_anchor_to_base(
         return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
     };
     let parent_revision = if anchor_commit_index == 0 {
-        &metadata.base_sha
+        merge_base
     } else {
         &metadata.commits[anchor_commit_index - 1].sha
     };
@@ -1838,7 +1862,7 @@ fn translate_left_diff_anchor_to_base(
     for commit_index in (0..anchor_commit_index).rev() {
         let current = &metadata.commits[commit_index].sha;
         let previous = if commit_index == 0 {
-            &metadata.base_sha
+            merge_base
         } else {
             &metadata.commits[commit_index - 1].sha
         };
@@ -2109,13 +2133,14 @@ fn translate_new_line_to_old_line_strict(
 fn head_diff_contains_right_side_range(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
     path: &crate::repo_path::RepoPath,
     first_line: u32,
     last_line: u32,
 ) -> Result<bool> {
     let hunks = vcs::diff_hunks_for_file_in_range(
         repo,
-        metadata.base_sha.as_str(),
+        merge_base.as_str(),
         metadata.head_sha.as_str(),
         path,
     )?;
@@ -2133,13 +2158,14 @@ fn head_diff_contains_right_side_range(
 fn head_diff_contains_left_side_range(
     repo: &gix::Repository,
     metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
     path: &crate::repo_path::RepoPath,
     first_line: u32,
     last_line: u32,
 ) -> Result<bool> {
     let hunks = vcs::diff_hunks_for_file_in_range(
         repo,
-        metadata.base_sha.as_str(),
+        merge_base.as_str(),
         metadata.head_sha.as_str(),
         path,
     )?;
@@ -5002,11 +5028,123 @@ mod tests {
         Ok(())
     }
 
+    /// A two-commit PR branched from `M` while `main` advanced to `M2`, which
+    /// inserts three lines at the top of `src/lib.rs` and edits `l12`. GitHub
+    /// diffs the PR as `merge-base(M2, head)..head`, so `M2` must not be the
+    /// origin for left-side lines or for head-diff visibility.
+    fn advanced_base_pull_request_fixture(
+        name: &str,
+    ) -> Result<(std::path::PathBuf, PullRequestMetadata, CommitId)> {
+        let repo_root = temp_git_repo(name);
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap())?;
+        let lines = (1..=30).map(|line| format!("l{line}")).collect::<Vec<_>>();
+        let render = |lines: &[String]| format!("{}\n", lines.join("\n"));
+        fs::write(&file_path, render(&lines))?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial main"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+
+        run_git(&repo_root, &["switch", "-c", "feature/value"]);
+        let mut first = lines.clone();
+        first[27] = "l28 edited".to_string();
+        fs::write(&file_path, render(&first))?;
+        run_git(&repo_root, &["commit", "-am", "Edit l28"]);
+        let first_sha = commit_id_at_head(&repo_root)?;
+        let mut second = first.clone();
+        second.drain(4..6);
+        fs::write(&file_path, render(&second))?;
+        run_git(&repo_root, &["commit", "-am", "Delete l5 and l6"]);
+        let head_sha = commit_id_at_head(&repo_root)?;
+
+        run_git(&repo_root, &["switch", "main"]);
+        let mut advanced = ["t1", "t2", "t3"]
+            .into_iter()
+            .map(str::to_string)
+            .chain(lines)
+            .collect::<Vec<_>>();
+        advanced[14] = "l12 main".to_string();
+        fs::write(&file_path, render(&advanced))?;
+        run_git(&repo_root, &["commit", "-am", "Advance main"]);
+        let base_sha = commit_id_at_head(&repo_root)?;
+
+        let metadata = pull_request_metadata(
+            base_sha,
+            head_sha.clone(),
+            vec![(first_sha, "Edit l28"), (head_sha.clone(), "Delete l5 and l6")],
+        );
+        Ok((repo_root, metadata, head_sha))
+    }
+
+    #[test]
+    fn left_side_anchor_maps_to_merge_base_when_base_branch_advanced() -> Result<()> {
+        let (repo_root, metadata, deleting_commit) =
+            advanced_base_pull_request_fixture("feedback_plan_left_merge_base")?;
+        let repo = gix::discover(&repo_root)?;
+        let record = review_record(
+            "left-merge-base",
+            &deleting_commit,
+            Some(CommentAnchor::Diff(DiffCommentAnchor {
+                revision: deleting_commit.clone(),
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                rows: [5, 6]
+                    .into_iter()
+                    .map(|old_line| crate::store::DiffCommentAnchorRow {
+                        kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                        old_line: Some(old_line),
+                        new_line: None,
+                    })
+                    .collect(),
+            })),
+            Some("deleted lines note"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert_eq!(plan.skipped, Vec::new());
+        assert_eq!(plan.draft.comments.len(), 1);
+        let comment = &plan.draft.comments[0];
+        assert_eq!(comment.side, GitHubCommentSide::Left);
+        assert_eq!(comment.start_line, Some(5));
+        assert_eq!(comment.line, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn right_side_anchor_outside_merge_base_diff_is_skipped() -> Result<()> {
+        let (repo_root, metadata, head_sha) =
+            advanced_base_pull_request_fixture("feedback_plan_right_merge_base")?;
+        let repo = gix::discover(&repo_root)?;
+        // `l12` sits at line 10 of the PR head; only `main` changed it.
+        let record = review_record(
+            "right-merge-base",
+            &head_sha,
+            Some(CommentAnchor::Source(SourceCommentAnchor {
+                revision: head_sha.clone(),
+                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                start_line: 9,
+                end_line: 10,
+            })),
+            Some("line main changed"),
+        );
+
+        let plan = build_pull_request_feedback_plan(&repo, &metadata, &[record], &HashSet::new())?;
+
+        assert!(plan.draft.comments.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(
+            plan.skipped[0].reason,
+            PullRequestFeedbackSkipReason::NotPresentInPrHeadDiff
+        );
+        Ok(())
+    }
+
     struct FeedbackTestGitHubClient {
         reviews: RefCell<Vec<PostedPullRequestReview>>,
         snapshot_pr: ResolvedPullRequestRef,
         snapshot_head: CommitId,
         snapshot_threads: Vec<crate::github::GitHubPullRequestReviewThreadSnapshot>,
+        other_user_review_ids: Vec<u64>,
         created: RefCell<Vec<GitHubReviewDraft>>,
         appended: RefCell<Vec<(u64, GitHubInlineComment)>>,
         submitted: RefCell<Vec<u64>>,

@@ -1245,6 +1245,19 @@ pub fn main_diff_range(repo: &gix::Repository) -> Result<CommitRange> {
     })
 }
 
+/// The best common ancestor of two revisions, as `git merge-base` reports it.
+pub fn merge_base_in_repo(repo: &gix::Repository, left: &str, right: &str) -> Result<CommitId> {
+    let resolve = |revision: &str| {
+        repo.rev_parse_single(revision)
+            .map(|id| id.detach())
+            .with_context(|| format!("revision `{revision}` could not be resolved"))
+    };
+    let base = repo
+        .merge_base(resolve(left)?, resolve(right)?)
+        .with_context(|| format!("revisions `{left}` and `{right}` have no merge base"))?;
+    CommitId::new(base.detach().to_string())
+}
+
 pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<HashSet<ChangedPath>> {
     let (base_tree, head_tree) = main_and_head_trees(repo)?;
     collect_changed_paths(repo, Some(&base_tree), Some(&head_tree))
