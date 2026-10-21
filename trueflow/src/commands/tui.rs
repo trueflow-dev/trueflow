@@ -5329,84 +5329,68 @@ fn reseat_root_cursor(state: &mut AppState, root_children: &[TreeNodeId]) {
     }
 }
 
-fn root_listing_prefix_line_count(state: &AppState) -> usize {
-    let mut line_count = 2usize;
-    let kind_counts = review_metadata::sorted_visible_block_kind_counts(
-        &state.navigator.tree,
-        state.navigator.visible_nodes(),
-    );
-
-    let mut last_parent = "";
-    for (kind, _) in kind_counts {
-        let parent = review_metadata::parent_kind_label(kind);
-        if parent != last_parent {
-            if !last_parent.is_empty() {
-                line_count = line_count.saturating_add(1);
-            }
-            line_count = line_count.saturating_add(1);
-            last_parent = parent;
-        }
-        line_count = line_count.saturating_add(1);
-    }
-
-    line_count.saturating_add(1)
-}
-
-fn root_selected_line_index(
-    state: &AppState,
-    root_children: &[TreeNodeId],
-    prefix_line_count: usize,
-) -> Option<usize> {
-    let selected_index = state
-        .root_cursor
-        .and_then(|id| root_children.iter().position(|&child| child == id))?;
-    Some(prefix_line_count.saturating_add(selected_index))
-}
-
-fn root_total_line_count(prefix_line_count: usize, root_children: &[TreeNodeId]) -> usize {
-    prefix_line_count.saturating_add(root_children.len().max(1))
-}
-
-fn scroll_offset_to_keep_line_visible(
+/// Scroll offset that keeps `rows` in the viewport, moving it as little as
+/// possible; a range taller than the viewport shows its first row.
+fn scroll_offset_to_keep_rows_visible(
     current_scroll_offset: u16,
     viewport_height: u16,
-    line_index: usize,
-    total_lines: usize,
+    rows: std::ops::Range<usize>,
+    total_rows: usize,
 ) -> u16 {
-    if viewport_height == 0 || total_lines <= usize::from(viewport_height) {
+    if viewport_height == 0 || total_rows <= usize::from(viewport_height) {
         return 0;
     }
 
     let viewport_height = usize::from(viewport_height);
     let current_top = usize::from(current_scroll_offset);
-    let next_top = if line_index < current_top {
-        line_index
-    } else if line_index >= current_top.saturating_add(viewport_height) {
-        line_index.saturating_add(1).saturating_sub(viewport_height)
+    let next_top = if rows.start < current_top {
+        rows.start
+    } else if rows.end > current_top.saturating_add(viewport_height) {
+        rows.end.saturating_sub(viewport_height).min(rows.start)
     } else {
         current_top
     };
-    let max_scroll = total_lines.saturating_sub(viewport_height);
+    let max_scroll = total_rows.saturating_sub(viewport_height);
     usize_to_u16_saturating(next_top.min(max_scroll))
 }
 
+/// Rows a listing renders as in a `code_width` pane: like `ui`, a listing
+/// taller than the viewport gives up one column to the scrollbar.
+fn listing_rows(lines: Vec<Line<'static>>, code_width: u16, viewport_height: u16) -> WrappedRows {
+    let full_width = code_width.max(1);
+    let rows = wrap_lines_into_rows(lines.clone(), full_width);
+    if rows.rows.len() <= usize::from(viewport_height) {
+        return rows;
+    }
+    wrap_lines_into_rows(lines, full_width.saturating_sub(1).max(1))
+}
+
 fn ensure_root_cursor_visible(state: &mut AppState, root_children: &[TreeNodeId]) {
-    let prefix_line_count = root_listing_prefix_line_count(state);
-    let total_line_count = root_total_line_count(prefix_line_count, root_children);
-    let Some(selected_line_index) =
-        root_selected_line_index(state, root_children, prefix_line_count)
-    else {
-        if total_line_count <= usize::from(state.viewport_height) {
+    let RootViewLines {
+        lines,
+        first_entry_line,
+    } = root_view_lines(state, root_children, &UiPalette::default());
+    let rows = listing_rows(lines, state.code_rect.width, state.viewport_height);
+    let total_rows = rows.rows.len();
+    let selected_rows = state
+        .root_cursor
+        .and_then(|id| root_children.iter().position(|&child| child == id))
+        .and_then(|index| {
+            let line = first_entry_line.saturating_add(index);
+            rows.row_range(&(line..line.saturating_add(1)))
+        });
+    let Some(selected_rows) = selected_rows else {
+        if total_rows <= usize::from(state.viewport_height) {
             state.scroll_offset = 0;
         }
         return;
     };
 
-    state.scroll_offset = scroll_offset_to_keep_line_visible(
+    state.scroll_offset = scroll_offset_to_keep_rows_visible(
         state.scroll_offset,
         state.viewport_height,
-        selected_line_index,
-        total_line_count,
+        selected_rows,
+        total_rows,
     );
 }
 
@@ -9194,6 +9178,21 @@ fn build_root_lines(
 
     reseat_root_cursor(state, &root_children);
 
+    root_view_lines(state, &root_children, palette).lines
+}
+
+/// Root view lines: a summary header, then one entry line per root child
+/// starting at `first_entry_line`.
+struct RootViewLines {
+    lines: Vec<Line<'static>>,
+    first_entry_line: usize,
+}
+
+fn root_view_lines(
+    state: &AppState,
+    root_children: &[TreeNodeId],
+    palette: &UiPalette,
+) -> RootViewLines {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
@@ -9234,12 +9233,11 @@ fn build_root_lines(
         )));
     }
 
-    if !lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "",
-            Style::default().bg(palette.code_bg),
-        )));
-    }
+    lines.push(Line::from(Span::styled(
+        "",
+        Style::default().bg(palette.code_bg),
+    )));
+    let first_entry_line = lines.len();
 
     let mut listing = root_children
         .iter()
@@ -9264,7 +9262,10 @@ fn build_root_lines(
     }
 
     lines.append(&mut listing);
-    lines
+    RootViewLines {
+        lines,
+        first_entry_line,
+    }
 }
 
 fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> Line<'static> {
@@ -12964,15 +12965,21 @@ mod diff_scope_tests {
     }
 
     #[test]
-    fn scroll_offset_to_keep_line_visible_scrolls_down_for_offscreen_selection() {
-        let offset = scroll_offset_to_keep_line_visible(0, 4, 8, 16);
+    fn scroll_offset_to_keep_rows_visible_scrolls_down_for_offscreen_selection() {
+        let offset = scroll_offset_to_keep_rows_visible(0, 4, 8..9, 16);
         assert_eq!(offset, 5);
     }
 
     #[test]
-    fn scroll_offset_to_keep_line_visible_keeps_visible_selection_stable() {
-        let offset = scroll_offset_to_keep_line_visible(4, 6, 7, 20);
+    fn scroll_offset_to_keep_rows_visible_keeps_visible_selection_stable() {
+        let offset = scroll_offset_to_keep_rows_visible(4, 6, 7..8, 20);
         assert_eq!(offset, 4);
+    }
+
+    #[test]
+    fn scroll_offset_to_keep_rows_visible_shows_every_row_of_a_wrapped_entry() {
+        assert_eq!(scroll_offset_to_keep_rows_visible(0, 4, 5..7, 16), 3);
+        assert_eq!(scroll_offset_to_keep_rows_visible(0, 2, 5..9, 16), 5);
     }
 
     #[test]
@@ -15123,6 +15130,58 @@ mod diff_scope_tests {
         assert_eq!(
             rendered_wrapped_row_count(&content.lines, 20),
             content.total_lines
+        );
+    }
+
+    #[test]
+    fn root_cursor_on_last_entry_stays_visible_when_header_lines_wrap() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let mut visible = HashSet::new();
+        for index in 0..20 {
+            let path = format!("file_{index:02}.rs");
+            let file = builder.add_file(
+                root,
+                path.clone(),
+                path.clone(),
+                format!("file-hash-{index}"),
+                Language::Rust,
+            );
+            let block = test_block(format!("fn f{index}() {{}}\n"), BlockKind::Function, 0, 1);
+            visible.insert(builder.add_block(
+                file,
+                "function".to_string(),
+                path,
+                block,
+                Language::Rust,
+            ));
+        }
+        let tree = builder.finalize();
+        let mut state = build_test_state(ScopePreset::All, HashMap::new());
+        state.review_order = ReviewOrder::from_tree(&tree, &visible);
+        state.navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        state.navigator.set_current(root);
+        state.total_blocks = visible.len();
+        state.initial_remaining_blocks = visible.len();
+        state.remaining_blocks = visible.len();
+        state.reviewable_nodes = visible;
+        state.scope_label = "pull request 1234 from a long feature branch".to_string();
+        let (width, height) = (40, 24);
+        render_screen(&mut state, width, height);
+        assert!(
+            state.content_height > state.viewport_height,
+            "the root listing must scroll for this test to exercise anything"
+        );
+
+        for _ in 0..20 {
+            move_root_cursor(&mut state, 1);
+        }
+        let screen = render_screen(&mut state, width, height);
+
+        assert!(
+            screen.contains("file_19.rs"),
+            "the selected last entry must be scrolled into view:\n{screen}"
         );
     }
 

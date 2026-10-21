@@ -418,8 +418,11 @@
      `--test e2e_inspect inspect_path_from_subdirectory`
    - [ ] The default scan cache lives in `~/.trueflow/cache`, the same folder
      name as project stores.
-   - [ ] Root-view cursor scrolling still counts one row per line, short
-     status messages count as one row, and wrapping counts chars, not graphemes.
+   - [X] Root-view cursor scrolling counted one row per line, so wrapped
+     header lines left the last entries below the viewport; it now counts
+     rendered rows. `--lib root_cursor_on_last_entry`
+   - [ ] Short status messages count as one row, and wrapping counts chars,
+     not graphemes.
    - [ ] Approving a whole file in an all-files scope writes one record per
      block whenever any block under it is already reviewed (correct, but each
      record is signed separately).
