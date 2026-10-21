@@ -34,6 +34,15 @@ impl AiProvider {
             Self::CodexCli => "Codex CLI",
         }
     }
+
+    /// Direct API providers are detected from their keys but have no client
+    /// yet, so only the CLI providers can serve plans and hints.
+    const fn is_implemented(self) -> bool {
+        match self {
+            Self::ClaudeCli | Self::CodexCli => true,
+            Self::Anthropic | Self::OpenAi => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1789,16 +1798,16 @@ pub fn resolve_ai_availability(config: &AiConfig, env: &AiEnvironment) -> AiAvai
 
     match config.provider {
         AiProviderConfig::Auto => detected
-            .first()
+            .iter()
             .copied()
+            .find(|provider| provider.is_implemented())
             .map(|provider| AiAvailability::Ready {
                 provider,
                 model: effective_model_for_provider(provider, &config.model),
             })
             .unwrap_or_else(|| AiAvailability::Unavailable {
-                reason: format!(
-                    "set {ANTHROPIC_API_KEY}, {OPENAI_API_KEY}, or install claude/codex CLI"
-                ),
+                reason: "install the claude or codex CLI; direct API providers are not implemented"
+                    .to_string(),
                 detected,
             }),
         AiProviderConfig::None => AiAvailability::Unavailable {
@@ -1826,7 +1835,15 @@ fn resolve_explicit_provider(
     env: &AiEnvironment,
     detected: Vec<AiProvider>,
 ) -> AiAvailability {
-    if env.has_provider(provider) {
+    if !provider.is_implemented() {
+        AiAvailability::Unavailable {
+            reason: format!(
+                "{} direct API provider is not implemented; set provider = \"claude_cli\" or \"codex_cli\"",
+                provider.label()
+            ),
+            detected,
+        }
+    } else if env.has_provider(provider) {
         AiAvailability::Ready {
             provider,
             model: effective_model_for_provider(provider, configured_model),
@@ -2541,32 +2558,59 @@ mod tests {
     }
 
     #[test]
-    fn auto_provider_selects_first_detected_provider_when_enabled() {
-        let env = AiEnvironment::for_tests(false, true, ["claude"]);
+    fn auto_provider_selects_first_implemented_provider_when_enabled() {
+        let env = AiEnvironment::for_tests(true, true, ["claude", "codex"]);
         let availability =
             resolve_ai_availability(&config(AiMode::ReviewPlan, AiProviderConfig::Auto), &env);
 
         assert_eq!(
             availability,
             AiAvailability::Ready {
-                provider: AiProvider::OpenAi,
-                model: "gpt-5-mini".to_string(),
+                provider: AiProvider::ClaudeCli,
+                model: "auto".to_string(),
             }
         );
+
+        let api_keys_only = AiEnvironment::for_tests(true, true, []);
+        let AiAvailability::Unavailable { reason, detected } = resolve_ai_availability(
+            &config(AiMode::ReviewPlan, AiProviderConfig::Auto),
+            &api_keys_only,
+        ) else {
+            panic!("auto must not select an unimplemented direct API provider");
+        };
+        assert!(reason.contains("claude"), "{reason}");
+        assert_eq!(detected, vec![AiProvider::Anthropic, AiProvider::OpenAi]);
+    }
+
+    #[test]
+    fn explicit_direct_api_provider_is_unavailable_even_with_credentials() {
+        let env = AiEnvironment::for_tests(true, true, ["claude", "codex"]);
+        for (provider_config, label) in [
+            (AiProviderConfig::Anthropic, "Anthropic"),
+            (AiProviderConfig::OpenAi, "OpenAI"),
+        ] {
+            let AiAvailability::Unavailable { reason, .. } =
+                resolve_ai_availability(&config(AiMode::ReviewPlan, provider_config), &env)
+            else {
+                panic!("{label} direct API provider must not resolve as ready");
+            };
+            assert!(reason.contains(label), "{reason}");
+            assert!(reason.contains("not implemented"), "{reason}");
+        }
     }
 
     #[test]
     fn explicit_provider_reports_unavailable_when_missing() {
         let env = AiEnvironment::for_tests(false, false, []);
         let availability = resolve_ai_availability(
-            &config(AiMode::ReviewPlan, AiProviderConfig::Anthropic),
+            &config(AiMode::ReviewPlan, AiProviderConfig::ClaudeCli),
             &env,
         );
 
         assert_eq!(
             availability,
             AiAvailability::Unavailable {
-                reason: "Anthropic credentials or executable not found".to_string(),
+                reason: "Claude CLI credentials or executable not found".to_string(),
                 detected: Vec::new(),
             }
         );

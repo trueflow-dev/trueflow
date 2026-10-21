@@ -402,6 +402,8 @@ still take precedence over config values.
 # AI mode: off|review_plan|block_hints|review_plan_and_block_hints.
 mode = "off"
 # Provider: auto|anthropic|open_ai|claude_cli|codex_cli|none.
+# auto picks the installed claude, then codex, CLI; the anthropic and open_ai
+# direct API providers are not implemented yet and report AI as unavailable.
 provider = "codex_cli"
 model = "auto"
 # Codex's "auto" model resolves to gpt-6; Codex reasoning effort is high.
