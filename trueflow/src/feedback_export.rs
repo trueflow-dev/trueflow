@@ -1676,9 +1676,8 @@ fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(Stri
             | ReviewTargetRef::Declaration { .. } => None,
         }
     };
-    let resolve = |file: &FileState| {
-        block_in_file(file).map(|block| (file.path.as_str().to_string(), block))
-    };
+    let resolve =
+        |file: &FileState| block_in_file(file).map(|block| (file.path.as_str().to_string(), block));
     match record.path_hint.as_ref() {
         Some(path_hint) => files
             .iter()

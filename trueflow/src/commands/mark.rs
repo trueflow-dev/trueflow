@@ -385,7 +385,10 @@ fn infer_target_kind_from_tree_location(
 
     // A directory path only binds Tree records for that directory's hash, so
     // any other fingerprint there would be recorded but never bind.
-    match tree.find_by_path(path_hint.as_str()).map(|id| tree.node(id).kind) {
+    match tree
+        .find_by_path(path_hint.as_str())
+        .map(|id| tree.node(id).kind)
+    {
         Some(TreeNodeKind::Root | TreeNodeKind::Directory) => anyhow::bail!(
             "fingerprint {fingerprint} does not match directory `{path_hint}` in the current scan; \
              use the directory hash from `trueflow scan --json --tree`"

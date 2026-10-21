@@ -279,14 +279,7 @@ fn mark_rejects_fingerprint_that_does_not_match_its_directory_path() -> Result<(
     let (repo, _) = ignored_log_repo("mark_dir_stale_fingerprint")?;
     let stale = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-    let error = repo.run_err(&[
-        "mark",
-        "--fingerprint",
-        stale,
-        "--path",
-        "src",
-        "--quiet",
-    ])?;
+    let error = repo.run_err(&["mark", "--fingerprint", stale, "--path", "src", "--quiet"])?;
 
     assert!(
         error.contains("does not match directory `src`"),

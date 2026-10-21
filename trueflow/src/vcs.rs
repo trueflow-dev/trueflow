@@ -2267,7 +2267,10 @@ mod tests {
         use crate::test_git::{CurrentDirGuard, run_git, temp_git_repo};
 
         let repo_path = temp_git_repo("git_config_signing_format");
-        run_git(&repo_path, &["config", "user.signingkey", "/tmp/signing.pub"]);
+        run_git(
+            &repo_path,
+            &["config", "user.signingkey", "/tmp/signing.pub"],
+        );
         run_git(&repo_path, &["config", "gpg.format", gpg_format]);
         let _cwd = CurrentDirGuard::push(&repo_path);
         git_config_from_workdir().unwrap().signing_key

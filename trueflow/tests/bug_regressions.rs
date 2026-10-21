@@ -2346,7 +2346,10 @@ fn test_feedback_xml_replaces_xml_forbidden_control_characters() -> Result<()> {
                 || matches!(ch, '\u{FFFE}' | '\u{FFFF}')
         })
         .collect::<Vec<_>>();
-    assert!(forbidden.is_empty(), "XML 1.0 forbids {forbidden:?}: {output}");
+    assert!(
+        forbidden.is_empty(),
+        "XML 1.0 forbids {forbidden:?}: {output}"
+    );
     assert!(output.contains("\t// page\u{FFFD}break \u{FFFD}[0m"));
     assert!(output.contains("<comment>pasted\u{FFFD}note\u{FFFD}</comment>"));
     Ok(())

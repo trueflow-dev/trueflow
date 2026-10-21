@@ -3143,7 +3143,10 @@ mod tests {
             })
             .ok_or_else(|| anyhow!("missing value block sides"))?;
         assert_eq!(
-            value_sides.base.as_ref().map(|block| block.content.as_str()),
+            value_sides
+                .base
+                .as_ref()
+                .map(|block| block.content.as_str()),
             Some("pub fn value() -> u8 { 1 }"),
             "the first target's changed pair must win a changed/changed tie"
         );
@@ -3158,7 +3161,10 @@ mod tests {
             })
             .ok_or_else(|| anyhow!("missing added block sides"))?;
         assert_eq!(
-            added_sides.base.as_ref().map(|block| block.content.as_str()),
+            added_sides
+                .base
+                .as_ref()
+                .map(|block| block.content.as_str()),
             Some("pub fn added() -> u8 { 4 }"),
             "the changed pair must win over the branch-wide addition"
         );
@@ -3183,7 +3189,7 @@ mod tests {
         });
 
         let error = result
-            .map_err(|_| anyhow!("collect_review panicked"))?
+            .map_err(|_panic_payload| anyhow!("collect_review panicked"))?
             .err()
             .ok_or_else(|| anyhow!("expected a file/directory collision error"))?;
         assert!(
