@@ -2,15 +2,17 @@ use super::{
     AppState, EditingActionResult, Event, InputCursor, InputMode, KeyCode, KeyEvent, KeyEventKind,
     KeybindAction, RecapAction, Rect, SessionRecap, SpeedReadController, TuiAiState,
     TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, UiMode, ViewMode,
-    clear_focus_scroll, current_ui_mode, editing_key_action_for_event, execute_action_with,
-    handle_advance_review_target, handle_child, handle_confirm_cancel, handle_editing_key_action,
+    clear_action_error, clear_focus_scroll, current_ui_mode, editing_key_action_for_event,
+    execute_action_with, handle_advance_review_target, handle_child, handle_confirm_cancel,
+    handle_editing_key_action,
     handle_editing_submit_with, handle_mouse_event, handle_next, handle_note_action, handle_parent,
     handle_paste_event, handle_prev, handle_scroll_line_down, handle_scroll_line_up,
     handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding,
     key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
     key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
-    keybind_action_for_key_code, recap_action_for_state, set_focus_for_current_node,
-    should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
+    keybind_action_for_key_code, recap_action_for_state, record_action_result,
+    set_focus_for_current_node, should_rerender_on_event, sync_speed_read_focus,
+    toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
@@ -347,6 +349,10 @@ where
             return Ok(());
         }
 
+        if key_event_for_press_or_repeat_event(event).is_some() {
+            clear_action_error(&mut self.state);
+        }
+
         let input_mode = match self.state.input_mode {
             InputMode::Normal => TestInputMode::Normal,
             InputMode::Editing { .. } => TestInputMode::Editing,
@@ -466,7 +472,7 @@ where
         match handle_editing_key_action(&mut self.state, editing_key_action_for_event(&key_event)) {
             EditingActionResult::Submit => {
                 let runner = &mut self.mark_action_runner;
-                handle_editing_submit_with(&mut self.state, |action, state| {
+                let result = handle_editing_submit_with(&mut self.state, |action, state| {
                     let Some(runner) = runner.as_mut() else {
                         bail!("submit is not supported in the scripted test harness")
                     };
@@ -474,7 +480,8 @@ where
                         let scripted_action = ScriptedMarkAction::from(params);
                         runner.run_mark(&scripted_action)
                     })
-                })?;
+                });
+                record_action_result(&mut self.state, result);
             }
             EditingActionResult::Handled | EditingActionResult::Noop => {}
         }
@@ -613,6 +620,7 @@ where
         input_cursor: InputCursor::default(),
         input_draft: None,
         editing_validation: None,
+        action_error: None,
         confirm_batch: crate::config::BatchConfirmPolicy::Never,
         repo_name: "repo".to_string(),
         repo_root: None,
@@ -701,6 +709,7 @@ fn build_state_with_single_rust_block_file(
         input_cursor: InputCursor::default(),
         input_draft: None,
         editing_validation: None,
+        action_error: None,
         confirm_batch: crate::config::BatchConfirmPolicy::Never,
         repo_name: "repo".to_string(),
         repo_root: None,

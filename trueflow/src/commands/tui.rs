@@ -1045,6 +1045,8 @@ struct AppState {
     input_cursor: InputCursor,
     input_draft: Option<String>,
     editing_validation: Option<EditingValidation>,
+    /// Why the last review save failed; shown until the next key press.
+    action_error: Option<String>,
     confirm_batch: BatchConfirmPolicy,
     repo_name: String,
     repo_root: Option<PathBuf>,
@@ -2226,6 +2228,7 @@ fn build_review_state(
         input_cursor: InputCursor::default(),
         input_draft: None,
         editing_validation: None,
+        action_error: None,
         confirm_batch: options.confirm_batch,
         repo_name: detect_repo_name(context),
         repo_root: vcs::git_root_from_workdir().ok().flatten(),
@@ -3527,6 +3530,11 @@ fn run_app(
             continue;
         }
 
+        if key_event_for_press_or_repeat_event(&event).is_some() && clear_action_error(&mut state)
+        {
+            needs_render = true;
+        }
+
         match &state.input_mode {
             InputMode::Normal => {
                 let Some(key_event) = key_event_for_press_or_repeat_event(&event) else {
@@ -3576,7 +3584,9 @@ fn run_app(
                         KeybindAction::Parent => handle_parent(&mut state),
                         KeybindAction::Child => handle_child(&mut state),
                         KeybindAction::Approve => {
-                            handle_action(session, context, &mut state, Verdict::Approved)?;
+                            let result =
+                                handle_action(session, context, &mut state, Verdict::Approved);
+                            record_action_result(&mut state, result);
                         }
                         KeybindAction::Note => {
                             handle_note_action(&mut state)?;
@@ -3672,7 +3682,8 @@ fn run_app(
                     editing_key_action_for_event(&key_event),
                 ) {
                     EditingActionResult::Submit => {
-                        handle_editing_submit(session, context, &mut state)?;
+                        let result = handle_editing_submit(session, context, &mut state);
+                        record_action_result(&mut state, result);
                         needs_render = true;
                     }
                     EditingActionResult::Handled => {
@@ -3688,7 +3699,8 @@ fn run_app(
 
                 match key_event.code {
                     KeyCode::Enter => {
-                        handle_confirm_batch(session, context, &mut state)?;
+                        let result = handle_confirm_batch(session, context, &mut state);
+                        record_action_result(&mut state, result);
                         needs_render = true;
                     }
                     KeyCode::Esc => {
@@ -5309,29 +5321,64 @@ fn handle_confirm_batch(
     context: &TrueflowContext,
     state: &mut AppState,
 ) -> Result<()> {
+    handle_confirm_batch_with(state, |action, state| {
+        execute_action(session, context, state, action)
+    })
+}
+
+fn handle_confirm_batch_with<F>(state: &mut AppState, on_action: F) -> Result<()>
+where
+    F: FnOnce(PendingAction, &mut AppState) -> Result<()>,
+{
     let action = match &state.input_mode {
         InputMode::ConfirmBatch { action, .. } => action.clone(),
         _ => return Ok(()),
     };
     state.input_mode = InputMode::Normal;
     state.input_draft = None;
-    execute_action(session, context, state, action)
+    let result = on_action(action.clone(), state);
+    if result.is_err() {
+        reopen_editor_for_comment(state, action);
+    }
+    result
 }
 
 fn handle_confirm_cancel(state: &mut AppState) {
     state.input_draft = None;
-    // Cancelling the confirmation of a typed note returns to the editor
-    // instead of discarding the note; other batch actions just close.
-    if let InputMode::ConfirmBatch { action, .. } = std::mem::take(&mut state.input_mode)
-        && let Some(note) = action.comment_note()
-    {
-        state.input_buffer = note.to_string();
-        state.input_cursor = InputCursor {
-            offset: note.len(),
-            goal_column: None,
-        };
-        state.input_mode = InputMode::Editing { action };
+    if let InputMode::ConfirmBatch { action, .. } = std::mem::take(&mut state.input_mode) {
+        reopen_editor_for_comment(state, action);
     }
+}
+
+/// Returns to the note editor with a comment action's typed note when its
+/// batch confirmation is cancelled or its save fails, so the note is never
+/// discarded; other actions leave the input mode as it is.
+fn reopen_editor_for_comment(state: &mut AppState, action: PendingAction) {
+    let Some(note) = action.comment_note() else {
+        return;
+    };
+    state.input_buffer = note.to_string();
+    state.input_cursor = InputCursor {
+        offset: note.len(),
+        goal_column: None,
+    };
+    state.input_mode = InputMode::Editing { action };
+}
+
+/// Records the outcome of saving a review. A failed save (signing cancelled,
+/// unresolvable revision, store write error) must not end the session: the
+/// input mode and any typed note stay as they are and the error is shown
+/// until the next key press.
+fn record_action_result(state: &mut AppState, result: Result<()>) {
+    if let Err(error) = result {
+        let message = format!("Save failed: {error:#}");
+        state.action_error = Some(message.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+}
+
+/// Clears a shown save failure; returns whether one was shown.
+fn clear_action_error(state: &mut AppState) -> bool {
+    state.action_error.take().is_some()
 }
 
 fn execute_action(
@@ -7316,6 +7363,11 @@ fn render_right_aligned_line(frame: &mut Frame, area: Rect, line: &Line<'_>) {
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
+    if let Some(error) = &state.action_error {
+        let style = Style::default().fg(palette.del).bg(palette.bg);
+        frame.render_widget(Paragraph::new(Span::styled(error.clone(), style)), area);
+        return;
+    }
     let counts = footer_progress_counts(state);
     render_footer_progress_bar(frame, counts, area, palette);
     let line = footer_progress_line(state, palette);
@@ -8841,7 +8893,10 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             let draft = state.input_draft.as_deref().filter(|_| content.is_empty());
             (
                 " Note ",
-                editing_overlay_hint(&content, draft, state.editing_validation),
+                match &state.action_error {
+                    Some(error) => format!("{error} • Enter to retry • Esc to cancel"),
+                    None => editing_overlay_hint(&content, draft, state.editing_validation),
+                },
                 content,
                 draft,
                 Some(state.input_cursor.clamped_to_buffer(&state.input_buffer)),
@@ -10141,6 +10196,7 @@ mod diff_scope_tests {
             input_cursor: InputCursor::default(),
             input_draft: None,
             editing_validation: None,
+            action_error: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             repo_root: None,
@@ -10215,6 +10271,7 @@ mod diff_scope_tests {
             input_cursor: InputCursor::default(),
             input_draft: None,
             editing_validation: None,
+            action_error: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             repo_root: None,
@@ -10363,6 +10420,7 @@ mod diff_scope_tests {
             input_cursor: InputCursor::default(),
             input_draft: None,
             editing_validation: None,
+            action_error: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             repo_root: None,
@@ -10481,6 +10539,7 @@ mod diff_scope_tests {
             input_cursor: InputCursor::default(),
             input_draft: None,
             editing_validation: None,
+            action_error: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             repo_root: None,
@@ -10575,6 +10634,7 @@ mod diff_scope_tests {
             input_cursor: InputCursor::default(),
             input_draft: None,
             editing_validation: None,
+            action_error: None,
             confirm_batch: BatchConfirmPolicy::Threshold(2),
             repo_name: "repo".to_string(),
             repo_root: None,
@@ -10679,6 +10739,7 @@ mod diff_scope_tests {
             input_cursor: InputCursor::default(),
             input_draft: None,
             editing_validation: None,
+            action_error: None,
             confirm_batch: BatchConfirmPolicy::Never,
             repo_name: "repo".to_string(),
             repo_root: None,
@@ -13652,6 +13713,66 @@ mod diff_scope_tests {
 
         assert!(matches!(state.input_mode, InputMode::Normal));
         assert!(state.input_buffer.is_empty());
+    }
+
+    fn render_screen(state: &mut AppState, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| ui(frame, state))
+            .unwrap_or_else(|error| panic!("failed to render state: {error}"));
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn failed_batch_note_save_returns_to_editor_with_note_and_error() {
+        let (mut state, _file_id, _block_ids) = build_state_with_file_block_count(3);
+        handle_note_action(&mut state)
+            .unwrap_or_else(|error| panic!("failed to open note editor: {error}"));
+        state.input_buffer = "alpha".to_string();
+        handle_editing_submit_with(&mut state, |_action, _state| {
+            panic!("batch note should ask for confirmation first");
+        })
+        .unwrap_or_else(|error| panic!("expected batch confirmation: {error}"));
+
+        let result = handle_confirm_batch_with(&mut state, |action, state| {
+            execute_action_with(state, action, |_params| {
+                Err(anyhow::anyhow!("pinentry cancelled"))
+            })
+        });
+        record_action_result(&mut state, result);
+
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert_eq!(state.input_buffer, "alpha");
+        assert_eq!(state.remaining_blocks, 3);
+        assert!(render_screen(&mut state, 100, 24).contains("Save failed: pinentry cancelled"));
+    }
+
+    #[test]
+    fn failed_approval_keeps_block_pending_and_shows_error_until_next_key() {
+        let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
+        state.navigator.set_current(block_ids[0]);
+        let action = PendingAction::from_node(&state.navigator.tree, block_ids[0], Verdict::Approved);
+
+        let result = execute_action_with(&mut state, action, |_params| {
+            Err(anyhow::anyhow!("store write failed\ndisk full"))
+        });
+        record_action_result(&mut state, result);
+
+        assert_eq!(state.navigator.current_id(), block_ids[0]);
+        assert!(state.reviewable_nodes.contains(&block_ids[0]));
+        assert!(matches!(state.input_mode, InputMode::Normal));
+        assert!(
+            render_screen(&mut state, 100, 24).contains("Save failed: store write failed disk full")
+        );
+        assert!(clear_action_error(&mut state));
+        assert!(!render_screen(&mut state, 100, 24).contains("Save failed"));
     }
 
     #[test]

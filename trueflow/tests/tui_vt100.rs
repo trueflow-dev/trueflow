@@ -911,11 +911,14 @@ fn failed_note_submit_keeps_editor_open_and_preserves_note() -> Result<()> {
     app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))?;
     press_text(&mut app, "beta")?;
 
-    let result = app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    let Err(error) = result else {
-        panic!("expected injected mark failure to bubble out");
-    };
-    assert!(error.to_string().contains("injected mark failure"));
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        screen.contains("injected mark failure"),
+        "expected the save failure to be shown in the TUI: {screen}"
+    );
     assert!(
         app.is_editing(),
         "expected submit failure to keep editor open"
