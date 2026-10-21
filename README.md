@@ -485,7 +485,8 @@ Declaration Review keys are intentionally fixed to its two-pane model:
 - `j`/`k`, Up/Down, PageUp/PageDown move within the active pane
 - `Tab` switches between the declaration outline and relationship graph on wide terminals
 - `o` expands relationships; Enter also opens the graph on narrow terminals
-- Enter follows an in-review relationship; Backspace returns
+- Enter follows an in-review relationship (on narrow terminals it opens the
+  destination's outline); Backspace returns
 - `a` approves, `c` comments, `r` rejects, and Space skips the current declaration
 - `q` quits
 

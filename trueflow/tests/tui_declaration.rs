@@ -443,6 +443,36 @@ fn in_review_relationship_jump_round_trips_back_stack_but_external_and_unresolve
 }
 
 #[test]
+fn narrow_in_review_relationship_jump_shows_an_actionable_destination_outline() -> Result<()> {
+    let mut app = app_with_fixture(review_fixture()?, 99, 12)?;
+    app.press(KeyCode::Char('o'))?;
+    app.press(KeyCode::Enter)?;
+
+    let jumped = app.state_snapshot();
+    assert_eq!(jumped.active_declaration, "validate");
+    assert_eq!(jumped.back_stack_depth, 1);
+    let rendered = app.render()?;
+    assert_eq!(
+        rendered.layout,
+        TestLayout::Single {
+            pane: DeclarationPane::Outline,
+            width: 99,
+        },
+        "a narrow jump must show the destination's source, not only its graph"
+    );
+    assert!(rendered.visible_text.contains(VALIDATE_SIGNATURE));
+
+    app.press(KeyCode::Char('a'))?;
+    let approval = only_action(&mut app)?;
+    assert_eq!(approval.kind, TestReviewActionKind::Approve);
+    assert_eq!(approval.owner_id, "validate");
+
+    app.press(KeyCode::Backspace)?;
+    assert_eq!(app.state_snapshot().active_declaration, "load");
+    Ok(())
+}
+
+#[test]
 fn field_approval_and_variant_comment_resolve_to_the_aggregate_review_owner() -> Result<()> {
     let field_fixture = review_fixture()?.with_initial_outline_selection("config.host");
     let mut field_app = app_with_fixture(field_fixture, 120, 12)?;

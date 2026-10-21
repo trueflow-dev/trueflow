@@ -1103,6 +1103,11 @@ impl DeclarationController {
                 self.outline.scroll = 0;
                 self.outline.expanded = expanded;
                 self.inspected_relationship = None;
+                if !self.is_wide() {
+                    // A single-pane layout must show the destination's source so its review
+                    // actions are visible and actionable; Backspace restores the graph.
+                    self.active_pane = DeclarationPane::Outline;
+                }
                 self.relationships.selection = graph_selection;
                 self.relationships.scroll = 0;
                 self.relationships.collapsed_groups.clear();
