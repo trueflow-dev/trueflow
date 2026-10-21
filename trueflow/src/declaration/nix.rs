@@ -122,16 +122,23 @@ impl Projector<'_> {
 
     fn collect_binding_set(&mut self, bindings: Node<'_>, scope: BindingScope) -> Result<()> {
         let mut pending_comments = Vec::<Range<usize>>::new();
+        let mut previous_item_end_row = None;
         let mut cursor = bindings.walk();
         for child in bindings.named_children(&mut cursor) {
             match child.kind() {
                 "comment" => {
+                    // A comment trailing the previous item on its line never documents the next.
+                    if previous_item_end_row == Some(child.start_position().row) {
+                        pending_comments.clear();
+                        continue;
+                    }
                     if pending_comments.last().is_some_and(|previous| {
                         !comments_are_contiguous(self.source, previous.end, child.start_byte())
                     }) {
                         pending_comments.clear();
                     }
                     pending_comments.push(child.byte_range());
+                    continue;
                 }
                 "binding" => {
                     let documentation = take_attached_comments(
@@ -151,6 +158,7 @@ impl Projector<'_> {
                 }
                 _ => pending_comments.clear(),
             }
+            previous_item_end_row = Some(child.end_position().row);
         }
         Ok(())
     }

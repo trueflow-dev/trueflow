@@ -253,3 +253,30 @@ project_name := "declarations"
     );
     Ok(())
 }
+
+#[test]
+fn nix_trailing_same_line_comment_is_not_the_next_binding_documentation() -> Result<()> {
+    const SOURCE: &str = "{\n  a = 1; # about a\n  # Documents b.\n  b = 2;\n  c = 3; # about c\n  d = 4;\n}\n";
+
+    let facts = project("default.nix", Language::Nix, SOURCE)?;
+    let documentation = |name: &str| -> Result<Vec<String>> {
+        Ok(facts
+            .declarations()
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .with_context(|| format!("missing binding {name}"))?
+            .components
+            .iter()
+            .filter(|component| component.role == SourceComponentRole::Documentation)
+            .map(|component| component.text.clone())
+            .collect())
+    };
+
+    assert_eq!(documentation("b")?, ["# Documents b."]);
+    assert!(
+        documentation("d")?.is_empty(),
+        "a trailing comment on c's line must not document d: {:?}",
+        documentation("d")?
+    );
+    Ok(())
+}
