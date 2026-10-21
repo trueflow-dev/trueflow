@@ -1,4 +1,4 @@
-use crate::analysis::{self, ParsedFile};
+use crate::analysis::{self, Language, ParsedFile};
 use crate::block::{Block, FileState};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
@@ -247,6 +247,63 @@ pub(crate) struct DiffChangedLineIndex {
     changed_lines: Vec<IndexedChangedDiffLine>,
     base_changed_line_indices: Vec<usize>,
     head_changed_line_indices: Vec<usize>,
+    indentation: Indentation,
+}
+
+/// Whether leading whitespace can change a file's meaning, which decides if
+/// an indentation-only replacement is mechanical churn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Indentation {
+    Significant,
+    Insignificant,
+}
+
+impl Indentation {
+    fn of(language: Language) -> Self {
+        match language {
+            Language::Python | Language::Yaml | Language::Haskell | Language::Markdown => {
+                Self::Significant
+            }
+            Language::Rust
+            | Language::Swift
+            | Language::Elisp
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Java
+            | Language::Kotlin
+            | Language::CSharp
+            | Language::Ruby
+            | Language::Php
+            | Language::Go
+            | Language::C
+            | Language::Cpp
+            | Language::Zig
+            | Language::Lua
+            | Language::Dart
+            | Language::Scala
+            | Language::OCaml
+            | Language::Elixir
+            | Language::Clojure
+            | Language::Sql
+            | Language::Json
+            | Language::Html
+            | Language::Css
+            | Language::Shell
+            | Language::Toml
+            | Language::Nix
+            | Language::Just
+            | Language::Text
+            | Language::Unknown => Self::Insignificant,
+        }
+    }
+
+    /// The part of a line that must match for a replacement to be churn.
+    fn semantic_text(self, text: &str) -> &str {
+        match self {
+            Self::Significant => text.trim_end(),
+            Self::Insignificant => text.trim(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +316,7 @@ struct IndexedChangedDiffLine {
 }
 
 impl DiffChangedLineIndex {
-    pub(crate) fn from_hunks(hunks: &[DiffHunk]) -> Self {
+    pub(crate) fn from_hunks(hunks: &[DiffHunk], language: Language) -> Self {
         let mut changed_lines = Vec::new();
         let mut next_change_run = 0;
         for hunk in hunks {
@@ -285,6 +342,7 @@ impl DiffChangedLineIndex {
             changed_lines,
             base_changed_line_indices,
             head_changed_line_indices,
+            indentation: Indentation::of(language),
         }
     }
 
@@ -307,7 +365,7 @@ impl DiffChangedLineIndex {
             return BlockDiffChangeKind::NoTextChanges;
         }
 
-        if all_changed_lines_are_nonreviewable(&changed_lines) {
+        if all_changed_lines_are_nonreviewable(&changed_lines, self.indentation) {
             BlockDiffChangeKind::OnlyNonreviewableChurn
         } else {
             BlockDiffChangeKind::ReviewableChanges
@@ -1011,7 +1069,10 @@ fn push_indexed_changed_lines_for_hunk(
     change_run + 1
 }
 
-fn all_changed_lines_are_nonreviewable(changed_lines: &[&IndexedChangedDiffLine]) -> bool {
+fn all_changed_lines_are_nonreviewable(
+    changed_lines: &[&IndexedChangedDiffLine],
+    indentation: Indentation,
+) -> bool {
     let mut index = 0;
     while index < changed_lines.len() {
         let line = &changed_lines[index].line;
@@ -1020,7 +1081,9 @@ fn all_changed_lines_are_nonreviewable(changed_lines: &[&IndexedChangedDiffLine]
             continue;
         }
 
-        if let Some(consumed) = trivial_formatting_only_replacement_run(&changed_lines[index..]) {
+        if let Some(consumed) =
+            trivial_formatting_only_replacement_run(&changed_lines[index..], indentation)
+        {
             index += consumed;
             continue;
         }
@@ -1033,17 +1096,20 @@ fn all_changed_lines_are_nonreviewable(changed_lines: &[&IndexedChangedDiffLine]
 
 fn trivial_formatting_only_replacement_run(
     changed_lines: &[&IndexedChangedDiffLine],
+    indentation: Indentation,
 ) -> Option<usize> {
     trivial_formatting_only_replacement_run_for_order(
         changed_lines,
         DiffLineKind::Removed,
         DiffLineKind::Added,
+        indentation,
     )
     .or_else(|| {
         trivial_formatting_only_replacement_run_for_order(
             changed_lines,
             DiffLineKind::Added,
             DiffLineKind::Removed,
+            indentation,
         )
     })
 }
@@ -1055,6 +1121,7 @@ fn trivial_formatting_only_replacement_run_for_order(
     changed_lines: &[&IndexedChangedDiffLine],
     first_kind: DiffLineKind,
     second_kind: DiffLineKind,
+    indentation: Indentation,
 ) -> Option<usize> {
     let change_run = changed_lines.first()?.change_run;
     let in_run_with_kind = |index: usize, kind: DiffLineKind| {
@@ -1079,8 +1146,8 @@ fn trivial_formatting_only_replacement_run_for_order(
 
     let mut saw_nonempty_line = false;
     for index in 0..first_len {
-        let first_trimmed = changed_lines[index].line.text.trim();
-        let second_trimmed = changed_lines[first_len + index].line.text.trim();
+        let first_trimmed = indentation.semantic_text(&changed_lines[index].line.text);
+        let second_trimmed = indentation.semantic_text(&changed_lines[first_len + index].line.text);
         if first_trimmed != second_trimmed {
             return None;
         }
@@ -1433,10 +1500,20 @@ mod tests {
         block: &crate::block::Block,
         hunks: &[DiffHunk],
     ) -> BlockDiffChangeKind {
-        DiffChangedLineIndex::from_hunks(hunks).change_kind_for_block(DiffBlockOwnership::Matched {
-            base: block,
-            head: block,
-        })
+        block_change_kind_in_language_diff(block, hunks, Language::Rust)
+    }
+
+    fn block_change_kind_in_language_diff(
+        block: &crate::block::Block,
+        hunks: &[DiffHunk],
+        language: Language,
+    ) -> BlockDiffChangeKind {
+        DiffChangedLineIndex::from_hunks(hunks, language).change_kind_for_block(
+            DiffBlockOwnership::Matched {
+                base: block,
+                head: block,
+            },
+        )
     }
 
     #[test]
@@ -1705,7 +1782,7 @@ mod tests {
             ],
         };
 
-        let index = DiffChangedLineIndex::from_hunks(&[hunk]);
+        let index = DiffChangedLineIndex::from_hunks(&[hunk], Language::Rust);
 
         assert_eq!(
             index.change_kind_for_block(DiffBlockOwnership::Matched {
@@ -1726,7 +1803,7 @@ mod tests {
             lines: vec![unified("-    value\n"), unified("+value\n")],
         }];
 
-        let index = DiffChangedLineIndex::from_hunks(&hunks);
+        let index = DiffChangedLineIndex::from_hunks(&hunks, Language::Rust);
         assert_eq!(
             index.change_kind_for_block(DiffBlockOwnership::Matched {
                 base: &block,
@@ -1745,12 +1822,15 @@ mod tests {
     fn diff_changed_line_index_block_start_whitespace_replacement_is_nonreviewable() {
         let base = local_source_block("    value\n", 0, 1);
         let head = local_source_block("value\n", 0, 1);
-        let index = DiffChangedLineIndex::from_hunks(&[DiffHunk {
-            file_path: RepoPath::root(),
-            old_start: 1,
-            new_start: 1,
-            lines: vec![unified("-    value\n"), unified("+value\n")],
-        }]);
+        let index = DiffChangedLineIndex::from_hunks(
+            &[DiffHunk {
+                file_path: RepoPath::root(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![unified("-    value\n"), unified("+value\n")],
+            }],
+            Language::Rust,
+        );
 
         assert_eq!(
             index.change_kind_for_block(DiffBlockOwnership::Matched {
@@ -1765,12 +1845,15 @@ mod tests {
     fn diff_changed_line_index_block_start_whitespace_only_changes_are_nonreviewable() {
         let base = local_source_block(" \n", 0, 1);
         let head = local_source_block("\t\n", 0, 1);
-        let index = DiffChangedLineIndex::from_hunks(&[DiffHunk {
-            file_path: RepoPath::root(),
-            old_start: 1,
-            new_start: 1,
-            lines: vec![unified("- \n"), unified("+\t\n")],
-        }]);
+        let index = DiffChangedLineIndex::from_hunks(
+            &[DiffHunk {
+                file_path: RepoPath::root(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![unified("- \n"), unified("+\t\n")],
+            }],
+            Language::Rust,
+        );
 
         assert_eq!(
             index.change_kind_for_block(DiffBlockOwnership::Matched {
@@ -1785,12 +1868,15 @@ mod tests {
     fn diff_changed_line_index_block_start_whitespace_mixed_with_removal_is_reviewable() {
         let base = local_source_block(" \nremoved\n", 0, 2);
         let head = line_only_block(0, 1);
-        let index = DiffChangedLineIndex::from_hunks(&[DiffHunk {
-            file_path: RepoPath::root(),
-            old_start: 1,
-            new_start: 1,
-            lines: vec![unified("- \n"), unified("-removed\n")],
-        }]);
+        let index = DiffChangedLineIndex::from_hunks(
+            &[DiffHunk {
+                file_path: RepoPath::root(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![unified("- \n"), unified("-removed\n")],
+            }],
+            Language::Rust,
+        );
 
         assert_eq!(
             index.change_kind_for_block(DiffBlockOwnership::Matched {
@@ -1817,7 +1903,7 @@ mod tests {
             lines: vec![unified("+line12\n")],
         };
 
-        let index = DiffChangedLineIndex::from_hunks(&[hunk_after, hunk_inside]);
+        let index = DiffChangedLineIndex::from_hunks(&[hunk_after, hunk_inside], Language::Rust);
 
         assert_eq!(
             index.change_kind_for_block(DiffBlockOwnership::HeadOnly(&block)),
@@ -2087,6 +2173,55 @@ mod tests {
             block_has_changed_lines_in_diff(&block, &[removal, addition]),
             BlockDiffChangeKind::ReviewableChanges,
             "a statement moved between hunks must remain reviewable"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_keeps_python_dedent_reviewable() {
+        let block = line_only_block(0, 5);
+
+        let hunk = DiffHunk {
+            file_path: RepoPath::new("app.py").unwrap(),
+            old_start: 1,
+            new_start: 1,
+            lines: vec![
+                unified(" def f(x):\n"),
+                unified("     if x:\n"),
+                unified("         a()\n"),
+                unified("-        b()\n"),
+                unified("+    b()\n"),
+            ],
+        };
+
+        for language in [
+            Language::Python,
+            Language::Yaml,
+            Language::Haskell,
+            Language::Markdown,
+        ] {
+            assert_eq!(
+                block_change_kind_in_language_diff(&block, std::slice::from_ref(&hunk), language),
+                BlockDiffChangeKind::ReviewableChanges,
+                "indentation-only changes are meaningful in {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_has_changed_lines_ignores_python_trailing_whitespace_replacements() {
+        let block = line_only_block(2, 5);
+
+        let hunk = DiffHunk {
+            file_path: RepoPath::new("app.py").unwrap(),
+            old_start: 3,
+            new_start: 3,
+            lines: vec![unified("-    b()\n"), unified("+    b()   \n")],
+        };
+
+        assert_eq!(
+            block_change_kind_in_language_diff(&block, &[hunk], Language::Python),
+            BlockDiffChangeKind::OnlyNonreviewableChurn,
+            "trailing whitespace stays churn even where indentation is significant"
         );
     }
 }

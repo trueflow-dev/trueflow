@@ -745,16 +745,17 @@ fn collect_diff_review_files(
             )
         });
 
-        let blocks = collect_diff_review_blocks_for_target_inputs(&target_inputs, &head_blocks);
-        if blocks.is_empty() {
-            continue;
-        }
-
         let language = head_file
             .as_ref()
             .map(|file| file.language)
             .or(base_language)
             .unwrap_or(Language::Unknown);
+        let blocks =
+            collect_diff_review_blocks_for_target_inputs(&target_inputs, &head_blocks, language);
+        if blocks.is_empty() {
+            continue;
+        }
+
         let file_hash = head_file
             .as_ref()
             .map(|file| file.tree_hash.clone())
@@ -1181,6 +1182,7 @@ fn is_subblock_covered(
 fn collect_diff_review_blocks_for_target_inputs(
     target_inputs: &[TargetFileDiffInput],
     head_blocks: &[Block],
+    language: Language,
 ) -> Vec<DiffReviewBlock> {
     let mut candidates = Vec::new();
     for target_input in target_inputs {
@@ -1193,6 +1195,7 @@ fn collect_diff_review_blocks_for_target_inputs(
             base_blocks,
             head_blocks,
             target_input.file_diff.hunks(),
+            language,
         ));
     }
     dedupe_diff_review_blocks(candidates)
@@ -1202,8 +1205,9 @@ fn collect_diff_review_blocks_for_file(
     base_blocks: &[Block],
     head_blocks: &[Block],
     hunks: &[vcs::DiffHunk],
+    language: Language,
 ) -> Vec<DiffReviewBlock> {
-    let changed_lines = vcs::DiffChangedLineIndex::from_hunks(hunks);
+    let changed_lines = vcs::DiffChangedLineIndex::from_hunks(hunks, language);
     let mut unmatched_base = vec![true; base_blocks.len()];
     let mut unmatched_head = vec![true; head_blocks.len()];
     // Reserve semantic survivors before positional evidence can consume them.
@@ -2363,6 +2367,7 @@ mod tests {
                 new_start: 1,
                 lines: vec![vcs::DiffHunkLine::removed("mod common;\n")],
             }],
+            Language::Rust,
         );
 
         let sides = diff_review_blocks(&blocks);
@@ -2397,6 +2402,7 @@ mod tests {
                     vcs::DiffHunkLine::removed("}\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         let sides = diff_review_blocks(&blocks);
@@ -2446,6 +2452,7 @@ mod tests {
                     vcs::DiffHunkLine::context("}\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         let sides = diff_review_blocks(&blocks);
@@ -2515,6 +2522,7 @@ mod tests {
                     vcs::DiffHunkLine::added("adjacent changed\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         let sides = diff_review_blocks(&blocks);
@@ -2549,6 +2557,7 @@ mod tests {
                     vcs::DiffHunkLine::context("pub fn retained() {}\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         assert_eq!(
@@ -2595,6 +2604,7 @@ mod tests {
                     vcs::DiffHunkLine::context("pub fn retained() {}\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         assert_eq!(
@@ -2641,6 +2651,7 @@ mod tests {
                     vcs::DiffHunkLine::context("pub fn retained() {}\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         assert_eq!(
@@ -2699,6 +2710,7 @@ mod tests {
                     vcs::DiffHunkLine::added("fn retained() {}\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         assert_eq!(
@@ -2742,6 +2754,7 @@ mod tests {
                     vcs::DiffHunkLine::added("\t\n"),
                 ],
             }],
+            Language::Rust,
         );
 
         assert!(
@@ -2791,6 +2804,7 @@ mod tests {
         let blocks = collect_diff_review_blocks_for_target_inputs(
             &[target_a.clone(), target_b.clone()],
             &head_blocks,
+            Language::Rust,
         );
         assert_eq!(
             blocks.len(),
@@ -2819,8 +2833,11 @@ mod tests {
                     .is_some_and(|base| base.hash == base_b_blocks[0].hash)
                 && block.sides.head.is_none()
         }));
-        let reversed =
-            collect_diff_review_blocks_for_target_inputs(&[target_b, target_a], &head_blocks);
+        let reversed = collect_diff_review_blocks_for_target_inputs(
+            &[target_b, target_a],
+            &head_blocks,
+            Language::Rust,
+        );
         assert_eq!(
             blocks
                 .iter()
@@ -2861,12 +2878,16 @@ mod tests {
                 .unwrap(),
             &head_blocks,
             input.file_diff.hunks(),
+            Language::Rust,
         );
         assert_eq!(per_target.len(), 1);
         assert_eq!(per_target[0].change_kind, BlockChangeKind::Changed);
 
-        let blocks =
-            collect_diff_review_blocks_for_target_inputs(&[input.clone(), input], &head_blocks);
+        let blocks = collect_diff_review_blocks_for_target_inputs(
+            &[input.clone(), input],
+            &head_blocks,
+            Language::Rust,
+        );
         assert_eq!(
             blocks.len(),
             1,
