@@ -708,6 +708,9 @@ impl<'a> CoverageLookups<'a> {
             let Some(language) = node.language else {
                 continue;
             };
+            if !sub_splitter::may_split_into_review_units(block, language) {
+                continue;
+            }
             let Ok(split) = sub_splitter::split_result(block, language) else {
                 continue;
             };

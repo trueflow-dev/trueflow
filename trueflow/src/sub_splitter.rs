@@ -116,6 +116,48 @@ pub fn split_result_for_child_navigation(block: &Block, lang: Language) -> Resul
     )
 }
 
+/// Whether `split_result(block, lang)` can yield review units other than
+/// `block` itself. When it cannot, the split returns the block alone or
+/// structural children, or fails, so callers that only consume review units
+/// skip it and its parse. Mirrors the branch order of
+/// `split_result_with_options` without `force_expand_children`.
+pub fn may_split_into_review_units(block: &Block, lang: Language) -> bool {
+    if let Some(language_registration) = languages::registration(lang) {
+        let registration = (language_registration.sub_split)(block.kind);
+        return matches!(
+            registration.semantics,
+            languages::LanguageSubSplitSemantics::ReviewUnits
+        ) && block.line_span().len() > MAX_REVIEW_UNIT_SPAN_LINES;
+    }
+    if is_toml_structural_kind(lang, block.kind) {
+        return false;
+    }
+    if is_nix_structural_candidate(lang, block.kind) {
+        // Only the parse tells whether Nix structural children exist.
+        return true;
+    }
+    let plan = determine_split_plan(block.kind, lang);
+    !matches!(plan, SplitPlan::IdentityReviewUnit)
+        && !should_keep_parent_review_unit(plan, block)
+        && plan.semantics() == SubSplitSemantics::ReviewUnits
+}
+
+fn is_toml_structural_kind(lang: Language, kind: BlockKind) -> bool {
+    matches!(lang, Language::Toml) && matches!(kind, BlockKind::Section | BlockKind::List)
+}
+
+fn is_nix_structural_candidate(lang: Language, kind: BlockKind) -> bool {
+    matches!(lang, Language::Nix)
+        && matches!(
+            kind,
+            BlockKind::Variable
+                | BlockKind::Section
+                | BlockKind::List
+                | BlockKind::Code
+                | BlockKind::Function
+        )
+}
+
 fn split_result_with_options(
     block: &Block,
     lang: Language,
@@ -170,8 +212,7 @@ fn split_result_with_options(
         return Ok(result);
     }
 
-    if matches!(lang, Language::Toml) && matches!(block.kind, BlockKind::Section | BlockKind::List)
-    {
+    if is_toml_structural_kind(lang, block.kind) {
         let blocks = split_toml_structural_children(parent, block.kind)?;
         let result = SubSplitResult {
             blocks,
@@ -185,15 +226,7 @@ fn split_result_with_options(
         return Ok(result);
     }
 
-    if matches!(lang, Language::Nix)
-        && matches!(
-            block.kind,
-            BlockKind::Variable
-                | BlockKind::Section
-                | BlockKind::List
-                | BlockKind::Code
-                | BlockKind::Function
-        )
+    if is_nix_structural_candidate(lang, block.kind)
         && let Some(blocks) = split_nix_structural_children(parent)?
     {
         let result = SubSplitResult {
@@ -1963,6 +1996,122 @@ mod tests {
         match Block::from_file_range(content, kind, ByteSpan::new(0, content.len())) {
             Ok(block) => block,
             Err(error) => panic!("test source range must be valid: {error}"),
+        }
+    }
+
+    /// Coverage and review skip the split whenever the predicate says it
+    /// cannot yield new review units, so for every language, kind, and size
+    /// on either side of the review-unit limits the split must fail, return
+    /// structural children, or return the block itself.
+    #[test]
+    fn skipped_splits_never_yield_new_review_units() {
+        const LANGUAGES: [Language; 34] = [
+            Language::Rust,
+            Language::Swift,
+            Language::Elisp,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Java,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Python,
+            Language::Ruby,
+            Language::Php,
+            Language::Go,
+            Language::C,
+            Language::Cpp,
+            Language::Zig,
+            Language::Lua,
+            Language::Dart,
+            Language::Scala,
+            Language::Haskell,
+            Language::OCaml,
+            Language::Elixir,
+            Language::Clojure,
+            Language::Sql,
+            Language::Yaml,
+            Language::Json,
+            Language::Html,
+            Language::Css,
+            Language::Shell,
+            Language::Markdown,
+            Language::Toml,
+            Language::Nix,
+            Language::Just,
+            Language::Text,
+            Language::Unknown,
+        ];
+        const KINDS: [BlockKind; 36] = [
+            BlockKind::TextBlock,
+            BlockKind::Code,
+            BlockKind::Gap,
+            BlockKind::Comment,
+            BlockKind::Section,
+            BlockKind::Preamble,
+            BlockKind::Function,
+            BlockKind::Struct,
+            BlockKind::Enum,
+            BlockKind::Impl,
+            BlockKind::Module,
+            BlockKind::Modules,
+            BlockKind::Import,
+            BlockKind::Const,
+            BlockKind::Static,
+            BlockKind::Macro,
+            BlockKind::Class,
+            BlockKind::Export,
+            BlockKind::Variable,
+            BlockKind::Decorator,
+            BlockKind::Interface,
+            BlockKind::Type,
+            BlockKind::Method,
+            BlockKind::Command,
+            BlockKind::CodeParagraph,
+            BlockKind::Header,
+            BlockKind::Paragraph,
+            BlockKind::CodeBlock,
+            BlockKind::List,
+            BlockKind::ListItem,
+            BlockKind::Quote,
+            BlockKind::Element,
+            BlockKind::Content,
+            BlockKind::Sentence,
+            BlockKind::Imports,
+            BlockKind::FunctionSignature,
+        ];
+
+        for line_count in [
+            1,
+            MAX_REVIEW_UNIT_SPAN_LINES + 1,
+            MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES + 1,
+        ] {
+            // Blank-line-separated statements: every code, paragraph, and
+            // sentence splitter cuts this into several review units, so a
+            // wrongly skipped split cannot pass as "only itself".
+            let content = (0..line_count)
+                .map(|line| if line % 2 == 0 { "x = 1.\n" } else { "\n" })
+                .collect::<String>();
+            for kind in KINDS {
+                let block = make_block(&content, kind);
+                for lang in LANGUAGES {
+                    if may_split_into_review_units(&block, lang) {
+                        continue;
+                    }
+                    let Ok(result) = split_result(&block, lang) else {
+                        continue;
+                    };
+                    let only_itself = matches!(
+                        result.blocks.as_slice(),
+                        [unit] if unit.content == block.content
+                            && unit.byte_span() == block.byte_span()
+                    );
+                    assert!(
+                        result.semantics == SubSplitSemantics::StructuralChildren || only_itself,
+                        "{lang:?} {kind:?} with {line_count} lines was skipped but splits into {} review units",
+                        result.blocks.len()
+                    );
+                }
+            }
         }
     }
 
