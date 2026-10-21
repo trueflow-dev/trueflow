@@ -9001,17 +9001,55 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
         .style(Style::default().bg(palette.bg).fg(palette.fg));
     let inner_area = block.inner(popup_area);
     let lines = input_overlay_lines(&content, draft, &hints, palette, inner_area.width);
+    let cursor_offset = cursor
+        .map(|cursor| editing_cursor_visual_offset(&content, cursor.offset, inner_area.width));
+    let layout = input_overlay_layout(
+        inner_area,
+        usize_to_u16_saturating(lines.hints.len()),
+        cursor_offset.map(|(_, row)| row),
+    );
 
-    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines.text).scroll((layout.text_scroll, 0)),
+        layout.text,
+    );
+    frame.render_widget(Paragraph::new(lines.hints), layout.hints);
 
-    if let Some(cursor) = cursor {
-        let hint_lines = usize_to_u16_saturating(wrapped_editor_line_count(
-            &hints,
-            usize::from(inner_area.width.max(1)),
-        ));
-        frame.set_cursor_position(editing_cursor_position(
-            &content, cursor, inner_area, hint_lines,
-        ));
+    if let Some((column, row)) = cursor_offset {
+        frame.set_cursor_position(Position {
+            x: inner_area.x + column.min(inner_area.width.saturating_sub(1)),
+            y: layout.text.y + row.saturating_sub(layout.text_scroll),
+        });
+    }
+}
+
+/// Inner rows of the input overlay: the editor text, scrolled so the cursor
+/// row stays visible, above a blank separator row and the hints pinned at the
+/// bottom, so long notes never push the typed line or the hints out of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputOverlayLayout {
+    text: Rect,
+    text_scroll: u16,
+    hints: Rect,
+}
+
+fn input_overlay_layout(inner: Rect, hint_rows: u16, cursor_row: Option<u16>) -> InputOverlayLayout {
+    let hint_rows = hint_rows.min(inner.height);
+    let text_rows = inner.height.saturating_sub(hint_rows).saturating_sub(1);
+    let text_scroll =
+        cursor_row.map_or(0, |row| row.saturating_sub(text_rows.saturating_sub(1)));
+    InputOverlayLayout {
+        text: Rect {
+            height: text_rows,
+            ..inner
+        },
+        text_scroll,
+        hints: Rect {
+            y: inner.y + inner.height - hint_rows,
+            height: hint_rows,
+            ..inner
+        },
     }
 }
 
@@ -9068,30 +9106,6 @@ fn editor_display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn editing_cursor_position(
-    content: &str,
-    cursor: InputCursor,
-    inner_area: Rect,
-    hint_lines: u16,
-) -> Position {
-    if inner_area.width == 0 || inner_area.height == 0 {
-        return Position {
-            x: inner_area.x,
-            y: inner_area.y,
-        };
-    }
-
-    let (column, row) = editing_cursor_visual_offset(content, cursor.offset, inner_area.width);
-    let visible_content_rows = inner_area
-        .height
-        .saturating_sub(hint_lines.saturating_add(1));
-    let max_row = visible_content_rows.saturating_sub(1);
-    Position {
-        x: inner_area.x + column.min(inner_area.width.saturating_sub(1)),
-        y: inner_area.y + row.min(max_row),
-    }
-}
-
 fn editing_cursor_visual_offset(
     content: &str,
     cursor_offset: usize,
@@ -9130,32 +9144,36 @@ fn input_overlay_rect(area: Rect, body_lines: u16) -> Rect {
     }
 }
 
+struct InputOverlayLines {
+    text: Vec<Line<'static>>,
+    hints: Vec<Line<'static>>,
+}
+
 fn input_overlay_lines(
     content: &str,
     draft: Option<&str>,
     hints: &str,
     palette: &UiPalette,
     wrap_width: u16,
-) -> Vec<Line<'static>> {
+) -> InputOverlayLines {
     let wrap_width = usize::from(wrap_width.max(1));
-    let mut lines = if content.is_empty() {
+    let dim = Style::default().fg(palette.dim);
+    let text = if content.is_empty() {
         cell_wrapped_editor_lines(visible_editor_text(content, draft), wrap_width)
             .into_iter()
-            .map(|line| Line::from(Span::styled(line, Style::default().fg(palette.dim))))
-            .collect::<Vec<_>>()
+            .map(|line| Line::from(Span::styled(line, dim)))
+            .collect()
     } else {
         cell_wrapped_editor_lines(content, wrap_width)
             .into_iter()
             .map(Line::from)
-            .collect::<Vec<_>>()
+            .collect()
     };
-    lines.push(Line::from(""));
-    lines.extend(
-        cell_wrapped_editor_lines(hints, wrap_width)
-            .into_iter()
-            .map(|line| Line::from(Span::styled(line, Style::default().fg(palette.dim)))),
-    );
-    lines
+    let hints = cell_wrapped_editor_lines(hints, wrap_width)
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, dim)))
+        .collect();
+    InputOverlayLines { text, hints }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13595,6 +13613,57 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn long_note_overlay_keeps_typed_line_cursor_and_hint_visible() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+        state.input_buffer = (1..=14)
+            .map(|index| format!("line-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.input_cursor = InputCursor {
+            offset: state.input_buffer.len(),
+            goal_column: None,
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| ui(frame, &mut state))
+            .unwrap_or_else(|error| panic!("failed to render editing overlay: {error}"));
+        let buffer = terminal.backend().buffer();
+        let rows = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("Enter to submit"),
+            "expected the submit hint to stay visible:\n{screen}"
+        );
+        let (typed_row, typed_line) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.contains("line-14"))
+            .unwrap_or_else(|| panic!("expected the typed line to stay visible:\n{screen}"));
+        let typed_column = typed_line
+            .find("line-14")
+            .map(|byte| typed_line[..byte].chars().count())
+            .unwrap_or_default();
+
+        terminal.backend_mut().assert_cursor_position((
+            u16::try_from(typed_column + "line-14".len()).unwrap_or(u16::MAX),
+            u16::try_from(typed_row).unwrap_or(u16::MAX),
+        ));
+    }
+
+    #[test]
     fn tui_keyboard_enhancement_flags_report_modified_enter_events() {
         let flags = tui_keyboard_enhancement_flags();
         assert!(
@@ -13687,11 +13756,11 @@ mod diff_scope_tests {
             80,
         );
 
-        assert_eq!(lines[0].to_string(), "first line");
-        assert_eq!(lines[1].to_string(), "second line");
-        assert_eq!(lines[2].to_string(), "");
+        assert_eq!(lines.text[0].to_string(), "first line");
+        assert_eq!(lines.text[1].to_string(), "second line");
+        assert_eq!(lines.text.len(), 2);
         assert!(
-            lines[3].to_string().contains("Ctrl+J newline"),
+            lines.hints[0].to_string().contains("Ctrl+J newline"),
             "expected multiline hint line to include Ctrl+J guidance"
         );
     }
@@ -13708,12 +13777,12 @@ mod diff_scope_tests {
         );
 
         assert_eq!(
-            lines[0].to_string(),
+            lines.text[0].to_string(),
             "Consider asking why this unwrap is safe."
         );
-        assert_eq!(lines[1].to_string(), "");
+        assert_eq!(lines.text.len(), 1);
         assert!(
-            lines[2]
+            lines.hints[0]
                 .to_string()
                 .contains("Right arrow to use suggestion")
         );
@@ -13730,9 +13799,9 @@ mod diff_scope_tests {
             8,
         );
 
-        assert_eq!(lines[0].to_string(), "hello wo");
-        assert_eq!(lines[1].to_string(), "rld");
-        assert_eq!(lines[2].to_string(), "");
+        assert_eq!(lines.text[0].to_string(), "hello wo");
+        assert_eq!(lines.text[1].to_string(), "rld");
+        assert_eq!(lines.text.len(), 2);
     }
 
     #[test]

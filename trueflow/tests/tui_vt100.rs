@@ -930,6 +930,39 @@ fn failed_note_submit_keeps_editor_open_and_preserves_note() -> Result<()> {
 }
 
 #[test]
+fn long_note_keeps_typed_line_and_submit_hint_visible() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(120, 20),
+        "src/lib.rs",
+        "fn demo() {\n    work();\n}\n",
+        "fn demo() {\n    work();\n}\n",
+        0,
+        3,
+    )?;
+
+    app.open_note_overlay()?;
+    for index in 1..=14 {
+        if index > 1 {
+            app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))?;
+        }
+        press_text(&mut app, &format!("line-{index:02}"))?;
+    }
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        screen.contains("line-14"),
+        "expected the line being typed to stay visible:\n{screen}"
+    );
+    assert!(
+        screen.contains("Enter to submit"),
+        "expected the submit hint to stay visible:\n{screen}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn multiline_note_submit_persists_to_review_store_and_feedback_output() -> Result<()> {
     let repo = TestRepo::new("tui_vt100_comment_submit")?;
     let file_content = "fn demo() {\n    work();\n}\n";
