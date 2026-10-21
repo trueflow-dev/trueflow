@@ -688,19 +688,35 @@ When CURRENT-IDX and TOTAL-COUNT are given, show them as review progress."
     (trueflow--refresh-focus-session trueflow-focus-status-buffer
                                      (alist-get 'hash trueflow-focus-current-block))))
 
-(defun trueflow-focus-approve ()
-  (interactive)
+(defun trueflow--focus-subblock-action (section verdict)
+  "Apply VERDICT to the sub-block SECTION of the split focus view.
+Refresh the status buffer and, while the parent block still needs review,
+re-render its split view."
+  (let ((parent-hash (alist-get 'hash trueflow-focus-current-block)))
+    (trueflow--run-mark (trueflow--section-value section) verdict nil)
+    (trueflow--refresh-focus-session trueflow-focus-status-buffer parent-hash)
+    (let ((focus-buf (get-buffer "*trueflow-focus*")))
+      (when (and focus-buf
+                 (equal (alist-get 'hash (buffer-local-value
+                                          'trueflow-focus-current-block focus-buf))
+                        parent-hash))
+        (with-current-buffer focus-buf
+          (trueflow-focus-subdivide))))))
+
+(defun trueflow--focus-verdict (verdict)
+  "Apply VERDICT to the sub-block at point, or else to the focused block."
   (let ((section (magit-current-section)))
     (if (cl-typep section 'trueflow-block)
-        (trueflow--mark-at-point "approved" nil)
-      (trueflow-focus-action "approved"))))
+        (trueflow--focus-subblock-action section verdict)
+      (trueflow-focus-action verdict))))
+
+(defun trueflow-focus-approve ()
+  (interactive)
+  (trueflow--focus-verdict "approved"))
 
 (defun trueflow-focus-reject ()
   (interactive)
-  (let ((section (magit-current-section)))
-    (if (cl-typep section 'trueflow-block)
-        (trueflow--mark-at-point "rejected" nil)
-      (trueflow-focus-action "rejected"))))
+  (trueflow--focus-verdict "rejected"))
 
 (defun trueflow-focus-comment ()
   (interactive)

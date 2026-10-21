@@ -301,6 +301,54 @@
         (kill-buffer "*trueflow-focus*"))
       (kill-buffer status-buf))))
 
+(ert-deftest trueflow-focus-subblock-verdicts-refresh-status-not-focus ()
+  "Marking a sub-block in the split view refreshes the status buffer.
+The focus buffer keeps showing the split parent instead of a status view."
+  (let* ((parent (trueflow-test--block "parent"))
+         (child '((hash . "child")
+                  (content . "child_body();\n")
+                  (start_line . 3)
+                  (end_line . 3)
+                  (kind . "CodeParagraph")
+                  (file . "src/lib.rs")))
+         (scan (trueflow-test--scan-data '("parent" "other"))))
+    (dolist (case '((trueflow-focus-approve "approved")
+                    (trueflow-focus-reject "rejected")))
+      (let ((status-buf (generate-new-buffer " *trueflow-test-status*"))
+            refreshed-in
+            mark-args)
+        (unwind-protect
+            (cl-letf (((symbol-function 'magit-current-section)
+                       (lambda () (make-instance 'trueflow-block)))
+                      ((symbol-function 'trueflow--section-value) (lambda (_) child))
+                      ((symbol-function 'trueflow-refresh)
+                       (lambda ()
+                         (setq refreshed-in (current-buffer))
+                         (setq trueflow-last-scan-data scan)))
+                      ((symbol-function 'trueflow--run-command)
+                       (lambda (args)
+                         (if (equal (car args) "mark")
+                             (progn (setq mark-args args) "")
+                           (list child)))))
+              (with-current-buffer status-buf
+                (trueflow-mode)
+                (setq-local trueflow-last-scan-data scan)
+                (trueflow-focus-open parent status-buf)
+                (trueflow-focus-subdivide))
+              (with-current-buffer "*trueflow-focus*"
+                (funcall (car case)))
+              (should (equal mark-args
+                             (list "mark" "--fingerprint" "child" "--verdict" (cadr case)
+                                   "--path" "src/lib.rs" "--line" "3")))
+              (should (eq refreshed-in status-buf))
+              (with-current-buffer "*trueflow-focus*"
+                (should (eq major-mode 'trueflow-focus-mode))
+                (should (equal (alist-get 'hash trueflow-focus-current-block) "parent"))
+                (should (string-match-p "child_body" (buffer-string)))))
+          (when (get-buffer "*trueflow-focus*")
+            (kill-buffer "*trueflow-focus*"))
+          (kill-buffer status-buf))))))
+
 (ert-deftest trueflow-comment-commit-runs-after-commit-callback ()
   "Committing a comment should mark it and refresh the focus session."
   (let* ((status-buf (generate-new-buffer " *trueflow-test-status*"))

@@ -409,8 +409,9 @@
      already diverged (onboarding guards); share one dispatcher.
    - [ ] Wrapped expressions continuing with `* x` are labelled comments; Nix
      structural children drop leading comments and closing delimiters.
-   - [ ] Emacs: approving a sub-block in the split view redraws the status view
-     into `*trueflow-focus*`.
+   - [X] Emacs: approving a sub-block in the split view redrew the status view
+     into `*trueflow-focus*`; it now refreshes the status buffer and re-splits
+     the parent. `trueflow-focus-subblock-verdicts-refresh-status-not-focus`
    - [X] `inspect --path` rejected the current-directory-relative paths that
      `mark --path` accepts from a subdirectory (scan paths were already
      repo-relative); both now share one resolver.
