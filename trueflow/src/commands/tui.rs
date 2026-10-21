@@ -976,6 +976,16 @@ impl PendingAction {
             }
         }
     }
+
+    fn comment_note(&self) -> Option<&str> {
+        match self {
+            PendingAction::Single { verdict, note, .. }
+            | PendingAction::Batch { verdict, note, .. } => match verdict {
+                Verdict::Comment => note.as_deref(),
+                _ => None,
+            },
+        }
+    }
 }
 
 #[derive(PartialEq, Default)]
@@ -5300,8 +5310,19 @@ fn handle_confirm_batch(
 }
 
 fn handle_confirm_cancel(state: &mut AppState) {
-    state.input_mode = InputMode::Normal;
     state.input_draft = None;
+    // Cancelling the confirmation of a typed note returns to the editor
+    // instead of discarding the note; other batch actions just close.
+    if let InputMode::ConfirmBatch { action, .. } = std::mem::take(&mut state.input_mode)
+        && let Some(note) = action.comment_note()
+    {
+        state.input_buffer = note.to_string();
+        state.input_cursor = InputCursor {
+            offset: note.len(),
+            goal_column: None,
+        };
+        state.input_mode = InputMode::Editing { action };
+    }
 }
 
 fn execute_action(
@@ -13542,6 +13563,41 @@ mod diff_scope_tests {
         assert!(matches!(state.input_mode, InputMode::Editing { .. }));
         assert_eq!(state.input_buffer, "keep me");
         assert_eq!(state.editing_validation, None);
+    }
+
+    #[test]
+    fn confirm_cancel_of_batch_note_returns_to_editor_with_note() {
+        let (mut state, _file_id, _block_ids) = build_state_with_file_block_count(3);
+        handle_note_action(&mut state)
+            .unwrap_or_else(|error| panic!("failed to open note editor: {error}"));
+        state.input_buffer = "alpha\nbeta".to_string();
+        state.input_cursor.offset = state.input_buffer.len();
+
+        handle_editing_submit_with(&mut state, |_action, _state| {
+            panic!("batch note should ask for confirmation first");
+        })
+        .unwrap_or_else(|error| panic!("expected batch confirmation: {error}"));
+        assert!(matches!(state.input_mode, InputMode::ConfirmBatch { .. }));
+
+        handle_confirm_cancel(&mut state);
+
+        assert!(matches!(state.input_mode, InputMode::Editing { .. }));
+        assert_eq!(state.input_buffer, "alpha\nbeta");
+        assert_eq!(state.input_cursor.offset, "alpha\nbeta".len());
+    }
+
+    #[test]
+    fn confirm_cancel_of_batch_approval_returns_to_normal() {
+        let (mut state, file_id, _block_ids) = build_state_with_file_block_count(3);
+        state.input_mode = InputMode::ConfirmBatch {
+            action: PendingAction::from_node(&state.navigator.tree, file_id, Verdict::Approved),
+            count: 3,
+        };
+
+        handle_confirm_cancel(&mut state);
+
+        assert!(matches!(state.input_mode, InputMode::Normal));
+        assert!(state.input_buffer.is_empty());
     }
 
     #[test]
