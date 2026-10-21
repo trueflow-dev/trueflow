@@ -668,6 +668,12 @@ trueflow feedback --pr pr:11
 trueflow feedback --pr pr:11 --submit
 ```
 
+GitHub allows one pending review per user on a pull request. When you already
+have a pending review that trueflow cannot append to (for example a draft
+started in the browser, or a trueflow review created for an older PR head),
+`trueflow feedback --pr` refuses to create another one and names the review to
+submit or discard on GitHub first.
+
 After resuming an interrupted feedback operation, Trueflow reloads and validates
 the remote PR state before further delivery or submission. Recovered feedback
 is preserved when new notes are appended in the same invocation.

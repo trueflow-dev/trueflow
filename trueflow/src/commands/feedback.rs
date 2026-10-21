@@ -664,7 +664,12 @@ where
         let may_dispatch = match &operation.intent {
             GitHubDeliveryIntent::CreatePendingReview { .. }
             | GitHubDeliveryIntent::CreatePendingReviewWithGeneralFeedback { .. } => {
-                find_trueflow_pending_review(session.ledger(), metadata, &snapshot)?.is_none()
+                let may_create =
+                    find_trueflow_pending_review(session.ledger(), metadata, &snapshot)?.is_none();
+                if may_create {
+                    ensure_viewer_has_no_pending_review(&snapshot)?;
+                }
+                may_create
             }
             GitHubDeliveryIntent::AppendReviewThread {
                 review_id,
@@ -1324,7 +1329,25 @@ fn select_pull_request_feedback_delivery(
         return Ok(PullRequestFeedbackDelivery::AppendToPendingReview { review });
     }
 
+    ensure_viewer_has_no_pending_review(snapshot)?;
     Ok(PullRequestFeedbackDelivery::CreatePendingReview)
+}
+
+/// GitHub allows one pending review per user per pull request, so a create
+/// beside any other viewer-authored pending review would be rejected after the
+/// intent is already InFlight.
+fn ensure_viewer_has_no_pending_review(snapshot: &GitHubPullRequestDeliverySnapshot) -> Result<()> {
+    match snapshot.reviews.iter().find(|review| {
+        review.viewer_did_author && review.state == PullRequestReviewState::Pending
+    }) {
+        Some(review) => Err(anyhow!(
+            "GitHub allows only one pending review per user on {}, and you already have pending review {} that trueflow cannot append to for head {}; submit or discard it on GitHub, then rerun trueflow feedback",
+            snapshot.pr,
+            review.html_url,
+            snapshot.head_sha
+        )),
+        None => Ok(()),
+    }
 }
 
 fn find_trueflow_pending_review(
@@ -4215,16 +4238,31 @@ mod tests {
         Ok(())
     }
 
+    fn assert_refused_create_for_existing_pending_review(
+        store: &FileStore,
+        client: &FeedbackTestGitHubClient,
+        error: &anyhow::Error,
+        review_url: &str,
+    ) -> Result<()> {
+        let message = format!("{error:#}");
+        assert!(message.contains(review_url), "{message}");
+        assert!(message.contains("one pending review"), "{message}");
+        assert!(client.created.borrow().is_empty());
+        assert!(client.appended.borrow().is_empty());
+        assert_eq!(*client.dispatch_observations.borrow(), 0);
+        assert!(
+            delivery_ledger_snapshot(store)?
+                .active_operations()
+                .iter()
+                .all(|operation| operation.status == GitHubDeliveryIntentStatus::Prepared)
+        );
+        Ok(())
+    }
+
     #[test]
-    fn pull_request_feedback_creates_fresh_review_when_marker_mismatches() -> Result<()> {
+    fn pull_request_feedback_refuses_create_when_pending_review_marker_mismatches() -> Result<()> {
         let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_marker_mismatch")?;
         let store = FileStore::for_root(&repo_root)?;
-        store.append(&review_record(
-            "old-record",
-            &metadata.head_sha,
-            Some(source_anchor(&metadata, 0, 1)?),
-            Some("old note"),
-        ))?;
         store.append(&review_record(
             "new-record",
             &metadata.head_sha,
@@ -4235,12 +4273,178 @@ mod tests {
         let mut edited =
             persist_pending_review(&store, &metadata, &metadata.head_sha, &["old-record"])?;
         edited.body = "human edited body".to_string();
+        let review_url = edited.html_url.clone();
 
         let client = FeedbackTestGitHubClient::new(&metadata, vec![edited]);
-        let prepared = prepared_review(metadata.clone());
+        let error = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_refused_create_for_existing_pending_review(&store, &client, &error, &review_url)?;
+        assert!(delivery_ledger_snapshot(&store)?.active_operations().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_refuses_create_when_stale_head_pending_review_exists() -> Result<()> {
+        let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_stale_head")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+
+        let stale_pending =
+            persist_pending_review(&store, &metadata, &metadata.base_sha, &["old-record"])?;
+        let review_url = stale_pending.html_url.clone();
+
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![stale_pending]);
+        let error = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_refused_create_for_existing_pending_review(&store, &client, &error, &review_url)?;
+        assert!(delivery_ledger_snapshot(&store)?.active_operations().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_refuses_create_when_viewer_has_foreign_pending_review() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_foreign_pending")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+        let web_draft = posted_review(55, PullRequestReviewState::Pending, "started on GitHub");
+        let review_url = web_draft.html_url.clone();
+
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![web_draft]);
+        for dry_run in [true, false] {
+            let error = run_prepared_pull_request_feedback(
+                &repo_root,
+                &prepared_review(metadata.clone()),
+                &client,
+                dry_run,
+                false,
+                false,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert_refused_create_for_existing_pending_review(
+                &store,
+                &client,
+                &error,
+                &review_url,
+            )?;
+        }
+        assert!(delivery_ledger_snapshot(&store)?.active_operations().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_keeps_prepared_create_when_viewer_has_pending_review() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_prepared_create_foreign_pending")?;
+        let store = FileStore::for_root(&repo_root)?;
+        let operation_id = GitHubDeliveryOperationId::new();
+        let review_body = materialize_pending_review_delivery_body(
+            TRUEFLOW_PENDING_REVIEW_MARKER,
+            &operation_id.to_string(),
+            &metadata.head_sha,
+        )?;
+        {
+            let mut session =
+                GitHubDeliveryLedgerStore::for_directory(store.trueflow_dir()).lock()?;
+            session
+                .ledger_mut()
+                .prepare(GitHubDeliveryOperation::prepared(
+                    operation_id,
+                    GitHubDeliveryIntent::CreatePendingReview {
+                        pr: metadata.pr.clone(),
+                        head_sha: metadata.head_sha.clone(),
+                        review_body,
+                        comments: vec![GitHubDeliveryComment {
+                            record_id: "prepared-record".to_string(),
+                            operation_id: GitHubDeliveryOperationId::new(),
+                            comment: GitHubInlineComment {
+                                path: crate::repo_path::RepoPath::new("src/lib.rs")?,
+                                line: 1,
+                                side: GitHubCommentSide::Right,
+                                start_line: None,
+                                start_side: None,
+                                body: "prepared comment".to_string(),
+                            },
+                        }],
+                    },
+                ))?;
+            session.save()?;
+        }
+        let web_draft = posted_review(55, PullRequestReviewState::Pending, "started on GitHub");
+        let review_url = web_draft.html_url.clone();
+        let client = FeedbackTestGitHubClient::new(&metadata, vec![web_draft]);
+
+        let error = run_prepared_pull_request_feedback(
+            &repo_root,
+            &prepared_review(metadata),
+            &client,
+            false,
+            false,
+            false,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_refused_create_for_existing_pending_review(&store, &client, &error, &review_url)?;
+        let ledger = delivery_ledger_snapshot(&store)?;
+        assert_eq!(ledger.active_operations().len(), 1);
+        assert_eq!(ledger.active_operations()[0].id, operation_id);
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_feedback_creates_review_beside_other_users_pending_review() -> Result<()> {
+        let (repo_root, metadata) =
+            single_commit_pull_request_fixture("feedback_other_user_pending")?;
+        let store = FileStore::for_root(&repo_root)?;
+        store.append(&review_record(
+            "new-record",
+            &metadata.head_sha,
+            Some(source_anchor(&metadata, 0, 1)?),
+            Some("new note"),
+        ))?;
+        let client = FeedbackTestGitHubClient::new(
+            &metadata,
+            vec![posted_review(
+                55,
+                PullRequestReviewState::Pending,
+                "someone else's draft",
+            )],
+        )
+        .with_other_user_review_ids(vec![55]);
+
         let outcome = run_prepared_pull_request_feedback(
             &repo_root,
-            &prepared,
+            &prepared_review(metadata),
             &client,
             false,
             false,
@@ -4253,62 +4457,6 @@ mod tests {
             Some(PullRequestFeedbackDelivery::CreatePendingReview)
         );
         assert_eq!(client.created.borrow().len(), 1);
-        assert!(client.appended.borrow().is_empty());
-        let ledger = delivery_ledger_snapshot(&store)?;
-        let excluded = ledger.excluded_record_ids(&metadata.pr);
-        assert!(excluded.contains("old-record"));
-        assert!(excluded.contains("new-record"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn pull_request_feedback_ignores_pending_review_from_stale_head() -> Result<()> {
-        let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_stale_head")?;
-        let store = FileStore::for_root(&repo_root)?;
-        store.append(&review_record(
-            "old-record",
-            &metadata.head_sha,
-            Some(source_anchor(&metadata, 0, 1)?),
-            Some("old note"),
-        ))?;
-        store.append(&review_record(
-            "new-record",
-            &metadata.head_sha,
-            Some(source_anchor(&metadata, 0, 1)?),
-            Some("new note"),
-        ))?;
-
-        let stale_pending =
-            persist_pending_review(&store, &metadata, &metadata.base_sha, &["old-record"])?;
-
-        let client = FeedbackTestGitHubClient::new(&metadata, vec![stale_pending]);
-        let prepared = prepared_review(metadata);
-        let outcome = run_prepared_pull_request_feedback(
-            &repo_root,
-            &prepared,
-            &client,
-            false,
-            false,
-            false,
-            |_| Ok(()),
-        )?;
-
-        assert_eq!(
-            outcome.delivery,
-            Some(PullRequestFeedbackDelivery::CreatePendingReview)
-        );
-        assert!(client.appended.borrow().is_empty());
-        let created = client.created.borrow();
-        assert_eq!(created.len(), 1);
-        let comment_bodies = created[0]
-            .comments
-            .iter()
-            .map(|comment| comment.body.as_str())
-            .collect::<Vec<_>>();
-        assert!(comment_bodies[0].starts_with("new note\n"));
-        assert!(comment_bodies[1].starts_with("old note\n"));
-
         Ok(())
     }
 
@@ -4877,6 +5025,7 @@ mod tests {
                 snapshot_pr: metadata.pr.clone(),
                 snapshot_head: metadata.head_sha.clone(),
                 snapshot_threads: Vec::new(),
+                other_user_review_ids: Vec::new(),
                 created: RefCell::new(Vec::new()),
                 appended: RefCell::new(Vec::new()),
                 submitted: RefCell::new(Vec::new()),
@@ -4887,6 +5036,11 @@ mod tests {
                 ledger_lock_probe_directory: None,
                 cursor_lock_probe_path: None,
             }
+        }
+
+        fn with_other_user_review_ids(mut self, other_user_review_ids: Vec<u64>) -> Self {
+            self.other_user_review_ids = other_user_review_ids;
+            self
         }
 
         fn with_submit_state(mut self, submit_state: PullRequestReviewState) -> Self {
@@ -5067,7 +5221,7 @@ mod tests {
                         head_sha: Some(self.snapshot_head.clone()),
                         body: review.body.clone(),
                         html_url: review.html_url.clone(),
-                        viewer_did_author: true,
+                        viewer_did_author: !self.other_user_review_ids.contains(&review.id),
                     })
                     .collect(),
                 threads: self.snapshot_threads.clone(),

@@ -103,6 +103,8 @@ struct PendingReviewFixture {
     stdin_log: PathBuf,
     argv_log: PathBuf,
     expected: ExpectedThreadFields,
+    /// Whether GitHub already holds the viewer's trueflow pending review 101.
+    seeded_pending_review: bool,
 }
 
 struct ConcurrentFeedbackWorkers {
@@ -221,6 +223,10 @@ impl PendingReviewFixture {
             .env(
                 "TRUEFLOW_FAKE_GH_PENDING_BODY_JSON",
                 serde_json::to_string(&self.pending_review_body()?)?,
+            )
+            .env(
+                "TRUEFLOW_FAKE_GH_SEEDED_PENDING_REVIEW",
+                if self.seeded_pending_review { "1" } else { "0" },
             );
         Ok(command)
     }
@@ -625,6 +631,7 @@ fn pending_review_fixture(anchor: AnchorKind) -> Result<PendingReviewFixture> {
         stdin_log,
         argv_log,
         expected: anchor.expected(),
+        seeded_pending_review: true,
     })
 }
 
@@ -730,6 +737,7 @@ fn general_declaration_fixture(name: &str, seed_pending: bool) -> Result<Pending
         stdin_log,
         argv_log,
         expected: AnchorKind::SingleRight.expected(),
+        seeded_pending_review: seed_pending,
     })
 }
 
@@ -881,7 +889,11 @@ case "$body" in
     printf '{"data":{"repository":{"pullRequest":{"headRefOid":"%s"}}}}\n' "$TRUEFLOW_FAKE_GH_HEAD"
     ;;
   *"TrueflowPullRequestDeliveryReviews"*)
-    printf '{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[{"id":"PRR_pending_review","fullDatabaseId":"101","url":"https://github.com/trueflow-test-owner/trueflow-test-repository/pull/11#pullrequestreview-101","body":%s,"state":"PENDING","viewerDidAuthor":true,"commit":{"oid":"%s"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$TRUEFLOW_FAKE_GH_PENDING_BODY_JSON" "$TRUEFLOW_FAKE_GH_HEAD"
+    if [ "$TRUEFLOW_FAKE_GH_SEEDED_PENDING_REVIEW" = "1" ]; then
+      printf '{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[{"id":"PRR_pending_review","fullDatabaseId":"101","url":"https://github.com/trueflow-test-owner/trueflow-test-repository/pull/11#pullrequestreview-101","body":%s,"state":"PENDING","viewerDidAuthor":true,"commit":{"oid":"%s"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$TRUEFLOW_FAKE_GH_PENDING_BODY_JSON" "$TRUEFLOW_FAKE_GH_HEAD"
+    else
+      printf '{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n'
+    fi
     ;;
   *"TrueflowPullRequestDeliveryThreads"*)
     printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n'
