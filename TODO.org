@@ -237,7 +237,7 @@
      when the chunk size changed; the existing test pinned the jump.
    - Verified by
      `cargo nextest run --features tui-test-support --lib rechunk`.
-** DONE DEF_TODO 2026-10-21 review sweep (each fix has a failing-then-passing test)
+** DONE DEF_TODO 2026-10-21 review sweep (each fix has a regression test; fix agents reported seeing each fail first)
    Run tests with `cargo nextest run --features tui-test-support <args>`.
 *** Review collection and TUI
    - [High] Overlapping historical targets (`--target main --target rev:HEAD`)

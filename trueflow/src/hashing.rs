@@ -196,13 +196,21 @@ mod tests {
     /// streams borrowed runs instead, and block hashes persist in review
     /// records, so the streaming form must never diverge from this.
     fn canonicalize_reference(input: &str) -> String {
+        // The line rule, restated independently of `canonical_line`.
+        fn reference_line(line: &str) -> &str {
+            let trimmed = line.trim_end_matches([' ', '\t']);
+            match trimmed.strip_suffix('\\') {
+                Some(_) if trimmed.len() != line.len() => line,
+                _ => trimmed,
+            }
+        }
         let mut output = String::with_capacity(input.len());
         let bytes = input.as_bytes();
         let mut line_start = 0;
         let mut index = 0;
         while index < bytes.len() {
             if matches!(bytes[index], b'\r' | b'\n') {
-                output.push_str(canonical_line(&input[line_start..index]));
+                output.push_str(reference_line(&input[line_start..index]));
                 output.push('\n');
                 if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
                     index += 1;
@@ -212,7 +220,7 @@ mod tests {
             index += 1;
         }
         if line_start < input.len() {
-            output.push_str(canonical_line(&input[line_start..]));
+            output.push_str(reference_line(&input[line_start..]));
             output.push('\n');
         }
         output

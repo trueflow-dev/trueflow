@@ -33,7 +33,8 @@ stores review state in an append-only flat file database, e.g.
 - An optional session-local AI review plan can add a priority prefix. It never
   removes or duplicates targets; every omitted block remains in canonical
   relative order.
-- Pressing Esc on the AI briefing preserves canonical order.
+- In a full review, pressing Esc on the AI briefing preserves canonical order;
+  in a focused pass, Esc switches to the heuristic picks.
 - A focused pass reviews a reading-budgeted subset first; everything it leaves
   out stays pending until a full review.
 - Runtime config lives in `trueflow.toml`.
