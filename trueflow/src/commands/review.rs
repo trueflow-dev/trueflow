@@ -845,7 +845,32 @@ type DiffReviewTreeBuild = (
     HashMap<tree::TreeNodeId, BlockChangeKind>,
 );
 
+/// A diff can delete file `notes` and add `notes/today.md`. The review tree
+/// indexes nodes by path, so one tree cannot hold both a file and a directory
+/// at `notes`; report that instead of tripping the tree's uniqueness assert.
+fn reject_file_directory_collisions(files: &[DiffReviewFile]) -> Result<()> {
+    let file_paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    for file in files {
+        let path = file.path.as_str();
+        for (separator, _) in path.match_indices('/') {
+            let ancestor = &path[..separator];
+            if file_paths.contains(ancestor) {
+                return Err(anyhow!(
+                    "cannot review `{ancestor}`: the selected changes replace a file with a \
+                     directory of the same name (or the reverse), and one review tree cannot \
+                     show both; narrow the review with `file:`/`dir:` targets"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_tree_from_diff_review_files(files: &[DiffReviewFile]) -> Result<DiffReviewTreeBuild> {
+    reject_file_directory_collisions(files)?;
     let mut builder = tree::TreeBuilder::new();
     let root = builder.root();
     let mut directories = HashMap::from([(RepoPath::root(), root)]);
@@ -3117,6 +3142,34 @@ mod tests {
             added_sides.base.as_ref().map(|block| block.content.as_str()),
             Some("pub fn added() -> u8 { 4 }"),
             "the changed pair must win over the branch-wide addition"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_review_revision_replacing_file_with_directory_does_not_panic() -> Result<()> {
+        let repo_root = temp_git_repo("file_replaced_by_directory");
+        fs::write(repo_root.join("notes"), "pub fn old_note() -> u8 { 1 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "file"]);
+        run_git(&repo_root, &["rm", "-q", "notes"]);
+        fs::create_dir_all(repo_root.join("notes"))?;
+        fs::write(repo_root.join("notes/today.md"), "# Today\n\nNew words.\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "directory"]);
+        let _guard = CurrentDirGuard::push(&repo_root);
+
+        let result = std::panic::catch_unwind(|| {
+            collect_review_for_targets(vec![ReviewTarget::Revision(RevisionExpr::new("HEAD")?)])
+        });
+
+        let error = result
+            .map_err(|_| anyhow!("collect_review panicked"))?
+            .err()
+            .ok_or_else(|| anyhow!("expected a file/directory collision error"))?;
+        assert!(
+            format!("{error:#}").contains("`notes`"),
+            "error must name the colliding path: {error:#}"
         );
         Ok(())
     }
