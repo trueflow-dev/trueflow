@@ -31,6 +31,7 @@ pub mod repo_path;
 pub mod review_metadata;
 pub mod review_navigator;
 pub mod review_order;
+pub mod review_pass;
 pub mod review_scope;
 pub mod review_session;
 pub mod review_speedread;

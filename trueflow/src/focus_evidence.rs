@@ -186,11 +186,12 @@ fn capture_with(
                 }
             },
         )?;
-        if let Some(class) = classification(node) {
+        if let Some(class) = source_class(node) {
             add(
                 EvidenceKind::SourceClassification,
                 format!(
-                    "{class}; discount volume/churn as a risk signal. Classification is heuristic, not a safety claim."
+                    "{}; discount volume/churn as a risk signal. Classification is heuristic, not a safety claim.",
+                    class.label()
                 ),
             )?;
         }
@@ -344,7 +345,7 @@ fn is_comment(line: &str) -> bool {
         || line.starts_with("# ")
 }
 
-fn signal(kind: EvidenceKind, line: &str) -> bool {
+pub(crate) fn signal(kind: EvidenceKind, line: &str) -> bool {
     if is_comment(line) {
         return false;
     }
@@ -428,28 +429,68 @@ fn excerpt(sample: &str) -> String {
     bounded(&output, MAX_EXCERPT_BYTES).to_owned()
 }
 
-fn classification(node: &crate::tree::TreeNode) -> Option<&'static str> {
+/// Heuristic provenance of a block's source. Absent means first-party, non-test source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceClass {
+    Vendor,
+    Generated,
+    Test,
+}
+
+impl SourceClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Vendor => "vendor/dependency source",
+            Self::Generated => "generated/build source",
+            Self::Test => "test-only source heuristic",
+        }
+    }
+}
+
+/// Dependency lock files are machine-generated even though they are committed.
+const LOCK_FILE_NAMES: &[&str] = &[
+    "Cargo.lock",
+    "flake.lock",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "uv.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "go.sum",
+    "Package.resolved",
+    "pubspec.lock",
+    "mix.lock",
+];
+
+pub(crate) fn source_class(node: &crate::tree::TreeNode) -> Option<SourceClass> {
     let block = node.block.as_ref()?;
     let path = node.path.as_str();
+    let file_name = path.rsplit('/').next().unwrap_or(path);
     if path.split('/').any(|part| {
         matches!(
             part,
             "vendor" | "node_modules" | "third_party" | "third-party"
         )
     }) {
-        Some("vendor/dependency source")
-    } else if path
-        .split('/')
-        .any(|part| matches!(part, "generated" | "dist" | "build"))
+        Some(SourceClass::Vendor)
+    } else if LOCK_FILE_NAMES.contains(&file_name)
+        || path
+            .split('/')
+            .any(|part| matches!(part, "generated" | "dist" | "build"))
         || block.tags.iter().any(|tag| tag == "generated")
         || bounded(&block.content, 1024)
             .to_ascii_lowercase()
             .contains("automatically generated")
         || bounded(&block.content, 1024).contains("@generated")
     {
-        Some("generated/build source")
+        Some(SourceClass::Generated)
     } else if crate::review_order::is_test_block(&node.path, node) {
-        Some("test-only source heuristic")
+        Some(SourceClass::Test)
     } else {
         None
     }

@@ -39,11 +39,11 @@ impl ReviewLocation {
     }
 
     pub(crate) fn estimated_seconds(&self) -> usize {
-        self.end_line
-            .saturating_sub(self.start_line)
-            .saturating_add(1)
-            .saturating_mul(2)
-            .saturating_add(10)
+        crate::review_pass::reading_seconds(
+            self.end_line
+                .saturating_sub(self.start_line)
+                .saturating_add(1),
+        )
     }
 }
 

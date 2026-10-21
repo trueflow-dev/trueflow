@@ -26,6 +26,15 @@ impl ReviewDuration {
         Ok(Self(seconds))
     }
 
+    /// Compile-time constructor for fixed defaults.
+    pub const fn from_minutes(minutes: usize) -> Self {
+        assert!(
+            minutes >= 1 && minutes <= 60,
+            "review duration must be between 1m and 60m"
+        );
+        Self(minutes * 60)
+    }
+
     pub const fn seconds(self) -> usize {
         self.0
     }
