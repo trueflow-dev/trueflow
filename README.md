@@ -572,7 +572,11 @@ trueflow review --target main --pass focused --json   # same heuristic subset fo
   selector, or the next commit of a PR), and `q` quits.
 - **Comments.** A block whose latest verdict is a comment on its current
   content is never a card: you already read it and it has not changed. It stays
-  pending for a full review and counts toward the remainder.
+  pending for a full review and counts toward the remainder. When nothing but
+  such blocks is left, the TUI opens on a "Nothing new for a focused pass"
+  recap (Enter for the full review) and `review --pass focused` says the same
+  instead of "All clear"; the recap offers `f` only while another pass could
+  pick something (a skipped card or an unpicked candidate).
 - **Containers.** With `--only` kinds such as `impl` or `class`, a container
   whose children are filtered out is a card like any other block; a container
   with pending children never is, because its approval would cover them.

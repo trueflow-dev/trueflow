@@ -519,7 +519,9 @@ pub(crate) fn signal(kind: EvidenceKind, line: &str) -> bool {
             "credential",
             "bearer",
             "csrf",
+            "apikey",
             "api_key",
+            "API_KEY",
             "deserialize",
             "parse(",
             "unsafe ",
@@ -1040,6 +1042,18 @@ mod tests {
         repo: Option<&gix::Repository>,
     ) -> FocusInventory {
         capture_with(review, &FocusScope::Repository, database, repo).unwrap()
+    }
+
+    #[test]
+    fn api_key_matches_every_common_spelling() {
+        for line in [
+            "api_key: String,",
+            "const API_KEY: &str = \"\";",
+            "apiKey: string;",
+            "let ApiKey = load();",
+        ] {
+            assert!(signal(EvidenceKind::TrustBoundary, line), "{line}");
+        }
     }
 
     #[test]
