@@ -98,6 +98,11 @@ impl Projector<'_> {
                 self.collect_scope(child, parent_id, parent_name, default_visibility)?;
                 continue;
             }
+            if let Some(block) = linkage_block(child) {
+                pending.clear();
+                self.collect_scope(block, parent_id, parent_name, default_visibility)?;
+                continue;
+            }
             if child.kind() == "namespace_definition" {
                 let attachments = std::mem::take(&mut pending);
                 if let Some(body) = child.child_by_field_name("body") {
@@ -1086,7 +1091,10 @@ fn function_node(node: Node<'_>) -> Option<Node<'_>> {
     ) {
         return contains_callable_syntax(node).then_some(node);
     }
-    if matches!(node.kind(), "template_declaration" | "friend_declaration") {
+    if matches!(
+        node.kind(),
+        "template_declaration" | "friend_declaration" | "linkage_specification"
+    ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if let Some(function) = function_node(child) {
@@ -1608,6 +1616,16 @@ fn is_preprocessor_container(kind: &str) -> bool {
         kind,
         "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_elifdef" | "preproc_else"
     )
+}
+
+/// The declaration list of an `extern "C" { ... }` block, whose members are file-scope
+/// declarations. A single-declaration `extern "C" int f(void);` is projected as one callable.
+fn linkage_block(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "linkage_specification" {
+        return None;
+    }
+    node.child_by_field_name("body")
+        .filter(|body| body.kind() == "declaration_list")
 }
 
 fn qualify(parent: Option<&str>, child: Option<&str>) -> Option<String> {

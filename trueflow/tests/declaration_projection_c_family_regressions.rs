@@ -662,3 +662,47 @@ fn cpp_preprocessor_blocks_inside_class_bodies_keep_members() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn cpp_extern_c_linkage_declarations_are_inventoried() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "extern \"C\" {\n",
+        "int open_handle(int);\n",
+        "struct Handle { int fd; };\n",
+        "}\n",
+        "extern \"C\" int close_handle(struct Handle *);\n",
+    );
+
+    let facts = project("src/handle.cpp", Language::Cpp, SOURCE)?;
+    assert_eq!(
+        facts
+            .declarations()
+            .iter()
+            .map(|declaration| (
+                declaration.name.as_str(),
+                declaration.kind,
+                declaration.projection_text.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "open_handle",
+                DeclarationKind::Function,
+                "int open_handle(int);"
+            ),
+            (
+                "Handle",
+                DeclarationKind::Struct,
+                "struct Handle { int fd; };"
+            ),
+            (
+                "close_handle",
+                DeclarationKind::Function,
+                "extern \"C\" int close_handle(struct Handle *);"
+            ),
+        ]
+    );
+    assert!(facts.diagnostics.is_empty(), "{:?}", facts.diagnostics);
+
+    Ok(())
+}
