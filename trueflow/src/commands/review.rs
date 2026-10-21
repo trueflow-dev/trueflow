@@ -528,7 +528,8 @@ fn collect_diff_review_presentation(
 
     for file in review_files {
         let mut unreviewed_blocks = Vec::new();
-        for review_block in &file.blocks {
+        let residues = DiffContainerResidues::new(&file.blocks);
+        for (index, review_block) in file.blocks.iter().enumerate() {
             let display_block = review_block.display_block().clone();
             if !query.filters.allows_block(display_block.kind) {
                 continue;
@@ -543,7 +544,8 @@ fn collect_diff_review_presentation(
                 continue;
             };
             if should_skip_container_by_default(
-                tree.is_container_block(node_id),
+                tree.is_container_block(node_id)
+                    && residues.residue(index) == ContainerResidue::Unchanged,
                 &display_block,
                 &query.filters,
             ) {
@@ -1041,6 +1043,87 @@ fn diff_parent_map_for_side(
     }
 
     parents
+}
+
+/// Whether a diff block changed outside the spans of its changed children.
+/// A container whose own text (header, delimiters, non-member code)
+/// changed must be reviewed itself, not hidden behind its children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerResidue {
+    Unchanged,
+    Changed,
+}
+
+/// Parent links of one file's diff blocks, used to compare each container's
+/// own text across base and head.
+struct DiffContainerResidues<'a> {
+    blocks: &'a [DiffReviewBlock],
+    base_parents: Vec<Option<usize>>,
+    head_parents: Vec<Option<usize>>,
+}
+
+impl<'a> DiffContainerResidues<'a> {
+    fn new(blocks: &'a [DiffReviewBlock]) -> Self {
+        let (base_parents, head_parents) = diff_parent_maps(blocks);
+        Self {
+            blocks,
+            base_parents,
+            head_parents,
+        }
+    }
+
+    fn residue(&self, index: usize) -> ContainerResidue {
+        match (
+            self.residue_text(index, DiffCoordinateSide::Base),
+            self.residue_text(index, DiffCoordinateSide::Head),
+        ) {
+            (Some(base), Some(head)) if residue_lines(&base).eq(residue_lines(&head)) => {
+                ContainerResidue::Unchanged
+            }
+            _ => ContainerResidue::Changed,
+        }
+    }
+
+    /// The container's text on `side` with its changed children cut out.
+    fn residue_text(&self, index: usize, side: DiffCoordinateSide) -> Option<String> {
+        let side_block = |block: &'a DiffReviewBlock| match side {
+            DiffCoordinateSide::Base => block.sides.base.as_ref(),
+            DiffCoordinateSide::Head => block.sides.head.as_ref(),
+        };
+        let parents = match side {
+            DiffCoordinateSide::Base => &self.base_parents,
+            DiffCoordinateSide::Head => &self.head_parents,
+        };
+        let container = side_block(&self.blocks[index])?;
+        let mut children = parents
+            .iter()
+            .zip(self.blocks)
+            .filter(|(parent, _)| **parent == Some(index))
+            .filter_map(|(_, child)| side_block(child).map(Block::byte_span))
+            .collect::<Vec<_>>();
+        children.sort_by_key(|span| span.start_byte);
+
+        let offset = container.start_byte;
+        let mut residue = String::with_capacity(container.content.len());
+        let mut cursor = offset;
+        for child in children {
+            if child.start_byte > cursor {
+                residue.push_str(&container.content[cursor - offset..child.start_byte - offset]);
+            }
+            cursor = cursor.max(child.end_byte);
+        }
+        residue.push_str(&container.content[cursor - offset..]);
+        Some(residue)
+    }
+}
+
+/// Non-blank lines without trailing whitespace, so moving, adding or
+/// resizing a child does not count as a change of the container itself.
+fn residue_lines(residue: &str) -> impl Iterator<Item = &str> {
+    residue
+        .lines()
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .filter(|line| !line.is_empty())
 }
 
 fn diff_parent_depths(parents: &[Option<usize>]) -> Result<Vec<usize>> {
@@ -2407,6 +2490,52 @@ mod tests {
             start_byte,
             end_byte,
         }
+    }
+
+    fn changed_impl_and_method(base: &str, head: &str) -> Vec<DiffReviewBlock> {
+        let pick = |blocks: &[Block], kind: BlockKind| {
+            blocks
+                .iter()
+                .find(|block| block.kind == kind)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {kind:?}: {blocks:#?}"))
+        };
+        let (base_blocks, head_blocks) = (rust_review_blocks(base), rust_review_blocks(head));
+        [BlockKind::Impl, BlockKind::Method]
+            .into_iter()
+            .map(|kind| {
+                diff_review_block(
+                    Some(pick(&base_blocks, kind)),
+                    Some(pick(&head_blocks, kind)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diff_container_residue_tracks_own_lines_outside_children() {
+        let base = "struct A;\n\nimpl Foo for A {\n    fn run(&self) -> i32 {\n        1\n    }\n}\n";
+        let body_only = changed_impl_and_method(
+            base,
+            &base.replace("        1\n", "        let value = 2;\n\n        value\n"),
+        );
+        assert_eq!(
+            DiffContainerResidues::new(&body_only).residue(0),
+            ContainerResidue::Unchanged,
+            "a change inside the only changed child keeps the container hidden"
+        );
+
+        let header = changed_impl_and_method(
+            base,
+            &base
+                .replace("impl Foo for A", "impl Foo for A where A: Send")
+                .replace("        1\n", "        2\n"),
+        );
+        assert_eq!(
+            DiffContainerResidues::new(&header).residue(0),
+            ContainerResidue::Changed,
+            "a changed impl header must surface the container"
+        );
     }
 
     #[test]

@@ -2590,6 +2590,50 @@ fn sql_alter_role_is_reviewable() -> Result<()> {
 }
 
 #[test]
+fn changed_container_header_is_not_hidden_by_approved_child() -> Result<()> {
+    let repo = TestRepo::new("changed_container_header")?;
+    let base = "pub trait Foo {\n    fn run(&self) -> i32;\n}\n\npub struct A;\n\npub struct B;\n\nimpl Foo for A {\n    fn run(&self) -> i32 {\n        let value = 1;\n        value\n    }\n}\n";
+    repo.write("src/worker.rs", base)?;
+    repo.commit_all("Base")?;
+    repo.git(&["checkout", "-b", "feature/header"])?;
+    repo.write(
+        "src/worker.rs",
+        &base
+            .replace("impl Foo for A", "impl Foo for B")
+            .replace("let value = 1;", "let value = 2;"),
+    )?;
+    repo.commit_all("Change header and body")?;
+
+    let summary = review_main(&repo)?;
+    let method = summary
+        .files
+        .iter()
+        .flat_map(|file| file.blocks.iter())
+        .find(|block| block.kind == BlockKind::Method && block.content.contains("value = 2"))
+        .with_context(|| format!("changed method: {:?}", unreviewed_contents(&summary)))?
+        .hash
+        .to_string();
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        method.as_str(),
+        "--verdict",
+        "approved",
+        "--quiet",
+    ])?;
+
+    let after = review_main(&repo)?;
+    let contents = unreviewed_contents(&after);
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("impl Foo for B")),
+        "changed impl header must stay unreviewed: {contents:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn go_grouped_type_declaration_exposes_every_spec() -> Result<()> {
     let repo = TestRepo::new("go_grouped_type_specs")?;
     repo.write(
