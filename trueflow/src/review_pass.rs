@@ -141,6 +141,19 @@ impl PassSignal {
             Self::ChangedLines(lines) => (lines / 10).min(2),
         }
     }
+
+    /// Compact label for one-line summaries; `Display` adds the quoted source line.
+    pub fn label(&self) -> String {
+        match self {
+            Self::DataShape => "data shape".to_string(),
+            Self::PublicInterface => "public interface".to_string(),
+            Self::TrustBoundary(_) => "trust boundary".to_string(),
+            Self::Writes(_) => "writes".to_string(),
+            Self::Concurrency(_) => "concurrency".to_string(),
+            Self::Complexity(score) => format!("complexity {score}"),
+            Self::ChangedLines(lines) => format!("{lines} changed lines"),
+        }
+    }
 }
 
 impl fmt::Display for PassSignal {

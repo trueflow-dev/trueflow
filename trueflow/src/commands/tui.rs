@@ -40,8 +40,8 @@ use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::{ReviewAnchor, ReviewOrder};
 use crate::review_pass::{
-    AiPick, CandidateChange, CandidateClass, PassCandidate, PassCard, PassPlan, PassWhy,
-    ReviewPass, format_reading_estimate,
+    AiPick, CandidateChange, CandidateClass, PassCandidate, PassCard, PassPlan, PassSignal,
+    PassWhy, ReviewPass, format_reading_estimate,
 };
 use crate::review_scope::{
     DiffQuery, ScopeOption, ScopePreset, commit_scope_option, default_scope_options,
@@ -2579,9 +2579,10 @@ fn focused_pass_card(card: &PassCard<TreeNodeId>) -> crate::onboarding::Onboardi
             ),
         ),
         PassWhy::Signals(signals) => {
+            let labels = signals.iter().map(PassSignal::label).collect::<Vec<_>>();
             let observed = signals.iter().map(ToString::to_string).collect::<Vec<_>>();
             (
-                format!("Why: {} · ~{estimate}", observed.join(" · ")),
+                format!("Why: {} · ~{estimate}", labels.join(" · ")),
                 format!(
                     "Heuristic focused pass\nStructural and lexical observations, not findings:\n{}\n\nReading estimate: ~{estimate}",
                     observed
