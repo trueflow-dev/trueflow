@@ -342,3 +342,17 @@
         (kill-buffer "*trueflow-comment*"))
       (kill-buffer status-buf)
       (kill-buffer focus-buf))))
+
+(ert-deftest trueflow-run-command-reports-stderr-without-writing-repo-files ()
+  "Failed commands should surface stderr and never write logs into the repo."
+  (let* ((root (file-name-as-directory (make-temp-file "trueflow-repo-" t)))
+         (exe (expand-file-name "fail.sh" root))
+         (trueflow-executable exe))
+    (with-temp-file exe
+      (insert "#!/bin/sh\necho partial\necho boom >&2\nexit 1\n"))
+    (set-file-modes exe #o755)
+    (cl-letf (((symbol-function 'trueflow-root) (lambda (&optional _) root)))
+      (let ((err (should-error (trueflow--run-command '("mark")))))
+        (should (string-match-p "boom" (error-message-string err)))
+        (should (string-match-p "partial" (error-message-string err)))))
+    (should-not (file-exists-p (expand-file-name "*trueflow-log*" root)))))

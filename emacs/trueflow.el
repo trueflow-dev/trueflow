@@ -352,19 +352,30 @@ when they contain a path separator. Bare command names are resolved via
     (insert (make-string padding ?\n))
     (insert (propertize text 'face 'trueflow-action-face))))
 
-(defun trueflow--run-command (args &optional async)
-  "Run trueflow command with ARGS."
+(defun trueflow--run-command (args)
+  "Run trueflow command with ARGS and return its parsed output.
+
+Stderr goes to a temporary file outside the repository and is included in
+the error when the command fails."
   (let ((default-directory (trueflow-root))
-        (exe (trueflow--resolve-executable)))
-    (with-temp-buffer
-      (let* ((call-args (append (list exe nil (list t "*trueflow-log*") nil) args))
-             (exit-code (apply #'call-process call-args)))
-        (unless (zerop exit-code)
-          (error "Trueflow command failed: %s %s" (mapconcat #'identity args " ") (buffer-string)))
-        (goto-char (point-min))
-        (if (looking-at-p "\\[\\|{")
-            (trueflow--ensure-list (json-parse-buffer :object-type 'alist :array-type 'list))
-          (buffer-string))))))
+        (exe (trueflow--resolve-executable))
+        (stderr-file (make-temp-file "trueflow-stderr-")))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((exit-code (apply #'call-process exe nil (list t stderr-file) nil args)))
+            (unless (eql exit-code 0)
+              (error "Trueflow command failed (%s): %s\n%s%s"
+                     exit-code
+                     (mapconcat #'identity args " ")
+                     (buffer-string)
+                     (with-temp-buffer
+                       (insert-file-contents stderr-file)
+                       (buffer-string))))
+            (goto-char (point-min))
+            (if (looking-at-p "\\[\\|{")
+                (trueflow--ensure-list (json-parse-buffer :object-type 'alist :array-type 'list))
+              (buffer-string))))
+      (delete-file stderr-file))))
 
 (defun trueflow--run-mark (block verdict note)
   "Mark BLOCK with VERDICT and optional NOTE.
