@@ -179,6 +179,9 @@ trueflow review --json
 # Inspect and split a block
 trueflow inspect --fingerprint <fp> --split
 
+# Pick one of several blocks with identical content (same hash)
+trueflow inspect --fingerprint <fp> --path src/lib.rs --line <start_line> --coverage
+
 # Export review feedback
 trueflow feedback --format xml
 

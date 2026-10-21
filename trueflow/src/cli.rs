@@ -201,6 +201,16 @@ pub enum Commands {
         /// Include review coverage details
         #[arg(long)]
         coverage: bool,
+
+        /// Only match blocks in this file, as listed by `scan --json`; selects
+        /// one of several blocks with identical content
+        #[arg(long)]
+        path: Option<RepoPath>,
+
+        /// Only match blocks starting at this line (`start_line` in JSON
+        /// output); selects among identical blocks in one file
+        #[arg(long)]
+        line: Option<u32>,
     },
     /// Verify record attestations
     #[command(group(
@@ -812,16 +822,24 @@ mod tests {
             "--fingerprint",
             "abc1234",
             "--coverage",
+            "--path",
+            "src/lib.rs",
+            "--line",
+            "3",
         ]);
         match cli.command {
             Commands::Inspect {
                 fingerprint,
                 split,
                 coverage,
+                path,
+                line,
             } => {
                 assert_eq!(fingerprint, "abc1234");
                 assert!(!split);
                 assert!(coverage);
+                assert_eq!(path, Some(RepoPath::new("src/lib.rs").unwrap()));
+                assert_eq!(line, Some(3));
             }
             _ => panic!("expected inspect command"),
         }

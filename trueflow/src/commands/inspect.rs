@@ -8,7 +8,7 @@ use crate::scanner;
 use crate::store::{FileStore, Record, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
 use crate::tree;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -68,9 +68,30 @@ struct MatchedBlock {
     path: RepoPath,
 }
 
+/// Optional location constraints that pick one of several blocks whose hash
+/// matches, e.g. identical content in two files or twice in one file.
+#[derive(Clone, Copy)]
+pub struct LocationFilter<'a> {
+    pub path: Option<&'a RepoPath>,
+    /// Block `start_line` as reported in JSON output.
+    pub line: Option<u32>,
+}
+
+impl LocationFilter<'_> {
+    fn allows_path(self, path: &RepoPath) -> bool {
+        self.path.is_none_or(|wanted| wanted == path)
+    }
+
+    fn allows_block(self, block: &crate::block::Block) -> bool {
+        self.line
+            .is_none_or(|line| u32::try_from(block.start_line).ok() == Some(line))
+    }
+}
+
 pub fn run(
     _context: &TrueflowContext,
     fingerprint: &str,
+    location: LocationFilter<'_>,
     split: bool,
     coverage: bool,
 ) -> Result<()> {
@@ -78,7 +99,7 @@ pub fn run(
     let scan_options = config.scan.resolve_options();
     let scan_result = scanner::scan_directory(".", &scan_options)?;
     let files = scan_result.files;
-    let matched = find_matching_block(&files, fingerprint)?;
+    let matched = find_matching_block(&files, fingerprint, location)?;
     if split {
         let sub_blocks = sub_splitter::split(&matched.block, matched.language)?;
         if coverage {
@@ -113,12 +134,17 @@ pub fn run(
 fn find_matching_block(
     files: &[crate::block::FileState],
     fingerprint: &str,
+    location: LocationFilter<'_>,
 ) -> Result<MatchedBlock> {
     let mut matches = Vec::new();
+    let files = || files.iter().filter(|file| location.allows_path(&file.path));
+    let is_match = |block: &crate::block::Block| {
+        block.hash.as_str().starts_with(fingerprint) && location.allows_block(block)
+    };
 
-    for file in files {
+    for file in files() {
         for block in &file.blocks {
-            if block.hash.as_str().starts_with(fingerprint) {
+            if is_match(block) {
                 matches.push(MatchedBlock {
                     block: block.clone(),
                     language: file.language,
@@ -129,11 +155,11 @@ fn find_matching_block(
     }
 
     if matches.is_empty() {
-        for file in files {
+        for file in files() {
             for block in &file.blocks {
                 if let Ok(sub_blocks) = sub_splitter::split(block, file.language) {
                     for sub_block in sub_blocks {
-                        if sub_block.hash.as_str().starts_with(fingerprint) {
+                        if is_match(&sub_block) {
                             matches.push(MatchedBlock {
                                 block: sub_block,
                                 language: file.language,
@@ -146,17 +172,34 @@ fn find_matching_block(
         }
     }
 
-    if matches.is_empty() {
-        bail!("Block not found");
+    match matches.len() {
+        0 => bail!("Block not found"),
+        1 => matches.pop().context("Block not found"),
+        _ => Err(ambiguous_match_error(&matches)),
     }
-    if matches.len() > 1 {
-        bail!(
-            "Multiple blocks matched fingerprint ({} matches). Use a longer prefix.",
-            matches.len()
-        );
-    }
+}
 
-    matches.pop().context("Block not found")
+fn ambiguous_match_error(matches: &[MatchedBlock]) -> anyhow::Error {
+    let first = &matches[0];
+    let hint = if matches
+        .iter()
+        .any(|matched| matched.block.hash.as_str() != first.block.hash.as_str())
+    {
+        "use a longer prefix"
+    } else if matches.iter().all(|matched| matched.path == first.path) {
+        "the content is identical; use --line to choose one"
+    } else {
+        "the content is identical; use --path (and --line) to choose one"
+    };
+    let locations = matches
+        .iter()
+        .map(|matched| format!("{} line {}", matched.path, matched.block.start_line))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow!(
+        "Multiple blocks matched fingerprint ({} matches: {locations}); {hint}.",
+        matches.len()
+    )
 }
 
 fn load_coverage_inputs(

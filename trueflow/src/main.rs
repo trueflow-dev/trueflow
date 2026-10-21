@@ -111,7 +111,18 @@ fn main() -> Result<()> {
             fingerprint,
             split,
             coverage,
-        } => commands::inspect::run(&context, fingerprint, *split, *coverage),
+            path,
+            line,
+        } => commands::inspect::run(
+            &context,
+            fingerprint,
+            commands::inspect::LocationFilter {
+                path: path.as_ref(),
+                line: *line,
+            },
+            *split,
+            *coverage,
+        ),
         Commands::Verify { all, id } => commands::verify::run(
             commands::verify::VerifySelection::from_clap_args(*all, id.as_deref()),
         ),

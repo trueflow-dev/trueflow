@@ -40,6 +40,94 @@ fn test_inspect_errors_on_duplicate_fingerprint() -> Result<()> {
 }
 
 #[test]
+fn inspect_full_hash_with_duplicate_content_is_resolvable() -> Result<()> {
+    let repo = TestRepo::new("inspect_duplicate_paths")?;
+    repo.write("src/a.rs", "fn dup() {}\n")?;
+    repo.write("src/b.rs", "fn dup() {}\n")?;
+    repo.commit_all("Add duplicates")?;
+
+    let blocks = scan_blocks(&repo)?;
+    let hash = blocks[0]["blocks"][0]["hash"].as_str().context("hash")?;
+    let start_line = blocks[0]["blocks"][0]["start_line"]
+        .as_u64()
+        .context("start_line")?
+        .to_string();
+
+    let output = repo.run_raw(&["inspect", "--fingerprint", hash])?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Multiple blocks matched"), "{stderr}");
+    assert!(stderr.contains("--path"), "{stderr}");
+    assert!(!stderr.contains("longer prefix"), "{stderr}");
+
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        hash,
+        "--verdict",
+        "approved",
+        "--path",
+        "src/b.rs",
+        "--line",
+        &start_line,
+        "--quiet",
+    ])?;
+
+    let direct_verdict = |path: &str| -> Result<Value> {
+        let output = repo.run(&[
+            "inspect",
+            "--fingerprint",
+            hash,
+            "--path",
+            path,
+            "--coverage",
+        ])?;
+        let inspected: Value = serde_json::from_str(&output)?;
+        assert_eq!(inspected["block"]["hash"].as_str(), Some(hash));
+        Ok(inspected["coverage"]["checks"]["review"]["direct_latest_verdict"].clone())
+    };
+    assert_eq!(direct_verdict("src/b.rs")?.as_str(), Some("approved"));
+    assert_eq!(direct_verdict("src/a.rs")?, Value::Null);
+
+    Ok(())
+}
+
+#[test]
+fn inspect_line_selects_duplicate_content_within_one_file() -> Result<()> {
+    let repo = TestRepo::new("inspect_duplicate_lines")?;
+    repo.write("src/lib.rs", "pub fn alpha() {}\n\npub fn alpha() {}\n")?;
+
+    let blocks = scan_blocks(&repo)?;
+    let file_blocks = blocks[0]["blocks"].as_array().context("blocks")?;
+    let hash = file_blocks[0]["hash"].as_str().context("hash")?;
+    let second_line = file_blocks
+        .iter()
+        .filter(|block| block["hash"].as_str() == Some(hash))
+        .nth(1)
+        .and_then(|block| block["start_line"].as_u64())
+        .context("second duplicate start_line")?;
+
+    let output = repo.run_raw(&["inspect", "--fingerprint", hash, "--path", "src/lib.rs"])?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--line"), "{stderr}");
+
+    let output = repo.run(&[
+        "inspect",
+        "--fingerprint",
+        hash,
+        "--path",
+        "src/lib.rs",
+        "--line",
+        &second_line.to_string(),
+    ])?;
+    let inspected: Value = serde_json::from_str(&output)?;
+    assert_eq!(inspected["start_line"].as_u64(), Some(second_line));
+
+    Ok(())
+}
+
+#[test]
 fn test_inspect_split_preserves_order() -> Result<()> {
     let repo = TestRepo::new("inspect_split")?;
     let content = "fn main() {\n    part1();\n\n    part2();\n}\n";
