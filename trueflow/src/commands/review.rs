@@ -280,7 +280,6 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     } else {
         None
     };
-    let workdir_prefix = workdir_prefix_from_git_root();
 
     let store = FileStore::new()?;
     let database = store.load_database()?;
@@ -292,13 +291,20 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         return Ok(empty_collected_review());
     }
 
-    let selected_paths = preselected_paths_for_review(&query.path_selection);
+    let load_scope = review_load_scope(&query.path_selection);
     let (files, diagnostics) = match &query.content_source {
         ReviewContentSource::Workdir => {
-            let scan_result = if let Some(paths) = selected_paths.as_ref() {
-                scanner::scan_paths(".", paths, &query.scan_options)?
-            } else {
-                scanner::scan_directory(".", &query.scan_options)?
+            let scan_result = match load_scope {
+                ReviewLoadScope::Paths(paths) => {
+                    scanner::scan_paths(".", &paths, &query.scan_options)?
+                }
+                ReviewLoadScope::CurrentDirectory => {
+                    scanner::scan_directory(".", &query.scan_options)?
+                }
+                ReviewLoadScope::Repository => match vcs::git_root_from_workdir() {
+                    Ok(Some(repo_root)) => scanner::scan_directory(repo_root, &query.scan_options)?,
+                    Ok(None) | Err(_) => scanner::scan_directory(".", &query.scan_options)?,
+                },
             };
             (
                 scan_result.files,
@@ -313,15 +319,18 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             let Some(repo) = review_repo.as_ref() else {
                 return Err(anyhow!("review repo unavailable for revision target"));
             };
-            let files = if let Some(paths) = selected_paths.as_ref() {
-                vcs::file_states_for_paths_in_revision(
+            let files = match load_scope {
+                ReviewLoadScope::Paths(paths) => {
+                    vcs::file_states_for_paths_in_revision(repo, revision.as_str(), &paths, None)?
+                }
+                ReviewLoadScope::CurrentDirectory => vcs::file_states_in_revision(
                     repo,
                     revision.as_str(),
-                    paths,
-                    workdir_prefix.as_deref(),
-                )?
-            } else {
-                vcs::file_states_in_revision(repo, revision.as_str(), workdir_prefix.as_deref())?
+                    workdir_prefix_from_git_root().as_deref(),
+                )?,
+                ReviewLoadScope::Repository => {
+                    vcs::file_states_in_revision(repo, revision.as_str(), None)?
+                }
             };
             (
                 files.files,
@@ -598,14 +607,24 @@ fn collect_diff_review_presentation(
     }
 }
 
-fn preselected_paths_for_review(path_selection: &ReviewPathSelection) -> Option<HashSet<RepoPath>> {
+/// Which files `collect_review` loads before path filtering. Explicit
+/// targets and changed paths are repo-root-relative wherever the command
+/// runs, so they never resolve against the current directory; only an
+/// unscoped review narrows to it.
+enum ReviewLoadScope {
+    Paths(HashSet<RepoPath>),
+    CurrentDirectory,
+    Repository,
+}
+
+fn review_load_scope(path_selection: &ReviewPathSelection) -> ReviewLoadScope {
     match path_selection {
-        ReviewPathSelection::All => None,
-        ReviewPathSelection::Empty => Some(HashSet::new()),
+        ReviewPathSelection::All => ReviewLoadScope::CurrentDirectory,
+        ReviewPathSelection::Empty => ReviewLoadScope::Paths(HashSet::new()),
         ReviewPathSelection::Scoped {
             changed: Some(changed),
             ..
-        } => Some(
+        } => ReviewLoadScope::Paths(
             changed
                 .iter()
                 .filter(|path| path_selection.includes(&path.location))
@@ -616,8 +635,8 @@ fn preselected_paths_for_review(path_selection: &ReviewPathSelection) -> Option<
             files,
             dirs,
             changed: None,
-        } if dirs.is_empty() => Some(files.clone()),
-        ReviewPathSelection::Scoped { .. } => None,
+        } if dirs.is_empty() => ReviewLoadScope::Paths(files.clone()),
+        ReviewPathSelection::Scoped { .. } => ReviewLoadScope::Repository,
     }
 }
 

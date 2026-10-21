@@ -1362,6 +1362,79 @@ fn test_review_historical_revision_dir_target_from_subdir_filters_subtree() -> R
     Ok(())
 }
 
+fn review_paths(output: &str) -> Result<Vec<String>> {
+    let mut paths = json_array(output)?
+        .iter()
+        .map(|file| file["path"].as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .context("review file path")?;
+    paths.sort();
+    Ok(paths)
+}
+
+#[test]
+fn test_review_deleted_file_from_subdir_does_not_borrow_root_file() -> Result<()> {
+    let repo = TestRepo::new("review_deleted_subdir_file_root_name")?;
+    // Same file name and function name, so a borrowed root file pairs with
+    // the deleted function as a "changed" block.
+    repo.write("lib.rs", "pub fn shared() {\n    root_only_marker();\n}\n")?;
+    repo.write("pkg/lib.rs", "pub fn shared() {\n    pkg_marker();\n}\n")?;
+    repo.write("pkg/other.rs", "pub fn other() {}\n")?;
+    repo.commit_all("Initial")?;
+    repo.git(&["rm", "-q", "pkg/lib.rs"])?;
+    repo.commit_all("Delete package lib")?;
+
+    let output = repo.run_in(
+        &["review", "--json", "--target", "rev:HEAD"],
+        &repo.path.join("pkg"),
+    )?;
+
+    let contents = json_array(&output)?
+        .iter()
+        .flat_map(|file| file["blocks"].as_array().cloned().unwrap_or_default())
+        .filter_map(|block| block["content"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("pkg_marker")),
+        "the deleted file must be reviewed: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .all(|content| !content.contains("root_only_marker")),
+        "the deleted pkg file borrowed the root file: {contents:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_review_dir_and_file_targets_from_subdir_cover_repo_paths() -> Result<()> {
+    let repo = TestRepo::new("review_dir_file_targets_subdir")?;
+    repo.write("pkg/a.rs", "pub fn a() {}\n")?;
+    repo.write("web/b.rs", "pub fn b() {}\n")?;
+    repo.commit_all("Initial")?;
+    let pkg = repo.path.join("pkg");
+
+    let mixed = repo.run_in(
+        &[
+            "review",
+            "--json",
+            "--target",
+            "file:web/b.rs",
+            "--target",
+            "dir:pkg",
+        ],
+        &pkg,
+    )?;
+    assert_eq!(review_paths(&mixed)?, vec!["pkg/a.rs", "web/b.rs"]);
+
+    let sibling_dir = repo.run_in(&["review", "--json", "--target", "dir:web"], &pkg)?;
+    assert_eq!(review_paths(&sibling_dir)?, vec!["web/b.rs"]);
+    Ok(())
+}
+
 #[test]
 fn test_review_historical_revision_range_dir_target_from_subdir_filters_subtree() -> Result<()> {
     let repo = TestRepo::new("review_historical_revision_range_dir_subdir")?;
