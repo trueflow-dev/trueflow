@@ -1175,6 +1175,9 @@ fn kind_rank(block: &Block) -> u8 {
     block.kind.default_review_priority()
 }
 
+/// Whether `block` is covered: skipped by the filters, approved itself, or
+/// (without a verdict of its own) split into review units that are all
+/// covered.
 fn is_subblock_covered(
     block: &Block,
     language: Language,
@@ -1183,51 +1186,57 @@ fn is_subblock_covered(
     review_check: &ReviewCheck,
     file_path: &RepoPath,
 ) -> bool {
-    let mut pending = vec![block.clone()];
-
-    while let Some(block) = pending.pop() {
-        if !query.filters.allows_subblock(block.kind) {
-            continue;
-        }
-        if should_skip_whitespace_only_by_default(&block, &query.filters) {
-            continue;
-        }
-
-        if coverage
-            .block(file_path, &block)
-            .direct_latest_verdict_for(review_check)
-            == Some(&Verdict::Approved)
-        {
-            continue;
-        }
-
-        let Ok(sub_split) = sub_splitter::split_result(&block, language) else {
-            return false;
-        };
-        if sub_split.blocks.is_empty() {
-            return false;
-        }
-
-        match sub_split.semantics {
-            sub_splitter::SubSplitSemantics::ReviewUnits => {
-                if sub_split.blocks.iter().any(|sub_block| {
-                    query.filters.allows_subblock(sub_block.kind)
-                        && !should_skip_whitespace_only_by_default(sub_block, &query.filters)
-                        && coverage
-                            .block(file_path, sub_block)
-                            .direct_latest_verdict_for(review_check)
-                            != Some(&Verdict::Approved)
-                }) {
-                    return false;
-                }
-            }
-            sub_splitter::SubSplitSemantics::StructuralChildren => {
-                return false;
-            }
-        }
+    if !query.filters.allows_subblock(block.kind)
+        || should_skip_whitespace_only_by_default(block, &query.filters)
+    {
+        return true;
     }
+    match coverage
+        .block(file_path, block)
+        .direct_latest_verdict_for(review_check)
+    {
+        Some(Verdict::Approved) => true,
+        Some(_) => false,
+        None => are_review_units_covered(block, language, query, coverage, review_check, file_path),
+    }
+}
 
-    true
+/// Whether `block` splits into review units that are all covered. Records
+/// bound strictly inside the block (for example, approvals of children
+/// expanded with the TUI's `C`, also of short blocks and of children of
+/// children) select the TUI's child-navigation split, so coverage agrees with
+/// the units the TUI showed; otherwise the default review-unit split applies.
+/// Structural children never cover their parent, since they omit its header.
+fn are_review_units_covered(
+    block: &Block,
+    language: Language,
+    query: &ResolvedReviewQuery,
+    coverage: &CoverageIndex<'_>,
+    review_check: &ReviewCheck,
+    file_path: &RepoPath,
+) -> bool {
+    let split = if coverage.has_block_records_within(file_path, block) {
+        sub_splitter::child_navigation_split(block, language)
+    } else {
+        sub_splitter::split_result(block, language)
+    };
+    let Ok(split) = split else {
+        return false;
+    };
+    match split.semantics {
+        sub_splitter::SubSplitSemantics::ReviewUnits => {
+            let mut units = split
+                .blocks
+                .iter()
+                .filter(|unit| unit.byte_span() != block.byte_span())
+                .peekable();
+            units.peek().is_some()
+                && units.all(|unit| {
+                    is_subblock_covered(unit, language, query, coverage, review_check, file_path)
+                })
+        }
+        sub_splitter::SubSplitSemantics::StructuralChildren => false,
+    }
 }
 
 fn collect_diff_review_blocks_for_target_inputs(

@@ -913,7 +913,11 @@ where
                 Ok(loaded) => return Ok(Some(loaded)),
                 Err(error) => {
                     failure = Some(ScopeLoadFailure {
-                        message: format!("{} unavailable: {}", scope.label(), single_line_error(&error)),
+                        message: format!(
+                            "{} unavailable: {}",
+                            scope.label(),
+                            single_line_error(&error)
+                        ),
                         scope,
                     });
                 }
@@ -3599,8 +3603,7 @@ fn run_app(
             continue;
         }
 
-        if key_event_for_press_or_repeat_event(&event).is_some() && clear_action_error(&mut state)
-        {
+        if key_event_for_press_or_repeat_event(&event).is_some() && clear_action_error(&mut state) {
             needs_render = true;
         }
 
@@ -4850,7 +4853,11 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
         return false;
     };
 
-    let Ok(child_blocks) = sub_splitter::child_navigation_blocks(&block, language) else {
+    let Ok(sub_splitter::SubSplitResult {
+        blocks: child_blocks,
+        ..
+    }) = sub_splitter::child_navigation_split(&block, language)
+    else {
         return false;
     };
     if child_blocks.is_empty() {
@@ -9034,11 +9041,14 @@ struct InputOverlayLayout {
     hints: Rect,
 }
 
-fn input_overlay_layout(inner: Rect, hint_rows: u16, cursor_row: Option<u16>) -> InputOverlayLayout {
+fn input_overlay_layout(
+    inner: Rect,
+    hint_rows: u16,
+    cursor_row: Option<u16>,
+) -> InputOverlayLayout {
     let hint_rows = hint_rows.min(inner.height);
     let text_rows = inner.height.saturating_sub(hint_rows).saturating_sub(1);
-    let text_scroll =
-        cursor_row.map_or(0, |row| row.saturating_sub(text_rows.saturating_sub(1)));
+    let text_scroll = cursor_row.map_or(0, |row| row.saturating_sub(text_rows.saturating_sub(1)));
     InputOverlayLayout {
         text: Rect {
             height: text_rows,
@@ -12427,7 +12437,12 @@ mod diff_scope_tests {
                     file,
                     format!("{name}-block"),
                     name.to_string(),
-                    test_block(format!("fn {}() {{}}", &name[..1]), BlockKind::Function, 0, 1),
+                    test_block(
+                        format!("fn {}() {{}}", &name[..1]),
+                        BlockKind::Function,
+                        0,
+                        1,
+                    ),
                     Language::Rust,
                 );
                 (file, block)
@@ -13978,7 +13993,8 @@ mod diff_scope_tests {
     fn failed_approval_keeps_block_pending_and_shows_error_until_next_key() {
         let (mut state, _file_id, block_ids) = build_state_with_file_block_count(2);
         state.navigator.set_current(block_ids[0]);
-        let action = PendingAction::from_node(&state.navigator.tree, block_ids[0], Verdict::Approved);
+        let action =
+            PendingAction::from_node(&state.navigator.tree, block_ids[0], Verdict::Approved);
 
         let result = execute_action_with(&mut state, action, |_params| {
             Err(anyhow::anyhow!("store write failed\ndisk full"))
@@ -13989,7 +14005,8 @@ mod diff_scope_tests {
         assert!(state.reviewable_nodes.contains(&block_ids[0]));
         assert!(matches!(state.input_mode, InputMode::Normal));
         assert!(
-            render_screen(&mut state, 100, 24).contains("Save failed: store write failed disk full")
+            render_screen(&mut state, 100, 24)
+                .contains("Save failed: store write failed disk full")
         );
         assert!(clear_action_error(&mut state));
         assert!(!render_screen(&mut state, 100, 24).contains("Save failed"));

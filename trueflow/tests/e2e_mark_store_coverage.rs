@@ -1,8 +1,10 @@
 use anyhow::Result;
 use std::fs;
 use std::process::Command;
-
+use trueflow::analysis::Language;
+use trueflow::block::{Block, BlockKind};
 use trueflow::store::{BlockState, ReviewTargetRef};
+use trueflow::{block_splitter, sub_splitter};
 use trueflow_test_support::*;
 
 #[test]
@@ -286,6 +288,81 @@ fn mark_rejects_fingerprint_that_does_not_match_its_directory_path() -> Result<(
         "expected directory mismatch error, got: {error}"
     );
     assert!(!repo.path.join(".trueflow/reviews.jsonl").exists());
+    Ok(())
+}
+
+/// The children `C` reveals in the TUI for `block`: the forced child split
+/// without gaps or a child spanning the whole parent.
+fn tui_child_blocks(block: &Block) -> Result<Vec<Block>> {
+    Ok(
+        sub_splitter::split_result_for_child_navigation(block, Language::Rust)?
+            .blocks
+            .into_iter()
+            .filter(|child| child.kind != BlockKind::Gap && child.byte_span() != block.byte_span())
+            .collect(),
+    )
+}
+
+fn mark_block_approved(repo: &TestRepo, block: &Block) -> Result<()> {
+    let line = block.start_line.to_string();
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        block.hash.as_str(),
+        "--verdict",
+        "approved",
+        "--path",
+        "src/lib.rs",
+        "--line",
+        &line,
+        "--quiet",
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn approvals_of_tui_expanded_children_cover_their_short_parent() -> Result<()> {
+    let repo = TestRepo::new("tui_expanded_children_cover_parent")?;
+    repo.write("src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n")?;
+    repo.commit_all("Initial")?;
+    repo.git(&["checkout", "-B", "main"])?;
+    repo.git(&["checkout", "-b", "feature/expanded-children"])?;
+    let source = "pub fn value() -> i32 {\n    let a = 1;\n    let b = 2;\n\n    a + b\n}\n";
+    repo.write("src/lib.rs", source)?;
+    repo.commit_all("Split value")?;
+
+    let function = block_splitter::split(source, Language::Rust)
+        .into_review_blocks(source)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::Function)
+        .ok_or_else(|| anyhow::anyhow!("expected the function review block"))?;
+    let children = tui_child_blocks(&function)?;
+    assert!(children.len() > 1, "expected TUI children: {children:?}");
+    let (last_child, other_children) = children
+        .split_last()
+        .ok_or_else(|| anyhow::anyhow!("expected TUI children"))?;
+
+    for child in other_children {
+        mark_block_approved(&repo, child)?;
+    }
+    let partial = repo.run_raw(&["check"])?;
+    assert!(
+        !partial.status.success(),
+        "an unapproved child must keep the function unreviewed"
+    );
+
+    mark_block_approved(&repo, last_child)?;
+    let review = json_array(&repo.run(&["review", "--target", "main", "--json"])?)?;
+    assert!(
+        review.is_empty(),
+        "approving every TUI child must cover the function: {review:?}"
+    );
+    let check = repo.run_raw(&["check"])?;
+    assert!(
+        check.status.success(),
+        "check must count approvals of TUI children: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
     Ok(())
 }
 

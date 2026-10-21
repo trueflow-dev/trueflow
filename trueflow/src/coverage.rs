@@ -127,20 +127,25 @@ pub struct CoverageIndex<'a> {
     block_units: HashMap<CoverageBlockLocator, CoverageUnitId>,
     block_nodes_by_path: HashMap<&'a RepoPath, Vec<&'a TreeNode>>,
     record_bindings: HashMap<String, RecordBinding>,
+    /// Byte spans of the block units that have direct records, per path.
+    recorded_block_spans_by_path: HashMap<RepoPath, Vec<ByteSpan>>,
 }
 
 impl<'a> CoverageIndex<'a> {
     pub fn build(tree: &'a Tree, database: &'a ReviewDatabase) -> anyhow::Result<Self> {
-        let lookups = CoverageLookups::from_tree(tree);
+        let mut lookups = CoverageLookups::from_tree(tree);
         let mut coverage = Self {
             tree,
             database,
             diagnostics: Vec::new(),
             unit_facts: HashMap::new(),
-            block_units: lookups.block_units.clone(),
+            block_units: HashMap::new(),
             block_nodes_by_path: HashMap::new(),
             record_bindings: HashMap::new(),
+            recorded_block_spans_by_path: HashMap::new(),
         };
+        let mut diagnostics = Vec::new();
+        let mut unresolved_block_records = Vec::new();
 
         for (record_index, record) in database.records().iter().enumerate() {
             let binding = match &record.target {
@@ -150,7 +155,13 @@ impl<'a> CoverageIndex<'a> {
                     })?;
                     continue;
                 }
-                ReviewTargetRef::Block { hash } => lookups.bind_block_record(record, hash),
+                ReviewTargetRef::Block { hash } => match lookups.bind_block_record(record, hash) {
+                    Err(RecordBindingFailure::Unresolved { .. }) if record.path_hint.is_some() => {
+                        unresolved_block_records.push((record_index, hash));
+                        continue;
+                    }
+                    binding => binding,
+                },
                 ReviewTargetRef::File { hash } => lookups.bind_path_target_record(
                     record,
                     hash,
@@ -164,46 +175,113 @@ impl<'a> CoverageIndex<'a> {
                     &lookups.tree_by_hash,
                 ),
             };
-            match binding {
-                Ok(binding) => {
-                    let facts = coverage
-                        .unit_facts
-                        .entry(binding.unit_id.clone())
-                        .or_default();
-                    facts.linked_record_indices.push(record_index);
-                    facts.direct_record_indices.push(record_index);
-                    coverage.record_bindings.insert(record.id.clone(), binding);
-                }
-                Err(RecordBindingFailure::Ambiguous {
-                    record_id,
-                    candidates,
-                }) => {
-                    for unit_id in &candidates {
-                        coverage
-                            .unit_facts
-                            .entry(unit_id.clone())
-                            .or_default()
-                            .linked_record_indices
-                            .push(record_index);
-                    }
-                    coverage
-                        .diagnostics
-                        .push(lookups.ambiguous_diagnostic(record_id, candidates));
-                }
-                Err(RecordBindingFailure::Unresolved { record_id }) => {
-                    coverage
-                        .diagnostics
-                        .push(CoverageDiagnostic::UnresolvedRecord { record_id });
-                }
-            }
+            coverage.apply_binding(&lookups, record_index, binding, &mut diagnostics);
         }
 
-        for facts in coverage.unit_facts.values_mut() {
-            facts.finalize(database.records());
+        // Approvals of blocks expanded with the TUI's child navigation (a
+        // forced child split, of short blocks too, and of children of
+        // children) target units the default review-unit split never
+        // produces. Register those units lazily, only under the blocks that
+        // contain such an otherwise unresolved record, then bind only those
+        // records again so every earlier binding stays as it was.
+        let mut expanded_blocks = HashSet::new();
+        for (record_index, _) in &unresolved_block_records {
+            let record = &database.records()[*record_index];
+            if let Some(path) = &record.path_hint {
+                lookups.register_child_navigation_units(
+                    path,
+                    record.line_hint,
+                    &mut expanded_blocks,
+                );
+            }
         }
+        for (record_index, hash) in unresolved_block_records {
+            let binding = lookups.bind_block_record(&database.records()[record_index], hash);
+            coverage.apply_binding(&lookups, record_index, binding, &mut diagnostics);
+        }
+
+        diagnostics.sort_by_key(|(record_index, _)| *record_index);
+        coverage.diagnostics = diagnostics
+            .into_iter()
+            .map(|(_, diagnostic)| diagnostic)
+            .collect();
+        for (unit_id, facts) in &mut coverage.unit_facts {
+            facts.finalize(database.records());
+            if facts.direct_record_indices.is_empty() {
+                continue;
+            }
+            if let Some(CoverageCandidate::Block {
+                path,
+                start_byte,
+                end_byte,
+                ..
+            }) = lookups.candidate_descriptions.get(unit_id)
+            {
+                coverage
+                    .recorded_block_spans_by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .push(ByteSpan::new(*start_byte, *end_byte));
+            }
+        }
+        coverage.block_units = lookups.block_units;
         coverage.block_nodes_by_path = lookups.block_nodes_by_path;
 
         Ok(coverage)
+    }
+
+    fn apply_binding(
+        &mut self,
+        lookups: &CoverageLookups<'_>,
+        record_index: usize,
+        binding: Result<RecordBinding, RecordBindingFailure>,
+        diagnostics: &mut Vec<(usize, CoverageDiagnostic)>,
+    ) {
+        match binding {
+            Ok(binding) => {
+                let facts = self.unit_facts.entry(binding.unit_id.clone()).or_default();
+                facts.linked_record_indices.push(record_index);
+                facts.direct_record_indices.push(record_index);
+                let record_id = self.database.records()[record_index].id.clone();
+                self.record_bindings.insert(record_id, binding);
+            }
+            Err(RecordBindingFailure::Ambiguous {
+                record_id,
+                candidates,
+            }) => {
+                for unit_id in &candidates {
+                    self.unit_facts
+                        .entry(unit_id.clone())
+                        .or_default()
+                        .linked_record_indices
+                        .push(record_index);
+                }
+                diagnostics.push((
+                    record_index,
+                    lookups.ambiguous_diagnostic(record_id, candidates),
+                ));
+            }
+            Err(RecordBindingFailure::Unresolved { record_id }) => {
+                diagnostics.push((
+                    record_index,
+                    CoverageDiagnostic::UnresolvedRecord { record_id },
+                ));
+            }
+        }
+    }
+
+    /// Whether a record is bound to a block unit strictly inside `block`, such
+    /// as an approval of a child expanded in the TUI. Only then is it worth
+    /// splitting `block` into its children to decide whether it is covered.
+    pub fn has_block_records_within(&self, path: &RepoPath, block: &Block) -> bool {
+        let block_span = block.byte_span();
+        self.recorded_block_spans_by_path
+            .get(path)
+            .is_some_and(|spans| {
+                spans
+                    .iter()
+                    .any(|span| *span != block_span && block_span.contains(span))
+            })
     }
 
     pub fn diagnostics(&self) -> &[CoverageDiagnostic] {
@@ -745,6 +823,40 @@ impl<'a> CoverageLookups<'a> {
         self.register_block_candidate(path, block, None);
     }
 
+    /// Registers, recursively, the child-navigation units (what the TUI's `C`
+    /// reveals) of the tree blocks in `path` whose lines contain `line`, or of
+    /// every block in `path` without a line hint. `expanded_blocks` keeps a
+    /// block from being split again for another record.
+    fn register_child_navigation_units(
+        &mut self,
+        path: &RepoPath,
+        line: Option<u32>,
+        expanded_blocks: &mut HashSet<CoverageBlockLocator>,
+    ) {
+        let mut pending = self
+            .block_nodes_by_path
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter_map(|node| Some((node.block.clone()?, node.language?)))
+            .filter(|(block, _)| block_contains_line(block, line))
+            .collect::<Vec<_>>();
+        while let Some((block, language)) = pending.pop() {
+            if !expanded_blocks.insert(CoverageBlockLocator::new(path, &block)) {
+                continue;
+            }
+            let Ok(split) = sub_splitter::child_navigation_split(&block, language) else {
+                continue;
+            };
+            for child in split.blocks {
+                self.register_generated_block(path.clone(), &child);
+                if block_contains_line(&child, line) {
+                    pending.push((child, language));
+                }
+            }
+        }
+    }
+
     fn register_block_candidate(
         &mut self,
         path: RepoPath,
@@ -993,6 +1105,18 @@ where
     best.map(|(_, record_index)| record_index)
 }
 
+/// Whether `line` (a record's line hint) falls on `block`'s lines; no hint
+/// matches every block.
+fn block_contains_line(block: &Block, line: Option<u32>) -> bool {
+    match line.map(usize::try_from) {
+        None => true,
+        Some(Ok(line)) => {
+            block.start_line == line || (block.start_line..block.end_line).contains(&line)
+        }
+        Some(Err(_)) => false,
+    }
+}
+
 fn identity_key(identity: &Identity) -> String {
     match identity {
         Identity::Email { email } => email.trim().to_ascii_lowercase(),
@@ -1072,6 +1196,114 @@ mod tests {
     fn test_block(content: String, kind: BlockKind, start_line: usize, end_line: usize) -> Block {
         let start_byte = start_line;
         test_block_at(content, kind, start_line, end_line, start_byte)
+    }
+
+    fn single_block_tree(source: &str, kind: BlockKind) -> (Tree, Block) {
+        let block = Block::new(
+            source.to_string(),
+            kind,
+            LineSpan::new(0, source.lines().count()),
+            ByteSpan::new(0, source.len()),
+        );
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file,
+            kind.as_str().to_string(),
+            "src/lib.rs".to_string(),
+            block.clone(),
+            Language::Rust,
+        );
+        (builder.finalize(), block)
+    }
+
+    fn approved_child_records(children: &[Block]) -> Vec<Record> {
+        children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                approved_block_record(
+                    &format!("child-{index}"),
+                    child.hash.clone(),
+                    "src/lib.rs",
+                    u32::try_from(child.start_line).unwrap(),
+                    "a@example.com",
+                    i64::try_from(index).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn approvals_of_tui_expanded_children_of_short_block_bind() {
+        let (tree, function) = single_block_tree(
+            "fn helper() {\n    let a = 1;\n    let b = 2;\n\n    a + b\n}\n",
+            BlockKind::Function,
+        );
+        let children = sub_splitter::child_navigation_split(&function, Language::Rust)
+            .unwrap()
+            .blocks;
+        assert!(children.len() > 1, "expected TUI children: {children:?}");
+        let database = ReviewDatabase::from_records(approved_child_records(&children));
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
+        let path = RepoPath::new("src/lib.rs").unwrap();
+
+        assert_eq!(coverage.diagnostics(), &[]);
+        for child in &children {
+            assert_eq!(
+                coverage
+                    .block(&path, child)
+                    .direct_latest_verdict_for(&ReviewCheck::review()),
+                Some(&Verdict::Approved),
+                "child {child:?}"
+            );
+        }
+        assert!(coverage.has_block_records_within(&path, &function));
+    }
+
+    #[test]
+    fn approvals_of_tui_expanded_grandchildren_bind() {
+        let (tree, impl_block) = single_block_tree(
+            "impl Foo {\n    fn a(&self) {\n        one();\n\n        two();\n    }\n}\n",
+            BlockKind::Impl,
+        );
+        let methods = sub_splitter::child_navigation_split(&impl_block, Language::Rust)
+            .unwrap()
+            .blocks;
+        let [method] = methods.as_slice() else {
+            panic!("expected one method child: {methods:?}");
+        };
+        let grandchildren = sub_splitter::child_navigation_split(method, Language::Rust)
+            .unwrap()
+            .blocks;
+        assert!(
+            grandchildren.len() > 1,
+            "expected grandchildren: {grandchildren:?}"
+        );
+        let database = ReviewDatabase::from_records(approved_child_records(&grandchildren));
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
+        let path = RepoPath::new("src/lib.rs").unwrap();
+
+        assert_eq!(coverage.diagnostics(), &[]);
+        for grandchild in &grandchildren {
+            assert_eq!(
+                coverage
+                    .block(&path, grandchild)
+                    .direct_latest_verdict_for(&ReviewCheck::review()),
+                Some(&Verdict::Approved),
+                "grandchild {grandchild:?}"
+            );
+        }
+        assert!(coverage.has_block_records_within(&path, method));
+        assert!(!coverage.has_block_records_within(&path, &grandchildren[0]));
     }
 
     #[test]
