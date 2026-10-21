@@ -845,15 +845,24 @@ mod tests {
     /// The indexed line span of every UTF-8 range must equal the definition:
     /// the start line counts the newlines before the range, and a non-empty
     /// range ends after its last newline plus the partial line it stops in.
-    /// Parent-relative children must land on the same absolute lines.
+    /// Parent-relative children must land on the same absolute lines and
+    /// bytes as the file-level block, including under a parent that starts
+    /// mid-file.
     #[test]
     fn test_indexed_line_spans_match_newline_counts_for_every_range() {
+        const PREFIX: &str = "é\n\r\nab";
         for text in ["", "x", "\n", "\n\n", "ab\ncd", "ab\ncd\n", "\nβ\r\n\né\n"] {
             let source = SourceText::new(text);
             let parent =
                 Block::from_file_range(text, BlockKind::Code, ByteSpan::new(0, text.len()))
                     .unwrap();
             let parent = ParentBlock::new(&parent);
+            let full = format!("{PREFIX}{text}");
+            let full_source = SourceText::new(&full);
+            let offset_parent = full_source
+                .block(BlockKind::Code, ByteSpan::new(PREFIX.len(), full.len()))
+                .unwrap();
+            let offset_parent = ParentBlock::new(&offset_parent);
             let boundaries = (0..=text.len()).filter(|&offset| text.is_char_boundary(offset));
             for start in boundaries.clone() {
                 for end in boundaries.clone().filter(|&end| end >= start) {
@@ -877,6 +886,17 @@ mod tests {
                     let child = parent.child(BlockKind::Code, span).unwrap();
                     assert_eq!(child.line_span(), expected, "{text:?} {span:?}");
                     assert_eq!(child.content, content);
+
+                    let absolute = ByteSpan::new(PREFIX.len() + start, PREFIX.len() + end);
+                    let offset_child = offset_parent.child(BlockKind::Code, span).unwrap();
+                    let file_block = full_source.block(BlockKind::Code, absolute).unwrap();
+                    assert_eq!(offset_child.byte_span(), absolute, "{text:?} {span:?}");
+                    assert_eq!(
+                        offset_child.line_span(),
+                        file_block.line_span(),
+                        "{text:?} {span:?}"
+                    );
+                    assert_eq!(offset_child.content, file_block.content);
                 }
             }
         }
