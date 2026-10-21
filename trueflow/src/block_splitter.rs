@@ -1896,20 +1896,18 @@ fn collect_test_ranges(
                         continue;
                     }
                     let attr_text = capture.node.utf8_text(source.as_bytes())?;
-                    if attr_text.contains("#[test]")
-                        && let Some(function_item) =
-                            next_named_sibling_of_kind(capture.node, "function_item")
-                    {
-                        ranges.push(ByteSpan::new(
-                            function_item.start_byte(),
-                            function_item.end_byte(),
-                        ));
-                    }
-                    if attr_text.contains("cfg")
-                        && attr_text.contains("test")
-                        && let Some(mod_item) = next_named_sibling_of_kind(capture.node, "mod_item")
-                    {
-                        ranges.push(ByteSpan::new(mod_item.start_byte(), mod_item.end_byte()));
+                    let Some(test_attribute) = rust_test_attribute(attr_text) else {
+                        continue;
+                    };
+                    let Some(item) = rust_attributed_item(capture.node) else {
+                        continue;
+                    };
+                    let targets_item = match test_attribute {
+                        RustTestAttribute::TestFunction => item.kind() == "function_item",
+                        RustTestAttribute::TestOnlyCfg => item.kind() == "mod_item",
+                    };
+                    if targets_item {
+                        ranges.push(ByteSpan::new(item.start_byte(), item.end_byte()));
                     }
                 }
             }
@@ -2011,18 +2009,44 @@ fn apply_test_tags(blocks: &mut [Block], test_spans: &[LineSpan]) {
     }
 }
 
-fn next_named_sibling_of_kind<'a>(
-    node: tree_sitter::Node<'a>,
-    kind: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    let mut current = node;
-    while let Some(next) = current.next_named_sibling() {
-        if next.kind() == kind {
-            return Some(next);
-        }
-        current = next;
+/// An attribute that marks the item it decorates as test code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustTestAttribute {
+    /// `#[test]`
+    TestFunction,
+    /// `#[cfg(test)]` or `#[cfg(all(.., test, ..))]`: compiled only for tests.
+    TestOnlyCfg,
+}
+
+fn rust_test_attribute(attr_text: &str) -> Option<RustTestAttribute> {
+    let compact = attr_text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if compact == "#[test]" {
+        return Some(RustTestAttribute::TestFunction);
     }
-    None
+
+    let predicate = compact.strip_prefix("#[cfg(")?.strip_suffix(")]")?;
+    let test_only = predicate == "test"
+        || predicate
+            .strip_prefix("all(")
+            .and_then(|args| args.strip_suffix(')'))
+            .is_some_and(|args| args.split(',').any(|arg| arg == "test"));
+    test_only.then_some(RustTestAttribute::TestOnlyCfg)
+}
+
+/// The item an outer attribute decorates: the next sibling that is not
+/// another attribute or a comment.
+fn rust_attributed_item(attribute: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut current = attribute.next_named_sibling()?;
+    while matches!(
+        current.kind(),
+        "attribute_item" | "line_comment" | "block_comment"
+    ) {
+        current = current.next_named_sibling()?;
+    }
+    Some(current)
 }
 
 fn next_named_sibling_of_kinds<'a>(
@@ -2455,6 +2479,24 @@ mod tests {
             .find(|b| b.content.contains("mod tests"));
         assert!(module_block.is_some());
         assert!(module_block.unwrap().tags.contains(&"test".to_string()));
+    }
+
+    #[test]
+    fn test_rust_test_tagging_ignores_non_test_cfg_and_unrelated_items() {
+        let content = "#[cfg(not(test))]\nmod real {}\n\n#[cfg_attr(test, derive(Debug))]\nstruct Config;\n\nmod helpers {}\n\n#[test]\nconst LIMIT: u32 = 1;\n\nfn production() {}\n\n#[cfg(all(test, feature = \"slow\"))]\nmod slow_tests {}\n";
+
+        let blocks = split_result(content, Language::Rust).blocks;
+        let is_tagged = |needle: &str| {
+            let Some(block) = blocks.iter().find(|block| block.content.contains(needle)) else {
+                panic!("missing block containing {needle:?}: {blocks:#?}");
+            };
+            block.tags.iter().any(|tag| tag == "test")
+        };
+
+        assert!(!is_tagged("mod real"));
+        assert!(!is_tagged("mod helpers"));
+        assert!(!is_tagged("fn production"));
+        assert!(is_tagged("mod slow_tests"));
     }
 
     #[test]
