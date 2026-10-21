@@ -877,7 +877,9 @@ fn completion_for_a_declaration_left_while_in_flight_is_stored_for_its_return() 
 
     runtime.skip_current()?;
     assert_eq!(
-        runtime.selected_target().map(|target| &target.declaration.id),
+        runtime
+            .selected_target()
+            .map(|target| &target.declaration.id),
         Some(&fixture.config),
         "fixture must leave alpha before its relationships complete"
     );
@@ -905,7 +907,9 @@ fn completion_for_a_declaration_left_while_in_flight_is_stored_for_its_return() 
         controller.handle_key(key)?;
     }
     assert_eq!(
-        runtime.selected_target().map(|target| &target.declaration.id),
+        runtime
+            .selected_target()
+            .map(|target| &target.declaration.id),
         Some(&fixture.alpha)
     );
     let visible = runtime.visible_text();

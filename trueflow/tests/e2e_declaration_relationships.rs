@@ -614,11 +614,10 @@ fn documented_type_declaration_reconciles_its_identifier_not_its_doc_comment() -
     let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
     let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
 
-    let payload_identifier = location_at(&uri, 1, 17, 1, 24);
     let uses_types = plan_uses_types(&index, &decode.id, PositionEncoding::Utf16)?;
     let mut backend = FakeRelationshipBackend::new(
         [RelationshipCapability::TypeDefinition],
-        [vec![payload_identifier.clone()]],
+        [vec![location_at(&uri, 1, 17, 1, 24)]],
     );
     let execution = execute_relationship_plan(&uses_types, &mut backend)?;
     backend.assert_exhausted();
