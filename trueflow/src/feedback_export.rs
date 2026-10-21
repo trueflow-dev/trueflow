@@ -213,7 +213,6 @@ pub struct ResolvedFeedbackBlock {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedFeedbackContext {
-    pub snapshot: FeedbackSnapshot,
     pub file_path: Option<String>,
     pub block: Option<ResolvedFeedbackBlock>,
 }
@@ -397,9 +396,11 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
     }
 }
 
+/// Groups records presented as one entry. Revision-independent like the
+/// store's block locators: an unchanged block reviewed at several commits
+/// (or once dirty, then committed) is one entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FeedbackPresentationEntryKey {
-    snapshot: FeedbackSnapshot,
     target: ReviewTargetRef,
     file_path: String,
     block_hash: TreeHash,
@@ -448,14 +449,10 @@ enum FeedbackDiffAnchorRowKind {
     Removed,
 }
 
+/// Latest-verdict identity. Revision-independent so a later approval at a
+/// different commit supersedes an earlier comment on the same block.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FeedbackVerdictKey {
-    snapshot: FeedbackSnapshot,
-    locator: FeedbackVerdictLocator,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum FeedbackVerdictLocator {
+enum FeedbackVerdictKey {
     Block {
         target_hash: TreeHash,
         file_path: String,
@@ -779,7 +776,6 @@ fn feedback_entry_parts(
         },
     };
     let entry_key = FeedbackPresentationEntryKey {
-        snapshot: context.snapshot.clone(),
         target: record.target.clone(),
         file_path: file_path.clone(),
         block_hash: block.hash.clone(),
@@ -854,7 +850,7 @@ fn feedback_verdict_key(
     context: &ResolvedFeedbackContext,
     canonical_file_path: &str,
 ) -> Option<FeedbackVerdictKey> {
-    let locator = match &record.target {
+    Some(match &record.target {
         ReviewTargetRef::Block { hash } => {
             let (block_hash, start_line, end_line) = context
                 .block
@@ -870,7 +866,7 @@ fn feedback_verdict_key(
                     let (start_line, end_line) = unresolved_block_line_range(record);
                     (hash.clone(), start_line, end_line)
                 });
-            FeedbackVerdictLocator::Block {
+            FeedbackVerdictKey::Block {
                 target_hash: hash.clone(),
                 file_path: canonical_file_path.to_string(),
                 block_hash,
@@ -878,20 +874,15 @@ fn feedback_verdict_key(
                 end_line,
             }
         }
-        ReviewTargetRef::File { hash } => FeedbackVerdictLocator::File {
+        ReviewTargetRef::File { hash } => FeedbackVerdictKey::File {
             target_hash: hash.clone(),
             path: record.path_hint.as_ref().map(RepoPath::to_string),
         },
-        ReviewTargetRef::Tree { hash } => FeedbackVerdictLocator::Tree {
+        ReviewTargetRef::Tree { hash } => FeedbackVerdictKey::Tree {
             target_hash: hash.clone(),
             path: record.path_hint.as_ref().map(RepoPath::to_string),
         },
         ReviewTargetRef::Declaration { .. } => return None,
-    };
-
-    Some(FeedbackVerdictKey {
-        snapshot: context.snapshot.clone(),
-        locator,
     })
 }
 
@@ -1424,7 +1415,6 @@ fn resolve_feedback_context(
             };
             if let Some((file_path, block)) = resolved {
                 return Ok(ResolvedFeedbackContext {
-                    snapshot: snapshot.clone(),
                     file_path: Some(file_path),
                     block: Some(resolved_feedback_block_for_record(record, block)),
                 });
@@ -1448,7 +1438,6 @@ fn resolve_feedback_context(
         )?;
         if let Some((file_path, block)) = resolve_record_in_files(record, &cache.files) {
             return Ok(ResolvedFeedbackContext {
-                snapshot: snapshot.clone(),
                 file_path: Some(file_path),
                 block: Some(resolved_feedback_block_for_record(record, block)),
             });
@@ -1456,7 +1445,6 @@ fn resolve_feedback_context(
     }
 
     Ok(ResolvedFeedbackContext {
-        snapshot: default_snapshot.clone(),
         file_path: record.path_hint.as_ref().map(RepoPath::to_string),
         block: None,
     })
@@ -2895,7 +2883,6 @@ mod tests {
 
     fn resolved_context(path: &str, content: &str) -> ResolvedFeedbackContext {
         ResolvedFeedbackContext {
-            snapshot: FeedbackSnapshot::Workdir,
             file_path: Some(path.to_string()),
             block: Some(fully_presented_feedback_block(Block::new(
                 content.to_string(),
@@ -2912,7 +2899,6 @@ mod tests {
         line_span: LineSpan,
     ) -> ResolvedFeedbackContext {
         ResolvedFeedbackContext {
-            snapshot: FeedbackSnapshot::Workdir,
             file_path: Some(path.to_string()),
             block: Some(fully_presented_feedback_block(Block::new(
                 content.to_string(),

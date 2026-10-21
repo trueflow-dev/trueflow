@@ -201,3 +201,78 @@ fn test_feedback_target_revision_range_includes_in_range_reviews_on_unchanged_fi
 
     Ok(())
 }
+
+fn review_with_id(
+    scenario: &FeedbackScenario,
+    path: &str,
+    verdict: &str,
+    id: &str,
+    timestamp: i64,
+) -> Result<()> {
+    scenario.review_block_in_process_with_overrides(
+        path,
+        verdict,
+        &ReviewRecordOverrides {
+            id: Some(id),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
+#[test]
+fn feedback_later_approval_at_new_commit_hides_comment() -> Result<()> {
+    let scenario = FeedbackScenario::new("feedback_cross_revision_approval")?;
+    scenario.write("src/lib.rs", "pub fn core() {}\n")?;
+    scenario.commit_all("A")?;
+    review_with_id(&scenario, "src/lib.rs", "comment", "comment", 1000)?;
+    scenario.write("docs/x.md", "# Unrelated\n")?;
+    scenario.commit_all("B")?;
+    review_with_id(&scenario, "src/lib.rs", "approved", "approval", 2000)?;
+
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+
+    assert!(entries.is_empty(), "stale comment exported: {entries:?}");
+    Ok(())
+}
+
+#[test]
+fn feedback_approval_after_committing_dirty_comment_hides_it() -> Result<()> {
+    let scenario = FeedbackScenario::new("feedback_dirty_comment_then_approval")?;
+    scenario.write("src/lib.rs", "pub fn core() {}\n")?;
+    scenario.commit_all("A")?;
+    scenario.write("src/lib.rs", "pub fn core() -> u8 { 1 }\n")?;
+    review_with_id(&scenario, "src/lib.rs", "comment", "comment", 1000)?;
+    scenario.commit_all("B")?;
+    review_with_id(&scenario, "src/lib.rs", "approved", "approval", 2000)?;
+
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+
+    assert!(entries.is_empty(), "stale comment exported: {entries:?}");
+    Ok(())
+}
+
+#[test]
+fn feedback_merges_unchanged_block_reviews_across_revisions() -> Result<()> {
+    let scenario = FeedbackScenario::new("feedback_cross_revision_merge")?;
+    scenario.write("src/lib.rs", "pub fn core() {}\n")?;
+    scenario.commit_all("A")?;
+    review_with_id(&scenario, "src/lib.rs", "comment", "first", 1000)?;
+    scenario.write("docs/x.md", "# Unrelated\n")?;
+    scenario.commit_all("B")?;
+    review_with_id(&scenario, "src/lib.rs", "rejected", "second", 2000)?;
+
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+
+    assert_eq!(entries.len(), 1, "one block, one entry: {entries:?}");
+    let ids = entries[0]["reviews"]
+        .as_array()
+        .context("reviews should be array")?
+        .iter()
+        .filter_map(|review| review["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["first", "second"]);
+    assert_eq!(entries[0]["latest_verdict"].as_str(), Some("rejected"));
+    Ok(())
+}
