@@ -2883,3 +2883,43 @@ fn review_reviews_shallow_clone_boundary_commit_as_root() -> Result<()> {
     assert_eq!(review_paths(&stdout)?, ["src/lib.rs"]);
     Ok(())
 }
+
+#[test]
+fn review_revision_ranges_follow_git_dot_syntax() -> Result<()> {
+    let repo = TestRepo::new("revision_range_dot_syntax")?;
+    repo.write("src/base.rs", "pub fn base() {}\n")?;
+    repo.write("src/main_only.rs", "pub fn main_only() {}\n")?;
+    repo.commit_all("base")?;
+    repo.git(&["branch", "-M", "main"])?;
+    repo.git(&["switch", "-c", "feature"])?;
+    repo.write("src/feature.rs", "pub fn feature() {}\n")?;
+    repo.commit_all("feature")?;
+    repo.git(&["switch", "main"])?;
+    repo.write("src/main_only.rs", "pub fn main_only() -> u8 {\n    2\n}\n")?;
+    repo.commit_all("main moves on")?;
+    repo.git(&["switch", "feature"])?;
+
+    let cases: [(&str, &[&str]); 5] = [
+        // `A...B` starts at the merge base, so main's later edit is excluded.
+        ("rev:main...feature", &["src/feature.rs"]),
+        ("rev:main...", &["src/feature.rs"]),
+        // `A..B` compares the two trees directly.
+        ("rev:main..feature", &["src/feature.rs", "src/main_only.rs"]),
+        ("rev:main..", &["src/feature.rs", "src/main_only.rs"]),
+        ("rev:..main", &["src/feature.rs", "src/main_only.rs"]),
+    ];
+    for (target, expected) in cases {
+        let output = repo.run_raw(&["review", "--json", "--target", target])?;
+        assert!(
+            output.status.success(),
+            "{target} must resolve: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            review_paths(&String::from_utf8(output.stdout)?)?,
+            expected,
+            "{target}"
+        );
+    }
+    Ok(())
+}

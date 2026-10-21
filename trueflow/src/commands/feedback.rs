@@ -263,19 +263,24 @@ fn resolve_local_feedback_targets(targets: &[ReviewTarget]) -> Result<ResolvedTa
     resolve_local_feedback_targets_with(
         targets,
         |revision| vcs::resolve_commit_id_from_workdir(revision.as_str()),
+        |left, right| {
+            vcs::merge_base_in_repo(&vcs::repo_from_workdir()?, left.as_str(), right.as_str())
+        },
         vcs::dirty_files_from_workdir,
         || vcs::resolved_main_diff(&vcs::repo_from_workdir()?),
     )
 }
 
-fn resolve_local_feedback_targets_with<ResolveFn, DirtyFn, MainFn>(
+fn resolve_local_feedback_targets_with<ResolveFn, MergeBaseFn, DirtyFn, MainFn>(
     targets: &[ReviewTarget],
     resolve_revision: ResolveFn,
+    merge_base: MergeBaseFn,
     dirty_files: DirtyFn,
     main_diff_files: MainFn,
 ) -> Result<ResolvedTargets>
 where
     ResolveFn: Fn(&crate::targets::RevisionExpr) -> Result<CommitId>,
+    MergeBaseFn: Fn(&CommitId, &CommitId) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<crate::repo_path::RepoPath>>,
     MainFn: Fn() -> Result<(
         crate::targets::CommitRange,
@@ -285,6 +290,7 @@ where
     resolve_targets_with(
         targets,
         resolve_revision,
+        merge_base,
         dirty_files,
         main_diff_files,
         |_revision| Ok(HashSet::new()),
@@ -2934,6 +2940,7 @@ mod tests {
                     other => Err(anyhow!("unexpected revision expression {other}")),
                 }
             },
+            |_left, _right| Err(anyhow!("a two-dot range has no merge base lookup")),
             || -> Result<HashSet<crate::repo_path::RepoPath>> {
                 Err(anyhow!("dirty files should not be resolved"))
             },

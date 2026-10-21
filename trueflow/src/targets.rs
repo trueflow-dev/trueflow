@@ -33,18 +33,69 @@ impl fmt::Display for RevisionExpr {
     }
 }
 
+/// Which commit a revision range's comparison starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RevisionRangeBase {
+    /// `A..B`: compare `A`'s tree with `B`'s.
+    Start,
+    /// `A...B`: compare from the merge base of `A` and `B`, like
+    /// `git diff A...B`, so only `B`'s side of the fork is reviewed.
+    MergeBase,
+}
+
+impl RevisionRangeBase {
+    fn separator(self) -> &'static str {
+        match self {
+            Self::Start => "..",
+            Self::MergeBase => "...",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RevisionRangeExpr {
     pub start: RevisionExpr,
     pub end: RevisionExpr,
+    pub base: RevisionRangeBase,
 }
 
 impl RevisionRangeExpr {
     pub fn new(start: impl Into<String>, end: impl Into<String>) -> Result<Self> {
+        Self::with_base(start, end, RevisionRangeBase::Start)
+    }
+
+    fn with_base(
+        start: impl Into<String>,
+        end: impl Into<String>,
+        base: RevisionRangeBase,
+    ) -> Result<Self> {
         Ok(Self {
             start: RevisionExpr::new(start)?,
             end: RevisionExpr::new(end)?,
+            base,
         })
+    }
+
+    /// Parses git's `A..B` and `A...B`; like git, an omitted side means `HEAD`.
+    fn parse(raw: &str) -> Result<Option<Self>> {
+        // `...` first: `A...B` also contains `..`.
+        let Some((base, (start, end))) = [RevisionRangeBase::MergeBase, RevisionRangeBase::Start]
+            .into_iter()
+            .find_map(|base| raw.split_once(base.separator()).map(|sides| (base, sides)))
+        else {
+            return Ok(None);
+        };
+        let or_head = |side: &str| match side.trim() {
+            "" => "HEAD".to_string(),
+            side => side.to_string(),
+        };
+        Self::with_base(or_head(start), or_head(end), base).map(Some)
+    }
+}
+
+impl fmt::Display for RevisionRangeExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}{}", self.start, self.base.separator(), self.end)
     }
 }
 
@@ -75,10 +126,10 @@ impl ReviewTarget {
             return Ok(Self::Dir(RepoPath::new(rest)?));
         }
         if let Some(rest) = raw.strip_prefix("rev:") {
-            if let Some((start, end)) = rest.split_once("..") {
-                return Ok(Self::RevisionRange(RevisionRangeExpr::new(start, end)?));
-            }
-            return Ok(Self::Revision(RevisionExpr::new(rest)?));
+            return Ok(match RevisionRangeExpr::parse(rest)? {
+                Some(range) => Self::RevisionRange(range),
+                None => Self::Revision(RevisionExpr::new(rest)?),
+            });
         }
         if raw.starts_with("pr:") || raw.starts_with("http://") || raw.starts_with("https://") {
             return Ok(Self::PullRequest(PullRequestRef::from_cli(raw)?));
@@ -304,6 +355,11 @@ pub fn resolve_targets(targets: &[ReviewTarget]) -> Result<ResolvedTargets> {
                 vcs::resolve_commit_id_in_repo(repo, revision.as_str())
             })
         },
+        |left, right| {
+            with_workdir_repo(&repo_cache, |repo| {
+                vcs::merge_base_in_repo(repo, left.as_str(), right.as_str())
+            })
+        },
         || with_workdir_repo(&repo_cache, vcs::dirty_changed_paths),
         || with_workdir_repo(&repo_cache, vcs::resolved_main_diff),
         |revision| {
@@ -334,9 +390,10 @@ fn with_workdir_repo<T>(
     action(repo)
 }
 
-pub(crate) fn resolve_targets_with<ResolveFn, DirtyFn, MainFn, RevisionFn, RangeFn>(
+pub(crate) fn resolve_targets_with<ResolveFn, MergeBaseFn, DirtyFn, MainFn, RevisionFn, RangeFn>(
     targets: &[ReviewTarget],
     resolve_revision: ResolveFn,
+    merge_base: MergeBaseFn,
     dirty_files: DirtyFn,
     main_diff_files: MainFn,
     revision_files: RevisionFn,
@@ -344,6 +401,7 @@ pub(crate) fn resolve_targets_with<ResolveFn, DirtyFn, MainFn, RevisionFn, Range
 ) -> Result<ResolvedTargets>
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
+    MergeBaseFn: Fn(&CommitId, &CommitId) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<RepoPath>>,
     MainFn: Fn() -> Result<(CommitRange, HashSet<ChangedPath>)>,
     RevisionFn: Fn(&str) -> Result<HashSet<ChangedPath>>,
@@ -352,6 +410,7 @@ where
     resolve_targets_with_changed(
         targets,
         resolve_revision,
+        merge_base,
         || {
             dirty_files().map(|paths| {
                 paths
@@ -366,9 +425,10 @@ where
     )
 }
 
-fn resolve_targets_with_changed<ResolveFn, DirtyFn, MainFn, RevisionFn, RangeFn>(
+fn resolve_targets_with_changed<ResolveFn, MergeBaseFn, DirtyFn, MainFn, RevisionFn, RangeFn>(
     targets: &[ReviewTarget],
     resolve_revision: ResolveFn,
+    merge_base: MergeBaseFn,
     dirty_files: DirtyFn,
     main_diff_files: MainFn,
     revision_files: RevisionFn,
@@ -376,6 +436,7 @@ fn resolve_targets_with_changed<ResolveFn, DirtyFn, MainFn, RevisionFn, RangeFn>
 ) -> Result<ResolvedTargets>
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
+    MergeBaseFn: Fn(&CommitId, &CommitId) -> Result<CommitId>,
     DirtyFn: Fn() -> Result<HashSet<ChangedPath>>,
     MainFn: Fn() -> Result<(CommitRange, HashSet<ChangedPath>)>,
     RevisionFn: Fn(&str) -> Result<HashSet<ChangedPath>>,
@@ -390,6 +451,7 @@ where
     let resolved_targets = resolve_target_exprs(
         targets,
         &resolve_revision,
+        &merge_base,
         main_diff.as_ref().map(|(range, _)| range),
     )?;
     let content_source = resolve_content_source(&resolved_targets)?;
@@ -495,13 +557,15 @@ fn reject_mixed_content_source_targets(targets: &[ReviewTarget]) -> Result<()> {
     Ok(())
 }
 
-fn resolve_target_exprs<ResolveFn>(
+fn resolve_target_exprs<ResolveFn, MergeBaseFn>(
     targets: &[ReviewTarget],
     resolve_revision: &ResolveFn,
+    merge_base: &MergeBaseFn,
     main_diff: Option<&CommitRange>,
 ) -> Result<Vec<ResolvedReviewTarget>>
 where
     ResolveFn: Fn(&RevisionExpr) -> Result<CommitId>,
+    MergeBaseFn: Fn(&CommitId, &CommitId) -> Result<CommitId>,
 {
     let mut revision_cache = HashMap::<RevisionExpr, CommitId>::new();
     let mut resolved = Vec::with_capacity(targets.len());
@@ -520,14 +584,14 @@ where
                 resolve_revision_expr(revision, resolve_revision, &mut revision_cache)?,
             ),
             ReviewTarget::RevisionRange(range) => {
-                ResolvedReviewTarget::RevisionRange(CommitRange {
-                    start: resolve_revision_expr(
-                        &range.start,
-                        resolve_revision,
-                        &mut revision_cache,
-                    )?,
-                    end: resolve_revision_expr(&range.end, resolve_revision, &mut revision_cache)?,
-                })
+                let start =
+                    resolve_revision_expr(&range.start, resolve_revision, &mut revision_cache)?;
+                let end = resolve_revision_expr(&range.end, resolve_revision, &mut revision_cache)?;
+                let start = match range.base {
+                    RevisionRangeBase::Start => start,
+                    RevisionRangeBase::MergeBase => merge_base(&start, &end)?,
+                };
+                ResolvedReviewTarget::RevisionRange(CommitRange { start, end })
             }
             ReviewTarget::PullRequest(_) => {
                 return Err(anyhow!(
@@ -620,9 +684,9 @@ pub fn workdir_prefix_from_git_root() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolvedTargets, ReviewContentSource, ReviewDiffSelection, ReviewPathSelection,
-        ReviewTarget, RevisionExpr, RevisionRangeExpr, extract_pull_request_target,
-        resolve_targets_with,
+        ResolvedTargets, ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget,
+        ReviewPathSelection, ReviewTarget, RevisionExpr, RevisionRangeBase, RevisionRangeExpr,
+        extract_pull_request_target, resolve_targets_with,
     };
     use crate::github::PullRequestRef;
     use crate::repo_path::RepoPath;
@@ -638,6 +702,88 @@ mod tests {
             },
             HashSet::new(),
         ))
+    }
+
+    fn unexpected_merge_base(left: &CommitId, right: &CommitId) -> anyhow::Result<CommitId> {
+        panic!("unexpected merge-base lookup for {left} and {right}")
+    }
+
+    #[test]
+    fn revision_ranges_parse_git_dot_syntax() {
+        let range = |start: &str, end: &str, base| {
+            ReviewTarget::RevisionRange(RevisionRangeExpr::with_base(start, end, base).unwrap())
+        };
+        for (raw, expected) in [
+            (
+                "rev:main..HEAD",
+                range("main", "HEAD", RevisionRangeBase::Start),
+            ),
+            (
+                "rev:main...HEAD",
+                range("main", "HEAD", RevisionRangeBase::MergeBase),
+            ),
+            (
+                "rev:HEAD~3..",
+                range("HEAD~3", "HEAD", RevisionRangeBase::Start),
+            ),
+            (
+                "rev:..feature",
+                range("HEAD", "feature", RevisionRangeBase::Start),
+            ),
+            (
+                "rev:main...",
+                range("main", "HEAD", RevisionRangeBase::MergeBase),
+            ),
+            (
+                "rev:...",
+                range("HEAD", "HEAD", RevisionRangeBase::MergeBase),
+            ),
+        ] {
+            assert_eq!(ReviewTarget::from_cli(raw).unwrap(), expected, "{raw}");
+        }
+        assert_eq!(
+            ReviewTarget::from_cli("rev:HEAD~2").unwrap(),
+            ReviewTarget::Revision(RevisionExpr::new("HEAD~2").unwrap())
+        );
+    }
+
+    #[test]
+    fn revision_range_display_keeps_its_separator() {
+        let two_dot = RevisionRangeExpr::new("main", "HEAD").unwrap();
+        let three_dot =
+            RevisionRangeExpr::with_base("main", "HEAD", RevisionRangeBase::MergeBase).unwrap();
+        assert_eq!(two_dot.to_string(), "main..HEAD");
+        assert_eq!(three_dot.to_string(), "main...HEAD");
+    }
+
+    #[test]
+    fn merge_base_range_starts_at_the_merge_base() {
+        let resolved = resolve_targets_with(
+            &[ReviewTarget::from_cli("rev:aaaaaaa...bbbbbbb").unwrap()],
+            |revision| CommitId::new(revision.as_str()),
+            |left, right| {
+                assert_eq!((left.as_str(), right.as_str()), ("aaaaaaa", "bbbbbbb"));
+                CommitId::new("ccccccc")
+            },
+            || Ok(HashSet::new()),
+            empty_main_diff,
+            |_revision| Ok(HashSet::new()),
+            |start, end| {
+                assert_eq!((start, end), ("ccccccc", "bbbbbbb"));
+                Ok(HashSet::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.diff_selection,
+            ReviewDiffSelection::Targets(vec![ReviewDiffTarget::RevisionRange(
+                super::CommitRange {
+                    start: CommitId::new("ccccccc").unwrap(),
+                    end: CommitId::new("bbbbbbb").unwrap(),
+                }
+            )])
+        );
     }
 
     #[test]
@@ -697,6 +843,7 @@ mod tests {
         let resolved = resolve_targets_with(
             &[target],
             |revision| CommitId::new(revision.as_str()),
+            unexpected_merge_base,
             || Ok(HashSet::new()),
             empty_main_diff,
             |_revision| Ok(HashSet::new()),
@@ -814,6 +961,7 @@ mod tests {
         let err = resolve_targets_with(
             &targets,
             |revision| CommitId::new(revision.as_str()),
+            unexpected_merge_base,
             || Ok(HashSet::new()),
             empty_main_diff,
             |_revision| Ok(HashSet::new()),
@@ -836,6 +984,7 @@ mod tests {
         let resolved = resolve_targets_with(
             &targets,
             |revision| CommitId::new(revision.as_str()),
+            unexpected_merge_base,
             || Ok(HashSet::new()),
             empty_main_diff,
             |_revision| Ok(HashSet::new()),
@@ -865,6 +1014,7 @@ mod tests {
         let resolved = resolve_targets_with(
             &targets,
             |revision| CommitId::new(revision.as_str()),
+            unexpected_merge_base,
             || Ok(HashSet::new()),
             empty_main_diff,
             |_revision| Ok(HashSet::new()),
@@ -883,6 +1033,7 @@ mod tests {
         let resolved = resolve_targets_with(
             &[ReviewTarget::MainDiff],
             |revision| CommitId::new(revision.as_str()),
+            unexpected_merge_base,
             || Ok(HashSet::new()),
             empty_main_diff,
             |_revision| Ok(HashSet::new()),
@@ -900,6 +1051,7 @@ mod tests {
         let err = resolve_targets_with(
             &[ReviewTarget::DirtyWorktree],
             |revision| CommitId::new(revision.as_str()),
+            unexpected_merge_base,
             || Err(anyhow::anyhow!("dirty file query failed")),
             empty_main_diff,
             |_revision| Ok(HashSet::new()),
@@ -919,6 +1071,7 @@ mod tests {
                 ReviewTarget::RevisionRange(RevisionRangeExpr::new("abc1234", "def5678").unwrap()),
             ],
             |revision| CommitId::new(revision.as_str()),
+            unexpected_merge_base,
             || Ok(HashSet::new()),
             empty_main_diff,
             |_revision| Ok(HashSet::new()),

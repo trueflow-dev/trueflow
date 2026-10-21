@@ -379,6 +379,9 @@ trueflow tui --target dir:trueflow/src
 # Scope the TUI to a revision range with additional filtering
 trueflow tui --target rev:abc1234..def5678 --only function --exclude comment
 
+# Review only the branch's side since it forked from main (like `git diff main...HEAD`)
+trueflow review --target rev:main...HEAD --json
+
 # Scope the TUI to a GitHub pull request by number or URL
 trueflow tui --target pr:11
 trueflow tui --target https://github.com/owner/repo/pull/11
@@ -392,6 +395,13 @@ captured when the review starts. Uncommitted edits are excluded; use `dirty`
 to review the working tree. Historical comparisons cannot be mixed with `dirty`
 in one target list. Source views, diffs, and comment anchors retain the captured
 revision even if branches move during the session.
+
+`rev:` follows git's revision syntax. `rev:A` reviews one commit against its
+first parent. `rev:A..B` compares `A`'s tree with `B`'s, so changes made on
+`A`'s side after the fork appear too; `rev:A...B` starts from the merge base
+of `A` and `B`, like `git diff A...B`, and reviews only `B`'s side. As in git,
+an omitted side means `HEAD`: `rev:main...` is `rev:main...HEAD` and
+`rev:HEAD~3..` is `rev:HEAD~3..HEAD`.
 
 The `[scan]` ignore rules (`ignore_names`, `ignore_globs`,
 `ignore_path_prefixes`, plus the built-in `.trueflow`, `target`,

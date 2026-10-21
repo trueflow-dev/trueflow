@@ -2260,7 +2260,7 @@ fn scope_preset_for_cli_targets(all: bool, targets: &[ReviewTarget]) -> (ScopePr
                 start: range.start.as_str().to_string(),
                 end: range.end.as_str().to_string(),
             },
-            format!("revisions {}..{}", range.start, range.end),
+            format!("revisions {range}"),
         ),
         _ => (ScopePreset::MainDiff, format!("{} targets", targets.len())),
     }
