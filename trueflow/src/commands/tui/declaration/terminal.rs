@@ -230,14 +230,12 @@ fn run_runtime(
                     .controller_mut()
                     .map(|controller| controller.take_actions())
                     .unwrap_or_default();
-                for action in actions {
-                    runtime.submit_action_with_persistence(&action, |record| {
-                        execute_mark_for_tui(
-                            || mark::append_structured_record_with_noninteractive_signing(record),
-                            || session.suspend(|| mark::append_structured_record(record)),
-                        )
-                    })?;
-                }
+                runtime.submit_actions_with_persistence(actions, |record| {
+                    execute_mark_for_tui(
+                        || mark::append_structured_record_with_noninteractive_signing(record),
+                        || session.suspend(|| mark::append_structured_record(record)),
+                    )
+                })?;
 
                 if runtime.is_finished() && has_later_scope {
                     return Ok(RuntimeExit::AdvanceScope);

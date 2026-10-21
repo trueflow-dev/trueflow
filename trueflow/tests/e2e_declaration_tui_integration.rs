@@ -397,6 +397,60 @@ fn approving_relationship_destination_preserves_pending_queue_and_exact_binding(
 }
 
 #[test]
+fn failed_declaration_note_submit_keeps_editor_open_and_preserves_note() -> Result<()> {
+    const NOTE: &str = "keep this note";
+    let (repo, query) = two_file_dirty_repo("declaration_tui_failed_note_save")?;
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+    let alpha = prepared.targets()[0].declaration.id.clone();
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
+
+    let controller = runtime.controller_mut().context("missing controller")?;
+    controller.handle_key(KeyCode::Char('r'))?;
+    controller.insert_text(NOTE);
+    controller.handle_key(KeyCode::Enter)?;
+    let actions = controller.take_actions();
+    runtime
+        .submit_actions_with_persistence(actions, |_| bail!("injected append failure"))
+        .context("a failed save must not end the declaration session")?;
+
+    let controller = runtime.controller().context("lost controller")?;
+    assert!(controller.is_editing(), "the note editor must reopen");
+    assert_eq!(
+        controller.state_snapshot().comment_draft.as_deref(),
+        Some(NOTE),
+        "the typed note must survive the failed save"
+    );
+    let screen = runtime.visible_text();
+    assert!(
+        screen.contains("Save failed: injected append failure"),
+        "the failure must be visible: {screen}"
+    );
+    assert!(screen.contains(&format!("Reject: {NOTE}")), "{screen}");
+    assert_eq!(
+        runtime.queue_current().map(|target| &target.declaration.id),
+        Some(&alpha)
+    );
+
+    let controller = runtime.controller_mut().context("lost controller")?;
+    controller.handle_key(KeyCode::Enter)?;
+    let actions = controller.take_actions();
+    let mut persisted = Vec::new();
+    runtime.submit_actions_with_persistence(actions, |record| {
+        persisted.push(record.clone());
+        Ok(())
+    })?;
+    let record = only_record(persisted)?;
+    assert_eq!(record.verdict, Verdict::Rejected);
+    assert_eq!(record.note.as_deref(), Some(NOTE));
+    assert!(
+        !runtime.visible_text().contains("Save failed"),
+        "a later key press clears the failure"
+    );
+    Ok(())
+}
+
+#[test]
 fn failed_relationship_approval_preserves_inspection_and_leaves_destination_pending() -> Result<()>
 {
     let (repo, query) = two_file_dirty_repo("declaration_tui_relationship_append_failure")?;

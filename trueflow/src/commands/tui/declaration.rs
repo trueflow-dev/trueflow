@@ -34,6 +34,8 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use super::single_line_error;
+
 pub use graph::{
     GraphPaneState, GraphSelection, Relationship, RelationshipDestination, RelationshipGroup,
     RelationshipRenderGroup, RelationshipRenderRow, RelationshipState,
@@ -428,6 +430,8 @@ pub struct DeclarationRenderModel {
     pub title: String,
     pub footer: String,
     pub banner: String,
+    /// Why the last review save failed; shown until the next key press.
+    pub save_error: Option<String>,
     pub active_selections: Vec<ActiveSelection>,
     pub visible_text: String,
 }
@@ -447,6 +451,7 @@ pub struct DeclarationController {
     replacement_restore: Option<Box<NavigationSnapshot>>,
     inspected_relationship: Option<String>,
     pending_actions: Vec<DeclarationReviewAction>,
+    save_error: Option<String>,
     inner_width: u16,
     inner_height: u16,
 }
@@ -565,6 +570,7 @@ impl DeclarationController {
             replacement_restore: None,
             inspected_relationship: None,
             pending_actions: Vec::new(),
+            save_error: None,
             inner_width,
             inner_height,
         };
@@ -702,7 +708,22 @@ impl DeclarationController {
         std::mem::take(&mut self.pending_actions)
     }
 
+    /// A failed save must not lose the reviewer's work: a comment or rejection note returns to
+    /// the editor for retry, and the error stays visible until the next key press.
+    pub(crate) fn report_failed_save(
+        &mut self,
+        action: DeclarationReviewAction,
+        error: &anyhow::Error,
+    ) {
+        self.save_error = Some(format!("Save failed: {}", single_line_error(error)));
+        if let Some(note) = action.comment_body {
+            self.rejection_draft = action.kind == DeclarationReviewActionKind::Reject;
+            self.comment_draft = Some(note);
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyCode) -> Result<()> {
+        self.save_error = None;
         if self.comment_draft.is_some() {
             return self.handle_editor_key(key);
         }
@@ -881,11 +902,13 @@ impl DeclarationController {
                     "[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned()
                 }
             },
-            banner: if self.comment_draft.is_some() {
-                "[Enter] submit · [Esc] cancel".to_owned()
-            } else {
-                "Declaration Review".to_owned()
+            banner: match (&self.save_error, self.comment_draft.is_some()) {
+                (Some(error), true) => format!("{error} · [Enter] retry · [Esc] cancel"),
+                (Some(error), false) => error.clone(),
+                (None, true) => "[Enter] submit · [Esc] cancel".to_owned(),
+                (None, false) => "Declaration Review".to_owned(),
             },
+            save_error: self.save_error.clone(),
             active_selections,
             visible_text,
         }
@@ -1363,6 +1386,9 @@ impl DeclarationController {
             };
             lines.push(format!("{label}: {draft}"));
         }
+        if let Some(error) = &self.save_error {
+            lines.push(error.clone());
+        }
         lines
             .push("[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned());
         lines.push("Declaration Review".to_owned());
@@ -1472,7 +1498,11 @@ pub fn render_declaration_review(
     frame.render_widget(
         Paragraph::new(model.banner.as_str())
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(if model.save_error.is_some() {
+                Color::Red
+            } else {
+                Color::Cyan
+            })),
         banner,
     );
 }

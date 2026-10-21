@@ -509,16 +509,45 @@ impl<A> DeclarationAppRuntime<A> {
     where
         F: FnOnce(&Record) -> Result<()>,
     {
+        let (target_index, record) = self.prepare_submission(action)?;
+        // Atomicity boundary: neither status nor cursor changes until persistence succeeds.
+        persist(&record)?;
+        self.finish_submission(target_index, action.kind)
+    }
+
+    /// Persists the controller's queued actions in order. A failed save (signing cancelled,
+    /// unwritable store) must not end the session: the review state stays as it was, a typed
+    /// note returns to the editor, and the error stays visible until the next key press.
+    pub fn submit_actions_with_persistence<F>(
+        &mut self,
+        actions: Vec<DeclarationReviewAction>,
+        mut persist: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Record) -> Result<()>,
+    {
+        for action in actions {
+            let (target_index, record) = self.prepare_submission(&action)?;
+            match persist(&record) {
+                Ok(()) => self.finish_submission(target_index, action.kind)?,
+                Err(error) => {
+                    if let Some(controller) = &mut self.controller {
+                        controller.report_failed_save(action, &error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_submission(&self, action: &DeclarationReviewAction) -> Result<(usize, Record)> {
         let target_index = self
             .selected_target_index()
             .context("declaration review has no selected target")?;
         let target = &self.prepared.targets[target_index];
         validate_action_for_target(action, target)?;
         let record = build_record(target, self.identity.clone(), action)?;
-
-        // Atomicity boundary: neither status nor cursor changes until persistence succeeds.
-        persist(&record)?;
-        self.finish_submission(target_index, action.kind)
+        Ok((target_index, record))
     }
 
     fn finish_submission(
