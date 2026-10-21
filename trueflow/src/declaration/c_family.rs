@@ -748,14 +748,15 @@ impl Projector<'_> {
             pending.clear();
             return;
         };
-        if !is_doxygen(text)
+        let leading = doc_comment(text) == Some(DocComment::Leading);
+        if !leading
             || pending.last().is_some_and(|previous| {
                 !immediately_precedes(self.source, previous.range.end, comment.start_byte())
             })
         {
             pending.clear();
         }
-        if is_doxygen(text) {
+        if leading {
             pending.push(Part {
                 range: whole_comment_line(self.source, comment.byte_range()),
                 role: SourceComponentRole::Documentation,
@@ -788,22 +789,30 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
         }];
     };
     if specifier.kind() == "enum_specifier" {
-        return vec![Part {
-            range: item.start_byte()..item_end,
-            role: SourceComponentRole::AggregateShape,
-        }];
+        return enum_parts(item.start_byte()..item_end, body, source);
     }
 
     let open_end = body.start_byte().saturating_add(1).min(body.end_byte());
-    let mut parts = vec![Part {
-        range: item.start_byte()..open_end,
-        role: SourceComponentRole::AggregateShape,
-    }];
-    let mut previous_end = open_end;
+    let mut shape = ShapeBuilder {
+        source,
+        parts: vec![Part {
+            range: item.start_byte()..open_end,
+            role: SourceComponentRole::AggregateShape,
+        }],
+        previous_end: open_end,
+        pending_docs: Vec::new(),
+        last_shape_member_end: None,
+    };
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
-        push_member_parts(member, source, &mut parts, &mut previous_end);
+        shape.push_member(member);
     }
+    shape.flush_docs();
+    let ShapeBuilder {
+        mut parts,
+        previous_end,
+        ..
+    } = shape;
     let close_start =
         whitespace_suffix_start(source, previous_end, body.end_byte().saturating_sub(1));
     if close_start < body.end_byte() {
@@ -821,77 +830,194 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
     parts
 }
 
-fn push_member_parts(
-    member: Node<'_>,
-    source: &str,
-    parts: &mut Vec<Part>,
-    previous_end: &mut usize,
-) {
-    let prefix_start = whitespace_suffix_start(source, *previous_end, member.start_byte());
-    let member_end = if member.kind() == "access_specifier" {
-        access_specifier_end(member, source)
-    } else {
-        member.end_byte()
-    };
-    match member.kind() {
-        "access_specifier" => parts.push(Part {
-            range: prefix_start..member_end,
-            role: SourceComponentRole::AggregateShape,
-        }),
-        "field_declaration" | "declaration" => {
-            // Callable and nested aggregate children exclusively own their surfaces.
-            let owned_by_child = contains_callable_declarator(member)
-                || aggregate_specifier(member)
-                    .is_some_and(|specifier| is_aggregate_declaration(member, specifier));
-            if !owned_by_child {
-                if prefix_start < member.start_byte() {
-                    parts.push(Part {
-                        range: prefix_start..member.start_byte(),
-                        role: SourceComponentRole::AggregateShape,
-                    });
-                }
-                parts.extend(field_shape_parts(member));
-            }
-        }
-        "function_definition" | "template_declaration" => {
-            // Callable children exclusively own their signatures; bodies never enter
-            // aggregate shape projections.
-        }
-        kind if is_preprocessor_container(kind) => {
-            push_preprocessor_parts(member, source, parts, previous_end);
-            return;
-        }
-        _ => {}
-    }
-    *previous_end = member_end;
-}
-
-/// Conditional directives inside an aggregate body are part of its shape; the members they
-/// guard are projected exactly as unguarded members.
-fn push_preprocessor_parts(
-    directive: Node<'_>,
-    source: &str,
-    parts: &mut Vec<Part>,
-    previous_end: &mut usize,
-) {
-    let mut cursor = directive.walk();
-    for (index, child) in directive.children(&mut cursor).enumerate() {
-        let field = u32::try_from(index)
-            .ok()
-            .and_then(|index| directive.field_name_for_child(index));
-        if child.is_named() && !matches!(field, Some("condition" | "name")) {
-            push_member_parts(child, source, parts, previous_end);
+/// An enum is one shape whose enumerator documentation comments are Documentation parts.
+fn enum_parts(range: Range<usize>, body: Node<'_>, source: &str) -> Vec<Part> {
+    let mut parts = Vec::new();
+    let mut start = range.start;
+    let mut cursor = body.walk();
+    for comment in body
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "comment")
+    {
+        if node_text(comment, source).and_then(doc_comment).is_none() {
             continue;
         }
-        if node_text(child, source).is_none_or(|text| text.trim().is_empty()) {
-            continue;
-        }
+        let line = whole_comment_line(source, comment.byte_range());
         parts.push(Part {
-            range: whitespace_suffix_start(source, *previous_end, child.start_byte())
-                ..child.end_byte(),
+            range: start..line.start,
             role: SourceComponentRole::AggregateShape,
         });
-        *previous_end = child.end_byte();
+        start = line.end;
+        parts.push(Part {
+            range: line,
+            role: SourceComponentRole::Documentation,
+        });
+    }
+    parts.push(Part {
+        range: start..range.end,
+        role: SourceComponentRole::AggregateShape,
+    });
+    parts.retain(|part| !part.range.is_empty());
+    parts
+}
+
+/// How an aggregate body member relates to the aggregate's shape projection.
+enum MemberShape {
+    /// Field-like syntax projected into the aggregate shape.
+    Shape,
+    /// A callable or nested aggregate child that exclusively owns its surface and docs.
+    Child,
+    /// Syntax that neither the shape nor a child projects.
+    Ignored,
+}
+
+fn member_shape(member: Node<'_>) -> MemberShape {
+    let owned_by_child = contains_callable_declarator(member)
+        || aggregate_specifier(member)
+            .is_some_and(|specifier| is_aggregate_declaration(member, specifier));
+    match (member.kind(), owned_by_child) {
+        (_, true) => MemberShape::Child,
+        ("access_specifier" | "field_declaration" | "declaration", false) => MemberShape::Shape,
+        (_, false) => MemberShape::Ignored,
+    }
+}
+
+/// Builds an aggregate body's shape parts. Leading documentation follows the member collector's
+/// attachment rules: docs immediately preceding a child belong to that child, every other
+/// documentation comment belongs to the shape.
+struct ShapeBuilder<'a> {
+    source: &'a str,
+    parts: Vec<Part>,
+    previous_end: usize,
+    /// Contiguous leading documentation awaiting its owner, as (whitespace prefix start, line).
+    pending_docs: Vec<(usize, Range<usize>)>,
+    /// End of the last member projected into the shape, which may carry trailing `///<` docs.
+    last_shape_member_end: Option<usize>,
+}
+
+impl ShapeBuilder<'_> {
+    fn push_part(&mut self, range: Range<usize>, role: SourceComponentRole) {
+        if !range.is_empty() {
+            self.parts.push(Part { range, role });
+        }
+    }
+
+    fn flush_docs(&mut self) {
+        for (prefix_start, line) in std::mem::take(&mut self.pending_docs) {
+            self.push_part(prefix_start..line.start, SourceComponentRole::AggregateShape);
+            self.previous_end = line.end;
+            self.push_part(line, SourceComponentRole::Documentation);
+        }
+    }
+
+    fn push_member(&mut self, member: Node<'_>) {
+        if member.kind() == "comment" {
+            self.push_comment(member);
+            return;
+        }
+        self.last_shape_member_end = None;
+        if is_preprocessor_container(member.kind()) {
+            self.flush_docs();
+            self.push_preprocessor(member);
+            return;
+        }
+        let shape = member_shape(member);
+        let docs_owned_by_child = matches!(shape, MemberShape::Child)
+            && self.pending_docs.last().is_some_and(|(_, line)| {
+                immediately_precedes(self.source, line.end, member.start_byte())
+            });
+        if docs_owned_by_child {
+            self.pending_docs.clear();
+        } else {
+            self.flush_docs();
+        }
+        let prefix_start =
+            whitespace_suffix_start(self.source, self.previous_end, member.start_byte());
+        let member_end = if member.kind() == "access_specifier" {
+            access_specifier_end(member, self.source)
+        } else {
+            member.end_byte()
+        };
+        match shape {
+            MemberShape::Shape if member.kind() == "access_specifier" => {
+                self.push_part(prefix_start..member_end, SourceComponentRole::AggregateShape);
+                self.last_shape_member_end = Some(member_end);
+            }
+            MemberShape::Shape => {
+                self.push_part(
+                    prefix_start..member.start_byte(),
+                    SourceComponentRole::AggregateShape,
+                );
+                self.parts.extend(field_shape_parts(member));
+                self.last_shape_member_end = Some(member_end);
+            }
+            MemberShape::Child | MemberShape::Ignored => {}
+        }
+        self.previous_end = member_end;
+    }
+
+    fn push_comment(&mut self, comment: Node<'_>) {
+        let kind = node_text(comment, self.source).and_then(doc_comment);
+        let line = whole_comment_line(self.source, comment.byte_range());
+        let trails_shape_member = self
+            .last_shape_member_end
+            .is_some_and(|end| immediately_precedes(self.source, end, comment.start_byte()));
+        self.last_shape_member_end = None;
+        match kind {
+            Some(DocComment::Trailing) if trails_shape_member => {
+                self.push_part(
+                    self.previous_end..comment.start_byte(),
+                    SourceComponentRole::AggregateShape,
+                );
+                self.previous_end = line.end;
+                self.push_part(line, SourceComponentRole::Documentation);
+            }
+            Some(DocComment::Leading) => {
+                if self.pending_docs.last().is_some_and(|(_, previous)| {
+                    !immediately_precedes(self.source, previous.end, comment.start_byte())
+                }) {
+                    self.flush_docs();
+                }
+                let prefix_lower = self
+                    .pending_docs
+                    .last()
+                    .map_or(self.previous_end, |(_, previous)| previous.end);
+                let prefix_start =
+                    whitespace_suffix_start(self.source, prefix_lower, comment.start_byte());
+                self.pending_docs.push((prefix_start, line));
+            }
+            Some(DocComment::Trailing) | None => {
+                self.flush_docs();
+                self.previous_end = comment.end_byte();
+            }
+        }
+    }
+
+    /// Conditional directives inside an aggregate body are part of its shape; the members they
+    /// guard are projected exactly as unguarded members.
+    fn push_preprocessor(&mut self, directive: Node<'_>) {
+        let mut cursor = directive.walk();
+        for (index, child) in directive.children(&mut cursor).enumerate() {
+            let field = u32::try_from(index)
+                .ok()
+                .and_then(|index| directive.field_name_for_child(index));
+            if child.is_named() && !matches!(field, Some("condition" | "name")) {
+                self.push_member(child);
+                continue;
+            }
+            if node_text(child, self.source).is_none_or(|text| text.trim().is_empty()) {
+                continue;
+            }
+            self.flush_docs();
+            self.last_shape_member_end = None;
+            self.push_part(
+                whitespace_suffix_start(self.source, self.previous_end, child.start_byte())
+                    ..child.end_byte(),
+                SourceComponentRole::AggregateShape,
+            );
+            self.previous_end = child.end_byte();
+        }
+        self.flush_docs();
     }
 }
 
@@ -1445,19 +1571,29 @@ fn whole_comment_line(source: &str, range: Range<usize>) -> Range<usize> {
     range.start..end
 }
 
-fn is_doxygen(text: &str) -> bool {
+/// A Doxygen comment, which documents the declaration that follows it (`///`, `/** */`) or the
+/// member it trails on the same line (`///<`, `/**< */`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocComment {
+    Leading,
+    Trailing,
+}
+
+fn doc_comment(text: &str) -> Option<DocComment> {
     let trimmed = text.trim_start();
-    if trimmed.starts_with("///<")
-        || trimmed.starts_with("//!<")
-        || trimmed.starts_with("/**<")
-        || trimmed.starts_with("/*!<")
+    if ["///<", "//!<", "/**<", "/*!<"]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
     {
-        return false;
+        Some(DocComment::Trailing)
+    } else if ["///", "//!", "/**", "/*!"]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+    {
+        Some(DocComment::Leading)
+    } else {
+        None
     }
-    trimmed.starts_with("///")
-        || trimmed.starts_with("//!")
-        || trimmed.starts_with("/**")
-        || trimmed.starts_with("/*!")
 }
 
 fn immediately_precedes(source: &str, previous_end: usize, next_start: usize) -> bool {

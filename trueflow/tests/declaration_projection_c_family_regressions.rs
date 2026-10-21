@@ -706,3 +706,107 @@ fn cpp_extern_c_linkage_declarations_are_inventoried() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn c_field_and_enumerator_documentation_is_part_of_the_aggregate_shape() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "struct Config {\n",
+        "    /** Port to bind. */\n",
+        "    int port;\n",
+        "    int backlog; ///< Pending connection limit.\n",
+        "    // plain note\n",
+        "    int flags;\n",
+        "};\n",
+        "enum Mode {\n",
+        "    /** Serve requests. */\n",
+        "    Serve,\n",
+        "    Drain, ///< Finish in-flight work.\n",
+        "};\n",
+    );
+
+    let facts = project("src/config.c", Language::C, SOURCE)?;
+    let config = declaration_named(&facts, "Config", DeclarationKind::Struct)?;
+    let mode = declaration_named(&facts, "Mode", DeclarationKind::Enum)?;
+    assert_eq!(
+        config.projection_text,
+        concat!(
+            "struct Config {\n",
+            "    /** Port to bind. */\n",
+            "    int port;\n",
+            "    int backlog; ///< Pending connection limit.\n",
+            "    int flags;\n",
+            "};",
+        )
+    );
+    assert_eq!(
+        mode.projection_text,
+        concat!(
+            "enum Mode {\n",
+            "    /** Serve requests. */\n",
+            "    Serve,\n",
+            "    Drain, ///< Finish in-flight work.\n",
+            "};",
+        )
+    );
+    for (declaration, documentation) in [
+        (config, "/** Port to bind. */\n"),
+        (config, "///< Pending connection limit.\n"),
+        (mode, "/** Serve requests. */\n"),
+        (mode, "///< Finish in-flight work.\n"),
+    ] {
+        assert!(
+            declaration.components.iter().any(|component| {
+                component.role == SourceComponentRole::Documentation
+                    && component.text == documentation
+            }),
+            "{} must expose {documentation:?} as documentation: {:?}",
+            declaration.name,
+            declaration.components
+        );
+    }
+
+    let edited = project(
+        "src/config.c",
+        Language::C,
+        &SOURCE
+            .replace("Port to bind.", "TCP port to bind.")
+            .replace("Finish in-flight", "Complete in-flight"),
+    )?;
+    assert_ne!(
+        config.projection_hash,
+        declaration_named(&edited, "Config", DeclarationKind::Struct)?.projection_hash
+    );
+    assert_ne!(
+        mode.projection_hash,
+        declaration_named(&edited, "Mode", DeclarationKind::Enum)?.projection_hash
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cpp_method_documentation_stays_with_the_method_not_the_class_shape() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "class Codec {\n",
+        "public:\n",
+        "    /// Format version.\n",
+        "    int version;\n",
+        "    /// Decodes input.\n",
+        "    int decode(int input);\n",
+        "};\n",
+    );
+
+    let facts = project("src/codec.cpp", Language::Cpp, SOURCE)?;
+    let codec = declaration_named(&facts, "Codec", DeclarationKind::Class)?;
+    let decode = declaration_named(&facts, "decode", DeclarationKind::Method)?;
+    assert_eq!(
+        codec.projection_text,
+        "class Codec {\npublic:\n    /// Format version.\n    int version;\n};"
+    );
+    assert_eq!(
+        decode.projection_text,
+        "/// Decodes input.\nint decode(int input);"
+    );
+
+    Ok(())
+}
