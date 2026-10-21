@@ -49,31 +49,7 @@ impl ReviewOrder {
     ) -> Self {
         let mut items: Vec<_> = unreviewed_block_nodes
             .iter()
-            .copied()
-            .filter_map(|node_id| {
-                let node = tree.node(node_id);
-                let block = node.block.as_ref()?;
-                let file_path = if node.path.is_root() {
-                    match RepoPath::new(&node.name) {
-                        Ok(path) => path,
-                        Err(error) => {
-                            panic!("tree node name should form a valid repo path: {error}")
-                        }
-                    }
-                } else {
-                    node.path.clone()
-                };
-                let group_rank = review_group_rank(review_group(&file_path, node));
-                let kind_rank = block.kind.default_review_priority();
-                let band_rank = review_band_rank(review_band_from_kind_rank(kind_rank));
-                let cursor = ReviewCursor {
-                    file_path,
-                    kind_rank,
-                    start_line: block.start_line,
-                    node_id,
-                };
-                Some((group_rank, band_rank, cursor))
-            })
+            .filter_map(|node_id| review_item(tree, *node_id))
             .collect();
 
         // Group classification inspects path components and allocates, so it is
@@ -122,6 +98,10 @@ impl ReviewOrder {
             }
         }
 
+        Self::from_ordered(ordered)
+    }
+
+    fn from_ordered(ordered: Vec<ReviewCursor>) -> Self {
         let index_by_node = ordered
             .iter()
             .enumerate()
@@ -131,6 +111,29 @@ impl ReviewOrder {
             ordered,
             index_by_node,
         }
+    }
+
+    /// Replaces `parent` with its refined `children`, in the given order, at
+    /// the parent's position so the sub-blocks are reviewed together. Returns
+    /// false (leaving the order unchanged) when `parent` is not in the order.
+    pub fn replace_with_children(
+        &mut self,
+        tree: &Tree,
+        parent: TreeNodeId,
+        children: &[TreeNodeId],
+    ) -> bool {
+        let Some(index) = self.index_by_node.get(&parent).copied() else {
+            return false;
+        };
+        let mut ordered = std::mem::take(&mut self.ordered);
+        ordered.splice(
+            index..=index,
+            children
+                .iter()
+                .filter_map(|child| review_item(tree, *child).map(|(_, _, cursor)| cursor)),
+        );
+        *self = Self::from_ordered(ordered);
+        true
     }
 
     pub fn iter_node_ids(&self) -> impl Iterator<Item = TreeNodeId> + '_ {
@@ -176,6 +179,29 @@ impl ReviewOrder {
     fn ordered_ids(&self) -> Vec<TreeNodeId> {
         self.ordered.iter().map(|cursor| cursor.node_id).collect()
     }
+}
+
+fn review_item(tree: &Tree, node_id: TreeNodeId) -> Option<(u8, u8, ReviewCursor)> {
+    let node = tree.node(node_id);
+    let block = node.block.as_ref()?;
+    let file_path = if node.path.is_root() {
+        match RepoPath::new(&node.name) {
+            Ok(path) => path,
+            Err(error) => panic!("tree node name should form a valid repo path: {error}"),
+        }
+    } else {
+        node.path.clone()
+    };
+    let group_rank = review_group_rank(review_group(&file_path, node));
+    let kind_rank = block.kind.default_review_priority();
+    let band_rank = review_band_rank(review_band_from_kind_rank(kind_rank));
+    let cursor = ReviewCursor {
+        file_path,
+        kind_rank,
+        start_line: block.start_line,
+        node_id,
+    };
+    Some((group_rank, band_rank, cursor))
 }
 
 fn review_band_from_kind_rank(kind_rank: u8) -> ReviewBand {
@@ -598,5 +624,57 @@ mod tests {
             prioritized.iter_node_ids().collect::<Vec<_>>(),
             vec![main_id, test_id, lib_id]
         );
+    }
+
+    #[test]
+    fn replace_with_children_keeps_refined_children_at_parent_position() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-lib".to_string(),
+            Language::Rust,
+        );
+        let parent = builder.add_block(
+            file,
+            "parent".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 0, &[]),
+            Language::Rust,
+        );
+        let sibling = builder.add_block(
+            file,
+            "sibling".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 10, &[]),
+            Language::Rust,
+        );
+        let mut tree = builder.finalize();
+        let children = tree.insert_block_children(
+            parent,
+            vec![
+                test_block(BlockKind::FunctionSignature, 1, &[]),
+                test_block(BlockKind::CodeParagraph, 2, &[]),
+                test_block(BlockKind::Comment, 3, &[]),
+            ],
+        );
+        let mut order = ReviewOrder::from_tree(&tree, &HashSet::from([parent, sibling]));
+
+        assert!(order.replace_with_children(&tree, parent, &children));
+
+        let expected = children
+            .iter()
+            .copied()
+            .chain([sibling])
+            .collect::<Vec<_>>();
+        assert_eq!(order.ordered_ids(), expected);
+        let remaining = expected.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            order.next_remaining_after(ReviewAnchor::Block(children[0]), &remaining),
+            Some(children[1])
+        );
+        assert!(!order.replace_with_children(&tree, parent, &children));
     }
 }

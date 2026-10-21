@@ -4793,13 +4793,18 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
     state
         .navigator
         .replace_visible_block_with_blocks(node_id, inserted_ids.iter().copied());
-    refresh_review_state_after_refinement(state, previous_remaining);
+    refresh_review_state_after_refinement(state, previous_remaining, node_id, &inserted_ids);
     state.content_frame_cache.clear();
 
     true
 }
 
-fn refresh_review_state_after_refinement(state: &mut AppState, previous_remaining: usize) {
+fn refresh_review_state_after_refinement(
+    state: &mut AppState,
+    previous_remaining: usize,
+    parent: TreeNodeId,
+    children: &[TreeNodeId],
+) {
     let next_remaining = state.reviewable_nodes.len();
     if next_remaining >= previous_remaining {
         let delta = next_remaining - previous_remaining;
@@ -4811,11 +4816,22 @@ fn refresh_review_state_after_refinement(state: &mut AppState, previous_remainin
         state.initial_remaining_blocks = state.initial_remaining_blocks.saturating_sub(delta);
     }
     state.remaining_blocks = next_remaining;
-    state.review_order = ReviewOrder::from_tree_with_priority_prefix(
-        &state.navigator.tree,
-        &state.reviewable_nodes,
-        &state.ai.priority_prefix,
-    );
+    if let Some(index) = state.ai.priority_prefix.iter().position(|id| *id == parent) {
+        state
+            .ai
+            .priority_prefix
+            .splice(index..=index, children.iter().copied());
+    }
+    if !state
+        .review_order
+        .replace_with_children(&state.navigator.tree, parent, children)
+    {
+        state.review_order = ReviewOrder::from_tree_with_priority_prefix(
+            &state.navigator.tree,
+            &state.reviewable_nodes,
+            &state.ai.priority_prefix,
+        );
+    }
 }
 
 fn handle_scroll_line_up(state: &mut AppState) {
@@ -9499,25 +9515,6 @@ mod diff_scope_tests {
         assert!(!refresh_ai_suggestion_state(&mut state));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert!(state.ai.pending.is_none());
-    }
-
-    #[test]
-    fn refinement_rebuild_keeps_surviving_priority_prefix_ids() {
-        let (mut state, _file, block_ids) = build_state_with_file_block_count(3);
-        state.ai.priority_prefix = vec![block_ids[2], block_ids[0]];
-        state.review_order = ReviewOrder::from_tree_with_priority_prefix(
-            &state.navigator.tree,
-            &state.reviewable_nodes,
-            &state.ai.priority_prefix,
-        );
-        state.reviewable_nodes.remove(&block_ids[2]);
-
-        refresh_review_state_after_refinement(&mut state, 3);
-
-        assert_eq!(
-            state.review_order.iter_node_ids().collect::<Vec<_>>(),
-            vec![block_ids[0], block_ids[1]]
-        );
     }
 
     #[test]
@@ -16398,6 +16395,110 @@ mod diff_scope_tests {
         assert_eq!(state.navigator.current_id(), paragraph_id);
         assert_eq!(state.reviewable_nodes, reviewable_before);
         assert!(state.navigator.tree.node(paragraph_id).children.is_empty());
+    }
+
+    fn build_state_with_rust_functions(sources: &[&str]) -> (AppState, Vec<TreeNodeId>) {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let mut start_line = 0;
+        let mut start_byte = 0;
+        let block_ids = sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let end_line = start_line + source.lines().count();
+                let end_byte = start_byte + source.len();
+                let block = Block::new(
+                    source.to_string(),
+                    BlockKind::Function,
+                    crate::block::LineSpan::new(start_line, end_line),
+                    crate::block::ByteSpan::new(start_byte, end_byte),
+                );
+                start_line = end_line;
+                start_byte = end_byte;
+                builder.add_block(
+                    file,
+                    format!("function-{index}"),
+                    "src/lib.rs".to_string(),
+                    block,
+                    Language::Rust,
+                )
+            })
+            .collect::<Vec<_>>();
+        let tree = builder.finalize();
+        let visible = block_ids.iter().copied().collect::<HashSet<_>>();
+        let mut state = build_test_state(ScopePreset::All, HashMap::new());
+        state.review_order = ReviewOrder::from_tree(&tree, &visible);
+        state.navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        state.navigator.set_current(block_ids[0]);
+        state.total_blocks = visible.len();
+        state.initial_remaining_blocks = visible.len();
+        state.remaining_blocks = visible.len();
+        state.reviewable_nodes = visible;
+        (state, block_ids)
+    }
+
+    const MULTI_STATEMENT_FUNCTION: &str = "fn a() {\n    one();\n\n    two();\n}\n";
+
+    #[test]
+    fn child_refinement_keeps_children_contiguous_in_review_order() {
+        let (mut state, block_ids) =
+            build_state_with_rust_functions(&[MULTI_STATEMENT_FUNCTION, "fn b() {}\n"]);
+        let (parent, sibling) = (block_ids[0], block_ids[1]);
+
+        handle_child(&mut state);
+
+        let children = state.navigator.tree.node(parent).children.clone();
+        assert!(children.len() > 1, "expected sub-blocks, got {children:?}");
+        assert_eq!(state.navigator.current_id(), children[0]);
+        assert_eq!(
+            compute_next_review_target(&state, children[0]),
+            Some(children[1])
+        );
+        let expected_order = children
+            .iter()
+            .copied()
+            .chain([sibling])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state.review_order.iter_node_ids().collect::<Vec<_>>(),
+            expected_order
+        );
+    }
+
+    #[test]
+    fn child_refinement_replaces_prioritized_parent_with_children() {
+        let (mut state, block_ids) =
+            build_state_with_rust_functions(&[MULTI_STATEMENT_FUNCTION, "fn b() {}\n"]);
+        let (parent, sibling) = (block_ids[0], block_ids[1]);
+        state.ai.priority_prefix = vec![parent, sibling];
+        state.review_order = ReviewOrder::from_tree_with_priority_prefix(
+            &state.navigator.tree,
+            &state.reviewable_nodes,
+            &state.ai.priority_prefix,
+        );
+
+        handle_child(&mut state);
+
+        let children = state.navigator.tree.node(parent).children.clone();
+        let expected_order = children
+            .iter()
+            .copied()
+            .chain([sibling])
+            .collect::<Vec<_>>();
+        assert_eq!(state.ai.priority_prefix, expected_order);
+        assert_eq!(
+            state.review_order.iter_node_ids().collect::<Vec<_>>(),
+            expected_order
+        );
     }
 
     #[test]
