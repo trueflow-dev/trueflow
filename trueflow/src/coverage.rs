@@ -1,3 +1,4 @@
+use crate::analysis::Language;
 use crate::block::{Block, ByteSpan};
 use crate::repo_path::RepoPath;
 use crate::store::{Identity, Record, ReviewCheck, ReviewDatabase, ReviewTargetRef, Verdict};
@@ -127,6 +128,7 @@ pub struct CoverageIndex<'a> {
     block_units: HashMap<CoverageBlockLocator, CoverageUnitId>,
     block_nodes_by_path: HashMap<&'a RepoPath, Vec<&'a TreeNode>>,
     record_bindings: HashMap<String, RecordBinding>,
+    review_units: HashMap<TreeNodeId, Vec<Block>>,
 }
 
 impl<'a> CoverageIndex<'a> {
@@ -140,6 +142,7 @@ impl<'a> CoverageIndex<'a> {
             block_units: std::mem::take(&mut lookups.block_units),
             block_nodes_by_path: HashMap::new(),
             record_bindings: HashMap::new(),
+            review_units: std::mem::take(&mut lookups.review_units),
         };
 
         for (record_index, record) in database.records().iter().enumerate() {
@@ -245,6 +248,48 @@ impl<'a> CoverageIndex<'a> {
                 .map(|facts| facts.linked_record_indices.clone())
                 .unwrap_or_default(),
         }
+    }
+
+    /// The latest direct verdict for `check` on the block at exactly this
+    /// path and location. Unlike [`Self::block`], it resolves no tree or
+    /// container nodes and copies no record lists.
+    pub fn direct_block_verdict_for(
+        &self,
+        path: &RepoPath,
+        block: &Block,
+        check: &ReviewCheck,
+    ) -> Option<&'a Verdict> {
+        let facts = self
+            .block_units
+            .get(&CoverageBlockLocator::new(path, block))
+            .and_then(|unit_id| self.unit_facts.get(unit_id))?;
+        let record_index = preferred_record_index_for_check(
+            self.database.records(),
+            &facts.direct_record_indices,
+            check,
+            |record_index| self.binding_relation_for_record_index(record_index),
+        )?;
+        Some(&self.database.records()[record_index].verdict)
+    }
+
+    /// The review units that indexing cut from tree block `node_id`, if that
+    /// node holds exactly `block` in `language` and split into review units.
+    pub fn review_units_for(
+        &self,
+        node_id: TreeNodeId,
+        block: &Block,
+        language: Language,
+    ) -> Option<&[Block]> {
+        let node = self.tree.node(node_id);
+        let indexed = node.block.as_ref()?;
+        let same_block = node.language == Some(language)
+            && indexed.kind == block.kind
+            && indexed.byte_span() == block.byte_span()
+            && indexed.hash == block.hash;
+        if !same_block {
+            return None;
+        }
+        self.review_units.get(&node_id).map(Vec::as_slice)
     }
 
     pub fn subtree(&'a self, node_id: TreeNodeId) -> SubtreeCoverage<'a> {
@@ -662,6 +707,8 @@ struct CoverageLookups<'a> {
     tree_by_path_hash: HashMap<(RepoPath, crate::store::TreeHash), Vec<CoverageUnitId>>,
     tree_by_hash: HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
     candidate_descriptions: HashMap<CoverageUnitId, CoverageCandidate>,
+    /// Review units cut from each tree block, kept for review to reuse.
+    review_units: HashMap<TreeNodeId, Vec<Block>>,
 }
 
 impl<'a> CoverageLookups<'a> {
@@ -717,9 +764,10 @@ impl<'a> CoverageLookups<'a> {
             if split.semantics != SubSplitSemantics::ReviewUnits {
                 continue;
             }
-            for generated_block in split.blocks {
-                lookups.register_generated_block(node.path.clone(), &generated_block);
+            for generated_block in &split.blocks {
+                lookups.register_generated_block(node.path.clone(), generated_block);
             }
+            lookups.review_units.insert(node.id, split.blocks);
         }
 
         lookups

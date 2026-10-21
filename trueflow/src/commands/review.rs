@@ -395,6 +395,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                 .is_none()
                 && is_subblock_covered(
                     &block,
+                    node_id,
                     language,
                     query,
                     &coverage,
@@ -548,6 +549,7 @@ fn collect_diff_review_presentation(
                 .is_none()
                 && is_subblock_covered(
                     &display_block,
+                    Some(node_id),
                     file.language,
                     query,
                     coverage,
@@ -1125,6 +1127,7 @@ fn kind_rank(block: &Block) -> u8 {
 
 fn is_subblock_covered(
     block: &Block,
+    node_id: Option<tree::TreeNodeId>,
     language: Language,
     query: &ResolvedReviewQuery,
     coverage: &CoverageIndex<'_>,
@@ -1136,10 +1139,7 @@ fn is_subblock_covered(
     {
         return true;
     }
-    if coverage
-        .block(file_path, block)
-        .direct_latest_verdict_for(review_check)
-        == Some(&Verdict::Approved)
+    if coverage.direct_block_verdict_for(file_path, block, review_check) == Some(&Verdict::Approved)
     {
         return true;
     }
@@ -1149,24 +1149,31 @@ fn is_subblock_covered(
     if !sub_splitter::may_split_into_review_units(block, language) {
         return false;
     }
-    let Ok(sub_split) = sub_splitter::split_result(block, language) else {
-        return false;
-    };
-    if sub_split.blocks.is_empty() {
-        return false;
-    }
+    // Coverage indexing already split tree blocks; split again only blocks
+    // it did not index.
+    let split_now;
+    let units =
+        match node_id.and_then(|node_id| coverage.review_units_for(node_id, block, language)) {
+            Some(units) => units,
+            None => {
+                let Ok(sub_split) = sub_splitter::split_result(block, language) else {
+                    return false;
+                };
+                if sub_split.semantics != sub_splitter::SubSplitSemantics::ReviewUnits {
+                    return false;
+                }
+                split_now = sub_split.blocks;
+                split_now.as_slice()
+            }
+        };
 
-    match sub_split.semantics {
-        sub_splitter::SubSplitSemantics::ReviewUnits => !sub_split.blocks.iter().any(|sub_block| {
+    !units.is_empty()
+        && !units.iter().any(|sub_block| {
             query.filters.allows_subblock(sub_block.kind)
                 && !should_skip_whitespace_only_by_default(sub_block, &query.filters)
-                && coverage
-                    .block(file_path, sub_block)
-                    .direct_latest_verdict_for(review_check)
+                && coverage.direct_block_verdict_for(file_path, sub_block, review_check)
                     != Some(&Verdict::Approved)
-        }),
-        sub_splitter::SubSplitSemantics::StructuralChildren => false,
-    }
+        })
 }
 
 fn collect_diff_review_blocks_for_target_inputs(
@@ -1794,6 +1801,83 @@ mod tests {
         .unwrap()
     }
 
+    /// A long block is covered exactly when every review unit is approved,
+    /// and the units indexed during coverage build must give the same answer
+    /// as splitting the block again.
+    #[test]
+    fn approved_review_units_cover_long_block_through_indexed_split() {
+        let body = (0..20)
+            .map(|index| format!("    let value_{index} = {index};\n\n"))
+            .collect::<String>();
+        let source = format!("fn long() {{\n{body}}}\n");
+        let function =
+            Block::from_file_range(&source, BlockKind::Function, ByteSpan::new(0, source.len()))
+                .unwrap_or_else(|error| panic!("function source range should be valid: {error}"));
+        let units = sub_splitter::split_result(&function, Language::Rust)
+            .unwrap_or_else(|error| panic!("long function should split: {error:#}"));
+        assert_eq!(
+            units.semantics,
+            sub_splitter::SubSplitSemantics::ReviewUnits
+        );
+        assert!(units.blocks.len() > 2, "{:#?}", units.blocks);
+
+        let mut builder = crate::tree::TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        builder.add_block(
+            file,
+            "long".to_string(),
+            "src/lib.rs".to_string(),
+            function.clone(),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        let file_path = RepoPath::new("src/lib.rs").unwrap();
+        let node_id = tree.find_block_node(file_path.as_str(), &function);
+        assert!(node_id.is_some());
+        let query = ResolvedReviewQuery {
+            filters: BlockFilters::default(),
+            scan_options: ScanOptions::default(),
+            content_source: ReviewContentSource::Workdir,
+            path_selection: ReviewPathSelection::All,
+            diff_selection: ReviewDiffSelection::None,
+        };
+        let review_check = ReviewCheck::review();
+        let approvals = units
+            .blocks
+            .iter()
+            .filter(|unit| !unit.content.trim().is_empty())
+            .map(|unit| approved_record_for_block(unit, "src/lib.rs"))
+            .collect::<Vec<_>>();
+
+        for (approved, expected) in [(approvals.len(), true), (approvals.len() - 1, false)] {
+            let database = ReviewDatabase::from_records(approvals[..approved].to_vec());
+            let coverage = CoverageIndex::build(&tree, &database).unwrap();
+            for node in [node_id, None] {
+                assert_eq!(
+                    is_subblock_covered(
+                        &function,
+                        node,
+                        Language::Rust,
+                        &query,
+                        &coverage,
+                        &review_check,
+                        &file_path,
+                    ),
+                    expected,
+                    "{approved} of {} units approved, node {node:?}",
+                    approvals.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn structural_child_coverage_does_not_cover_container_header() {
         let source = "type User struct {\n\tName string\n\tAge int\n}\n";
@@ -1847,6 +1931,7 @@ mod tests {
         assert!(
             !is_subblock_covered(
                 &container,
+                tree.find_block_node(file_path.as_str(), &container),
                 Language::Go,
                 &query,
                 &coverage,
@@ -1990,6 +2075,7 @@ mod tests {
             assert!(
                 !is_subblock_covered(
                     &visible_parent,
+                    tree.find_block_node(file_path.as_str(), &visible_parent),
                     Language::Text,
                     &query,
                     &coverage,
