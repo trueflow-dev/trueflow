@@ -1400,42 +1400,28 @@ fn resolve_feedback_context(
         .iter()
         .flatten()
     {
-        if let Some(path_hint) = record.path_hint.as_ref() {
-            let resolved = {
-                let cache = snapshot_file_cache_for_path(
-                    snapshot_files,
-                    snapshot,
-                    path_hint,
-                    scan_options,
-                    workdir_prefix,
-                    repo_root,
-                    snapshot == default_snapshot,
-                )?;
-                resolve_record_in_files(record, &cache.files)
-            };
-            if let Some((file_path, block)) = resolved {
-                return Ok(ResolvedFeedbackContext {
-                    file_path: Some(file_path),
-                    block: Some(resolved_feedback_block_for_record(record, block)),
-                });
-            }
-
-            if snapshot_files
-                .get(snapshot)
-                .is_some_and(|cache| cache.complete)
-            {
-                continue;
-            }
-        }
-
-        let cache = complete_snapshot_file_cache(
-            snapshot_files,
-            snapshot,
-            scan_options,
-            workdir_prefix,
-            repo_root,
-            snapshot == default_snapshot,
-        )?;
+        let strict = snapshot == default_snapshot;
+        let cache = match record.path_hint.as_ref() {
+            // A path-hinted record binds only to that path, so loading it is
+            // enough; other snapshots are tried before giving up.
+            Some(path_hint) => snapshot_file_cache_for_path(
+                snapshot_files,
+                snapshot,
+                path_hint,
+                scan_options,
+                workdir_prefix,
+                repo_root,
+                strict,
+            )?,
+            None => complete_snapshot_file_cache(
+                snapshot_files,
+                snapshot,
+                scan_options,
+                workdir_prefix,
+                repo_root,
+                strict,
+            )?,
+        };
         if let Some((file_path, block)) = resolve_record_in_files(record, &cache.files) {
             return Ok(ResolvedFeedbackContext {
                 file_path: Some(file_path),
@@ -1679,40 +1665,31 @@ fn merge_snapshot_files(cache: &mut SnapshotFileCache, files: Vec<FileState>) {
     }
 }
 
+/// Finds the record's block. A record with a path binds only to that path;
+/// only path-less records may match by hash anywhere.
 fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(String, Block)> {
-    match &record.target {
-        ReviewTargetRef::Block { hash } => {
-            if let Some(path_hint) = record.path_hint.as_ref()
-                && let Some(file) = files.iter().find(|file| file.path == *path_hint)
-                && let Some(block) = best_block_for_hash(file, hash, record.line_hint)
-            {
-                return Some((file.path.as_str().to_string(), block.clone()));
+    let block_in_file = |file: &FileState| -> Option<Block> {
+        match &record.target {
+            ReviewTargetRef::Block { hash } => {
+                best_block_for_hash(file, hash, record.line_hint).cloned()
             }
-
-            files.iter().find_map(|file| {
-                best_block_for_hash(file, hash, record.line_hint)
-                    .map(|block| (file.path.as_str().to_string(), block.clone()))
-            })
-        }
-        ReviewTargetRef::File { hash } => {
-            if let Some(path_hint) = record.path_hint.as_ref()
-                && let Some(file) = files.iter().find(|file| file.path == *path_hint)
-                && file.tree_hash == *hash
-                && let Some(block) = best_block_for_file(file, record.line_hint)
-            {
-                return Some((file.path.as_str().to_string(), block.clone()));
+            ReviewTargetRef::File { hash } if file.tree_hash == *hash => {
+                best_block_for_file(file, record.line_hint).cloned()
             }
-
-            files.iter().find_map(|file| {
-                if file.tree_hash != *hash {
-                    return None;
-                }
-                best_block_for_file(file, record.line_hint)
-                    .map(|block| (file.path.as_str().to_string(), block.clone()))
-            })
+            ReviewTargetRef::File { .. }
+            | ReviewTargetRef::Tree { .. }
+            | ReviewTargetRef::Declaration { .. } => None,
         }
-        ReviewTargetRef::Tree { .. } => None,
-        ReviewTargetRef::Declaration { .. } => None,
+    };
+    let resolve = |file: &FileState| {
+        block_in_file(file).map(|block| (file.path.as_str().to_string(), block))
+    };
+    match record.path_hint.as_ref() {
+        Some(path_hint) => files
+            .iter()
+            .find(|file| file.path == *path_hint)
+            .and_then(resolve),
+        None => files.iter().find_map(resolve),
     }
 }
 
@@ -2489,15 +2466,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repo_resolver_falls_back_to_full_scan_when_path_hint_misses() {
-        let repo = trueflow_test_support::temp_test_dir("feedback_resolver_fallback");
+    fn resolver_fallback_repo(name: &str) -> (std::path::PathBuf, TreeHash) {
+        let repo = trueflow_test_support::temp_test_dir(name);
         write_rust_file(&repo, "src/target.rs", "fn target() {}\n");
         write_rust_file(&repo, "src/unrelated.rs", "fn unrelated() {}\n");
         let hash = first_scanned_block_hash(&repo, "src/target.rs");
+        (repo, hash)
+    }
+
+    #[test]
+    fn repo_resolver_falls_back_to_full_scan_for_pathless_record() {
+        let (repo, hash) = resolver_fallback_repo("feedback_resolver_fallback");
         let mut record = build_record("target", "aaaaaaa", "src/moved.rs", 10, Verdict::Comment);
         record.repo_ref = RepoRef::Unknown;
         record.target = ReviewTargetRef::Block { hash };
+        record.path_hint = None;
 
         let scan_options = ScanOptions::default();
         let mut resolver = RepoFeedbackContextResolver::new_for_repo_root(
@@ -2526,6 +2509,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["src/target.rs", "src/unrelated.rs"]
         );
+    }
+
+    #[test]
+    fn repo_resolver_never_moves_path_hinted_record_to_same_hash_elsewhere() {
+        let (repo, hash) = resolver_fallback_repo("feedback_resolver_path_bound");
+        let mut record = build_record("target", "aaaaaaa", "src/moved.rs", 10, Verdict::Comment);
+        record.repo_ref = RepoRef::Unknown;
+        record.target = ReviewTargetRef::Block { hash };
+
+        let scan_options = ScanOptions::default();
+        let mut resolver = RepoFeedbackContextResolver::new_for_repo_root(
+            &ReviewContentSource::Workdir,
+            &scan_options,
+            None,
+            &repo,
+        )
+        .unwrap_or_else(|error| panic!("resolver construction should be lazy: {error}"));
+
+        let context = resolver
+            .resolve_context(&record)
+            .unwrap_or_else(|error| panic!("unresolved context is not an error: {error}"));
+
+        assert_eq!(context.file_path.as_deref(), Some("src/moved.rs"));
+        assert!(context.block.is_none());
     }
 
     #[test]

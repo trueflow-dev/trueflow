@@ -276,3 +276,19 @@ fn feedback_merges_unchanged_block_reviews_across_revisions() -> Result<()> {
     assert_eq!(entries[0]["latest_verdict"].as_str(), Some("rejected"));
     Ok(())
 }
+
+#[test]
+fn feedback_uncommitted_copy_stays_on_its_own_path() -> Result<()> {
+    let scenario = FeedbackScenario::new("feedback_uncommitted_copy_path")?;
+    scenario.write("src/b.rs", "pub fn shared() {}\n")?;
+    scenario.commit_all("A")?;
+    scenario.write("src/a.rs", "pub fn shared() {}\n")?;
+    review_with_id(&scenario, "src/a.rs", "comment", "copy-comment", 1000)?;
+
+    let entries =
+        scenario.feedback_json_in_process(&["--since", "all", "--target", "file:src/a.rs"])?;
+
+    assert_eq!(entries.len(), 1, "comment lost from its path: {entries:?}");
+    assert_eq!(entries[0]["file"].as_str(), Some("src/a.rs"));
+    Ok(())
+}
