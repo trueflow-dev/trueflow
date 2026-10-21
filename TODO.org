@@ -369,6 +369,29 @@
    - [Medium] Pasted CR line breaks, source views past 65,535 rows, the editor
      cursor after a full row, and oversized sub-block headers.
      `--lib handle_paste_event source_view_focus_on_block_past_u16 editing_cursor block_header_caps`
+*** Declarations, coverage, and VCS (third wave)
+   - [High] Declaration feedback ignored later approvals from other snapshots;
+     an approved surface hid its later deletion (deletions are now reviewed
+     explicitly via a signed `declaration_deletion` marker); comments on
+     deletions dropped out of `--target rev:X`.
+     `--test declaration_feedback --test declaration_coverage --test e2e_declaration_tui_integration`
+   - [Medium] A failed declaration save closed the TUI; unsupported-language
+     or undecodable files aborted declaration launches.
+     `--test e2e_declaration_capture --test e2e_declaration_tui_integration failed_declaration_note`
+   - [High] TUI file/dir/root approvals wrote node records that covered
+     never-shown blocks (diff scopes, `--only`); they now record the shown
+     blocks unless the whole node was pending in an all-files scope.
+     `--lib batch_file_approval file_approval_records_the_file_only`
+   - [Medium] `C` on Zig unions panicked on duplicate nodes; newer approvals
+     now cover older comments; expanded-child approvals bind exactly before
+     falling back to path. `--lib handle_child_on_zig_union approvals_of_tui_expanded_children
+     --test bug_regressions newer_file_approval`
+   - [High] `main`, `rev:`, `--since`, and `check` ignored `[scan]` ignores.
+     `--test bug_regressions historical_targets_honor_scan_ignore_config check_ignores_changes`
+   - [Medium] Shallow-clone boundary commits are roots; `rev:A...B` starts at
+     the merge base and an empty side means HEAD; tracked files that
+     `.gitignore` matches are scanned. `--lib shallow_boundary revision_ranges_parse
+     --test bug_regressions whole_repo_scopes_include_tracked`
 ** TODO DEF_TODO Follow-ups found by the 2026-10-21 sweep
    - [ ] Deleting previously approved code passes `check`: base-only diff units
      bind to the old content approval. Needs a deletion review identity.
@@ -392,6 +415,15 @@
      name as project stores.
    - [ ] Root-view cursor scrolling still counts one row per line, short
      status messages count as one row, and wrapping counts chars, not graphemes.
+   - [ ] Approving a whole file in an all-files scope writes one record per
+     block whenever any block under it is already reviewed (correct, but each
+     record is signed separately).
+   - [ ] In a shallow clone with no merge base, `main` silently diffs from the
+     main tip; declaration capture has its own walk that may miss `[scan]`
+     ignores and tracked `.gitignore` matches.
+   - [ ] Dirty declaration capture still reads the head of a supported-to-
+     unsupported rename (an oversized head aborts); PR delivery puts comments
+     on deleted declarations in the review body.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of
@@ -434,10 +466,16 @@
    - [X] AI review plan picks when available; otherwise an explicitly labelled
      heuristic pass ranked by signal weight per reading second.
    - [X] Unselected blocks stay pending; the recap offers a full review of the
-     same scope. Verified by `--test tui_pty_smoke pty_focused_pass`.
+     same scope or (`f`) the next focused pass over what is left. Verified by
+     `--test tui_pty_smoke pty_focused_pass`.
    - [X] `review --pass focused [--budget] [--json]` lists the same subset for
      agents (`--test e2e_review_pass`); the AI plan prompt states each block's
      reading estimate and the pass budget (`--lib review_plan_prompt_states`).
+   - [X] Unresolved comments on unchanged blocks are not pass candidates; an
+     empty pass says why instead of opening a full review; ranking charges
+     each card at least 30s. `--lib focused_pass --test e2e_review_pass`
+   - [ ] Decide whether `--pr N --pass focused` should budget the whole PR
+     instead of each commit (today each commit gets its own pass).
 ** TODO Browser review UI (WASM or webpage)
    Goal: bring the `trueflow tui` review workflow into the browser with better
    readability, navigation, and commenting, not just terminal emulation.
