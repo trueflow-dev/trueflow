@@ -31,8 +31,8 @@
   "Return a minimal review block for HASH."
   `((hash . ,hash)
     (content . ,(format "fn %s() {}\n" hash))
-    (start_line . 0)
-    (end_line . 0)
+    (start_line . 3)
+    (end_line . 3)
     (kind . "function")
     (file . "src/lib.rs")))
 
@@ -47,14 +47,14 @@
   (mapcar #'trueflow-test--block hashes))
 
 (defun trueflow-test--exercise-focus-action (action-fn)
-  "Run ACTION-FN and return (MARK-CALL OPENED REVIEW-INDEX REVIEW-HASHES)."
+  "Run ACTION-FN and return (MARK-ARGS OPENED REVIEW-INDEX REVIEW-HASHES)."
   (let* ((initial-hashes '("a" "b" "c"))
          (remaining-hashes '("b" "c"))
          (initial-scan (trueflow-test--scan-data initial-hashes))
          (remaining-scan (trueflow-test--scan-data remaining-hashes))
          (status-buf (generate-new-buffer " *trueflow-test-status*"))
          (focus-buf (generate-new-buffer " *trueflow-test-focus*"))
-         mark-call
+         mark-args
          opened)
     (unwind-protect
         (progn
@@ -69,10 +69,10 @@
             (setq-local trueflow-focus-current-block (trueflow-test--block "a"))
             (setq-local trueflow-focus-status-buffer status-buf))
           (cl-letf (((symbol-function 'magit-current-section) (lambda () nil))
-                    ((symbol-function 'trueflow--run-mark)
-                     (lambda (&rest args)
-                       (setq mark-call args)
-                       t))
+                    ((symbol-function 'trueflow--run-command)
+                     (lambda (args)
+                       (setq mark-args args)
+                       ""))
                     ((symbol-function 'trueflow-refresh)
                      (lambda ()
                        (setq trueflow-last-scan-data remaining-scan)))
@@ -82,7 +82,7 @@
                        (setq opened (list (alist-get 'hash block) current-idx total-count)))))
             (with-current-buffer focus-buf
               (funcall action-fn)))
-          (list mark-call
+          (list mark-args
                 opened
                 (with-current-buffer status-buf trueflow-review-index)
                 (with-current-buffer status-buf
@@ -179,9 +179,11 @@
   "Approve and reject should send distinct verdicts and open the next item."
   (dolist (case '((trueflow-focus-approve "approved")
                   (trueflow-focus-reject "rejected")))
-    (pcase-let ((`(,mark-call ,opened ,review-index ,review-hashes)
+    (pcase-let ((`(,mark-args ,opened ,review-index ,review-hashes)
                   (trueflow-test--exercise-focus-action (car case))))
-      (should (equal mark-call (list "a" (cadr case) nil)))
+      (should (equal mark-args
+                     (list "mark" "--fingerprint" "a" "--verdict" (cadr case)
+                           "--path" "src/lib.rs" "--line" "3")))
       (should (equal opened '("b" 1 2)))
       (should (= review-index 0))
       (should (equal review-hashes '("b" "c"))))))
@@ -234,3 +236,36 @@
         (kill-buffer comment-buf))
       (kill-buffer status-buf)
       (kill-buffer focus-buf))))
+
+(ert-deftest trueflow-mark-at-point-passes-path-and-line ()
+  "Status-buffer marks should identify the reviewed occurrence."
+  (let ((block '((hash . "h")
+                 (content . "fn h() {}\n")
+                 (start_line . 7)
+                 (end_line . 7)
+                 (kind . "function")
+                 (file . "src/a.rs")))
+        mark-args)
+    (cl-letf (((symbol-function 'magit-current-section)
+               (lambda () (make-instance 'trueflow-block)))
+              ((symbol-function 'trueflow--section-value) (lambda (_) block))
+              ((symbol-function 'trueflow-refresh) #'ignore)
+              ((symbol-function 'trueflow--run-command)
+               (lambda (args)
+                 (setq mark-args args)
+                 "")))
+      (trueflow-approve-at-point))
+    (should (equal mark-args
+                   '("mark" "--fingerprint" "h" "--verdict" "approved"
+                     "--path" "src/a.rs" "--line" "7")))))
+
+(ert-deftest trueflow-review-items-and-sections-share-file-annotation ()
+  "Status sections and review items should carry the block's file path."
+  (let ((block '((hash . "h") (start_line . 2))))
+    (should (equal (alist-get 'file (trueflow--annotate-block "src/a.rs" block))
+                   "src/a.rs"))
+    (should-not (alist-get 'file block))
+    (should (equal (mapcar (lambda (item) (alist-get 'file item))
+                           (trueflow--review-items-from-scan-data
+                            (trueflow-test--scan-data '("a" "b"))))
+                   '("src/lib.rs" "src/lib.rs")))))

@@ -366,9 +366,18 @@ when they contain a path separator. Bare command names are resolved via
             (trueflow--ensure-list (json-parse-buffer :object-type 'alist :array-type 'list))
           (buffer-string))))))
 
-(defun trueflow--run-mark (hash verdict note)
-  "Execute the mark command."
-  (let ((args (list "mark" "--fingerprint" hash "--verdict" verdict)))
+(defun trueflow--run-mark (block verdict note)
+  "Mark BLOCK with VERDICT and optional NOTE.
+
+BLOCK must carry its `file' and 0-indexed `start_line' so the record
+identifies the reviewed occurrence, as the TUI does."
+  (let* ((path (or (alist-get 'file block)
+                   (error "Trueflow block %s has no file path" (alist-get 'hash block))))
+         (args (list "mark"
+                     "--fingerprint" (alist-get 'hash block)
+                     "--verdict" verdict
+                     "--path" path
+                     "--line" (number-to-string (alist-get 'start_line block)))))
     (when note
       (setq args (append args (list "--note" note))))
     (trueflow--run-command args)))
@@ -449,9 +458,9 @@ when they contain a path separator. Bare command names are resolved via
   (let ((hash (alist-get 'hash block-struct))
         (content (alist-get 'content block-struct))
         (start (alist-get 'start_line block-struct))
-        (end (alist-get 'end_line block-struct))
-        (kind (alist-get 'kind block-struct)))
-    (magit-insert-section (trueflow-block block-struct :type 'trueflow-block)
+        (end (alist-get 'end_line block-struct)))
+    (magit-insert-section (trueflow-block (trueflow--annotate-block path block-struct)
+                                          :type 'trueflow-block)
       (magit-insert-heading
        (format "L%d-L%d (%s...)" start end (trueflow--short-hash hash)))
       (magit-insert-section-body
@@ -477,13 +486,12 @@ when they contain a path separator. Bare command names are resolved via
     (unless (cl-typep section 'trueflow-block)
       (user-error "Not on a block"))
     (let* ((block (trueflow--section-value section))
-           (hash (alist-get 'hash block))
            (status-buf (current-buffer))
            (buf (get-buffer-create "*trueflow-comment*")))
       (pop-to-buffer buf '((display-buffer-below-selected) (window-height . 10)))
       (trueflow-comment-mode)
       (erase-buffer)
-      (setq-local trueflow-comment-target-hash hash)
+      (setq-local trueflow-comment-target-block block)
       (setq-local trueflow-comment-status-buffer status-buf)
       (insert "# Write your comment below. Press C-c C-c to finish, C-c C-k to cancel.\n\n"))))
 
@@ -492,10 +500,8 @@ when they contain a path separator. Bare command names are resolved via
   (let ((section (magit-current-section)))
     (unless (cl-typep section 'trueflow-block)
       (user-error "Not on a block"))
-    (let* ((block (trueflow--section-value section))
-           (hash (alist-get 'hash block)))
-      (trueflow--run-mark hash verdict note)
-      (trueflow-refresh))))
+    (trueflow--run-mark (trueflow--section-value section) verdict note)
+    (trueflow-refresh)))
 
 (defun trueflow-edit-at-point ()
   "Jump to the file location of the block at point."
@@ -557,17 +563,19 @@ when they contain a path separator. Bare command names are resolved via
 (defvar-local trueflow-last-scan-data nil
   "The last data retrieved from trueflow CLI.")
 
+(defun trueflow--annotate-block (path block)
+  "Return a copy of BLOCK annotated with its file PATH."
+  (let ((annotated (copy-alist block)))
+    (setf (alist-get 'file annotated) path)
+    annotated))
+
 (defun trueflow--review-items-from-scan-data (scan-data)
   "Flatten SCAN-DATA into review items annotated with their file paths."
   (seq-mapcat
    (lambda (file)
      (let ((path (alist-get 'path file)))
-       (mapcar
-        (lambda (block)
-          (let ((annotated (copy-alist block)))
-            (setf (alist-get 'file annotated) path)
-            annotated))
-        (trueflow--ensure-list (alist-get 'blocks file)))))
+       (mapcar (lambda (block) (trueflow--annotate-block path block))
+               (trueflow--ensure-list (alist-get 'blocks file)))))
    scan-data))
 
 (defun trueflow--refresh-review-state (&optional current-hash)
@@ -677,7 +685,7 @@ next refreshed item is shown instead of skipping ahead."
         
         (magit-insert-section (sub-blocks)
           (seq-doseq (block sub-blocks)
-             (trueflow--insert-block nil block)))
+             (trueflow--insert-block (alist-get 'file trueflow-focus-current-block) block)))
         
         (trueflow--insert-actions
          "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit")
@@ -695,9 +703,9 @@ next refreshed item is shown instead of skipping ahead."
 (defun trueflow-focus-action (verdict &optional note)
   "Apply VERDICT to current focused block and move to the next refreshed item."
   (when trueflow-focus-current-block
-    (let ((hash (alist-get 'hash trueflow-focus-current-block)))
-      (trueflow--run-mark hash verdict note)
-      (trueflow--refresh-focus-session trueflow-focus-status-buffer hash))))
+    (trueflow--run-mark trueflow-focus-current-block verdict note)
+    (trueflow--refresh-focus-session trueflow-focus-status-buffer
+                                     (alist-get 'hash trueflow-focus-current-block))))
 
 (defun trueflow-focus-approve ()
   (interactive)
@@ -723,7 +731,7 @@ next refreshed item is shown instead of skipping ahead."
       (pop-to-buffer buf '((display-buffer-below-selected) (window-height . 10)))
       (trueflow-comment-mode)
       (erase-buffer)
-      (setq-local trueflow-comment-target-hash hash)
+      (setq-local trueflow-comment-target-block block)
       (setq-local trueflow-comment-status-buffer status-buf)
       (setq-local trueflow-comment-after-commit-function
                   (lambda ()
@@ -748,8 +756,8 @@ next refreshed item is shown instead of skipping ahead."
 Press C-c C-c to commit, C-c C-k to cancel."
   :group 'trueflow)
 
-(defvar-local trueflow-comment-target-hash nil
-  "The hash of the block being commented on.")
+(defvar-local trueflow-comment-target-block nil
+  "The review block being commented on.")
 
 (defvar-local trueflow-comment-status-buffer nil
   "The buffer to return to after commenting.")
@@ -760,14 +768,14 @@ Press C-c C-c to commit, C-c C-k to cancel."
 (defun trueflow-comment-commit ()
   "Submit the comment in the current buffer."
   (interactive)
-  (unless trueflow-comment-target-hash
+  (unless trueflow-comment-target-block
     (error "Not in a valid trueflow comment buffer"))
   (let ((content (buffer-substring-no-properties (point-min) (point-max))))
     (setq content (replace-regexp-in-string "^#.*\n" "" content))
     (setq content (string-trim content))
     (if (string-empty-p content)
         (message "Comment aborted (empty)")
-      (trueflow--run-mark trueflow-comment-target-hash "comment" content)
+      (trueflow--run-mark trueflow-comment-target-block "comment" content)
       (message "Comment recorded"))
     (quit-window t)
     (if trueflow-comment-after-commit-function
