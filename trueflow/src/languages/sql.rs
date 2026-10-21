@@ -56,7 +56,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
         }
 
         let start = pending_comment_start.take().unwrap_or(child.start_byte());
-        push_non_whitespace_gap(&mut blocks, content, last_end, start, lang)?;
+        push_leftover_code(&mut blocks, content, last_end, start, lang)?;
 
         let (end, next_index) =
             extend_with_statement_terminator(&children, index, child.end_byte());
@@ -75,7 +75,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
     }
 
     if let Some(start) = pending_comment_start {
-        push_non_whitespace_gap(&mut blocks, content, last_end, start, lang)?;
+        push_leftover_code(&mut blocks, content, last_end, start, lang)?;
         blocks.push(create_file_block(
             &content[start..pending_comment_end],
             BlockKind::Comment,
@@ -87,7 +87,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
         last_end = pending_comment_end;
     }
 
-    push_non_whitespace_gap(&mut blocks, content, last_end, content.len(), lang)?;
+    push_leftover_code(&mut blocks, content, last_end, content.len(), lang)?;
 
     Ok(blocks)
 }
@@ -267,7 +267,10 @@ fn is_comment_kind(kind: &str) -> bool {
     matches!(kind, "comment" | "marginalia")
 }
 
-fn push_non_whitespace_gap(
+/// Text between top-level statements that tree-sitter left as loose tokens
+/// (for example under an `ERROR` root). Anything beyond whitespace and `;`
+/// is SQL, so it must stay reviewable rather than become a hidden gap.
+fn push_leftover_code(
     blocks: &mut Vec<Block>,
     content: &str,
     start: usize,
@@ -288,7 +291,7 @@ fn push_non_whitespace_gap(
 
     blocks.push(create_file_block(
         chunk,
-        BlockKind::Gap,
+        BlockKind::Code,
         content,
         start,
         end,
@@ -338,5 +341,37 @@ mod tests {
 
         assert!(select.content.starts_with("-- docs for report"));
         assert!(select.content.trim_end().ends_with(';'));
+    }
+
+    fn split_source(source: &str) -> (String, Vec<Block>) {
+        let tree = parse_tree(source);
+        let root_kind = tree.root_node().kind().to_string();
+        let blocks = split_top_level(tree.root_node(), source, Language::Sql)
+            .unwrap_or_else(|error| panic!("split SQL source: {error}"));
+        (root_kind, blocks)
+    }
+
+    #[test]
+    fn split_top_level_never_hides_tokens_under_error_root() {
+        let source = "BEGIN;\nDELETE FROM t WHERE x =\n";
+        let (root_kind, blocks) = split_source(source);
+        assert_eq!(root_kind, "ERROR", "precondition: unrecoverable parse");
+        for block in &blocks {
+            if block.kind == BlockKind::Gap {
+                assert!(
+                    block
+                        .content
+                        .trim_matches(|ch: char| ch.is_whitespace() || ch == ';')
+                        .is_empty(),
+                    "hidden gap must not carry SQL tokens: {block:#?}"
+                );
+            }
+        }
+        let covered = blocks
+            .iter()
+            .filter(|block| block.kind != BlockKind::Gap)
+            .map(|block| block.content.as_str())
+            .collect::<String>();
+        assert!(covered.contains('='), "operator must be reviewable: {blocks:#?}");
     }
 }
