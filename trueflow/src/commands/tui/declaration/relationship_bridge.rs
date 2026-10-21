@@ -46,7 +46,7 @@ pub struct DeclarationRelationshipRequest {
     pub snapshot_id: SnapshotId,
     pub document: DeclarationRelationshipDocument,
     pub target: PreparedDeclarationTarget,
-    documents: Vec<PreparedProviderDocument>,
+    companions: Vec<PreparedProviderDocument>,
     session_generation: SessionGeneration,
     projection: RelationshipProjectionIndex,
 }
@@ -307,7 +307,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             snapshot_id: entry.target.snapshot.id.clone(),
             document: entry.document.clone(),
             target: entry.target.clone(),
-            documents: provider_documents_for(&entry, &self.documents),
+            companions: companion_documents_for(&entry, &self.documents),
             session_generation: session_generation_for(&entry, &self.documents),
             projection: self.projection.clone(),
         };
@@ -553,35 +553,27 @@ fn session_generation_for(
     }
 }
 
-fn provider_documents_for(
+/// Captured documents of other URIs that a session can hold alongside the target. A URI
+/// captured with conflicting bytes is left to the server's own view.
+fn companion_documents_for(
     entry: &CatalogEntry,
     documents: &[PreparedProviderDocument],
 ) -> Vec<PreparedProviderDocument> {
-    let mut selected = vec![PreparedProviderDocument {
-        uri: entry.document.uri.clone(),
-        version: entry.document.version,
-        language: entry.language,
-        document_hash: entry.generation.document_hash.clone(),
-        exact_source: entry.document.exact_source.clone(),
-    }];
+    let mut selected: Vec<PreparedProviderDocument> = Vec::new();
     for document in documents {
-        if selected
-            .iter()
-            .any(|candidate| candidate.uri == document.uri)
+        if document.uri == entry.document.uri
+            || selected
+                .iter()
+                .any(|candidate| candidate.uri == document.uri)
         {
             continue;
         }
-        let mut generations = documents
-            .iter()
-            .filter(|candidate| candidate.uri == document.uri)
-            .map(|candidate| &candidate.document_hash);
-        let Some(first_hash) = generations.next() else {
-            continue;
-        };
-        if generations.any(|hash| hash != first_hash) {
-            continue;
+        let conflicting = documents.iter().any(|candidate| {
+            candidate.uri == document.uri && candidate.document_hash != document.document_hash
+        });
+        if !conflicting {
+            selected.push(document.clone());
         }
-        selected.push(document.clone());
     }
     selected
 }
@@ -1125,6 +1117,7 @@ trait ProviderSession: RelationshipBackend {
         &mut self,
         document: DocumentSnapshot,
     ) -> std::result::Result<(), ProviderError>;
+    fn close_document(&mut self, uri: Url) -> std::result::Result<(), ProviderError>;
     fn call_hierarchy(
         &mut self,
         key: RelationshipRequestKey,
@@ -1148,6 +1141,10 @@ impl ProviderSession for RelationshipProvider {
         document: DocumentSnapshot,
     ) -> std::result::Result<(), ProviderError> {
         Self::synchronize_document(self, document)
+    }
+
+    fn close_document(&mut self, uri: Url) -> std::result::Result<(), ProviderError> {
+        Self::close_document(self, uri)
     }
 
     fn call_hierarchy(
@@ -1223,7 +1220,7 @@ struct ProviderSessionKey {
 
 fn execute_provider_request<L: SessionLauncher>(
     request: &DeclarationRelationshipRequest,
-    providers: &mut HashMap<ProviderSessionKey, L::Session>,
+    sessions: &mut HashMap<ProviderSessionKey, OpenSession<L::Session>>,
     launcher: &mut L,
 ) -> DeclarationRelationshipResults {
     let session_key = ProviderSessionKey {
@@ -1232,7 +1229,7 @@ fn execute_provider_request<L: SessionLauncher>(
         language: request.target.snapshot.language,
         generation: request.session_generation.clone(),
     };
-    if !providers.contains_key(&session_key) {
+    if !sessions.contains_key(&session_key) {
         let provider = match launcher.launch(
             request.key.server_profile,
             request.target.snapshot.language,
@@ -1241,51 +1238,128 @@ fn execute_provider_request<L: SessionLauncher>(
             Ok(provider) => provider,
             Err(error) => return failed_results(request, error.to_string()),
         };
-        providers.insert(session_key.clone(), provider);
+        sessions.insert(session_key.clone(), OpenSession::new(provider));
     }
-    let Some(provider) = providers.get_mut(&session_key) else {
+    let Some(session) = sessions.get_mut(&session_key) else {
         return failed_results(
             request,
             "relationship provider disappeared after launch".to_owned(),
         );
     };
-    let result = execute_with_provider(request, provider);
-    let replace = providers
+    let result = match session.synchronize(request) {
+        Ok(()) => execute_with_provider(request, &mut session.session),
+        Err(error) => failed_results(request, error.to_string()),
+    };
+    let replace = sessions
         .get(&session_key)
-        .is_some_and(|provider| !provider.session_available());
+        .is_some_and(|session| !session.session.session_available());
     if replace
-        && let Some(mut provider) = providers.remove(&session_key)
-        && let Err(error) = provider.shutdown()
+        && let Some(mut session) = sessions.remove(&session_key)
+        && let Err(error) = session.session.shutdown()
     {
         eprintln!("failed to retire an unhealthy relationship session: {error}");
     }
     result
 }
 
+/// A language-server session plus the documents the worker opened in it, least recently used
+/// first. Sessions hold a bounded number of documents, so the request target is always opened
+/// (evicting older documents when full) while companions only fill the remaining room.
+struct OpenSession<S> {
+    session: S,
+    documents: Vec<Url>,
+}
+
+impl<S: ProviderSession> OpenSession<S> {
+    const fn new(session: S) -> Self {
+        Self {
+            session,
+            documents: Vec::new(),
+        }
+    }
+
+    fn synchronize(
+        &mut self,
+        request: &DeclarationRelationshipRequest,
+    ) -> std::result::Result<(), ProviderError> {
+        let language = self.session.language();
+        let target = exact_snapshot(
+            &request.document.uri,
+            request.document.version,
+            language,
+            &request.key.document_hash,
+            &request.document.exact_source,
+        )?;
+        self.open_target(&target)?;
+        for companion in &request.companions {
+            if companion.language != language {
+                continue;
+            }
+            let snapshot = exact_snapshot(
+                &companion.uri,
+                companion.version,
+                companion.language,
+                &companion.document_hash,
+                &companion.exact_source,
+            )?;
+            match self.open(snapshot) {
+                // A full session leaves the remaining companions to the server's own view.
+                Ok(()) | Err(ProviderError::ResourceLimit(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn open_target(&mut self, target: &DocumentSnapshot) -> std::result::Result<(), ProviderError> {
+        loop {
+            match self.open(target.clone()) {
+                Err(ProviderError::ResourceLimit(reason)) => {
+                    let Some(index) = self.documents.iter().position(|uri| *uri != target.uri)
+                    else {
+                        return Err(ProviderError::ResourceLimit(reason));
+                    };
+                    let evicted = self.documents.remove(index);
+                    self.session.close_document(evicted)?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn open(&mut self, document: DocumentSnapshot) -> std::result::Result<(), ProviderError> {
+        let uri = document.uri.clone();
+        self.session.synchronize_document(document)?;
+        self.documents.retain(|open| *open != uri);
+        self.documents.push(uri);
+        Ok(())
+    }
+}
+
+fn exact_snapshot(
+    uri: &Url,
+    version: i32,
+    language: Language,
+    hash: &DocumentHash,
+    exact_source: &str,
+) -> std::result::Result<DocumentSnapshot, ProviderError> {
+    if *hash != DocumentHash::from_bytes(exact_source.as_bytes()) {
+        return Err(ProviderError::InvalidDocument(
+            "prepared relationship document hash does not match its exact bytes".to_owned(),
+        ));
+    }
+    Ok(DocumentSnapshot::new(
+        uri.clone(),
+        version,
+        language,
+        exact_source,
+    ))
+}
+
 fn execute_with_provider<S: ProviderSession>(
     request: &DeclarationRelationshipRequest,
     provider: &mut S,
 ) -> DeclarationRelationshipResults {
-    for document in &request.documents {
-        if document.language != provider.language() {
-            continue;
-        }
-        if document.document_hash != DocumentHash::from_bytes(document.exact_source.as_bytes()) {
-            return failed_results(
-                request,
-                "prepared relationship document hash does not match its exact bytes".to_owned(),
-            );
-        }
-        if let Err(error) = provider.synchronize_document(DocumentSnapshot::new(
-            document.uri.clone(),
-            document.version,
-            document.language,
-            document.exact_source.clone(),
-        )) {
-            return failed_results(request, error.to_string());
-        }
-    }
-
     let name_start = match declaration_name_start(
         request.target.snapshot.source(),
         &request.target.declaration,
@@ -1468,6 +1542,11 @@ mod tests {
                 ));
             }
             self.open.insert(document.uri, hash);
+            Ok(())
+        }
+
+        fn close_document(&mut self, uri: Url) -> std::result::Result<(), ProviderError> {
+            self.open.remove(&uri);
             Ok(())
         }
 
@@ -1660,6 +1739,22 @@ mod tests {
             launcher.launches, 2,
             "one URI with two captured byte generations needs one session per generation"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn more_same_language_files_than_a_session_holds_still_serve_every_target() -> Result<()> {
+        let (_repo, requests) = dirty_requests("relationship_worker_document_limit", 33)?;
+        let mut sessions = HashMap::new();
+        let mut launcher = FakeLauncher::default();
+        for request in &requests {
+            assert_synchronized(&execute_provider_request(
+                request,
+                &mut sessions,
+                &mut launcher,
+            ));
+        }
+        assert_eq!(launcher.launches, 1);
         Ok(())
     }
 }
