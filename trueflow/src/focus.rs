@@ -475,11 +475,14 @@ mod tests {
         let error = generate(
             &inventory(Vec::new(), Vec::new()),
             ReviewDuration::from_seconds(3600).unwrap(),
-            |_| unreachable!("no candidates means no model call"),
+            |_| bail!("no candidates means no model call"),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("no unreviewed"), "{error}");
-        assert!(!error.contains("budget") && !error.contains("duration"), "{error}");
+        assert!(
+            !error.contains("budget") && !error.contains("duration"),
+            "{error}"
+        );
     }
 }

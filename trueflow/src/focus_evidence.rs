@@ -128,7 +128,6 @@ pub struct LimitationSummary<'a> {
 }
 
 impl<'a> LimitationSummary<'a> {
-
     pub fn of(diagnostics: &'a [FocusDiagnostic]) -> Self {
         let mut counts = BTreeMap::new();
         let mut listed = Vec::new();
@@ -241,7 +240,11 @@ fn capture_with(
 ) -> Result<FocusInventory> {
     if let FocusScope::Under(path) = scope {
         ensure!(
-            review.tree.nodes().iter().any(|node| node.path.is_under(path)),
+            review
+                .tree
+                .nodes()
+                .iter()
+                .any(|node| node.path.is_under(path)),
             "--path {path} matches no scanned source files; check the path and scan/review filters"
         );
     }
@@ -778,7 +781,8 @@ fn history(
                             commit.id,
                             bounded(&error.to_string(), 512)
                         );
-                        diagnostics.push(FocusDiagnostic::new(DiagnosticKind::GitHistory, &message));
+                        diagnostics
+                            .push(FocusDiagnostic::new(DiagnosticKind::GitHistory, &message));
                         for observations in result.values_mut() {
                             observations.push(Observation {
                                 kind: EvidenceKind::HistoryStatus,
@@ -1143,10 +1147,18 @@ mod tests {
         let fixture = review(&[("auth.rs", initial)]);
         let absent = capture(&fixture, &db, None);
         let unborn = capture(&fixture, &db, Some(&repo));
-        assert!(absent.diagnostics.iter().any(|d| d.kind == DiagnosticKind::GitHistory
-            && d.message.contains("unavailable")));
-        assert!(unborn.diagnostics.iter().any(|d| d.kind == DiagnosticKind::GitHistory
-            && d.message.contains("unavailable")));
+        assert!(
+            absent
+                .diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::GitHistory && d.message.contains("unavailable"))
+        );
+        assert!(
+            unborn
+                .diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::GitHistory && d.message.contains("unavailable"))
+        );
         std::fs::write(root.join("auth.rs"), initial).unwrap();
         run_git(&root, &["add", "."]);
         run_git(&root, &["commit", "-qm", "initial"]);

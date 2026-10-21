@@ -181,11 +181,7 @@ exit 24
         directory.join("bin/codex"),
         std::fs::Permissions::from_mode(0o755),
     )?;
-    let path = std::env::join_paths([
-        directory.join("bin"),
-        "/usr/bin".into(),
-        "/bin".into(),
-    ])?;
+    let path = std::env::join_paths([directory.join("bin"), "/usr/bin".into(), "/bin".into()])?;
     Ok(std::process::Command::new(env!("CARGO_BIN_EXE_trueflow"))
         .args(["onboard", "--json"])
         .args(extra)
@@ -208,7 +204,10 @@ fn onboarding_generation_has_a_configurable_agentic_deadline() -> Result<()> {
     let started = std::time::Instant::now();
     let output = generate_with_fake_codex(&repo, "hang", &["--timeout", "1"])?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "a hanging provider generated a plan");
+    assert!(
+        !output.status.success(),
+        "a hanging provider generated a plan"
+    );
     assert!(stderr.contains("timed out"), "{stderr}");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
