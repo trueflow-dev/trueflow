@@ -409,8 +409,10 @@
      structural children drop leading comments and closing delimiters.
    - [ ] Emacs: approving a sub-block in the split view redraws the status view
      into `*trueflow-focus*`.
-   - [ ] `inspect --path` takes scan-relative paths while `mark --path` takes
-     repo-relative ones; they disagree when run from a subdirectory.
+  - [X] `inspect --path` rejected the current-directory-relative paths that
+    `mark --path` accepts from a subdirectory (scan paths were already
+    repo-relative); both now share one resolver.
+    `--test e2e_inspect inspect_path_from_subdirectory`
    - [ ] The default scan cache lives in `~/.trueflow/cache`, the same folder
      name as project stores.
    - [ ] Root-view cursor scrolling still counts one row per line, short

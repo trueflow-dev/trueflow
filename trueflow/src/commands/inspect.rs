@@ -1,3 +1,4 @@
+use crate::commands::mark;
 use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::coverage::{
@@ -99,6 +100,13 @@ pub fn run(
     let scan_options = config.scan.resolve_options();
     let scan_result = scanner::scan_directory(".", &scan_options)?;
     let files = scan_result.files;
+    // Scanned paths are repository-relative; accept `--path` in every form
+    // `mark --path` accepts, including one relative to the current directory.
+    let path_hint = location.path.map(mark::resolve_path_hint_from_workdir);
+    let location = LocationFilter {
+        path: path_hint.as_ref(),
+        line: location.line,
+    };
     let matched = find_matching_block(&files, fingerprint, location)?;
     if split {
         let sub_blocks = sub_splitter::split(&matched.block, matched.language)?;

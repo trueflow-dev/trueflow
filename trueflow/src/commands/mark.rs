@@ -169,19 +169,19 @@ pub fn terminal_suspend_requirement_from_workdir() -> TerminalSuspendRequirement
     runtime_config_from_git_config(vcs::git_config_from_workdir().ok()).terminal_suspend_requirement
 }
 
-fn normalize_path_hint_from_workdir(path: Option<RepoPath>) -> Option<RepoPath> {
-    let path = path?;
-
+/// Resolves a user-supplied `--path` against the repository root: it may be
+/// repository-relative or relative to the current directory.
+pub(crate) fn resolve_path_hint_from_workdir(path: &RepoPath) -> RepoPath {
     let prefix = vcs::git_root_from_workdir()
         .ok()
         .flatten()
         .and_then(|repo_root| path_utils::current_workdir_prefix_for_repo_root(&repo_root))
         .and_then(|prefix| RepoPath::new(prefix).ok());
 
-    Some(match prefix {
+    match prefix {
         Some(prefix) => path.resolve_from_prefix(&prefix),
-        None => path,
-    })
+        None => path.clone(),
+    }
 }
 
 pub fn run(context: &TrueflowContext, params: MarkParams) -> Result<()> {
@@ -315,7 +315,7 @@ fn build_mark_record(
         comment_anchor,
     } = params;
 
-    let path_hint = normalize_path_hint_from_workdir(path);
+    let path_hint = path.as_ref().map(resolve_path_hint_from_workdir);
     let target_kind = infer_target_kind(target_kind, &fingerprint, path_hint.as_ref(), line)?;
     let target = target_kind.parse_target(&fingerprint)?;
     let block_state: BlockState = vcs::block_state_for_path(

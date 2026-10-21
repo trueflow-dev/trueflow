@@ -179,7 +179,8 @@ trueflow review --json
 # Inspect and split a block
 trueflow inspect --fingerprint <fp> --split
 
-# Pick one of several blocks with identical content (same hash)
+# Pick one of several blocks with identical content (same hash). As for `mark`,
+# --path is repository-relative or relative to the current directory.
 trueflow inspect --fingerprint <fp> --path src/lib.rs --line <start_line> --coverage
 
 # Export review feedback

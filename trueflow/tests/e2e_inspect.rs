@@ -93,6 +93,64 @@ fn inspect_full_hash_with_duplicate_content_is_resolvable() -> Result<()> {
 }
 
 #[test]
+fn inspect_path_from_subdirectory_resolves_like_mark_path() -> Result<()> {
+    let repo = TestRepo::new("inspect_subdir_paths")?;
+    repo.write("src/a.rs", "fn dup() {}\n")?;
+    repo.write("src/b.rs", "fn dup() {}\n")?;
+    repo.commit_all("Add duplicates")?;
+    let subdir = repo.path.join("src");
+
+    let blocks = scan_blocks(&repo)?;
+    let hash = blocks[0]["blocks"][0]["hash"].as_str().context("hash")?;
+
+    repo.run_in(
+        &[
+            "mark",
+            "--fingerprint",
+            hash,
+            "--verdict",
+            "approved",
+            "--path",
+            "src/b.rs",
+            "--quiet",
+        ],
+        &subdir,
+    )?;
+
+    // `mark --path` accepts both a repo-relative path and one relative to the
+    // current directory; `inspect --path` must accept the same forms.
+    let direct_verdict = |path: &str| -> Result<Value> {
+        let output = repo.run_in(
+            &[
+                "inspect",
+                "--fingerprint",
+                hash,
+                "--path",
+                path,
+                "--coverage",
+            ],
+            &subdir,
+        )?;
+        let inspected: Value = serde_json::from_str(&output)?;
+        Ok(inspected["coverage"]["checks"]["review"]["direct_latest_verdict"].clone())
+    };
+    assert_eq!(direct_verdict("src/b.rs")?.as_str(), Some("approved"));
+    assert_eq!(direct_verdict("b.rs")?.as_str(), Some("approved"));
+    assert_eq!(direct_verdict("src/a.rs")?, Value::Null);
+
+    let error = repo
+        .run_in(&["inspect", "--fingerprint", hash], &subdir)
+        .expect_err("duplicate content is ambiguous without --path")
+        .to_string();
+    assert!(
+        error.contains("src/a.rs line") && error.contains("src/b.rs line"),
+        "ambiguity lists the repo-relative paths --path accepts: {error}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn inspect_line_selects_duplicate_content_within_one_file() -> Result<()> {
     let repo = TestRepo::new("inspect_duplicate_lines")?;
     repo.write("src/lib.rs", "pub fn alpha() {}\n\npub fn alpha() {}\n")?;
