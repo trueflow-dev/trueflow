@@ -295,6 +295,9 @@ History inspects up to eight first-parent commits and is file-local, not precise
 historical-to-current block attribution. Missing/truncated evidence is explicit.
 Generated/vendor/test-heavy content and mechanical whitespace churn are labeled
 for discounting. There is no whole-program call graph or executed test analysis.
+Repository-wide evidence limitations (scan, review-binding, Git history, and
+related-test diagnostics) are counted by kind; prompts, cards, and warnings list
+at most three of each kind. `--candidates` returns every one as `{kind, message}`.
 
 Every model-selected card must cite evidence IDs for its exact target and include
 a reason, uncertainty, and concrete inspection questions. Bounded multi-pass

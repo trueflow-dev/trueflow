@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::review::CollectedReview;
-use crate::focus_evidence::{FocusCandidate, FocusInventory, FocusScope};
+use crate::focus_evidence::{FocusCandidate, FocusInventory, FocusScope, LimitationSummary};
 use crate::onboarding::{PreparedOnboarding, ReviewLocation, ReviewPurpose, ReviewSpecification};
 
 pub const MAX_SPECIFICATION_BYTES: usize = 256 * 1024;
@@ -254,8 +254,11 @@ impl FocusSpecification {
                     evidence.id, evidence.detail, evidence.provenance
                 ));
             }
-            for diagnostic in &inventory.diagnostics {
-                details.push_str(&format!("\nEvidence limitation: {diagnostic}\n"));
+            if !inventory.diagnostics.is_empty() {
+                details.push_str(&format!(
+                    "\nEvidence limitations: {}\n",
+                    LimitationSummary::of(&inventory.diagnostics)
+                ));
             }
             card.details = Some(details);
         }
@@ -307,7 +310,11 @@ pub fn generate(
     );
     let mut calls = 0;
     loop {
-        let batches = prompt_batches(&candidates, duration, &inventory.diagnostics)?;
+        let batches = prompt_batches(
+            &candidates,
+            duration,
+            &LimitationSummary::of(&inventory.diagnostics),
+        )?;
         ensure!(
             calls + batches.len() <= MAX_GENERATION_CALLS,
             "focus scope exceeds the {MAX_GENERATION_CALLS}-call evidence limit; narrow --path (no partial queue generated)"
@@ -352,7 +359,7 @@ type PromptBatch<'a> = (Vec<&'a FocusCandidate>, String);
 fn prompt_batches<'a>(
     candidates: &[&'a FocusCandidate],
     duration: ReviewDuration,
-    diagnostics: &[String],
+    limitations: &LimitationSummary<'_>,
 ) -> Result<Vec<PromptBatch<'a>>> {
     let header = format!(
         r#"Select an ordered high-value human review queue from the supplied evidence, within {seconds} estimated seconds.
@@ -366,7 +373,11 @@ Evidence limitations: {limitations}
 Candidates:
 "#,
         seconds = duration.seconds(),
-        limitations = serde_json::to_string(diagnostics)?
+        limitations = serde_json::to_string(limitations)?
+    );
+    ensure!(
+        header.len() < MAX_PROMPT_BYTES,
+        "focus instructions and evidence limitations alone exceed the {MAX_PROMPT_BYTES}-byte prompt size"
     );
     let mut batches = Vec::new();
     let mut batch = Vec::new();
@@ -400,6 +411,7 @@ Candidates:
 mod tests {
     use super::*;
     use crate::block::BlockKind;
+    use crate::focus_evidence::{DiagnosticKind, FocusDiagnostic};
     use crate::hashing::BytesHash;
     use crate::repo_path::RepoPath;
 
@@ -420,12 +432,42 @@ mod tests {
         }
     }
 
-    fn inventory(candidates: Vec<FocusCandidate>, diagnostics: Vec<String>) -> FocusInventory {
+    fn inventory(
+        candidates: Vec<FocusCandidate>,
+        diagnostics: Vec<FocusDiagnostic>,
+    ) -> FocusInventory {
         FocusInventory {
             candidates,
             snapshot_hash: BytesHash::from_bytes(b"snapshot"),
             diagnostics,
         }
+    }
+
+    #[test]
+    fn many_repository_diagnostics_fit_the_prompt_budget() {
+        let stale_record = FocusDiagnostic::new(
+            DiagnosticKind::ReviewBinding,
+            &format!(
+                "Human review binding diagnostic: {{\"kind\":\"unresolved_record\",\"record_id\":\"{}\"}}",
+                "r".repeat(64)
+            ),
+        );
+        let mut prompts = Vec::new();
+        let error = generate(
+            &inventory(vec![candidate()], vec![stale_record; 700]),
+            ReviewDuration::from_seconds(300).unwrap(),
+            |prompt| {
+                prompts.push(prompt.to_owned());
+                bail!("prompt recorded")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "prompt recorded");
+        assert!(prompts[0].len() <= MAX_PROMPT_BYTES);
+        assert!(
+            prompts[0].contains(r#""total":700"#),
+            "the summary must count every diagnostic"
+        );
     }
 
     #[test]

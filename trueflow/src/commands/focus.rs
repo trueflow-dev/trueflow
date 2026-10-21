@@ -12,7 +12,7 @@ use crate::commands::{onboard, tui};
 use crate::config::AiMode;
 use crate::context::TrueflowContext;
 use crate::focus::{FocusSpecification, ReviewDuration};
-use crate::focus_evidence::{FocusInventory, FocusScope};
+use crate::focus_evidence::{FocusInventory, FocusScope, LimitationSummary};
 use crate::repo_path::RepoPath;
 
 #[derive(Debug, Args)]
@@ -117,8 +117,11 @@ pub fn run(context: &TrueflowContext, args: &FocusArgs) -> Result<()> {
         );
         return Ok(());
     }
-    for diagnostic in &inventory.diagnostics {
-        eprintln!("warning: {diagnostic}");
+    if !inventory.diagnostics.is_empty() {
+        eprintln!(
+            "warning: evidence limitations: {}",
+            LimitationSummary::of(&inventory.diagnostics)
+        );
     }
     let duration = duration.context("missing focus duration")?;
     let oversized = inventory

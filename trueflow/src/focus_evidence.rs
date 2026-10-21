@@ -23,6 +23,8 @@ const MAX_HISTORY_BLOB_BYTES: u64 = 128 * 1024;
 const MAX_PATCH_BYTES: usize = 2048;
 const MAX_REVIEW_NOTES: usize = 8;
 const MAX_TEST_BLOCKS: usize = 2048;
+const MAX_LISTED_DIAGNOSTICS_PER_KIND: usize = 3;
+const MAX_DIAGNOSTIC_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,11 +81,97 @@ impl FocusScope {
     }
 }
 
+/// Where an evidence limitation comes from. Limitations are repository-wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticKind {
+    Scan,
+    ReviewBinding,
+    GitHistory,
+    RelatedTests,
+}
+
+impl DiagnosticKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::ReviewBinding => "review binding",
+            Self::GitHistory => "Git history",
+            Self::RelatedTests => "related tests",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FocusDiagnostic {
+    pub kind: DiagnosticKind,
+    pub message: String,
+}
+
+impl FocusDiagnostic {
+    pub fn new(kind: DiagnosticKind, message: &str) -> Self {
+        Self {
+            kind,
+            message: bounded(message, MAX_DIAGNOSTIC_BYTES).to_owned(),
+        }
+    }
+}
+
+/// A bounded view of the repository-wide limitations: every diagnostic is counted
+/// by kind, but only the first few of each kind are listed. Their number grows with
+/// stale review records and scan problems, so they must not consume a prompt budget.
+#[derive(Debug, Serialize)]
+pub struct LimitationSummary<'a> {
+    pub total: usize,
+    pub counts: BTreeMap<DiagnosticKind, usize>,
+    pub listed: Vec<&'a FocusDiagnostic>,
+}
+
+impl<'a> LimitationSummary<'a> {
+
+    pub fn of(diagnostics: &'a [FocusDiagnostic]) -> Self {
+        let mut counts = BTreeMap::new();
+        let mut listed = Vec::new();
+        for diagnostic in diagnostics {
+            let count = counts.entry(diagnostic.kind).or_insert(0);
+            if *count < MAX_LISTED_DIAGNOSTICS_PER_KIND {
+                listed.push(diagnostic);
+            }
+            *count += 1;
+        }
+        Self {
+            total: diagnostics.len(),
+            counts,
+            listed,
+        }
+    }
+}
+
+impl std::fmt::Display for LimitationSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} repository-wide", self.total)?;
+        for (kind, count) in &self.counts {
+            write!(f, "; {}: {count}", kind.label())?;
+        }
+        for diagnostic in &self.listed {
+            write!(f, "\n- {}", diagnostic.message)?;
+        }
+        if self.listed.len() < self.total {
+            write!(
+                f,
+                "\n({} more; see `trueflow focus --candidates`)",
+                self.total - self.listed.len()
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct FocusInventory {
     pub candidates: Vec<FocusCandidate>,
     pub snapshot_hash: BytesHash,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<FocusDiagnostic>,
 }
 
 impl FocusInventory {
@@ -92,9 +180,9 @@ impl FocusInventory {
         let repo = vcs::repo_from_workdir();
         let mut inventory = capture_with(review, scope, &database, repo.as_ref().ok())?;
         if let Err(error) = repo {
-            inventory.diagnostics.push(format!(
-                "Git discovery unavailable: {}",
-                bounded(&error.to_string(), 512)
+            inventory.diagnostics.push(FocusDiagnostic::new(
+                DiagnosticKind::GitHistory,
+                &format!("Git discovery unavailable: {error}"),
             ));
         }
         Ok(inventory)
@@ -165,18 +253,21 @@ fn capture_with(
         .summary
         .diagnostics
         .iter()
-        .map(|d| d.display_message())
+        .map(|d| FocusDiagnostic::new(DiagnosticKind::Scan, &d.display_message()))
         .collect();
     for diagnostic in coverage.diagnostics() {
-        diagnostics.push(format!(
-            "Human review binding diagnostic: {}",
-            bounded(&serde_json::to_string(diagnostic)?, 512)
+        diagnostics.push(FocusDiagnostic::new(
+            DiagnosticKind::ReviewBinding,
+            &format!(
+                "Human review binding diagnostic: {}",
+                serde_json::to_string(diagnostic)?
+            ),
         ));
     }
     let history = history(repo, &paths, &mut diagnostics)?;
     let tests = TestIndex::build(review);
     if tests.truncated {
-        diagnostics.push("Related-test index truncated; only bounded sampled tokens/paths are considered; this is not test coverage.".into());
+        diagnostics.push(FocusDiagnostic::new(DiagnosticKind::RelatedTests, "Related-test index truncated; only bounded sampled tokens/paths are considered; this is not test coverage."));
     }
     let mut candidates = Vec::with_capacity(nodes.len());
     let mut payload_bytes = 0usize;
@@ -615,7 +706,7 @@ struct Observation {
 fn history(
     repo: Option<&gix::Repository>,
     paths: &BTreeSet<RepoPath>,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut Vec<FocusDiagnostic>,
 ) -> Result<BTreeMap<RepoPath, Vec<Observation>>> {
     let mut result: BTreeMap<_, _> = paths
         .iter()
@@ -650,7 +741,7 @@ fn history(
                             commit.id,
                             bounded(&error.to_string(), 512)
                         );
-                        diagnostics.push(message.clone());
+                        diagnostics.push(FocusDiagnostic::new(DiagnosticKind::GitHistory, &message));
                         for observations in result.values_mut() {
                             observations.push(Observation {
                                 kind: EvidenceKind::HistoryStatus,
@@ -683,7 +774,7 @@ fn history(
             }
         }
     }
-    diagnostics.push(status.clone());
+    diagnostics.push(FocusDiagnostic::new(DiagnosticKind::GitHistory, &status));
     for observations in result.values_mut() {
         observations.push(Observation {
             kind: EvidenceKind::HistoryStatus,
@@ -876,6 +967,24 @@ mod tests {
     }
 
     #[test]
+    fn limitation_summary_counts_every_kind_but_lists_only_a_few() {
+        let mut diagnostics =
+            vec![FocusDiagnostic::new(DiagnosticKind::ReviewBinding, "stale record"); 700];
+        diagnostics.push(FocusDiagnostic::new(
+            DiagnosticKind::Scan,
+            "src/x.rs: invalid UTF-8",
+        ));
+        let text = LimitationSummary::of(&diagnostics).to_string();
+        assert!(
+            text.starts_with("701 repository-wide; scan: 1; review binding: 700\n"),
+            "{text}"
+        );
+        assert!(text.contains("\n- src/x.rs: invalid UTF-8"));
+        assert_eq!(text.lines().filter(|l| l.starts_with("- ")).count(), 4);
+        assert!(text.ends_with("(697 more; see `trueflow focus --candidates`)"));
+    }
+
+    #[test]
     fn deterministic_ids_reject_stale_source_and_scope_excludes_siblings() {
         let db = ReviewDatabase::default();
         let initial = review(&[
@@ -1001,8 +1110,10 @@ mod tests {
         let fixture = review(&[("auth.rs", initial)]);
         let absent = capture(&fixture, &db, None);
         let unborn = capture(&fixture, &db, Some(&repo));
-        assert!(absent.diagnostics.iter().any(|d| d.contains("unavailable")));
-        assert!(unborn.diagnostics.iter().any(|d| d.contains("unavailable")));
+        assert!(absent.diagnostics.iter().any(|d| d.kind == DiagnosticKind::GitHistory
+            && d.message.contains("unavailable")));
+        assert!(unborn.diagnostics.iter().any(|d| d.kind == DiagnosticKind::GitHistory
+            && d.message.contains("unavailable")));
         std::fs::write(root.join("auth.rs"), initial).unwrap();
         run_git(&root, &["add", "."]);
         run_git(&root, &["commit", "-qm", "initial"]);
@@ -1076,7 +1187,7 @@ mod tests {
             inventory
                 .diagnostics
                 .iter()
-                .any(|d| d.contains("history truncated"))
+                .any(|d| d.message.contains("history truncated"))
         );
         let source = format!(
             "pub fn handle() {{\n{}\nstd::fs::write(path, request.body())?;\n}}",
