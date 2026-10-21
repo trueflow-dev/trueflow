@@ -63,16 +63,31 @@ enum CandidateMatch {
     Ambiguous,
 }
 
-type PathKeyHash<'a> = (
-    &'a RepoPath,
-    &'a DeclarationKey,
-    &'a DeclarationProjectionHash,
-);
+/// Revision-independent identity of a declaration review: one surface at one path, by
+/// semantic key and projection. Coverage binds its `SamePathKeyHash` tier on it and feedback
+/// export keys latest verdicts on it, so a later approval resolves an earlier comment in both
+/// no matter which snapshot either record was captured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeclarationSurfaceIdentity<'a> {
+    path: &'a RepoPath,
+    declaration_key: &'a DeclarationKey,
+    projection_hash: &'a DeclarationProjectionHash,
+}
+
+impl<'a> DeclarationSurfaceIdentity<'a> {
+    pub fn of_locator(locator: &'a DeclarationRecordLocator) -> Self {
+        Self {
+            path: &locator.path,
+            declaration_key: &locator.declaration_key,
+            projection_hash: &locator.projection_hash,
+        }
+    }
+}
 
 struct CandidateLookup<'a> {
     exact: HashMap<&'a DeclarationRecordLocator, CandidateMatch>,
-    same_path: HashMap<PathKeyHash<'a>, CandidateMatch>,
-    rename: HashMap<PathKeyHash<'a>, CandidateMatch>,
+    same_path: HashMap<DeclarationSurfaceIdentity<'a>, CandidateMatch>,
+    rename: HashMap<DeclarationSurfaceIdentity<'a>, CandidateMatch>,
     key_hash: HashMap<(&'a DeclarationKey, &'a DeclarationProjectionHash), CandidateMatch>,
     hash: HashMap<&'a DeclarationProjectionHash, CandidateMatch>,
 }
@@ -91,21 +106,13 @@ impl<'a> CandidateLookup<'a> {
             insert_match(&mut lookup.exact, locator, index);
             insert_match(
                 &mut lookup.same_path,
-                (
-                    &locator.path,
-                    &locator.declaration_key,
-                    &locator.projection_hash,
-                ),
+                DeclarationSurfaceIdentity::of_locator(locator),
                 index,
             );
             for source in &candidate.rename_sources {
                 insert_match(
                     &mut lookup.rename,
-                    (
-                        &source.path,
-                        &source.declaration_key,
-                        &source.projection_hash,
-                    ),
+                    DeclarationSurfaceIdentity::of_locator(source),
                     index,
                 );
             }
@@ -119,24 +126,25 @@ impl<'a> CandidateLookup<'a> {
         lookup
     }
 
+    /// Records are validated first, so the locator's projection hash is the target hash.
     fn find(
         &self,
         locator: &DeclarationRecordLocator,
-        hash: &DeclarationProjectionHash,
     ) -> Option<(CoverageBindingKind, CandidateMatch)> {
-        let path_key_hash = (&locator.path, &locator.declaration_key, hash);
+        let surface = DeclarationSurfaceIdentity::of_locator(locator);
+        let hash = &locator.projection_hash;
         // An ambiguous stronger tier is still a match: never fall through it.
         self.exact
             .get(locator)
             .map(|matched| (CoverageBindingKind::ExactLocator, *matched))
             .or_else(|| {
                 self.same_path
-                    .get(&path_key_hash)
+                    .get(&surface)
                     .map(|matched| (CoverageBindingKind::SamePathKeyHash, *matched))
             })
             .or_else(|| {
                 self.rename
-                    .get(&path_key_hash)
+                    .get(&surface)
                     .map(|matched| (CoverageBindingKind::ProvenRenameMatch, *matched))
             })
             .or_else(|| {
@@ -181,9 +189,9 @@ impl DeclarationCoverageIndex {
         let mut bindings = HashMap::<OccurrenceKey, DeclarationCoverageBinding>::new();
 
         for (record_index, record) in records.iter().enumerate() {
-            let ReviewTargetRef::Declaration { hash } = &record.target else {
+            if !matches!(record.target, ReviewTargetRef::Declaration { .. }) {
                 continue;
-            };
+            }
             record
                 .validate()
                 .with_context(|| format!("invalid declaration coverage record {}", record.id))?;
@@ -200,7 +208,7 @@ impl DeclarationCoverageIndex {
                 )
             })?;
 
-            let Some((kind, CandidateMatch::Unique(candidate_index))) = lookup.find(locator, hash)
+            let Some((kind, CandidateMatch::Unique(candidate_index))) = lookup.find(locator)
             else {
                 continue;
             };

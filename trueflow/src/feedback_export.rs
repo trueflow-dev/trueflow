@@ -1,6 +1,7 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, FileState};
 use crate::config::BlockFilters;
+use crate::declaration::coverage::DeclarationSurfaceIdentity;
 use crate::declaration::snapshot::SourceSnapshot;
 use crate::declaration::{
     DeclarationKey, DeclarationNode, DeclarationProjectionHash, project_source,
@@ -654,7 +655,9 @@ fn collect_declaration_feedback_entries(
     resolver: &mut impl FeedbackContextResolver,
 ) -> Result<Vec<FeedbackEntry>> {
     let mut candidates = Vec::new();
-    let mut latest = HashMap::<&DeclarationRecordLocator, (i64, usize, &'static str)>::new();
+    // Like block verdicts, declaration verdicts are revision-independent: a later approval
+    // from any snapshot of the same surface resolves earlier comments on it.
+    let mut latest = HashMap::<DeclarationSurfaceIdentity<'_>, (i64, usize, &'static str)>::new();
     for (index, record) in records.iter().enumerate() {
         if !matches!(record.target, ReviewTargetRef::Declaration { .. })
             || !record_matches_allowed_revisions(record, query.allowed_revisions.as_ref())
@@ -665,21 +668,22 @@ fn collect_declaration_feedback_entries(
             continue;
         };
         candidates.push((index, record, locator));
+        let surface = DeclarationSurfaceIdentity::of_locator(locator);
         if latest
-            .get(locator)
+            .get(&surface)
             .is_none_or(|(timestamp, existing_index, _)| {
                 record.timestamp > *timestamp
                     || (record.timestamp == *timestamp && index > *existing_index)
             })
         {
-            latest.insert(locator, (record.timestamp, index, record.verdict.as_str()));
+            latest.insert(surface, (record.timestamp, index, record.verdict.as_str()));
         }
     }
 
     let mut grouped = HashMap::<DeclarationFeedbackEntryKey, FeedbackEntry>::new();
     for (index, record, locator) in candidates {
         let latest_verdict = latest
-            .get(locator)
+            .get(&DeclarationSurfaceIdentity::of_locator(locator))
             .map_or("unreviewed", |(_, _, verdict)| *verdict);
         // Historical verdicts still participate above, but excluded records need
         // neither source IO nor semantic projection.

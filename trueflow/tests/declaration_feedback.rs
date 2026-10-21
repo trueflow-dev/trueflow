@@ -599,6 +599,51 @@ fn declaration_feedback_uses_newest_timestamp_when_older_comment_is_stored_last(
 }
 
 #[test]
+fn declaration_feedback_later_approval_from_another_snapshot_suppresses_comment() -> TestResult {
+    const STALE_NOTE: &str = "comment resolved by a later session's approval";
+
+    let scenario = FeedbackScenario::new("declaration_feedback_cross_snapshot_approval")?;
+    scenario.write(PATH, DECLARATION_SOURCE)?;
+    let revision = CommitId::new(scenario.commit_all("add declaration feedback source")?)?;
+    let (snapshot, declaration) = captured_declaration(scenario.repo(), &revision)?;
+
+    let comment = declaration_record(
+        "earlier-comment",
+        &revision,
+        &snapshot,
+        &declaration,
+        AnchorSelection::Signature,
+        STALE_NOTE,
+    )?;
+
+    // A later session captures the same surface under another comparison, so its snapshot
+    // identity differs while path, semantic key, and projection stay the same.
+    let mut later_approval = comment.clone();
+    later_approval.id = "later-approval".to_string();
+    later_approval.timestamp = comment.timestamp + 1;
+    later_approval.verdict = Verdict::Approved;
+    later_approval.note = None;
+    later_approval.comment_context = None;
+    locator_mut(&mut later_approval)?
+        .reviewed_snapshot
+        .snapshot_id = "source:later-session".to_string();
+    declaration_anchor_mut(&mut later_approval)?
+        .reviewed_snapshot
+        .snapshot_id = "source:later-session".to_string();
+    later_approval.validate()?;
+
+    scenario.write_reviews(&[comment, later_approval])?;
+
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+    assert!(
+        entries.is_empty(),
+        "a later approval of the same declaration surface must resolve its comment; \
+         stale note {STALE_NOTE:?} was exported in {entries:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn uncommitted_declaration_feedback_resolves_against_captured_worktree_snapshot() -> TestResult {
     const INITIAL_SOURCE: &str =
         "/// Converts one wide value.\npub fn convert(value: u16) -> u16 { value }\n";
