@@ -512,3 +512,63 @@ fn cpp_lambda_constant_projects_its_signature_without_the_body() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn cpp_nested_class_is_an_aggregate_child_not_a_method() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "struct Outer {\n",
+        "    int x;\n",
+        "    struct Inner {\n",
+        "        int f() { return 1; }\n",
+        "        int g() { return 2; }\n",
+        "    };\n",
+        "    struct Inner *make();\n",
+        "};\n",
+        "struct Outer *create(void);\n",
+    );
+
+    let facts = project("src/nested.cpp", Language::Cpp, SOURCE)?;
+    let outer = declaration_named(&facts, "Outer", DeclarationKind::Struct)?;
+    let inner = declaration_named(&facts, "Inner", DeclarationKind::Struct)?;
+    let f = declaration_named(&facts, "f", DeclarationKind::Method)?;
+    let g = declaration_named(&facts, "g", DeclarationKind::Method)?;
+    let make = declaration_named(&facts, "make", DeclarationKind::Method)?;
+    let create = declaration_named(&facts, "create", DeclarationKind::Function)?;
+
+    assert_eq!(
+        facts
+            .declarations()
+            .iter()
+            .map(|declaration| (declaration.name.as_str(), declaration.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("Outer", DeclarationKind::Struct),
+            ("Inner", DeclarationKind::Struct),
+            ("f", DeclarationKind::Method),
+            ("g", DeclarationKind::Method),
+            ("make", DeclarationKind::Method),
+            ("create", DeclarationKind::Function),
+        ]
+    );
+    assert_eq!(outer.projection_text, "struct Outer {\n    int x;\n};");
+    assert_eq!(inner.projection_text, "struct Inner {\n    };");
+    assert_eq!(f.projection_text, "int f()");
+    assert_eq!(g.projection_text, "int g()");
+    assert_eq!(make.projection_text, "struct Inner *make();");
+    assert_eq!(create.projection_text, "struct Outer *create(void);");
+    assert_eq!(inner.parent_part.as_ref(), Some(&outer.id));
+    assert_eq!(make.parent_part.as_ref(), Some(&outer.id));
+    assert_eq!(outer.children, [inner.id.clone(), make.id.clone()]);
+    assert_eq!(f.parent_part.as_ref(), Some(&inner.id));
+    assert_eq!(g.parent_part.as_ref(), Some(&inner.id));
+    assert!(
+        facts
+            .declarations()
+            .iter()
+            .all(|declaration| !declaration.projection_text.contains("return")),
+        "no projection may render a nested method body"
+    );
+    assert!(facts.diagnostics.is_empty(), "{:?}", facts.diagnostics);
+
+    Ok(())
+}

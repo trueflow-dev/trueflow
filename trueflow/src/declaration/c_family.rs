@@ -114,20 +114,18 @@ impl Projector<'_> {
             }
 
             self.expire_detached_docs(child.start_byte(), &mut pending);
-            if let Some(specifier) = aggregate_specifier(child) {
-                if is_aggregate_declaration(child, specifier) {
-                    let attachments = std::mem::take(&mut pending);
-                    self.add_aggregate(
-                        child,
-                        specifier,
-                        attachments,
-                        parent_id.cloned(),
-                        parent_name,
-                        default_visibility.clone(),
-                    )?;
-                } else {
-                    pending.clear();
-                }
+            if let Some(specifier) = aggregate_specifier(child)
+                .filter(|specifier| is_aggregate_declaration(child, *specifier))
+            {
+                let attachments = std::mem::take(&mut pending);
+                self.add_aggregate(
+                    child,
+                    specifier,
+                    attachments,
+                    parent_id.cloned(),
+                    parent_name,
+                    default_visibility.clone(),
+                )?;
                 continue;
             }
             if let Some(declarators) = callable_declarators(child) {
@@ -587,19 +585,17 @@ impl Projector<'_> {
                 continue;
             }
             self.expire_detached_docs(child.start_byte(), &mut pending);
-            if let Some(specifier) = aggregate_specifier(child) {
-                if is_aggregate_declaration(child, specifier) {
-                    self.add_aggregate(
-                        child,
-                        specifier,
-                        std::mem::take(&mut pending),
-                        Some(parent_id.clone()),
-                        Some(parent_name),
-                        visibility.clone(),
-                    )?;
-                } else {
-                    pending.clear();
-                }
+            if let Some(specifier) = aggregate_specifier(child)
+                .filter(|specifier| is_aggregate_declaration(child, *specifier))
+            {
+                self.add_aggregate(
+                    child,
+                    specifier,
+                    std::mem::take(&mut pending),
+                    Some(parent_id.clone()),
+                    Some(parent_name),
+                    visibility.clone(),
+                )?;
                 continue;
             }
             if let Some(declarators) = callable_declarators(child) {
@@ -803,21 +799,12 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
                 range: prefix_start..member_end,
                 role: SourceComponentRole::AggregateShape,
             }),
-            "field_declaration" => {
-                if !contains_callable_declarator(member) {
-                    if prefix_start < member.start_byte() {
-                        parts.push(Part {
-                            range: prefix_start..member.start_byte(),
-                            role: SourceComponentRole::AggregateShape,
-                        });
-                    }
-                    parts.extend(field_shape_parts(member));
-                }
-            }
-            "declaration" => {
-                if contains_callable_declarator(member) {
-                    // A callable child exclusively owns its prototype.
-                } else if aggregate_specifier(member).is_none() {
+            "field_declaration" | "declaration" => {
+                // Callable and nested aggregate children exclusively own their surfaces.
+                let owned_by_child = contains_callable_declarator(member)
+                    || aggregate_specifier(member)
+                        .is_some_and(|specifier| is_aggregate_declaration(member, specifier));
+                if !owned_by_child {
                     if prefix_start < member.start_byte() {
                         parts.push(Part {
                             range: prefix_start..member.start_byte(),
@@ -1008,7 +995,10 @@ fn collect_entity_declarators<'a>(node: Node<'a>, found: &mut Vec<Node<'a>>) {
     }
     if matches!(
         node.kind(),
-        "parameter_declaration" | "optional_parameter_declaration" | "compound_statement"
+        "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "compound_statement"
+            | "field_declaration_list"
     ) {
         return;
     }
@@ -1059,6 +1049,10 @@ fn function_node(node: Node<'_>) -> Option<Node<'_>> {
 fn contains_callable_syntax(node: Node<'_>) -> bool {
     if matches!(node.kind(), "function_declarator" | "operator_cast") {
         return true;
+    }
+    // Callables inside a nested aggregate body belong to that aggregate.
+    if node.kind() == "field_declaration_list" {
+        return false;
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
@@ -1162,7 +1156,11 @@ fn aggregate_specifier(node: Node<'_>) -> Option<Node<'_>> {
     }
     if matches!(
         node.kind(),
-        "declaration" | "type_definition" | "template_declaration" | "friend_declaration"
+        "declaration"
+            | "field_declaration"
+            | "type_definition"
+            | "template_declaration"
+            | "friend_declaration"
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -1186,7 +1184,9 @@ fn is_aggregate_declaration(item: Node<'_>, specifier: Node<'_>) -> bool {
                 "identifier"
                     | "field_identifier"
                     | "pointer_declarator"
+                    | "reference_declarator"
                     | "array_declarator"
+                    | "function_declarator"
                     | "init_declarator"
             )
     })
