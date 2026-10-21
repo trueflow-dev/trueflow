@@ -881,7 +881,7 @@ case "$body" in
     printf '{"data":{"repository":{"pullRequest":{"headRefOid":"%s"}}}}\n' "$TRUEFLOW_FAKE_GH_HEAD"
     ;;
   *"TrueflowPullRequestDeliveryReviews"*)
-    printf '{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[{"id":"PRR_pending_review","fullDatabaseId":101,"url":"https://github.com/trueflow-test-owner/trueflow-test-repository/pull/11#pullrequestreview-101","body":%s,"state":"PENDING","viewerDidAuthor":true,"commit":{"oid":"%s"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$TRUEFLOW_FAKE_GH_PENDING_BODY_JSON" "$TRUEFLOW_FAKE_GH_HEAD"
+    printf '{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[{"id":"PRR_pending_review","fullDatabaseId":"101","url":"https://github.com/trueflow-test-owner/trueflow-test-repository/pull/11#pullrequestreview-101","body":%s,"state":"PENDING","viewerDidAuthor":true,"commit":{"oid":"%s"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$TRUEFLOW_FAKE_GH_PENDING_BODY_JSON" "$TRUEFLOW_FAKE_GH_HEAD"
     ;;
   *"TrueflowPullRequestDeliveryThreads"*)
     printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n'

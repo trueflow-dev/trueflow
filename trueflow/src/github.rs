@@ -1334,13 +1334,33 @@ struct PullRequestDeliveryPageInfo {
 struct RawPullRequestDeliveryReview {
     id: String,
     #[serde(rename = "fullDatabaseId")]
-    database_id: Option<u64>,
+    database_id: Option<GraphQlBigInt>,
     url: String,
     body: String,
     state: String,
     #[serde(rename = "viewerDidAuthor")]
     viewer_did_author: bool,
     commit: Option<RawPullRequestDeliveryCommit>,
+}
+
+/// GraphQL `BigInt` values are documented as JSON strings; numbers are
+/// accepted too because the scalar's wire encoding is not part of the schema.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GraphQlBigInt {
+    String(String),
+    Number(u64),
+}
+
+impl GraphQlBigInt {
+    fn into_u64(self) -> Result<u64> {
+        match self {
+            Self::String(value) => value
+                .parse()
+                .with_context(|| format!("expected an unsigned integer string, got {value:?}")),
+            Self::Number(value) => Ok(value),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1482,7 +1502,11 @@ fn snapshot_pull_request_delivery_review(
 ) -> Result<GitHubPullRequestReviewSnapshot> {
     Ok(GitHubPullRequestReviewSnapshot {
         node_id: nonblank_pull_request_delivery_value(&review.id, "review id")?,
-        database_id: review.database_id,
+        database_id: review
+            .database_id
+            .map(GraphQlBigInt::into_u64)
+            .transpose()
+            .context("GitHub GraphQL delivery review included an invalid fullDatabaseId")?,
         state: parse_pull_request_review_state(Some(&review.state)),
         head_sha: review
             .commit
@@ -2405,6 +2429,49 @@ mod tests {
         );
         assert!(super::parse_trueflow_delivery_marker(&duplicated).is_err());
     }
+
+    #[test]
+    fn delivery_snapshot_parses_numeric_full_database_id() {
+        let reviews_raw = serde_json::json!({
+            "data": {"repository": {"pullRequest": {"reviews": {
+                "nodes": [{
+                    "id": "PRR_17",
+                    "fullDatabaseId": 17,
+                    "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-17",
+                    "body": "",
+                    "state": "PENDING",
+                    "viewerDidAuthor": true,
+                    "commit": null
+                }],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            }}}}
+        })
+        .to_string();
+        let (reviews, _) = super::parse_pull_request_delivery_reviews_page(&reviews_raw).unwrap();
+        assert_eq!(reviews[0].database_id, Some(17));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_non_numeric_full_database_id() {
+        let reviews_raw = serde_json::json!({
+            "data": {"repository": {"pullRequest": {"reviews": {
+                "nodes": [{
+                    "id": "PRR_17",
+                    "fullDatabaseId": "seventeen",
+                    "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-17",
+                    "body": "",
+                    "state": "PENDING",
+                    "viewerDidAuthor": true,
+                    "commit": null
+                }],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            }}}}
+        })
+        .to_string();
+        let error = super::parse_pull_request_delivery_reviews_page(&reviews_raw).unwrap_err();
+        assert!(format!("{error:#}").contains("fullDatabaseId"), "{error:#}");
+    }
+
     #[test]
     fn delivery_snapshot_parses_review_thread_and_every_comment_field() {
         let reviews_raw = serde_json::json!({
@@ -2414,7 +2481,7 @@ mod tests {
                         "reviews": {
                             "nodes": [{
                                 "id": "PRR_17",
-                                "fullDatabaseId": 17,
+                                "fullDatabaseId": "17",
                                 "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-17",
                                 "body": "owned review",
                                 "state": "PENDING",
