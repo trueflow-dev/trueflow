@@ -167,7 +167,11 @@ impl Projector<'_> {
             )));
             return Ok(());
         };
-        let Some(name_node) = item.declaration.child_by_field_name("name") else {
+        let Some(name_node) = item
+            .declaration
+            .child_by_field_name("name")
+            .or_else(|| default_export_keyword(item.outer))
+        else {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
                 "omitted TypeScript {:?} at byte {} because it has no declared name",
                 item.kind,
@@ -622,7 +626,9 @@ impl Projector<'_> {
         parent_id: Option<&DeclarationId>,
         parent_name: Option<&str>,
     ) -> Result<()> {
-        let name_node = declaration.child_by_field_name("name");
+        let name_node = declaration
+            .child_by_field_name("name")
+            .or_else(|| default_export_keyword(outer));
         let (name, name_range) = if kind == DeclarationKind::Constructor {
             if let Some(name_node) = name_node {
                 (
@@ -773,8 +779,11 @@ impl Projector<'_> {
 
 fn top_level_item(node: Node<'_>) -> Option<TopLevelItem<'_>> {
     let outer = node;
+    // An anonymous `export default function () {}` or `export default class {}` is parsed as
+    // the export's value rather than its declaration.
     let mut declaration = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration")?
+        node.child_by_field_name("declaration")
+            .or_else(|| node.child_by_field_name("value"))?
     } else {
         node
     };
@@ -799,8 +808,12 @@ fn top_level_item(node: Node<'_>) -> Option<TopLevelItem<'_>> {
         })?;
     }
     let kind = match declaration.kind() {
-        "function_declaration" | "function_signature" => DeclarationKind::Function,
-        "class_declaration" | "abstract_class_declaration" => DeclarationKind::Class,
+        "function_declaration"
+        | "function_signature"
+        | "function_expression"
+        | "generator_function"
+        | "arrow_function" => DeclarationKind::Function,
+        "class_declaration" | "abstract_class_declaration" | "class" => DeclarationKind::Class,
         "interface_declaration" => DeclarationKind::Interface,
         "type_alias_declaration" => DeclarationKind::TypeAlias,
         "enum_declaration" => DeclarationKind::Enum,
@@ -830,6 +843,14 @@ fn direct_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tr
 
     node.children(&mut cursor)
         .find(|child| child.kind() == kind)
+}
+
+/// The `default` keyword naming an anonymous default export.
+fn default_export_keyword(outer: Node<'_>) -> Option<Node<'_>> {
+    if outer.kind() != "export_statement" {
+        return None;
+    }
+    direct_child_by_kind(outer, "default")
 }
 
 fn is_callable_member(node: Node<'_>) -> bool {

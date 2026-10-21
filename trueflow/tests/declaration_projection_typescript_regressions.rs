@@ -326,3 +326,36 @@ fn arrow_function_const_excludes_its_body() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn anonymous_default_exports_are_projected_as_default_declarations() -> Result<()> {
+    for (source, kind, projection) in [
+        (
+            "/** Starts the app. */\nexport default function (port: number): void {\n  listen(port);\n}\n",
+            DeclarationKind::Function,
+            "/** Starts the app. */\nexport default function (port: number): void",
+        ),
+        (
+            "export default (port: number): void => {\n  listen(port);\n};\n",
+            DeclarationKind::Function,
+            "export default (port: number): void =>",
+        ),
+        (
+            "export default class {\n  port: number = 80;\n}\n",
+            DeclarationKind::Class,
+            "export default class {\n  port: number;\n}",
+        ),
+    ] {
+        let facts = project(source)?;
+        assert_complete_inventory(&facts);
+        let declaration = declaration_named(&facts, "default", kind)?;
+        assert_eq!(declaration.projection_text, projection, "{source:?}");
+        assert_eq!(facts.declarations().len(), 1, "{source:?}");
+        assert!(
+            !declaration.projection_text.contains("listen"),
+            "default export bodies must not be projected"
+        );
+    }
+
+    Ok(())
+}
