@@ -22,7 +22,7 @@ mod client;
 
 pub use client::{
     AsyncLspLauncher, CallHierarchyBundle, DocumentSnapshot, ProviderCallHierarchyState,
-    ProviderError, RelationshipProvider, TextDocumentSync,
+    ProviderError, ProviderKillSwitch, RelationshipProvider, TextDocumentSync,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

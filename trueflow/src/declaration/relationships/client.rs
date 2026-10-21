@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 
 use crate::analysis::Language;
@@ -246,10 +247,31 @@ impl LspServerLauncher for AsyncLspLauncher {
         if self.provider.is_some() {
             return Err(LaunchError::new("an LSP provider is already active"));
         }
-        let provider = RelationshipProvider::launch(profile, language, workspace_root, self.trust)
-            .map_err(|error| LaunchError::new(error.to_string()))?;
+        let provider = RelationshipProvider::launch(
+            profile,
+            language,
+            workspace_root,
+            self.trust,
+            &ProviderKillSwitch::default(),
+        )
+        .map_err(|error| LaunchError::new(error.to_string()))?;
         self.provider = Some(provider);
         Ok(())
+    }
+}
+
+/// Kills every language server launched with it, including one that is still initializing
+/// or answering a request. Graceful shutdown stays the normal path; this bounds it.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderKillSwitch(CancellationToken);
+
+impl ProviderKillSwitch {
+    pub fn kill(&self) {
+        self.0.cancel();
+    }
+
+    pub fn is_killed(&self) -> bool {
+        self.0.is_cancelled()
     }
 }
 
@@ -287,6 +309,7 @@ pub struct RelationshipProvider {
     command_tx: mpsc::Sender<WorkerCommand>,
     healthy: AtomicBool,
     thread: Option<JoinHandle<()>>,
+    kill_switch: ProviderKillSwitch,
     closed: bool,
 }
 
@@ -296,6 +319,7 @@ impl RelationshipProvider {
         language: Language,
         workspace_root: &Path,
         trust: WorkspaceTrust,
+        kill_switch: &ProviderKillSwitch,
     ) -> Result<Self, ProviderError> {
         if trust != WorkspaceTrust::TrustedForInvocation {
             return Err(ProviderError::Untrusted);
@@ -319,8 +343,19 @@ impl RelationshipProvider {
             )));
         }
         let executable = resolve_fixed_executable(profile, &root)?;
+        Self::launch_executable(profile, language, root, executable, kill_switch)
+    }
+
+    fn launch_executable(
+        profile: LspServerProfile,
+        language: Language,
+        root: PathBuf,
+        executable: PathBuf,
+        kill_switch: &ProviderKillSwitch,
+    ) -> Result<Self, ProviderError> {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
+        let worker_kill_switch = kill_switch.clone();
         let thread = thread::Builder::new()
             .name(format!("trueflow-lsp-{profile:?}"))
             .spawn(move || {
@@ -333,9 +368,11 @@ impl RelationshipProvider {
                         return;
                     }
                 };
-                runtime.block_on(worker_main(
+                // Killing drops the session mid-await; its child was spawned with
+                // `kill_on_drop`, so the server process is killed with it.
+                runtime.block_on(worker_kill_switch.0.run_until_cancelled(worker_main(
                     profile, language, root, executable, command_rx, startup_tx,
-                ));
+                )));
             })
             .map_err(|error| {
                 ProviderError::Protocol(format!("cannot start LSP worker: {error}"))
@@ -361,6 +398,7 @@ impl RelationshipProvider {
             command_tx,
             healthy: AtomicBool::new(true),
             thread: Some(thread),
+            kill_switch: kill_switch.clone(),
             closed: false,
         })
     }
@@ -420,6 +458,13 @@ impl RelationshipProvider {
             return Ok(());
         }
         self.closed = true;
+        if self.kill_switch.is_killed() {
+            // The worker dropped the session, killing its server; only the thread remains.
+            return match self.thread.take().map(JoinHandle::join) {
+                Some(Err(_)) => Err(ProviderError::Protocol("LSP worker panicked".to_owned())),
+                Some(Ok(())) | None => Ok(()),
+            };
+        }
         let reply = self.request_even_if_closing(|reply| WorkerCommand::Shutdown { reply });
         let should_join =
             reply.is_ok() || self.thread.as_ref().is_some_and(JoinHandle::is_finished);
@@ -1851,6 +1896,84 @@ mod tests {
             folder_uris,
             Some(vec![expected_uri]),
             "workspaceFolders must be non-null and contain exactly the identified root"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: &str) -> bool {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .is_ok_and(|output| {
+                let state = String::from_utf8_lossy(&output.stdout);
+                output.status.success()
+                    && !state.trim().is_empty()
+                    && !state.trim().starts_with('Z')
+            })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_switch_stops_a_server_that_never_answers() {
+        let fixture = TestDirectory::new("lsp_kill_switch_hung_server");
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("create workspace: {error}"));
+        let workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical workspace: {error}"));
+        let pid_file = fixture.path().join("server.pid");
+        let server = fixture.path().join("hung-server");
+        fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap_or_else(|error| panic!("write hung server: {error}"));
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| panic!("mark hung server executable: {error}"));
+
+        let kill_switch = ProviderKillSwitch::default();
+        let killer = {
+            let kill_switch = kill_switch.clone();
+            let pid_file = pid_file.clone();
+            thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while fs::read_to_string(&pid_file).map_or(true, |pid| !pid.ends_with('\n'))
+                    && std::time::Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                kill_switch.kill();
+            })
+        };
+        let started = std::time::Instant::now();
+        let launched = RelationshipProvider::launch_executable(
+            LspServerProfile::RustAnalyzer,
+            Language::Rust,
+            workspace,
+            server,
+            &kill_switch,
+        );
+        killer
+            .join()
+            .unwrap_or_else(|_| panic!("kill switch thread panicked"));
+
+        assert!(
+            launched.is_err(),
+            "a killed server must not become a session"
+        );
+        assert!(
+            started.elapsed() < INITIALIZE_TIMEOUT,
+            "the kill switch must interrupt a hung server instead of waiting for its timeout"
+        );
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap_or_else(|error| panic!("read server pid: {error}"));
+        assert!(
+            !process_is_running(pid.trim()),
+            "the killed language server process {} is still running",
+            pid.trim()
         );
     }
 }

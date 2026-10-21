@@ -11,12 +11,13 @@ use async_lsp::lsp_types::{CallHierarchyItem, Position, Range, Url};
 
 use crate::declaration::relationships::{
     CallHierarchyBundle, DocumentHash, DocumentSnapshot, LspServerProfile, PositionEncoding,
-    ProjectedDocument, ProviderCallHierarchyState, ProviderError, RelationshipBackend,
-    RelationshipEdge, RelationshipKind, RelationshipLocation, RelationshipMethod,
-    RelationshipOutcome, RelationshipProjectionIndex, RelationshipProvenance, RelationshipProvider,
-    RelationshipRequestKey, RelationshipResult, RelationshipScope, RelationshipTarget,
-    SourceGeneration, WorkspaceTrust, declaration_name_start, execute_relationship_plan,
-    lsp_position_for_byte_offset, plan_used_by, plan_uses_types, reconcile_relationship_execution,
+    ProjectedDocument, ProviderCallHierarchyState, ProviderError, ProviderKillSwitch,
+    RelationshipBackend, RelationshipEdge, RelationshipKind, RelationshipLocation,
+    RelationshipMethod, RelationshipOutcome, RelationshipProjectionIndex, RelationshipProvenance,
+    RelationshipProvider, RelationshipRequestKey, RelationshipResult, RelationshipScope,
+    RelationshipTarget, SourceGeneration, WorkspaceTrust, declaration_name_start,
+    execute_relationship_plan, lsp_position_for_byte_offset, plan_used_by, plan_uses_types,
+    reconcile_relationship_execution,
 };
 use crate::declaration::snapshot::SnapshotId;
 use crate::declaration::{DeclarationId, TypeUseRole, project_source};
@@ -1014,16 +1015,25 @@ pub struct BackgroundRelationshipProvider {
     work_tx: Option<SyncSender<DeclarationRelationshipRequest>>,
     result_rx: Receiver<DeclarationRelationshipResults>,
     worker: Option<JoinHandle<()>>,
+    kill_switch: ProviderKillSwitch,
     closed: bool,
 }
 
 impl BackgroundRelationshipProvider {
     pub fn new() -> std::result::Result<Self, ProviderError> {
-        Self::with_launcher(LspSessionLauncher)
+        let kill_switch = ProviderKillSwitch::default();
+        Self::with_launcher(
+            LspSessionLauncher {
+                kill_switch: kill_switch.clone(),
+            },
+            kill_switch,
+        )
     }
 
+    /// `kill_switch` must be the switch every session `launcher` starts is bound to.
     fn with_launcher<L: SessionLauncher + Send + 'static>(
         launcher: L,
+        kill_switch: ProviderKillSwitch,
     ) -> std::result::Result<Self, ProviderError> {
         let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_DEPTH);
         let (result_tx, result_rx) = mpsc::sync_channel(RESULT_QUEUE_DEPTH);
@@ -1039,6 +1049,7 @@ impl BackgroundRelationshipProvider {
             work_tx: Some(work_tx),
             result_rx,
             worker: Some(worker),
+            kill_switch,
             closed: false,
         })
     }
@@ -1080,12 +1091,12 @@ impl DeclarationRelationshipProvider for BackgroundRelationshipProvider {
         let Some(worker) = self.worker.as_ref() else {
             return Ok(());
         };
-        let deadline = Instant::now() + BACKGROUND_SHUTDOWN_TIMEOUT;
-        while !worker.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if !worker.is_finished() {
-            return Err(ProviderError::Timeout);
+        if !wait_until_finished(worker, BACKGROUND_SHUTDOWN_TIMEOUT) {
+            // A language server that does not stop in time must not outlive the review.
+            self.kill_switch.kill();
+            if !wait_until_finished(worker, BACKGROUND_SHUTDOWN_TIMEOUT) {
+                return Err(ProviderError::Timeout);
+            }
         }
         let Some(worker) = self.worker.take() else {
             return Err(ProviderError::Protocol(
@@ -1106,6 +1117,14 @@ impl Drop for BackgroundRelationshipProvider {
             eprintln!("relationship background shutdown failed: {error}");
         }
     }
+}
+
+fn wait_until_finished(worker: &JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    worker.is_finished()
 }
 
 /// Language-server operations the background worker drives. `RelationshipProvider` is the
@@ -1175,7 +1194,9 @@ trait SessionLauncher {
     ) -> std::result::Result<Self::Session, ProviderError>;
 }
 
-struct LspSessionLauncher;
+struct LspSessionLauncher {
+    kill_switch: ProviderKillSwitch,
+}
 
 impl SessionLauncher for LspSessionLauncher {
     type Session = RelationshipProvider;
@@ -1191,6 +1212,7 @@ impl SessionLauncher for LspSessionLauncher {
             language,
             workspace_root,
             WorkspaceTrust::TrustedForInvocation,
+            &self.kill_switch,
         )
     }
 }
@@ -1500,8 +1522,10 @@ mod tests {
     }
 
     /// Mirrors the LSP client's open-document bookkeeping and its 32-document session limit.
+    /// With `hang_until_killed` it models a server that never answers until it is killed.
     struct FakeSession {
         open: HashMap<Url, DocumentHash>,
+        hang_until_killed: Option<ProviderKillSwitch>,
     }
 
     impl RelationshipBackend for FakeSession {
@@ -1555,6 +1579,16 @@ mod tests {
             key: RelationshipRequestKey,
             _position: Position,
         ) -> ProviderCallHierarchyState {
+            if let Some(kill_switch) = &self.hang_until_killed {
+                // A hung server: only the kill switch ends the request.
+                while !kill_switch.is_killed() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return ProviderCallHierarchyState::Failed {
+                    key,
+                    message: "language server was killed".to_owned(),
+                };
+            }
             if self.open.contains_key(&key.document_uri) {
                 ProviderCallHierarchyState::Ready(CallHierarchyBundle {
                     key,
@@ -1582,6 +1616,7 @@ mod tests {
     #[derive(Default)]
     struct FakeLauncher {
         launches: usize,
+        hang_until_killed: Option<ProviderKillSwitch>,
     }
 
     impl SessionLauncher for FakeLauncher {
@@ -1596,6 +1631,7 @@ mod tests {
             self.launches += 1;
             Ok(FakeSession {
                 open: HashMap::new(),
+                hang_until_killed: self.hang_until_killed.clone(),
             })
         }
     }
@@ -1755,6 +1791,31 @@ mod tests {
             ));
         }
         assert_eq!(launcher.launches, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_kills_language_servers_behind_an_in_flight_request() -> Result<()> {
+        let (_repo, mut requests) = dirty_requests("relationship_worker_shutdown_kill", 1)?;
+        let kill_switch = ProviderKillSwitch::default();
+        let mut provider = BackgroundRelationshipProvider::with_launcher(
+            FakeLauncher {
+                launches: 0,
+                hang_until_killed: Some(kill_switch.clone()),
+            },
+            kill_switch.clone(),
+        )?;
+        provider.request(requests.remove(0))?;
+
+        let shutdown = provider.shutdown();
+        assert!(
+            kill_switch.is_killed(),
+            "quitting must kill a language server that does not stop in time"
+        );
+        assert!(
+            shutdown.is_ok(),
+            "the relationship worker must stop once its servers are killed: {shutdown:?}"
+        );
         Ok(())
     }
 }
