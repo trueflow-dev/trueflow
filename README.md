@@ -653,7 +653,10 @@ history: restore or correct the log before relying on its review coverage.
 Pull request review is fetch-only. `trueflow tui --target pr:11` resolves the
 pull request metadata and reviews the PR diff without checking out the branch or
 switching the user worktree. PR targets can also use `pr:owner/repo/11` or a
-GitHub pull request URL.
+GitHub pull request URL, including its `files`, `commits`, or `checks` tab.
+Short forms take the host from the matching git remote; SSH remote hosts are
+resolved through `ssh -G`, so `~/.ssh/config` aliases such as
+`git@github-work:owner/repo.git` reach the aliased GitHub host.
 
 The TUI queues each PR commit as its diff against its first parent. Merge
 commits that only bring the base branch into the PR (such as GitHub's "Update

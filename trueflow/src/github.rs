@@ -3,6 +3,8 @@ use crate::store::CommitId;
 use crate::vcs;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::path::Path;
 use std::process::Command;
@@ -720,11 +722,17 @@ pub fn load_git_remotes(repo_root: &Path) -> Result<Vec<GitRemote>> {
 
     let stdout = String::from_utf8(output.stdout)
         .with_context(|| format!("git config output was not utf8 in {}", repo_root.display()))?;
-    parse_git_remotes_config(&stdout)
+    parse_git_remotes_config(&stdout, resolve_ssh_host_with_ssh_config)
 }
 
-pub fn parse_git_remotes_config(raw: &str) -> Result<Vec<GitRemote>> {
+/// Parses `git config --get-regexp` remote URLs. SSH hosts go through
+/// `resolve_ssh_host` once each, so `~/.ssh/config` aliases name the real host.
+pub fn parse_git_remotes_config(
+    raw: &str,
+    mut resolve_ssh_host: impl FnMut(&str) -> Result<String>,
+) -> Result<Vec<GitRemote>> {
     let mut remotes = Vec::new();
+    let mut resolved_ssh_hosts = HashMap::<String, String>::new();
 
     for line in raw.lines() {
         let line = line.trim();
@@ -740,6 +748,21 @@ pub fn parse_git_remotes_config(raw: &str) -> Result<Vec<GitRemote>> {
         };
         let Some((host, owner, repo)) = parse_remote_repo_identity(fetch_url.trim()) else {
             continue;
+        };
+        let host = match host {
+            RemoteHost::Literal(host) => host,
+            RemoteHost::Ssh(alias) => match resolved_ssh_hosts.entry(alias) {
+                Entry::Occupied(entry) => entry.get().clone(),
+                Entry::Vacant(entry) => {
+                    let resolved = resolve_ssh_host(entry.key()).with_context(|| {
+                        format!(
+                            "failed to resolve SSH host alias '{}' of remote '{remote_name}'",
+                            entry.key()
+                        )
+                    })?;
+                    entry.insert(resolved).clone()
+                }
+            },
         };
         remotes.push(GitRemote {
             name: remote_name.to_string(),
@@ -1957,19 +1980,35 @@ fn parse_remote_config_key(key: &str) -> Option<&str> {
     (suffix == "url").then_some(name)
 }
 
-fn parse_remote_repo_identity(url: &str) -> Option<(String, String, String)> {
+/// How a remote URL names its host.
+enum RemoteHost {
+    /// An SSH destination, which `~/.ssh/config` may alias to another hostname.
+    Ssh(String),
+    /// A hostname used as written.
+    Literal(String),
+}
+
+fn parse_remote_repo_identity(url: &str) -> Option<(RemoteHost, String, String)> {
     parse_remote_repo_identity_from_standard_url(url)
         .or_else(|| parse_remote_repo_identity_from_scp_like_url(url))
 }
 
-fn parse_remote_repo_identity_from_standard_url(url: &str) -> Option<(String, String, String)> {
+fn parse_remote_repo_identity_from_standard_url(
+    url: &str,
+) -> Option<(RemoteHost, String, String)> {
     let parsed = Url::parse(url).ok()?;
     let host = parsed.host_str()?.to_string();
+    let host = match parsed.scheme() {
+        "ssh" | "git+ssh" | "ssh+git" => RemoteHost::Ssh(host),
+        _ => RemoteHost::Literal(host),
+    };
     let path = parsed.path().trim_start_matches('/');
     parse_owner_repo_path(path).map(|(owner, repo)| (host, owner, repo))
 }
 
-fn parse_remote_repo_identity_from_scp_like_url(url: &str) -> Option<(String, String, String)> {
+fn parse_remote_repo_identity_from_scp_like_url(
+    url: &str,
+) -> Option<(RemoteHost, String, String)> {
     let (host_part, path_part) = url.split_once(':')?;
     if host_part.contains('/') {
         return None;
@@ -1980,7 +2019,39 @@ fn parse_remote_repo_identity_from_scp_like_url(url: &str) -> Option<(String, St
     if host.trim().is_empty() {
         return None;
     }
-    parse_owner_repo_path(path_part).map(|(owner, repo)| (host.to_string(), owner, repo))
+    parse_owner_repo_path(path_part)
+        .map(|(owner, repo)| (RemoteHost::Ssh(host.to_string()), owner, repo))
+}
+
+/// Resolves an SSH destination the way `ssh` and `gh` do, through `ssh -G`.
+fn resolve_ssh_host_with_ssh_config(alias: &str) -> Result<String> {
+    let output = Command::new("ssh")
+        .args(["-G", "--", alias])
+        .output()
+        .with_context(|| format!("failed to run `ssh -G` for SSH host '{alias}'"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`ssh -G` could not resolve SSH host '{alias}': {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    ssh_config_hostname(&String::from_utf8_lossy(&output.stdout))
+        .with_context(|| format!("`ssh -G` printed no hostname for SSH host '{alias}'"))
+}
+
+/// The `hostname` in `ssh -G` output, named the way `gh` names GitHub hosts:
+/// subdomains such as the port-443 endpoint `ssh.github.com` are `github.com`.
+fn ssh_config_hostname(ssh_config: &str) -> Option<String> {
+    let hostname = ssh_config
+        .lines()
+        .find_map(|line| line.strip_prefix("hostname "))?
+        .trim()
+        .to_ascii_lowercase();
+    Some(if hostname.ends_with(".github.com") {
+        "github.com".to_string()
+    } else {
+        hostname
+    })
 }
 
 fn parse_owner_repo_path(path: &str) -> Option<(String, String)> {
@@ -2774,6 +2845,7 @@ mod tests {
     fn parse_git_remotes_config_supports_https_and_ssh_urls() {
         let remotes = parse_git_remotes_config(
             "remote.origin.url https://github.com/jmqd/trueflow.git\nremote.upstream.url git@github.company.com:trueflow/trueflow.git\n",
+            literal_host,
         )
         .unwrap();
 
@@ -2802,6 +2874,7 @@ mod tests {
     fn parse_git_remotes_config_rejects_urls_with_extra_path_segments() {
         let remotes = parse_git_remotes_config(
             "remote.bad-https.url https://github.com/jmqd/trueflow/extra.git\nremote.bad-ssh.url git@github.com:jmqd/trueflow/extra.git\n",
+            literal_host,
         )
         .unwrap();
 
@@ -2811,9 +2884,66 @@ mod tests {
     #[test]
     fn parse_git_remotes_config_rejects_scp_like_urls_with_empty_host() {
         let remotes =
-            parse_git_remotes_config("remote.origin.url git@:jmqd/trueflow.git\n").unwrap();
+            parse_git_remotes_config("remote.origin.url git@:jmqd/trueflow.git\n", literal_host)
+                .unwrap();
 
         assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn parse_git_remotes_config_resolves_ssh_host_aliases_once() {
+        let mut resolved = Vec::new();
+        let remotes = parse_git_remotes_config(
+            "remote.origin.url git@github-work:jmqd/trueflow.git\nremote.fork.url ssh://git@github-work/me/trueflow.git\nremote.web.url https://github-work/jmqd/trueflow.git\n",
+            |alias| {
+                resolved.push(alias.to_string());
+                Ok("github.com".to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, vec!["github-work".to_string()]);
+        assert_eq!(
+            remotes
+                .iter()
+                .map(|remote| (remote.name.as_str(), remote.host.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("origin", "github.com"),
+                ("fork", "github.com"),
+                ("web", "github-work"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_git_remotes_config_names_unresolvable_ssh_alias_and_remote() {
+        let error = parse_git_remotes_config(
+            "remote.origin.url git@github-work:jmqd/trueflow.git\n",
+            |alias| Err(anyhow!("ssh could not resolve {alias}")),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("'github-work'"), "{message}");
+        assert!(message.contains("'origin'"), "{message}");
+    }
+
+    #[test]
+    fn ssh_config_hostname_normalizes_github_ssh_endpoints() {
+        assert_eq!(
+            super::ssh_config_hostname("user git\nhostname ssh.github.com\nport 443\n"),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            super::ssh_config_hostname("hostname GitHub.Company.com\n"),
+            Some("github.company.com".to_string())
+        );
+        assert_eq!(super::ssh_config_hostname("user git\nport 22\n"), None);
+    }
+
+    fn literal_host(host: &str) -> Result<String> {
+        Ok(host.to_string())
     }
 
     #[test]
@@ -3089,7 +3219,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:jmqd/trueflow.git",
+                "https://github.com/jmqd/trueflow.git",
             ],
         );
         let requested = PullRequestRef::Number { number: 11 };
@@ -3141,7 +3271,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@GitHub.com:JMQD/Trueflow.git",
+                "https://github.com/JMQD/Trueflow.git",
             ],
         );
         let metadata = PullRequestMetadata {

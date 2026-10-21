@@ -303,6 +303,19 @@ fn gh_pending_review_append_uses_thread_for_multiline() -> TestResult {
 }
 
 #[test]
+fn gh_pending_review_append_resolves_ssh_host_alias_origin() -> TestResult {
+    // `github-work` is an ~/.ssh/config alias; fake ssh resolves it to the
+    // port-443 endpoint, and fake gh rejects any hostname but github.com.
+    let fixture = pending_review_fixture_with_origin(
+        AnchorKind::SingleRight,
+        &format!("git@github-work:{OWNER}/{REPOSITORY}.git"),
+    )?;
+    let output = fixture.run("success")?;
+    assert_success(&output)?;
+    assert_captured_thread_request(&fixture)
+}
+
+#[test]
 fn gh_fresh_pending_review_delivers_general_only_declaration_feedback() -> TestResult {
     let fixture = general_declaration_fixture("github_fresh_general_declaration_delivery", false)?;
 
@@ -567,7 +580,18 @@ fn assert_concurrent_delivery_ledger(
     Ok(())
 }
 
+fn https_origin() -> String {
+    format!("https://github.com/{OWNER}/{REPOSITORY}.git")
+}
+
 fn pending_review_fixture(anchor: AnchorKind) -> Result<PendingReviewFixture> {
+    pending_review_fixture_with_origin(anchor, &https_origin())
+}
+
+fn pending_review_fixture_with_origin(
+    anchor: AnchorKind,
+    origin_url: &str,
+) -> Result<PendingReviewFixture> {
     let scenario = FeedbackScenario::new(anchor.fixture_name())?;
     scenario.write(
         "src/lib.rs",
@@ -616,7 +640,7 @@ fn pending_review_fixture(anchor: AnchorKind) -> Result<PendingReviewFixture> {
     });
     scenario.write_reviews(&[record])?;
 
-    configure_github_shaped_origin(&scenario, &base_sha, &head_sha)?;
+    configure_github_shaped_origin(&scenario, &base_sha, &head_sha, origin_url)?;
     seed_pending_review_ledger(&scenario, &head_sha)?;
 
     let fake_bin = temp_test_dir("github_pending_review_fake_gh");
@@ -625,6 +649,7 @@ fn pending_review_fixture(anchor: AnchorKind) -> Result<PendingReviewFixture> {
     let stdin_log = fake_bin.join("stdin.jsonl");
     let argv_log = fake_bin.join("argv.bin");
     write_fake_gh(&fake_bin.join("gh"))?;
+    write_fake_ssh(&fake_bin.join("ssh"))?;
 
     Ok(PendingReviewFixture {
         scenario,
@@ -720,7 +745,7 @@ fn general_declaration_fixture(name: &str, seed_pending: bool) -> Result<Pending
     record.validate()?;
     scenario.write_reviews(&[record])?;
 
-    configure_github_shaped_origin(&scenario, &base_sha, &head_sha)?;
+    configure_github_shaped_origin(&scenario, &base_sha, &head_sha, &https_origin())?;
     if seed_pending {
         seed_pending_review_ledger(&scenario, &head_sha)?;
     }
@@ -745,6 +770,7 @@ fn configure_github_shaped_origin(
     scenario: &FeedbackScenario,
     base_sha: &str,
     head_sha: &str,
+    origin_url: &str,
 ) -> Result<()> {
     let bare_remote = temp_test_dir("github_pending_review_git_remote");
     let bare_remote_string = bare_remote.to_string_lossy().to_string();
@@ -766,23 +792,30 @@ fn configure_github_shaped_origin(
     )?;
     run_git(
         &scenario.repo().path,
-        &[
-            "remote",
-            "add",
-            "origin",
-            &format!("https://github.com/{OWNER}/{REPOSITORY}.git"),
-        ],
+        &["remote", "add", "origin", origin_url],
     )?;
     let rewrite_key = format!("url.{bare_url}.insteadOf");
     run_git(
         &scenario.repo().path,
-        &[
-            "config",
-            "--local",
-            rewrite_key.as_str(),
-            &format!("https://github.com/{OWNER}/{REPOSITORY}.git"),
-        ],
+        &["config", "--local", rewrite_key.as_str(), origin_url],
     )
+}
+
+fn write_fake_ssh(path: &Path) -> Result<()> {
+    // Mirrors `ssh -G` for a multi-account alias that reaches GitHub over port 443.
+    let script = r#"#!/bin/sh
+if [ "$#" -ne 3 ] || [ "$1" != "-G" ] || [ "$2" != "--" ] || [ "$3" != "github-work" ]; then
+  printf 'fake ssh received unexpected arguments: %s\n' "$*" >&2
+  exit 255
+fi
+printf 'user git\nhostname ssh.github.com\nport 443\n'
+"#;
+    fs::write(path, script)
+        .with_context(|| format!("failed to write fake ssh executable {}", path.display()))?;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to make fake ssh executable {}", path.display()))
 }
 
 fn seed_pending_review_ledger(scenario: &FeedbackScenario, head_sha: &str) -> Result<()> {
