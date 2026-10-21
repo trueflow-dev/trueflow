@@ -4737,11 +4737,8 @@ fn handle_child(state: &mut AppState) {
         return;
     }
     if state.navigator.current_id() == state.navigator.tree.root() {
-        let root = state.navigator.tree.root();
-        state.root_cursor = state
-            .root_cursor
-            .filter(|id| state.navigator.is_visible(*id))
-            .or_else(|| state.navigator.first_visible_child(root));
+        let root_children = visible_root_children(state);
+        reseat_root_cursor(state, &root_children);
 
         if let Some(target) = state.root_cursor {
             state.navigator.set_current(target);
@@ -5088,6 +5085,17 @@ fn visible_root_children(state: &AppState) -> Vec<TreeNodeId> {
         .collect()
 }
 
+/// Keeps the root cursor on a visible root row, re-seating it onto the first
+/// one when its row disappeared (for example, its file was fully approved).
+fn reseat_root_cursor(state: &mut AppState, root_children: &[TreeNodeId]) {
+    if !state
+        .root_cursor
+        .is_some_and(|cursor| root_children.contains(&cursor))
+    {
+        state.root_cursor = root_children.first().copied();
+    }
+}
+
 fn root_listing_prefix_line_count(state: &AppState) -> usize {
     let mut line_count = 2usize;
     let kind_counts = review_metadata::sorted_visible_block_kind_counts(
@@ -5178,6 +5186,7 @@ fn move_root_cursor(state: &mut AppState, offset: isize) {
         return;
     }
 
+    reseat_root_cursor(state, &root_children);
     let current = state
         .root_cursor
         .and_then(|id| root_children.iter().position(|&child| child == id))
@@ -5577,6 +5586,8 @@ fn apply_action_locally(
             }
         }
         state.remaining_blocks = state.remaining_blocks.saturating_sub(removed_reviewable);
+        let root_children = visible_root_children(state);
+        reseat_root_cursor(state, &root_children);
     }
 
     if matches!(verdict, Verdict::Comment) {
@@ -8703,9 +8714,7 @@ fn build_root_lines(
 ) -> (Vec<Line<'static>>, usize) {
     let root_children = visible_root_children(state);
 
-    if state.root_cursor.is_none() {
-        state.root_cursor = root_children.first().copied();
-    }
+    reseat_root_cursor(state, &root_children);
 
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
@@ -12168,6 +12177,51 @@ mod diff_scope_tests {
         handle_next(&mut state);
 
         assert_eq!(state.navigator.current_id(), second_file);
+    }
+
+    #[test]
+    fn root_cursor_reseats_onto_visible_file_after_its_file_is_approved() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let (files, blocks): (Vec<_>, Vec<_>) = ["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(|name| {
+                let file = builder.add_file(
+                    root,
+                    name.to_string(),
+                    name.to_string(),
+                    format!("{name}-hash"),
+                    Language::Rust,
+                );
+                let block = builder.add_block(
+                    file,
+                    format!("{name}-block"),
+                    name.to_string(),
+                    test_block(format!("fn {}() {{}}", &name[..1]), BlockKind::Function, 0, 1),
+                    Language::Rust,
+                );
+                (file, block)
+            })
+            .unzip();
+        let tree = builder.finalize();
+        let visible = blocks.iter().copied().collect::<HashSet<_>>();
+        let mut state = build_test_state(ScopePreset::All, HashMap::new());
+        state.review_order = ReviewOrder::from_tree(&tree, &visible);
+        state.navigator = ReviewNavigator::new(tree, visible.clone())
+            .unwrap_or_else(|error| panic!("failed to build navigator: {error}"));
+        state.navigator.set_current(blocks[0]);
+        state.remaining_blocks = visible.len();
+        state.reviewable_nodes = visible;
+        state.root_cursor = Some(files[0]);
+
+        let action = PendingAction::from_node(&state.navigator.tree, blocks[0], Verdict::Approved);
+        execute_action_with(&mut state, action, |_params| Ok(()))
+            .unwrap_or_else(|error| panic!("approval should succeed: {error}"));
+        state.navigator.jump_root();
+
+        assert_eq!(state.root_cursor, Some(files[1]));
+        handle_scroll_line_down(&mut state);
+        assert_eq!(state.root_cursor, Some(files[2]));
     }
 
     #[test]
