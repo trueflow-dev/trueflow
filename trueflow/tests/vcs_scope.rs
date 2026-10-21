@@ -108,7 +108,9 @@ fn test_revision_file_states_recognize_canonical_file_names() -> Result<()> {
     repo.commit_all("Add Justfile")?;
 
     let git_repo = gix::open(&repo.path)?;
-    let files = trueflow::vcs::file_states_in_revision(&git_repo, "HEAD", None)?;
+    let scan_options = trueflow::scanner::ScanOptions::default();
+    let ignore = trueflow::scanner::DirectScanPathIgnoreMatcher::new(&scan_options)?;
+    let files = trueflow::vcs::file_states_in_revision(&git_repo, "HEAD", None, &ignore)?;
     let Some(justfile) = files
         .files
         .iter()

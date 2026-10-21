@@ -393,6 +393,12 @@ to review the working tree. Historical comparisons cannot be mixed with `dirty`
 in one target list. Source views, diffs, and comment anchors retain the captured
 revision even if branches move during the session.
 
+The `[scan]` ignore rules (`ignore_names`, `ignore_globs`,
+`ignore_path_prefixes`, plus the built-in `.trueflow`, `target`,
+`node_modules` and `mutants.out` names) apply to every scope alike: files
+under them are left out of `--all`, `dirty`, `main`, `rev:`, `--since` and
+`check`, including files a comparison deletes.
+
 ## Runtime config
 
 Trueflow first loads `~/.trueflow.toml` as global defaults, if present. It then

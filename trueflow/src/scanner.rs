@@ -254,7 +254,7 @@ pub fn scan_paths<P: AsRef<Path>>(
     let mut files = Vec::new();
     let mut ordered_paths = paths.iter().collect::<Vec<_>>();
     ordered_paths.sort();
-    let ignore_matcher = DirectScanPathIgnoreMatcher::new(&repo_path_base, options)?;
+    let ignore_matcher = DirectScanPathIgnoreMatcher::new(options)?;
 
     for path in ordered_paths {
         if path.is_root() || ignore_matcher.matches(path) {
@@ -332,15 +332,19 @@ pub fn scan_paths<P: AsRef<Path>>(
     })
 }
 
-struct DirectScanPathIgnoreMatcher<'a> {
+/// Matches repo-relative paths against the `[scan]` ignore rules and the
+/// built-in ignored names, so every content source (worktree paths,
+/// revision trees, changed-path sets) skips the same files.
+pub struct DirectScanPathIgnoreMatcher<'a> {
     path_prefixes: &'a [RepoPath],
     ignored_names: HashSet<&'a str>,
     glob_matcher: Gitignore,
 }
 
 impl<'a> DirectScanPathIgnoreMatcher<'a> {
-    fn new(repo_path_base: &Path, options: &'a ScanOptions) -> Result<Self> {
-        let mut builder = GitignoreBuilder::new(repo_path_base);
+    pub fn new(options: &'a ScanOptions) -> Result<Self> {
+        // Paths are repo-relative, so the glob root never strips anything.
+        let mut builder = GitignoreBuilder::new(".");
         builder.allow_unclosed_class(false);
         for pattern in &options.ignore_globs {
             builder.add_line(None, pattern)?;
@@ -357,7 +361,7 @@ impl<'a> DirectScanPathIgnoreMatcher<'a> {
         })
     }
 
-    fn matches(&self, path: &RepoPath) -> bool {
+    pub fn matches(&self, path: &RepoPath) -> bool {
         if self
             .path_prefixes
             .iter()

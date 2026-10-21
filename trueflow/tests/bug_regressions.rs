@@ -2079,7 +2079,9 @@ fn test_revision_files_skip_invalid_utf8_blob_with_diagnostic() -> Result<()> {
     repo.commit_all("Add Latin-1 notes")?;
 
     let git = gix::open(&repo.path)?;
-    let revision = trueflow::vcs::file_states_in_revision(&git, "HEAD", None)?;
+    let scan_options = ScanOptions::default();
+    let ignore = trueflow::scanner::DirectScanPathIgnoreMatcher::new(&scan_options)?;
+    let revision = trueflow::vcs::file_states_in_revision(&git, "HEAD", None, &ignore)?;
 
     assert!(
         revision
@@ -2775,6 +2777,77 @@ fn go_grouped_type_declaration_exposes_every_spec() -> Result<()> {
             .iter()
             .any(|content| content.contains("Hook func()")),
         "every grouped spec must be reviewable: {contents:?}"
+    );
+    Ok(())
+}
+
+/// Builds `main` with an ignored `vendor/` tree, then a `feature` commit that
+/// edits `src/main.rs` only when `edit_source` is set and always adds,
+/// edits and deletes files that `[scan]` and the built-in names ignore.
+fn repo_with_ignored_historical_changes(name: &str, edit_source: bool) -> Result<TestRepo> {
+    let repo = TestRepo::new(name)?;
+    repo.write(
+        "trueflow.toml",
+        "[scan]\nignore_path_prefixes = [\"vendor\"]\n",
+    )?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.write("vendor/old.rs", "pub fn old() {}\n")?;
+    repo.write("vendor/kept.rs", "pub fn kept() {}\n")?;
+    repo.commit_all("base")?;
+    repo.git(&["branch", "-M", "main"])?;
+    repo.git(&["switch", "-c", "feature"])?;
+    if edit_source {
+        repo.write(
+            "src/main.rs",
+            "fn main() {\n    helper();\n}\n\nfn helper() {}\n",
+        )?;
+    }
+    repo.write("vendor/lib.rs", "pub fn vendored() {}\n")?;
+    repo.write("vendor/kept.rs", "pub fn kept() -> u8 {\n    1\n}\n")?;
+    repo.write("node_modules/pkg/index.js", "function bundled() {}\n")?;
+    repo.git(&["rm", "-q", "vendor/old.rs"])?;
+    repo.git(&["add", "-f", "."])?;
+    repo.commit("feature")?;
+    Ok(repo)
+}
+
+fn assert_review_paths(output: &str, expected: &[&str], context: &str) -> Result<()> {
+    let paths = review_paths(output)?;
+    assert_eq!(
+        paths, expected,
+        "{context} must honor [scan] ignores: {output}"
+    );
+    Ok(())
+}
+
+#[test]
+fn historical_targets_honor_scan_ignore_config() -> Result<()> {
+    let repo = repo_with_ignored_historical_changes("historical_scan_ignore", true)?;
+    let cases: [(&[&str], &[&str]); 4] = [
+        (&["--target", "main"], &["src/main.rs"]),
+        (&["--target", "rev:HEAD"], &["src/main.rs"]),
+        (&["--since", "main"], &["src/main.rs"]),
+        (&["--target", "rev:HEAD", "--target", "dir:vendor"], &[]),
+    ];
+
+    for (target_args, expected) in cases {
+        let mut args = vec!["review", "--json"];
+        args.extend_from_slice(target_args);
+        assert_review_paths(&repo.run(&args)?, expected, &args.join(" "))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn check_ignores_changes_under_scan_ignored_paths() -> Result<()> {
+    let repo = repo_with_ignored_historical_changes("check_scan_ignore", false)?;
+
+    let output = repo.run_raw(&["check"])?;
+    assert!(
+        output.status.success(),
+        "check must not fail on ignored changes: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
 }

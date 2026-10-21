@@ -2,7 +2,7 @@ use crate::analysis::{self, Language, ParsedFile};
 use crate::block::{Block, FileState};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
-use crate::scanner::{self, ScanDiagnostic};
+use crate::scanner::{self, DirectScanPathIgnoreMatcher, ScanDiagnostic};
 use crate::store::CommitId;
 use crate::targets::CommitRange;
 use anyhow::{Context, Result};
@@ -671,24 +671,29 @@ pub(crate) enum RevisionBlob {
     Skipped(ScanDiagnostic),
 }
 
+/// Loads `paths` from `revision`, leaving out every path the scan ignore
+/// rules exclude, exactly like the worktree scanner does.
 pub fn file_states_for_paths_in_revision(
     repo: &gix::Repository,
     revision: &str,
     paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
 ) -> Result<RevisionFiles> {
     let tree = tree_for_revision(repo, revision)?;
-    file_states_for_paths_in_tree(&tree, paths, workdir_prefix)
+    file_states_for_paths_in_tree(&tree, paths, workdir_prefix, ignore)
 }
 
+/// Loads every file of `revision` the scan ignore rules admit.
 pub fn file_states_in_revision(
     repo: &gix::Repository,
     revision: &str,
     workdir_prefix: Option<&str>,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
 ) -> Result<RevisionFiles> {
     let tree = tree_for_revision(repo, revision)?;
     let mut files = RevisionFiles::default();
-    collect_file_states_in_tree(&tree, "", workdir_prefix, &mut files)?;
+    collect_file_states_in_tree(&tree, "", workdir_prefix, ignore, &mut files)?;
     files
         .files
         .sort_by(|left, right| left.path.cmp(&right.path));
@@ -755,8 +760,12 @@ fn file_states_for_paths_in_tree(
     tree: &gix::Tree<'_>,
     paths: &HashSet<RepoPath>,
     workdir_prefix: Option<&str>,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
 ) -> Result<RevisionFiles> {
-    let mut ordered_paths = paths.iter().collect::<Vec<_>>();
+    let mut ordered_paths = paths
+        .iter()
+        .filter(|path| !ignore.matches(path))
+        .collect::<Vec<_>>();
     ordered_paths.sort();
 
     let mut files = RevisionFiles::default();
@@ -811,6 +820,7 @@ fn collect_file_states_in_tree(
     tree: &gix::Tree<'_>,
     prefix: &str,
     workdir_prefix: Option<&str>,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
     files: &mut RevisionFiles,
 ) -> Result<()> {
     let mut pending = vec![(tree.clone(), prefix.to_string())];
@@ -827,6 +837,9 @@ fn collect_file_states_in_tree(
 
             match entry.kind() {
                 EntryKind::Tree => {
+                    if ignore.matches(&display_path_for_tree_entry(&full_path, workdir_prefix)?) {
+                        continue;
+                    }
                     let child_tree = entry.object()?.try_into_tree()?;
                     pending.push((child_tree, full_path));
                 }
@@ -838,6 +851,9 @@ fn collect_file_states_in_tree(
                     }
 
                     let output_path = display_path_for_tree_entry(&full_path, workdir_prefix)?;
+                    if ignore.matches(&output_path) {
+                        continue;
+                    }
                     let blob = entry.object()?.try_into_blob()?;
                     files.push(revision_blob(&blob, Path::new(&full_path), output_path)?);
                 }

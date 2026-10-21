@@ -14,7 +14,7 @@ use crate::review_pass::{
     PassScope, PassSource, PassWhy, ReviewPass, format_reading_estimate, heuristic_pass,
     nothing_new_reason,
 };
-use crate::scanner::{self, ScanDiagnostic, ScanOptions};
+use crate::scanner::{self, DirectScanPathIgnoreMatcher, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
 use crate::targets::{
@@ -324,17 +324,23 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             let Some(repo) = review_repo.as_ref() else {
                 return Err(anyhow!("review repo unavailable for revision target"));
             };
+            let ignore = DirectScanPathIgnoreMatcher::new(&query.scan_options)?;
             let files = match load_scope {
-                ReviewLoadScope::Paths(paths) => {
-                    vcs::file_states_for_paths_in_revision(repo, revision.as_str(), &paths, None)?
-                }
+                ReviewLoadScope::Paths(paths) => vcs::file_states_for_paths_in_revision(
+                    repo,
+                    revision.as_str(),
+                    &paths,
+                    None,
+                    &ignore,
+                )?,
                 ReviewLoadScope::CurrentDirectory => vcs::file_states_in_revision(
                     repo,
                     revision.as_str(),
                     workdir_prefix_from_git_root().as_deref(),
+                    &ignore,
                 )?,
                 ReviewLoadScope::Repository => {
-                    vcs::file_states_in_revision(repo, revision.as_str(), None)?
+                    vcs::file_states_in_revision(repo, revision.as_str(), None, &ignore)?
                 }
             };
             (
@@ -475,6 +481,7 @@ fn collect_diff_scoped_review(
 ) -> Result<CollectedReview> {
     let review_files = collect_diff_review_files(
         &query.path_selection,
+        &DirectScanPathIgnoreMatcher::new(&query.scan_options)?,
         diff_context.repo,
         files,
         diff_context.diff_targets,
@@ -697,6 +704,7 @@ fn collect_target_diff_batches<'a>(
 
 fn collect_diff_review_files(
     path_selection: &ReviewPathSelection,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
     repo: &gix::Repository,
     files: Vec<crate::block::FileState>,
     diff_targets: &[ReviewDiffTarget],
@@ -707,6 +715,9 @@ fn collect_diff_review_files(
         .map(|file| (file.path.clone(), file))
         .collect::<HashMap<_, _>>();
     let mut selected_paths = selected_review_paths(path_selection, &head_files_by_path);
+    // Changed paths that no longer exist at the head (deletions) never went
+    // through the content loader, so the scan ignore rules apply here too.
+    selected_paths.retain(|path| !ignore.matches(path));
     selected_paths.sort();
     let mut target_batches = collect_target_diff_batches(repo, diff_targets, &selected_paths)?;
 

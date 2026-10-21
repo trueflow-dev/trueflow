@@ -8,7 +8,7 @@ use crate::declaration::{
 use crate::feedback_since::ResolvedFeedbackSince as ParsedFeedbackSince;
 use crate::hashing::hex_digest;
 use crate::repo_path::RepoPath;
-use crate::scanner::{self, ScanOptions};
+use crate::scanner::{self, DirectScanPathIgnoreMatcher, ScanOptions};
 use crate::store::{
     BlockState, CommentAnchor, DeclarationAnchorRange, DeclarationRecordLocator, FileStore, Record,
     RepoRef, ReviewTargetRef, TreeHash,
@@ -1526,7 +1526,13 @@ fn load_snapshot_files_strict(
             } else {
                 vcs::repo_from_workdir()?
             };
-            Ok(vcs::file_states_in_revision(&repo, revision, workdir_prefix)?.files)
+            Ok(vcs::file_states_in_revision(
+                &repo,
+                revision,
+                workdir_prefix,
+                &DirectScanPathIgnoreMatcher::new(scan_options)?,
+            )?
+            .files)
         }
     }
 }
@@ -1555,10 +1561,14 @@ fn load_snapshot_files_for_paths_strict(
             } else {
                 vcs::repo_from_workdir()?
             };
-            Ok(
-                vcs::file_states_for_paths_in_revision(&repo, revision, paths, workdir_prefix)?
-                    .files,
-            )
+            Ok(vcs::file_states_for_paths_in_revision(
+                &repo,
+                revision,
+                paths,
+                workdir_prefix,
+                &DirectScanPathIgnoreMatcher::new(scan_options)?,
+            )?
+            .files)
         }
     }
 }
