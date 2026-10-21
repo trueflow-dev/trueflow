@@ -1337,9 +1337,11 @@ fn select_pull_request_feedback_delivery(
 /// beside any other viewer-authored pending review would be rejected after the
 /// intent is already InFlight.
 fn ensure_viewer_has_no_pending_review(snapshot: &GitHubPullRequestDeliverySnapshot) -> Result<()> {
-    match snapshot.reviews.iter().find(|review| {
-        review.viewer_did_author && review.state == PullRequestReviewState::Pending
-    }) {
+    match snapshot
+        .reviews
+        .iter()
+        .find(|review| review.viewer_did_author && review.state == PullRequestReviewState::Pending)
+    {
         Some(review) => Err(anyhow!(
             "GitHub allows only one pending review per user on {}, and you already have pending review {} that trueflow cannot append to for head {}; submit or discard it on GitHub, then rerun trueflow feedback",
             snapshot.pr,
@@ -1477,11 +1479,8 @@ pub fn build_pull_request_feedback_plan(
     let mut general_declaration_feedback = Vec::new();
     let mut skipped = Vec::new();
     // GitHub diffs a PR from the merge base, not from the base-branch tip.
-    let merge_base = vcs::merge_base_in_repo(
-        repo,
-        metadata.base_sha.as_str(),
-        metadata.head_sha.as_str(),
-    )?;
+    let merge_base =
+        vcs::merge_base_in_repo(repo, metadata.base_sha.as_str(), metadata.head_sha.as_str())?;
 
     for record in records {
         if excluded_ids.contains(&record.id) {
@@ -4314,7 +4313,11 @@ mod tests {
         .unwrap_err();
 
         assert_refused_create_for_existing_pending_review(&store, &client, &error, &review_url)?;
-        assert!(delivery_ledger_snapshot(&store)?.active_operations().is_empty());
+        assert!(
+            delivery_ledger_snapshot(&store)?
+                .active_operations()
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -4346,14 +4349,17 @@ mod tests {
         .unwrap_err();
 
         assert_refused_create_for_existing_pending_review(&store, &client, &error, &review_url)?;
-        assert!(delivery_ledger_snapshot(&store)?.active_operations().is_empty());
+        assert!(
+            delivery_ledger_snapshot(&store)?
+                .active_operations()
+                .is_empty()
+        );
         Ok(())
     }
 
     #[test]
     fn pull_request_feedback_refuses_create_when_viewer_has_foreign_pending_review() -> Result<()> {
-        let (repo_root, metadata) =
-            single_commit_pull_request_fixture("feedback_foreign_pending")?;
+        let (repo_root, metadata) = single_commit_pull_request_fixture("feedback_foreign_pending")?;
         let store = FileStore::for_root(&repo_root)?;
         store.append(&review_record(
             "new-record",
@@ -4383,7 +4389,11 @@ mod tests {
                 &review_url,
             )?;
         }
-        assert!(delivery_ledger_snapshot(&store)?.active_operations().is_empty());
+        assert!(
+            delivery_ledger_snapshot(&store)?
+                .active_operations()
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -5071,7 +5081,10 @@ mod tests {
         let metadata = pull_request_metadata(
             base_sha,
             head_sha.clone(),
-            vec![(first_sha, "Edit l28"), (head_sha.clone(), "Delete l5 and l6")],
+            vec![
+                (first_sha, "Edit l28"),
+                (head_sha.clone(), "Delete l5 and l6"),
+            ],
         );
         Ok((repo_root, metadata, head_sha))
     }

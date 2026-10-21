@@ -15,8 +15,7 @@ use crate::vcs;
 
 use super::super::{
     CliReviewRequest, TerminalSession, TuiRunRequest, cli_review_request, execute_mark_for_tui,
-    pull_request_cli_requests, resolve_cli_review_request,
-    resolve_pull_request_target_for_tui,
+    pull_request_cli_requests, resolve_cli_review_request, resolve_pull_request_target_for_tui,
 };
 use super::relationship_bridge::ProductionRelationshipCoordinator;
 use super::{

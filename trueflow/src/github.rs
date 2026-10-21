@@ -1993,9 +1993,7 @@ fn parse_remote_repo_identity(url: &str) -> Option<(RemoteHost, String, String)>
         .or_else(|| parse_remote_repo_identity_from_scp_like_url(url))
 }
 
-fn parse_remote_repo_identity_from_standard_url(
-    url: &str,
-) -> Option<(RemoteHost, String, String)> {
+fn parse_remote_repo_identity_from_standard_url(url: &str) -> Option<(RemoteHost, String, String)> {
     let parsed = Url::parse(url).ok()?;
     let host = parsed.host_str()?.to_string();
     let host = match parsed.scheme() {
@@ -2006,9 +2004,7 @@ fn parse_remote_repo_identity_from_standard_url(
     parse_owner_repo_path(path).map(|(owner, repo)| (host, owner, repo))
 }
 
-fn parse_remote_repo_identity_from_scp_like_url(
-    url: &str,
-) -> Option<(RemoteHost, String, String)> {
+fn parse_remote_repo_identity_from_scp_like_url(url: &str) -> Option<(RemoteHost, String, String)> {
     let (host_part, path_part) = url.split_once(':')?;
     if host_part.contains('/') {
         return None;
@@ -3296,10 +3292,8 @@ mod tests {
             PullRequestRef::from_cli("https://github.com/jmqd/TRUEFLOW/pull/11").unwrap(),
         ] {
             let prepared =
-                prepare_pull_request_review_with(&repo_root, &requested, &client, |_, _, _| {
-                    Ok(())
-                })
-                .unwrap();
+                prepare_pull_request_review_with(&repo_root, &requested, &client, |_, _, _| Ok(()))
+                    .unwrap();
             assert_eq!(prepared.remote.name, "origin");
             assert_eq!(prepared.metadata, metadata);
         }
@@ -3431,9 +3425,15 @@ mod tests {
         let base = commit_file("a.rs", "a1\n", "Main change");
 
         run_git(&repo_root, &["switch", "feature"]);
-        run_git(&repo_root, &["merge", "--no-ff", "-m", "Update branch", "main"]);
+        run_git(
+            &repo_root,
+            &["merge", "--no-ff", "-m", "Update branch", "main"],
+        );
         let update_branch = head().unwrap();
-        run_git(&repo_root, &["merge", "--no-ff", "-m", "Merge side", "side"]);
+        run_git(
+            &repo_root,
+            &["merge", "--no-ff", "-m", "Merge side", "side"],
+        );
         let side_merge = head().unwrap();
 
         let commit = |sha: &CommitId, summary: &str| PullRequestCommit {
