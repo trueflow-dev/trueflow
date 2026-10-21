@@ -135,7 +135,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         rescanned_files: 0,
     };
 
-    let cached_entry = load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics);
+    let mut cached_entry = load_scan_cache_for_read(&root, options, &mut cache, &mut diagnostics);
     let cached_entry_count = cached_entry.as_ref().map(HashMap::len);
 
     let inventory = collect_scan_inventory(&root, &repo_path_base, options, &mut diagnostics)?;
@@ -144,15 +144,16 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
     let mut cache_files = Vec::with_capacity(inventory.len());
 
     for scan_input in inventory {
+        // Inventory paths are unique, so each cached entry is taken at most once.
         let reused_entry = cached_entry
-            .as_ref()
-            .and_then(|entries| entries.get(&scan_input.path))
+            .as_mut()
+            .and_then(|entries| entries.remove(&scan_input.path))
             .filter(|entry| entry.stamp == scan_input.stamp);
 
         let attempt = match reused_entry {
             Some(entry) => {
                 cache.reused_files += 1;
-                ScanAttempt::Cache(entry.clone())
+                ScanAttempt::Cache(entry)
             }
             None => {
                 cache.rescanned_files += 1;
