@@ -1078,12 +1078,19 @@ impl<'a> DiffContainerResidues<'a> {
         }
     }
 
+    /// A two-sided container changed when its own lines differ; a container
+    /// on one side only (added or deleted) needs its own review only when it
+    /// has lines its displayed children do not already show, such as an impl
+    /// header. A Markdown section whose own text is its own leaf block has none.
     fn residue(&self, index: usize) -> ContainerResidue {
         match (
             self.residue_text(index, DiffCoordinateSide::Base),
             self.residue_text(index, DiffCoordinateSide::Head),
         ) {
             (Some(base), Some(head)) if residue_lines(&base).eq(residue_lines(&head)) => {
+                ContainerResidue::Unchanged
+            }
+            (Some(only), None) | (None, Some(only)) if residue_lines(&only).next().is_none() => {
                 ContainerResidue::Unchanged
             }
             _ => ContainerResidue::Changed,
