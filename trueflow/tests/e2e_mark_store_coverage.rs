@@ -484,6 +484,48 @@ fn test_store_parent_discovery_no_git() -> Result<()> {
 }
 
 #[test]
+fn store_discovery_outside_git_ignores_home_cache_dir() -> Result<()> {
+    let home = temp_test_dir("no_git_home_cache_dir");
+    fs::create_dir_all(home.join(".trueflow").join("cache"))?;
+    let project = home.join("proj");
+    fs::create_dir_all(&project)?;
+
+    let hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let output = Command::new(env!("CARGO_BIN_EXE_trueflow"))
+        .args([
+            "mark",
+            "--fingerprint",
+            hash,
+            "--verdict",
+            "approved",
+            "--quiet",
+        ])
+        .env("HOME", &home)
+        .current_dir(&project)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "trueflow failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let project_store = project.join(".trueflow");
+    assert_eq!(
+        read_review_records(&project_store.join("reviews.jsonl"))?.len(),
+        1
+    );
+    assert!(project_store.join("logs").is_dir());
+    let home_store = home.join(".trueflow");
+    assert!(
+        !home_store.join("reviews.jsonl").exists(),
+        "the global cache directory must not collect project reviews"
+    );
+    assert!(!home_store.join("logs").exists());
+
+    Ok(())
+}
+
+#[test]
 fn test_commands_write_logs_under_trueflow_directory() -> Result<()> {
     let repo = TestRepo::new("logs_under_trueflow")?;
     repo.write("src/main.rs", "fn main() {}\n")?;

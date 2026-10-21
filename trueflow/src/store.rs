@@ -8,7 +8,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::declaration::{DeclarationKey, DeclarationProjectionHash};
@@ -1421,17 +1421,10 @@ impl StoreLocation {
         }
 
         let start_dir = std::env::current_dir()?;
-        for dir in start_dir.ancestors() {
-            if dir.join(TRUEFLOW_DIR).exists() {
-                return Ok(Self {
-                    root_path: dir.to_path_buf(),
-                });
-            }
-        }
-
-        let location = Self {
-            root_path: start_dir,
-        };
+        let home_dir = dirs::home_dir().map(|home| fs::canonicalize(&home).unwrap_or(home));
+        let root_path =
+            existing_store_root_outside_git(&start_dir, home_dir.as_deref()).unwrap_or(start_dir);
+        let location = Self { root_path };
         location.ensure_trueflow_dir()?;
         Ok(location)
     }
@@ -1451,6 +1444,17 @@ impl StoreLocation {
         }
         Ok(())
     }
+}
+
+/// The closest ancestor of `start_dir` holding a `.trueflow` store. The home
+/// directory is skipped: `~/.trueflow` holds the global scan cache, not the
+/// reviews of whichever non-git project happens to live under `$HOME`.
+fn existing_store_root_outside_git(start_dir: &Path, home_dir: Option<&Path>) -> Option<PathBuf> {
+    start_dir
+        .ancestors()
+        .filter(|dir| Some(*dir) != home_dir)
+        .find(|dir| dir.join(TRUEFLOW_DIR).exists())
+        .map(Path::to_path_buf)
 }
 
 #[derive(Debug, Clone)]
