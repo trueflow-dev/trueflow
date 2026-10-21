@@ -1636,28 +1636,40 @@ impl UnchangedLineIndex {
     }
 }
 
+/// Keeps one candidate per display block. Overlapping targets (e.g. `main`
+/// plus `rev:HEAD`) pair the same head block with different bases, but each
+/// display block is a single review node, so the most informative pair wins:
+/// a changed pair over an addition over a deletion, first target on ties.
 fn dedupe_diff_review_blocks(blocks: Vec<DiffReviewBlock>) -> Vec<DiffReviewBlock> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::with_capacity(blocks.len());
+    let mut index_by_display: HashMap<_, usize> = HashMap::new();
+    let mut deduped: Vec<DiffReviewBlock> = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let identity = (
-            block
-                .sides
-                .base
-                .as_ref()
-                .map(|side| (side.hash.clone(), side.byte_span())),
-            block
-                .sides
-                .head
-                .as_ref()
-                .map(|side| (side.hash.clone(), side.byte_span())),
-        );
-        if seen.insert(identity) {
-            deduped.push(block);
+        let display = block.display_block();
+        match index_by_display.entry((display.hash.clone(), display.byte_span())) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let kept = &mut deduped[*entry.get()];
+                if diff_candidate_preference(block.change_kind)
+                    < diff_candidate_preference(kept.change_kind)
+                {
+                    *kept = block;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(deduped.len());
+                deduped.push(block);
+            }
         }
     }
     sort_diff_review_blocks(&mut deduped);
     deduped
+}
+
+fn diff_candidate_preference(change_kind: BlockChangeKind) -> u8 {
+    match change_kind {
+        BlockChangeKind::Changed => 0,
+        BlockChangeKind::Added => 1,
+        BlockChangeKind::Deleted => 2,
+    }
 }
 
 fn sort_diff_review_blocks(blocks: &mut [DiffReviewBlock]) {
@@ -3019,6 +3031,92 @@ mod tests {
         assert_eq!(
             sides.head.as_ref().unwrap().content,
             "pub fn value() -> u8 { 2 }"
+        );
+        Ok(())
+    }
+
+    fn collect_review_for_targets(targets: Vec<ReviewTarget>) -> Result<CollectedReview> {
+        let query = resolve_review_request(
+            ReviewRequest::Targets(targets),
+            BlockFilters::default(),
+            ScanOptions::default(),
+        )?;
+        collect_review(&query)
+    }
+
+    fn unreviewed_head_contents(collected: &CollectedReview) -> Vec<String> {
+        let mut contents = collected
+            .unreviewed_block_nodes
+            .iter()
+            .filter_map(|node_id| collected.tree.node(*node_id).block.as_ref())
+            .map(|block| block.content.clone())
+            .collect::<Vec<_>>();
+        contents.sort();
+        contents
+    }
+
+    #[test]
+    fn collect_review_overlapping_historical_targets_shares_head_block() -> Result<()> {
+        let repo_root = temp_git_repo("overlapping_historical_targets");
+        let path = repo_root.join("lib.rs");
+        fs::write(&path, "pub fn value() -> u8 { 1 }\n")?;
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "base"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        run_git(&repo_root, &["switch", "-c", "feature"]);
+        fs::write(
+            &path,
+            "pub fn value() -> u8 { 2 }\npub fn added() -> u8 { 4 }\n",
+        )?;
+        run_git(&repo_root, &["commit", "-am", "first edit"]);
+        fs::write(
+            &path,
+            "pub fn value() -> u8 { 3 }\npub fn added() -> u8 { 5 }\n",
+        )?;
+        run_git(&repo_root, &["commit", "-am", "second edit"]);
+        let _guard = CurrentDirGuard::push(&repo_root);
+
+        let collected = collect_review_for_targets(vec![
+            ReviewTarget::MainDiff,
+            ReviewTarget::Revision(RevisionExpr::new("HEAD")?),
+        ])?;
+
+        assert_eq!(
+            unreviewed_head_contents(&collected),
+            vec![
+                "pub fn added() -> u8 { 5 }".to_string(),
+                "pub fn value() -> u8 { 3 }".to_string(),
+            ]
+        );
+        let value_sides = collected
+            .diff_block_sides
+            .values()
+            .find(|sides| {
+                sides
+                    .head
+                    .as_ref()
+                    .is_some_and(|block| block.content.contains("value"))
+            })
+            .ok_or_else(|| anyhow!("missing value block sides"))?;
+        assert_eq!(
+            value_sides.base.as_ref().map(|block| block.content.as_str()),
+            Some("pub fn value() -> u8 { 1 }"),
+            "the first target's changed pair must win a changed/changed tie"
+        );
+        let added_sides = collected
+            .diff_block_sides
+            .values()
+            .find(|sides| {
+                sides
+                    .head
+                    .as_ref()
+                    .is_some_and(|block| block.content.contains("added"))
+            })
+            .ok_or_else(|| anyhow!("missing added block sides"))?;
+        assert_eq!(
+            added_sides.base.as_ref().map(|block| block.content.as_str()),
+            Some("pub fn added() -> u8 { 4 }"),
+            "the changed pair must win over the branch-wide addition"
         );
         Ok(())
     }
