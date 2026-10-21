@@ -2466,6 +2466,13 @@ fn ai_review_plan_blocks_for_state(state: &AppState) -> Vec<(TreeNodeId, AiRevie
                     start_line: block.start_line,
                     end_line: block.end_line,
                     estimated_seconds: scope.estimated_seconds(node_id).unwrap_or_default(),
+                    focused_pass: if state.commented_nodes.contains(&node_id) {
+                        crate::ai::FocusedPassEligibility::UnresolvedComment
+                    } else if scope.has_pending_descendant(node_id) {
+                        crate::ai::FocusedPassEligibility::CoversPendingBlocks
+                    } else {
+                        crate::ai::FocusedPassEligibility::Eligible
+                    },
                     content: ai_block_context_content(
                         &block.content,
                         state.diff_block_sides.get(&node_id),

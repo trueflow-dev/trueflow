@@ -190,7 +190,29 @@ pub struct AiReviewPlanBlock {
     pub end_line: usize,
     /// Reading estimate a focused pass would charge for this block.
     pub estimated_seconds: usize,
+    pub focused_pass: FocusedPassEligibility,
     pub content: String,
+}
+
+/// Whether a focused pass may take a block as a card. The manifest still
+/// lists ineligible blocks because a full review's targeted order uses them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedPassEligibility {
+    Eligible,
+    /// The latest verdict is a comment on unchanged content.
+    UnresolvedComment,
+    /// Approving the block would cover other pending blocks.
+    CoversPendingBlocks,
+}
+
+impl FocusedPassEligibility {
+    const fn ineligible_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Eligible => None,
+            Self::UnresolvedComment => Some("unresolved comment"),
+            Self::CoversPendingBlocks => Some("covers other pending blocks"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,6 +585,9 @@ fn build_review_plan_prompt(
             block.block_hash,
             format_reading_estimate(block.estimated_seconds),
         ));
+        if let Some(reason) = block.focused_pass.ineligible_reason() {
+            manifest.push_str(&format!("  Focused pass: not eligible ({reason})\n"));
+        }
         if excerpt.is_empty() {
             manifest.push_str("  Excerpt: (excerpt omitted by context budget)\n");
         } else {
@@ -595,7 +620,7 @@ Return exactly one JSON object with no Markdown and exactly these keys:\n\
 }}\n\
 Use only the supplied context. Do not run tools or inspect other files. Copy block IDs verbatim.\n\
 Return at most eight priority blocks. Avoid style-only or speculative advice.\n\
-A focused pass reads only the priority blocks, in your order, within about {budget}; prefer a coherent set whose reading estimates fit, most consequential first.\n\
+A focused pass reads only eligible priority blocks, in your order, within about {budget}; prefer a coherent set of eligible blocks whose reading estimates fit, most consequential first.\n\
 Do not include Markdown fences or any text outside the JSON object.",
         budget = format_reading_estimate(focused_pass_budget_seconds),
         presented = coverage.presented_blocks,
@@ -2253,6 +2278,7 @@ mod tests {
             start_line: index + 1,
             end_line: index + 3,
             estimated_seconds: 16,
+            focused_pass: FocusedPassEligibility::Eligible,
             content,
         }
     }
@@ -2284,10 +2310,33 @@ mod tests {
         assert!(prompt.contains("  Reading estimate: ~6m 50s\n"), "{prompt}");
         assert!(
             prompt.contains(
-                "A focused pass reads only the priority blocks, in your order, within about 5m"
+                "A focused pass reads only eligible priority blocks, in your order, within about 5m"
             ),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn review_plan_prompt_marks_blocks_a_focused_pass_cannot_use() {
+        let mut commented = review_plan_block(0, "fn commented() {}".to_string());
+        commented.focused_pass = FocusedPassEligibility::UnresolvedComment;
+        let mut container = review_plan_block(1, "impl A {}".to_string());
+        container.focused_pass = FocusedPassEligibility::CoversPendingBlocks;
+        let blocks = vec![
+            commented,
+            container,
+            review_plan_block(2, "fn x() {}".to_string()),
+        ];
+        let prompt = review_plan_request(&blocks, 20).prompt;
+        assert!(
+            prompt.contains("  Focused pass: not eligible (unresolved comment)\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("  Focused pass: not eligible (covers other pending blocks)\n"),
+            "{prompt}"
+        );
+        assert_eq!(prompt.matches("  Focused pass: not eligible").count(), 2);
     }
 
     #[test]
