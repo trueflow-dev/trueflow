@@ -1830,10 +1830,14 @@ fn configure_onboarding(
             && selected.is_subset(&state.reviewable_nodes),
         "onboarding cards must be distinct pending review blocks"
     );
+    // A container approval covers every descendant. Plan cards must be leaves;
+    // a focused pass may include a container whose descendants are not pending
+    // (filtered out by `--only`), exactly as a full review of that scope would.
     anyhow::ensure!(
-        selected
-            .iter()
-            .all(|&id| !state.navigator.tree.is_container_block(id)),
+        selected.iter().all(|&id| match purpose {
+            CardQueuePurpose::Plan(_) => !state.navigator.tree.is_container_block(id),
+            CardQueuePurpose::FocusedPass { .. } => !has_pending_descendant(state, id),
+        }),
         "onboarding cards must be leaf blocks: container approvals cover unselected descendants"
     );
     // Keep the captured tree for source context, but never expose its other targets.
@@ -2480,14 +2484,14 @@ fn clear_ai_review_plan_priorities(state: &mut AppState) {
     reset_review_focus_to_first_block(state);
 }
 
-/// Pending leaf blocks in canonical order. Containers are excluded because their
-/// approvals would cover descendants outside the pass.
+/// Pending blocks in canonical order. Containers with pending descendants are
+/// excluded because their approvals would cover blocks outside the pass.
 fn focused_pass_candidates(state: &AppState) -> Vec<PassCandidate<'_, TreeNodeId>> {
     let tree = &state.navigator.tree;
     let canonical = ReviewOrder::from_tree(tree, &state.reviewable_nodes);
     canonical
         .iter_node_ids()
-        .filter(|&node_id| !tree.is_container_block(node_id))
+        .filter(|&node_id| !has_pending_descendant(state, node_id))
         .filter_map(|node_id| {
             let node = tree.node(node_id);
             let block = node.block.as_ref()?;
@@ -2515,6 +2519,15 @@ fn focused_pass_candidates(state: &AppState) -> Vec<PassCandidate<'_, TreeNodeId
             })
         })
         .collect()
+}
+
+fn has_pending_descendant(state: &AppState, node_id: TreeNodeId) -> bool {
+    state.navigator.tree.is_container_block(node_id)
+        && state
+            .navigator
+            .visible_descendant_block_ids(node_id)
+            .into_iter()
+            .any(|id| id != node_id && state.reviewable_nodes.contains(&id))
 }
 
 fn heuristic_pass_for_state(state: &AppState, budget: ReviewDuration) -> PassPlan<TreeNodeId> {
@@ -2718,8 +2731,7 @@ fn render_ai_review_plan_screen(
     scroll: u16,
     footer: &str,
 ) {
-    let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let (body, footer_area) = ai_briefing_layout(frame.area());
     let palette = UiPalette::default();
     frame.render_widget(
         Paragraph::new(ai_review_plan_lines(state, plan, coverage))
@@ -2731,13 +2743,31 @@ fn render_ai_review_plan_screen(
             )
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
-        chunks[0],
+        body,
     );
+    render_ai_briefing_footer(frame, footer_area, footer, &palette);
+}
+
+/// Rows reserved under briefing screens so long key hints wrap instead of
+/// losing their trailing keys at 80 columns.
+const AI_BRIEFING_FOOTER_ROWS: u16 = 2;
+
+fn ai_briefing_layout(area: Rect) -> (Rect, Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(AI_BRIEFING_FOOTER_ROWS),
+    ])
+    .split(area);
+    (chunks[0], chunks[1])
+}
+
+fn render_ai_briefing_footer(frame: &mut Frame, area: Rect, footer: &str, palette: &UiPalette) {
     frame.render_widget(
         Paragraph::new(footer.to_string())
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
             .style(Style::default().bg(palette.bg).fg(palette.fg)),
-        chunks[1],
+        area,
     );
 }
 
@@ -2795,17 +2825,15 @@ fn ai_review_plan_scroll_limit(
     plan: &AiReviewPlan,
     coverage: &AiReviewPlanCoverage,
 ) -> u16 {
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let (body, _) = ai_briefing_layout(area);
     let lines = ai_review_plan_lines(state, plan, coverage);
     let (content_lines, _) =
-        wrapped_display_metrics_for_lines(&lines, None, chunks[0].width.saturating_sub(2));
-    usize_to_u16_saturating(content_lines.saturating_sub(chunks[0].height.saturating_sub(2).into()))
+        wrapped_display_metrics_for_lines(&lines, None, body.width.saturating_sub(2));
+    usize_to_u16_saturating(content_lines.saturating_sub(body.height.saturating_sub(2).into()))
 }
 
 fn ai_review_plan_viewport_height(area: Rect) -> u16 {
-    Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area)[0]
-        .height
-        .saturating_sub(2)
+    ai_briefing_layout(area).0.height.saturating_sub(2)
 }
 
 fn render_ai_review_kickoff_status(
@@ -2816,8 +2844,7 @@ fn render_ai_review_kickoff_status(
     message: &str,
     footer: &str,
 ) {
-    let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let (body, footer_area) = ai_briefing_layout(frame.area());
     let palette = UiPalette::default();
     let lines = vec![
         Line::from(message.to_string()),
@@ -2833,14 +2860,9 @@ fn render_ai_review_kickoff_status(
                     .style(Style::default().bg(palette.code_bg).fg(palette.fg)),
             )
             .wrap(Wrap { trim: false }),
-        chunks[0],
+        body,
     );
-    frame.render_widget(
-        Paragraph::new(footer.to_string())
-            .alignment(Alignment::Center)
-            .style(Style::default().bg(palette.bg).fg(palette.fg)),
-        chunks[1],
-    );
+    render_ai_briefing_footer(frame, footer_area, footer, &palette);
 }
 
 fn render_ai_review_kickoff_loading(
@@ -7492,7 +7514,7 @@ fn recap_footer_hint_text(keybinds: &TuiKeybindsConfig) -> String {
 
 fn focused_pass_recap_hint_text(keybinds: &TuiKeybindsConfig, remainder: Option<usize>) -> String {
     let rest = format!(
-        "[{}] choose scope  [{}/Esc] exit",
+        "[{}] review something else  [{}/Esc] exit",
         recap_done_key(keybinds),
         keybinds.quit
     );
@@ -9735,7 +9757,7 @@ mod diff_scope_tests {
             AiReviewKickoffKeyAction::StartFocused
         );
 
-        assert_eq!(ai_review_plan_viewport_height(Rect::new(0, 0, 80, 24)), 21);
+        assert_eq!(ai_review_plan_viewport_height(Rect::new(0, 0, 80, 24)), 20);
 
         assert_eq!(
             ai_review_kickoff_key_action(KeyCode::Char('j'), &keybinds),
@@ -10232,6 +10254,71 @@ mod diff_scope_tests {
         start_focused_pass(&mut state, &empty).unwrap();
         assert!(state.onboarding.is_none());
         assert_eq!(state.reviewable_nodes, ids.into_iter().collect());
+    }
+
+    #[test]
+    fn focused_pass_includes_pending_containers_whose_children_are_filtered() {
+        // `--only impl` keeps an impl pending while its methods are filtered out:
+        // the container is the only reviewable unit, as in a full review.
+        let (mut state, _file, ids) = build_state_with_file_block_count(1);
+        state.navigator.tree.insert_block_children(
+            ids[0],
+            vec![test_block("child".to_string(), BlockKind::Code, 0, 1)],
+        );
+        assert!(state.navigator.tree.is_container_block(ids[0]));
+
+        let plan = heuristic_pass_for_state(&state, crate::review_pass::DEFAULT_PASS_BUDGET);
+        assert_eq!(
+            plan.cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+            vec![ids[0]]
+        );
+        start_focused_pass(&mut state, &plan).unwrap();
+        assert!(state.onboarding.is_some());
+    }
+
+    #[test]
+    fn ai_briefing_footer_keeps_every_key_visible_at_80_columns() {
+        let (state, _file, block_ids) = build_state_with_file_block_count(5);
+        let picks = block_ids
+            .iter()
+            .map(|&id| AiPick {
+                id,
+                reason: "shared state".to_string(),
+                checks: Vec::new(),
+            })
+            .collect();
+        let focused = crate::review_pass::ai_pass(
+            &focused_pass_candidates(&state),
+            picks,
+            crate::review_pass::DEFAULT_PASS_BUDGET,
+        );
+        let plan = test_review_plan();
+        let coverage = AiReviewPlanCoverage {
+            total_blocks: 5,
+            presented_blocks: 5,
+            excerpted_blocks: 5,
+            fully_excerpted_blocks: 5,
+            excerpt_lines: 5,
+        };
+        for pass in [ReviewPass::Full, ReviewPass::Focused] {
+            let footer = ai_review_plan_ready_footer(&state.keybinds, pass, &focused);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_ai_review_plan_screen(frame, &state, &plan, &coverage, 0, &footer);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let bottom = buffer
+                .content()
+                .chunks(usize::from(buffer.area.width))
+                .skip(22)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(bottom.contains("Esc"), "{pass:?}: {bottom}");
+            assert!(bottom.contains("q quit"), "{pass:?}: {bottom}");
+        }
     }
 
     impl AiSuggestionProvider for StaticAiSuggestionProvider {

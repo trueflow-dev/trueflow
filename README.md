@@ -499,7 +499,7 @@ changes: read the consequential slice first, then decide whether to continue.
 
 ```sh
 trueflow tui --target main --pass focused              # 5m default budget
-trueflow tui --target pr:11 --pass focused --budget 10m
+trueflow tui --target pr:11 --pass focused --budget 10m  # each PR commit gets its own pass
 trueflow tui --budget 2m    # then press f on any scope-selector row
 ```
 
@@ -522,8 +522,11 @@ trueflow tui --budget 2m    # then press f on any scope-selector row
   onboarding. Parent, child, and root navigation are disabled so an approval
   never covers unselected code.
 - **Remainder.** Unselected blocks stay pending. The recap reports how many
-  remain; Enter reloads the same scope as a full review, `d` chooses another
-  scope, and `q` quits.
+  remain; Enter reloads the same scope as a full review, `d` reviews something
+  else (the scope selector, or the next commit of a PR), and `q` quits.
+- **Containers.** With `--only` kinds such as `impl` or `class`, a container
+  whose children are filtered out is a card like any other block; a container
+  with pending children never is, because its approval would cover them.
 
 #### Declaration Review
 
