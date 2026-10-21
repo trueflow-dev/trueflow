@@ -414,6 +414,39 @@ under them are left out of `--all`, `dirty`, `main`, `rev:`, `--since` and
 untracked files: as in git, a tracked file it matches is still scanned and
 reviewed by `--all`, `scan`, the TUI's all-files scope and `mark`.
 
+### Deleted code
+
+Deleting code is a change that needs review, like adding it: dropping an
+access check is as consequential as writing one. Diff scopes (`dirty`,
+`main`, `rev:`, `--since`, `check`) list every block a comparison deletes,
+and `review --json` marks those blocks `"change": "deleted"`. A review of a
+deletion is its own decision: approving code when it was added (or approving
+the same content again) never covers its later deletion, and approving a
+deletion never covers the code if it returns. Only reviews of other deleted
+blocks that enclose it (for example the deleted `impl` around a deleted
+method) cover a deleted block; a file or directory approval does not.
+
+The TUI records a deletion review whenever you approve, reject, or comment on
+a deleted block. From the command line, pass the comparison's head revision:
+
+```bash
+trueflow mark --fingerprint <hash> --path src/lib.rs --line <start_line> --deleted-in HEAD
+```
+
+The record carries a signed `block_deletion` marker naming that head; records
+without it review content only. Like other verdicts it is
+revision-independent, so an approved deletion stays reviewed wherever the
+same block is deleted from the same path, and `feedback --target` selects
+deletion comments by the revision that deleted the block. Only a deletion
+approval resolves a comment on a deletion.
+
+Moving code is a deletion plus an addition. Content deleted from one file and
+added identically to another in the same comparison is reviewed on both
+sides: approving the new copy does not review its removal from the old
+location (that location may have been the only caller, or the guarded path),
+and the moved-in copy is new content at its new path. Content carried
+unchanged through a file rename that git detects is not deleted at all.
+
 ## Runtime config
 
 Trueflow first loads `~/.trueflow.toml` as global defaults, if present. It then

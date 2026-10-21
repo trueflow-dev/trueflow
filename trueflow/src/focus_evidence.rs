@@ -352,7 +352,7 @@ fn capture_with(
                 ),
             )?;
         }
-        let block_coverage = coverage.block(&node.path, block);
+        let block_coverage = coverage.block_showing(&node.path, block, node.change);
         let records = block_coverage.effective_records();
         let latest = block_coverage.effective_latest_verdict_for(&ReviewCheck::review());
         let records_pin = BytesHash::from_bytes(&serde_json::to_vec(&records)?).to_string();

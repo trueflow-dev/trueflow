@@ -50,8 +50,9 @@ use crate::review_scope::{
 use crate::review_session;
 use crate::review_speedread::PlaybackState;
 use crate::store::{
-    CommentAnchor, CommentAnchorDiffLineKind, DiffCommentAnchor, DiffCommentAnchorRow, FileStore,
-    ReviewCheck, ReviewTargetKind, SourceCommentAnchor, Verdict,
+    BlockDeletion, CommentAnchor, CommentAnchorDiffLineKind, DiffCommentAnchor,
+    DiffCommentAnchorRow, FileStore, ReviewCheck, ReviewTargetKind, ReviewedBlockChange,
+    SourceCommentAnchor, Verdict,
 };
 use crate::sub_splitter;
 use crate::targets::{extract_pull_request_target, workdir_prefix_from_git_root};
@@ -5739,6 +5740,15 @@ fn node_mark_params(
         })
         .transpose()?
         .flatten();
+    // A base-only diff block is reviewed as the comparison's deletion of it.
+    let deletion = match node.change {
+        ReviewedBlockChange::Content => None,
+        ReviewedBlockChange::Deleted => Some(BlockDeletion {
+            head_revision: review_scope_revision(state)?.context(
+                "reviewing a deleted block needs the commit at the head of the reviewed comparison",
+            )?,
+        }),
+    };
 
     Ok(mark::MarkParams {
         fingerprint,
@@ -5751,6 +5761,7 @@ fn node_mark_params(
         comment_scope,
         comment_context,
         comment_anchor,
+        deletion,
     })
 }
 
@@ -9826,7 +9837,7 @@ mod diff_scope_tests {
     use crate::cli::Cli;
     use crate::commands::review::{
         BlockChangeKind, CollectedReview, ReviewDiagnostic, ReviewRequest, ReviewSummary,
-        UnreviewedFile,
+        UnreviewedBlock, UnreviewedFile,
     };
     use crate::config::{BatchConfirmPolicy, BlockFilters};
     use crate::context::TrueflowContext;
@@ -11879,8 +11890,18 @@ mod diff_scope_tests {
                 path: RepoPath::new("src/lib.rs").unwrap(),
                 language: Language::Rust,
                 blocks: vec![
-                    test_block("fn alpha() {}".to_string(), BlockKind::Function, 1, 2),
-                    test_block("fn beta() {}".to_string(), BlockKind::Function, 3, 4),
+                    UnreviewedBlock::content(test_block(
+                        "fn alpha() {}".to_string(),
+                        BlockKind::Function,
+                        1,
+                        2,
+                    )),
+                    UnreviewedBlock::content(test_block(
+                        "fn beta() {}".to_string(),
+                        BlockKind::Function,
+                        3,
+                        4,
+                    )),
                 ],
             }],
             total_blocks: 5,
@@ -13301,7 +13322,7 @@ mod diff_scope_tests {
                 files: vec![UnreviewedFile {
                     path: RepoPath::new("src/lib.rs").unwrap(),
                     language: Language::Rust,
-                    blocks: vec![block],
+                    blocks: vec![UnreviewedBlock::content(block)],
                 }],
                 total_blocks: 1,
                 diagnostics: Vec::<ReviewDiagnostic>::new(),
@@ -13343,6 +13364,95 @@ mod diff_scope_tests {
         assert!(state.commented_nodes.contains(&block_id));
         assert_ne!(state.navigator.current_id(), state.navigator.tree.root());
         assert_eq!(state.view_mode, ViewMode::Source);
+    }
+
+    #[test]
+    fn marking_a_deleted_block_reviews_its_deletion_at_the_comparison_head() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let kept = test_block("fn kept() {}\n".to_string(), BlockKind::Function, 1, 2);
+        let gone = test_block("fn gone() {}\n".to_string(), BlockKind::Function, 3, 4);
+        let kept_id = builder.add_block(
+            file,
+            "kept".to_string(),
+            "src/lib.rs".to_string(),
+            kept.clone(),
+            Language::Rust,
+        );
+        let gone_id = builder.add_block_showing(
+            file,
+            "gone".to_string(),
+            "src/lib.rs".to_string(),
+            gone.clone(),
+            Language::Rust,
+            ReviewedBlockChange::Deleted,
+        );
+        let review = CollectedReview {
+            diff_selection: crate::targets::ReviewDiffSelection::None,
+            summary: ReviewSummary {
+                files: vec![UnreviewedFile {
+                    path: RepoPath::new("src/lib.rs").unwrap(),
+                    language: Language::Rust,
+                    blocks: vec![
+                        UnreviewedBlock::content(kept),
+                        UnreviewedBlock {
+                            block: gone,
+                            change: ReviewedBlockChange::Deleted,
+                        },
+                    ],
+                }],
+                total_blocks: 2,
+                diagnostics: Vec::<ReviewDiagnostic>::new(),
+            },
+            tree: builder.finalize(),
+            unreviewed_block_nodes: HashSet::from([kept_id, gone_id]),
+            commented_block_nodes: HashSet::new(),
+            diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::from([(gone_id, BlockChangeKind::Deleted)]),
+        };
+        let head = "2222222222222222222222222222222222222222";
+        let mut state = build_review_state(
+            &TrueflowContext::new(Cli::parse_from(["trueflow", "tui"])),
+            review,
+            ScopePreset::Commit {
+                id: head.to_string(),
+                summary: String::new(),
+            },
+            ReviewStateBuildOptions {
+                confirm_batch: BatchConfirmPolicy::Never,
+                block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+                diff_line_numbers: TuiDiffLineNumbers::Disabled,
+                keybinds: TuiKeybindsConfig::default(),
+                scope_label: head.to_string(),
+                initial_view_mode: ViewMode::Diff,
+                speed_read_config: TuiSpeedReadConfig::default(),
+                speed_read_defaults: SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
+                ai: TuiAiState::empty(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("expected review state: {error}"));
+
+        let deletion = node_mark_params(&mut state, gone_id, Verdict::Approved, None)
+            .unwrap_or_else(|error| panic!("expected deletion params: {error}"));
+        let content = node_mark_params(&mut state, kept_id, Verdict::Approved, None)
+            .unwrap_or_else(|error| panic!("expected content params: {error}"));
+
+        assert_eq!(
+            deletion.deletion,
+            Some(BlockDeletion {
+                head_revision: CommitId::new(head).unwrap(),
+            })
+        );
+        assert_eq!(content.deletion, None);
     }
 
     #[test]
@@ -15789,7 +15899,15 @@ mod diff_scope_tests {
             .files
             .into_iter()
             .flat_map(|file| file.blocks)
-            .map(|block| block.content.lines().next().unwrap_or_default().to_string())
+            .map(|unreviewed| {
+                unreviewed
+                    .block
+                    .content
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect()
     }
 

@@ -347,7 +347,9 @@ the error when the command fails."
   "Mark BLOCK with VERDICT and optional NOTE.
 
 BLOCK must carry its `file' and 0-indexed `start_line' so the record
-identifies the reviewed occurrence, as the TUI does."
+identifies the reviewed occurrence, as the TUI does.  A block the status
+review lists as deleted (`change' is \"deleted\") is reviewed as its
+deletion by the worktree changes on top of HEAD."
   (let* ((path (or (alist-get 'file block)
                    (error "Trueflow block %s has no file path" (alist-get 'hash block))))
          (args (list "mark"
@@ -355,6 +357,8 @@ identifies the reviewed occurrence, as the TUI does."
                      "--verdict" verdict
                      "--path" path
                      "--line" (number-to-string (alist-get 'start_line block)))))
+    (when (equal (alist-get 'change block) "deleted")
+      (setq args (append args (list "--deleted-in" "HEAD"))))
     (when note
       (setq args (append args (list "--note" note))))
     (trueflow--run-command args)))

@@ -5797,6 +5797,7 @@ mod tests {
             comment_anchor,
             declaration_locator: None,
             declaration_deletion: None,
+            block_deletion: None,
             tags: None,
             attestations: None,
         }

@@ -259,6 +259,29 @@
                    '("mark" "--fingerprint" "h" "--verdict" "approved"
                      "--path" "src/a.rs" "--line" "7")))))
 
+(ert-deftest trueflow-mark-at-point-reviews-a-deleted-block-as-its-deletion ()
+  "A block `review --json' lists as deleted is reviewed as its deletion by HEAD's changes."
+  (let ((block '((hash . "h")
+                 (content . "fn h() {}\n")
+                 (start_line . 7)
+                 (end_line . 7)
+                 (kind . "function")
+                 (change . "deleted")
+                 (file . "src/a.rs")))
+        mark-args)
+    (cl-letf (((symbol-function 'magit-current-section)
+               (lambda () (make-instance 'trueflow-block)))
+              ((symbol-function 'trueflow--section-value) (lambda (_) block))
+              ((symbol-function 'trueflow-refresh) #'ignore)
+              ((symbol-function 'trueflow--run-command)
+               (lambda (args)
+                 (setq mark-args args)
+                 "")))
+      (trueflow-approve-at-point))
+    (should (equal mark-args
+                   '("mark" "--fingerprint" "h" "--verdict" "approved"
+                     "--path" "src/a.rs" "--line" "7" "--deleted-in" "HEAD")))))
+
 (ert-deftest trueflow-review-items-and-sections-share-file-annotation ()
   "Status sections and review items should carry the block's file path."
   (let ((block '((hash . "h") (start_line . 2))))

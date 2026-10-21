@@ -86,6 +86,12 @@ pub enum Commands {
         #[arg(long, hide = true)]
         comment_anchor_json: Option<String>,
 
+        /// Review the block's deletion rather than its content: the block is deleted by the
+        /// reviewed comparison, whose head is REVISION (`HEAD` for `--target main` and worktree
+        /// reviews). `review --json` marks such blocks `"change": "deleted"`.
+        #[arg(long, value_name = "REVISION")]
+        deleted_in: Option<String>,
+
         /// Suppress output for UI usage
         #[arg(long)]
         quiet: bool,

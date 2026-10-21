@@ -41,6 +41,8 @@ pub struct ScriptedMarkAction {
     pub comment_scope: Option<CommentScope>,
     pub comment_context: Option<String>,
     pub comment_anchor: Option<CommentAnchor>,
+    /// The head revision of a reviewed deletion (`mark --deleted-in`).
+    pub deleted_in: Option<String>,
 }
 
 impl From<mark::MarkParams> for ScriptedMarkAction {
@@ -55,6 +57,9 @@ impl From<mark::MarkParams> for ScriptedMarkAction {
             comment_scope: params.comment_scope,
             comment_context: params.comment_context,
             comment_anchor: params.comment_anchor,
+            deleted_in: params
+                .deletion
+                .map(|deletion| deletion.head_revision.as_str().to_string()),
         }
     }
 }
@@ -114,6 +119,9 @@ impl MarkActionRunner for CliMarkActionRunner {
             command
                 .arg("--comment-anchor-json")
                 .arg(serde_json::to_string(anchor)?);
+        }
+        if let Some(revision) = &action.deleted_in {
+            command.arg("--deleted-in").arg(revision);
         }
 
         let output = command.output()?;

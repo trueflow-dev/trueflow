@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::{Block, ByteSpan, FileState};
 use crate::hashing::{TreeHash, hash_str};
 use crate::repo_path::RepoPath;
-use crate::store::ApprovedTargets;
+use crate::store::{ApprovedTargets, ReviewedBlockChange};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -73,6 +73,9 @@ pub struct TreeNode {
     pub children: Vec<TreeNodeId>,
     pub block: Option<Block>,
     pub language: Option<Language>,
+    /// What reviewing the node covers. A diff review's base-only block, and every block
+    /// expanded from one, shows a deletion; every other node shows content.
+    pub change: ReviewedBlockChange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -221,6 +224,8 @@ impl Tree {
 
         let hash = block.hash.clone();
         let byte_span = block.byte_span();
+        // A block expanded from a deleted block is deleted too.
+        let change = self.nodes[parent.0].change;
         let id = TreeNodeId(self.nodes.len());
         self.nodes.push(TreeNode {
             id,
@@ -232,6 +237,7 @@ impl Tree {
             children: Vec::new(),
             block: Some(block),
             language: Some(language),
+            change,
         });
         self.nodes[parent.0].children.push(id);
 
@@ -318,6 +324,7 @@ impl TreeBuilder {
             children: Vec::new(),
             block: None,
             language: None,
+            change: ReviewedBlockChange::Content,
         };
         let mut nodes_by_path = HashMap::new();
         nodes_by_path.insert(RepoPath::root(), root);
@@ -373,12 +380,37 @@ impl TreeBuilder {
         P: TryInto<RepoPath>,
         P::Error: std::fmt::Debug,
     {
+        self.add_block_showing(
+            parent,
+            name,
+            path,
+            block,
+            language,
+            ReviewedBlockChange::Content,
+        )
+    }
+
+    /// Adds a block whose review covers `change`: its content, or its deletion.
+    pub fn add_block_showing<P>(
+        &mut self,
+        parent: TreeNodeId,
+        name: String,
+        path: P,
+        block: Block,
+        language: Language,
+        change: ReviewedBlockChange,
+    ) -> TreeNodeId
+    where
+        P: TryInto<RepoPath>,
+        P::Error: std::fmt::Debug,
+    {
         let hash = block.hash.clone();
         let id = self.add_node(parent, TreeNodeKind::Block, name, path);
         if let Some(node) = self.nodes.get_mut(id.0) {
             node.hash = hash;
             node.block = Some(block);
             node.language = Some(language);
+            node.change = change;
         }
         id
     }
@@ -421,6 +453,7 @@ impl TreeBuilder {
             children: Vec::new(),
             block: None,
             language: None,
+            change: ReviewedBlockChange::Content,
         };
         self.nodes.push(node);
         if is_hash_entry {

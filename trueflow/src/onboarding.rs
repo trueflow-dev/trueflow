@@ -225,10 +225,10 @@ impl ReviewSpecification {
             .commented_block_nodes
             .retain(|id| review.unreviewed_block_nodes.contains(id));
         for file in &mut review.summary.files {
-            file.blocks.retain(|block| {
+            file.blocks.retain(|unreviewed| {
                 review
                     .tree
-                    .find_block_node(&file.path, block)
+                    .find_block_node(&file.path, &unreviewed.block)
                     .is_some_and(|id| review.unreviewed_block_nodes.contains(&id))
             });
         }

@@ -754,7 +754,7 @@ fn test_deleted_block_approval_round_trip_unblocks_check() -> Result<()> {
     fs::remove_file(repo.path.join("src/legacy.rs"))?;
     repo.commit_all("Delete legacy path")?;
 
-    // WHEN: we approve the deleted block that review exposes
+    // WHEN: we approve the deletion of the block that review exposes
     let before_check = repo.run_raw(&["check"])?;
     let review_before = get_main_review_json(&repo)?;
     let deleted_file = review_file_by_path(&review_before, "src/legacy.rs")?;
@@ -763,6 +763,8 @@ fn test_deleted_block_approval_round_trip_unblocks_check() -> Result<()> {
         "mark",
         "--fingerprint",
         &deleted_hash,
+        "--deleted-in",
+        "HEAD",
         "--verdict",
         "approved",
         "--quiet",

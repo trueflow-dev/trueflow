@@ -33,7 +33,7 @@ pub fn gamma() {
     let beta_hash = summary
         .files
         .iter()
-        .flat_map(|file| file.blocks.iter())
+        .flat_map(|file| file.blocks.iter().map(|unreviewed| &unreviewed.block))
         .find(|block| block.content.contains("beta"))
         .context("Should find beta block")?
         .hash
@@ -42,7 +42,7 @@ pub fn gamma() {
         summary
             .files
             .iter()
-            .flat_map(|file| file.blocks.iter())
+            .flat_map(|file| file.blocks.iter().map(|unreviewed| &unreviewed.block))
             .any(|block| block.content.contains("gamma")),
         "Should find gamma block"
     );
@@ -64,7 +64,7 @@ pub fn gamma() {
     let remaining_blocks = summary_after
         .files
         .iter()
-        .flat_map(|file| file.blocks.iter())
+        .flat_map(|file| file.blocks.iter().map(|unreviewed| &unreviewed.block))
         .collect::<Vec<_>>();
 
     assert!(

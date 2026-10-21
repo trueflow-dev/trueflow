@@ -30,6 +30,7 @@ fn main() -> Result<()> {
             comment_scope_end,
             comment_context,
             comment_anchor_json,
+            deleted_in,
             quiet: _,
         } => commands::mark::run(
             &context,
@@ -51,6 +52,13 @@ fn main() -> Result<()> {
                 comment_anchor: comment_anchor_json
                     .as_ref()
                     .map(|value| serde_json::from_str::<trueflow::store::CommentAnchor>(value))
+                    .transpose()?,
+                deletion: deleted_in
+                    .as_deref()
+                    .map(|revision| {
+                        trueflow::vcs::resolve_commit_id_from_workdir(revision)
+                            .map(|head_revision| trueflow::store::BlockDeletion { head_revision })
+                    })
                     .transpose()?,
             },
         ),

@@ -12,7 +12,7 @@ use crate::repo_path::RepoPath;
 use crate::scanner::{self, DirectScanPathIgnoreMatcher, ScanOptions};
 use crate::store::{
     BlockState, CommentAnchor, DeclarationAnchorRange, DeclarationRecordLocator, FileStore, Record,
-    RepoRef, ReviewTargetRef, TreeHash,
+    RepoRef, ReviewTargetRef, ReviewedBlockChange, TreeHash,
 };
 use crate::targets::{
     ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
@@ -399,10 +399,12 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
 
 /// Groups records presented as one entry. Revision-independent like the
 /// store's block locators: an unchanged block reviewed at several commits
-/// (or once dirty, then committed) is one entry.
+/// (or once dirty, then committed) is one entry. A block's deletion is a
+/// separate entry from its content.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FeedbackPresentationEntryKey {
     target: ReviewTargetRef,
+    change: ReviewedBlockChange,
     file_path: String,
     block_hash: TreeHash,
     start_line: usize,
@@ -451,11 +453,14 @@ enum FeedbackDiffAnchorRowKind {
 }
 
 /// Latest-verdict identity. Revision-independent so a later approval at a
-/// different commit supersedes an earlier comment on the same block.
+/// different commit supersedes an earlier comment on the same block. Like
+/// coverage, only a review of the same change answers a block comment: an
+/// approval of the content never resolves a comment on its deletion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FeedbackVerdictKey {
     Block {
         target_hash: TreeHash,
+        change: ReviewedBlockChange,
         file_path: String,
         block_hash: TreeHash,
         start_line: usize,
@@ -778,6 +783,7 @@ fn feedback_entry_parts(
     };
     let entry_key = FeedbackPresentationEntryKey {
         target: record.target.clone(),
+        change: record.reviewed_block_change(),
         file_path: file_path.clone(),
         block_hash: block.hash.clone(),
         start_line: block.start_line,
@@ -869,6 +875,7 @@ fn feedback_verdict_key(
                 });
             FeedbackVerdictKey::Block {
                 target_hash: hash.clone(),
+                change: record.reviewed_block_change(),
                 file_path: canonical_file_path.to_string(),
                 block_hash,
                 start_line,
@@ -1370,17 +1377,22 @@ fn revisions_reachable_from_tip_with_hidden(
     Ok(revisions)
 }
 
-/// Matches the revision of the reviewed comparison. A deletion's source revision is the
-/// comparison base, which a target's revision set excludes, so it matches by the head that
-/// deleted the surface instead.
+/// Matches the revision of the reviewed comparison. A deletion's reviewed content belongs to
+/// the comparison base, which a target's revision set excludes, so it matches by the head that
+/// deleted it instead.
 fn record_matches_allowed_revisions(record: &Record, allowed: Option<&HashSet<String>>) -> bool {
     let Some(allowed) = allowed else {
         return true;
     };
-    match (&record.declaration_deletion, &record.repo_ref) {
-        (Some(deletion), _) => allowed.contains(deletion.head_revision.as_str()),
-        (None, RepoRef::Vcs { revision, .. }) => allowed.contains(revision.as_str()),
-        (None, RepoRef::Unknown) => false,
+    match (
+        &record.declaration_deletion,
+        &record.block_deletion,
+        &record.repo_ref,
+    ) {
+        (Some(deletion), _, _) => allowed.contains(deletion.head_revision.as_str()),
+        (None, Some(deletion), _) => allowed.contains(deletion.head_revision.as_str()),
+        (None, None, RepoRef::Vcs { revision, .. }) => allowed.contains(revision.as_str()),
+        (None, None, RepoRef::Unknown) => false,
     }
 }
 
@@ -2944,6 +2956,7 @@ mod tests {
             comment_anchor: None,
             declaration_locator: None,
             declaration_deletion: None,
+            block_deletion: None,
             tags: None,
             attestations: None,
         }

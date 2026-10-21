@@ -4,9 +4,9 @@ use crate::gpg::{GpgClient, SigningMode};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::{
-    Attestation, AttestationKind, BlockState, Canonicalization, CommentAnchor, CommentScope,
-    DeclarationDeletion, DeclarationRecordLocator, FileStore, Identity, Record, RepoRef,
-    ReviewCheck, ReviewStore, ReviewTargetKind, ReviewTargetRef, VcsSystem, Verdict,
+    Attestation, AttestationKind, BlockDeletion, BlockState, Canonicalization, CommentAnchor,
+    CommentScope, DeclarationDeletion, DeclarationRecordLocator, FileStore, Identity, Record,
+    RepoRef, ReviewCheck, ReviewStore, ReviewTargetKind, ReviewTargetRef, VcsSystem, Verdict,
 };
 use crate::tree::{self, TreeNodeKind};
 use crate::vcs;
@@ -40,6 +40,8 @@ pub struct MarkParams {
     pub comment_scope: Option<CommentScope>,
     pub comment_context: Option<String>,
     pub comment_anchor: Option<CommentAnchor>,
+    /// Set when the mark reviews the block's deletion rather than its content.
+    pub deletion: Option<BlockDeletion>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,10 +315,16 @@ fn build_mark_record(
         comment_scope,
         comment_context,
         comment_anchor,
+        deletion,
     } = params;
 
     let path_hint = path.as_ref().map(resolve_path_hint_from_workdir);
-    let target_kind = infer_target_kind(target_kind, &fingerprint, path_hint.as_ref(), line)?;
+    // A deletion's content is gone from the worktree, so only a block target can name it.
+    let target_kind = match (target_kind, &deletion) {
+        (Some(kind), _) => kind,
+        (None, Some(_)) => ReviewTargetKind::Block,
+        (None, None) => infer_target_kind(&fingerprint, path_hint.as_ref(), line)?,
+    };
     let target = target_kind.parse_target(&fingerprint)?;
     let block_state: BlockState = vcs::block_state_for_path(
         repo_snapshot,
@@ -339,19 +347,16 @@ fn build_mark_record(
     record.comment_scope = comment_scope;
     record.comment_context = comment_context;
     record.comment_anchor = comment_anchor;
+    record.block_deletion = deletion;
+    record.validate()?;
     Ok(record)
 }
 
 fn infer_target_kind(
-    explicit: Option<ReviewTargetKind>,
     fingerprint: &str,
     path_hint: Option<&RepoPath>,
     line_hint: Option<u32>,
 ) -> Result<ReviewTargetKind> {
-    if let Some(kind) = explicit {
-        return Ok(kind);
-    }
-
     // Hashes must come from the same configured scan as `scan`/`review`.
     let scan_options = load_config()?.scan.resolve_options();
     let scan_result = crate::scanner::scan_directory(".", &scan_options)?;

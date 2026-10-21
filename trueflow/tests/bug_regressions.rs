@@ -391,7 +391,7 @@ fn test_diff_blocks_match_post_hunk_file_content() -> Result<()> {
     // THEN: semantic block content reflects the post-hunk file content
     let file_content = fs::read_to_string(repo.path.join("src/main.rs"))?;
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].content, file_content.trim_end_matches('\n'));
+    assert_eq!(blocks[0].block.content, file_content.trim_end_matches('\n'));
     Ok(())
 }
 
@@ -1687,10 +1687,10 @@ fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> 
         .blocks;
     assert_eq!(blocks.len(), 2, "expected duplicate blocks before approval");
 
-    let duplicate_hash = blocks[0].hash.to_string();
-    let first_start_line = blocks[0].start_line;
-    let second_start_line = blocks[1].start_line;
-    assert_eq!(blocks[1].hash.to_string(), duplicate_hash);
+    let duplicate_hash = blocks[0].block.hash.to_string();
+    let first_start_line = blocks[0].block.start_line;
+    let second_start_line = blocks[1].block.start_line;
+    assert_eq!(blocks[1].block.hash.to_string(), duplicate_hash);
     assert_ne!(first_start_line, second_start_line);
 
     repo.run(&[
@@ -1719,7 +1719,7 @@ fn test_review_uses_precise_block_approval_for_duplicate_hashes() -> Result<()> 
         "expected one duplicate block to remain after exact approval"
     );
 
-    assert_eq!(remaining_blocks[0].start_line, second_start_line);
+    assert_eq!(remaining_blocks[0].block.start_line, second_start_line);
 
     Ok(())
 }
@@ -1778,7 +1778,7 @@ fn test_block_rejection_overrides_file_approval_in_review() -> Result<()> {
         .unwrap_or(&[]);
 
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].hash, block.hash);
+    assert_eq!(blocks[0].block.hash, block.hash);
     Ok(())
 }
 
@@ -2713,7 +2713,7 @@ fn unreviewed_contents(summary: &trueflow::commands::review::ReviewSummary) -> V
         .files
         .iter()
         .flat_map(|file| file.blocks.iter())
-        .map(|block| block.content.clone())
+        .map(|unreviewed| unreviewed.block.content.clone())
         .collect()
 }
 
@@ -2800,6 +2800,7 @@ fn changed_container_header_is_not_hidden_by_approved_child() -> Result<()> {
         .files
         .iter()
         .flat_map(|file| file.blocks.iter())
+        .map(|unreviewed| &unreviewed.block)
         .find(|block| block.kind == BlockKind::Method && block.content.contains("value = 2"))
         .with_context(|| format!("changed method: {:?}", unreviewed_contents(&summary)))?
         .hash
@@ -3036,5 +3037,181 @@ fn whole_repo_scopes_include_tracked_files_matching_gitignore() -> Result<()> {
         ],
         "trueflow's own ignore rules still apply to tracked files"
     );
+    Ok(())
+}
+
+const ACCESS_CHECK: &str = "pub fn check_access(user: &str) -> bool {\n    user == \"admin\"\n}\n";
+const KEPT_FUNCTION: &str = "pub fn keep() -> u32 {\n    1\n}\n";
+
+/// Approves every block `review --all` lists, as `mark` with path and line.
+fn approve_every_block(repo: &TestRepo) -> Result<()> {
+    for file in json_array(&repo.run(&["review", "--all", "--json"])?)? {
+        let path = file["path"].as_str().context("review file path")?;
+        for block in file["blocks"].as_array().context("review blocks")? {
+            let hash = block["hash"].as_str().context("block hash")?;
+            let line = block["start_line"].as_u64().context("block start line")?;
+            repo.run(&[
+                "mark",
+                "--fingerprint",
+                hash,
+                "--path",
+                path,
+                "--line",
+                &line.to_string(),
+                "--quiet",
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+/// A repository whose `main` holds an approved access check and whose
+/// `feature` branch then changes it with `edit`.
+fn repo_changing_approved_access_check(
+    name: &str,
+    edit: impl FnOnce(&TestRepo) -> Result<()>,
+) -> Result<TestRepo> {
+    let repo = TestRepo::new(name)?;
+    repo.write("src/lib.rs", &format!("{KEPT_FUNCTION}\n{ACCESS_CHECK}"))?;
+    repo.commit_all("base")?;
+    repo.git(&["branch", "-M", "main"])?;
+    approve_every_block(&repo)?;
+    repo.git(&["switch", "-c", "feature"])?;
+    edit(&repo)?;
+    repo.commit_all("change the access check")?;
+    Ok(repo)
+}
+
+fn delete_access_check(repo: &TestRepo) -> Result<()> {
+    repo.write("src/lib.rs", KEPT_FUNCTION)
+}
+
+/// The `(hash, start_line)` of the block in `path` whose content contains
+/// `needle`, from `review --target main --json`, with its JSON value.
+fn main_review_block(repo: &TestRepo, path: &str, needle: &str) -> Result<Option<Value>> {
+    let files = json_array(&repo.run(&["review", "--target", "main", "--json"])?)?;
+    Ok(files
+        .iter()
+        .filter(|file| file["path"] == path)
+        .flat_map(|file| file["blocks"].as_array().into_iter().flatten())
+        .find(|block| {
+            block["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(needle))
+        })
+        .cloned())
+}
+
+fn mark_block(repo: &TestRepo, block: &Value, path: &str, extra: &[&str]) -> Result<()> {
+    let hash = block["hash"].as_str().context("block hash")?;
+    let line = block["start_line"].as_u64().context("block start line")?;
+    let line = line.to_string();
+    let mut args = vec![
+        "mark",
+        "--fingerprint",
+        hash,
+        "--path",
+        path,
+        "--line",
+        &line,
+        "--quiet",
+    ];
+    args.extend_from_slice(extra);
+    repo.run(&args).map(drop)
+}
+
+fn check_passes(repo: &TestRepo) -> Result<bool> {
+    Ok(repo.run_raw(&["check"])?.status.success())
+}
+
+#[test]
+fn deleting_approved_code_needs_a_review_of_the_deletion() -> Result<()> {
+    let repo = repo_changing_approved_access_check("deleted_approved_block", delete_access_check)?;
+
+    let check = repo.run_raw(&["check"])?;
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        !check.status.success() && stderr.contains("src/lib.rs"),
+        "check must list the unreviewed deletion of approved code: {stderr}"
+    );
+    let deleted = main_review_block(&repo, "src/lib.rs", "check_access")?
+        .context("review --target main must list the deleted block")?;
+    assert_eq!(deleted["change"], "deleted", "{deleted}");
+
+    // Approving the removed content again is not a review of its removal.
+    mark_block(&repo, &deleted, "src/lib.rs", &[])?;
+    assert!(!check_passes(&repo)?);
+    assert!(main_review_block(&repo, "src/lib.rs", "check_access")?.is_some());
+
+    mark_block(&repo, &deleted, "src/lib.rs", &["--deleted-in", "HEAD"])?;
+    assert!(check_passes(&repo)?, "an approved deletion passes check");
+    assert!(
+        json_array(&repo.run(&["review", "--target", "main", "--json"])?)?.is_empty(),
+        "an approved deletion leaves nothing to review"
+    );
+    Ok(())
+}
+
+#[test]
+fn moved_code_reviews_its_deletion_and_its_addition_separately() -> Result<()> {
+    let repo = repo_changing_approved_access_check("moved_approved_block", |repo| {
+        delete_access_check(repo)?;
+        repo.write("src/auth.rs", ACCESS_CHECK)
+    })?;
+
+    let added = main_review_block(&repo, "src/auth.rs", "check_access")?
+        .context("the moved-in copy is new content at its path")?;
+    let deleted = main_review_block(&repo, "src/lib.rs", "check_access")?
+        .context("the moved-out copy is a deletion at its path")?;
+    assert_eq!(deleted["change"], "deleted", "{deleted}");
+    assert!(added.get("change").is_none(), "{added}");
+
+    mark_block(&repo, &added, "src/auth.rs", &[])?;
+    assert!(
+        main_review_block(&repo, "src/lib.rs", "check_access")?.is_some(),
+        "approving the destination does not review the removal from the source"
+    );
+    assert!(!check_passes(&repo)?);
+
+    mark_block(&repo, &deleted, "src/lib.rs", &["--deleted-in", "HEAD"])?;
+    assert!(check_passes(&repo)?);
+    Ok(())
+}
+
+#[test]
+fn deletion_feedback_is_resolved_only_by_a_deletion_approval() -> Result<()> {
+    let repo = repo_changing_approved_access_check("deleted_block_feedback", delete_access_check)?;
+    let deleted =
+        main_review_block(&repo, "src/lib.rs", "check_access")?.context("deleted block")?;
+    mark_block(
+        &repo,
+        &deleted,
+        "src/lib.rs",
+        &[
+            "--deleted-in",
+            "HEAD",
+            "--verdict",
+            "comment",
+            "--note",
+            "why drop the check?",
+        ],
+    )?;
+    let open_comments = |repo: &TestRepo| -> Result<Vec<Value>> {
+        json_array(&repo.run(&["feedback", "--format", "json", "--target", "main"])?)
+    };
+    let feedback = open_comments(&repo)?;
+    assert_eq!(feedback.len(), 1, "{feedback:?}");
+    assert_eq!(feedback[0]["latest_verdict"], "comment");
+
+    // An approval of the removed content does not answer the deletion comment.
+    mark_block(&repo, &deleted, "src/lib.rs", &[])?;
+    let feedback = open_comments(&repo)?;
+    assert_eq!(feedback.len(), 1, "{feedback:?}");
+    assert_eq!(feedback[0]["latest_verdict"], "comment");
+    assert!(!check_passes(&repo)?);
+
+    mark_block(&repo, &deleted, "src/lib.rs", &["--deleted-in", "HEAD"])?;
+    assert!(open_comments(&repo)?.is_empty());
+    assert!(check_passes(&repo)?);
     Ok(())
 }

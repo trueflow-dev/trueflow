@@ -30,6 +30,19 @@
       ],
       "type": "string"
     },
+    "BlockDeletion": {
+      "additionalProperties": false,
+      "description": "Marks a block record as reviewing the deletion of the hinted block: the block exists on the\nbase of the reviewed comparison and `head_revision`, the comparison's head, removes it. For a\nworktree review the head is the commit the worktree changes.",
+      "properties": {
+        "head_revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "head_revision"
+      ],
+      "type": "object"
+    },
     "BlockState": {
       "enum": [
         "committed",
@@ -642,6 +655,35 @@
           "declaration_locator"
         ]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "block_deletion": {
+            "$ref": "#/$defs/BlockDeletion"
+          }
+        },
+        "required": [
+          "block_deletion"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "block"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "version": {
+            "const": 5
+          }
+        }
+      }
     }
   ],
   "properties": {
@@ -652,6 +694,16 @@
       "type": [
         "array",
         "null"
+      ]
+    },
+    "block_deletion": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BlockDeletion"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "block_state": {

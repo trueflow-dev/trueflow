@@ -175,7 +175,7 @@ impl FeedbackScenario {
             .with_context(|| format!("missing review output for {path}"))?;
         file.blocks
             .first()
-            .cloned()
+            .map(|unreviewed| unreviewed.block.clone())
             .context("expected at least one block")
     }
 

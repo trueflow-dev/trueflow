@@ -288,6 +288,34 @@ pub struct DeclarationDeletion {
     pub head_revision: CommitId,
 }
 
+/// Marks a block record as reviewing the deletion of the hinted block: the block exists on the
+/// base of the reviewed comparison and `head_revision`, the comparison's head, removes it. For a
+/// worktree review the head is the commit the worktree changes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct BlockDeletion {
+    pub head_revision: CommitId,
+}
+
+/// Which change a block review covers. Content and its deletion are separate decisions: a record
+/// never covers a unit of the other kind, so approving code when it was added says nothing about
+/// removing it, and approving a removal says nothing about the code if it returns.
+#[derive(Serialize, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewedBlockChange {
+    /// Content present in the reviewed snapshot.
+    #[default]
+    Content,
+    /// Content the reviewed comparison deletes from its base.
+    Deleted,
+}
+
+impl ReviewedBlockChange {
+    pub fn is_content(&self) -> bool {
+        matches!(self, Self::Content)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct DeclarationAnchorRange {
@@ -542,6 +570,23 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                     },
                     "required": ["declaration_locator"]
                 }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "block_deletion": { "$ref": "#/$defs/BlockDeletion" }
+                    },
+                    "required": ["block_deletion"]
+                },
+                "then": {
+                    "properties": {
+                        "version": { "const": 5 },
+                        "target": {
+                            "properties": { "kind": { "const": "block" } },
+                            "required": ["kind"]
+                        }
+                    }
+                }
             }
         ]),
     );
@@ -572,6 +617,8 @@ pub struct Record {
     pub declaration_locator: Option<DeclarationRecordLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration_deletion: Option<DeclarationDeletion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_deletion: Option<BlockDeletion>,
     #[schemars(inner(length(min = 1)))]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -597,6 +644,7 @@ struct RecordWire {
     comment_anchor: Option<CommentAnchor>,
     declaration_locator: Option<DeclarationRecordLocator>,
     declaration_deletion: Option<DeclarationDeletion>,
+    block_deletion: Option<BlockDeletion>,
     tags: Option<Vec<String>>,
     attestations: Option<Vec<Attestation>>,
 }
@@ -621,6 +669,7 @@ impl From<RecordWire> for Record {
             comment_anchor: record.comment_anchor,
             declaration_locator: record.declaration_locator,
             declaration_deletion: record.declaration_deletion,
+            block_deletion: record.block_deletion,
             tags: record.tags,
             attestations: record.attestations,
         }
@@ -715,6 +764,9 @@ struct SignableRecordV5<'a> {
     // Omitted when absent so records signed before deletion reviews keep their payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     declaration_deletion: &'a Option<DeclarationDeletion>,
+    // Omitted when absent so records signed before block deletion reviews keep their payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_deletion: &'a Option<BlockDeletion>,
     tags: &'a Option<Vec<String>>,
 }
 
@@ -745,8 +797,17 @@ impl Record {
             comment_anchor: None,
             declaration_locator: None,
             declaration_deletion: None,
+            block_deletion: None,
             tags: None,
             attestations: None,
+        }
+    }
+
+    /// Which block change the record reviews: a deletion exactly when it carries the marker.
+    pub fn reviewed_block_change(&self) -> ReviewedBlockChange {
+        match self.block_deletion {
+            Some(_) => ReviewedBlockChange::Deleted,
+            None => ReviewedBlockChange::Content,
         }
     }
 
@@ -756,6 +817,15 @@ impl Record {
                 "unsupported review record version {}",
                 self.version
             ));
+        }
+
+        if self.block_deletion.is_some() {
+            if self.version != 5 {
+                return Err(anyhow!("block deletions require review record version 5"));
+            }
+            if !matches!(self.target, ReviewTargetRef::Block { .. }) {
+                return Err(anyhow!("a block deletion requires a block target"));
+            }
         }
 
         let declaration_target = matches!(self.target, ReviewTargetRef::Declaration { .. });
@@ -937,6 +1007,7 @@ impl Record {
                 comment_anchor: &self.comment_anchor,
                 declaration_locator: &self.declaration_locator,
                 declaration_deletion: &self.declaration_deletion,
+                block_deletion: &self.block_deletion,
                 tags: &self.tags,
             })?),
             version => Err(anyhow!("unsupported review record version {version}")),
@@ -1627,8 +1698,59 @@ mod tests {
             comment_anchor: None,
             declaration_locator: None,
             declaration_deletion: None,
+            block_deletion: None,
             tags: None,
             attestations: None,
+        }
+    }
+
+    #[test]
+    fn block_deletion_is_a_signed_v5_block_field_omitted_when_absent() {
+        let hash = TreeHash::from_content("fn gone() {}\n");
+        let content = record(
+            "content",
+            ReviewTargetRef::Block { hash: hash.clone() },
+            "review",
+            Verdict::Approved,
+            1,
+        );
+        let mut deletion = content.clone();
+        deletion.block_deletion = Some(BlockDeletion {
+            head_revision: CommitId::new("fedcba9876543210").unwrap(),
+        });
+
+        assert_eq!(
+            content.reviewed_block_change(),
+            ReviewedBlockChange::Content
+        );
+        assert_eq!(
+            deletion.reviewed_block_change(),
+            ReviewedBlockChange::Deleted
+        );
+        assert!(
+            !content
+                .signing_payload()
+                .unwrap()
+                .contains("block_deletion")
+        );
+        assert!(
+            !serde_json::to_string(&content)
+                .unwrap()
+                .contains("block_deletion")
+        );
+        assert!(
+            deletion
+                .signing_payload()
+                .unwrap()
+                .contains(r#""block_deletion":{"head_revision":"fedcba9876543210"}"#)
+        );
+
+        let mut legacy = deletion.clone();
+        legacy.version = 4;
+        let mut file = deletion;
+        file.target = ReviewTargetRef::File { hash };
+        for invalid in [legacy, file] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
         }
     }
 

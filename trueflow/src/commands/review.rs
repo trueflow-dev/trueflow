@@ -15,7 +15,7 @@ use crate::review_pass::{
     nothing_new_reason,
 };
 use crate::scanner::{self, DirectScanPathIgnoreMatcher, ScanDiagnostic, ScanOptions};
-use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
+use crate::store::{FileStore, ReviewCheck, ReviewStore, ReviewedBlockChange, Verdict};
 use crate::sub_splitter;
 use crate::targets::{
     ResolvedTargets, ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget,
@@ -37,7 +37,26 @@ pub use crate::targets::{ReviewTarget, RevisionExpr, RevisionRangeExpr};
 pub struct UnreviewedFile {
     pub path: RepoPath,
     pub language: Language,
-    pub blocks: Vec<Block>,
+    pub blocks: Vec<UnreviewedBlock>,
+}
+
+/// A block that still needs review, and which change of it: its content, or (in a diff
+/// review) its deletion, which `mark --deleted-in` reviews.
+#[derive(Serialize, Debug, Clone)]
+pub struct UnreviewedBlock {
+    #[serde(flatten)]
+    pub block: Block,
+    #[serde(skip_serializing_if = "ReviewedBlockChange::is_content")]
+    pub change: ReviewedBlockChange,
+}
+
+impl UnreviewedBlock {
+    pub fn content(block: Block) -> Self {
+        Self {
+            block,
+            change: ReviewedBlockChange::Content,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +118,17 @@ pub enum BlockChangeKind {
     Added,
     Deleted,
     Changed,
+}
+
+impl BlockChangeKind {
+    /// What reviewing a block with this change covers: a deleted block's review covers its
+    /// deletion, never its (former) content.
+    pub fn reviewed_change(self) -> ReviewedBlockChange {
+        match self {
+            Self::Added | Self::Changed => ReviewedBlockChange::Content,
+            Self::Deleted => ReviewedBlockChange::Deleted,
+        }
+    }
 }
 
 pub struct CollectedReview {
@@ -417,6 +447,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                 coverage: &coverage,
                 review_check: &review_check,
                 file_path: &file.path,
+                change: ReviewedBlockChange::Content,
             };
             if subblocks.is_covered(&block, node_id, None) {
                 continue;
@@ -428,7 +459,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                     commented_block_nodes.insert(node_id);
                 }
             }
-            unreviewed_blocks.push(block);
+            unreviewed_blocks.push(UnreviewedBlock::content(block));
         }
 
         if !unreviewed_blocks.is_empty() {
@@ -440,22 +471,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         }
     }
 
-    for file in &mut unreviewed_files {
-        file.blocks.sort_by_key(|block| {
-            (
-                kind_rank(block),
-                block.start_byte,
-                block.end_byte,
-                block.start_line,
-                block.end_line,
-            )
-        });
-    }
-
-    unreviewed_files.sort_by(|a, b| {
-        let rank_fn = |file: &UnreviewedFile| file.blocks.first().map_or(100, kind_rank);
-        (rank_fn(a), &a.path).cmp(&(rank_fn(b), &b.path))
-    });
+    sort_unreviewed_files(&mut unreviewed_files);
 
     Ok(CollectedReview {
         diff_selection: query.diff_selection.clone(),
@@ -557,7 +573,8 @@ fn collect_diff_review_presentation(
                 continue;
             }
             total_blocks += 1;
-            let block_coverage = coverage.block(&file.path, &display_block);
+            let change = review_block.change_kind.reviewed_change();
+            let block_coverage = coverage.block_showing(&file.path, &display_block, change);
             let effective_verdict = block_coverage.effective_latest_verdict_for(review_check);
             if effective_verdict == Some(&Verdict::Approved) {
                 continue;
@@ -569,6 +586,7 @@ fn collect_diff_review_presentation(
                 coverage,
                 review_check,
                 file_path: &file.path,
+                change,
             };
             if subblocks.is_covered(&display_block, Some(node_id), None) {
                 continue;
@@ -578,7 +596,10 @@ fn collect_diff_review_presentation(
             if effective_verdict == Some(&Verdict::Comment) {
                 commented_block_nodes.insert(node_id);
             }
-            unreviewed_blocks.push(display_block);
+            unreviewed_blocks.push(UnreviewedBlock {
+                block: display_block,
+                change,
+            });
         }
 
         if !unreviewed_blocks.is_empty() {
@@ -590,8 +611,21 @@ fn collect_diff_review_presentation(
         }
     }
 
-    for file in &mut unreviewed_files {
-        file.blocks.sort_by_key(|block| {
+    sort_unreviewed_files(&mut unreviewed_files);
+
+    DiffReviewPresentation {
+        unreviewed_files,
+        total_blocks,
+        unreviewed_block_nodes,
+        commented_block_nodes,
+    }
+}
+
+/// Orders files and their blocks for review: by block kind, then by position.
+fn sort_unreviewed_files(files: &mut [UnreviewedFile]) {
+    for file in files.iter_mut() {
+        file.blocks.sort_by_key(|unreviewed| {
+            let block = &unreviewed.block;
             (
                 kind_rank(block),
                 block.start_byte,
@@ -601,17 +635,14 @@ fn collect_diff_review_presentation(
             )
         });
     }
-    unreviewed_files.sort_by(|a, b| {
-        let rank_fn = |file: &UnreviewedFile| file.blocks.first().map_or(100, kind_rank);
+    files.sort_by(|a, b| {
+        let rank_fn = |file: &UnreviewedFile| {
+            file.blocks
+                .first()
+                .map_or(100, |unreviewed| kind_rank(&unreviewed.block))
+        };
         (rank_fn(a), &a.path).cmp(&(rank_fn(b), &b.path))
     });
-
-    DiffReviewPresentation {
-        unreviewed_files,
-        total_blocks,
-        unreviewed_block_nodes,
-        commented_block_nodes,
-    }
 }
 
 /// Which files `collect_review` loads before path filtering. Explicit
@@ -963,12 +994,13 @@ fn build_tree_from_diff_review_files(files: &[DiffReviewFile]) -> Result<DiffRev
                         None => file_id,
                     };
                     let display_block = review_block.display_block().clone();
-                    let node_id = builder.add_block(
+                    let node_id = builder.add_block_showing(
                         parent,
                         diff_block_label(&display_block),
                         next_path.clone(),
                         display_block,
                         file.language,
+                        review_block.change_kind.reviewed_change(),
                     );
                     node_ids[entry_index] = Some(node_id);
                     diff_block_sides.insert(node_id, review_block.sides.clone());
@@ -1220,10 +1252,14 @@ pub fn print_review_summary(summary: ReviewSummary, json: bool) -> Result<()> {
     } else {
         for file in unreviewed_files {
             writeln!(out, "File: {}", file.path)?;
-            for block in file.blocks {
+            for UnreviewedBlock { block, change } in file.blocks {
+                let status = match change {
+                    ReviewedBlockChange::Content => "Unreviewed",
+                    ReviewedBlockChange::Deleted => "Unreviewed deletion",
+                };
                 writeln!(
                     out,
-                    "  [Unreviewed] L{}-L{} (Hash: {}) Kind: {}",
+                    "  [{status}] L{}-L{} (Hash: {}) Kind: {}",
                     block.start_line, block.end_line, block.hash, block.kind
                 )?;
                 if let Some(first_line) = block.content.lines().next() {
@@ -1432,7 +1468,8 @@ fn kind_rank(block: &Block) -> u8 {
 }
 
 /// The file-level context a sub-block coverage check needs besides the
-/// block itself.
+/// block itself, including which change of the block is reviewed: the
+/// review units of a deleted block are deleted too.
 #[derive(Clone, Copy)]
 struct SubblockCoverage<'a, 'tree> {
     language: Language,
@@ -1440,6 +1477,7 @@ struct SubblockCoverage<'a, 'tree> {
     coverage: &'a CoverageIndex<'tree>,
     review_check: &'a ReviewCheck,
     file_path: &'a RepoPath,
+    change: ReviewedBlockChange,
 }
 
 impl SubblockCoverage<'_, '_> {
@@ -1462,7 +1500,7 @@ impl SubblockCoverage<'_, '_> {
         }
         let latest = self
             .coverage
-            .block(self.file_path, block)
+            .block_showing(self.file_path, block, self.change)
             .direct_latest_for(self.review_check)
             .filter(|latest| after.is_none_or(|after| latest.order > after));
         match latest {
@@ -1495,7 +1533,7 @@ impl SubblockCoverage<'_, '_> {
         let split_now;
         let units = if self
             .coverage
-            .has_block_records_within(self.file_path, block)
+            .has_block_records_within(self.file_path, block, self.change)
         {
             let Ok(split) = sub_splitter::child_navigation_split(block, self.language) else {
                 return false;
@@ -2246,6 +2284,7 @@ mod tests {
                         query: &query,
                         coverage: &coverage,
                         review_check: &review_check,
+                        change: ReviewedBlockChange::Content,
                         file_path: &file_path,
                     }
                     .is_covered(&function, node, None),
@@ -2313,6 +2352,7 @@ mod tests {
                 query: &query,
                 coverage: &coverage,
                 review_check: &review_check,
+                change: ReviewedBlockChange::Content,
                 file_path: &file_path,
             }
             .is_covered(
@@ -2463,6 +2503,7 @@ mod tests {
                         query: &query,
                         coverage: &coverage,
                         review_check: &review_check,
+                        change: ReviewedBlockChange::Content,
                         file_path: &file_path,
                     }
                     .is_covered(&visible_parent, node, None),
@@ -2499,8 +2540,11 @@ mod tests {
             );
             assert_eq!(
                 (
-                    presentation.unreviewed_files[0].blocks[0].hash.clone(),
-                    presentation.unreviewed_files[0].blocks[0].byte_span(),
+                    presentation.unreviewed_files[0].blocks[0]
+                        .block
+                        .hash
+                        .clone(),
+                    presentation.unreviewed_files[0].blocks[0].block.byte_span(),
                 ),
                 (visible_parent.hash.clone(), visible_parent.byte_span()),
                 "{mode} must present only the visible parent"
@@ -3448,13 +3492,15 @@ mod tests {
         let collected = collect_review(&query)
             .unwrap_or_else(|error| panic!("expected collected review: {error}"));
 
-        let deleted_block = collected
+        let deleted = collected
             .summary
             .files
             .iter()
             .flat_map(|file| file.blocks.iter())
-            .find(|block| block.content.contains("mod common;"))
+            .find(|unreviewed| unreviewed.block.content.contains("mod common;"))
             .unwrap_or_else(|| panic!("expected deleted module block in summary"));
+        assert_eq!(deleted.change, ReviewedBlockChange::Deleted);
+        let deleted_block = &deleted.block;
         assert!(
             !deleted_block.content.trim().is_empty(),
             "expected deleted block to keep original content"
