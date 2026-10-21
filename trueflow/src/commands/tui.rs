@@ -105,6 +105,15 @@ struct ScopeSelector {
     options: Vec<ScopeSelectorOption>,
     selected: usize,
     history: Option<CommitHistoryPager>,
+    load_failure: Option<ScopeLoadFailure>,
+}
+
+/// A picked scope whose review failed to load; the reopened selector shows
+/// the message and keeps that scope selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopeLoadFailure {
+    scope: ScopePreset,
+    message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -817,11 +826,24 @@ impl ScopeSelector {
             options,
             selected,
             history: None,
+            load_failure: None,
         }
     }
 
     fn with_history(mut self, history: Option<CommitHistoryPager>) -> Self {
         self.history = history;
+        self
+    }
+
+    fn with_load_failure(mut self, failure: Option<ScopeLoadFailure>) -> Self {
+        if let Some(index) = failure.as_ref().and_then(|failure| {
+            self.options
+                .iter()
+                .position(|option| option.scope == failure.scope)
+        }) {
+            self.selected = index;
+        }
+        self.load_failure = failure;
         self
     }
 
@@ -873,6 +895,52 @@ enum ScopeSelection {
         scope: ScopePreset,
         pass: ReviewPass,
     },
+}
+
+/// Runs the scope selector until a picked scope loads. A scope whose review
+/// fails to load (for example, "diff vs main" without a main branch) reopens
+/// the selector with the failure shown instead of ending the session.
+fn select_loaded_scope<S, L, R>(mut select: S, mut load: L) -> Result<Option<R>>
+where
+    S: FnMut(Option<ScopeLoadFailure>) -> Result<ScopeSelection>,
+    L: FnMut(&ScopePreset, ReviewPass) -> Result<R>,
+{
+    let mut failure = None;
+    loop {
+        match select(failure.take())? {
+            ScopeSelection::Quit => return Ok(None),
+            ScopeSelection::Selected { scope, pass } => match load(&scope, pass) {
+                Ok(loaded) => return Ok(Some(loaded)),
+                Err(error) => {
+                    failure = Some(ScopeLoadFailure {
+                        message: format!("{} unavailable: {}", scope.label(), single_line_error(&error)),
+                        scope,
+                    });
+                }
+            },
+        }
+    }
+}
+
+fn collect_launch_review(
+    launch: &QueuedLaunch,
+    filters: &BlockFilters,
+    scan_options: &crate::scanner::ScanOptions,
+) -> Result<CollectedReview> {
+    let query = resolve_review_request(
+        launch.request.request.clone(),
+        filters.clone(),
+        scan_options.clone(),
+    )?;
+    collect_review(&query)
+}
+
+/// Formats an error chain on one line for single-row status displays.
+fn single_line_error(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 enum AppExit {
@@ -1812,38 +1880,39 @@ fn run_tui_review_loop(
     let mut session = TerminalSession::enter()?;
     let run_result = (|| {
         loop {
-            let launch = if let Some(launch) = pending_launches.pop_front() {
-                launch
+            let (launch, review) = if let Some(launch) = pending_launches.pop_front() {
+                let review = collect_launch_review(&launch, filters, scan_options)?;
+                (launch, review)
             } else if allow_scope_selector {
-                let LoadedScopeSelector {
-                    selector,
-                    status_poller,
-                } = load_scope_selector(filters, scan_options);
-                let selection = run_scope_selector(
-                    session.terminal_mut(),
-                    selector,
-                    status_poller,
-                    &config.tui.keybinds,
-                    pass_defaults,
-                )?;
-                match selection {
-                    ScopeSelection::Quit => return Ok(()),
-                    ScopeSelection::Selected { scope, pass } => QueuedLaunch {
-                        request: CliReviewRequest::for_scope(scope)?,
-                        pass,
+                let loaded = select_loaded_scope(
+                    |failure| {
+                        let LoadedScopeSelector {
+                            selector,
+                            status_poller,
+                        } = load_scope_selector(filters, scan_options);
+                        run_scope_selector(
+                            session.terminal_mut(),
+                            selector.with_load_failure(failure),
+                            status_poller,
+                            &config.tui.keybinds,
+                            pass_defaults,
+                        )
                     },
-                }
+                    |scope, pass| {
+                        let launch = QueuedLaunch {
+                            request: CliReviewRequest::for_scope(scope.clone())?,
+                            pass,
+                        };
+                        let review = collect_launch_review(&launch, filters, scan_options)?;
+                        Ok((launch, review))
+                    },
+                )?;
+                let Some(loaded) = loaded else {
+                    return Ok(());
+                };
+                loaded
             } else {
                 return Ok(());
-            };
-
-            let review = {
-                let query = resolve_review_request(
-                    launch.request.request.clone(),
-                    filters.clone(),
-                    scan_options.clone(),
-                )?;
-                collect_review(&query)?
             };
             let mut state = build_review_state(
                 context,
@@ -5371,8 +5440,7 @@ fn reopen_editor_for_comment(state: &mut AppState, action: PendingAction) {
 /// until the next key press.
 fn record_action_result(state: &mut AppState, result: Result<()>) {
     if let Err(error) = result {
-        let message = format!("Save failed: {error:#}");
-        state.action_error = Some(message.split_whitespace().collect::<Vec<_>>().join(" "));
+        state.action_error = Some(format!("Save failed: {}", single_line_error(&error)));
     }
 }
 
@@ -5768,17 +5836,20 @@ fn render_scope_selector(
             .bg(palette.bg)
             .add_modifier(Modifier::BOLD),
     )));
-    // The spacer row doubles as the place to report that older history failed to load.
-    let history_note = match selector.history_state() {
-        Some(CommitHistoryState::Failed(error)) => truncate_text_to_width(
-            &format!("Older commits unavailable: {error}"),
-            usize::from(layout.content.width),
-        ),
-        Some(CommitHistoryState::More | CommitHistoryState::End) | None => String::new(),
+    // The spacer row doubles as the place to report that the picked scope or
+    // older history failed to load.
+    let (note, note_color) = match (&selector.load_failure, selector.history_state()) {
+        (Some(failure), _) => (failure.message.clone(), palette.del),
+        (None, Some(CommitHistoryState::Failed(error))) => {
+            (format!("Older commits unavailable: {error}"), palette.dim)
+        }
+        (None, Some(CommitHistoryState::More | CommitHistoryState::End) | None) => {
+            (String::new(), palette.dim)
+        }
     };
     lines.push(Line::from(Span::styled(
-        history_note,
-        Style::default().fg(palette.dim).bg(palette.bg),
+        truncate_text_to_width(&note, usize::from(layout.content.width)),
+        Style::default().fg(note_color).bg(palette.bg),
     )));
 
     let visible_options = if layout.content.height > 0 && layout.content.width > 0 {
@@ -9980,18 +10051,6 @@ mod diff_scope_tests {
         (state, file, ids)
     }
 
-    fn render_screen(state: &mut AppState, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| ui(frame, state)).unwrap();
-        let buffer = terminal.backend().buffer();
-        buffer
-            .content()
-            .chunks(usize::from(buffer.area.width))
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
     fn focused_pass_walks_only_selected_cards_and_keeps_the_diff_toggle() {
         // Each one-line block costs 12s, so a 24s budget selects two of three.
@@ -11339,6 +11398,98 @@ mod diff_scope_tests {
         assert!(
             screen.contains("> Commit 09"),
             "expected selected overflowing option to stay visible:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn select_loaded_scope_reopens_selector_after_load_failure() {
+        let mut received_failures = Vec::new();
+        let mut selections = vec![
+            ScopeSelection::Selected {
+                scope: ScopePreset::MainDiff,
+                pass: ReviewPass::Full,
+            },
+            ScopeSelection::Selected {
+                scope: ScopePreset::All,
+                pass: ReviewPass::Focused,
+            },
+        ]
+        .into_iter();
+
+        let loaded = select_loaded_scope(
+            |failure| {
+                received_failures.push(failure);
+                Ok(selections
+                    .next()
+                    .unwrap_or_else(|| panic!("selector reopened too often")))
+            },
+            |scope, pass| match scope {
+                ScopePreset::MainDiff => Err(anyhow::anyhow!("no main branch\nfound")),
+                _ => Ok((scope.clone(), pass, "all files review")),
+            },
+        )
+        .unwrap_or_else(|error| panic!("a failed scope load must not end the session: {error}"));
+
+        assert_eq!(
+            loaded,
+            Some((ScopePreset::All, ReviewPass::Focused, "all files review"))
+        );
+        assert_eq!(
+            received_failures,
+            vec![
+                None,
+                Some(ScopeLoadFailure {
+                    scope: ScopePreset::MainDiff,
+                    message: format!(
+                        "{} unavailable: no main branch found",
+                        ScopePreset::MainDiff.label()
+                    ),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_selector_shows_load_failure_and_reselects_failed_scope() {
+        let options = [ScopePreset::All, ScopePreset::MainDiff]
+            .into_iter()
+            .map(|scope| ScopeSelectorOption {
+                label: scope.label(),
+                scope,
+                status: ScopeSelectorStatus::Unavailable,
+                status_check: ScopeStatusCheck::NotNeeded,
+            })
+            .collect::<Vec<_>>();
+        let mut selector = ScopeSelector::new(options);
+        selector.selected = 0;
+        let selector = selector.with_load_failure(Some(ScopeLoadFailure {
+            scope: ScopePreset::MainDiff,
+            message: "Diff vs main unavailable: no main branch".to_string(),
+        }));
+
+        assert_eq!(selector.selected_scope(), Some(ScopePreset::MainDiff));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| {
+                render_scope_selector(
+                    frame,
+                    &selector,
+                    &TuiKeybindsConfig::default(),
+                    PassDefaults::resolve(&TuiConfig::default(), None, None),
+                );
+            })
+            .unwrap_or_else(|error| panic!("failed to render scope selector: {error}"));
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("Diff vs main unavailable: no main branch"),
+            "expected the load failure on the selector:\n{screen}"
         );
     }
 
