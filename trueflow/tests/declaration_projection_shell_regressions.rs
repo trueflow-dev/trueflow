@@ -73,3 +73,38 @@ printf '%s\n' "$RELEASE_CHANNEL"
     );
     Ok(())
 }
+
+#[test]
+fn doc_comment_directly_after_code_does_not_absorb_the_previous_newline() -> Result<()> {
+    let project = |source: &str| -> Result<Vec<_>> {
+        let facts = project_source(Path::new("scripts/deploy.sh"), Language::Shell, source)?;
+        Ok(facts
+            .declarations()
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.projection_text.clone(),
+                    declaration.projection_hash.clone(),
+                )
+            })
+            .collect())
+    };
+
+    let adjacent =
+        project("set -eu\n# Deploys.\ndeploy() { :; }\n# Cleans up.\ncleanup() { :; }\n")?;
+    let spaced =
+        project("set -eu\n\n# Deploys.\ndeploy() { :; }\n\n# Cleans up.\ncleanup() { :; }\n")?;
+
+    assert_eq!(
+        adjacent
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["# Deploys.\ndeploy()", "# Cleans up.\ncleanup()"]
+    );
+    assert_eq!(
+        adjacent, spaced,
+        "a blank line above a doc comment must not change the projection"
+    );
+    Ok(())
+}

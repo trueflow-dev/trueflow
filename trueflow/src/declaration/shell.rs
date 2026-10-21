@@ -160,32 +160,33 @@ fn trimmed_signature_range(source: &str, range: Range<usize>) -> Range<usize> {
 
 fn leading_comment_range(source: &str, declaration_start: usize) -> Option<Range<usize>> {
     let prefix = source.get(..declaration_start)?;
-    let mut end = prefix.trim_end_matches([' ', '\t', '\r', '\n']).len();
+    let end = prefix.trim_end_matches([' ', '\t', '\r', '\n']).len();
     if end == 0 || prefix[end..].matches('\n').count() > 1 {
         return None;
     }
 
-    let mut start = end;
+    // `block_start` moves only when a comment line is accepted, so the newline ending the
+    // preceding code line never joins the documentation.
+    let mut block_start = end;
+    let mut line_end = end;
     loop {
-        let line_start = prefix[..start].rfind('\n').map_or(0, |newline| newline + 1);
-        let line = &prefix[line_start..start];
-        let trimmed = line.trim_start();
+        let line_start = prefix[..line_end].rfind('\n').map_or(0, |newline| newline + 1);
+        let trimmed = prefix[line_start..line_end].trim_start();
         if !trimmed.starts_with('#') || trimmed.starts_with("#!") {
             break;
         }
-        start = line_start;
-        if start == 0 {
+        block_start = line_start;
+        if line_start == 0 {
             break;
         }
-        end = end.max(start);
-        let previous_end = start - 1;
-        if prefix[..previous_end].ends_with('\n') {
+        let previous_line_end = line_start - 1;
+        if prefix[..previous_line_end].ends_with('\n') {
             break;
         }
-        start = previous_end;
+        line_end = previous_line_end;
     }
 
-    (start < end).then_some(start..end)
+    (block_start < end).then_some(block_start..end)
 }
 
 fn has_error_before(node: Node<'_>, end: usize) -> bool {
