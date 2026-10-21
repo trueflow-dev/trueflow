@@ -8,7 +8,7 @@ use crate::store::{Record, Verdict};
 
 use super::coverage::DeclarationCoverageIndex;
 use super::diff::{
-    DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic, DiffDiagnosticKind,
+    DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic,
 };
 use super::snapshot::{SnapshotPair, SnapshotPairId, SourceSnapshot};
 use super::{
@@ -365,28 +365,25 @@ fn display_side<'a>(
     }
 }
 
+/// Every language without a declaration projector has Unsupported capabilities, so the
+/// capability alone decides; partial projectors such as Nix and Just are never unsupported.
 fn collect_unsupported_languages(
     batch: &DeclarationReviewDiffBatch,
     unsupported_languages: &mut Vec<Language>,
 ) {
-    let has_no_projector_diagnostic = batch.diff.diagnostics.iter().any(|diagnostic| {
-        diagnostic.kind == DiffDiagnosticKind::ProjectionDiagnostic
-            && diagnostic.message.contains("no declaration projector")
-    });
-
-    for snapshot in batch
-        .snapshot_pairs
-        .iter()
-        .flat_map(|pair| pair.base.iter().chain(pair.head.iter()))
-    {
-        let inventory = capabilities_for(snapshot.language).inventory;
-        let explicitly_unsupported = matches!(&inventory, Capability::Unsupported { .. });
-        let projector_unavailable =
-            has_no_projector_diagnostic && !matches!(&inventory, Capability::Complete);
-        if explicitly_unsupported || projector_unavailable {
-            unsupported_languages.push(snapshot.language);
-        }
-    }
+    unsupported_languages.extend(
+        batch
+            .snapshot_pairs
+            .iter()
+            .flat_map(|pair| pair.base.iter().chain(pair.head.iter()))
+            .filter(|snapshot| {
+                matches!(
+                    capabilities_for(snapshot.language).inventory,
+                    Capability::Unsupported { .. }
+                )
+            })
+            .map(|snapshot| snapshot.language),
+    );
 }
 
 const fn declaration_kind_priority(kind: DeclarationKind) -> u8 {

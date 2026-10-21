@@ -557,3 +557,48 @@ fn mixed_rust_and_unsupported_java_collection_retains_reviewable_items_and_unsup
     );
     Ok(())
 }
+
+#[test]
+fn partial_projector_languages_are_not_reported_as_unsupported() -> Result<()> {
+    let launch = declaration_launch("[tui]\nmode = \"declarations\"\n")?;
+    let batch = diff_batch(vec![
+        added_pair(
+            "app",
+            "head-app",
+            "src/app.js",
+            Language::JavaScript,
+            "export function start() {}\n",
+        ),
+        added_pair(
+            "flake",
+            "head-flake",
+            "flake.nix",
+            Language::Nix,
+            "{ outputs = inputs: inputs; }\n",
+        ),
+        added_pair(
+            "justfile",
+            "head-justfile",
+            "justfile",
+            Language::Just,
+            "build:\n    cargo build\n",
+        ),
+    ])?;
+
+    let collection = collect_declaration_review(&launch.declaration_query(vec![batch])?)?;
+    assert_eq!(
+        collection.status,
+        DeclarationReviewStatus::UnsupportedLanguage {
+            languages: vec![Language::JavaScript],
+        },
+        "Nix and Just have partial projectors and must not be listed as unsupported"
+    );
+    assert!(
+        collection
+            .items
+            .iter()
+            .any(|item| item.snapshot.language == Language::Nix),
+        "the Nix declaration must remain reviewable"
+    );
+    Ok(())
+}
