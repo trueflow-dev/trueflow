@@ -1275,11 +1275,15 @@ mod tests {
             "impl Foo {\n    fn a(&self) {\n        one();\n\n        two();\n    }\n}\n",
             BlockKind::Impl,
         );
-        let methods = sub_splitter::child_navigation_split(&impl_block, Language::Rust)
+        let units = sub_splitter::child_navigation_split(&impl_block, Language::Rust)
             .unwrap()
             .blocks;
-        let [method] = methods.as_slice() else {
-            panic!("expected one method child: {methods:?}");
+        let [method] = units
+            .iter()
+            .filter(|unit| unit.kind == BlockKind::Method)
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("expected one method child: {units:?}");
         };
         let grandchildren = sub_splitter::child_navigation_split(method, Language::Rust)
             .unwrap()
