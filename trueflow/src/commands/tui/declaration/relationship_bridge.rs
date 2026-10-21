@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use crate::analysis::Language;
 use anyhow::{Context, Result, anyhow, ensure};
-use async_lsp::lsp_types::{CallHierarchyItem, Range, Url};
+use async_lsp::lsp_types::{CallHierarchyItem, Position, Range, Url};
 
 use crate::declaration::relationships::{
     CallHierarchyBundle, DocumentHash, DocumentSnapshot, LspServerProfile, PositionEncoding,
-    ProjectedDocument, ProviderCallHierarchyState, ProviderError, RelationshipEdge,
-    RelationshipKind, RelationshipLocation, RelationshipMethod, RelationshipOutcome,
-    RelationshipProjectionIndex, RelationshipProvenance, RelationshipProvider,
+    ProjectedDocument, ProviderCallHierarchyState, ProviderError, RelationshipBackend,
+    RelationshipEdge, RelationshipKind, RelationshipLocation, RelationshipMethod,
+    RelationshipOutcome, RelationshipProjectionIndex, RelationshipProvenance, RelationshipProvider,
     RelationshipRequestKey, RelationshipResult, RelationshipScope, RelationshipTarget,
     SourceGeneration, WorkspaceTrust, declaration_name_start, execute_relationship_plan,
     lsp_position_for_byte_offset, plan_used_by, plan_uses_types, reconcile_relationship_execution,
@@ -47,6 +47,7 @@ pub struct DeclarationRelationshipRequest {
     pub document: DeclarationRelationshipDocument,
     pub target: PreparedDeclarationTarget,
     documents: Vec<PreparedProviderDocument>,
+    session_generation: SessionGeneration,
     projection: RelationshipProjectionIndex,
 }
 
@@ -307,6 +308,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
             document: entry.document.clone(),
             target: entry.target.clone(),
             documents: provider_documents_for(&entry, &self.documents),
+            session_generation: session_generation_for(&entry, &self.documents),
             projection: self.projection.clone(),
         };
         if let Err(error) = self.provider.request(request) {
@@ -524,6 +526,30 @@ fn exact_synchronization(
             "the live workspace bytes for {} do not match any captured snapshot generation; exact semantic synchronization is unavailable",
             absolute.display()
         ))
+    }
+}
+
+/// Which language-server session may serve a request. One session holds every URI at a
+/// single byte generation, so a target whose URI was captured with conflicting bytes needs a
+/// session bound to its own generation; every other target shares one session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SessionGeneration {
+    Shared,
+    Exact(DocumentHash),
+}
+
+fn session_generation_for(
+    entry: &CatalogEntry,
+    documents: &[PreparedProviderDocument],
+) -> SessionGeneration {
+    let conflicting = documents.iter().any(|document| {
+        document.uri == entry.document.uri
+            && document.document_hash != entry.generation.document_hash
+    });
+    if conflicting {
+        SessionGeneration::Exact(entry.generation.document_hash.clone())
+    } else {
+        SessionGeneration::Shared
     }
 }
 
@@ -1001,11 +1027,17 @@ pub struct BackgroundRelationshipProvider {
 
 impl BackgroundRelationshipProvider {
     pub fn new() -> std::result::Result<Self, ProviderError> {
+        Self::with_launcher(LspSessionLauncher)
+    }
+
+    fn with_launcher<L: SessionLauncher + Send + 'static>(
+        launcher: L,
+    ) -> std::result::Result<Self, ProviderError> {
         let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_DEPTH);
         let (result_tx, result_rx) = mpsc::sync_channel(RESULT_QUEUE_DEPTH);
         let worker = thread::Builder::new()
             .name("trueflow-relationship-coordinator".to_owned())
-            .spawn(move || provider_worker(&work_rx, &result_tx))
+            .spawn(move || provider_worker(&work_rx, &result_tx, launcher))
             .map_err(|error| {
                 ProviderError::Protocol(format!(
                     "cannot start relationship coordinator worker: {error}"
@@ -1084,13 +1116,96 @@ impl Drop for BackgroundRelationshipProvider {
     }
 }
 
-fn provider_worker(
+/// Language-server operations the background worker drives. `RelationshipProvider` is the
+/// production session; the trait keeps the worker's session policy testable.
+trait ProviderSession: RelationshipBackend {
+    fn language(&self) -> Language;
+    fn position_encoding(&self) -> PositionEncoding;
+    fn synchronize_document(
+        &mut self,
+        document: DocumentSnapshot,
+    ) -> std::result::Result<(), ProviderError>;
+    fn call_hierarchy(
+        &mut self,
+        key: RelationshipRequestKey,
+        position: Position,
+    ) -> ProviderCallHierarchyState;
+    fn session_available(&self) -> bool;
+    fn shutdown(&mut self) -> std::result::Result<(), ProviderError>;
+}
+
+impl ProviderSession for RelationshipProvider {
+    fn language(&self) -> Language {
+        Self::language(self)
+    }
+
+    fn position_encoding(&self) -> PositionEncoding {
+        Self::position_encoding(self)
+    }
+
+    fn synchronize_document(
+        &mut self,
+        document: DocumentSnapshot,
+    ) -> std::result::Result<(), ProviderError> {
+        Self::synchronize_document(self, document)
+    }
+
+    fn call_hierarchy(
+        &mut self,
+        key: RelationshipRequestKey,
+        position: Position,
+    ) -> ProviderCallHierarchyState {
+        Self::call_hierarchy(self, key, position)
+    }
+
+    fn session_available(&self) -> bool {
+        Self::session_available(self)
+    }
+
+    fn shutdown(&mut self) -> std::result::Result<(), ProviderError> {
+        Self::shutdown(self)
+    }
+}
+
+trait SessionLauncher {
+    type Session: ProviderSession;
+
+    fn launch(
+        &mut self,
+        profile: LspServerProfile,
+        language: Language,
+        workspace_root: &Path,
+    ) -> std::result::Result<Self::Session, ProviderError>;
+}
+
+struct LspSessionLauncher;
+
+impl SessionLauncher for LspSessionLauncher {
+    type Session = RelationshipProvider;
+
+    fn launch(
+        &mut self,
+        profile: LspServerProfile,
+        language: Language,
+        workspace_root: &Path,
+    ) -> std::result::Result<RelationshipProvider, ProviderError> {
+        RelationshipProvider::launch(
+            profile,
+            language,
+            workspace_root,
+            WorkspaceTrust::TrustedForInvocation,
+        )
+    }
+}
+
+fn provider_worker<L: SessionLauncher>(
     work_rx: &Receiver<DeclarationRelationshipRequest>,
     result_tx: &SyncSender<DeclarationRelationshipResults>,
+    mut launcher: L,
 ) {
-    let mut providers: HashMap<ProviderSessionKey, RelationshipProvider> = HashMap::new();
+    let mut sessions = HashMap::new();
     while let Ok(request) = work_rx.recv() {
-        let result = execute_provider_request(&request, &mut providers);
+        let result = execute_provider_request(&request, &mut sessions, &mut launcher);
         match result_tx.try_send(result) {
             Ok(()) | Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => break,
@@ -1103,27 +1218,25 @@ struct ProviderSessionKey {
     workspace_root: PathBuf,
     profile: LspServerProfile,
     language: Language,
-    snapshot_id: SnapshotId,
-    document_hash: DocumentHash,
+    generation: SessionGeneration,
 }
 
-fn execute_provider_request(
+fn execute_provider_request<L: SessionLauncher>(
     request: &DeclarationRelationshipRequest,
-    providers: &mut HashMap<ProviderSessionKey, RelationshipProvider>,
+    providers: &mut HashMap<ProviderSessionKey, L::Session>,
+    launcher: &mut L,
 ) -> DeclarationRelationshipResults {
     let session_key = ProviderSessionKey {
         workspace_root: request.workspace_root.clone(),
         profile: request.key.server_profile,
         language: request.target.snapshot.language,
-        snapshot_id: request.snapshot_id.clone(),
-        document_hash: request.key.document_hash.clone(),
+        generation: request.session_generation.clone(),
     };
     if !providers.contains_key(&session_key) {
-        let provider = match RelationshipProvider::launch(
+        let provider = match launcher.launch(
             request.key.server_profile,
             request.target.snapshot.language,
             &request.workspace_root,
-            WorkspaceTrust::TrustedForInvocation,
         ) {
             Ok(provider) => provider,
             Err(error) => return failed_results(request, error.to_string()),
@@ -1149,9 +1262,9 @@ fn execute_provider_request(
     result
 }
 
-fn execute_with_provider(
+fn execute_with_provider<S: ProviderSession>(
     request: &DeclarationRelationshipRequest,
-    provider: &mut RelationshipProvider,
+    provider: &mut S,
 ) -> DeclarationRelationshipResults {
     for document in &request.documents {
         if document.language != provider.language() {
@@ -1205,9 +1318,9 @@ fn execute_with_provider(
     }
 }
 
-fn run_relationship_plan(
+fn run_relationship_plan<S: ProviderSession>(
     request: &DeclarationRelationshipRequest,
-    provider: &mut RelationshipProvider,
+    provider: &mut S,
     uses_types: bool,
 ) -> RelationshipOutcome {
     let plan = if uses_types {
@@ -1266,5 +1379,287 @@ fn failed_results(
             key: request.key.clone(),
             outcome: RelationshipOutcome::Failed { message },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use trueflow_test_support::TestRepo;
+
+    use super::*;
+    use crate::commands::review::ResolvedReviewQuery;
+    use crate::config::BlockFilters;
+    use crate::declaration::relationships::RelationshipCapability;
+    use crate::repo_path::RepoPath;
+    use crate::scanner::ScanOptions;
+    use crate::store::CommitId;
+    use crate::targets::{
+        CommitRange, ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget,
+        ReviewPathSelection,
+    };
+    use crate::vcs::ChangedPath;
+    use trueflow_test_support::run_git_output;
+
+    #[derive(Default)]
+    struct RecordingProvider {
+        requests: Vec<DeclarationRelationshipRequest>,
+    }
+
+    impl DeclarationRelationshipProvider for RecordingProvider {
+        fn request(
+            &mut self,
+            request: DeclarationRelationshipRequest,
+        ) -> std::result::Result<(), ProviderError> {
+            self.requests.push(request);
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Option<DeclarationRelationshipResults> {
+            None
+        }
+
+        fn shutdown(&mut self) -> std::result::Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// Mirrors the LSP client's open-document bookkeeping and its 32-document session limit.
+    struct FakeSession {
+        open: HashMap<Url, DocumentHash>,
+    }
+
+    impl RelationshipBackend for FakeSession {
+        fn supports(&self, _capability: RelationshipCapability) -> bool {
+            false
+        }
+
+        fn request(
+            &mut self,
+            _request: crate::declaration::relationships::RelationshipRequest,
+        ) -> std::result::Result<Vec<async_lsp::lsp_types::Location>, ProviderError> {
+            Err(ProviderError::Protocol("no capabilities".to_owned()))
+        }
+    }
+
+    impl ProviderSession for FakeSession {
+        fn language(&self) -> Language {
+            Language::Rust
+        }
+
+        fn position_encoding(&self) -> PositionEncoding {
+            PositionEncoding::Utf16
+        }
+
+        fn synchronize_document(
+            &mut self,
+            document: DocumentSnapshot,
+        ) -> std::result::Result<(), ProviderError> {
+            let hash = document.hash();
+            match self.open.get(&document.uri) {
+                Some(open) if *open == hash => return Ok(()),
+                Some(_) => return Err(ProviderError::SessionReplacementRequired),
+                None => {}
+            }
+            if self.open.len() >= 32 {
+                return Err(ProviderError::ResourceLimit(
+                    "session already has the maximum 32 open documents".to_owned(),
+                ));
+            }
+            self.open.insert(document.uri, hash);
+            Ok(())
+        }
+
+        fn call_hierarchy(
+            &mut self,
+            key: RelationshipRequestKey,
+            _position: Position,
+        ) -> ProviderCallHierarchyState {
+            if self.open.contains_key(&key.document_uri) {
+                ProviderCallHierarchyState::Ready(CallHierarchyBundle {
+                    key,
+                    prepared: Vec::new(),
+                    incoming: Vec::new(),
+                    outgoing: Vec::new(),
+                })
+            } else {
+                ProviderCallHierarchyState::Failed {
+                    key,
+                    message: "the exact request document is not synchronized".to_owned(),
+                }
+            }
+        }
+
+        fn session_available(&self) -> bool {
+            true
+        }
+
+        fn shutdown(&mut self) -> std::result::Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeLauncher {
+        launches: usize,
+    }
+
+    impl SessionLauncher for FakeLauncher {
+        type Session = FakeSession;
+
+        fn launch(
+            &mut self,
+            _profile: LspServerProfile,
+            _language: Language,
+            _workspace_root: &Path,
+        ) -> std::result::Result<FakeSession, ProviderError> {
+            self.launches += 1;
+            Ok(FakeSession {
+                open: HashMap::new(),
+            })
+        }
+    }
+
+    fn rust_function(name: &str, ty: &str) -> String {
+        format!("pub fn {name}(value: {ty}) -> {ty} {{\n    value\n}}\n")
+    }
+
+    /// Commits one function per file, widens each in the working tree, and captures the
+    /// relationship request the bridge issues for every changed declaration.
+    fn dirty_requests(
+        name: &str,
+        files: usize,
+    ) -> Result<(TestRepo, Vec<DeclarationRelationshipRequest>)> {
+        let repo = TestRepo::new(name)?;
+        let paths = (0..files)
+            .map(|index| format!("src/file_{index:02}.rs"))
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            repo.write(path, &rust_function(&format!("function_{index:02}"), "u8"))?;
+        }
+        repo.commit_all("base functions")?;
+        for (index, path) in paths.iter().enumerate() {
+            repo.write(path, &rust_function(&format!("function_{index:02}"), "u16"))?;
+        }
+        let changed = paths
+            .iter()
+            .map(|path| RepoPath::new(path).map(ChangedPath::identity))
+            .collect::<Result<HashSet<_>>>()?;
+        let query = ResolvedReviewQuery {
+            filters: BlockFilters::default(),
+            scan_options: ScanOptions::default(),
+            content_source: ReviewContentSource::Workdir,
+            path_selection: ReviewPathSelection::Scoped {
+                files: HashSet::new(),
+                dirs: Vec::new(),
+                changed: Some(changed),
+            },
+            diff_selection: ReviewDiffSelection::None,
+        };
+        let requests = bridge_requests(&repo, &query)?;
+        ensure!(requests.len() == files, "expected one request per file");
+        Ok((repo, requests))
+    }
+
+    fn bridge_requests(
+        repo: &TestRepo,
+        query: &ResolvedReviewQuery,
+    ) -> Result<Vec<DeclarationRelationshipRequest>> {
+        let prepared = super::super::prepare_declaration_launch(&repo.path, query, Vec::new())?;
+        let mut bridge = RelationshipBridge::new(
+            &prepared,
+            &repo.path,
+            WorkspaceTrust::TrustedForInvocation,
+            Some(LspServerProfile::RustAnalyzer),
+            RecordingProvider::default(),
+        )?;
+        for target in prepared.targets() {
+            let update = bridge.request(&target.declaration.id)?;
+            ensure!(
+                update.state == RelationshipState::Checking,
+                "fixture request did not reach the provider: {:?}",
+                update.state
+            );
+        }
+        Ok(std::mem::take(&mut bridge.provider.requests))
+    }
+
+    fn commit_id(repo: &TestRepo) -> Result<CommitId> {
+        CommitId::new(run_git_output(&repo.path, &["rev-parse", "HEAD"])?)
+    }
+
+    fn assert_synchronized(results: &DeclarationRelationshipResults) {
+        assert!(
+            matches!(results.call_hierarchy, ProviderCallHierarchyState::Ready(_)),
+            "relationship request failed: {:?}",
+            results.call_hierarchy
+        );
+    }
+
+    #[test]
+    fn one_language_server_session_serves_targets_in_different_files() -> Result<()> {
+        let (_repo, requests) = dirty_requests("relationship_worker_shared_session", 2)?;
+        let mut sessions = HashMap::new();
+        let mut launcher = FakeLauncher::default();
+        for request in &requests {
+            assert_synchronized(&execute_provider_request(
+                request,
+                &mut sessions,
+                &mut launcher,
+            ));
+        }
+        assert_eq!(
+            launcher.launches, 1,
+            "every reviewed file of one language must share one language server"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_captured_generations_of_one_file_use_separate_sessions() -> Result<()> {
+        let repo = TestRepo::new("relationship_worker_conflicting_generations")?;
+        repo.write("src/a.rs", &rust_function("alpha", "u8"))?;
+        repo.commit_all("base")?;
+        let base = commit_id(&repo)?;
+        repo.write("src/a.rs", &rust_function("alpha", "u16"))?;
+        repo.commit_all("first generation")?;
+        let first = commit_id(&repo)?;
+        repo.write("src/a.rs", &rust_function("alpha", "u32"))?;
+        repo.commit_all("second generation")?;
+        let second = commit_id(&repo)?;
+        let query = ResolvedReviewQuery {
+            filters: BlockFilters::default(),
+            scan_options: ScanOptions::default(),
+            content_source: ReviewContentSource::Revision(second.clone()),
+            path_selection: ReviewPathSelection::All,
+            diff_selection: ReviewDiffSelection::Targets(vec![
+                ReviewDiffTarget::RevisionRange(CommitRange {
+                    start: base,
+                    end: first.clone(),
+                }),
+                ReviewDiffTarget::RevisionRange(CommitRange {
+                    start: first,
+                    end: second,
+                }),
+            ]),
+        };
+        let requests = bridge_requests(&repo, &query)?;
+        ensure!(requests.len() == 2, "expected one request per generation");
+
+        let mut sessions = HashMap::new();
+        let mut launcher = FakeLauncher::default();
+        for request in &requests {
+            assert_synchronized(&execute_provider_request(
+                request,
+                &mut sessions,
+                &mut launcher,
+            ));
+        }
+        assert_eq!(
+            launcher.launches, 2,
+            "one URI with two captured byte generations needs one session per generation"
+        );
+        Ok(())
     }
 }
