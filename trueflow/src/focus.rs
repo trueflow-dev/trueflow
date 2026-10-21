@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::review::CollectedReview;
-use crate::focus_evidence::{FocusCandidate, FocusInventory};
+use crate::focus_evidence::{FocusCandidate, FocusInventory, FocusScope};
 use crate::onboarding::{PreparedOnboarding, ReviewLocation, ReviewPurpose, ReviewSpecification};
 
 pub const MAX_SPECIFICATION_BYTES: usize = 256 * 1024;
@@ -150,6 +150,17 @@ impl FocusSpecification {
 
     pub fn is_empty(&self) -> bool {
         self.0.steps.is_empty()
+    }
+
+    /// The files a saved plan targets: the only scope its revalidation needs.
+    pub fn target_scope(&self) -> FocusScope {
+        FocusScope::Files(
+            self.0
+                .steps
+                .iter()
+                .map(|step| step.target.path.clone())
+                .collect(),
+        )
     }
 
     fn validate_candidates<'a>(

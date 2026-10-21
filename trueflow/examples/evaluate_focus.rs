@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use trueflow::commands::review::{ReviewRequest, collect_review, resolve_review_request};
 use trueflow::focus::FocusSpecification;
-use trueflow::focus_evidence::{FocusCandidate, FocusInventory};
+use trueflow::focus_evidence::{FocusCandidate, FocusInventory, FocusScope};
 use trueflow::onboarding::ReviewLocation;
 use trueflow::review_order::ReviewOrder;
 use trueflow_test_support::TestRepo;
@@ -311,7 +311,7 @@ fn inventory_and_order(repo: &TestRepo) -> Result<(FocusInventory, Vec<usize>)> 
         config.scan.resolve_options(),
     )?;
     let review = collect_review(&query)?;
-    let inventory = FocusInventory::capture(&review, None)?;
+    let inventory = FocusInventory::capture(&review, &FocusScope::Repository)?;
     let mut ordered = Vec::new();
     for id in ReviewOrder::from_tree(&review.tree, &review.unreviewed_block_nodes).iter_node_ids() {
         let node = review.tree.node(id);

@@ -135,3 +135,27 @@ fn focus_loaded_plan_resumes_without_approving_unselected_content() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn focus_plan_reopens_when_unplanned_paths_exceed_the_inventory_cap() -> Result<()> {
+    let repo = repository("focus_plan_scope")?;
+    let page = inventory(&repo)?;
+    repo.write("plan.json", &plan(&page["candidates"][0], 300).to_string())?;
+    // More unreviewed leaf blocks outside the plan than one inventory may hold.
+    for file in 0..5 {
+        let source: String = (0..4001)
+            .map(|n| format!("fn generated_{file}_{n}() {{}}\n"))
+            .collect();
+        repo.write(&format!("generated/part{file}.rs"), &source)?;
+    }
+    assert!(
+        repo.run_err(&["focus", "--candidates"])?
+            .contains("narrow the path scope")
+    );
+    let reopened = parse_json(&repo.run(&["focus", "--plan", "plan.json", "--json"])?)?;
+    assert_eq!(
+        reopened["steps"][0]["target"],
+        page["candidates"][0]["target"]
+    );
+    Ok(())
+}

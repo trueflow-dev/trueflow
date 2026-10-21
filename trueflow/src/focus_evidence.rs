@@ -58,6 +58,27 @@ pub struct FocusCandidate {
     pub excerpt: String,
 }
 
+/// The unreviewed blocks an inventory covers. Evidence is gathered per path and block,
+/// so narrowing the scope never changes the evidence IDs of a covered candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FocusScope {
+    Repository,
+    /// A user-selected file or directory; it must name scanned source.
+    Under(RepoPath),
+    /// Exactly the files a saved plan targets.
+    Files(BTreeSet<RepoPath>),
+}
+
+impl FocusScope {
+    fn contains(&self, path: &RepoPath) -> bool {
+        match self {
+            Self::Repository => true,
+            Self::Under(scope) => path.is_under(scope),
+            Self::Files(paths) => paths.contains(path),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct FocusInventory {
     pub candidates: Vec<FocusCandidate>,
@@ -66,10 +87,10 @@ pub struct FocusInventory {
 }
 
 impl FocusInventory {
-    pub fn capture(review: &CollectedReview, path: Option<&RepoPath>) -> Result<Self> {
+    pub fn capture(review: &CollectedReview, scope: &FocusScope) -> Result<Self> {
         let database = FileStore::new()?.load_database()?;
         let repo = vcs::repo_from_workdir();
-        let mut inventory = capture_with(review, path, &database, repo.as_ref().ok())?;
+        let mut inventory = capture_with(review, scope, &database, repo.as_ref().ok())?;
         if let Err(error) = repo {
             inventory.diagnostics.push(format!(
                 "Git discovery unavailable: {}",
@@ -106,7 +127,7 @@ impl FocusEvidence {
 
 fn capture_with(
     review: &CollectedReview,
-    path: Option<&RepoPath>,
+    scope: &FocusScope,
     database: &ReviewDatabase,
     repo: Option<&gix::Repository>,
 ) -> Result<FocusInventory> {
@@ -115,9 +136,7 @@ fn capture_with(
         .iter()
         .copied()
         .filter(|id| {
-            let node = review.tree.node(*id);
-            !review.tree.is_container_block(*id)
-                && path.is_none_or(|scope| node.path.is_under(scope))
+            !review.tree.is_container_block(*id) && scope.contains(&review.tree.node(*id).path)
         })
         .collect();
     ensure!(
@@ -847,7 +866,7 @@ mod tests {
         database: &ReviewDatabase,
         repo: Option<&gix::Repository>,
     ) -> FocusInventory {
-        capture_with(review, None, database, repo).unwrap()
+        capture_with(review, &FocusScope::Repository, database, repo).unwrap()
     }
 
     #[test]
@@ -881,7 +900,7 @@ mod tests {
             assert!(!changed.contains_evidence(&first.candidates[0].target, &evidence.id));
         }
         let scope = RepoPath::new("src/a.rs").unwrap();
-        let scoped = capture_with(&initial, Some(&scope), &db, None).unwrap();
+        let scoped = capture_with(&initial, &FocusScope::Under(scope.clone()), &db, None).unwrap();
         assert_eq!(
             scoped
                 .candidates
@@ -889,6 +908,13 @@ mod tests {
                 .map(|c| c.target.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["src/a.rs"]
+        );
+        let planned =
+            capture_with(&initial, &FocusScope::Files([scope].into()), &db, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&planned.candidates).unwrap(),
+            serde_json::to_value(&first.candidates[..1]).unwrap(),
+            "a plan-scoped inventory must reproduce the same evidence identities"
         );
     }
 

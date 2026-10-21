@@ -307,7 +307,9 @@ source line plus ten seconds per complete card. Oversized blocks are reported,
 not truncated. There are no elapsed-time, pause, or extend controls. Actual
 review can take longer. Source, review state, and evidence are rechecked after
 generation; stale/invented references fail. Saved plans revalidate their remaining
-cards and omit already-approved cards.
+cards and omit already-approved cards. Reopening a plan gathers evidence only for
+the files it targets, so `--plan` takes no `--path` and still opens in repositories
+whose whole inventory exceeds the candidate limits.
 
 In the TUI, `F1` opens full reasons, uncertainty, questions, and cited evidence.
 Use arrows, `j`/`k`, or PageUp/PageDown to scroll; Escape/F1 closes the panel.

@@ -12,7 +12,7 @@ use crate::commands::{onboard, tui};
 use crate::config::AiMode;
 use crate::context::TrueflowContext;
 use crate::focus::{FocusSpecification, ReviewDuration};
-use crate::focus_evidence::FocusInventory;
+use crate::focus_evidence::{FocusInventory, FocusScope};
 use crate::repo_path::RepoPath;
 
 #[derive(Debug, Args)]
@@ -89,7 +89,12 @@ pub fn run(context: &TrueflowContext, args: &FocusArgs) -> Result<()> {
     }
     let config = crate::config::load()?;
     let collected = onboard::collect(&config, true)?;
-    let inventory = FocusInventory::capture(&collected, args.path.as_ref())?;
+    let scope = match (&loaded, &args.path) {
+        (Some(plan), _) => plan.target_scope(),
+        (None, Some(path)) => FocusScope::Under(path.clone()),
+        (None, None) => FocusScope::Repository,
+    };
+    let inventory = FocusInventory::capture(&collected, &scope)?;
     if args.candidates {
         let page: Vec<_> = inventory
             .candidates
@@ -153,7 +158,7 @@ pub fn run(context: &TrueflowContext, args: &FocusArgs) -> Result<()> {
             })?;
             drop(collected);
             let fresh = onboard::collect(&config, true)?;
-            let fresh_inventory = FocusInventory::capture(&fresh, args.path.as_ref())?;
+            let fresh_inventory = FocusInventory::capture(&fresh, &scope)?;
             ensure!(
                 fresh_inventory.snapshot_hash == inventory.snapshot_hash,
                 "source, review state or evidence changed during focus generation; regenerate the plan"
