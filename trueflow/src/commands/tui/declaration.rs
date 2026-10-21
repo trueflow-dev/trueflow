@@ -45,6 +45,7 @@ use graph::{
 };
 
 pub const WIDE_LAYOUT_MIN_WIDTH: u16 = 100;
+const TAB_EXPANSION: &str = "    ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclarationPane {
@@ -767,17 +768,25 @@ impl DeclarationController {
         let outline_selection = visible_outline
             .iter()
             .position(|row| row.id == self.outline.selection);
-        let outline_start = effective_window_start(
+        let outline_line_counts = self.outline_line_counts(&visible_outline);
+        let outline_start = window_start(
             self.outline.scroll,
             outline_selection,
             visible_outline.len(),
             row_height,
+            |row| outline_line_counts[row],
         );
+        let mut used_lines = 0;
         let outline_rows = visible_outline
             .iter()
+            .zip(&outline_line_counts)
             .skip(outline_start)
-            .take(row_height)
-            .map(|row| OutlineRenderRow {
+            .take_while(|(_, lines)| {
+                let starts_in_window = used_lines < row_height;
+                used_lines += **lines;
+                starts_in_window
+            })
+            .map(|(row, _)| OutlineRenderRow {
                 id: row.id.clone(),
                 source_text: self.document().source_text(&row.display_range).to_owned(),
                 selected: self.active_pane == DeclarationPane::Outline
@@ -800,11 +809,12 @@ impl DeclarationController {
                 .iter()
                 .position(|row| row.selection() == *selection)
         });
-        let graph_start = effective_window_start(
+        let graph_start = window_start(
             self.relationships.scroll,
             graph_selection,
             graph_rows.len(),
             row_height,
+            |_| 1,
         );
         let relationship_rows = graph_rows
             .into_iter()
@@ -917,13 +927,13 @@ impl DeclarationController {
     }
 
     fn ensure_outline_visible(&mut self) {
-        let (selected_index, visible_len, first_id) = {
+        let (selected_index, line_counts, first_id) = {
             let visible = self.visible_outline_rows();
             (
                 visible
                     .iter()
                     .position(|row| row.id == self.outline.selection),
-                visible.len(),
+                self.outline_line_counts(&visible),
                 visible.first().map(|row| row.id.clone()),
             )
         };
@@ -934,13 +944,19 @@ impl DeclarationController {
             }
             return;
         };
-        let height = usize::from(self.inner_height).max(1);
-        if index < self.outline.scroll {
-            self.outline.scroll = index;
-        } else if index >= self.outline.scroll.saturating_add(height) {
-            self.outline.scroll = index + 1 - height;
-        }
-        self.outline.scroll = self.outline.scroll.min(visible_len.saturating_sub(height));
+        self.outline.scroll = window_start(
+            self.outline.scroll,
+            Some(index),
+            line_counts.len(),
+            usize::from(self.inner_height).max(1),
+            |row| line_counts[row],
+        );
+    }
+
+    fn outline_line_counts(&self, rows: &[&OutlineRow]) -> Vec<usize> {
+        rows.iter()
+            .map(|row| source_line_count(self.document().source_text(&row.display_range)))
+            .collect()
     }
 
     fn select_outline_index(&mut self, index: usize) {
@@ -1354,24 +1370,39 @@ impl DeclarationController {
     }
 }
 
-fn effective_window_start(
+/// First row of a `height`-line window that keeps `selection` visible, where row `index`
+/// occupies `row_lines(index)` terminal lines. The window starts from `saved_scroll` and never
+/// leaves avoidable blank lines below the last row.
+fn window_start(
     saved_scroll: usize,
     selection: Option<usize>,
     row_count: usize,
     height: usize,
+    row_lines: impl Fn(usize) -> usize,
 ) -> usize {
-    if height == 0 {
+    if height == 0 || row_count == 0 {
         return saved_scroll.min(row_count);
     }
-    let mut start = saved_scroll.min(row_count.saturating_sub(height));
+    let mut start = saved_scroll.min(row_count - 1);
     if let Some(selection) = selection {
-        if selection < start {
-            start = selection;
-        } else if selection >= start.saturating_add(height) {
-            start = selection + 1 - height;
+        start = start.min(selection);
+        let mut used = (start..=selection).map(&row_lines).sum::<usize>();
+        while start < selection && used > height {
+            used -= row_lines(start);
+            start += 1;
         }
     }
-    start.min(row_count.saturating_sub(height))
+    let mut used = (start..row_count).map(&row_lines).sum::<usize>();
+    while start > 0 && used + row_lines(start - 1) <= height {
+        start -= 1;
+        used += row_lines(start);
+    }
+    start
+}
+
+/// Terminal lines an exact-source outline row occupies: one per source line.
+fn source_line_count(text: &str) -> usize {
+    text.lines().count().max(1)
 }
 
 pub fn layout_for(inner_width: u16, active_pane: DeclarationPane) -> DeclarationLayout {
@@ -1543,24 +1574,30 @@ pub fn render_outline_pane(
         .fg(Color::Black)
         .bg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    let lines = rows
-        .iter()
-        .map(|row| {
-            let row_style = if active && row.selected {
-                selected
-            } else {
-                normal
-            };
-            let prefix = if active && row.selected { "> " } else { "  " };
-            let indent = "  ".repeat(row.depth);
-            Line::from(vec![
-                Span::styled(prefix, row_style),
-                Span::styled(indent, row_style),
-                Span::styled(&row.source_text, row_style),
-                Span::styled(row.status.marker(), normal),
-            ])
-        })
-        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    for row in rows {
+        let row_style = if active && row.selected {
+            selected
+        } else {
+            normal
+        };
+        let prefix = if active && row.selected { "> " } else { "  " };
+        let indent = "  ".repeat(row.depth);
+        let last = source_line_count(&row.source_text) - 1;
+        // Spans drop control characters, so every source line becomes its own terminal line
+        // and tabs are expanded; otherwise multi-line surfaces flatten and lose text.
+        for (index, source_line) in row.source_text.lines().enumerate() {
+            let mut spans = vec![
+                Span::styled(if index == 0 { prefix } else { "  " }, row_style),
+                Span::styled(indent.clone(), row_style),
+                Span::styled(source_line.replace('\t', TAB_EXPANSION), row_style),
+            ];
+            if index == last {
+                spans.push(Span::styled(row.status.marker(), normal));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
     Paragraph::new(lines).render(content, buffer);
 }
 
@@ -1570,8 +1607,9 @@ pub mod tui_test_support {
     use super::{
         BTreeMap, BTreeSet, DeclarationAnchor, DeclarationController, DeclarationDocument,
         DeclarationLayout, DeclarationRenderModel, DeclarationReviewAction,
-        DeclarationReviewActionKind, DeclarationStateSnapshot, KeyCode, OutlineRow, Relationship,
-        RelationshipDestination, RelationshipGroup, RelationshipState, Result, ensure,
+        DeclarationReviewActionKind, DeclarationStateSnapshot, Frame, KeyCode, OutlineRow, Rect,
+        Relationship, RelationshipDestination, RelationshipGroup, RelationshipState, Result,
+        ensure, render_declaration_review,
     };
     pub use super::{DeclarationPane, GraphSelection};
 
@@ -1742,6 +1780,11 @@ pub mod tui_test_support {
 
         pub fn render(&mut self) -> Result<TestRenderedDeclaration> {
             Ok(self.controller.render_model())
+        }
+
+        /// Draws the complete declaration surface exactly as the terminal runtime does.
+        pub fn draw(&self, frame: &mut Frame<'_>, area: Rect) {
+            render_declaration_review(frame, area, &self.controller);
         }
 
         pub fn state_snapshot(&self) -> TestDeclarationState {

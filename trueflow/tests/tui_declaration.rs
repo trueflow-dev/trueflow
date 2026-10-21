@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use anyhow::{Context, Result, ensure};
 use crossterm::event::KeyCode;
+use ratatui::{Terminal, backend::TestBackend};
 use trueflow::commands::tui::declaration::tui_test_support::{
     DeclarationPane, DeclarationTestApp, GraphSelection, TestDeclarationAnchor,
     TestDeclarationFixture, TestLayout, TestOutlineRow, TestRelationship, TestRelationshipGroup,
@@ -616,5 +617,98 @@ fn declaration_renderer_never_exposes_body_text_speed_read_or_ai_hints() -> Resu
             "declaration renderer leaked forbidden block-only content {forbidden:?}"
         );
     }
+    Ok(())
+}
+
+const MULTILINE_SOURCE: &str = "/// Server configuration.\n/// Loaded from disk.\npub struct Server {\n    pub host: String,\n    pub port: u16,\n\tpub mode: Mode,\n    pub timeout_seconds: u64,\n}\n\npub fn start(server: &Server) {}\n";
+const SERVER_DOC: &str = "/// Server configuration.\n/// Loaded from disk.";
+const SERVER_SHAPE: &str = "pub struct Server {\n    pub host: String,\n    pub port: u16,\n\tpub mode: Mode,\n    pub timeout_seconds: u64,\n}";
+const START_SIGNATURE: &str = "pub fn start(server: &Server)";
+
+fn multiline_range(needle: &str) -> Result<Range<usize>> {
+    let start = MULTILINE_SOURCE
+        .find(needle)
+        .with_context(|| format!("multi-line fixture is missing {needle:?}"))?;
+    Ok(start..start + needle.len())
+}
+
+fn multiline_fixture(selection: &str) -> Result<TestDeclarationFixture> {
+    let declaration = multiline_range(SERVER_DOC)?.start..multiline_range(SERVER_SHAPE)?.end;
+    let start = multiline_range(START_SIGNATURE)?;
+    Ok(
+        TestDeclarationFixture::new(SNAPSHOT_ID, PATH, MULTILINE_SOURCE)
+            .with_outline_rows(vec![
+                TestOutlineRow::review_target(
+                    "server",
+                    declaration,
+                    multiline_range(SERVER_SHAPE)?,
+                    vec![multiline_range(SERVER_DOC)?, multiline_range(SERVER_SHAPE)?],
+                ),
+                TestOutlineRow::aggregate_component(
+                    "server.doc",
+                    "server",
+                    multiline_range(SERVER_DOC)?,
+                ),
+                TestOutlineRow::aggregate_component(
+                    "server.shape",
+                    "server",
+                    multiline_range(SERVER_SHAPE)?,
+                ),
+                TestOutlineRow::review_target("start", start.clone(), start.clone(), vec![start]),
+            ])
+            .with_canonical_order(["server", "start"])
+            .with_initial_expanded(["server"])
+            .with_initial_outline_selection(selection),
+    )
+}
+
+fn rendered_lines(app: &DeclarationTestApp, width: u16, height: u16) -> Result<Vec<String>> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+    terminal.draw(|frame| app.draw(frame, frame.area()))?;
+    let buffer = terminal.backend().buffer();
+    Ok((0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect())
+}
+
+#[test]
+fn multi_line_outline_rows_render_every_source_line_before_approval() -> Result<()> {
+    let app = app_with_fixture(multiline_fixture("server")?, 120, 20)?;
+    let lines = rendered_lines(&app, 120, 24)?;
+    for expected in [
+        "/// Server configuration.",
+        "/// Loaded from disk.",
+        "pub struct Server {",
+        "    pub host: String,",
+        "    pub mode: Mode,",
+        "    pub timeout_seconds: u64,",
+    ] {
+        assert!(
+            lines.iter().any(|line| {
+                let outline = line.split('│').next().unwrap_or_default();
+                outline.trim_end().ends_with(expected)
+            }),
+            "multi-line surface line {expected:?} is not on its own rendered row:\n{}",
+            lines.join("\n")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn outline_window_keeps_the_selection_visible_below_tall_rows() -> Result<()> {
+    let app = app_with_fixture(multiline_fixture("start")?, 120, 8)?;
+    let lines = rendered_lines(&app, 120, 12)?;
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(&format!("> {START_SIGNATURE}"))),
+        "the selected row must stay visible after taller rows above it:\n{}",
+        lines.join("\n")
+    );
     Ok(())
 }
