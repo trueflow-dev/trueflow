@@ -425,6 +425,9 @@
      rendered rows. `--lib root_cursor_on_last_entry`
    - [ ] Short status messages count as one row, and wrapping counts chars,
      not graphemes.
+   - [ ] Emacs `trueflow-focus-subdivide` and `trueflow--fetch-subblocks` call
+     `inspect --split` without `--path`/`--line`, so duplicated content fails
+     with "Multiple blocks matched".
    - [ ] Approving a whole file in an all-files scope writes one record per
      block whenever any block under it is already reviewed (correct, but each
      record is signed separately).
@@ -502,6 +505,9 @@
    - [X] Unresolved comments on unchanged blocks are not pass candidates; an
      empty pass says why instead of opening a full review; ranking charges
      each card at least 30s. `--lib focused_pass --test e2e_review_pass`
+   - [X] The recap offers `f` only when another pass could pick something; the
+     AI plan manifest marks blocks a pass cannot use (unresolved comment,
+     covers other pending blocks). `--lib skipped_cards review_plan_prompt_marks`
    - [ ] Decide whether `--pr N --pass focused` should budget the whole PR
      instead of each commit (today each commit gets its own pass).
 ** TODO Browser review UI (WASM or webpage)
