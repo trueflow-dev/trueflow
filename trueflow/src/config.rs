@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use ignore::gitignore::GitignoreBuilder;
 use serde::{Deserialize, Deserializer};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, TableLike, value};
@@ -753,6 +754,9 @@ pub struct BlockFilterConfig {
 }
 
 impl BlockFilterConfig {
+    /// CLI lists replace the matching config list. Kinds named by CLI `only`
+    /// are also dropped from an inherited config `exclude`, so asking for a
+    /// kind on the command line never yields nothing; a CLI `exclude` still wins.
     pub fn resolve_filters(
         &self,
         cli_only: &[BlockKind],
@@ -763,12 +767,16 @@ impl BlockFilterConfig {
         } else {
             cli_only
         };
-        let exclude_values = if cli_exclude.is_empty() {
-            &self.exclude
+        let exclude_values: Cow<'_, [BlockKind]> = if cli_exclude.is_empty() {
+            self.exclude
+                .iter()
+                .copied()
+                .filter(|kind| !cli_only.contains(kind))
+                .collect()
         } else {
-            cli_exclude
+            Cow::Borrowed(cli_exclude)
         };
-        BlockFilters::from_lists(only_values, exclude_values)
+        BlockFilters::from_lists(only_values, &exclude_values)
     }
 }
 
@@ -1761,6 +1769,29 @@ exclude = ["comment"]
         assert!(filters.allows_block(BlockKind::Gap));
         assert!(filters.allows_subblock(BlockKind::Gap));
         assert!(!filters.allows_block(BlockKind::Function));
+    }
+
+    #[test]
+    fn cli_only_overrides_config_exclude_for_same_kind() {
+        let config = BlockFilterConfig {
+            only: vec![],
+            exclude: vec![BlockKind::Comment, BlockKind::Struct],
+        };
+
+        let filters = config.resolve_filters(&[BlockKind::Comment, BlockKind::Function], &[]);
+
+        assert!(filters.allows_block(BlockKind::Comment));
+        assert!(filters.allows_subblock(BlockKind::Comment));
+        assert!(filters.allows_block(BlockKind::Function));
+        assert!(!filters.allows_block(BlockKind::Struct));
+        assert!(!filters.allows_subblock(BlockKind::Struct));
+
+        let cli_excluded =
+            config.resolve_filters(&[BlockKind::Comment], &[BlockKind::Comment]);
+        assert!(
+            !cli_excluded.allows_block(BlockKind::Comment),
+            "an explicit CLI exclude still wins over CLI only"
+        );
     }
 
     #[test]
