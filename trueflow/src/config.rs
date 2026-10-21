@@ -3,7 +3,7 @@ use ignore::gitignore::GitignoreBuilder;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, Entry, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, value};
 
 use crate::block::BlockKind;
 use crate::cli::TuiReviewMode;
@@ -1023,41 +1023,13 @@ pub fn update_speed_read_defaults_in_file(
         })?;
     }
 
-    let root = document.as_table_mut();
-    let tui_table = match root.entry("tui") {
-        Entry::Vacant(entry) => entry
-            .insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| anyhow!("Expected [tui] to be a table"))?,
-        Entry::Occupied(entry) => {
-            if !entry.get().is_table() {
-                return Err(anyhow!("Expected [tui] to be a table"));
-            }
-            entry
-                .into_mut()
-                .as_table_mut()
-                .ok_or_else(|| anyhow!("Expected [tui] to be a table"))?
-        }
-    };
-
-    let speed_read_table = match tui_table.entry("speed_read") {
-        Entry::Vacant(entry) => entry
-            .insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| anyhow!("Expected [tui.speed_read] to be a table"))?,
-        Entry::Occupied(entry) => {
-            if !entry.get().is_table() {
-                return Err(anyhow!("Expected [tui.speed_read] to be a table"));
-            }
-            entry
-                .into_mut()
-                .as_table_mut()
-                .ok_or_else(|| anyhow!("Expected [tui.speed_read] to be a table"))?
-        }
-    };
-
-    speed_read_table["default_wpm"] = value(i64::from(default_wpm));
-    speed_read_table["default_chunk_words"] = value(i64::from(default_chunk_words));
+    let tui_table = child_table_like(document.as_table_mut(), "tui", "tui")?;
+    let speed_read_table = child_table_like(tui_table, "speed_read", "tui.speed_read")?;
+    speed_read_table.insert("default_wpm", value(i64::from(default_wpm)));
+    speed_read_table.insert(
+        "default_chunk_words",
+        value(i64::from(default_chunk_words)),
+    );
 
     let updated = document.to_string();
     let _: TrueflowConfig = toml::from_str(&updated).with_context(|| {
@@ -1071,6 +1043,21 @@ pub fn update_speed_read_defaults_in_file(
         .with_context(|| format!("Failed to write config update: {}", path.display()))?;
 
     Ok(())
+}
+
+/// Returns `parent[key]` as a standard or inline table, creating a table when absent.
+fn child_table_like<'a>(
+    parent: &'a mut dyn TableLike,
+    key: &str,
+    label: &str,
+) -> Result<&'a mut dyn TableLike> {
+    if parent.get(key).is_none() {
+        parent.insert(key, Item::Table(Table::new()));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| anyhow!("Expected [{label}] to be a table"))
 }
 
 #[cfg(test)]
@@ -1969,5 +1956,28 @@ max_chunk_words = 5
         let content =
             std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read config: {err}"));
         assert_eq!(content, initial);
+    }
+
+    #[test]
+    fn update_speed_read_defaults_accepts_inline_tables() {
+        for initial in [
+            "tui = { speed_read = { enabled = true } }\n",
+            "tui = { mode = \"blocks\" }\n",
+            "[tui]\nspeed_read = { enabled = true }\n",
+        ] {
+            let path = temp_speed_read_config_path("speed_read_inline_tables");
+            write_config(&path, initial);
+
+            update_speed_read_defaults_in_file(&path, 360, 3)
+                .unwrap_or_else(|err| panic!("update {initial:?}: {err}"));
+
+            let content =
+                std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read config: {err}"));
+            let parsed: TrueflowConfig =
+                toml::from_str(&content).unwrap_or_else(|err| panic!("parse config: {err}"));
+            assert_eq!(parsed.tui.speed_read.default_wpm, 360, "{content}");
+            assert_eq!(parsed.tui.speed_read.default_chunk_words, 3, "{content}");
+            assert!(parsed.tui.speed_read.enabled, "{content}");
+        }
     }
 }
