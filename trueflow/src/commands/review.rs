@@ -2,7 +2,7 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
-use crate::coverage::CoverageIndex;
+use crate::coverage::{CoverageIndex, LatestVerdict, RecordOrder};
 use crate::focus::ReviewDuration;
 use crate::policy::{
     should_skip_container_by_default, should_skip_imports_by_default,
@@ -404,18 +404,15 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
                 continue;
             }
 
-            if block_coverage
-                .direct_latest_verdict_for(&review_check)
-                .is_none()
-                && is_subblock_covered(
-                    &block,
-                    language,
-                    query,
-                    &coverage,
-                    &review_check,
-                    &file.path,
-                )
-            {
+            if is_subblock_covered(
+                &block,
+                language,
+                query,
+                &coverage,
+                &review_check,
+                &file.path,
+                None,
+            ) {
                 continue;
             }
 
@@ -559,18 +556,15 @@ fn collect_diff_review_presentation(
                 continue;
             }
 
-            if block_coverage
-                .direct_latest_verdict_for(review_check)
-                .is_none()
-                && is_subblock_covered(
-                    &display_block,
-                    file.language,
-                    query,
-                    coverage,
-                    review_check,
-                    &file.path,
-                )
-            {
+            if is_subblock_covered(
+                &display_block,
+                file.language,
+                query,
+                coverage,
+                review_check,
+                &file.path,
+                None,
+            ) {
                 continue;
             }
 
@@ -1417,8 +1411,10 @@ fn kind_rank(block: &Block) -> u8 {
 }
 
 /// Whether `block` is covered: skipped by the filters, approved itself, or
-/// (without a verdict of its own) split into review units that are all
-/// covered.
+/// split into review units that are all covered by approvals newer than the
+/// block's own comment or rejection, so approving every child expanded in the
+/// TUI after commenting on their parent covers the parent. Verdicts not newer
+/// than `after` (an enclosing block's comment or rejection) are ignored.
 fn is_subblock_covered(
     block: &Block,
     language: Language,
@@ -1426,19 +1422,43 @@ fn is_subblock_covered(
     coverage: &CoverageIndex<'_>,
     review_check: &ReviewCheck,
     file_path: &RepoPath,
+    after: Option<RecordOrder>,
 ) -> bool {
     if !query.filters.allows_subblock(block.kind)
         || should_skip_whitespace_only_by_default(block, &query.filters)
     {
         return true;
     }
-    match coverage
+    let latest = coverage
         .block(file_path, block)
-        .direct_latest_verdict_for(review_check)
-    {
-        Some(Verdict::Approved) => true,
-        Some(_) => false,
-        None => are_review_units_covered(block, language, query, coverage, review_check, file_path),
+        .direct_latest_for(review_check)
+        .filter(|latest| after.is_none_or(|after| latest.order > after));
+    match latest {
+        Some(LatestVerdict {
+            verdict: Verdict::Approved,
+            ..
+        }) => true,
+        Some(LatestVerdict {
+            verdict: Verdict::Comment | Verdict::Rejected,
+            order,
+        }) => are_review_units_covered(
+            block,
+            language,
+            query,
+            coverage,
+            review_check,
+            file_path,
+            Some(order),
+        ),
+        None => are_review_units_covered(
+            block,
+            language,
+            query,
+            coverage,
+            review_check,
+            file_path,
+            after,
+        ),
     }
 }
 
@@ -1455,6 +1475,7 @@ fn are_review_units_covered(
     coverage: &CoverageIndex<'_>,
     review_check: &ReviewCheck,
     file_path: &RepoPath,
+    after: Option<RecordOrder>,
 ) -> bool {
     let split = if coverage.has_block_records_within(file_path, block) {
         sub_splitter::child_navigation_split(block, language)
@@ -1473,7 +1494,15 @@ fn are_review_units_covered(
                 .peekable();
             units.peek().is_some()
                 && units.all(|unit| {
-                    is_subblock_covered(unit, language, query, coverage, review_check, file_path)
+                    is_subblock_covered(
+                        unit,
+                        language,
+                        query,
+                        coverage,
+                        review_check,
+                        file_path,
+                        after,
+                    )
                 })
         }
         sub_splitter::SubSplitSemantics::StructuralChildren => false,
@@ -2178,6 +2207,7 @@ mod tests {
                 &coverage,
                 &review_check,
                 &file_path,
+                None,
             ),
             "approved structural children must not cover omitted container header"
         );
@@ -2321,6 +2351,7 @@ mod tests {
                     &coverage,
                     &review_check,
                     &file_path,
+                    None,
                 ),
                 "{mode} must not clear the visible parent from the shared coarse approval"
             );

@@ -1783,6 +1783,129 @@ fn test_block_rejection_overrides_file_approval_in_review() -> Result<()> {
 }
 
 #[test]
+fn newer_file_approval_covers_older_block_comment_or_rejection_in_review() -> Result<()> {
+    for (verdict, note) in [("comment", Some("look again")), ("rejected", None)] {
+        let repo = TestRepo::new(&format!("review_newer_file_approval_over_{verdict}"))?;
+        repo.write(
+            "src/lib.rs",
+            "fn needs_review() { println!(\"check me\"); }\n",
+        )?;
+        repo.commit_all("Add review target")?;
+
+        let scan = repo.scan_without_cache()?;
+        let file = scan
+            .files
+            .iter()
+            .find(|file| file.path.as_str() == "src/lib.rs")
+            .context("expected src/lib.rs in scan output")?;
+        let block = file.blocks.first().context("expected review block")?;
+
+        let older_block_verdict = build_review_record(
+            block.hash.as_str(),
+            ReviewRecordOverrides {
+                id: Some("older-block-verdict"),
+                target_kind: Some("block"),
+                verdict: Some(verdict),
+                note,
+                timestamp: Some(1),
+                path_hint: Some("src/lib.rs"),
+                line_hint: Some(u32::try_from(block.start_line).context("block line fits u32")?),
+                ..Default::default()
+            },
+        );
+        let newer_file_approval = build_review_record(
+            file.tree_hash.as_str(),
+            ReviewRecordOverrides {
+                id: Some("newer-file-approval"),
+                target_kind: Some("file"),
+                verdict: Some("approved"),
+                timestamp: Some(2),
+                path_hint: Some("src/lib.rs"),
+                ..Default::default()
+            },
+        );
+        write_reviews_jsonl(
+            &repo.path.join(".trueflow"),
+            &[older_block_verdict, newer_file_approval],
+        )?;
+
+        let summary = review_all(&repo)?;
+        assert!(
+            summary
+                .files
+                .iter()
+                .all(|file| file.path.as_str() != "src/lib.rs"),
+            "a file approval newer than the block's {verdict} must cover it: {:?}",
+            summary
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn newer_approvals_of_expanded_children_cover_older_parent_comment_in_review() -> Result<()> {
+    let repo = TestRepo::new("review_children_approval_over_parent_comment")?;
+    repo.write(
+        "src/lib.rs",
+        "fn helper() -> i32 {\n    let a = 1;\n    let b = 2;\n\n    a + b\n}\n",
+    )?;
+    repo.commit_all("Add helper")?;
+
+    let scan = repo.scan_without_cache()?;
+    let file = scan
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "src/lib.rs")
+        .context("expected src/lib.rs in scan output")?;
+    let block = file.blocks.first().context("expected review block")?;
+    let children = sub_splitter::child_navigation_split(block, file.language)?.blocks;
+    assert!(children.len() > 1, "expected TUI children: {children:?}");
+
+    let mut records = vec![build_review_record(
+        block.hash.as_str(),
+        ReviewRecordOverrides {
+            id: Some("older-parent-comment"),
+            verdict: Some("comment"),
+            note: Some("look again"),
+            timestamp: Some(1),
+            path_hint: Some("src/lib.rs"),
+            line_hint: Some(u32::try_from(block.start_line)?),
+            ..Default::default()
+        },
+    )];
+    for (index, child) in children.iter().enumerate() {
+        let id = format!("newer-child-approval-{index}");
+        records.push(build_review_record(
+            child.hash.as_str(),
+            ReviewRecordOverrides {
+                id: Some(&id),
+                timestamp: Some(2 + i64::try_from(index)?),
+                path_hint: Some("src/lib.rs"),
+                line_hint: Some(u32::try_from(child.start_line)?),
+                ..Default::default()
+            },
+        ));
+    }
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &records)?;
+
+    let summary = review_all(&repo)?;
+    assert!(
+        summary.files.is_empty(),
+        "approving every expanded child after commenting must cover the parent: {:?}",
+        summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[test]
 fn test_exclude_gap_case_insensitive_for_subblocks() -> Result<()> {
     let repo = TestRepo::new("exclude_gap_case")?;
     repo.write(

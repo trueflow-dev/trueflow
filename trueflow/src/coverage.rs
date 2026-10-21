@@ -363,6 +363,19 @@ impl<'a> CoverageIndex<'a> {
             .unwrap_or_default()
     }
 
+    fn latest_record_index_for_node(
+        &self,
+        node_id: TreeNodeId,
+        check: &ReviewCheck,
+    ) -> Option<usize> {
+        preferred_record_index_for_check(
+            self.database.records(),
+            &self.direct_record_indices_for_node(node_id),
+            check,
+            |record_index| self.binding_relation_for_record_index(record_index),
+        )
+    }
+
     fn smallest_covering_block_node(&self, path: &RepoPath, block: &Block) -> Option<TreeNodeId> {
         self.block_nodes_by_path
             .get(path)?
@@ -423,29 +436,23 @@ impl<'a> NodeCoverage<'a> {
     }
 
     pub fn direct_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
-        let record_index = preferred_record_index_for_check(
-            self.index.database.records(),
-            &self.record_indices_for_node(self.node_id),
-            check,
-            |record_index| self.index.binding_relation_for_record_index(record_index),
-        )?;
+        let record_index = self
+            .index
+            .latest_record_index_for_node(self.node_id, check)?;
         Some(&self.index.database.records()[record_index].verdict)
     }
 
     pub fn effective_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
-        for ancestor_id in self.index.tree.ancestors(self.node_id) {
-            let record_indices = self.record_indices_for_node(ancestor_id);
-            let Some(record_index) = preferred_record_index_for_check(
-                self.index.database.records(),
-                &record_indices,
-                check,
-                |record_index| self.index.binding_relation_for_record_index(record_index),
-            ) else {
-                continue;
-            };
-            return Some(&self.index.database.records()[record_index].verdict);
-        }
-        None
+        let records = self.index.database.records();
+        let record_index = effective_record_index(
+            records,
+            self.index
+                .tree
+                .ancestors(self.node_id)
+                .into_iter()
+                .map(|ancestor_id| self.index.latest_record_index_for_node(ancestor_id, check)),
+        )?;
+        Some(&records[record_index].verdict)
     }
 
     pub fn direct_distinct_identity_count(&self, check: &ReviewCheck) -> usize {
@@ -572,23 +579,40 @@ impl<'a> BlockCoverage<'a> {
     }
 
     pub fn direct_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
-        let record_index = preferred_record_index_for_check(
+        self.direct_latest_for(check).map(|latest| latest.verdict)
+    }
+
+    /// The block's own latest verdict for `check` and when it was recorded.
+    pub fn direct_latest_for(&self, check: &ReviewCheck) -> Option<LatestVerdict<'a>> {
+        let record_index = self.direct_latest_record_index(check)?;
+        Some(LatestVerdict::of(
+            self.index.database.records(),
+            record_index,
+        ))
+    }
+
+    pub fn effective_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
+        let records = self.index.database.records();
+        let enclosing = self
+            .container_node_id
+            .map(|node_id| self.index.tree.ancestors(node_id))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ancestor_id| self.index.latest_record_index_for_node(ancestor_id, check));
+        let record_index = effective_record_index(
+            records,
+            std::iter::once(self.direct_latest_record_index(check)).chain(enclosing),
+        )?;
+        Some(&records[record_index].verdict)
+    }
+
+    fn direct_latest_record_index(&self, check: &ReviewCheck) -> Option<usize> {
+        preferred_record_index_for_check(
             self.index.database.records(),
             &self.direct_record_indices,
             check,
             |record_index| self.index.binding_relation_for_record_index(record_index),
-        )?;
-        Some(&self.index.database.records()[record_index].verdict)
-    }
-
-    pub fn effective_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
-        if let Some(verdict) = self.direct_latest_verdict_for(check) {
-            return Some(verdict);
-        }
-        let container_node_id = self.container_node_id?;
-        self.index
-            .node(container_node_id)
-            .effective_latest_verdict_for(check)
+        )
     }
 
     pub fn direct_distinct_identity_count(&self, check: &ReviewCheck) -> usize {
@@ -1122,33 +1146,73 @@ fn preferred_record_index_for_check<F>(
 where
     F: Fn(usize) -> Option<BindingRelation>,
 {
-    let mut best: Option<(i64, usize)> = None;
+    record_indices
+        .iter()
+        .copied()
+        .filter(|record_index| {
+            &records[*record_index].check == check && relation_for_record(*record_index).is_some()
+        })
+        .max_by_key(|record_index| RecordOrder::of(records, *record_index))
+}
 
-    for record_index in record_indices {
-        let record = &records[*record_index];
-        if &record.check != check {
-            continue;
-        }
+/// When a record was made: its timestamp, then its position in the store
+/// for records made in the same instant. A greater order is newer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RecordOrder {
+    timestamp: i64,
+    position: usize,
+}
 
-        if relation_for_record(*record_index).is_none() {
-            continue;
-        }
-
-        let candidate = (record.timestamp, *record_index);
-
-        match best {
-            Some((best_timestamp, best_index)) => {
-                if candidate.0 > best_timestamp
-                    || (candidate.0 == best_timestamp && candidate.1 > best_index)
-                {
-                    best = Some(candidate);
-                }
-            }
-            None => best = Some(candidate),
+impl RecordOrder {
+    fn of(records: &[Record], position: usize) -> Self {
+        Self {
+            timestamp: records[position].timestamp,
+            position,
         }
     }
+}
 
-    best.map(|(_, record_index)| record_index)
+/// A unit's latest verdict for a check and when it was recorded.
+#[derive(Debug, Clone, Copy)]
+pub struct LatestVerdict<'a> {
+    pub verdict: &'a Verdict,
+    pub order: RecordOrder,
+}
+
+impl<'a> LatestVerdict<'a> {
+    fn of(records: &'a [Record], position: usize) -> Self {
+        Self {
+            verdict: &records[position].verdict,
+            order: RecordOrder::of(records, position),
+        }
+    }
+}
+
+/// The record that decides a unit's effective verdict, from the latest
+/// records of the unit and of each unit enclosing it, nearest first: the
+/// nearest latest record, unless an enclosing unit's approval is newer than
+/// that record's other verdict. A file approval made after a comment on (or
+/// a rejection of) a block in it therefore covers the block, while a block
+/// verdict made after the file approval still overrides it.
+fn effective_record_index(
+    records: &[Record],
+    latest_nearest_first: impl IntoIterator<Item = Option<usize>>,
+) -> Option<usize> {
+    latest_nearest_first
+        .into_iter()
+        .flatten()
+        .reduce(|effective, enclosing| {
+            match (&records[effective].verdict, &records[enclosing].verdict) {
+                (Verdict::Approved, _) | (_, Verdict::Comment | Verdict::Rejected) => effective,
+                (Verdict::Comment | Verdict::Rejected, Verdict::Approved)
+                    if RecordOrder::of(records, enclosing)
+                        > RecordOrder::of(records, effective) =>
+                {
+                    enclosing
+                }
+                (Verdict::Comment | Verdict::Rejected, Verdict::Approved) => effective,
+            }
+        })
 }
 
 /// Whether `line` (a record's line hint) falls on `block`'s lines; no hint
@@ -1440,6 +1504,52 @@ mod tests {
             None,
             "the long function's never-viewed unit must stay unapproved"
         );
+    }
+
+    #[test]
+    fn newer_file_approval_overrides_older_block_comment_but_not_newer_one() {
+        let (tree, file_id, function_id, _, _) = build_function_tree();
+        let file_hash = tree.node(file_id).hash.clone();
+        let function_hash = tree.node(function_id).hash.clone();
+        let path = RepoPath::new("src/lib.rs").unwrap();
+        let function = tree.node(function_id).block.clone().unwrap();
+        let comment_at = |timestamp| {
+            let mut record = approved_block_record(
+                &format!("comment-{timestamp}"),
+                function_hash.clone(),
+                "src/lib.rs",
+                1,
+                "a@example.com",
+                timestamp,
+            );
+            record.verdict = Verdict::Comment;
+            record.note = Some("look again".to_string());
+            record
+        };
+        let file_approval =
+            approved_file_record("file", file_hash, "src/lib.rs", "a@example.com", 2);
+
+        for (comment_timestamp, expected) in [(1, Verdict::Approved), (3, Verdict::Comment)] {
+            let database = ReviewDatabase::from_records(vec![
+                comment_at(comment_timestamp),
+                file_approval.clone(),
+            ]);
+            let coverage = CoverageIndex::build(&tree, &database).unwrap();
+            assert_eq!(
+                coverage
+                    .node(function_id)
+                    .effective_latest_verdict_for(&ReviewCheck::review()),
+                Some(&expected),
+                "node with comment at {comment_timestamp}"
+            );
+            assert_eq!(
+                coverage
+                    .block(&path, &function)
+                    .effective_latest_verdict_for(&ReviewCheck::review()),
+                Some(&expected),
+                "block with comment at {comment_timestamp}"
+            );
+        }
     }
 
     #[test]
