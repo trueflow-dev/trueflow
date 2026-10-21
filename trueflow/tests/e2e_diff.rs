@@ -208,6 +208,15 @@ fn test_check_command_gates_semantic_main_diff_blocks() -> Result<()> {
         stdout.trim().is_empty(),
         "Expected check to be silent on stdout"
     );
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("unreviewed block(s) across 1 file(s) in main diff."),
+        "Expected check to summarize unreviewed blocks on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("  src/lib.rs ("),
+        "Expected check to list unreviewed files on stderr: {stderr}"
+    );
 
     let review_output = repo.run(&["review", "--target", "main"])?;
     assert!(review_output.contains("File: src/lib.rs"));
