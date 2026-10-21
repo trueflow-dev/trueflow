@@ -1,11 +1,13 @@
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 
 use crate::ai::{
-    AiAvailability, AiEnvironment, CommandAiReviewPlanProvider, resolve_ai_availability,
+    AiAvailability, AiEnvironment, AiExecutionOptions, CommandAiReviewPlanProvider,
+    resolve_ai_availability,
 };
 use crate::commands::{review, tui};
 use crate::config::{AiMode, TrueflowConfig};
@@ -13,6 +15,9 @@ use crate::context::TrueflowContext;
 use crate::onboarding::{ReviewSpecification, candidate_page, generation_prompt};
 use crate::repo_path::RepoPath;
 use crate::scanner::ScanCacheMode;
+
+/// The agent explores the repository and pages candidates; its event stream is verbose.
+const GENERATION_OUTPUT_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Args)]
 pub struct OnboardArgs {
@@ -39,6 +44,10 @@ pub struct OnboardArgs {
     /// Candidate page size (1..=64; default 64)
     #[arg(long, requires = "candidates", value_parser = clap::value_parser!(u8).range(1..=64))]
     pub limit: Option<u8>,
+
+    /// Generation deadline in seconds for the exploring LLM agent
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub timeout: u64,
 }
 
 pub fn run(context: &TrueflowContext, args: &OnboardArgs) -> Result<()> {
@@ -105,7 +114,14 @@ pub fn run(context: &TrueflowContext, args: &OnboardArgs) -> Result<()> {
                 "Generating a focused onboarding review with {} ({model}); targeting under 15 minutes, at most 64 cards...",
                 provider.label()
             );
-            let answer = generator.generate(&prompt)?;
+            let answer = generator.generate_with_options(
+                &prompt,
+                &AiExecutionOptions {
+                    timeout: Duration::from_secs(args.timeout),
+                    max_output_bytes: GENERATION_OUTPUT_BYTE_LIMIT,
+                    ..Default::default()
+                },
+            )?;
             let specification = ReviewSpecification::from_json(&answer)?;
             // Generation can take time. Recheck both source and approvals, and use one fresh
             // captured tree for all cards; never render new content under old target identities.

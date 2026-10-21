@@ -138,3 +138,97 @@ fn candidate_pagination_and_subdirectory_queries_are_repository_scoped() -> Resu
     assert_eq!(nested, all);
     Ok(())
 }
+
+/// Runs `onboard` against a fake Codex CLI that writes `plan` as its final message.
+#[cfg(unix)]
+fn generate_with_fake_codex(
+    repo: &TestRepo,
+    behavior: &str,
+    extra: &[&str],
+) -> Result<std::process::Output> {
+    use std::os::unix::fs::PermissionsExt;
+    repo.write(
+        "trueflow.toml",
+        "[scan]\nuse_cache = false\nwrite_cache = false\n[ai]\nprovider = \"codex_cli\"\nmodel = \"fixture-model\"\n",
+    )?;
+    let page = candidates(repo)?;
+    repo.write(
+        ".fixture/plan.json",
+        &specification(&page["candidates"][0]["target"]).to_string(),
+    )?;
+    repo.write(
+        ".fixture/bin/codex",
+        r#"#!/bin/sh
+set -eu
+/bin/cat > /dev/null
+case "$ONBOARD_BEHAVIOR" in
+  hang) exec /bin/sleep 30 ;;
+  verbose) /usr/bin/yes '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"candidate page"}}' | /usr/bin/head -n 40000 ;;
+esac
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --output-last-message ]; then
+    shift
+    /bin/cat "$ONBOARD_FIXTURE/plan.json" > "$1"
+    exit 0
+  fi
+  shift
+done
+exit 24
+"#,
+    )?;
+    let directory = repo.path.join(".fixture");
+    std::fs::set_permissions(
+        directory.join("bin/codex"),
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    let path = std::env::join_paths([
+        directory.join("bin"),
+        "/usr/bin".into(),
+        "/bin".into(),
+    ])?;
+    Ok(std::process::Command::new(env!("CARGO_BIN_EXE_trueflow"))
+        .args(["onboard", "--json"])
+        .args(extra)
+        .current_dir(&repo.path)
+        .env_clear()
+        .env("HOME", &repo.path)
+        .env("PATH", path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("ONBOARD_FIXTURE", &directory)
+        .env("ONBOARD_BEHAVIOR", behavior)
+        .stdin(std::process::Stdio::null())
+        .output()?)
+}
+
+#[cfg(unix)]
+#[test]
+fn onboarding_generation_has_a_configurable_agentic_deadline() -> Result<()> {
+    let repo = repository("onboarding_generation_deadline")?;
+    let started = std::time::Instant::now();
+    let output = generate_with_fake_codex(&repo, "hang", &["--timeout", "1"])?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "a hanging provider generated a plan");
+    assert!(stderr.contains("timed out"), "{stderr}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "--timeout 1 must bound a provider that sleeps for 30 seconds"
+    );
+    assert!(
+        String::from_utf8_lossy(&repo.run_raw(&["onboard", "--timeout", "0"])?.stderr)
+            .contains("--timeout")
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn onboarding_generation_accepts_a_verbose_agent_event_stream() -> Result<()> {
+    let repo = repository("onboarding_generation_events")?;
+    let output = generate_with_fake_codex(&repo, "verbose", &[])?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let plan = parse_json(&String::from_utf8(output.stdout)?)?;
+    assert_eq!(plan["title"], "State transitions");
+    Ok(())
+}

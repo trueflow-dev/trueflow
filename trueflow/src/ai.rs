@@ -605,20 +605,6 @@ impl CommandAiReviewPlanProvider {
         Ok(Self { provider, model })
     }
 
-    pub fn generate(&self, prompt: &str) -> Result<String> {
-        self.generate_with_options(prompt, &AiExecutionOptions::default())
-    }
-
-    pub fn generate_with_timeout(&self, prompt: &str, timeout: Duration) -> Result<String> {
-        self.generate_with_options(
-            prompt,
-            &AiExecutionOptions {
-                timeout,
-                ..Default::default()
-            },
-        )
-    }
-
     pub fn generate_with_options(
         &self,
         prompt: &str,

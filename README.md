@@ -198,6 +198,9 @@ still apply; onboarding requires a CLI provider (`codex_cli` or `claude_cli`).
 Invoking onboarding requests generation even when ordinary TUI AI is off.
 Generation sends selected repository context to the configured provider and
 allows its CLI to inspect the repository; Codex runs in its read-only sandbox.
+Because the agent explores the repository, generation has a 600-second deadline
+by default (`--timeout 1..3600` seconds); a provider that exceeds it is stopped
+and no plan is generated.
 
 The model is asked to aim for 8–24 cards, with a hard maximum of 64. Trueflow
 also enforces a 14-minute **reading estimate**: two seconds per source line plus
