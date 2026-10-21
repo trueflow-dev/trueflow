@@ -9862,8 +9862,9 @@ mod diff_scope_tests {
             .collect::<Vec<_>>();
         let screen = rows.join("\n");
 
-        // The last content row sits just above the bottom border.
-        let last_content_row = &rows[rows.len() - 3];
+        // The last content row sits just above the body's bottom border.
+        let (body, _) = ai_briefing_layout(area);
+        let last_content_row = &rows[usize::from(body.bottom()) - 2];
         assert!(
             last_content_row.contains("unchanged)"),
             "scrolling to the limit must show the final briefing row:\n{screen}"
