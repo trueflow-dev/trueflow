@@ -407,7 +407,9 @@ The `[scan]` ignore rules (`ignore_names`, `ignore_globs`,
 `ignore_path_prefixes`, plus the built-in `.trueflow`, `target`,
 `node_modules` and `mutants.out` names) apply to every scope alike: files
 under them are left out of `--all`, `dirty`, `main`, `rev:`, `--since` and
-`check`, including files a comparison deletes.
+`check`, including files a comparison deletes. `.gitignore` only hides
+untracked files: as in git, a tracked file it matches is still scanned and
+reviewed by `--all`, `scan`, the TUI's all-files scope and `mark`.
 
 ## Runtime config
 

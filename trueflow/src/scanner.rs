@@ -786,8 +786,88 @@ fn collect_scan_inventory(
         }
     }
 
+    append_gitignored_tracked_inputs(root, repo_path_base, options, &mut inputs, diagnostics)?;
     inputs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(inputs)
+}
+
+/// Git never ignores a tracked file, but the walker applies `.gitignore`
+/// (and `.ignore`) rules to every path. Index-tracked regular files under
+/// `root` that the walk left out are added back; trueflow's own `[scan]`
+/// ignore rules still apply.
+fn append_gitignored_tracked_inputs(
+    root: &Path,
+    repo_path_base: &Path,
+    options: &ScanOptions,
+    inputs: &mut Vec<ScanInput>,
+    diagnostics: &mut Vec<ScanDiagnostic>,
+) -> Result<()> {
+    let Ok(repo) = gix::discover(root) else {
+        return Ok(());
+    };
+    let Ok(relative_root) = root.strip_prefix(repo_path_base) else {
+        return Ok(());
+    };
+    if repo.workdir() != Some(repo_path_base) {
+        return Ok(());
+    }
+    let index = match repo.index_or_empty() {
+        Ok(index) => index,
+        Err(err) => {
+            diagnostics.push(ScanDiagnostic::new(
+                None,
+                format!("failed to read the git index; tracked files that .gitignore matches are not scanned: {err}"),
+            ));
+            return Ok(());
+        }
+    };
+    let scope = RepoPath::from_relative_path(relative_root)?;
+    let ignore = DirectScanPathIgnoreMatcher::new(options)?;
+    let walked = inputs
+        .iter()
+        .map(|input| input.path.clone())
+        .collect::<HashSet<_>>();
+    let mut added = HashSet::new();
+
+    for entry in index.entries() {
+        let is_regular_file = entry.mode.to_tree_entry_mode().is_some_and(|mode| {
+            matches!(
+                mode.kind(),
+                gix::object::tree::EntryKind::Blob | gix::object::tree::EntryKind::BlobExecutable
+            )
+        });
+        if !is_regular_file {
+            continue;
+        }
+        let Ok(path) = RepoPath::new(entry.path(&index).to_string()) else {
+            continue;
+        };
+        if !path.is_under(&scope)
+            || ignore.matches(&path)
+            || walked.contains(&path)
+            || !added.insert(path.clone())
+        {
+            continue;
+        }
+        match admit_scan_path(repo_path_base, &path) {
+            Ok(ScanPathAdmission::Regular { full_path, stamp }) => inputs.push(ScanInput {
+                path,
+                full_path,
+                stamp,
+            }),
+            // Deleted, replaced or reached through a link: the walk would not
+            // have scanned it either.
+            Ok(ScanPathAdmission::MissingOrNonFile | ScanPathAdmission::Link { .. }) => {}
+            Err(err) => {
+                let full_path = repo_path_base.join(path.as_str());
+                let diagnostic =
+                    diagnostic_for_process_file_error(repo_path_base, &full_path, &err);
+                log_process_file_error(&diagnostic, &err);
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {

@@ -2923,3 +2923,55 @@ fn review_revision_ranges_follow_git_dot_syntax() -> Result<()> {
     }
     Ok(())
 }
+
+fn all_files_review_paths(repo: &TestRepo, dir: &Path) -> Result<Vec<String>> {
+    review_paths(&repo.run_in(&["review", "--all", "--json"], dir)?)
+}
+
+#[test]
+fn whole_repo_scopes_include_tracked_files_matching_gitignore() -> Result<()> {
+    let repo = TestRepo::new("tracked_gitignored_scan")?;
+    repo.write(".gitignore", "build/\n*.gen.rs\n")?;
+    repo.write("src/main.rs", "fn main() {}\n")?;
+    repo.write("src/schema.gen.rs", "pub fn schema() {}\n")?;
+    repo.write("build/config.rs", "pub fn config() {}\n")?;
+    repo.write("build/untracked.rs", "pub fn untracked() {}\n")?;
+    repo.commit_all("base")?;
+    repo.git(&["add", "-f", "build/config.rs", "src/schema.gen.rs"])?;
+    repo.commit("track ignored files")?;
+
+    let scan = repo.scan_without_cache()?;
+    assert!(scan_contains_path(&scan, "build/config.rs"));
+    assert!(scan_contains_path(&scan, "src/schema.gen.rs"));
+    assert!(!scan_contains_path(&scan, "build/untracked.rs"));
+
+    assert_eq!(
+        all_files_review_paths(&repo, &repo.path)?,
+        [
+            ".gitignore",
+            "build/config.rs",
+            "src/main.rs",
+            "src/schema.gen.rs"
+        ]
+    );
+    assert_eq!(
+        all_files_review_paths(&repo, &repo.path.join("src"))?,
+        ["src/main.rs", "src/schema.gen.rs"]
+    );
+
+    repo.write(
+        "trueflow.toml",
+        "[scan]\nignore_path_prefixes = [\"build\"]\n",
+    )?;
+    assert_eq!(
+        all_files_review_paths(&repo, &repo.path)?,
+        [
+            ".gitignore",
+            "src/main.rs",
+            "src/schema.gen.rs",
+            "trueflow.toml"
+        ],
+        "trueflow's own ignore rules still apply to tracked files"
+    );
+    Ok(())
+}
