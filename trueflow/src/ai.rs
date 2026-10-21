@@ -1510,11 +1510,21 @@ fn collapse_whitespace(raw: &str) -> String {
     out
 }
 
+/// Return `text` through its first sentence terminator. A `.`, `!` or `?`
+/// ends a sentence only after a non-space character and before whitespace or
+/// the end of text, so `self.cache`, `1.2`, `config.rs` and a standalone `?`
+/// operator stay inside the sentence.
 fn first_sentence(text: &str) -> &str {
-    for (index, ch) in text.char_indices() {
-        if matches!(ch, '.' | '!' | '?') {
-            return &text[..=index];
+    let mut previous = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        let ends_sentence = matches!(ch, '.' | '!' | '?')
+            && previous.is_some_and(|previous: char| !previous.is_whitespace())
+            && chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        if ends_sentence {
+            return &text[..index + ch.len_utf8()];
         }
+        previous = Some(ch);
     }
     text
 }
@@ -1975,6 +1985,33 @@ mod tests {
         assert!(request.prompt.contains("NEW_MARKER"), "{}", request.prompt);
         assert!(request.prompt.contains("[base partial;"), "{}", request.prompt);
         assert!(request.prompt.matches("old();").count() < 80);
+    }
+
+    #[test]
+    fn suggestion_sentences_end_only_at_terminators_before_whitespace() {
+        for (raw, expected_explanation, expected_change) in [
+            (
+                "EXPLANATION: Reads config.toml once! Then caches it.\nCHANGE: Cache it in self.cache instead. Extra sentence.",
+                "Reads config.toml once!",
+                "Cache it in self.cache instead.",
+            ),
+            (
+                "EXPLANATION: Parses v1.2 headers.\nCHANGE: Propagate the error with ? instead of unwrap. Extra.",
+                "Parses v1.2 headers.",
+                "Propagate the error with ? instead of unwrap.",
+            ),
+            (
+                "EXPLANATION: Is this safe?\nCHANGE: Validate the path in config.rs before opening it",
+                "Is this safe?",
+                "Validate the path in config.rs before opening it",
+            ),
+        ] {
+            let suggestion = AiSuggestion::from_provider_text(raw)
+                .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
+
+            assert_eq!(suggestion.explanation.as_deref(), Some(expected_explanation));
+            assert_eq!(suggestion.proposed_change.as_deref(), Some(expected_change));
+        }
     }
 
     #[test]
