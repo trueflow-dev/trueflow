@@ -4752,7 +4752,10 @@ fn handle_paste_event(state: &mut AppState, pasted: &str) -> bool {
         return false;
     }
 
-    insert_text_at_input_cursor(state, pasted)
+    // Bracketed paste arrives raw: xterm/VTE send line breaks as `\r` and
+    // Windows clipboards carry `\r\n`, while the editor splits on `\n` only.
+    let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+    insert_text_at_input_cursor(state, &pasted)
 }
 
 fn handle_mouse_event(state: &mut AppState, mouse_event: MouseEvent) -> bool {
@@ -14224,6 +14227,30 @@ mod diff_scope_tests {
             state.input_cursor,
             InputCursor {
                 offset: 4,
+                goal_column: None,
+            }
+        );
+    }
+
+    #[test]
+    fn handle_paste_event_normalizes_carriage_return_line_breaks() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.input_mode = InputMode::Editing {
+            action: PendingAction::Single {
+                node_id: TreeBuilder::new().root(),
+                verdict: Verdict::Comment,
+                note: None,
+            },
+        };
+
+        let rerender = handle_paste_event(&mut state, "a\r\nb\rc");
+
+        assert!(rerender);
+        assert_eq!(state.input_buffer, "a\nb\nc");
+        assert_eq!(
+            state.input_cursor,
+            InputCursor {
+                offset: "a\nb\nc".len(),
                 goal_column: None,
             }
         );
