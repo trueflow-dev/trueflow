@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
+use crate::block::{Block, BlockKind, ByteSpan, LineSpan, SourceText};
 use crate::code_comments;
 use crate::complexity;
 use crate::optimizer;
@@ -209,6 +209,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
         return BlockSplitResult::new(Vec::new(), BlockSplitStrategy::EmptyInput, Vec::new());
     }
 
+    let content = &SourceText::new(content);
     match lang {
         Language::Markdown => {
             attempt_split(content, lang, split_markdown(content), FallbackMode::Text)
@@ -260,7 +261,7 @@ fn split_non_empty(content: &str, lang: Language) -> BlockSplitResult {
 }
 
 fn attempt_split(
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
     attempt: Result<Vec<Block>>,
     fallback_mode: FallbackMode,
@@ -293,7 +294,7 @@ fn attempt_split(
 }
 
 fn fallback_result(
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
     fallback_mode: FallbackMode,
     strategy: BlockSplitStrategy,
@@ -311,7 +312,7 @@ fn complete_split(
     BlockSplitResult::new(blocks, strategy, diagnostics)
 }
 
-fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
+fn split_tree_sitter(content: &SourceText<'_>, lang: Language) -> Result<Vec<Block>> {
     let registration = languages::registration(lang);
     let mut parser = Parser::new();
     let language = tree_sitter_language_for(lang, content)
@@ -319,7 +320,7 @@ fn split_tree_sitter(content: &str, lang: Language) -> Result<Vec<Block>> {
     parser.set_language(&language)?;
 
     let tree = parser
-        .parse(content, None)
+        .parse(content.as_str(), None)
         .context("Failed to parse source with tree-sitter")?;
     let root = tree.root_node();
     let test_spans = collect_test_line_spans(lang, &tree, content)?;
@@ -558,14 +559,14 @@ fn php_tree_sitter_language(content: &str) -> TsLanguage {
     }
 }
 
-fn split_markdown(content: &str) -> Result<Vec<Block>> {
+fn split_markdown(content: &SourceText<'_>) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_md::LANGUAGE.into())
         .context("Failed to load markdown grammar")?;
 
     let tree = parser
-        .parse(content, None)
+        .parse(content.as_str(), None)
         .context("Failed to parse markdown")?;
     let root = tree.root_node();
 
@@ -606,7 +607,7 @@ fn split_markdown(content: &str) -> Result<Vec<Block>> {
 }
 
 pub(crate) fn fallback_split_blocks(
-    content: &str,
+    content: &SourceText<'_>,
     mode: FallbackMode,
     lang: Language,
 ) -> Vec<Block> {
@@ -641,14 +642,14 @@ fn classify_code_paragraph(chunk: &str) -> BlockKind {
 }
 
 fn create_fallback_block(
-    full_source: &str,
+    full_source: &SourceText<'_>,
     chunk: &str,
     kind: BlockKind,
     start: usize,
     end: usize,
     lang: Language,
 ) -> Option<Block> {
-    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start, end)).ok()?;
+    let mut block = full_source.block(kind, ByteSpan::new(start, end)).ok()?;
     assert_eq!(
         block.content, chunk,
         "fallback splitter range must name the supplied chunk"
@@ -695,7 +696,7 @@ where
     blocks
 }
 
-fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
+fn split_paragraphs(content: &SourceText<'_>, lang: Language) -> Vec<Block> {
     collect_valid_paragraph_blocks(content, |chunk, start, end, is_gap| {
         let kind = if is_gap {
             BlockKind::Gap
@@ -706,7 +707,7 @@ fn split_paragraphs(content: &str, lang: Language) -> Vec<Block> {
     })
 }
 
-fn split_toml(content: &str) -> Result<Vec<Block>> {
+fn split_toml(content: &SourceText<'_>) -> Result<Vec<Block>> {
     let spans = toml_blocks::split_document(content)?;
     let mut blocks = Vec::new();
     let mut last_end = 0usize;
@@ -730,7 +731,7 @@ fn split_toml(content: &str) -> Result<Vec<Block>> {
 
 fn push_non_empty_toml_gap(
     blocks: &mut Vec<Block>,
-    content: &str,
+    content: &SourceText<'_>,
     start: usize,
     end: usize,
 ) -> Result<()> {
@@ -766,13 +767,15 @@ struct NixBoundary {
     kind: BlockKind,
 }
 
-fn split_nix(content: &str) -> Result<Vec<Block>> {
+fn split_nix(content: &SourceText<'_>) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_nix::LANGUAGE.into())
         .context("Failed to load nix grammar")?;
 
-    let tree = parser.parse(content, None).context("Failed to parse nix")?;
+    let tree = parser
+        .parse(content.as_str(), None)
+        .context("Failed to parse nix")?;
     let root = tree.root_node();
 
     let Some(expression) = root.child_by_field_name("expression") else {
@@ -997,7 +1000,7 @@ struct MarkdownSectionSpan {
 }
 
 fn split_markdown_section_for_review(
-    content: &str,
+    content: &SourceText<'_>,
     section: MarkdownSectionSpan,
     headings: &[MarkdownHeading],
     force_refine: bool,
@@ -1112,8 +1115,8 @@ fn markdown_section_child_sections(
     ))
 }
 
-fn markdown_span_line_count(content: &str, start: usize, end: usize) -> Result<usize> {
-    Ok(Block::line_span_from_file_range(content, ByteSpan::new(start, end))?.len())
+fn markdown_span_line_count(content: &SourceText<'_>, start: usize, end: usize) -> Result<usize> {
+    Ok(content.line_span(ByteSpan::new(start, end))?.len())
 }
 
 #[derive(Debug, Clone)]
@@ -1130,12 +1133,16 @@ struct MarkdownFlatPart {
     kind: BlockKind,
 }
 
-fn split_markdown_flat_range(content: &str, start: usize, end: usize) -> Result<Vec<Block>> {
+fn split_markdown_flat_range(
+    content: &SourceText<'_>,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Block>> {
     split_markdown_flat_range_with_attached_heading(content, None, start, end)
 }
 
 fn split_markdown_flat_range_attaching_heading(
-    content: &str,
+    content: &SourceText<'_>,
     heading_start: usize,
     body_start: usize,
     end: usize,
@@ -1144,7 +1151,7 @@ fn split_markdown_flat_range_attaching_heading(
 }
 
 fn split_markdown_flat_range_with_attached_heading(
-    content: &str,
+    content: &SourceText<'_>,
     attached_heading_start: Option<usize>,
     start: usize,
     end: usize,
@@ -1578,7 +1585,7 @@ fn c_node_contains_const_qualifier(node: tree_sitter::Node<'_>, content: &str) -
 
 fn collect_swift_type_items(
     type_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
@@ -1606,7 +1613,7 @@ fn collect_swift_type_items(
 
 fn collect_rust_impl_items(
     impl_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     rust::collect_impl_member_spans(impl_node)
@@ -1626,7 +1633,7 @@ fn collect_rust_impl_items(
 
 fn collect_java_type_items(
     type_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
@@ -1654,7 +1661,7 @@ fn collect_java_type_items(
 
 fn collect_kotlin_type_items(
     type_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let Some(body) = kotlin_type_body(type_node) else {
@@ -1701,7 +1708,7 @@ fn map_kotlin_type_member_kind(node: tree_sitter::Node<'_>, content: &str) -> Bl
 
 fn collect_csharp_namespace_items(
     namespace_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let Some(body) = namespace_node.child_by_field_name("body") else {
@@ -1718,7 +1725,7 @@ fn collect_csharp_namespace_items(
 
 fn collect_csharp_declaration_blocks(
     node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let kind = map_kind(lang, node.kind());
@@ -1754,7 +1761,7 @@ fn collect_csharp_declaration_blocks(
 
 fn collect_ruby_scope_items(
     scope_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let Some(body) = scope_node.child_by_field_name("body") else {
@@ -1797,7 +1804,7 @@ fn ruby_scope_body_children(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Nod
 
 fn collect_csharp_type_items(
     type_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
@@ -1814,7 +1821,7 @@ fn collect_csharp_type_items(
 
 fn collect_php_type_items(
     type_node: tree_sitter::Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let Some(body) = type_node.child_by_field_name("body") else {
@@ -1843,7 +1850,7 @@ fn collect_php_type_items(
 fn create_block(
     text: &str,
     kind: BlockKind,
-    full_source: &str,
+    full_source: &SourceText<'_>,
     start_byte: usize,
     end_byte: usize,
     lang: Language,
@@ -1861,12 +1868,12 @@ fn create_block(
 fn create_block_with_complexity(
     text: &str,
     kind: BlockKind,
-    full_source: &str,
+    full_source: &SourceText<'_>,
     start_byte: usize,
     end_byte: usize,
     complexity: Option<u32>,
 ) -> Result<Block> {
-    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    let mut block = full_source.block(kind, ByteSpan::new(start_byte, end_byte))?;
     assert_eq!(
         block.content, text,
         "parser split range must name the supplied block content"
@@ -1991,11 +1998,11 @@ fn collect_test_ranges(
 fn collect_test_line_spans(
     lang: Language,
     tree: &tree_sitter::Tree,
-    source: &str,
+    source: &SourceText<'_>,
 ) -> Result<Vec<LineSpan>> {
     collect_test_ranges(lang, tree, source)?
         .into_iter()
-        .map(|range| Block::line_span_from_file_range(source, range))
+        .map(|range| source.line_span(range))
         .collect()
 }
 
@@ -3072,7 +3079,11 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
     #[test]
     fn fallback_blocks_preserve_absolute_utf8_byte_spans() {
         let source = "éclair paragraph.\n\nλater paragraph.";
-        let blocks = fallback_split_blocks(source, FallbackMode::Text, Language::Unknown);
+        let blocks = fallback_split_blocks(
+            &SourceText::new(source),
+            FallbackMode::Text,
+            Language::Unknown,
+        );
         assert_eq!(blocks.len(), 3);
 
         for block in blocks {

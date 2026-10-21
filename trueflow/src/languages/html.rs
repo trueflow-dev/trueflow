@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration, default_code_sub_split, no_attribute_nodes, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser};
@@ -183,7 +183,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_section_review_units(block: &Block) -> Result<Vec<Block>> {
+fn split_section_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_html(&block.content).context("Failed to parse HTML review block")?;
     let root = tree.root_node();
     let Some(review_root) = find_primary_review_root(root) else {
@@ -266,7 +266,7 @@ fn leaf_child_span(node: Node<'_>, content: &str) -> Option<SemanticSpan> {
     }
 }
 
-fn build_review_blocks(parent: &Block, spans: &[SemanticSpan]) -> Result<Vec<Block>> {
+fn build_review_blocks(parent: &ParentBlock<'_>, spans: &[SemanticSpan]) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut last_end = 0usize;
 
@@ -287,7 +287,7 @@ fn build_review_blocks(parent: &Block, spans: &[SemanticSpan]) -> Result<Vec<Blo
 
 fn push_fragment_block(
     blocks: &mut Vec<Block>,
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
 ) -> Result<()> {
@@ -310,7 +310,7 @@ fn classify_fragment(fragment: &str) -> BlockKind {
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     content: &str,
     start_offset: usize,
     kind: BlockKind,
@@ -318,7 +318,8 @@ fn create_sub_block(
     let end_offset = start_offset
         .checked_add(content.len())
         .context("HTML sub-split end offset overflow")?;
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("HTML sub-split range must be a valid parent UTF-8 slice")?;
     assert_eq!(
         block.content, content,

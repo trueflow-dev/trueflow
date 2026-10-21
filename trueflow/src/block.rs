@@ -3,8 +3,10 @@ use crate::hashing::{BytesHash, TreeHash};
 use crate::repo_path::RepoPath;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::cmp::Reverse;
 use std::fmt;
+use std::ops::Deref;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -296,61 +298,161 @@ impl Block {
         }
     }
 
-    /// Constructs a block from an absolute byte range in its complete source.
+    /// Constructs one block from an absolute byte range in its complete source.
     ///
-    /// The range is checked for ordering, bounds, and UTF-8 boundaries before
-    /// content and line coordinates are derived from the same source slice.
+    /// To cut several blocks from one source, build a [`SourceText`] once and
+    /// call [`SourceText::block`]; this constructor indexes the source anew.
     pub(crate) fn from_file_range(
         full_source: &str,
         kind: BlockKind,
         byte_span: ByteSpan,
     ) -> anyhow::Result<Self> {
-        let content = full_source
+        SourceText::new(full_source).block(kind, byte_span)
+    }
+
+    pub fn line_span(&self) -> LineSpan {
+        LineSpan::new(self.start_line, self.end_line)
+    }
+
+    pub fn byte_span(&self) -> ByteSpan {
+        ByteSpan::new(self.start_byte, self.end_byte)
+    }
+
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|candidate| candidate == tag)
+    }
+
+    pub fn is_test(&self) -> bool {
+        self.has_tag("test")
+    }
+}
+
+/// A complete source text that blocks are cut from by absolute byte range.
+///
+/// The offsets of its `\n` bytes are indexed in one pass on first use, so
+/// each block's line span costs two binary searches. Recounting the prefix
+/// for every block was quadratic: 16 s to cut the 29,927 paragraphs of a
+/// 6.3 MB text file.
+#[derive(Debug)]
+pub(crate) struct SourceText<'a> {
+    text: &'a str,
+    newline_offsets: OnceCell<Vec<usize>>,
+}
+
+impl<'a> SourceText<'a> {
+    pub(crate) fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            newline_offsets: OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'a str {
+        self.text
+    }
+
+    /// Cuts the block named by an absolute byte range of this text.
+    ///
+    /// The range is checked for ordering, bounds, and UTF-8 boundaries before
+    /// content and line coordinates are derived from the same slice.
+    pub(crate) fn block(&self, kind: BlockKind, byte_span: ByteSpan) -> anyhow::Result<Block> {
+        let content = self.slice(byte_span)?;
+        Ok(Block::new(
+            content.to_owned(),
+            kind,
+            self.line_span_of_slice(byte_span, content),
+            byte_span,
+        ))
+    }
+
+    /// Derives the line span of a checked UTF-8 byte range of this text.
+    pub(crate) fn line_span(&self, byte_span: ByteSpan) -> anyhow::Result<LineSpan> {
+        let content = self.slice(byte_span)?;
+        Ok(self.line_span_of_slice(byte_span, content))
+    }
+
+    fn slice(&self, byte_span: ByteSpan) -> anyhow::Result<&'a str> {
+        self.text
             .get(byte_span.start_byte..byte_span.end_byte)
             .ok_or_else(|| {
                 anyhow!(
                     "invalid source byte range {}..{} for {} bytes",
                     byte_span.start_byte,
                     byte_span.end_byte,
-                    full_source.len()
+                    self.text.len()
                 )
-            })?;
-        let line_span = Self::line_span_from_file_range(full_source, byte_span)?;
-
-        Ok(Self::new(content.to_owned(), kind, line_span, byte_span))
+            })
     }
 
-    /// Derives a line span from a checked absolute UTF-8 byte range without
-    /// allocating the corresponding source slice.
-    pub(crate) fn line_span_from_file_range(
-        full_source: &str,
-        byte_span: ByteSpan,
-    ) -> anyhow::Result<LineSpan> {
-        line_span_for_source_range(full_source, byte_span).ok_or_else(|| {
-            anyhow!(
-                "invalid source byte range {}..{} for {} bytes",
-                byte_span.start_byte,
-                byte_span.end_byte,
-                full_source.len()
-            )
-        })
+    /// `content` must be this text's slice for `byte_span`.
+    fn line_span_of_slice(&self, byte_span: ByteSpan, content: &str) -> LineSpan {
+        let start_line = self.newlines_before(byte_span.start_byte);
+        if content.is_empty() {
+            return LineSpan::new(start_line, start_line);
+        }
+        // A range that stops mid-line still occupies that line.
+        let end_line =
+            self.newlines_before(byte_span.end_byte) + usize::from(!content.ends_with('\n'));
+        LineSpan::new(start_line, end_line)
     }
 
-    /// Constructs a block from a range relative to an exact source-backed
-    /// parent, translating the stored coordinate to the original file.
-    pub(crate) fn from_parent_range(
-        parent: &Block,
-        kind: BlockKind,
-        relative_span: ByteSpan,
-    ) -> anyhow::Result<Self> {
+    /// Counts the `\n` bytes before `byte`. UTF-8 never encodes 0x0A inside a
+    /// multi-byte sequence, so these are exactly the `'\n'` chars.
+    fn newlines_before(&self, byte: usize) -> usize {
+        self.newline_offsets
+            .get_or_init(|| {
+                self.text
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
+                    .collect()
+            })
+            .partition_point(|&offset| offset < byte)
+    }
+}
+
+impl Deref for SourceText<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.text
+    }
+}
+
+/// A source-backed block that children are cut from by parent-relative byte
+/// range. It indexes the parent's content once, like [`SourceText`], and
+/// dereferences to the parent block.
+#[derive(Debug)]
+pub(crate) struct ParentBlock<'a> {
+    block: &'a Block,
+    content: SourceText<'a>,
+}
+
+impl<'a> ParentBlock<'a> {
+    pub(crate) fn new(block: &'a Block) -> Self {
+        Self {
+            block,
+            content: SourceText::new(&block.content),
+        }
+    }
+
+    pub(crate) fn block(&self) -> &'a Block {
+        self.block
+    }
+
+    /// Cuts a child block from a range relative to the parent's content and
+    /// translates its coordinates to the original file.
+    pub(crate) fn child(&self, kind: BlockKind, relative_span: ByteSpan) -> anyhow::Result<Block> {
+        let parent = self.block;
         if parent.content.len() != parent.byte_span().len() {
             return Err(anyhow!(
                 "parent content byte length does not match its source span"
             ));
         }
 
-        let content = parent
+        let content = self
             .content
+            .text
             .get(relative_span.start_byte..relative_span.end_byte)
             .ok_or_else(|| {
                 anyhow!(
@@ -379,7 +481,7 @@ impl Block {
             ));
         }
 
-        let relative_line_span = Self::line_span_from_file_range(&parent.content, relative_span)?;
+        let relative_line_span = self.content.line_span_of_slice(relative_span, content);
         let line_span = LineSpan::new(
             parent
                 .start_line
@@ -391,44 +493,16 @@ impl Block {
                 .ok_or_else(|| anyhow!("parent-relative end line overflow"))?,
         );
 
-        Ok(Self::new(content.to_owned(), kind, line_span, byte_span))
-    }
-
-    pub fn line_span(&self) -> LineSpan {
-        LineSpan::new(self.start_line, self.end_line)
-    }
-
-    pub fn byte_span(&self) -> ByteSpan {
-        ByteSpan::new(self.start_byte, self.end_byte)
-    }
-
-    pub fn has_tag(&self, tag: &str) -> bool {
-        self.tags.iter().any(|candidate| candidate == tag)
-    }
-
-    pub fn is_test(&self) -> bool {
-        self.has_tag("test")
+        Ok(Block::new(content.to_owned(), kind, line_span, byte_span))
     }
 }
 
-fn line_span_for_source_range(source: &str, byte_span: ByteSpan) -> Option<LineSpan> {
-    let before = source.get(..byte_span.start_byte)?;
-    let content = source.get(byte_span.start_byte..byte_span.end_byte)?;
-    let start_line = count_newlines(before);
-    if content.is_empty() {
-        return Some(LineSpan::new(start_line, start_line));
+impl Deref for ParentBlock<'_> {
+    type Target = Block;
+
+    fn deref(&self) -> &Block {
+        self.block
     }
-
-    let end_line = start_line
-        .checked_add(count_newlines(content))?
-        .checked_add(usize::from(!content.ends_with('\n')))?;
-    Some(LineSpan::new(start_line, end_line))
-}
-
-/// Counts `\n` bytes. UTF-8 never encodes 0x0A inside a multi-byte sequence,
-/// so this equals the number of `'\n'` chars without decoding.
-fn count_newlines(text: &str) -> usize {
-    text.bytes().filter(|&byte| byte == b'\n').count()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,25 +821,65 @@ mod tests {
         .unwrap();
         let child_start = parent.content.find("let β").unwrap();
         let child_end = child_start + "let β = 1;".len();
-        let child = Block::from_parent_range(
-            &parent,
-            BlockKind::CodeParagraph,
-            ByteSpan::new(child_start, child_end),
-        )
-        .unwrap();
+        let child = ParentBlock::new(&parent)
+            .child(
+                BlockKind::CodeParagraph,
+                ByteSpan::new(child_start, child_end),
+            )
+            .unwrap();
 
         assert_eq!(&source[child.start_byte..child.end_byte], "let β = 1;");
         assert_eq!(child.line_span(), LineSpan::new(2, 3));
         assert_eq!(child.byte_span().start_byte, parent_start + child_start);
         assert!(Block::from_file_range(source, BlockKind::Code, ByteSpan::new(1, 2)).is_err());
         assert!(
-            Block::from_parent_range(
-                &parent,
-                BlockKind::Code,
-                ByteSpan::new(parent.content.len(), parent.content.len() + 1),
-            )
-            .is_err()
+            ParentBlock::new(&parent)
+                .child(
+                    BlockKind::Code,
+                    ByteSpan::new(parent.content.len(), parent.content.len() + 1),
+                )
+                .is_err()
         );
+    }
+
+    /// The indexed line span of every UTF-8 range must equal the definition:
+    /// the start line counts the newlines before the range, and a non-empty
+    /// range ends after its last newline plus the partial line it stops in.
+    /// Parent-relative children must land on the same absolute lines.
+    #[test]
+    fn test_indexed_line_spans_match_newline_counts_for_every_range() {
+        for text in ["", "x", "\n", "\n\n", "ab\ncd", "ab\ncd\n", "\nβ\r\n\né\n"] {
+            let source = SourceText::new(text);
+            let parent =
+                Block::from_file_range(text, BlockKind::Code, ByteSpan::new(0, text.len()))
+                    .unwrap();
+            let parent = ParentBlock::new(&parent);
+            let boundaries = (0..=text.len()).filter(|&offset| text.is_char_boundary(offset));
+            for start in boundaries.clone() {
+                for end in boundaries.clone().filter(|&end| end >= start) {
+                    let span = ByteSpan::new(start, end);
+                    let content = &text[start..end];
+                    let start_line = text[..start].matches('\n').count();
+                    let end_line = if content.is_empty() {
+                        start_line
+                    } else {
+                        start_line
+                            + content.matches('\n').count()
+                            + usize::from(!content.ends_with('\n'))
+                    };
+                    let expected = LineSpan::new(start_line, end_line);
+
+                    assert_eq!(
+                        source.line_span(span).unwrap(),
+                        expected,
+                        "{text:?} {span:?}"
+                    );
+                    let child = parent.child(BlockKind::Code, span).unwrap();
+                    assert_eq!(child.line_span(), expected, "{text:?} {span:?}");
+                    assert_eq!(child.content, content);
+                }
+            }
+        }
     }
 
     #[test]

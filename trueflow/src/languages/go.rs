@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration, no_attribute_nodes,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::code_comments;
 
 use crate::text_split::paragraph_break_regex;
@@ -187,7 +187,7 @@ fn sub_split(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_function_like(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse Go function-like block")?;
     let root = tree.root_node();
     let Some(function_node) = find_named_descendant_any(root, FUNCTION_LIKE_DECLARATIONS) else {
@@ -205,7 +205,7 @@ fn split_function_like(block: &Block) -> Result<Vec<Block>> {
     split_review_units_after_signature(block, signature_end)
 }
 
-fn split_type_like(block: &Block) -> Result<Vec<Block>> {
+fn split_type_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse Go type-like block")?;
     let root = tree.root_node();
     let Some(type_node) = find_type_like_descendant(root) else {
@@ -263,7 +263,10 @@ fn first_named_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
     node.named_children(&mut cursor).next()
 }
 
-fn collect_container_member_blocks(parent: &Block, type_node: Node<'_>) -> Result<Vec<Block>> {
+fn collect_container_member_blocks(
+    parent: &ParentBlock<'_>,
+    type_node: Node<'_>,
+) -> Result<Vec<Block>> {
     collect_container_member_spans(type_node, &parent.content)
         .into_iter()
         .map(|span| {
@@ -277,7 +280,10 @@ fn collect_container_member_blocks(parent: &Block, type_node: Node<'_>) -> Resul
         .collect()
 }
 
-fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Result<Vec<Block>> {
+fn split_review_units_after_signature(
+    block: &ParentBlock<'_>,
+    signature_end: usize,
+) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut blocks = vec![create_sub_block_with_kind(
         block,
@@ -316,7 +322,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
 }
 
 fn push_review_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     blocks: &mut Vec<Block>,
     chunk: &str,
     start_offset: usize,
@@ -403,7 +409,7 @@ fn signature_end_offset(content: &str, block_start: usize) -> usize {
 }
 
 fn create_sub_block_with_kind(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     content: &str,
     start_offset: usize,
     kind: BlockKind,
@@ -411,7 +417,8 @@ fn create_sub_block_with_kind(
     let end_offset = start_offset
         .checked_add(content.len())
         .context("Go sub-split end offset overflow")?;
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("Go sub-split range must be a valid parent UTF-8 slice")?;
     assert_eq!(
         block.content, content,

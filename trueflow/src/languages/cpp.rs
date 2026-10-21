@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration, no_attribute_nodes,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::code_comments;
 
 use crate::text_split::paragraph_break_regex;
@@ -311,7 +311,7 @@ fn sub_split(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_function_like(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse C++ function-like block")?;
     let root = tree.root_node();
     let Some(function_node) = find_named_descendant_any(root, FUNCTION_LIKE_DECLARATIONS) else {
@@ -329,7 +329,7 @@ fn split_function_like(block: &Block) -> Result<Vec<Block>> {
     split_review_units_after_signature(block, signature_end)
 }
 
-fn split_container_like(block: &Block) -> Result<Vec<Block>> {
+fn split_container_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse C++ container block")?;
     let root = tree.root_node();
     let Some(container) = find_structural_container_descendant(root) else {
@@ -408,7 +408,7 @@ fn find_structural_container_descendant<'a>(node: Node<'a>) -> Option<Node<'a>> 
 }
 
 fn collect_direct_child_blocks(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     body: Node<'_>,
     in_container: bool,
 ) -> Result<Vec<Block>> {
@@ -435,7 +435,7 @@ fn collect_direct_child_blocks(
     Ok(blocks)
 }
 
-fn collect_enum_member_blocks(parent: &Block, enum_node: Node<'_>) -> Result<Vec<Block>> {
+fn collect_enum_member_blocks(parent: &ParentBlock<'_>, enum_node: Node<'_>) -> Result<Vec<Block>> {
     let Some(body) = first_named_child(enum_node) else {
         return Ok(Vec::new());
     };
@@ -461,7 +461,10 @@ fn first_named_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
     node.named_children(&mut cursor).next()
 }
 
-fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Result<Vec<Block>> {
+fn split_review_units_after_signature(
+    block: &ParentBlock<'_>,
+    signature_end: usize,
+) -> Result<Vec<Block>> {
     let content = block.content.as_str();
     let mut blocks = vec![create_sub_block_with_kind(
         block,
@@ -500,7 +503,7 @@ fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Re
 }
 
 fn push_review_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     blocks: &mut Vec<Block>,
     chunk: &str,
     start_offset: usize,
@@ -587,7 +590,7 @@ fn signature_end_offset(content: &str, block_start: usize) -> usize {
 }
 
 fn create_sub_block_with_kind(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     content: &str,
     start_offset: usize,
     kind: BlockKind,
@@ -595,7 +598,8 @@ fn create_sub_block_with_kind(
     let end_offset = start_offset
         .checked_add(content.len())
         .context("C++ sub-split end offset overflow")?;
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("C++ sub-split range must be a valid parent UTF-8 slice")?;
     assert_eq!(
         block.content, content,

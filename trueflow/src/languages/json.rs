@@ -3,7 +3,7 @@ use super::{
     default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock, SourceText};
 use crate::complexity;
 
 use anyhow::{Context, Result};
@@ -27,7 +27,7 @@ fn parser_language(_content: &str) -> TsLanguage {
     tree_sitter_json::LANGUAGE.into()
 }
 
-fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
+fn split_top_level(root: Node<'_>, content: &SourceText<'_>, lang: Language) -> Result<Vec<Block>> {
     let values = root_json_values(root);
     if values.is_empty() {
         return Ok(vec![create_file_block(
@@ -55,7 +55,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
 
 fn split_json_value_at_file_scope(
     value: Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     Ok(match value.kind() {
@@ -80,7 +80,7 @@ fn split_object_children(
     range_start: usize,
     range_end: usize,
     object: Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let pairs = object_pairs(object);
@@ -118,7 +118,7 @@ fn split_array_children(
     range_start: usize,
     range_end: usize,
     array: Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let items = array_items(array);
@@ -199,11 +199,11 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn identity_review_unit(block: &Block) -> Result<Vec<Block>> {
-    Ok(vec![block.clone()])
+fn identity_review_unit(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
+    Ok(vec![block.block().clone()])
 }
 
-fn split_composite_children(block: &Block) -> Result<Vec<Block>> {
+fn split_composite_children(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let needs_pair_wrapper = looks_like_json_pair(&block.content);
     let source = if needs_pair_wrapper {
         format!("{{{}}}", block.content)
@@ -299,7 +299,7 @@ fn composite_node_from_block(root: Node<'_>, needs_pair_wrapper: bool) -> Option
 
 fn push_non_empty_gap(
     blocks: &mut Vec<Block>,
-    content: &str,
+    content: &SourceText<'_>,
     start: usize,
     end: usize,
     lang: Language,
@@ -326,7 +326,7 @@ fn push_non_empty_gap(
 
 fn push_container_interstitial(
     blocks: &mut Vec<Block>,
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
     is_noise: fn(&str) -> bool,
@@ -368,12 +368,12 @@ fn parse_tree(source: &str) -> Result<tree_sitter::Tree> {
 fn create_file_block(
     text: &str,
     kind: BlockKind,
-    full_source: &str,
+    full_source: &SourceText<'_>,
     start_byte: usize,
     end_byte: usize,
     lang: Language,
 ) -> Result<Block> {
-    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))?;
+    let mut block = full_source.block(kind, ByteSpan::new(start_byte, end_byte))?;
     assert_eq!(
         block.content, text,
         "JSON top-level range must name content"
@@ -383,13 +383,12 @@ fn create_file_block(
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
 ) -> Result<Block> {
-    let mut block =
-        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    let mut block = parent.child(kind, ByteSpan::new(start_offset, end_offset))?;
     block.tags = parent.tags.clone();
     Ok(block)
 }

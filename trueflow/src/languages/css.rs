@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration, default_code_sub_split, no_attribute_nodes, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 
 use anyhow::{Context, Result};
 use tree_sitter::{Language as TsLanguage, Node, Parser};
@@ -135,7 +135,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_section_review_units(block: &Block) -> Result<Vec<Block>> {
+fn split_section_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_css(&block.content).context("Failed to parse CSS review block")?;
     let root = tree.root_node();
     let Some(review_root) = find_primary_review_root(root) else {
@@ -155,7 +155,7 @@ fn split_section_review_units(block: &Block) -> Result<Vec<Block>> {
     }
 }
 
-fn split_rule_like(block: &Block, review_root: Node<'_>) -> Result<Vec<Block>> {
+fn split_rule_like(block: &ParentBlock<'_>, review_root: Node<'_>) -> Result<Vec<Block>> {
     let Some(body) = first_named_child_of_kind(review_root, "block") else {
         return crate::sub_splitter::split_code_review_units(block);
     };
@@ -175,7 +175,7 @@ fn split_rule_like(block: &Block, review_root: Node<'_>) -> Result<Vec<Block>> {
 }
 
 fn split_container_like(
-    block: &Block,
+    block: &ParentBlock<'_>,
     review_root: Node<'_>,
     body_kind: &str,
 ) -> Result<Vec<Block>> {
@@ -277,7 +277,7 @@ fn flush_pending_group(spans: &mut Vec<SemanticSpan>, pending_group: &mut Option
     }
 }
 
-fn build_review_blocks(parent: &Block, spans: &[SemanticSpan]) -> Result<Vec<Block>> {
+fn build_review_blocks(parent: &ParentBlock<'_>, spans: &[SemanticSpan]) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut last_end = 0usize;
 
@@ -298,7 +298,7 @@ fn build_review_blocks(parent: &Block, spans: &[SemanticSpan]) -> Result<Vec<Blo
 
 fn push_fragment_block(
     blocks: &mut Vec<Block>,
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
 ) -> Result<()> {
@@ -326,7 +326,7 @@ fn classify_fragment(fragment: &str) -> BlockKind {
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     content: &str,
     start_offset: usize,
     kind: BlockKind,
@@ -334,7 +334,8 @@ fn create_sub_block(
     let end_offset = start_offset
         .checked_add(content.len())
         .context("CSS sub-split end offset overflow")?;
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("CSS sub-split range must be a valid parent UTF-8 slice")?;
     assert_eq!(
         block.content, content,

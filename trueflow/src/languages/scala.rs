@@ -3,7 +3,7 @@ use super::{
     TopLevelRegistration,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::code_comments;
 
 use crate::text_split::paragraph_break_regex;
@@ -476,7 +476,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_function_like(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse Scala function-like block")?;
     let root = tree.root_node();
 
@@ -507,7 +507,10 @@ fn split_function_like(block: &Block) -> Result<Vec<Block>> {
     crate::sub_splitter::split_code_review_units(block)
 }
 
-fn split_review_units_after_signature(block: &Block, signature_end: usize) -> Result<Vec<Block>> {
+fn split_review_units_after_signature(
+    block: &ParentBlock<'_>,
+    signature_end: usize,
+) -> Result<Vec<Block>> {
     let mut blocks = vec![create_sub_block(
         block,
         &block.content[..signature_end],
@@ -596,7 +599,7 @@ fn classify_review_chunk(chunk: &str) -> BlockKind {
     }
 }
 
-fn split_type_like(block: &Block) -> Result<Vec<Block>> {
+fn split_type_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse Scala type-like block")?;
     let root = tree.root_node();
     let Some(container) = find_named_descendant_any(root, TYPE_LIKE_DECLARATIONS) else {
@@ -637,7 +640,7 @@ fn split_type_like(block: &Block) -> Result<Vec<Block>> {
 }
 
 fn push_non_child_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
     blocks: &mut Vec<Block>,
@@ -683,15 +686,14 @@ fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     text: &str,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
     tags: Vec<String>,
 ) -> Result<Block> {
-    let mut block =
-        Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))?;
+    let mut block = parent.child(kind, ByteSpan::new(start_offset, end_offset))?;
     block.tags = parent.tags.clone();
     assert_eq!(
         block.content, text,

@@ -1,5 +1,5 @@
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock, SourceText};
 use anyhow::Result;
 use tree_sitter::{Language as TsLanguage, Node, Tree};
 
@@ -38,8 +38,9 @@ pub(crate) type AttributeNodeDetector = fn(&str) -> bool;
 pub(crate) type NestedBlockCollector =
     for<'tree> fn(Node<'tree>, &str, Language) -> Vec<NestedBlock>;
 pub(crate) type TestRangeCollector = fn(&Tree, &str) -> Result<Vec<ByteSpan>>;
-pub(crate) type TopLevelSplitter = for<'tree> fn(Node<'tree>, &str, Language) -> Result<Vec<Block>>;
-pub(crate) type SubSplitter = fn(&Block) -> Result<Vec<Block>>;
+pub(crate) type TopLevelSplitter =
+    for<'tree> fn(Node<'tree>, &SourceText<'_>, Language) -> Result<Vec<Block>>;
+pub(crate) type SubSplitter = fn(&ParentBlock<'_>) -> Result<Vec<Block>>;
 pub(crate) type SubSplitRegistrationFn = fn(BlockKind) -> SubSplitRegistration;
 
 #[derive(Clone, Copy)]

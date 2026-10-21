@@ -3,7 +3,7 @@ use super::{
     default_code_sub_split, default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock, SourceText};
 use crate::code_comments;
 use crate::complexity;
 
@@ -37,7 +37,7 @@ fn parser_language(_content: &str) -> TsLanguage {
     tree_sitter_dart::LANGUAGE.into()
 }
 
-fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
+fn split_top_level(root: Node<'_>, content: &SourceText<'_>, lang: Language) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut cursor = root.walk();
     let children: Vec<_> = root.children(&mut cursor).collect();
@@ -242,7 +242,7 @@ fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<
 
 fn collect_type_member_blocks(
     type_node: Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     collect_type_member_spans(type_node, content)
@@ -316,7 +316,7 @@ fn collect_type_member_spans(type_node: Node<'_>, content: &str) -> Vec<Semantic
 
 fn collect_test_invocation_blocks(
     function_body: Node<'_>,
-    content: &str,
+    content: &SourceText<'_>,
     lang: Language,
 ) -> Result<Vec<Block>> {
     let mut spans = Vec::new();
@@ -442,7 +442,7 @@ fn extend_to_semicolon(content: &str, from: usize) -> usize {
 
 fn push_non_empty_gap(
     blocks: &mut Vec<Block>,
-    content: &str,
+    content: &SourceText<'_>,
     start: usize,
     end: usize,
     lang: Language,
@@ -626,7 +626,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_function_like_review_units(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
 
@@ -754,7 +754,7 @@ fn classify_review_chunk(chunk: &str) -> BlockKind {
     }
 }
 
-fn split_type_like_review_units(block: &Block) -> Result<Vec<Block>> {
+fn split_type_like_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
 
@@ -764,7 +764,7 @@ fn split_type_like_review_units(block: &Block) -> Result<Vec<Block>> {
     let root = tree.root_node();
 
     if find_named_descendant(root, "type_alias").is_some() {
-        return Ok(vec![block.clone()]);
+        return Ok(vec![block.block().clone()]);
     }
 
     let Some(type_node) = find_named_descendant_any(
@@ -789,7 +789,7 @@ fn split_type_like_review_units(block: &Block) -> Result<Vec<Block>> {
 }
 
 fn review_unit_blocks_from_spans(
-    block: &Block,
+    block: &ParentBlock<'_>,
     mut spans: Vec<SemanticSpan>,
 ) -> Result<Vec<Block>> {
     spans.sort_by_key(|span| (span.start_byte, span.end_byte));
@@ -857,12 +857,13 @@ fn create_file_block(
     text: &str,
     kind: BlockKind,
     tags: Vec<String>,
-    full_source: &str,
+    full_source: &SourceText<'_>,
     start_byte: usize,
     end_byte: usize,
     lang: Language,
 ) -> Result<Block> {
-    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))
+    let mut block = full_source
+        .block(kind, ByteSpan::new(start_byte, end_byte))
         .context("Dart top-level range must be a valid UTF-8 source slice")?;
     assert_eq!(
         block.content, text,
@@ -874,14 +875,15 @@ fn create_file_block(
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     text: &str,
     start_offset: usize,
     end_offset: usize,
     kind: BlockKind,
     tags: Vec<String>,
 ) -> Result<Block> {
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("Dart sub-split range must be a valid parent UTF-8 slice")?;
     block.tags = parent.tags.clone();
     assert_eq!(
@@ -908,7 +910,7 @@ mod tests {
             Block::from_file_range(source, BlockKind::Class, ByteSpan::new(0, source.len()))
                 .unwrap();
 
-        let blocks = split_type_like_review_units(&block).unwrap();
+        let blocks = split_type_like_review_units(&ParentBlock::new(&block)).unwrap();
         let rebuilt = blocks
             .iter()
             .map(|block| block.content.as_str())
@@ -931,7 +933,7 @@ set topLevelName(String value) {}\n";
         let tree = parser
             .parse(source, None)
             .context("failed to parse Dart test")?;
-        let blocks = split_top_level(tree.root_node(), source, Language::Dart)?;
+        let blocks = split_top_level(tree.root_node(), &SourceText::new(source), Language::Dart)?;
 
         let find_kind = |needle: &str| {
             blocks

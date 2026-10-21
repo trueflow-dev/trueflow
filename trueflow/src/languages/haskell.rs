@@ -3,7 +3,7 @@ use super::{
     default_code_sub_split, default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
-use crate::block::{Block, BlockKind, ByteSpan};
+use crate::block::{Block, BlockKind, ByteSpan, ParentBlock, SourceText};
 use crate::complexity;
 
 use crate::text_split::paragraph_break_regex;
@@ -47,7 +47,7 @@ fn parser_language(_content: &str) -> TsLanguage {
     tree_sitter_haskell::LANGUAGE.into()
 }
 
-fn split_top_level(root: Node<'_>, content: &str, lang: Language) -> Result<Vec<Block>> {
+fn split_top_level(root: Node<'_>, content: &SourceText<'_>, lang: Language) -> Result<Vec<Block>> {
     let mut items = collect_top_level_items(root, content);
     items.sort_by_key(|item| item.span.start_byte);
 
@@ -388,7 +388,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
     }
 }
 
-fn split_function_like_review_units(block: &Block) -> Result<Vec<Block>> {
+fn split_function_like_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse Haskell function-like block")?;
     let root = tree.root_node();
     let entries = collect_top_level_declaration_entries(root, &block.content);
@@ -440,7 +440,7 @@ fn split_function_like_review_units(block: &Block) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-fn split_declaration_group_children(block: &Block) -> Result<Vec<Block>> {
+fn split_declaration_group_children(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let tree = parse_tree(&block.content).context("Failed to parse Haskell declaration group")?;
     let root = tree.root_node();
     let Some(group_node) =
@@ -490,7 +490,7 @@ fn collect_top_level_declaration_entries<'tree>(
     entries
 }
 
-fn split_review_tail(parent: &Block, start_offset: usize) -> Result<Vec<Block>> {
+fn split_review_tail(parent: &ParentBlock<'_>, start_offset: usize) -> Result<Vec<Block>> {
     let rest = &parent.content[start_offset..];
     let re = paragraph_break_regex();
     let mut blocks = Vec::new();
@@ -535,7 +535,7 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Result<Vec<Block>> 
 }
 
 fn push_review_chunk(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     start: usize,
     end: usize,
     blocks: &mut Vec<Block>,
@@ -589,7 +589,7 @@ fn classify_review_chunk(chunk: &str) -> BlockKind {
 
 fn push_top_level_interstitial(
     blocks: &mut Vec<Block>,
-    content: &str,
+    content: &SourceText<'_>,
     start: usize,
     end: usize,
     lang: Language,
@@ -829,12 +829,13 @@ fn create_file_block(
     text: &str,
     kind: BlockKind,
     tags: Vec<String>,
-    full_source: &str,
+    full_source: &SourceText<'_>,
     start_byte: usize,
     end_byte: usize,
     lang: Language,
 ) -> Result<Block> {
-    let mut block = Block::from_file_range(full_source, kind, ByteSpan::new(start_byte, end_byte))
+    let mut block = full_source
+        .block(kind, ByteSpan::new(start_byte, end_byte))
         .context("Haskell top-level range must be a valid UTF-8 source slice")?;
     assert_eq!(
         block.content, text,
@@ -846,7 +847,7 @@ fn create_file_block(
 }
 
 fn create_sub_block(
-    parent: &Block,
+    parent: &ParentBlock<'_>,
     text: &str,
     start_offset: usize,
     kind: BlockKind,
@@ -855,7 +856,8 @@ fn create_sub_block(
     let end_offset = start_offset
         .checked_add(text.len())
         .context("Haskell sub-split end offset overflow")?;
-    let mut block = Block::from_parent_range(parent, kind, ByteSpan::new(start_offset, end_offset))
+    let mut block = parent
+        .child(kind, ByteSpan::new(start_offset, end_offset))
         .context("Haskell sub-split range must be a valid parent UTF-8 slice")?;
     block.tags = parent.tags.clone();
     assert_eq!(
@@ -884,7 +886,7 @@ mod tests {
         let tree = parse_tree(source).unwrap();
         let root = tree.root_node();
 
-        let blocks = split_top_level(root, source, Language::Haskell).unwrap();
+        let blocks = split_top_level(root, &SourceText::new(source), Language::Haskell).unwrap();
         let kinds = blocks.iter().map(|block| block.kind).collect::<Vec<_>>();
 
         assert!(kinds.contains(&BlockKind::Module));
@@ -927,7 +929,7 @@ mod tests {
         let tree = parse_tree(source).unwrap();
         let root = tree.root_node();
 
-        let blocks = split_top_level(root, source, Language::Haskell).unwrap();
+        let blocks = split_top_level(root, &SourceText::new(source), Language::Haskell).unwrap();
         let spec_block = blocks
             .iter()
             .find(|block| {
@@ -944,7 +946,7 @@ mod tests {
         let source = "module Demo where\n\ntype Rendered = String\n\nfoo :: Int -> Int\nfoo 0 = 0\nfoo n = n + 1\n";
         let tree = parse_tree(source).unwrap();
         let root = tree.root_node();
-        let blocks = split_top_level(root, source, Language::Haskell).unwrap();
+        let blocks = split_top_level(root, &SourceText::new(source), Language::Haskell).unwrap();
 
         assert!(
             blocks.iter().any(|block| {
@@ -982,7 +984,7 @@ mod tests {
         let tree = parse_tree(source).unwrap();
         let root = tree.root_node();
 
-        let blocks = split_top_level(root, source, Language::Haskell).unwrap();
+        let blocks = split_top_level(root, &SourceText::new(source), Language::Haskell).unwrap();
         let kinds = blocks.iter().map(|block| block.kind).collect::<Vec<_>>();
 
         assert!(kinds.contains(&BlockKind::Module));
@@ -999,7 +1001,7 @@ mod tests {
                 block.kind == BlockKind::Function && block.content.contains("render :: Text")
             })
             .unwrap_or_else(|| panic!("missing pragma-adjacent render block: {blocks:#?}"));
-        let split = split_function_like_review_units(render)
+        let split = split_function_like_review_units(&ParentBlock::new(render))
             .unwrap_or_else(|error| panic!("split render with pragma: {error}"));
         assert_eq!(
             split.first().map(|block| block.kind),
@@ -1012,7 +1014,7 @@ mod tests {
         let source = "module Demo where\n\nrender :: Int\nrender = 1\n";
         let tree = parse_tree(source).unwrap();
         let root = tree.root_node();
-        let blocks = split_top_level(root, source, Language::Haskell).unwrap();
+        let blocks = split_top_level(root, &SourceText::new(source), Language::Haskell).unwrap();
 
         let module_block = blocks
             .iter()
@@ -1036,7 +1038,7 @@ mod tests {
             Block::from_file_range(source, BlockKind::Function, ByteSpan::new(0, source.len()))
                 .unwrap();
 
-        let split = split_function_like_review_units(&block)
+        let split = split_function_like_review_units(&ParentBlock::new(&block))
             .unwrap_or_else(|error| panic!("split pragma-bearing function block: {error}"));
         assert_eq!(
             split.first().map(|block| block.kind),
@@ -1057,7 +1059,7 @@ mod tests {
             Block::from_file_range(source, BlockKind::Function, ByteSpan::new(0, source.len()))
                 .unwrap();
 
-        let split = split_function_like_review_units(&block)
+        let split = split_function_like_review_units(&ParentBlock::new(&block))
             .unwrap_or_else(|error| panic!("split no-signature function block: {error}"));
         assert_eq!(
             split.first().map(|block| block.kind),
