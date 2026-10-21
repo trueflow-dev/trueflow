@@ -461,6 +461,24 @@ pub fn resolve_commit_id_from_workdir(revision: &str) -> Result<CommitId> {
     resolve_commit_id_in_repo(&repo, revision)
 }
 
+/// Git's `gpg.format`: which signing backend `user.signingkey` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitSigningFormat {
+    OpenPgp,
+    /// `ssh`, `x509`, or a value Git itself rejects; never an OpenPGP key.
+    NotOpenPgp,
+}
+
+impl GitSigningFormat {
+    fn from_config_value(value: Option<&gix::bstr::BStr>) -> Self {
+        match value {
+            None => Self::OpenPgp,
+            Some(format) if format == "openpgp" => Self::OpenPgp,
+            Some(_) => Self::NotOpenPgp,
+        }
+    }
+}
+
 pub fn git_config_from_workdir() -> Result<GitConfig> {
     let repo = repo_from_workdir()?;
     let config = repo.config_snapshot();
@@ -468,9 +486,15 @@ pub fn git_config_from_workdir() -> Result<GitConfig> {
         || "unknown@localhost".to_string(),
         |value| value.to_string(),
     );
-    let signing_key = config
-        .string("user.signingkey")
-        .map(|value| value.to_string());
+    // Trueflow signs with `gpg`, so only OpenPGP signing keys apply; SSH and
+    // X.509 signing configs record unsigned reviews.
+    let signing_key =
+        match GitSigningFormat::from_config_value(config.string("gpg.format").as_deref()) {
+            GitSigningFormat::OpenPgp => config
+                .string("user.signingkey")
+                .map(|value| value.to_string()),
+            GitSigningFormat::NotOpenPgp => None,
+        };
     Ok(GitConfig { email, signing_key })
 }
 
@@ -2236,6 +2260,30 @@ mod tests {
             block_change_kind_in_language_diff(&block, &[hunk], Language::Python),
             BlockDiffChangeKind::OnlyNonreviewableChurn,
             "trailing whitespace stays churn even where indentation is significant"
+        );
+    }
+
+    fn signing_key_with_gpg_format(gpg_format: &str) -> Option<String> {
+        use crate::test_git::{CurrentDirGuard, run_git, temp_git_repo};
+
+        let repo_path = temp_git_repo("git_config_signing_format");
+        run_git(&repo_path, &["config", "user.signingkey", "/tmp/signing.pub"]);
+        run_git(&repo_path, &["config", "gpg.format", gpg_format]);
+        let _cwd = CurrentDirGuard::push(&repo_path);
+        git_config_from_workdir().unwrap().signing_key
+    }
+
+    #[test]
+    fn git_config_ignores_ssh_and_x509_signing_keys() {
+        assert_eq!(signing_key_with_gpg_format("ssh"), None);
+        assert_eq!(signing_key_with_gpg_format("x509"), None);
+    }
+
+    #[test]
+    fn git_config_uses_openpgp_signing_keys() {
+        assert_eq!(
+            signing_key_with_gpg_format("openpgp").as_deref(),
+            Some("/tmp/signing.pub")
         );
     }
 }
