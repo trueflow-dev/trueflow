@@ -32,7 +32,7 @@ use crate::declaration::review::{DeclarationReviewDiffBatch, DeclarationReviewQu
 use crate::focus::ReviewDuration;
 use crate::github::{
     GhGitHubClient, PullRequestCommit, PullRequestMetadata, PullRequestRef,
-    prepare_pull_request_review,
+    prepare_pull_request_review, pull_request_review_commits,
 };
 use crate::hashing::{TreeHash, hash_str};
 use crate::path_utils;
@@ -1996,9 +1996,7 @@ fn run_pull_request_review(
 ) -> Result<()> {
     let repo_root = vcs::git_root_from_workdir()?
         .ok_or_else(|| anyhow!("git repository required for pull request review targets"))?;
-    let client = GhGitHubClient;
-    let prepared = prepare_pull_request_review(&repo_root, pull_request, &client)?;
-    let pending_launches = build_pull_request_cli_requests(&prepared.metadata)?
+    let pending_launches = pull_request_cli_requests(&repo_root, pull_request)?
         .into_iter()
         .map(|request| QueuedLaunch {
             request,
@@ -2016,8 +2014,20 @@ fn run_pull_request_review(
     )
 }
 
+/// Fetches the pull request and queues its reviewable commits.
+fn pull_request_cli_requests(
+    repo_root: &Path,
+    pull_request: &PullRequestRef,
+) -> Result<VecDeque<CliReviewRequest>> {
+    let prepared = prepare_pull_request_review(repo_root, pull_request, &GhGitHubClient)?;
+    let commits = pull_request_review_commits(repo_root, &prepared.metadata)?;
+    build_pull_request_cli_requests(&prepared.metadata, &commits)
+}
+
+/// Queues `commits` (from [`pull_request_review_commits`]) oldest first.
 fn build_pull_request_cli_requests(
     metadata: &PullRequestMetadata,
+    commits: &[PullRequestCommit],
 ) -> Result<VecDeque<CliReviewRequest>> {
     if metadata.commits.is_empty() {
         return Err(anyhow!(
@@ -2025,18 +2035,27 @@ fn build_pull_request_cli_requests(
             metadata.pr.number
         ));
     }
+    if commits.is_empty() {
+        return Err(anyhow!(
+            "Pull request {} only merges {} into its branch; there are no commits to review",
+            metadata.pr.number,
+            metadata.base_ref
+        ));
+    }
 
-    metadata
-        .commits
+    commits
         .iter()
         .enumerate()
-        .map(|(index, commit)| pull_request_cli_review_request(metadata, index, commit))
+        .map(|(index, commit)| {
+            pull_request_cli_review_request(metadata, index, commits.len(), commit)
+        })
         .collect()
 }
 
 fn pull_request_cli_review_request(
     metadata: &PullRequestMetadata,
     index: usize,
+    commit_count: usize,
     commit: &PullRequestCommit,
 ) -> Result<CliReviewRequest> {
     let revision = RevisionExpr::new(commit.sha.as_str())?;
@@ -2045,7 +2064,7 @@ fn pull_request_cli_review_request(
         id: revision.as_str().to_string(),
         summary: commit.summary.clone(),
     };
-    let scope_label = pull_request_scope_label(metadata, index, commit);
+    let scope_label = pull_request_scope_label(metadata, index, commit_count, commit);
     Ok(CliReviewRequest {
         request,
         scope,
@@ -2057,6 +2076,7 @@ fn pull_request_cli_review_request(
 fn pull_request_scope_label(
     metadata: &PullRequestMetadata,
     index: usize,
+    commit_count: usize,
     commit: &PullRequestCommit,
 ) -> String {
     let pr_title = truncate_scope_text(&metadata.title, 28);
@@ -2067,7 +2087,7 @@ fn pull_request_scope_label(
             "PR #{} [{}/{}] {}",
             metadata.pr.number,
             index + 1,
-            metadata.commits.len(),
+            commit_count,
             short_sha
         )
     } else if commit_summary.is_empty() {
@@ -2076,7 +2096,7 @@ fn pull_request_scope_label(
             metadata.pr.number,
             pr_title,
             index + 1,
-            metadata.commits.len(),
+            commit_count,
             short_sha
         )
     } else if pr_title.is_empty() {
@@ -2084,7 +2104,7 @@ fn pull_request_scope_label(
             "PR #{} [{}/{}] {} {}",
             metadata.pr.number,
             index + 1,
-            metadata.commits.len(),
+            commit_count,
             short_sha,
             commit_summary
         )
@@ -2094,7 +2114,7 @@ fn pull_request_scope_label(
             metadata.pr.number,
             pr_title,
             index + 1,
-            metadata.commits.len(),
+            commit_count,
             short_sha,
             commit_summary
         )
@@ -12697,7 +12717,7 @@ mod diff_scope_tests {
             ],
         };
 
-        let requests = build_pull_request_cli_requests(&metadata)
+        let requests = build_pull_request_cli_requests(&metadata, &metadata.commits)
             .unwrap_or_else(|error| panic!("expected pull request review sequence: {error}"));
         let requests = requests.into_iter().collect::<Vec<_>>();
 
@@ -12718,6 +12738,13 @@ mod diff_scope_tests {
         assert!(requests[0].scope_label.contains("[1/2]"));
         assert!(requests[1].scope_label.contains("[2/2]"));
         assert!(requests[1].scope_label.contains("Fetch PR refs"));
+
+        let reviewed = build_pull_request_cli_requests(&metadata, &metadata.commits[1..])
+            .unwrap_or_else(|error| panic!("expected filtered review sequence: {error}"));
+        assert_eq!(reviewed.len(), 1);
+        assert!(reviewed[0].scope_label.contains("[1/1]"));
+        let error = build_pull_request_cli_requests(&metadata, &[]).unwrap_err();
+        assert!(error.to_string().contains("only merges main"), "{error}");
     }
 
     #[test]

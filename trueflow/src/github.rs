@@ -973,6 +973,59 @@ fn validate_fetched_pull_request(repo_root: &Path, metadata: &PullRequestMetadat
     Ok(())
 }
 
+/// The PR commits to review one by one, oldest first.
+///
+/// Each commit is reviewed as its diff against its first parent. A merge whose
+/// other parents are all reachable from the base tip (for example GitHub's
+/// "Update branch") would replay the base branch's own changes, which GitHub's
+/// PR diff excludes, so it is left out. Conflict resolutions in such a merge
+/// are left out with it; merges of branches outside the base stay queued.
+pub fn pull_request_review_commits(
+    repo_root: &Path,
+    metadata: &PullRequestMetadata,
+) -> Result<Vec<PullRequestCommit>> {
+    let repo = gix::discover(repo_root)
+        .with_context(|| format!("git repository required at {}", repo_root.display()))?;
+    let base = resolve_commit_object_id(&repo, &metadata.base_sha)?;
+    let mut commits = Vec::with_capacity(metadata.commits.len());
+    for commit in &metadata.commits {
+        if !merges_only_base_branch(&repo, &commit.sha, base)? {
+            commits.push(commit.clone());
+        }
+    }
+    Ok(commits)
+}
+
+fn merges_only_base_branch(
+    repo: &gix::Repository,
+    commit: &CommitId,
+    base: gix::ObjectId,
+) -> Result<bool> {
+    let commit = repo.find_commit(resolve_commit_object_id(repo, commit)?)?;
+    let mut merged_parents = commit.parent_ids().skip(1).peekable();
+    if merged_parents.peek().is_none() {
+        return Ok(false);
+    }
+    for parent in merged_parents {
+        let parent = parent.detach();
+        let reachable_from_base = match repo.merge_base(parent, base) {
+            Ok(merge_base) => merge_base.detach() == parent,
+            Err(gix::repository::merge_base::Error::NotFound { .. }) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !reachable_from_base {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn resolve_commit_object_id(repo: &gix::Repository, commit: &CommitId) -> Result<gix::ObjectId> {
+    repo.rev_parse_single(commit.as_str())
+        .map(|id| id.detach())
+        .with_context(|| format!("expected PR commit {commit} to be available locally"))
+}
+
 fn run_gh_api(host: &str, endpoint: &str) -> Result<String> {
     run_gh_api_with_args(host, ["api", endpoint])
 }
@@ -3224,5 +3277,65 @@ mod tests {
             run_git_stdout(&local_repo, &["rev-parse", head_sha.as_str()]).trim(),
             head_sha
         );
+    }
+
+    #[test]
+    fn pull_request_review_commits_skip_merges_from_base_branch() {
+        let repo_root = temp_git_repo("pr_review_commits_base_merge");
+        let head = || CommitId::new(run_git_stdout(&repo_root, &["rev-parse", "HEAD"]).trim());
+        let commit_file = |path: &str, contents: &str, message: &str| {
+            fs::write(repo_root.join(path), contents).unwrap();
+            run_git(&repo_root, &["add", path]);
+            run_git(&repo_root, &["commit", "-m", message]);
+            head().unwrap()
+        };
+        commit_file("a.rs", "a0\n", "Initial main");
+        run_git(&repo_root, &["branch", "-M", "main"]);
+
+        run_git(&repo_root, &["switch", "-c", "side"]);
+        let side = commit_file("c.rs", "c1\n", "Side change");
+        run_git(&repo_root, &["switch", "main"]);
+        run_git(&repo_root, &["switch", "-c", "feature"]);
+        let pr_change = commit_file("b.rs", "b1\n", "PR change");
+        run_git(&repo_root, &["switch", "main"]);
+        let base = commit_file("a.rs", "a1\n", "Main change");
+
+        run_git(&repo_root, &["switch", "feature"]);
+        run_git(&repo_root, &["merge", "--no-ff", "-m", "Update branch", "main"]);
+        let update_branch = head().unwrap();
+        run_git(&repo_root, &["merge", "--no-ff", "-m", "Merge side", "side"]);
+        let side_merge = head().unwrap();
+
+        let commit = |sha: &CommitId, summary: &str| PullRequestCommit {
+            sha: sha.clone(),
+            summary: summary.to_string(),
+        };
+        let metadata = PullRequestMetadata {
+            pr: ResolvedPullRequestRef {
+                host: "github.com".to_string(),
+                owner: "jmqd".to_string(),
+                repo: "trueflow".to_string(),
+                number: 11,
+            },
+            title: "Base merge".to_string(),
+            base_ref: "main".to_string(),
+            base_sha: base,
+            head_ref: "feature".to_string(),
+            head_sha: side_merge.clone(),
+            commits: vec![
+                commit(&pr_change, "PR change"),
+                commit(&side, "Side change"),
+                commit(&update_branch, "Update branch"),
+                commit(&side_merge, "Merge side"),
+            ],
+        };
+
+        let reviewed = super::pull_request_review_commits(&repo_root, &metadata)
+            .unwrap()
+            .into_iter()
+            .map(|commit| commit.sha)
+            .collect::<Vec<_>>();
+
+        assert_eq!(reviewed, vec![pr_change, side, side_merge]);
     }
 }

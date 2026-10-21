@@ -10,13 +10,12 @@ use ratatui::widgets::{Block as UiBlock, Borders, Paragraph, Wrap};
 use crate::commands::mark;
 use crate::commands::review::{ReviewRequest, ReviewTarget, resolve_review_request};
 use crate::config::{BlockFilters, TrueflowConfig};
-use crate::github::{GhGitHubClient, prepare_pull_request_review};
 use crate::store::{FileStore, ReviewStore};
 use crate::vcs;
 
 use super::super::{
-    CliReviewRequest, TerminalSession, TuiRunRequest, build_pull_request_cli_requests,
-    cli_review_request, execute_mark_for_tui, resolve_cli_review_request,
+    CliReviewRequest, TerminalSession, TuiRunRequest, cli_review_request, execute_mark_for_tui,
+    pull_request_cli_requests, resolve_cli_review_request,
     resolve_pull_request_target_for_tui,
 };
 use super::relationship_bridge::ProductionRelationshipCoordinator;
@@ -104,8 +103,7 @@ fn declaration_requests(
     since: Option<&str>,
 ) -> Result<VecDeque<CliReviewRequest>> {
     if let Some(pull_request) = resolve_pull_request_target_for_tui(all, target, since)? {
-        let prepared = prepare_pull_request_review(repo_root, &pull_request, &GhGitHubClient)?;
-        return build_pull_request_cli_requests(&prepared.metadata);
+        return pull_request_cli_requests(repo_root, &pull_request);
     }
 
     let request = cli_review_request(all, target, since, &[], &[])?

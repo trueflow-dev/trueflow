@@ -655,6 +655,11 @@ pull request metadata and reviews the PR diff without checking out the branch or
 switching the user worktree. PR targets can also use `pr:owner/repo/11` or a
 GitHub pull request URL.
 
+The TUI queues each PR commit as its diff against its first parent. Merge
+commits that only bring the base branch into the PR (such as GitHub's "Update
+branch") are skipped, because their diff is the base branch's own changes;
+conflict resolutions in those merges are skipped with them.
+
 Feedback posting uses a separate flag because it writes to GitHub:
 
 ```sh
