@@ -259,7 +259,9 @@ fn collect_ns_clause_spans(form: Node<'_>, source: &str) -> Vec<SemanticSpan> {
     let values = value_children(form);
     let start = skip_optional_doc_and_attr_map(&values, 2);
 
-    values[start..]
+    values
+        .get(start..)
+        .unwrap_or_default()
         .iter()
         .copied()
         .filter_map(|value| {
@@ -291,7 +293,9 @@ fn collect_protocol_method_spans(form: Node<'_>, _source: &str) -> Vec<SemanticS
     let values = value_children(form);
     let start = skip_optional_doc_and_attr_map(&values, 2);
 
-    values[start..]
+    values
+        .get(start..)
+        .unwrap_or_default()
         .iter()
         .copied()
         .filter_map(|value| {
@@ -612,6 +616,22 @@ mod tests {
 
         assert!(import.content.contains(":require"));
         assert!(!import.content.contains(":gen-class"));
+    }
+
+    #[test]
+    fn test_split_tolerates_bare_ns_and_defprotocol_forms() {
+        let source = "(ns)\n(in-ns)\n(defprotocol)\n";
+
+        let result = crate::block_splitter::split(source, Language::Clojure);
+
+        assert_eq!(
+            result
+                .blocks
+                .iter()
+                .map(|block| block.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["(ns)", "(in-ns)", "(defprotocol)"]
+        );
     }
 
     #[test]
