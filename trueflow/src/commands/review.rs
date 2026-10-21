@@ -1303,6 +1303,7 @@ fn run_focused_pass(
     let scope = PassScope {
         tree: &review.tree,
         pending: &pending,
+        commented: &review.commented_block_nodes,
         diff_block_sides: &review.diff_block_sides,
         block_change_kinds: &review.block_change_kinds,
     };
@@ -1334,7 +1335,7 @@ fn run_focused_pass(
         source: plan.source,
         budget_seconds: plan.budget.seconds(),
         estimated_seconds: plan.estimated_seconds(),
-        remainder: plan.remainder,
+        remainder: plan.remainder(pending.len()),
         cards,
     };
     if json {

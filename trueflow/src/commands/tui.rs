@@ -954,6 +954,8 @@ enum AppExit {
     ReviewSomethingElse,
     /// Reload the same scope and walk every pending block after a focused pass.
     ContinueFullReview,
+    /// Reload the same scope and pick the next focused pass from what is left.
+    NextFocusedPass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -961,6 +963,7 @@ enum RecapAction {
     Exit,
     ReviewSomethingElse,
     ContinueFullReview,
+    NextFocusedPass,
 }
 
 #[derive(Debug, Clone)]
@@ -1963,6 +1966,10 @@ fn run_tui_review_loop(
                     pass: ReviewPass::Full,
                     ..launch
                 }),
+                AppExit::NextFocusedPass => pending_launches.push_front(QueuedLaunch {
+                    pass: ReviewPass::Focused,
+                    ..launch
+                }),
             }
         }
     })();
@@ -2519,6 +2526,7 @@ fn pass_scope(state: &AppState) -> PassScope<'_> {
     PassScope {
         tree: &state.navigator.tree,
         pending: &state.reviewable_nodes,
+        commented: &state.commented_nodes,
         diff_block_sides: &state.diff_block_sides,
         block_change_kinds: &state.block_change_kinds,
     }
@@ -2558,22 +2566,23 @@ fn start_focused_pass(state: &mut AppState, plan: &PassPlan<TreeNodeId>) -> Resu
         return Ok(());
     }
     let title = state.scope_label.clone();
+    let pending_blocks = state.reviewable_nodes.len();
     configure_onboarding(
         state,
         title,
-        focused_pass_summary(plan),
+        focused_pass_summary(plan, pending_blocks),
         plan.cards.iter().map(focused_pass_card).collect(),
         CardQueuePurpose::FocusedPass {
-            remainder: plan.remainder,
+            remainder: plan.remainder(pending_blocks),
         },
     )
 }
 
-fn focused_pass_summary(plan: &PassPlan<TreeNodeId>) -> String {
+fn focused_pass_summary(plan: &PassPlan<TreeNodeId>, pending_blocks: usize) -> String {
     format!(
         "{} of {} pending blocks · ~{} of {} budget · chosen by {}",
         plan.cards.len(),
-        plan.cards.len() + plan.remainder,
+        pending_blocks,
         format_reading_estimate(plan.estimated_seconds()),
         format_reading_estimate(plan.budget.seconds()),
         plan.source.label(),
@@ -3652,6 +3661,7 @@ fn run_app(
                                 RecapAction::Exit => AppExit::Quit,
                                 RecapAction::ReviewSomethingElse => AppExit::ReviewSomethingElse,
                                 RecapAction::ContinueFullReview => AppExit::ContinueFullReview,
+                                RecapAction::NextFocusedPass => AppExit::NextFocusedPass,
                             });
                         }
                         needs_render = true;
@@ -4805,7 +4815,8 @@ fn recap_done_action_text(keybinds: &TuiKeybindsConfig) -> String {
     format_key_action(recap_done_key(keybinds), "choose scope")
 }
 
-/// Recap keys for the current session; a focused pass with a remainder adds Enter.
+/// Recap keys for the current session; a focused pass with a remainder adds
+/// Enter (continue the full review) and the focused-pass key (another pass).
 fn recap_action_for_state(state: &AppState, key_code: KeyCode) -> Option<RecapAction> {
     let continuable = state
         .onboarding
@@ -4814,6 +4825,9 @@ fn recap_action_for_state(state: &AppState, key_code: KeyCode) -> Option<RecapAc
         .is_some();
     match key_code {
         KeyCode::Enter if continuable => Some(RecapAction::ContinueFullReview),
+        KeyCode::Char(key) if continuable && key == state.keybinds.focused_pass => {
+            Some(RecapAction::NextFocusedPass)
+        }
         _ => recap_action_for_key_code(&state.keybinds, key_code),
     }
 }
@@ -7661,7 +7675,10 @@ fn focused_pass_recap_hint_text(keybinds: &TuiKeybindsConfig, remainder: Option<
         keybinds.quit
     );
     match remainder {
-        Some(_) => format!("Press [Enter] continue full review  {rest}"),
+        Some(_) => format!(
+            "Press [Enter] continue full review  [{}] next focused pass  {rest}",
+            keybinds.focused_pass
+        ),
         None => format!("Press {rest}"),
     }
 }
@@ -10403,6 +10420,44 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn finished_focused_pass_offers_another_pass_over_the_remainder() {
+        let (mut state, _file, ids) = focused_pass_test_state(24);
+        for selected in [ids[0], ids[1]] {
+            let action =
+                PendingAction::from_node(&state.navigator.tree, selected, Verdict::Approved);
+            execute_action_with(&mut state, action, |_| Ok(())).unwrap();
+        }
+        assert!(is_recap_mode(&state));
+
+        let screen = render_screen(&mut state, 120, 30);
+        assert!(screen.contains("[f] next focused pass"), "{screen}");
+        assert_eq!(
+            recap_action_for_state(&state, KeyCode::Char('f')),
+            Some(RecapAction::NextFocusedPass)
+        );
+    }
+
+    #[test]
+    fn focused_pass_skips_blocks_already_commented_in_this_scope() {
+        // A pending comment means the reviewer already read the block and
+        // nothing changed since; a budgeted pass should spend time elsewhere.
+        let (mut state, _file, ids) = build_state_with_file_block_count(3);
+        state.commented_nodes.insert(ids[0]);
+        let budget = crate::focus::ReviewDuration::from_seconds(300).unwrap();
+
+        let plan = heuristic_pass_for_state(&state, budget);
+
+        let picked = plan.cards.iter().map(|card| card.id).collect::<Vec<_>>();
+        assert_eq!(picked, vec![ids[1], ids[2]]);
+        start_focused_pass(&mut state, &plan).unwrap();
+        assert_eq!(
+            state.onboarding.as_ref().unwrap().purpose,
+            CardQueuePurpose::FocusedPass { remainder: 1 },
+            "the commented block stays pending for a full review"
+        );
+    }
+
+    #[test]
     fn focused_pass_covering_the_whole_scope_does_not_offer_continuation() {
         let (mut state, _file, ids) = focused_pass_test_state(300);
         for selected in [ids[0], ids[1], ids[2]] {
@@ -10414,8 +10469,10 @@ mod diff_scope_tests {
         let recap = recap_summary_lines(&state).join("\n");
         assert!(recap.contains("Every pending block in this scope was part of the pass."));
         assert_eq!(recap_action_for_state(&state, KeyCode::Enter), None);
+        assert_eq!(recap_action_for_state(&state, KeyCode::Char('f')), None);
         let screen = render_screen(&mut state, 100, 30);
         assert!(!screen.contains("continue full review"), "{screen}");
+        assert!(!screen.contains("next focused pass"), "{screen}");
     }
 
     #[test]
@@ -10443,7 +10500,7 @@ mod diff_scope_tests {
             pass.cards.iter().map(|card| card.id).collect::<Vec<_>>(),
             vec![ids[2]]
         );
-        assert_eq!(pass.remainder, 2);
+        assert_eq!(pass.remainder(state.reviewable_nodes.len()), 2);
 
         start_focused_pass(&mut state, &pass).unwrap();
         let queue = state.onboarding.as_ref().unwrap();

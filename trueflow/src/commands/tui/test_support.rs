@@ -150,6 +150,7 @@ pub enum ScriptedSessionAction {
     Exit,
     ReviewSomethingElse,
     ContinueFullReview,
+    NextFocusedPass,
 }
 
 impl From<RecapAction> for ScriptedSessionAction {
@@ -158,6 +159,7 @@ impl From<RecapAction> for ScriptedSessionAction {
             RecapAction::Exit => Self::Exit,
             RecapAction::ReviewSomethingElse => Self::ReviewSomethingElse,
             RecapAction::ContinueFullReview => Self::ContinueFullReview,
+            RecapAction::NextFocusedPass => Self::NextFocusedPass,
         }
     }
 }

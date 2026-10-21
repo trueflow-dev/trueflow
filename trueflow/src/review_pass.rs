@@ -123,6 +123,8 @@ pub struct PassCandidate<'a, Id> {
 pub struct PassScope<'a> {
     pub tree: &'a Tree,
     pub pending: &'a HashSet<TreeNodeId>,
+    /// Pending blocks whose latest verdict is a comment on unchanged content.
+    pub commented: &'a HashSet<TreeNodeId>,
     pub diff_block_sides: &'a HashMap<TreeNodeId, DiffBlockSides>,
     pub block_change_kinds: &'a HashMap<TreeNodeId, BlockChangeKind>,
 }
@@ -130,10 +132,14 @@ pub struct PassScope<'a> {
 impl<'a> PassScope<'a> {
     /// Pending blocks in canonical order. Containers with pending descendants
     /// are excluded because their approvals would cover blocks outside a pass.
+    /// Commented blocks are excluded because the reviewer already read them
+    /// and their content has not changed since (a change unbinds the comment);
+    /// they stay pending for a full review.
     pub fn candidates(self) -> Vec<PassCandidate<'a, TreeNodeId>> {
         let canonical = ReviewOrder::from_tree(self.tree, self.pending);
         canonical
             .iter_node_ids()
+            .filter(|node_id| !self.commented.contains(node_id))
             .filter(|&node_id| !self.has_pending_descendant(node_id))
             .filter_map(|node_id| {
                 let node = self.tree.node(node_id);
@@ -276,13 +282,18 @@ pub struct PassPlan<Id> {
     pub source: PassSource,
     pub budget: ReviewDuration,
     pub cards: Vec<PassCard<Id>>,
-    /// Pending candidates left for a full review of the same scope.
-    pub remainder: usize,
 }
 
 impl<Id> PassPlan<Id> {
     pub fn estimated_seconds(&self) -> usize {
         self.cards.iter().map(|card| card.estimated_seconds).sum()
+    }
+
+    /// Pending blocks a full review of the same scope still shows once every
+    /// card is reviewed. `pending_blocks` counts every pending block, including
+    /// ones that cannot be cards (commented blocks, covering containers).
+    pub fn remainder(&self, pending_blocks: usize) -> usize {
+        pending_blocks.saturating_sub(self.cards.len())
     }
 }
 
@@ -307,7 +318,6 @@ pub fn heuristic_pass<Id: Copy>(
             source: PassSource::Heuristic,
             budget,
             cards: Vec::new(),
-            remainder: 0,
         };
     };
     let mut ranked = candidates
@@ -341,7 +351,6 @@ pub fn heuristic_pass<Id: Copy>(
     PassPlan {
         source: PassSource::Heuristic,
         budget,
-        remainder: candidates.len() - cards.len(),
         cards,
     }
 }
@@ -406,7 +415,6 @@ pub fn ai_pass<Id: Copy + Eq + Hash>(
     PassPlan {
         source: PassSource::AiPlan,
         budget,
-        remainder: candidates.len() - cards.len(),
         cards,
     }
 }
@@ -618,7 +626,7 @@ mod tests {
 
         assert_eq!(plan.source, PassSource::Heuristic);
         assert_eq!(ids(&plan), vec![1, 2, 0, 3]);
-        assert_eq!(plan.remainder, 0);
+        assert_eq!(plan.remainder(candidates.len()), 0);
         assert_eq!(
             plan.cards[0].why,
             PassWhy::Signals(vec![
@@ -652,7 +660,7 @@ mod tests {
 
         assert_eq!(ids(&plan), vec![0, 1]);
         assert_eq!(plan.estimated_seconds(), 230);
-        assert_eq!(plan.remainder, 2);
+        assert_eq!(plan.remainder(candidates.len()), 2);
         assert!(plan.estimated_seconds() <= plan.budget.seconds());
     }
 
@@ -667,7 +675,7 @@ mod tests {
         let plan = heuristic_pass(&candidates, budget(60));
 
         assert_eq!(ids(&plan), vec![1]);
-        assert_eq!(plan.remainder, 1);
+        assert_eq!(plan.remainder(candidates.len()), 1);
     }
 
     #[test]
@@ -706,7 +714,7 @@ mod tests {
         let plan = heuristic_pass(&candidates, budget(150));
 
         assert_eq!(ids(&plan), vec![1, 2, 3]);
-        assert_eq!(plan.remainder, 1);
+        assert_eq!(plan.remainder(candidates.len()), 1);
     }
 
     #[test]
@@ -722,7 +730,7 @@ mod tests {
 
         assert_eq!(ids(&plan), vec![1]);
         assert!(plan.estimated_seconds() > plan.budget.seconds());
-        assert_eq!(plan.remainder, 1);
+        assert_eq!(plan.remainder(candidates.len()), 1);
     }
 
     #[test]
@@ -738,7 +746,7 @@ mod tests {
 
         let plan = heuristic_pass(&candidates, budget(300));
         assert_eq!(ids(&plan), vec![0]);
-        assert_eq!(plan.remainder, 3);
+        assert_eq!(plan.remainder(candidates.len()), 3);
 
         let without_code = [test, prose, lock];
         assert_eq!(ids(&heuristic_pass(&without_code, budget(300))), vec![1]);
@@ -771,7 +779,6 @@ mod tests {
     fn heuristic_pass_of_nothing_is_empty() {
         let plan = heuristic_pass::<usize>(&[], budget(300));
         assert!(plan.cards.is_empty());
-        assert_eq!(plan.remainder, 0);
     }
 
     #[test]
@@ -798,7 +805,7 @@ mod tests {
 
         assert_eq!(plan.source, PassSource::AiPlan);
         assert_eq!(ids(&plan), vec![2, 0]);
-        assert_eq!(plan.remainder, 2);
+        assert_eq!(plan.remainder(candidates.len()), 2);
         assert_eq!(
             plan.cards[0].why,
             PassWhy::AiPlan {
@@ -822,7 +829,7 @@ mod tests {
             budget(300),
         );
         assert!(plan.cards.is_empty());
-        assert_eq!(plan.remainder, 1);
+        assert_eq!(plan.remainder(candidates.len()), 1);
     }
 
     #[test]

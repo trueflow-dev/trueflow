@@ -522,10 +522,12 @@ trueflow review --target main --pass focused --json   # same heuristic subset fo
   pass; nothing is substituted silently.
 - **Heuristics.** Ranked by explicit signal weight per estimated reading second:
   data shapes, public interfaces, trust boundaries, writes, concurrency,
-  complexity, and change size. Code outranks tests, which outrank prose, which
-  outranks generated or vendored files (including lock files); a pass draws
-  only from the most consequential class present and is never padded with the
-  others. Lexical signals are observations, not findings.
+  complexity, and change size. Ranking charges every card at least 30 seconds,
+  so trivial one-liners do not crowd out richer short blocks. Code outranks
+  tests, which outrank prose, which outranks generated or vendored files
+  (including lock files); a pass draws only from the most consequential class
+  present and is never padded with the others. Lexical signals are
+  observations, not findings.
 - **Budget.** Estimates use the onboarding formula: ten seconds per card plus
   two per line read. A changed block costs its changed lines plus three context
   lines on each side, not the whole block. If nothing fits, the top-ranked
@@ -540,8 +542,12 @@ trueflow review --target main --pass focused --json   # same heuristic subset fo
   `fingerprint`, `kind`, the `review --json` line range, `estimated_seconds`,
   `why`, and `content`). It never calls an LLM or records a verdict.
 - **Remainder.** Unselected blocks stay pending. The recap reports how many
-  remain; Enter reloads the same scope as a full review, `d` reviews something
-  else (the scope selector, or the next commit of a PR), and `q` quits.
+  remain; Enter reloads the same scope as a full review, `f` picks the next
+  focused pass from what is left, `d` reviews something else (the scope
+  selector, or the next commit of a PR), and `q` quits.
+- **Comments.** A block whose latest verdict is a comment on its current
+  content is never a card: you already read it and it has not changed. It stays
+  pending for a full review and counts toward the remainder.
 - **Containers.** With `--only` kinds such as `impl` or `class`, a container
   whose children are filtered out is a card like any other block; a container
   with pending children never is, because its approval would cover them.

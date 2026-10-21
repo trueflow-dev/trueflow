@@ -72,6 +72,43 @@ fn review_focused_pass_reports_a_budgeted_explained_subset() -> Result<()> {
 }
 
 #[test]
+fn review_focused_pass_skips_blocks_the_reviewer_already_commented() -> Result<()> {
+    let (repo, target) = changed_repo("review_focused_pass_commented")?;
+    let args = [
+        "review", "--target", &target, "--pass", "focused", "--budget", "40s", "--json",
+    ];
+    let first: Value = serde_json::from_str(&repo.run(&args)?).context("first pass JSON")?;
+    let commented = first["cards"][0]["fingerprint"]
+        .as_str()
+        .context("fingerprint")?
+        .to_string();
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &commented,
+        "--verdict",
+        "comment",
+        "--note",
+        "Why shell out here?",
+    ])?;
+
+    let pass: Value = serde_json::from_str(&repo.run(&args)?).context("second pass JSON")?;
+    let cards = pass["cards"].as_array().context("cards")?;
+    assert!(
+        cards
+            .iter()
+            .all(|card| card["fingerprint"] != commented.as_str()),
+        "an unchanged commented block must not take pass time: {pass}"
+    );
+    assert_eq!(cards.len(), 2);
+    assert_eq!(
+        pass["remainder"], 5,
+        "the commented block stays pending for a full review: {pass}"
+    );
+    Ok(())
+}
+
+#[test]
 fn review_full_pass_output_is_unchanged_and_budget_needs_a_focused_pass() -> Result<()> {
     let (repo, target) = changed_repo("review_full_pass_json")?;
 

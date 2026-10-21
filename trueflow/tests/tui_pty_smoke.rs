@@ -980,12 +980,11 @@ fn pty_focus_preserves_selected_order_evidence_approvals_and_resume_scope() -> R
     Ok(())
 }
 
-#[test]
-fn pty_focused_pass_reviews_a_budgeted_subset_then_continues_the_full_review() -> Result<()> {
-    if cfg!(windows) {
-        return Ok(());
-    }
-    let repo = TestRepo::new("focused_pass_pty")?;
+/// A commit that edits six trivial helpers and adds one shell-out. With a 40s
+/// budget a heuristic pass holds two cards: run_git (16s) leads, and each
+/// one-line helper change costs 18s.
+fn focused_pass_repo(name: &str) -> Result<(TestRepo, String)> {
+    let repo = TestRepo::new(name)?;
     repo.write(
         "trueflow.toml",
         "[scan]\nuse_cache = false\nwrite_cache = false\n[ai]\nmode = \"off\"\n",
@@ -1006,9 +1005,15 @@ fn pty_focused_pass_reviews_a_budgeted_subset_then_continues_the_full_review() -
     )?;
     repo.commit_all("change helpers and shell out")?;
     let revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
-    let target = format!("rev:{}", revision.trim());
+    Ok((repo, format!("rev:{}", revision.trim())))
+}
 
-    // run_git costs 16s and each one-line helper change 18s, so 40s holds two cards.
+#[test]
+fn pty_focused_pass_reviews_a_budgeted_subset_then_continues_the_full_review() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let (repo, target) = focused_pass_repo("focused_pass_pty")?;
     let mut session = FocusPty::open_with(
         &repo,
         &[
@@ -1052,5 +1057,47 @@ fn pty_focused_pass_reviews_a_budgeted_subset_then_continues_the_full_review() -
         1,
         "only the approved card may be recorded; the skipped card and remainder stay pending"
     );
+    Ok(())
+}
+
+#[test]
+fn pty_focused_pass_recap_starts_the_next_pass_over_the_remainder() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let (repo, target) = focused_pass_repo("next_focused_pass_pty")?;
+    let mut session = FocusPty::open_with(
+        &repo,
+        &[
+            "tui", "--target", &target, "--pass", "focused", "--budget", "40s",
+        ],
+    )?;
+    session.wait_screen("to open the first focused pass", |screen| {
+        screen.contains("Card 1/2") && screen.contains("pub fn run_git")
+    })?;
+    session.send(b"a")?;
+    session.wait_screen("to advance to the second card", |screen| {
+        screen.contains("Card 2/2") && screen.contains("helper_0")
+    })?;
+    session.send(b"a")?;
+    session.wait_screen("to offer another focused pass", |screen| {
+        screen.contains("Focused pass complete") && screen.contains("[f] next focused pass")
+    })?;
+    session.send(b"f")?;
+    session.wait_screen(
+        "to pick the next pass from the blocks left after the first",
+        |screen| {
+            screen.contains("Focused pass")
+                && screen.contains("Card 1/2")
+                && screen.contains("2 remaining")
+                && screen.contains("helper_1")
+                && !screen.contains("pub fn run_git")
+        },
+    )?;
+    session.send(b"q")?;
+    session.finish()?;
+
+    let records = read_review_records(&repo.path.join(".trueflow/reviews.jsonl"))?;
+    assert_eq!(records.len(), 2, "only the two approved cards are recorded");
     Ok(())
 }
