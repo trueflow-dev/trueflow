@@ -2728,16 +2728,19 @@ fn render_ai_review_plan_screen(
 ) {
     let (body, footer_area) = ai_briefing_layout(frame.area());
     let palette = UiPalette::default();
+    let inner_width = body.width.saturating_sub(2);
     frame.render_widget(
-        Paragraph::new(ai_review_plan_lines(state, plan, coverage))
-            .block(
-                UiBlock::default()
-                    .title(" AI review briefing ")
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .style(Style::default().bg(palette.code_bg).fg(palette.fg)),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+        Paragraph::new(
+            wrap_lines_into_rows(ai_review_plan_lines(state, plan, coverage), inner_width).rows,
+        )
+        .block(
+            UiBlock::default()
+                .title(" AI review briefing ")
+                .borders(ratatui::widgets::Borders::ALL)
+                .style(Style::default().bg(palette.code_bg).fg(palette.fg)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0)),
         body,
     );
     render_ai_briefing_footer(frame, footer_area, footer, &palette);
@@ -2821,10 +2824,13 @@ fn ai_review_plan_scroll_limit(
     coverage: &AiReviewPlanCoverage,
 ) -> u16 {
     let (body, _) = ai_briefing_layout(area);
-    let lines = ai_review_plan_lines(state, plan, coverage);
-    let (content_lines, _) =
-        wrapped_display_metrics_for_lines(&lines, None, body.width.saturating_sub(2));
-    usize_to_u16_saturating(content_lines.saturating_sub(body.height.saturating_sub(2).into()))
+    let rows = wrap_lines_into_rows(
+        ai_review_plan_lines(state, plan, coverage),
+        body.width.saturating_sub(2),
+    )
+    .rows
+    .len();
+    usize_to_u16_saturating(rows.saturating_sub(body.height.saturating_sub(2).into()))
 }
 
 fn ai_review_plan_viewport_height(area: Rect) -> u16 {
@@ -6392,36 +6398,142 @@ fn display_metrics_for_content(content: &BuiltContent) -> (usize, Option<std::op
     (content.total_lines, content.focus_row_range.clone())
 }
 
-fn wrapped_display_metrics_for_lines(
-    lines: &[Line<'static>],
-    focus_line_range: Option<&std::ops::Range<usize>>,
-    width: u16,
-) -> (usize, Option<std::ops::Range<usize>>) {
-    let display_row_prefixes = wrapped_display_row_prefixes(lines, width);
-    let total_rows = *display_row_prefixes.last().unwrap_or(&0);
-
-    let focus_row_range = focus_line_range.and_then(|range| {
-        let start = range.start.min(lines.len());
-        let end = range.end.max(start).min(lines.len());
-        (start < end).then_some(display_row_prefixes[start]..display_row_prefixes[end])
-    });
-
-    (total_rows, focus_row_range)
+/// Lines split into display rows: line `i` occupies rows
+/// `line_row_prefixes[i]..line_row_prefixes[i + 1]`.
+struct WrappedRows {
+    rows: Vec<Line<'static>>,
+    line_row_prefixes: Vec<usize>,
 }
 
-fn wrapped_display_row_prefixes(lines: &[Line<'static>], width: u16) -> Vec<usize> {
-    let wrap_width = usize::from(width.max(1));
-    let mut display_row_prefixes = Vec::with_capacity(lines.len().saturating_add(1));
-    let mut total_rows = 0usize;
-    display_row_prefixes.push(total_rows);
+impl WrappedRows {
+    fn row_range(&self, lines: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        let line_count = self.line_row_prefixes.len().saturating_sub(1);
+        let start = lines.start.min(line_count);
+        let end = lines.end.max(start).min(line_count);
+        (start < end).then(|| self.line_row_prefixes[start]..self.line_row_prefixes[end])
+    }
+}
 
+/// Word-wraps `lines` into rows at most `width` cells wide. Every row fits,
+/// so a `Paragraph` draws each as exactly one row and `rows.len()` is the
+/// rendered height (ratatui's own wrapper cannot report its row count).
+fn wrap_lines_into_rows(lines: Vec<Line<'static>>, width: u16) -> WrappedRows {
+    let mut rows = Vec::with_capacity(lines.len());
+    let mut line_row_prefixes = Vec::with_capacity(lines.len().saturating_add(1));
+    line_row_prefixes.push(0);
     for line in lines {
-        let line_width = line_display_width(line).max(1);
-        total_rows = total_rows.saturating_add(line_width.div_ceil(wrap_width));
-        display_row_prefixes.push(total_rows);
+        rows.extend(wrap_line_into_rows(line, width));
+        line_row_prefixes.push(rows.len());
+    }
+    WrappedRows {
+        rows,
+        line_row_prefixes,
+    }
+}
+
+/// Byte position inside a line's spans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpanPosition {
+    span: usize,
+    byte: usize,
+}
+
+/// Splits one line into rows of at most `width` cells. A row breaks after the
+/// last whitespace that fits, or mid-word when one word is wider than a row;
+/// a whitespace character that would overflow ends the row and is dropped.
+fn wrap_line_into_rows(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    if line_display_width(&line) <= width {
+        return vec![line];
     }
 
-    display_row_prefixes
+    // (end of row, start of the next row); they differ by a dropped space.
+    let mut breaks: Vec<(SpanPosition, SpanPosition)> = Vec::new();
+    let mut row_width = 0usize;
+    let mut row_has_text = false;
+    // Position after the row's last whitespace and the row width up to it.
+    let mut word_break: Option<(SpanPosition, usize)> = None;
+    for (span_index, span) in line.spans.iter().enumerate() {
+        for (byte, ch) in span.content.char_indices() {
+            let at = SpanPosition {
+                span: span_index,
+                byte,
+            };
+            let after = SpanPosition {
+                span: span_index,
+                byte: byte + ch.len_utf8(),
+            };
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let is_whitespace = ch.is_whitespace();
+            if ch_width > 0 && row_width > 0 && row_width + ch_width > width {
+                if is_whitespace {
+                    breaks.push((at, after));
+                    row_width = 0;
+                    row_has_text = false;
+                    word_break = None;
+                    continue;
+                }
+                match word_break.take() {
+                    Some((position, break_width)) => {
+                        breaks.push((position, position));
+                        row_width -= break_width;
+                        row_has_text = row_width > 0;
+                    }
+                    None => {
+                        breaks.push((at, at));
+                        row_width = 0;
+                        row_has_text = false;
+                    }
+                }
+                if row_width > 0 && row_width + ch_width > width {
+                    breaks.push((at, at));
+                    row_width = 0;
+                    row_has_text = false;
+                }
+            }
+            row_width += ch_width;
+            if is_whitespace {
+                if row_has_text {
+                    word_break = Some((after, row_width));
+                }
+            } else {
+                row_has_text = true;
+            }
+        }
+    }
+
+    let line_end = SpanPosition {
+        span: line.spans.len(),
+        byte: 0,
+    };
+    let mut row_start = SpanPosition { span: 0, byte: 0 };
+    let mut rows = Vec::with_capacity(breaks.len() + 1);
+    for (row_end, next_start) in breaks.into_iter().chain([(line_end, line_end)]) {
+        let mut row = Line::from(spans_between(&line.spans, row_start, row_end)).style(line.style);
+        row.alignment = line.alignment;
+        rows.push(row);
+        row_start = next_start;
+    }
+    rows
+}
+
+fn spans_between(
+    spans: &[Span<'static>],
+    start: SpanPosition,
+    end: SpanPosition,
+) -> Vec<Span<'static>> {
+    (start.span..spans.len().min(end.span.saturating_add(1)))
+        .filter_map(|index| {
+            let span = &spans[index];
+            let from = if index == start.span { start.byte } else { 0 };
+            let to = if index == end.span {
+                end.byte
+            } else {
+                span.content.len()
+            };
+            (from < to).then(|| Span::styled(span.content[from..to].to_string(), span.style))
+        })
+        .collect()
 }
 
 fn line_display_width(line: &Line<'_>) -> usize {
@@ -7655,23 +7767,23 @@ fn build_content_lines(
         TreeNodeKind::Block => build_block_lines(state, node, palette, code_height, code_width),
         TreeNodeKind::File => build_file_lines(state, node, palette, code_height, code_width),
         TreeNodeKind::Directory => {
-            let (lines, total_lines) = build_directory_lines(state, node, palette, code_height);
-            BuiltContent {
-                lines,
-                total_lines,
-                focus_row_range: None,
-                comment_rows: None,
-            }
+            let lines = build_directory_lines(state, node, palette, code_height);
+            wrapped_listing_content(lines, code_width)
         }
         TreeNodeKind::Root => {
-            let (lines, total_lines) = build_root_lines(state, palette, code_height);
-            BuiltContent {
-                lines,
-                total_lines,
-                focus_row_range: None,
-                comment_rows: None,
-            }
+            let lines = build_root_lines(state, palette, code_height);
+            wrapped_listing_content(lines, code_width)
         }
+    }
+}
+
+fn wrapped_listing_content(lines: Vec<Line<'static>>, code_width: u16) -> BuiltContent {
+    let rows = wrap_lines_into_rows(lines, code_width).rows;
+    BuiltContent {
+        total_lines: rows.len(),
+        lines: rows,
+        focus_row_range: None,
+        comment_rows: None,
     }
 }
 
@@ -7892,24 +8004,19 @@ fn build_source_context_content(
                 )
             })
             .collect::<Vec<_>>();
-        let comment_rows = Some(source_comment_rows(
-            &lines,
-            &block
-                .content
-                .lines()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            block.start_line,
-            code_width,
-        ));
-        let (total_lines, focus_row_range) =
-            wrapped_display_metrics_for_lines(&lines, Some(&(0..lines.len())), code_width);
-        return BuiltContent {
+        let raw_lines = block
+            .content
+            .lines()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let line_count = raw_lines.len();
+        return wrapped_source_content(
             lines,
-            total_lines,
-            focus_row_range,
-            comment_rows,
-        };
+            &raw_lines,
+            block.start_line,
+            Some(&(0..line_count)),
+            code_width,
+        );
     }
 
     let language = node.language;
@@ -7928,24 +8035,19 @@ fn build_source_context_content(
                     )
                 })
                 .collect::<Vec<_>>();
-            let comment_rows = Some(source_comment_rows(
-                &lines,
-                &block
-                    .content
-                    .lines()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>(),
-                block.start_line,
-                code_width,
-            ));
-            let (total_lines, focus_row_range) =
-                wrapped_display_metrics_for_lines(&lines, Some(&(0..lines.len())), code_width);
-            return BuiltContent {
+            let raw_lines = block
+                .content
+                .lines()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let line_count = raw_lines.len();
+            return wrapped_source_content(
                 lines,
-                total_lines,
-                focus_row_range,
-                comment_rows,
-            };
+                &raw_lines,
+                block.start_line,
+                Some(&(0..line_count)),
+                code_width,
+            );
         }
         return BuiltContent {
             lines: vec![Line::from(Span::styled(
@@ -7991,42 +8093,45 @@ fn build_source_context_content(
         }
     }
 
-    let comment_rows = Some(source_comment_rows(
-        &lines,
+    wrapped_source_content(
+        lines,
         file_lines.as_ref(),
         0,
+        focus_line_range.as_ref(),
         code_width,
-    ));
-    let (total_lines, focus_row_range) =
-        wrapped_display_metrics_for_lines(&lines, focus_line_range.as_ref(), code_width);
-
-    BuiltContent {
-        total_lines,
-        lines,
-        focus_row_range,
-        comment_rows,
-    }
+    )
 }
 
-fn source_comment_rows(
-    lines: &[Line<'static>],
+/// Source content for `raw_lines` (file lines from `start_line`) rendered as
+/// `lines`, word-wrapped into rows of `code_width` cells.
+fn wrapped_source_content(
+    lines: Vec<Line<'static>>,
     raw_lines: &[String],
     start_line: usize,
+    focus_line_range: Option<&std::ops::Range<usize>>,
     code_width: u16,
-) -> Vec<CommentContextRow> {
-    let row_prefixes = wrapped_display_row_prefixes(lines, code_width);
-    raw_lines
+) -> BuiltContent {
+    let wrapped = wrap_lines_into_rows(lines, code_width);
+    let focus_row_range = focus_line_range.and_then(|range| wrapped.row_range(range));
+    let comment_rows = raw_lines
         .iter()
         .enumerate()
         .map(|(index, text)| CommentContextRow {
             scope_line_index: start_line.saturating_add(index),
             text: text.clone(),
-            display_row_range: row_prefixes[index]..row_prefixes[index.saturating_add(1)],
+            display_row_range: wrapped.line_row_prefixes[index]
+                ..wrapped.line_row_prefixes[index.saturating_add(1)],
             anchor: CommentAnchorRowCapture::SourceLine {
                 line_index: start_line.saturating_add(index),
             },
         })
-        .collect()
+        .collect();
+    BuiltContent {
+        total_lines: wrapped.rows.len(),
+        lines: wrapped.rows,
+        focus_row_range,
+        comment_rows: Some(comment_rows),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8841,7 +8946,7 @@ fn build_directory_lines(
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
-) -> (Vec<Line<'static>>, usize) {
+) -> Vec<Line<'static>> {
     let mut entries = Vec::new();
     for child_id in &node.children {
         if !state.navigator.is_visible(*child_id) {
@@ -8859,30 +8964,24 @@ fn build_directory_lines(
     entries.sort();
 
     if entries.is_empty() {
-        return (
-            vec![Line::from(Span::styled(
-                "(Empty)",
-                Style::default().fg(palette.context).bg(palette.code_bg),
-            ))],
-            1,
-        );
+        return vec![Line::from(Span::styled(
+            "(Empty)",
+            Style::default().fg(palette.context).bg(palette.code_bg),
+        ))];
     }
 
     // Scrollable directory view
-    let entries_list = entries
+    entries
         .iter()
         .map(|entry| format_directory_line(entry, palette))
-        .collect::<Vec<_>>();
-
-    let len = entries_list.len();
-    (entries_list, len)
+        .collect()
 }
 
 fn build_root_lines(
     state: &mut AppState,
     palette: &UiPalette,
     _code_height: u16,
-) -> (Vec<Line<'static>>, usize) {
+) -> Vec<Line<'static>> {
     let root_children = visible_root_children(state);
 
     reseat_root_cursor(state, &root_children);
@@ -8957,8 +9056,7 @@ fn build_root_lines(
     }
 
     lines.append(&mut listing);
-    let len = lines.len();
-    (lines, len)
+    lines
 }
 
 fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> Line<'static> {
@@ -9182,7 +9280,10 @@ fn editing_cursor_visual_offset(
         (column, row)
     };
 
-    (usize_to_u16_saturating(column), usize_to_u16_saturating(row))
+    (
+        usize_to_u16_saturating(column),
+        usize_to_u16_saturating(row),
+    )
 }
 
 fn input_overlay_rect(area: Rect, body_lines: u16) -> Rect {
@@ -9675,6 +9776,46 @@ mod diff_scope_tests {
         assert!(
             screen.contains("shared state"),
             "missing target reason:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn ai_review_ready_screen_scroll_limit_reaches_word_wrapped_end() {
+        let (state, _file, _blocks) = build_state_with_file_block_count(1);
+        let plan = AiReviewPlan {
+            summary: "aaaa bbbbbb cccccc dddd eeeeee ffffff gggg hhhhhh iiiiii".to_string(),
+            global_checks: Vec::new(),
+            priority_blocks: Vec::new(),
+        };
+        let coverage = AiReviewPlanCoverage {
+            total_blocks: 1,
+            presented_blocks: 1,
+            excerpted_blocks: 1,
+            fully_excerpted_blocks: 1,
+            excerpt_lines: 1,
+        };
+        let area = Rect::new(0, 0, 12, 8);
+        let scroll = ai_review_plan_scroll_limit(area, &state, &plan, &coverage);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
+            .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
+        terminal
+            .draw(|frame| {
+                render_ai_review_plan_screen(frame, &state, &plan, &coverage, scroll, "");
+            })
+            .unwrap_or_else(|error| panic!("failed to render review plan: {error}"));
+        let buffer = terminal.backend().buffer();
+        let rows = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let screen = rows.join("\n");
+
+        // The last content row sits just above the bottom border.
+        let last_content_row = &rows[rows.len() - 3];
+        assert!(
+            last_content_row.contains("unchanged)"),
+            "scrolling to the limit must show the final briefing row:\n{screen}"
         );
     }
 
@@ -14573,11 +14714,10 @@ mod diff_scope_tests {
             ),
         ];
 
-        let (total_lines, focus_row_range) =
-            wrapped_display_metrics_for_lines(&lines, Some(&(1..2)), 20);
+        let wrapped = wrap_lines_into_rows(lines, 20);
 
-        assert_eq!(total_lines, 3);
-        assert_eq!(focus_row_range, Some(2..3));
+        assert_eq!(wrapped.rows.len(), 3);
+        assert_eq!(wrapped.row_range(&(1..2)), Some(2..3));
     }
 
     #[test]
@@ -14596,12 +14736,61 @@ mod diff_scope_tests {
         let display_metrics = display_metrics_for_content(&content);
 
         assert!(
-            content.total_lines > content.lines.len(),
-            "narrow source content should cache wrapped display row count"
+            content.total_lines > 2 && content.total_lines == content.lines.len(),
+            "narrow source content should be stored as pre-wrapped rows"
         );
         assert_eq!(
             display_metrics,
             (content.total_lines, content.focus_row_range)
+        );
+    }
+
+    /// Rows ratatui actually draws for `lines` word-wrapped at `width`.
+    fn rendered_wrapped_row_count(lines: &[Line<'static>], width: u16) -> usize {
+        use ratatui::widgets::Widget;
+        let area = Rect::new(0, 0, width, 200);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buffer);
+        buffer
+            .content()
+            .chunks(usize::from(width))
+            .rposition(|row| row.iter().any(|cell| cell.symbol() != " "))
+            .map_or(0, |last| last + 1)
+    }
+
+    #[test]
+    fn source_view_metrics_match_word_wrapped_rows() {
+        let file_path = temp_test_file_path("tui_source_word_wrapped_rows");
+        let file_content = "aaaa bbbbbb cccccc\n";
+        let (mut state, file_id, _block_id) =
+            build_state_with_block_file(&file_path, file_content, file_content, 0, 1);
+        state.view_mode = ViewMode::Source;
+        let snapshot = ContentNodeSnapshot::from_node(state.navigator.tree.node(file_id));
+
+        let content = build_file_lines(&mut state, &snapshot, &UiPalette::default(), 3, 10);
+
+        assert_eq!(content.total_lines, 3);
+        assert_eq!(
+            rendered_wrapped_row_count(&content.lines, 10),
+            content.total_lines
+        );
+        assert_eq!(content.focus_row_range, Some(0..3));
+    }
+
+    #[test]
+    fn root_view_metrics_count_wrapped_scope_label_rows() {
+        let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
+        state.scope_label = "pull request 1234 from a long feature branch".to_string();
+        let snapshot =
+            ContentNodeSnapshot::from_node(state.navigator.tree.node(state.navigator.tree.root()));
+
+        let content = build_content_lines(&mut state, &snapshot, &UiPalette::default(), 10, 20);
+
+        assert_eq!(
+            rendered_wrapped_row_count(&content.lines, 20),
+            content.total_lines
         );
     }
 
