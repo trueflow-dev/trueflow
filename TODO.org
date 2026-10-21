@@ -440,7 +440,11 @@
      `cargo nextest` runs.
    - Fix both: point test scans at their temp dir, and cap or evict the
      cache by age or size.
-** TODO DEF_TODO [Low] Make deadline-bound tests robust to host load
+** DONE DEF_TODO [Low] Make deadline-bound tests robust to host load
+   - Fixed: focus generation tests use 60 s provider deadlines (except the
+     test that asserts `--timeout 1` bounds a hanging provider), and the
+     concurrent-worker test keeps a 60 s readiness guard with a separate
+     5 s exclusion window.
    - `e2e_focus_generation` runs `trueflow focus --timeout 5`; on a loaded
      host the same binary took 1.05-5.09 s serially and the provider timed
      out. `github_feedback_serializes_concurrent_workers` similarly times

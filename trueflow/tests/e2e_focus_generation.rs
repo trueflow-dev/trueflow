@@ -211,7 +211,7 @@ fn save_response(repo: &TestRepo, response: &str) -> Result<()> {
 fn focus_generation_uses_supplied_evidence_and_returns_a_portable_validated_plan() -> Result<()> {
     for provider in ["claude", "codex"] {
         let (repo, expected) = fixture(provider)?;
-        let mut generation = Generation::spawn(&repo, provider, "valid", "5")?;
+        let mut generation = Generation::spawn(&repo, provider, "valid", "60")?;
         let (status, stdout, stderr) = generation.finish()?;
         assert!(status.success(), "{provider}: {stderr}");
         let plan = parse_json(&stdout)?;
@@ -308,7 +308,7 @@ fn focus_generation_rejects_provider_errors_invalid_json_and_invented_evidence_w
 fn focus_generation_rejects_source_and_approval_drift_after_evidence_capture() -> Result<()> {
     for drift in ["source", "approval"] {
         let (repo, plan) = fixture("claude")?;
-        let mut generation = Generation::spawn(&repo, "claude", "wait", "5")?;
+        let mut generation = Generation::spawn(&repo, "claude", "wait", "60")?;
         generation.ready()?;
         if drift == "source" {
             repo.write(
