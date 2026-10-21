@@ -51,6 +51,10 @@ const CONTEXT_LINES: usize = 3;
 const SIGNAL_QUOTE_CHARS: usize = 60;
 /// Lines inspected for a public declaration (attributes and doc lines precede it).
 const SIGNATURE_LINES: usize = 4;
+/// Ranking charges every card at least this long: switching to a card and
+/// reading its context costs time even when the block is one line, so a pass
+/// is not flooded with trivial one-liners. Budget fitting uses real estimates.
+const RANK_FLOOR_SECONDS: usize = 30;
 
 /// Reading estimate for a card that shows `lines` lines.
 pub const fn reading_seconds(lines: usize) -> usize {
@@ -317,7 +321,8 @@ pub fn heuristic_pass<Id: Copy>(
             let estimated_seconds = reading_seconds(reading.read);
             let rank = HeuristicRank {
                 has_signal: score > 0,
-                milli_score_per_second: score.saturating_mul(1000) / estimated_seconds,
+                milli_score_per_second: score.saturating_mul(1000)
+                    / estimated_seconds.max(RANK_FLOOR_SECONDS),
                 score,
                 canonical_index: index,
             };
@@ -663,6 +668,21 @@ mod tests {
 
         assert_eq!(ids(&plan), vec![1]);
         assert_eq!(plan.remainder, 1);
+    }
+
+    #[test]
+    fn heuristic_pass_does_not_let_trivial_one_liners_outrank_richer_short_blocks() {
+        let alias = "type Id = u64;\n";
+        let config = "pub struct Credentials {\n    user: String,\n    password: String,\n    host: String,\n    port: u16,\n    database: String,\n    timeout: u64,\n}\n";
+        let candidates = [
+            candidate(0, BlockKind::Type, alias),
+            candidate(1, BlockKind::Struct, config),
+        ];
+
+        let plan = heuristic_pass(&candidates, budget(300));
+
+        // Both cost under the 30s ranking floor, so the richer block wins.
+        assert_eq!(ids(&plan), vec![1, 0]);
     }
 
     #[test]
