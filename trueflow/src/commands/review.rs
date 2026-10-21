@@ -712,15 +712,22 @@ fn collect_diff_review_files(
                     )?
                 }
             };
-            let base = base.map(|parsed| {
-                diagnostics.extend(parsed.diagnostics.into_iter().map(|diagnostic| {
-                    ReviewDiagnostic::from(ScanDiagnostic::new(
-                        Some(parsed.file_state.path.clone()),
-                        diagnostic.reason,
-                    ))
-                }));
-                parsed.file_state
-            });
+            let base = match base {
+                Some(vcs::RevisionBlob::Parsed(parsed)) => {
+                    diagnostics.extend(parsed.diagnostics.into_iter().map(|diagnostic| {
+                        ReviewDiagnostic::from(ScanDiagnostic::new(
+                            Some(parsed.file_state.path.clone()),
+                            diagnostic.reason,
+                        ))
+                    }));
+                    Some(parsed.file_state)
+                }
+                Some(vcs::RevisionBlob::Skipped(diagnostic)) => {
+                    diagnostics.push(ReviewDiagnostic::from(diagnostic));
+                    None
+                }
+                None => None,
+            };
             target_inputs.push(TargetFileDiffInput { base, file_diff });
         }
 

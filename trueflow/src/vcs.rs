@@ -2,7 +2,7 @@ use crate::analysis::{self, Language, ParsedFile};
 use crate::block::{Block, FileState};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
-use crate::scanner::ScanDiagnostic;
+use crate::scanner::{self, ScanDiagnostic};
 use crate::store::CommitId;
 use crate::targets::CommitRange;
 use anyhow::{Context, Result};
@@ -625,13 +625,26 @@ pub struct RevisionFiles {
 }
 
 impl RevisionFiles {
-    fn push(&mut self, parsed: ParsedFile) {
-        self.diagnostics
-            .extend(parsed.diagnostics.into_iter().map(|diagnostic| {
-                ScanDiagnostic::new(Some(parsed.file_state.path.clone()), diagnostic.reason)
-            }));
-        self.files.push(parsed.file_state);
+    fn push(&mut self, blob: RevisionBlob) {
+        match blob {
+            RevisionBlob::Parsed(parsed) => {
+                self.diagnostics
+                    .extend(parsed.diagnostics.into_iter().map(|diagnostic| {
+                        ScanDiagnostic::new(Some(parsed.file_state.path.clone()), diagnostic.reason)
+                    }));
+                self.files.push(parsed.file_state);
+            }
+            RevisionBlob::Skipped(diagnostic) => self.diagnostics.push(diagnostic),
+        }
     }
+}
+
+/// One file read from a revision tree: parsed into review blocks, or left
+/// out with the reason, exactly like the worktree scanner skips such files.
+#[derive(Debug)]
+pub(crate) enum RevisionBlob {
+    Parsed(ParsedFile),
+    Skipped(ScanDiagnostic),
 }
 
 pub fn file_states_for_paths_in_revision(
@@ -663,7 +676,7 @@ pub(crate) fn file_state_for_path_in_revision(
     revision: &str,
     repo_relative_path: &RepoPath,
     output_path: &RepoPath,
-) -> Result<Option<ParsedFile>> {
+) -> Result<Option<RevisionBlob>> {
     let tree = tree_for_revision(repo, revision)?;
     file_state_for_path_in_tree(&tree, repo_relative_path.as_str(), output_path)
 }
@@ -688,7 +701,7 @@ pub(crate) fn file_state_for_path_in_revision_base(
     revision: &str,
     repo_relative_path: &RepoPath,
     output_path: &RepoPath,
-) -> Result<Option<ParsedFile>> {
+) -> Result<Option<RevisionBlob>> {
     let object = repo.rev_parse_single(revision)?;
     let commit = object
         .object()?
@@ -727,9 +740,8 @@ fn file_states_for_paths_in_tree(
         let candidates =
             path_utils::tree_path_candidates_for_repo_path(requested_path.as_str(), workdir_prefix);
         for candidate in candidates {
-            if let Some(file_state) = file_state_for_path_in_tree(tree, &candidate, requested_path)?
-            {
-                files.push(file_state);
+            if let Some(blob) = file_state_for_path_in_tree(tree, &candidate, requested_path)? {
+                files.push(blob);
                 break;
             }
         }
@@ -742,7 +754,7 @@ fn file_state_for_path_in_tree(
     tree: &gix::Tree<'_>,
     tree_path_str: &str,
     output_path: &RepoPath,
-) -> Result<Option<ParsedFile>> {
+) -> Result<Option<RevisionBlob>> {
     let tree_path = Path::new(tree_path_str);
     let Some(entry) = tree.lookup_entry_by_path(tree_path)? else {
         return Ok(None);
@@ -752,11 +764,7 @@ fn file_state_for_path_in_tree(
     }
 
     let blob = entry.object()?.try_into_blob()?;
-    Ok(Some(file_state_from_blob(
-        &blob,
-        tree_path,
-        output_path.clone(),
-    )?))
+    revision_blob(&blob, tree_path, output_path.clone()).map(Some)
 }
 
 fn file_text_for_path_in_tree(tree: &gix::Tree<'_>, tree_path_str: &str) -> Result<Option<String>> {
@@ -807,11 +815,7 @@ fn collect_file_states_in_tree(
 
                     let output_path = display_path_for_tree_entry(&full_path, workdir_prefix)?;
                     let blob = entry.object()?.try_into_blob()?;
-                    files.push(file_state_from_blob(
-                        &blob,
-                        Path::new(&full_path),
-                        output_path,
-                    )?);
+                    files.push(revision_blob(&blob, Path::new(&full_path), output_path)?);
                 }
                 _ => {}
             }
@@ -826,16 +830,22 @@ fn display_path_for_tree_entry(path: &str, _workdir_prefix: Option<&str>) -> Res
     RepoPath::new(normalized_path)
 }
 
-fn file_state_from_blob(
+fn revision_blob(
     blob: &gix::Blob<'_>,
     tree_path: &Path,
     output_path: RepoPath,
-) -> Result<ParsedFile> {
+) -> Result<RevisionBlob> {
     let source_path = RepoPath::new(tree_path.to_string_lossy().as_ref())?;
-    let mut parsed = analysis::parse_file(&source_path, &blob.data)
-        .with_context(|| format!("failed to parse revision file {source_path}"))?;
-    parsed.file_state.path = output_path;
-    Ok(parsed)
+    Ok(match analysis::parse_file(&source_path, &blob.data) {
+        Ok(mut parsed) => {
+            parsed.file_state.path = output_path;
+            RevisionBlob::Parsed(parsed)
+        }
+        Err(err) => RevisionBlob::Skipped(ScanDiagnostic::new(
+            Some(output_path),
+            scanner::skipped_file_reason(&err),
+        )),
+    })
 }
 
 pub fn diff_hunks_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<Vec<DiffHunk>> {
@@ -1337,12 +1347,16 @@ fn file_diff_from_change(
             let unified = gix::diff::blob::UnifiedDiff::new(
                 &diff,
                 &input,
-                gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(String::new(), "\n"),
+                // Bytes, not `String`: a non-UTF-8 side must not fail the review.
+                gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(
+                    gix::bstr::BString::default(),
+                    "\n",
+                ),
                 gix::diff::blob::unified_diff::ContextSize::symmetrical(3),
             )
             .consume()?;
             let mut hunks = Vec::new();
-            collect_hunks(&mut hunks, &changed_path.location, &unified)?;
+            collect_hunks(&mut hunks, &changed_path.location, &unified.to_str_lossy())?;
             if hunks.is_empty() {
                 Ok(FileDiff::NoTextChanges { changed_path })
             } else {

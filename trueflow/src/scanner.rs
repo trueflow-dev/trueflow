@@ -1010,7 +1010,12 @@ fn diagnostic_for_process_file_error(
     err: &anyhow::Error,
 ) -> ScanDiagnostic {
     let path = normalize_cache_key(repo_path_base, path).ok();
-    let reason = if err.downcast_ref::<std::str::Utf8Error>().is_some() {
+    ScanDiagnostic::new(path, skipped_file_reason(err))
+}
+
+/// Why a file that could not be read or parsed was left out of review.
+pub(crate) fn skipped_file_reason(err: &anyhow::Error) -> String {
+    if err.downcast_ref::<std::str::Utf8Error>().is_some() {
         "skipped invalid UTF-8 file".to_string()
     } else if err
         .downcast_ref::<std::io::Error>()
@@ -1019,8 +1024,7 @@ fn diagnostic_for_process_file_error(
         format!("skipped unreadable file: {err}")
     } else {
         format!("skipped file: {err}")
-    };
-    ScanDiagnostic::new(path, reason)
+    }
 }
 
 fn symbolic_link_diagnostic(path: &RepoPath, component: &RepoPath) -> ScanDiagnostic {

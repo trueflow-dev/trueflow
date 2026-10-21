@@ -1879,6 +1879,53 @@ fn test_scan_cache_reuses_invalid_utf8_diagnostic_for_unchanged_file() -> Result
 }
 
 #[test]
+fn test_revision_files_skip_invalid_utf8_blob_with_diagnostic() -> Result<()> {
+    let repo = TestRepo::new("revision_invalid_utf8_blob")?;
+    fs::write(repo.path.join("a.txt"), b"caf\xe9\n")?;
+    repo.write("b.rs", "pub fn b() {}\n")?;
+    repo.commit_all("Add Latin-1 notes")?;
+
+    let git = gix::open(&repo.path)?;
+    let revision = trueflow::vcs::file_states_in_revision(&git, "HEAD", None)?;
+
+    assert!(revision.files.iter().any(|file| file.path.as_str() == "b.rs"));
+    assert!(!revision.files.iter().any(|file| file.path.as_str() == "a.txt"));
+    assert!(revision.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str() == "a.txt")
+            && diagnostic.reason.contains("invalid UTF-8")
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn test_review_revision_target_survives_invalid_utf8_base_blob() -> Result<()> {
+    let repo = TestRepo::new("review_revision_invalid_utf8_base")?;
+    fs::write(repo.path.join("notes.txt"), b"caf\xe9\n")?;
+    repo.write("src/lib.rs", "pub fn before() {}\n")?;
+    repo.commit_all("Latin-1 notes")?;
+
+    repo.write("notes.txt", "caf\u{e9} au lait\n")?;
+    repo.write("src/lib.rs", "pub fn after() {}\n")?;
+    repo.commit_all("Convert notes to UTF-8")?;
+
+    let output = repo.run(&["review", "--json", "--target", "rev:HEAD"])?;
+    let files = json_array(&output)?;
+    let paths = files
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(paths.contains(&"src/lib.rs"), "paths: {paths:?}");
+    assert!(paths.contains(&"notes.txt"), "paths: {paths:?}");
+
+    Ok(())
+}
+
+#[test]
 fn test_scan_ignores_mutants_out_directory() -> Result<()> {
     let repo = TestRepo::new("scan_ignores_mutants_out")?;
     repo.write("src/main.rs", "fn main() {}\n")?;
