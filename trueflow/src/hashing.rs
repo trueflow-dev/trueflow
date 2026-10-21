@@ -126,7 +126,8 @@ pub fn hash_bytes(input: &[u8]) -> String {
 }
 
 /// Normalize content for hashing.
-/// - Trims trailing whitespace from lines.
+/// - Trims trailing ASCII spaces and tabs from lines, except after a
+///   line-continuation backslash, where trailing whitespace changes meaning.
 /// - Replaces Windows/Mac line endings with \n.
 /// - Ensures a single trailing newline.
 pub fn canonicalize(input: &str) -> String {
@@ -141,7 +142,7 @@ pub fn canonicalize(input: &str) -> String {
 
     while index < bytes.len() {
         if matches!(bytes[index], b'\r' | b'\n') {
-            output.push_str(input[line_start..index].trim_end());
+            output.push_str(canonical_line(&input[line_start..index]));
             output.push('\n');
 
             if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
@@ -153,11 +154,20 @@ pub fn canonicalize(input: &str) -> String {
     }
 
     if line_start < input.len() {
-        output.push_str(input[line_start..].trim_end());
+        output.push_str(canonical_line(&input[line_start..]));
         output.push('\n');
     }
 
     output
+}
+
+fn canonical_line(line: &str) -> &str {
+    let trimmed = line.trim_end_matches([' ', '\t']);
+    if trimmed.len() != line.len() && trimmed.ends_with('\\') {
+        line
+    } else {
+        trimmed
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +213,19 @@ mod tests {
         assert_eq!(canonicalize("foo  \n"), "foo\n");
         assert_eq!(canonicalize("  foo"), "  foo\n");
         assert_eq!(canonicalize(""), "");
+    }
+
+    #[test]
+    fn hash_str_distinguishes_backslash_space_continuation() {
+        assert_ne!(hash_str("a \\\nb"), hash_str("a \\ \nb"));
+        assert_ne!(hash_str("a \\\r\nb"), hash_str("a \\\t\r\nb"));
+        assert_ne!(hash_str("a \\"), hash_str("a \\ "));
+    }
+
+    #[test]
+    fn canonicalize_trims_only_ascii_space_and_tab() {
+        assert_eq!(canonicalize("x \t\ny"), "x\ny\n");
+        assert_eq!(canonicalize("x\u{a0}\ny\u{3000}"), "x\u{a0}\ny\u{3000}\n");
     }
 
     #[test]
