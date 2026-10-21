@@ -160,7 +160,6 @@ fn statement_primary_node(statement: Node<'_>) -> Option<Node<'_>> {
 
 fn classify_statement_node(node: Node<'_>) -> BlockKind {
     match node.kind() {
-        "comment_statement" => BlockKind::Comment,
         "create_table" | "alter_table" | "drop_table" => BlockKind::Struct,
         "create_view" | "create_materialized_view" | "alter_view" | "drop_view" => {
             BlockKind::Module
@@ -174,7 +173,7 @@ fn classify_statement_node(node: Node<'_>) -> BlockKind {
         "create_type" => classify_create_type(node),
         "alter_type" | "drop_type" => BlockKind::Type,
         "select" | "set_operation" | "insert" | "update" | "delete" | "set_statement"
-        | "reset_statement" => BlockKind::Code,
+        | "reset_statement" | "comment_statement" => BlockKind::Code,
         _ => BlockKind::Code,
     }
 }
@@ -195,9 +194,6 @@ fn classify_create_type(node: Node<'_>) -> BlockKind {
 fn classify_statement_text_prefix(statement_text: &str) -> BlockKind {
     let text = statement_text.trim_start().to_ascii_lowercase();
 
-    if text.starts_with("comment ") {
-        return BlockKind::Comment;
-    }
     if text.starts_with("create view")
         || text.starts_with("create materialized view")
         || text.starts_with("alter view")
@@ -373,5 +369,23 @@ mod tests {
             .map(|block| block.content.as_str())
             .collect::<String>();
         assert!(covered.contains('='), "operator must be reviewable: {blocks:#?}");
+    }
+
+    #[test]
+    fn comment_on_statement_is_code() {
+        for source in [
+            "COMMENT ON TABLE t IS 'x';\n",
+            "COMMENT ON COLUMN accounts.email IS 'PII';\n",
+        ] {
+            let (_, blocks) = split_source(source);
+            assert!(
+                blocks.iter().all(|block| block.kind != BlockKind::Comment),
+                "{source:?} must not be a comment: {blocks:#?}"
+            );
+        }
+        assert_eq!(
+            classify_statement_text_prefix("COMMENT ON TABLE t IS 'x';"),
+            BlockKind::Code
+        );
     }
 }
