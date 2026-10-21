@@ -1888,8 +1888,18 @@ fn test_revision_files_skip_invalid_utf8_blob_with_diagnostic() -> Result<()> {
     let git = gix::open(&repo.path)?;
     let revision = trueflow::vcs::file_states_in_revision(&git, "HEAD", None)?;
 
-    assert!(revision.files.iter().any(|file| file.path.as_str() == "b.rs"));
-    assert!(!revision.files.iter().any(|file| file.path.as_str() == "a.txt"));
+    assert!(
+        revision
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "b.rs")
+    );
+    assert!(
+        !revision
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "a.txt")
+    );
     assert!(revision.diagnostics.iter().any(|diagnostic| {
         diagnostic
             .path
