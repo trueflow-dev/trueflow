@@ -252,14 +252,19 @@ pub(crate) struct DiffChangedLineIndex {
 #[derive(Debug, Clone)]
 struct IndexedChangedDiffLine {
     diff_order: usize,
+    /// Identifies a maximal run of changed lines inside one hunk with no
+    /// context line between them. Only lines in one run are adjacent edits.
+    change_run: usize,
     line: DiffLine,
 }
 
 impl DiffChangedLineIndex {
     pub(crate) fn from_hunks(hunks: &[DiffHunk]) -> Self {
         let mut changed_lines = Vec::new();
+        let mut next_change_run = 0;
         for hunk in hunks {
-            push_indexed_changed_lines_for_hunk(&mut changed_lines, hunk);
+            next_change_run =
+                push_indexed_changed_lines_for_hunk(&mut changed_lines, hunk, next_change_run);
         }
 
         let mut base_changed_line_indices = changed_lines
@@ -952,23 +957,29 @@ fn selected_destination_for_location<'a>(
     }
 }
 
+/// Appends the hunk's added and removed lines and returns the next unused
+/// change-run id.
 fn push_indexed_changed_lines_for_hunk(
     changed_lines: &mut Vec<IndexedChangedDiffLine>,
     hunk: &DiffHunk,
-) {
+    first_change_run: usize,
+) -> usize {
     let mut old_line = hunk.old_start;
     let mut new_line = hunk.new_start;
+    let mut change_run = first_change_run;
 
     for line in &hunk.lines {
         match line.kind {
             DiffLineKind::Context => {
                 old_line = old_line.saturating_add(1);
                 new_line = new_line.saturating_add(1);
+                change_run += 1;
             }
             DiffLineKind::Added => {
                 let diff_order = changed_lines.len();
                 changed_lines.push(IndexedChangedDiffLine {
                     diff_order,
+                    change_run,
                     line: DiffLine {
                         kind: DiffLineKind::Added,
                         old_line: None,
@@ -983,6 +994,7 @@ fn push_indexed_changed_lines_for_hunk(
                 let diff_order = changed_lines.len();
                 changed_lines.push(IndexedChangedDiffLine {
                     diff_order,
+                    change_run,
                     line: DiffLine {
                         kind: DiffLineKind::Removed,
                         old_line: Some(old_line),
@@ -995,6 +1007,8 @@ fn push_indexed_changed_lines_for_hunk(
             }
         }
     }
+
+    change_run + 1
 }
 
 fn all_changed_lines_are_nonreviewable(changed_lines: &[&IndexedChangedDiffLine]) -> bool {
@@ -1034,24 +1048,28 @@ fn trivial_formatting_only_replacement_run(
     })
 }
 
+/// Pairs a run of `first_kind` lines with an equally long run of
+/// `second_kind` lines that directly follows it in the same change run, so
+/// a statement moved past unchanged context is never mistaken for churn.
 fn trivial_formatting_only_replacement_run_for_order(
     changed_lines: &[&IndexedChangedDiffLine],
     first_kind: DiffLineKind,
     second_kind: DiffLineKind,
 ) -> Option<usize> {
+    let change_run = changed_lines.first()?.change_run;
+    let in_run_with_kind = |index: usize, kind: DiffLineKind| {
+        changed_lines
+            .get(index)
+            .is_some_and(|line| line.line.kind == kind && line.change_run == change_run)
+    };
+
     let mut first_len = 0;
-    while changed_lines
-        .get(first_len)
-        .is_some_and(|line| line.line.kind == first_kind)
-    {
+    while in_run_with_kind(first_len, first_kind) {
         first_len += 1;
     }
 
     let mut second_len = 0;
-    while changed_lines
-        .get(first_len + second_len)
-        .is_some_and(|line| line.line.kind == second_kind)
-    {
+    while in_run_with_kind(first_len + second_len, second_kind) {
         second_len += 1;
     }
 
@@ -2021,6 +2039,54 @@ mod tests {
             block_has_changed_lines_in_diff(&block, &[hunk]),
             BlockDiffChangeKind::OnlyNonreviewableChurn,
             "multiline indentation-only replacements should not mark a block as changed for review"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_keeps_moved_statement_reviewable() {
+        let block = line_only_block(0, 5);
+
+        let hunk = DiffHunk {
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
+            old_start: 1,
+            new_start: 1,
+            lines: vec![
+                unified(" fn f() {\n"),
+                unified("-    a();\n"),
+                unified("     b();\n"),
+                unified("+    a();\n"),
+                unified(" }\n"),
+            ],
+        };
+
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[hunk]),
+            BlockDiffChangeKind::ReviewableChanges,
+            "a statement moved past unchanged context must remain reviewable"
+        );
+    }
+
+    #[test]
+    fn block_has_changed_lines_keeps_statement_moved_across_hunks_reviewable() {
+        let block = line_only_block(0, 20);
+
+        let removal = DiffHunk {
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
+            old_start: 2,
+            new_start: 2,
+            lines: vec![unified("-    a();\n")],
+        };
+        let addition = DiffHunk {
+            file_path: RepoPath::new("src/lib.rs").unwrap(),
+            old_start: 15,
+            new_start: 14,
+            lines: vec![unified("+    a();\n")],
+        };
+
+        assert_eq!(
+            block_has_changed_lines_in_diff(&block, &[removal, addition]),
+            BlockDiffChangeKind::ReviewableChanges,
+            "a statement moved between hunks must remain reviewable"
         );
     }
 }
