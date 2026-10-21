@@ -414,15 +414,21 @@ impl Block {
 fn line_span_for_source_range(source: &str, byte_span: ByteSpan) -> Option<LineSpan> {
     let before = source.get(..byte_span.start_byte)?;
     let content = source.get(byte_span.start_byte..byte_span.end_byte)?;
-    let start_line = before.chars().filter(|&ch| ch == '\n').count();
+    let start_line = count_newlines(before);
     if content.is_empty() {
         return Some(LineSpan::new(start_line, start_line));
     }
 
     let end_line = start_line
-        .checked_add(content.chars().filter(|&ch| ch == '\n').count())?
+        .checked_add(count_newlines(content))?
         .checked_add(usize::from(!content.ends_with('\n')))?;
     Some(LineSpan::new(start_line, end_line))
+}
+
+/// Counts `\n` bytes. UTF-8 never encodes 0x0A inside a multi-byte sequence,
+/// so this equals the number of `'\n'` chars without decoding.
+fn count_newlines(text: &str) -> usize {
+    text.bytes().filter(|&byte| byte == b'\n').count()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
