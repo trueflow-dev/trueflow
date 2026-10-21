@@ -392,12 +392,16 @@ fn collect_unsupported_languages(
         .capability_notices
         .iter()
         .map(|notice| notice.language);
-    unsupported_languages.extend(snapshot_languages.chain(notice_languages).filter(|language| {
-        matches!(
-            capabilities_for(*language).inventory,
-            Capability::Unsupported { .. }
-        )
-    }));
+    unsupported_languages.extend(
+        snapshot_languages
+            .chain(notice_languages)
+            .filter(|language| {
+                matches!(
+                    capabilities_for(*language).inventory,
+                    Capability::Unsupported { .. }
+                )
+            }),
+    );
 }
 
 const fn declaration_kind_priority(kind: DeclarationKind) -> u8 {

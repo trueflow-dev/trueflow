@@ -672,7 +672,10 @@ fn approve_only_target(prepared: PreparedDeclarationLaunch, name: &str) -> Resul
         .iter()
         .map(|target| target.declaration.name.as_str())
         .collect::<Vec<_>>();
-    ensure!(names == [name], "expected only {name} to review, got {names:?}");
+    ensure!(
+        names == [name],
+        "expected only {name} to review, got {names:?}"
+    );
     let mut runtime =
         DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
     runtime.submit(DeclarationReviewActionKind::Approve, None)?;
@@ -701,11 +704,8 @@ fn deletion_of_an_approved_surface_is_reviewed_once_and_stays_reviewed() -> Resu
     repo.commit_all("remove gone")?;
     let deleting_revision = head_revision(&repo)?;
     let deleting = revision_query(deleting_revision.clone());
-    let deletion = prepare_declaration_launch(
-        &repo.path,
-        &deleting,
-        vec![addition_approval.clone()],
-    )?;
+    let deletion =
+        prepare_declaration_launch(&repo.path, &deleting, vec![addition_approval.clone()])?;
     assert_eq!(
         deletion.status(),
         &CollectionStatus::Ready,

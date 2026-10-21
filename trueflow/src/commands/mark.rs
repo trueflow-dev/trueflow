@@ -6,8 +6,7 @@ use crate::repo_path::RepoPath;
 use crate::store::{
     Attestation, AttestationKind, BlockState, Canonicalization, CommentAnchor, CommentScope,
     DeclarationDeletion, DeclarationRecordLocator, FileStore, Identity, Record, RepoRef,
-    ReviewCheck, ReviewStore,
-    ReviewTargetKind, ReviewTargetRef, VcsSystem, Verdict,
+    ReviewCheck, ReviewStore, ReviewTargetKind, ReviewTargetRef, VcsSystem, Verdict,
 };
 use crate::tree::{self, TreeNodeKind};
 use crate::vcs;

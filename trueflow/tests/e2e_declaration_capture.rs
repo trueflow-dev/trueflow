@@ -769,11 +769,14 @@ fn launch_names(prepared: &PreparedDeclarationLaunch) -> Vec<&str> {
 }
 
 #[test]
-fn unsupported_language_non_utf8_or_large_file_does_not_block_supported_declarations()
--> Result<()> {
+fn unsupported_language_non_utf8_or_large_file_does_not_block_supported_declarations() -> Result<()>
+{
     let repo = TestRepo::new("declaration_capture_unsupported_unread")?;
     repo.write("src/lib.rs", "pub fn kept() -> u8 { 0 }\n")?;
-    std::fs::write(repo.path.join("legacy.php"), b"<?php function caf\xe9() {}\n")?;
+    std::fs::write(
+        repo.path.join("legacy.php"),
+        b"<?php function caf\xe9() {}\n",
+    )?;
     write_sparse_source(&repo, "vendor/app.min.js", MAX_DECLARATION_SOURCE_BYTES + 1)?;
     repo.commit_all("mixed languages")?;
     let head = commit_id(&repo, "HEAD")?;

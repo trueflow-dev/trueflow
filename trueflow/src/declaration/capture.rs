@@ -643,9 +643,7 @@ fn snapshot_from_worktree(
     }
     let fingerprint = FileFingerprint::from_metadata(after, Some(BytesHash::from_bytes(&bytes)));
     let source = match language {
-        Some(language) => {
-            EndpointSource::decode(path, language, &bytes, endpoint_name, target_key)
-        }
+        Some(language) => EndpointSource::decode(path, language, &bytes, endpoint_name, target_key),
         None => EndpointSource::Absent,
     };
     Ok((source, fingerprint))

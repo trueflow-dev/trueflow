@@ -471,7 +471,8 @@ fn deleted_declaration_is_not_covered_by_prior_surface_approval() -> Result<()> 
 
     let deletion_approval = deletion_record("deletion-approval", &base, &deleted, 20)?;
     let records = vec![surface_approval, deletion_approval];
-    let reloaded = DeclarationCoverageIndex::build(std::slice::from_ref(&deleting_batch), &records)?;
+    let reloaded =
+        DeclarationCoverageIndex::build(std::slice::from_ref(&deleting_batch), &records)?;
     assert_binding(
         &reloaded,
         "deleting-pair",

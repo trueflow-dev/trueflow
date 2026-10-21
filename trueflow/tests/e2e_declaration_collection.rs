@@ -13,7 +13,6 @@ use trueflow::config::BlockFilters;
 use trueflow::config::TrueflowConfig;
 use trueflow::declaration::capture::capture_declaration_sources;
 use trueflow::declaration::diff::{DeclarationDiff, diff_declarations};
-use trueflow::declaration::{Capability, Visibility};
 use trueflow::declaration::review::{
     DeclarationReviewDiffBatch, DeclarationReviewQuery, DeclarationReviewStatus,
     collect_declaration_review,
@@ -21,6 +20,7 @@ use trueflow::declaration::review::{
 use trueflow::declaration::snapshot::{
     PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId, SourceSnapshot,
 };
+use trueflow::declaration::{Capability, Visibility};
 use trueflow::github::PullRequestCommit;
 use trueflow::repo_path::RepoPath;
 use trueflow::review_scope::ScopePreset;

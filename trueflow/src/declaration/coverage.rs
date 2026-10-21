@@ -147,7 +147,11 @@ impl<'a> CandidateLookup<'a> {
         for (index, candidate) in candidates.iter().enumerate() {
             let locator = &candidate.locator;
             insert_match(&mut lookup.exact, locator, index);
-            insert_match(&mut lookup.same_path, SurfaceKey::of_locator(locator), index);
+            insert_match(
+                &mut lookup.same_path,
+                SurfaceKey::of_locator(locator),
+                index,
+            );
             for source in &candidate.rename_sources {
                 insert_match(&mut lookup.rename, SurfaceKey::of_locator(source), index);
             }
@@ -243,8 +247,7 @@ impl DeclarationCoverageIndex {
                 )
             })?;
 
-            let Some((kind, CandidateMatch::Unique(candidate_index))) = lookup.find(locator)
-            else {
+            let Some((kind, CandidateMatch::Unique(candidate_index))) = lookup.find(locator) else {
                 continue;
             };
             let candidate = &candidates[candidate_index];
@@ -324,12 +327,8 @@ fn collect_candidates(batches: &[DeclarationReviewDiffBatch]) -> Result<Vec<Cand
                     pair.id.as_str()
                 )
             })?;
-            let mut candidate = candidate_occurrence(
-                pair,
-                ReviewedChange::Surface,
-                head,
-                &declaration_match.head,
-            )?;
+            let mut candidate =
+                candidate_occurrence(pair, ReviewedChange::Surface, head, &declaration_match.head)?;
             if is_conservative_file_rename(pair, declaration_match) {
                 let base = pair.base.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
