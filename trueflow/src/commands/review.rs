@@ -1854,12 +1854,17 @@ mod tests {
             diff_selection: ReviewDiffSelection::None,
         };
         let review_check = ReviewCheck::review();
+        // Exactly the units coverage requires, so dropping one must uncover.
         let approvals = units
             .blocks
             .iter()
-            .filter(|unit| !unit.content.trim().is_empty())
+            .filter(|unit| {
+                query.filters.allows_subblock(unit.kind)
+                    && !should_skip_whitespace_only_by_default(unit, &query.filters)
+            })
             .map(|unit| approved_record_for_block(unit, "src/lib.rs"))
             .collect::<Vec<_>>();
+        assert!(approvals.len() > 1);
 
         for (approved, expected) in [(approvals.len(), true), (approvals.len() - 1, false)] {
             let database = ReviewDatabase::from_records(approvals[..approved].to_vec());
@@ -2077,18 +2082,23 @@ mod tests {
                 None,
                 "{mode} must retain the hidden shared generated unit as an ambiguous candidate"
             );
-            assert!(
-                !is_subblock_covered(
-                    &visible_parent,
-                    tree.find_block_node(file_path.as_str(), &visible_parent),
-                    Language::Text,
-                    &query,
-                    &coverage,
-                    &review_check,
-                    &file_path,
-                ),
-                "{mode} must not clear the visible parent from the shared coarse approval"
-            );
+            let visible_node = tree.find_block_node(file_path.as_str(), &visible_parent);
+            assert!(visible_node.is_some());
+            for node in [visible_node, None] {
+                assert!(
+                    !is_subblock_covered(
+                        &visible_parent,
+                        node,
+                        Language::Text,
+                        &query,
+                        &coverage,
+                        &review_check,
+                        &file_path,
+                    ),
+                    "{mode} must not clear the visible parent from the shared coarse approval \
+                     (node {node:?})"
+                );
+            }
             let presentation = collect_diff_review_presentation(
                 &query,
                 &review_files,

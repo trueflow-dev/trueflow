@@ -274,6 +274,9 @@ impl<'a> CoverageIndex<'a> {
 
     /// The review units that indexing cut from tree block `node_id`, if that
     /// node holds exactly `block` in `language` and split into review units.
+    /// Units depend only on the parent's language, kind, span, and exact
+    /// content; the hash alone would also match CRLF or trailing-space
+    /// variants whose units have different spans.
     pub fn review_units_for(
         &self,
         node_id: TreeNodeId,
@@ -285,7 +288,7 @@ impl<'a> CoverageIndex<'a> {
         let same_block = node.language == Some(language)
             && indexed.kind == block.kind
             && indexed.byte_span() == block.byte_span()
-            && indexed.hash == block.hash;
+            && indexed.content == block.content;
         if !same_block {
             return None;
         }
