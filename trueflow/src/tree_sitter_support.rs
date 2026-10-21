@@ -61,10 +61,10 @@ pub(crate) fn classify_kotlin_property_kind(text: &str) -> BlockKind {
     }
 }
 
-pub(crate) fn markdown_heading_level(kind: &str, start: usize, content: &str) -> Option<u8> {
-    match kind {
+pub(crate) fn markdown_heading_level(node: Node<'_>, content: &str) -> Option<u8> {
+    match node.kind() {
         "atx_heading" => {
-            let line = content.get(start..)?.lines().next()?;
+            let line = content.get(node.start_byte()..)?.lines().next()?;
             let level = line.chars().take_while(|ch| *ch == '#').count();
             if level > 0 {
                 u8::try_from(level.min(6)).ok()
@@ -72,15 +72,16 @@ pub(crate) fn markdown_heading_level(kind: &str, start: usize, content: &str) ->
                 None
             }
         }
+        // A setext heading starts at its title paragraph; the level lives in
+        // the underline child that follows it.
         "setext_heading" => {
-            let line = content.get(start..)?.lines().next()?;
-            if line.chars().all(|ch| ch == '=') {
-                Some(1)
-            } else if line.chars().all(|ch| ch == '-') {
-                Some(2)
-            } else {
-                None
-            }
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(|child| match child.kind() {
+                    "setext_h1_underline" => Some(1),
+                    "setext_h2_underline" => Some(2),
+                    _ => None,
+                })
         }
         _ => None,
     }

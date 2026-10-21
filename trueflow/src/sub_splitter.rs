@@ -732,7 +732,7 @@ fn collect_markdown_heading_spans(
 ) {
     let mut pending = vec![node];
     while let Some(current) = pending.pop() {
-        if let Some(level) = markdown_heading_level(current.kind(), current.start_byte(), content) {
+        if let Some(level) = markdown_heading_level(current, content) {
             headings.push(MarkdownHeadingSpan {
                 start: current.start_byte(),
                 end: current.end_byte(),
@@ -2451,7 +2451,10 @@ mod tests {
     fn test_java_type_review_units_cover_header_and_non_members() {
         let content = format!(
             "/** Worker docs. */\nclass Worker extends SecuredController {{\n    static {{\n        init();\n    }}\n\n    private final int scale = 2;\n{}}}\n",
-            padded_members("\n    int process{n}(int value) {\n        return value * scale;\n    }\n", 8)
+            padded_members(
+                "\n    int process{n}(int value) {\n        return value * scale;\n    }\n",
+                8
+            )
         );
         let units = assert_review_units_tile_parent(&content, BlockKind::Class, Language::Java);
         assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
@@ -2467,7 +2470,10 @@ mod tests {
     fn test_kotlin_type_review_units_cover_header_and_enum_entries() {
         let content = format!(
             "enum class Mode(val weight: Int) : Weighted {{\n    FAST(1),\n    SLOW(2);\n{}}}\n",
-            padded_members("\n    fun weigh{n}(value: Int): Int {\n        return value * weight\n    }\n", 8)
+            padded_members(
+                "\n    fun weigh{n}(value: Int): Int {\n        return value * weight\n    }\n",
+                8
+            )
         );
         let units = assert_review_units_tile_parent(&content, BlockKind::Enum, Language::Kotlin);
         assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
@@ -2482,7 +2488,10 @@ mod tests {
     fn test_csharp_type_review_units_cover_header_and_operators() {
         let content = format!(
             "public class Money : IComparable {{\n    public static Money operator +(Money a, Money b) => a;\n{}}}\n",
-            padded_members("\n    public int Scale{n}(int value) {\n        return value;\n    }\n", 8)
+            padded_members(
+                "\n    public int Scale{n}(int value) {\n        return value;\n    }\n",
+                8
+            )
         );
         let units = assert_review_units_tile_parent(&content, BlockKind::Class, Language::CSharp);
         assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
@@ -2497,7 +2506,10 @@ mod tests {
     fn test_php_type_review_units_cover_header() {
         let content = format!(
             "class Worker extends BaseController {{\n{}}}\n",
-            padded_members("\n    public function process{n}($value) {\n        return $value;\n    }\n", 8)
+            padded_members(
+                "\n    public function process{n}($value) {\n        return $value;\n    }\n",
+                8
+            )
         );
         let units = assert_review_units_tile_parent(&content, BlockKind::Class, Language::Php);
         assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));

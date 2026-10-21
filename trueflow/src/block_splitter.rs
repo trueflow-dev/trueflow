@@ -1322,7 +1322,7 @@ fn collect_markdown_headings(
 ) {
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if let Some(level) = markdown_heading_level(current.kind(), current.start_byte(), content) {
+        if let Some(level) = markdown_heading_level(current, content) {
             headings.push(MarkdownHeading {
                 start: current.start_byte(),
                 end: current.end_byte(),
@@ -2652,6 +2652,21 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].content, "# Root\n## Sub\n### SubSub\n");
         assert_eq!(blocks[1].content, "# Root 2");
+    }
+
+    #[test]
+    fn test_split_markdown_setext_headers() {
+        let blocks = split_blocks(
+            "Guide\n=====\n\nIntro.\n\nReference\n=========\n\nDetails.\n",
+            Language::Markdown,
+        );
+
+        assert_eq!(
+            blocks.iter().map(|block| block.kind).collect::<Vec<_>>(),
+            vec![BlockKind::Section, BlockKind::Section]
+        );
+        assert_eq!(blocks[0].content, "Guide\n=====\n\nIntro.\n\n");
+        assert!(blocks[1].content.starts_with("Reference\n========="));
     }
 
     #[test]
