@@ -30,10 +30,15 @@ pub enum BlockKind {
     Enum,
     #[serde(rename = "impl")]
     Impl,
+    /// A body-less module or package declaration (`mod x;`, `package x`),
+    /// reviewed like an import.
     #[serde(rename = "module")]
     Module,
     #[serde(rename = "Modules")]
     Modules,
+    /// A module or namespace with a body of its own code.
+    #[serde(rename = "namespace")]
+    Namespace,
     #[serde(rename = "import")]
     Import,
     #[serde(rename = "const")]
@@ -100,6 +105,7 @@ impl BlockKind {
                 | BlockKind::Class
                 | BlockKind::Struct
                 | BlockKind::Enum
+                | BlockKind::Namespace
                 | BlockKind::Section
         )
     }
@@ -141,6 +147,7 @@ impl BlockKind {
             BlockKind::Impl => "impl",
             BlockKind::Module => "module",
             BlockKind::Modules => "Modules",
+            BlockKind::Namespace => "namespace",
             BlockKind::Import => "import",
             BlockKind::Const => "const",
             BlockKind::Static => "static",
@@ -197,6 +204,7 @@ impl FromStr for BlockKind {
             "impl" => BlockKind::Impl,
             "module" => BlockKind::Module,
             "modules" => BlockKind::Modules,
+            "namespace" => BlockKind::Namespace,
             "import" => BlockKind::Import,
             "const" => BlockKind::Const,
             "static" => BlockKind::Static,
@@ -575,6 +583,7 @@ mod tests {
             BlockKind::Impl,
             BlockKind::Module,
             BlockKind::Modules,
+            BlockKind::Namespace,
             BlockKind::Import,
             BlockKind::Const,
             BlockKind::Static,

@@ -59,7 +59,7 @@ fn classify_assignment_like(node: Node<'_>, content: &str) -> BlockKind {
             return BlockKind::Import;
         }
         if value.kind() == "table_constructor" {
-            return BlockKind::Module;
+            return BlockKind::Namespace;
         }
         if value.kind() == "function_definition" {
             return classify_function_value(
@@ -99,7 +99,7 @@ fn classify_return_statement(node: Node<'_>, content: &str) -> BlockKind {
         BlockKind::Import
     } else {
         match value.kind() {
-            "table_constructor" => BlockKind::Module,
+            "table_constructor" => BlockKind::Namespace,
             "function_definition" => BlockKind::Function,
             _ => BlockKind::Export,
         }
@@ -229,7 +229,7 @@ fn call_name(node: Node<'_>, content: &str) -> Option<String> {
 }
 
 fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<NestedBlock> {
-    if map_kind(node, content) != BlockKind::Module {
+    if map_kind(node, content) != BlockKind::Namespace {
         return Vec::new();
     }
 
@@ -310,7 +310,7 @@ fn classify_field(node: Node<'_>, content: &str) -> BlockKind {
         return BlockKind::Import;
     }
     if value.kind() == "table_constructor" {
-        return BlockKind::Module;
+        return BlockKind::Namespace;
     }
     if value.kind() == "function_definition" {
         return classify_function_value(target, value, content, true);
@@ -330,7 +330,7 @@ fn classify_positional_table_child(node: Node<'_>, content: &str) -> BlockKind {
 
     match node.kind() {
         "comment" => BlockKind::Comment,
-        "table_constructor" => BlockKind::Module,
+        "table_constructor" => BlockKind::Namespace,
         "function_definition" => BlockKind::Function,
         _ => BlockKind::CodeParagraph,
     }
@@ -342,7 +342,7 @@ fn sub_split(kind: BlockKind) -> SubSplitRegistration {
             semantics: LanguageSubSplitSemantics::ReviewUnits,
             splitter: split_function_like,
         },
-        BlockKind::Module => SubSplitRegistration {
+        BlockKind::Namespace => SubSplitRegistration {
             semantics: LanguageSubSplitSemantics::ReviewUnits,
             splitter: split_module_like,
         },
@@ -700,7 +700,7 @@ mod tests {
         let source =
             "local M = {\n  value = 1,\n\n  run = function()\n    return 2\n  end,\n}\nreturn M\n";
         let block =
-            Block::from_file_range(source, BlockKind::Module, ByteSpan::new(0, source.len()))
+            Block::from_file_range(source, BlockKind::Namespace, ByteSpan::new(0, source.len()))
                 .unwrap();
 
         let blocks = split_module_like(&block).unwrap();

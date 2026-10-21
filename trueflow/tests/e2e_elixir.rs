@@ -50,7 +50,7 @@ fn test_elixir_fixture_detects_structural_blocks_and_test_tags() -> Result<()> {
         "expected alias/import/use block: {lib_kinds:?}"
     );
     assert!(
-        lib_kinds.contains(&"module"),
+        lib_kinds.contains(&"namespace"),
         "expected module block: {lib_kinds:?}"
     );
     assert!(
@@ -87,7 +87,7 @@ fn test_elixir_fixture_detects_structural_blocks_and_test_tags() -> Result<()> {
     let describe_block = test_blocks
         .iter()
         .find(|block| {
-            block["kind"].as_str() == Some("module")
+            block["kind"].as_str() == Some("namespace")
                 && block["content"]
                     .as_str()
                     .is_some_and(|content| content.contains("describe \"run/1\" do"))
@@ -204,7 +204,7 @@ fn test_elixir_test_module_sub_split_preserves_content_without_descendant_overla
         blocks
             .iter()
             .find(|block| {
-                block.kind == BlockKind::Module
+                block.kind == BlockKind::Namespace
                     && block.content.contains("defmodule Demo.WorkerTest do")
             })
             .cloned()
@@ -228,7 +228,7 @@ fn test_elixir_test_module_sub_split_preserves_content_without_descendant_overla
         module_block.content
     );
     assert!(kinds.contains(&BlockKind::Import), "kinds={kinds:?}");
-    assert!(kinds.contains(&BlockKind::Module), "kinds={kinds:?}");
+    assert!(kinds.contains(&BlockKind::Namespace), "kinds={kinds:?}");
     assert!(kinds.contains(&BlockKind::Function), "kinds={kinds:?}");
 
     Ok(())
@@ -295,7 +295,7 @@ fn test_elixir_sub_block_support_for_function_and_module_blocks() -> Result<()> 
         blocks
             .iter()
             .find(|block| {
-                block.kind == BlockKind::Module
+                block.kind == BlockKind::Namespace
                     && block.content.contains("defmodule Demo.Worker do")
             })
             .cloned()

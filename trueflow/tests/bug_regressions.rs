@@ -296,10 +296,7 @@ fn test_optimizer_module_merge_preserves_content() -> Result<()> {
 #[test]
 fn test_optimizer_module_merge_preserves_test_tags() -> Result<()> {
     let repo = TestRepo::new("optimizer_module_tags")?;
-    repo.write(
-        "src/lib.rs",
-        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {}\n}\n\nmod helper {\n    pub fn noop() {}\n}\n",
-    )?;
+    repo.write("src/lib.rs", "#[cfg(test)]\nmod tests;\n\nmod helper;\n")?;
 
     let scan = repo.scan_without_cache()?;
     let blocks = &scan
@@ -2521,4 +2518,73 @@ fn review_file_target_rejects_stable_external_symlink_sentinel() -> Result<()> {
         "file:src/link.rs",
         "--json",
     ])?)
+}
+
+fn unreviewed_contents(summary: &trueflow::commands::review::ReviewSummary) -> Vec<String> {
+    summary
+        .files
+        .iter()
+        .flat_map(|file| file.blocks.iter())
+        .map(|block| block.content.clone())
+        .collect()
+}
+
+#[test]
+fn inline_module_outside_lib_rs_is_reviewable() -> Result<()> {
+    let repo = TestRepo::new("inline_module_reviewable")?;
+    repo.write("src/main.rs", "mod util;\n")?;
+    repo.write(
+        "src/util.rs",
+        "pub mod inner {\n    pub fn run() { std::fs::remove_dir_all(\"/\").unwrap(); }\n}\n",
+    )?;
+    repo.commit_all("Add inline module")?;
+
+    let summary = review_all(&repo)?;
+    let contents = unreviewed_contents(&summary);
+    assert_eq!(summary.total_blocks, 1, "only the inline module: {contents:?}");
+    assert!(
+        contents.iter().any(|content| content.contains("fn run")),
+        "inline module body must be reviewable: {contents:?}"
+    );
+    assert!(
+        !contents.iter().any(|content| content.trim() == "mod util;"),
+        "body-less module declaration stays import-like: {contents:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cpp_namespace_is_reviewable() -> Result<()> {
+    let repo = TestRepo::new("cpp_namespace_reviewable")?;
+    repo.write(
+        "src/net.cpp",
+        "namespace net {\n#ifdef _WIN32\nint init(){ system(\"x\"); return 1; }\n#endif\n}\n",
+    )?;
+    repo.commit_all("Add namespace")?;
+
+    let summary = review_all(&repo)?;
+    let contents = unreviewed_contents(&summary);
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("system(\"x\")")),
+        "namespace body must be reviewable: {contents:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn sql_alter_role_is_reviewable() -> Result<()> {
+    let repo = TestRepo::new("sql_alter_role_reviewable")?;
+    repo.write("db/roles.sql", "ALTER ROLE app SUPERUSER;\n")?;
+    repo.commit_all("Add role change")?;
+
+    let summary = review_all(&repo)?;
+    assert_eq!(
+        summary.total_blocks,
+        1,
+        "role DDL must be reviewable: {:?}",
+        unreviewed_contents(&summary)
+    );
+    Ok(())
 }

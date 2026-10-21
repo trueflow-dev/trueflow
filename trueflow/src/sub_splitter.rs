@@ -345,7 +345,7 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
             SplitPlan::PythonFunctionReviewUnits
         }
         Language::Ruby if matches!(kind, BlockKind::Method) => SplitPlan::RubyMethodReviewUnits,
-        Language::Ruby if matches!(kind, BlockKind::Module | BlockKind::Class) => {
+        Language::Ruby if matches!(kind, BlockKind::Namespace | BlockKind::Class) => {
             SplitPlan::RubyScopeReviewUnits
         }
         Language::JavaScript | Language::TypeScript
@@ -1860,7 +1860,7 @@ fn collect_ruby_scope_items(scope_node: tree_sitter::Node<'_>, content: &str) ->
         .filter_map(|child| {
             let kind = match child.kind() {
                 "class" => BlockKind::Class,
-                "module" => BlockKind::Module,
+                "module" => BlockKind::Namespace,
                 "method" | "singleton_method" => BlockKind::Method,
                 "assignment" if ruby_assignment_targets_constant(child) => BlockKind::Const,
                 "call" if ruby_call_is_import(child, content) => BlockKind::Import,
@@ -2433,17 +2433,17 @@ mod tests {
     #[test]
     fn test_split_ruby_module_into_members() {
         let content = "module Trueflow\n  DEFAULT_LIMIT = 4\n\n  module Formatting\n    def self.render(values)\n      values.join(\",\")\n    end\n  end\n\n  class Processor\n    SCALE = 2\n\n    def process(values)\n      values.map { |value| value * SCALE }\n    end\n  end\nend\n";
-        let block = make_block(content, BlockKind::Module);
+        let block = make_block(content, BlockKind::Namespace);
         let chunks = split_result_for_child_navigation(&block, Language::Ruby)
             .unwrap()
             .blocks;
         assert!(chunks.iter().any(|block| block.kind == BlockKind::Const));
-        assert!(chunks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(chunks.iter().any(|block| block.kind == BlockKind::Namespace));
         assert!(chunks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(
             !chunks
                 .iter()
-                .any(|block| block.kind == BlockKind::Module && block.content == content)
+                .any(|block| block.kind == BlockKind::Namespace && block.content == content)
         );
     }
 

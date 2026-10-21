@@ -34,7 +34,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
             semantics: LanguageSubSplitSemantics::ReviewUnits,
             splitter: split_function_like_block,
         },
-        BlockKind::Module | BlockKind::Interface | BlockKind::Impl => SubSplitRegistration {
+        BlockKind::Namespace | BlockKind::Interface | BlockKind::Impl => SubSplitRegistration {
             semantics: LanguageSubSplitSemantics::ReviewUnits,
             splitter: split_module_like_block,
         },
@@ -56,7 +56,7 @@ fn map_kind(node: Node<'_>, content: &str) -> BlockKind {
 fn map_call_kind(node: Node<'_>, content: &str) -> BlockKind {
     match call_target_name(node, content).as_deref() {
         Some("alias" | "import" | "require" | "use") => BlockKind::Import,
-        Some("defmodule" | "describe") => BlockKind::Module,
+        Some("defmodule" | "describe") => BlockKind::Namespace,
         Some("defprotocol") => BlockKind::Interface,
         Some("defimpl") => BlockKind::Impl,
         Some("defmacro" | "defmacrop" | "defguard" | "defguardp") => BlockKind::Macro,
@@ -72,7 +72,7 @@ fn is_attribute_node(kind: &str) -> bool {
 fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<NestedBlock> {
     if !matches!(
         map_kind(node, content),
-        BlockKind::Module | BlockKind::Interface | BlockKind::Impl
+        BlockKind::Namespace | BlockKind::Interface | BlockKind::Impl
     ) {
         return Vec::new();
     }
@@ -164,7 +164,7 @@ fn collect_container_blocks(
                         recurse: recurse
                             && matches!(
                                 kind,
-                                BlockKind::Module | BlockKind::Interface | BlockKind::Impl
+                                BlockKind::Namespace | BlockKind::Interface | BlockKind::Impl
                             ),
                     });
                     pending_start = None;

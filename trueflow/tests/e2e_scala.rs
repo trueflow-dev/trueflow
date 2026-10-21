@@ -42,7 +42,7 @@ fn test_scala_fixture_detects_language_and_structural_blocks() -> Result<()> {
     let workflow_kinds = non_gap_kinds(workflow_blocks);
 
     for expected in [
-        "module",
+        "namespace",
         "import",
         "const",
         "variable",

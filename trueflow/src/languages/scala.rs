@@ -71,6 +71,7 @@ fn map_kind(node: Node<'_>, content: &str) -> BlockKind {
 fn classify_node(node: Node<'_>, content: &str, in_container: bool) -> BlockKind {
     match node.kind() {
         "comment" | "block_comment" => BlockKind::Comment,
+        "package_clause" if node.child_by_field_name("body").is_some() => BlockKind::Namespace,
         "package_clause" => BlockKind::Module,
         "import_declaration" => BlockKind::Import,
         "export_declaration" => BlockKind::Export,

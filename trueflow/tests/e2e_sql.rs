@@ -56,7 +56,7 @@ fn test_sql_fixture_detects_language_and_structural_statement_blocks() -> Result
         schema_kinds.contains(&"enum") || schema_kinds.contains(&"type"),
         "kinds={schema_kinds:?}"
     );
-    assert!(schema_kinds.contains(&"module"), "kinds={schema_kinds:?}");
+    assert!(schema_kinds.contains(&"type"), "kinds={schema_kinds:?}");
     assert!(schema_kinds.contains(&"function"), "kinds={schema_kinds:?}");
     assert!(schema_kinds.contains(&"code"), "kinds={schema_kinds:?}");
     assert!(
@@ -77,7 +77,7 @@ fn test_sql_fixture_detects_language_and_structural_statement_blocks() -> Result
     );
     assert_eq!(
         find_block(schema_blocks, "CREATE VIEW active_accounts")?["kind"].as_str(),
-        Some("module")
+        Some("type")
     );
     assert_eq!(
         find_block(schema_blocks, "CREATE FUNCTION normalize_email")?["kind"].as_str(),
@@ -93,7 +93,7 @@ fn test_sql_fixture_detects_language_and_structural_statement_blocks() -> Result
     );
     assert_eq!(
         find_block(schema_blocks, "DROP VIEW IF EXISTS legacy_accounts")?["kind"].as_str(),
-        Some("module")
+        Some("type")
     );
     for needle in [
         "SELECT id, email\nFROM active_accounts",
@@ -155,7 +155,7 @@ fn test_sql_top_level_split_is_statement_aligned_and_structured() -> Result<()> 
         .iter()
         .find(|block| block.content.contains("CREATE VIEW active_accounts"))
         .context("missing create view block")?;
-    assert_eq!(create_view.kind, BlockKind::Module);
+    assert_eq!(create_view.kind, BlockKind::Type);
     assert!(create_view.content.contains("SELECT id, email, status"));
     assert!(create_view.content.trim_end().ends_with(';'));
     assert!(

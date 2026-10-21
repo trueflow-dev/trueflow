@@ -161,13 +161,13 @@ fn statement_primary_node(statement: Node<'_>) -> Option<Node<'_>> {
 fn classify_statement_node(node: Node<'_>) -> BlockKind {
     match node.kind() {
         "create_table" | "alter_table" | "drop_table" => BlockKind::Struct,
-        "create_view" | "create_materialized_view" | "alter_view" | "drop_view" => {
-            BlockKind::Module
-        }
+        "create_view" | "create_materialized_view" | "alter_view" | "drop_view" => BlockKind::Type,
         "create_function" | "drop_function" | "create_trigger" => BlockKind::Function,
-        "create_schema" | "create_database" | "create_extension" | "alter_schema"
-        | "alter_database" | "drop_schema" | "drop_database" | "drop_extension" | "create_role"
-        | "alter_role" | "drop_role" => BlockKind::Module,
+        "create_schema" | "create_database" | "alter_schema" | "alter_database" | "drop_schema"
+        | "drop_database" => BlockKind::Namespace,
+        "create_extension" | "drop_extension" | "create_role" | "alter_role" | "drop_role" => {
+            BlockKind::Code
+        }
         "create_sequence" | "alter_sequence" | "drop_sequence" => BlockKind::Variable,
         "create_index" | "alter_index" | "drop_index" => BlockKind::Type,
         "create_type" => classify_create_type(node),
@@ -199,7 +199,7 @@ fn classify_statement_text_prefix(statement_text: &str) -> BlockKind {
         || text.starts_with("alter view")
         || text.starts_with("drop view")
     {
-        return BlockKind::Module;
+        return BlockKind::Type;
     }
     if text.starts_with("create function")
         || text.starts_with("drop function")
@@ -226,7 +226,7 @@ fn classify_statement_text_prefix(statement_text: &str) -> BlockKind {
         || text.starts_with("drop schema")
         || text.starts_with("drop database")
     {
-        return BlockKind::Module;
+        return BlockKind::Namespace;
     }
 
     BlockKind::Code
@@ -387,5 +387,30 @@ mod tests {
             classify_statement_text_prefix("COMMENT ON TABLE t IS 'x';"),
             BlockKind::Code
         );
+    }
+
+    #[test]
+    fn schema_ddl_is_not_import_like() {
+        for source in [
+            "CREATE VIEW v AS SELECT 1;\n",
+            "DROP VIEW v;\n",
+            "CREATE SCHEMA app;\n",
+            "DROP SCHEMA app;\n",
+            "CREATE DATABASE app;\n",
+            "DROP DATABASE app;\n",
+            "CREATE ROLE app;\n",
+            "ALTER ROLE app SUPERUSER;\n",
+            "DROP ROLE app;\n",
+        ] {
+            let (_, blocks) = split_source(source);
+            assert!(!blocks.is_empty(), "{source:?} must produce a block");
+            assert!(
+                blocks.iter().all(|block| !block.kind.is_import_like()),
+                "{source:?} must be reviewable: {blocks:#?}"
+            );
+        }
+        for text in ["create view v as select 1", "drop schema app", "alter database app"] {
+            assert!(!classify_statement_text_prefix(text).is_import_like(), "{text}");
+        }
     }
 }

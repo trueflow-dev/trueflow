@@ -92,7 +92,7 @@ fn map_kind(node: Node<'_>, content: &str) -> BlockKind {
     match node.kind() {
         "comment" | "directive" | "line_number_directive" | "shebang" => BlockKind::Comment,
         "open_module" | "include_module" => BlockKind::Import,
-        "module_definition" => BlockKind::Module,
+        "module_definition" => BlockKind::Namespace,
         "module_type_definition" | "class_type_definition" => BlockKind::Interface,
         "class_definition" => BlockKind::Class,
         "type_definition" => classify_type_definition(node),
@@ -162,7 +162,7 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
             semantics: LanguageSubSplitSemantics::ReviewUnits,
             splitter: split_function_like,
         },
-        BlockKind::Module | BlockKind::Interface => SubSplitRegistration {
+        BlockKind::Namespace | BlockKind::Interface => SubSplitRegistration {
             semantics: LanguageSubSplitSemantics::ReviewUnits,
             splitter: split_module_like,
         },
@@ -276,7 +276,7 @@ fn collect_nested_file_blocks(node: Node<'_>, content: &str, lang: Language) -> 
                 };
                 let children = collect_immediate_nested_blocks(container, content);
                 for child in children.into_iter().rev() {
-                    if matches!(child.kind, BlockKind::Module | BlockKind::Interface) {
+                    if matches!(child.kind, BlockKind::Namespace | BlockKind::Interface) {
                         let child_node =
                             find_named_node_by_span(current, child.start_byte, child.end_byte)
                                 .or_else(|| {

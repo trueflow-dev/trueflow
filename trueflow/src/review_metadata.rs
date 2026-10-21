@@ -104,6 +104,7 @@ pub fn parent_kind_label(kind: BlockKind) -> &'static str {
         | BlockKind::Type => "Definitions",
         BlockKind::Module
         | BlockKind::Modules
+        | BlockKind::Namespace
         | BlockKind::Import
         | BlockKind::Imports
         | BlockKind::Export
@@ -138,7 +139,9 @@ fn block_identifier(block: &crate::block::Block) -> Option<String> {
         BlockKind::Class => extract_named_declaration(line, &["class"]),
         BlockKind::Interface => extract_named_declaration(line, &["interface", "protocol"]),
         BlockKind::Type => extract_named_declaration(line, &["type", "typealias"]),
-        BlockKind::Module => extract_named_declaration(line, &["module", "mod", "namespace"]),
+        BlockKind::Module | BlockKind::Namespace => {
+            extract_named_declaration(line, &["module", "mod", "namespace"])
+        }
         BlockKind::Const => extract_named_declaration(line, &["const"]),
         BlockKind::Static => extract_named_declaration(line, &["static"]),
         BlockKind::Variable => extract_named_declaration(line, &["let", "var", "val", "const"]),

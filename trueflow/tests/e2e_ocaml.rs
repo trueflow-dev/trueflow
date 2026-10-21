@@ -70,7 +70,7 @@ fn test_ocaml_fixture_scan_detects_language_and_structural_blocks() -> Result<()
     );
     assert_eq!(
         find_block(ml_blocks, "module Helpers = struct")?["kind"].as_str(),
-        Some("module")
+        Some("namespace")
     );
     assert_eq!(
         find_block(ml_blocks, "type job = {")?["kind"].as_str(),
@@ -109,7 +109,7 @@ fn test_ocaml_fixture_scan_detects_language_and_structural_blocks() -> Result<()
     );
     assert_eq!(
         find_block(mli_blocks, "module Helpers : sig")?["kind"].as_str(),
-        Some("module")
+        Some("namespace")
     );
     assert_eq!(
         find_block(mli_blocks, "val render : int -> string")?["kind"].as_str(),
@@ -187,7 +187,8 @@ fn test_ocaml_function_and_module_sub_blocks_are_reviewable() -> Result<()> {
         blocks
             .iter()
             .find(|block| {
-                block.kind == BlockKind::Module && block.content.contains("module Helpers = struct")
+                block.kind == BlockKind::Namespace
+                    && block.content.contains("module Helpers = struct")
             })
             .cloned()
             .context("expected OCaml Helpers module block")?,
@@ -212,7 +213,7 @@ fn test_ocaml_function_and_module_sub_blocks_are_reviewable() -> Result<()> {
         BlockKind::Struct,
         BlockKind::Enum,
         BlockKind::Const,
-        BlockKind::Module,
+        BlockKind::Namespace,
         BlockKind::Function,
     ] {
         assert!(

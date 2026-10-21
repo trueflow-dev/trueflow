@@ -40,7 +40,7 @@ fn test_cpp_fixture_detects_language_and_structural_blocks() -> Result<()> {
         kinds.contains(&"import") || kinds.contains(&"Imports"),
         "expected C++ import block in fixture (kinds={kinds:?})"
     );
-    for expected in ["module", "type", "enum", "class", "method", "function"] {
+    for expected in ["namespace", "type", "enum", "class", "method", "function"] {
         assert!(
             kinds.contains(&expected),
             "expected C++ {expected} block in fixture (kinds={kinds:?})"

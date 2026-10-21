@@ -31,7 +31,7 @@ fn test_lua_fixture_scan_detects_language_and_structural_blocks() -> Result<()> 
         "expected import-like block in lua fixture (kinds={kinds:?})"
     );
 
-    for expected_kind in ["module", "function", "method", "const", "variable"] {
+    for expected_kind in ["namespace", "function", "method", "const", "variable"] {
         assert!(
             kinds.contains(&expected_kind),
             "expected {expected_kind} block in lua fixture (kinds={kinds:?})"
@@ -149,7 +149,7 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
     let defaults_module = blocks
         .iter()
         .find(|block| {
-            block.kind == BlockKind::Module && block.content.contains("local Defaults = {")
+            block.kind == BlockKind::Namespace && block.content.contains("local Defaults = {")
         })
         .cloned()
         .context("expected Defaults module block")?;
@@ -172,7 +172,7 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
         "expected Defaults module review units to expose variable fields: {defaults_kinds:?}"
     );
     assert!(
-        defaults_kinds.contains(&BlockKind::Module),
+        defaults_kinds.contains(&BlockKind::Namespace),
         "expected Defaults module review units to expose nested tables: {defaults_kinds:?}"
     );
     assert!(
@@ -187,7 +187,8 @@ fn test_lua_fixture_sub_splitting_supports_assigned_functions_and_modules() -> R
     let aliases_module = blocks
         .iter()
         .find(|block| {
-            block.kind == BlockKind::Module && block.content.trim_start().starts_with("aliases = {")
+            block.kind == BlockKind::Namespace
+                && block.content.trim_start().starts_with("aliases = {")
         })
         .cloned()
         .context("expected aliases module block")?;
@@ -254,7 +255,7 @@ fn test_lua_module_sub_splitting_handles_leading_comments() -> Result<()> {
     let content = "-- Module preface\nlocal M = {\n  value = 1,\n}\n";
     let block = Block::new(
         content.to_string(),
-        BlockKind::Module,
+        BlockKind::Namespace,
         LineSpan::new(0, content.lines().count()),
         ByteSpan::new(0, content.len()),
     );

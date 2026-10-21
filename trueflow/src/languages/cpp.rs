@@ -38,7 +38,7 @@ fn classify_node(node: Node<'_>, content: &str, in_container: bool) -> Option<Bl
     match node.kind() {
         "comment" => Some(BlockKind::Comment),
         "preproc_include" => Some(BlockKind::Import),
-        "namespace_definition" => Some(BlockKind::Module),
+        "namespace_definition" => Some(BlockKind::Namespace),
         "alias_declaration" => Some(BlockKind::Type),
         "using_declaration" => Some(BlockKind::Import),
         "class_specifier" => Some(BlockKind::Class),
@@ -298,7 +298,7 @@ fn sub_split(kind: BlockKind) -> SubSplitRegistration {
             semantics: LanguageSubSplitSemantics::ReviewUnits,
             splitter: split_function_like,
         },
-        BlockKind::Class | BlockKind::Struct | BlockKind::Enum | BlockKind::Module => {
+        BlockKind::Class | BlockKind::Struct | BlockKind::Enum | BlockKind::Namespace => {
             SubSplitRegistration {
                 semantics: LanguageSubSplitSemantics::StructuralChildren,
                 splitter: split_container_like,

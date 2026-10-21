@@ -1353,7 +1353,7 @@ fn map_kind_for_node(lang: Language, node: tree_sitter::Node<'_>, content: &str)
         Language::Kotlin => map_kotlin_kind(node, content),
         Language::Ruby => map_ruby_kind(node, content),
         Language::C => map_c_kind(node, content),
-        _ => map_kind(lang, node.kind()),
+        _ => map_kind(lang, node),
     }
 }
 
@@ -1410,7 +1410,18 @@ fn elisp_form_name<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&
     }
 }
 
-fn map_kind(lang: Language, kind: &str) -> BlockKind {
+/// Body-less module declarations (`mod a;`, `namespace Foo;`) are
+/// import-like; a module with a body holds reviewable code.
+fn module_declaration_kind(node: tree_sitter::Node<'_>) -> BlockKind {
+    if node.child_by_field_name("body").is_some() {
+        BlockKind::Namespace
+    } else {
+        BlockKind::Module
+    }
+}
+
+fn map_kind(lang: Language, node: tree_sitter::Node<'_>) -> BlockKind {
+    let kind = node.kind();
     match lang {
         Language::Rust => match kind {
             "function_item" => BlockKind::Function,
@@ -1418,7 +1429,8 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             "enum_item" => BlockKind::Enum,
             "impl_item" => BlockKind::Impl,
             "trait_item" => BlockKind::Interface,
-            "mod_item" | "foreign_mod_item" => BlockKind::Module,
+            "mod_item" => module_declaration_kind(node),
+            "foreign_mod_item" => BlockKind::Module,
             "use_declaration" | "extern_crate_declaration" => BlockKind::Import,
             "const_item" => BlockKind::Const,
             "static_item" => BlockKind::Static,
@@ -1435,7 +1447,8 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             _ => BlockKind::Code,
         },
         Language::Java => match kind {
-            "package_declaration" | "module_declaration" => BlockKind::Module,
+            "package_declaration" => BlockKind::Module,
+            "module_declaration" => BlockKind::Namespace,
             "import_declaration" => BlockKind::Import,
             "class_declaration" => BlockKind::Class,
             "interface_declaration" => BlockKind::Interface,
@@ -1450,7 +1463,8 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             _ => BlockKind::Code,
         },
         Language::CSharp => match kind {
-            "namespace_declaration" | "file_scoped_namespace_declaration" => BlockKind::Module,
+            "namespace_declaration" => BlockKind::Namespace,
+            "file_scoped_namespace_declaration" => BlockKind::Module,
             "using_directive" => BlockKind::Import,
             "class_declaration" => BlockKind::Class,
             "interface_declaration" => BlockKind::Interface,
@@ -1463,7 +1477,7 @@ fn map_kind(lang: Language, kind: &str) -> BlockKind {
             _ => BlockKind::Code,
         },
         Language::Php => match kind {
-            "namespace_definition" => BlockKind::Module,
+            "namespace_definition" => module_declaration_kind(node),
             "namespace_use_declaration" => BlockKind::Import,
             "class_declaration" => BlockKind::Class,
             "interface_declaration" => BlockKind::Interface,
@@ -1511,7 +1525,7 @@ fn map_kotlin_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
 fn map_ruby_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
     match node.kind() {
         "class" => BlockKind::Class,
-        "module" => BlockKind::Module,
+        "module" => BlockKind::Namespace,
         "method" | "singleton_method" => BlockKind::Method,
         "assignment" => {
             if ruby_assignment_targets_constant(node) {
@@ -1656,7 +1670,7 @@ fn collect_java_type_items(
     let mut blocks = Vec::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
-        let kind = map_kind(lang, child.kind());
+        let kind = map_kind(lang, child);
         if matches!(kind, BlockKind::Code) {
             continue;
         }
@@ -1741,7 +1755,7 @@ fn collect_csharp_declaration_blocks(
     content: &str,
     lang: Language,
 ) -> Result<Vec<Block>> {
-    let kind = map_kind(lang, node.kind());
+    let kind = map_kind(lang, node);
     let mut blocks = Vec::new();
 
     if !matches!(kind, BlockKind::Code) {
@@ -1844,7 +1858,7 @@ fn collect_php_type_items(
     let mut blocks = Vec::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
-        let kind = map_kind(lang, child.kind());
+        let kind = map_kind(lang, child);
         if matches!(kind, BlockKind::Code) {
             continue;
         }
@@ -2619,7 +2633,7 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(result.strategy, BlockSplitStrategy::Structured);
         let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Namespace));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
@@ -2649,7 +2663,7 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(result.strategy, BlockSplitStrategy::Structured);
         let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Module));
+        assert!(blocks.iter().any(|block| block.kind == BlockKind::Namespace));
         assert!(
             blocks
                 .iter()
@@ -3123,6 +3137,39 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         let blocks = split_blocks("(use-package foo)\n", Language::Elisp);
         assert_eq!(blocks.len(), 1, "{blocks:#?}");
         assert_eq!(blocks[0].kind, BlockKind::Import);
+    }
+
+    #[test]
+    fn only_bodyless_module_declarations_are_import_like() {
+        for (content, language) in [
+            ("pub mod inner {\n    pub fn run() {}\n}\n", Language::Rust),
+            ("namespace net {\nint init() { return 1; }\n}\n", Language::Cpp),
+            ("namespace Net {\n    class Client {}\n}\n", Language::CSharp),
+            ("<?php\nnamespace Net {\n    function init() {}\n}\n", Language::Php),
+            ("module Net\n  LIMIT = 4\nend\n", Language::Ruby),
+        ] {
+            let blocks = split_blocks(content, language);
+            let bodied = blocks
+                .iter()
+                .find(|block| block.content.contains('\n'))
+                .unwrap_or_else(|| panic!("{content:?}: {blocks:#?}"));
+            assert!(
+                !bodied.kind.is_import_like(),
+                "{content:?} must be reviewable: {blocks:#?}"
+            );
+        }
+
+        for (content, language) in [
+            ("mod a;\n", Language::Rust),
+            ("namespace Net;\n", Language::CSharp),
+            ("<?php\nnamespace Net;\n", Language::Php),
+        ] {
+            let blocks = split_blocks(content, language);
+            assert!(
+                blocks.iter().any(|block| block.kind.is_import_like()),
+                "{content:?} stays import-like: {blocks:#?}"
+            );
+        }
     }
 
     #[test]

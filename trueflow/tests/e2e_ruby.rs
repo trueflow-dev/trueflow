@@ -30,7 +30,7 @@ fn test_ruby_fixture_detects_language_and_structural_blocks() -> Result<()> {
         "expected require block: {kinds:?}"
     );
     assert!(
-        kinds.contains(&"module"),
+        kinds.contains(&"namespace"),
         "expected module block: {kinds:?}"
     );
     assert!(kinds.contains(&"class"), "expected class block: {kinds:?}");
@@ -152,7 +152,7 @@ fn test_ruby_inspect_split_returns_structural_children_for_large_module() -> Res
     let module_block = blocks
         .iter()
         .find(|block| {
-            block["kind"].as_str() == Some("module")
+            block["kind"].as_str() == Some("namespace")
                 && block["content"]
                     .as_str()
                     .is_some_and(|content| content.contains("module Trueflow"))
@@ -171,7 +171,7 @@ fn test_ruby_inspect_split_returns_structural_children_for_large_module() -> Res
         "expected module const child: {kinds:?}"
     );
     assert!(
-        kinds.contains(&"module"),
+        kinds.contains(&"namespace"),
         "expected nested module child: {kinds:?}"
     );
     assert!(kinds.contains(&"class"), "expected class child: {kinds:?}");

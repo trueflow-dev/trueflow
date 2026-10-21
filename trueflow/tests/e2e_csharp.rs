@@ -40,7 +40,7 @@ fn test_csharp_fixture_detects_language_and_structural_blocks() -> Result<()> {
         "expected using block: {kinds:?}"
     );
     assert!(
-        kinds.contains(&"module"),
+        kinds.contains(&"namespace"),
         "expected namespace block: {kinds:?}"
     );
     assert!(
