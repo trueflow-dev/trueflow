@@ -572,3 +572,35 @@ fn cpp_nested_class_is_an_aggregate_child_not_a_method() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn c_preprocessor_alternative_branches_are_inventoried() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "#if A\n",
+        "int a(void);\n",
+        "#elif B\n",
+        "int b(void);\n",
+        "#elifdef C\n",
+        "int c(void);\n",
+        "#else\n",
+        "int d(void);\n",
+        "#endif\n",
+    );
+
+    let facts = project("src/branches.c", Language::C, SOURCE)?;
+    assert_eq!(
+        facts
+            .declarations()
+            .iter()
+            .map(|declaration| (declaration.name.as_str(), declaration.projection_text.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("a", "int a(void);"),
+            ("b", "int b(void);"),
+            ("c", "int c(void);"),
+            ("d", "int d(void);"),
+        ]
+    );
+
+    Ok(())
+}

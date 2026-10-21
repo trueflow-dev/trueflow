@@ -1553,7 +1553,10 @@ fn has_static_storage(node: Node<'_>, source: &str) -> bool {
 }
 
 fn is_preprocessor_container(kind: &str) -> bool {
-    matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_else")
+    matches!(
+        kind,
+        "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_elifdef" | "preproc_else"
+    )
 }
 
 fn qualify(parent: Option<&str>, child: Option<&str>) -> Option<String> {
