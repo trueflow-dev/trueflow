@@ -265,3 +265,64 @@ fn top_level_const_preserves_its_exact_typed_value_surface() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn arrow_function_const_excludes_its_body() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "/** Parses input. */\n",
+        "export const parse = (input: string): number => {\n",
+        "  return Number(input);\n",
+        "};\n",
+        "export const render = function (value: number): string {\n",
+        "  return String(value);\n",
+        "};\n",
+        "export const double = (value: number) => value * 2;\n",
+    );
+    const EDITED: &str = concat!(
+        "/** Parses input. */\n",
+        "export const parse = (input: string): number => {\n",
+        "  return Number.parseInt(input, 10);\n",
+        "};\n",
+        "export const render = function (value: number): string {\n",
+        "  return `${value}`;\n",
+        "};\n",
+        "export const double = (value: number) => value + value;\n",
+    );
+
+    let facts = project(SOURCE)?;
+    assert_complete_inventory(&facts);
+    let parse = declaration_named(&facts, "parse", DeclarationKind::Constant)?;
+    let render = declaration_named(&facts, "render", DeclarationKind::Constant)?;
+    let double = declaration_named(&facts, "double", DeclarationKind::Constant)?;
+    assert_eq!(
+        parse.projection_text,
+        "/** Parses input. */\nexport const parse = (input: string): number =>"
+    );
+    assert_eq!(
+        render.projection_text,
+        "export const render = function (value: number): string"
+    );
+    assert_eq!(
+        double.projection_text,
+        "export const double = (value: number) =>"
+    );
+    assert!(
+        [parse, render, double]
+            .iter()
+            .flat_map(|declaration| &declaration.components)
+            .all(|component| component.role != SourceComponentRole::Value),
+        "callable initializers are projected as signatures, not values"
+    );
+
+    let edited = project(EDITED)?;
+    for name in ["parse", "render", "double"] {
+        assert_eq!(
+            declaration_named(&facts, name, DeclarationKind::Constant)?.projection_hash,
+            declaration_named(&edited, name, DeclarationKind::Constant)?.projection_hash,
+            "a body-only edit of {name} must not change its projection"
+        );
+    }
+    assert_non_overlapping_source_ownership(SOURCE, &facts);
+
+    Ok(())
+}

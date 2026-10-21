@@ -560,7 +560,21 @@ impl Projector<'_> {
         let surface_start = documentation
             .first()
             .map_or(item.outer.start_byte(), |range| range.start);
-        let include = surface_start..item.outer.end_byte();
+        let (surface_end, role) = match declarator.child_by_field_name("value") {
+            Some(value)
+                if matches!(
+                    value.kind(),
+                    "arrow_function" | "function_expression" | "generator_function"
+                ) =>
+            {
+                (
+                    callable_signature_end(value, self.source),
+                    SourceComponentRole::Signature,
+                )
+            }
+            _ => (item.outer.end_byte(), SourceComponentRole::Value),
+        };
+        let include = surface_start..surface_end;
         let includes = std::slice::from_ref(&include);
         if has_syntax_error_in_ranges(item.outer, includes) {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
@@ -570,8 +584,8 @@ impl Projector<'_> {
             return Ok(());
         }
         let mut semantics = vec![SemanticRange {
-            range: item.outer.byte_range(),
-            role: SourceComponentRole::Value,
+            range: item.outer.start_byte()..surface_end,
+            role,
         }];
         add_documentation_semantics(&mut semantics, documentation);
         let components = build_components(
