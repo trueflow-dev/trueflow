@@ -1,8 +1,8 @@
+use crate::config::load as load_config;
 use crate::context::TrueflowContext;
 use crate::gpg::{GpgClient, SigningMode};
 use crate::path_utils;
 use crate::repo_path::RepoPath;
-use crate::scanner::ScanOptions;
 use crate::store::{
     Attestation, AttestationKind, BlockState, Canonicalization, CommentAnchor, CommentScope,
     DeclarationRecordLocator, FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore,
@@ -328,31 +328,20 @@ fn infer_target_kind(
         return Ok(kind);
     }
 
-    if let Some(kind) = infer_target_kind_from_current_tree(fingerprint, path_hint, line_hint)? {
-        return Ok(kind);
-    }
-
-    Ok(ReviewTargetKind::Block)
-}
-
-fn infer_target_kind_from_current_tree(
-    fingerprint: &str,
-    path_hint: Option<&RepoPath>,
-    line_hint: Option<u32>,
-) -> Result<Option<ReviewTargetKind>> {
-    let scan_result = match crate::scanner::scan_directory(".", &ScanOptions::default()) {
-        Ok(scan_result) => scan_result,
-        Err(_) => return Ok(None),
-    };
+    // Hashes must come from the same configured scan as `scan`/`review`.
+    let scan_options = load_config()?.scan.resolve_options();
+    let scan_result = crate::scanner::scan_directory(".", &scan_options)?;
     let tree = tree::build_tree_from_files(&scan_result.files);
 
     if let Some(kind) =
-        infer_target_kind_from_tree_location(&tree, fingerprint, path_hint, line_hint)
+        infer_target_kind_from_tree_location(&tree, fingerprint, path_hint, line_hint)?
     {
-        return Ok(Some(kind));
+        return Ok(kind);
     }
 
-    Ok(infer_target_kind_from_tree(&tree, fingerprint))
+    // Unmatched hashes stay Block targets: deleted diff blocks and generated
+    // review units are valid Block records absent from the current tree.
+    Ok(infer_target_kind_from_tree(&tree, fingerprint).unwrap_or(ReviewTargetKind::Block))
 }
 
 fn infer_target_kind_from_tree_location(
@@ -360,8 +349,10 @@ fn infer_target_kind_from_tree_location(
     fingerprint: &str,
     path_hint: Option<&RepoPath>,
     line_hint: Option<u32>,
-) -> Option<ReviewTargetKind> {
-    let path_hint = path_hint?;
+) -> Result<Option<ReviewTargetKind>> {
+    let Some(path_hint) = path_hint else {
+        return Ok(None);
+    };
 
     if let Some(line_hint) = line_hint {
         for node in tree.nodes() {
@@ -375,7 +366,7 @@ fn infer_target_kind_from_tree_location(
                 continue;
             };
             if u32::try_from(block.start_line).ok() == Some(line_hint) {
-                return Some(ReviewTargetKind::Block);
+                return Ok(Some(ReviewTargetKind::Block));
             }
         }
     }
@@ -389,10 +380,18 @@ fn infer_target_kind_from_tree_location(
             TreeNodeKind::File => ReviewTargetKind::File,
             TreeNodeKind::Block => ReviewTargetKind::Block,
         };
-        return Some(kind);
+        return Ok(Some(kind));
     }
 
-    None
+    // A directory path only binds Tree records for that directory's hash, so
+    // any other fingerprint there would be recorded but never bind.
+    match tree.find_by_path(path_hint.as_str()).map(|id| tree.node(id).kind) {
+        Some(TreeNodeKind::Root | TreeNodeKind::Directory) => anyhow::bail!(
+            "fingerprint {fingerprint} does not match directory `{path_hint}` in the current scan; \
+             use the directory hash from `trueflow scan --json --tree`"
+        ),
+        Some(TreeNodeKind::File | TreeNodeKind::Block) | None => Ok(None),
+    }
 }
 
 fn infer_target_kind_from_tree(tree: &tree::Tree, fingerprint: &str) -> Option<ReviewTargetKind> {
@@ -455,7 +454,8 @@ mod tests {
                 "same-hash",
                 Some(&RepoPath::new("src/lib.rs").unwrap()),
                 Some(4),
-            ),
+            )
+            .unwrap(),
             Some(ReviewTargetKind::Block)
         );
     }

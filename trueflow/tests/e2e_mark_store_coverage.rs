@@ -240,6 +240,62 @@ fn test_mark_diff_block_hash_records_block_target() -> Result<()> {
     Ok(())
 }
 
+fn ignored_log_repo(name: &str) -> Result<(TestRepo, String)> {
+    let repo = TestRepo::new(name)?;
+    repo.write("trueflow.toml", "[scan]\nignore_globs = [\"*.log\"]\n")?;
+    repo.write("src/a.rs", "pub fn a() {}\n")?;
+    repo.write("src/x.log", "ignored by the configured scan\n")?;
+    repo.commit_all("Initial")?;
+    let tree = json(&repo.run(&["scan", "--json", "--tree"])?)?;
+    let dir_hash = find_tree_hash(&tree, "src")?;
+    Ok((repo, dir_hash))
+}
+
+#[test]
+fn mark_infers_directory_target_with_configured_scan_options() -> Result<()> {
+    let (repo, dir_hash) = ignored_log_repo("mark_dir_scan_options")?;
+
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        &dir_hash,
+        "--path",
+        "src",
+        "--quiet",
+    ])?;
+
+    let records = read_review_records(&repo.path.join(".trueflow/reviews.jsonl"))?;
+    assert_eq!(records.len(), 1);
+    match &records[0].target {
+        ReviewTargetRef::Tree { hash } => assert_eq!(hash.as_str(), dir_hash),
+        other => panic!("expected tree target, got {other:?}"),
+    }
+    assert!(json_array(&repo.run(&["review", "--target", "dir:src", "--json"])?)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn mark_rejects_fingerprint_that_does_not_match_its_directory_path() -> Result<()> {
+    let (repo, _) = ignored_log_repo("mark_dir_stale_fingerprint")?;
+    let stale = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    let error = repo.run_err(&[
+        "mark",
+        "--fingerprint",
+        stale,
+        "--path",
+        "src",
+        "--quiet",
+    ])?;
+
+    assert!(
+        error.contains("does not match directory `src`"),
+        "expected directory mismatch error, got: {error}"
+    );
+    assert!(!repo.path.join(".trueflow/reviews.jsonl").exists());
+    Ok(())
+}
+
 #[test]
 fn test_store_subdirectory_discovery() -> Result<()> {
     let repo = TestRepo::new("subdir_discovery")?;
