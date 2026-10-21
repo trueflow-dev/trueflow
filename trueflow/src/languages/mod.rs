@@ -142,13 +142,14 @@ pub(crate) fn default_code_sub_split(_kind: BlockKind) -> SubSplitRegistration {
 pub(crate) fn data_interstitial_kind(
     chunk: &str,
     is_structural_line: fn(&str) -> bool,
+    syntax: crate::code_comments::CommentSyntax,
 ) -> BlockKind {
     let mut saw_comment = false;
     for line in chunk.lines().map(str::trim) {
         if line.is_empty() || is_structural_line(line) {
             continue;
         }
-        if crate::code_comments::chunk_is_comment_only(line) {
+        if crate::code_comments::chunk_is_comment_only(line, syntax) {
             saw_comment = true;
             continue;
         }

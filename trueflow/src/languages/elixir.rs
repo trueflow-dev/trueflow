@@ -4,7 +4,7 @@ use super::{
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
-use crate::code_comments;
+use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
@@ -336,11 +336,12 @@ fn split_review_tail(parent: &Block, start_offset: usize) -> Result<Vec<Block>> 
             return Ok(());
         }
 
-        let kind = if code_comments::chunk_is_comment_only(chunk) {
-            BlockKind::Comment
-        } else {
-            BlockKind::CodeParagraph
-        };
+        let kind =
+            if code_comments::chunk_is_comment_only(chunk, CommentSyntax::of(Language::Elixir)) {
+                BlockKind::Comment
+            } else {
+                BlockKind::CodeParagraph
+            };
         blocks.push(create_sub_block(parent, start, end, kind)?);
         Ok(())
     };
@@ -404,7 +405,7 @@ fn push_non_child_chunk(
     let chunk = &parent.content[start..end];
     let kind = if chunk.trim().is_empty() {
         BlockKind::Gap
-    } else if code_comments::chunk_is_comment_only(chunk) {
+    } else if code_comments::chunk_is_comment_only(chunk, CommentSyntax::of(Language::Elixir)) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph

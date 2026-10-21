@@ -1,6 +1,6 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
-use crate::code_comments;
+use crate::code_comments::{self, CommentSyntax};
 use crate::review_units::{MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES, MAX_REVIEW_UNIT_SPAN_LINES};
 use crate::text_split::paragraph_break_regex;
 use crate::tree_sitter_support::{
@@ -393,7 +393,8 @@ pub(crate) fn split_code_review_units(block: &Block) -> Result<Vec<Block>> {
             let block_kind = if is_gap {
                 BlockKind::Gap
             } else {
-                classify_code_chunk(chunk)
+                // Language-agnostic default splitter: keep `#` comments.
+                classify_code_chunk(chunk, CommentSyntax::CStyleOrHash)
             };
             create_sub_block_with_kind(block, chunk, start, end, block_kind).ok()
         },
@@ -845,6 +846,7 @@ struct FunctionSplitConfig<'a> {
     body_statement_kind: Option<&'a str>,
     signature_end: fn(&str, usize) -> usize,
     comment_kinds: &'a [&'a str],
+    comment_syntax: CommentSyntax,
     trailing_delimiters: &'a [&'a str],
 }
 
@@ -858,6 +860,7 @@ fn split_rust_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["line_comment", "block_comment"],
+            comment_syntax: CommentSyntax::of(Language::Rust),
             trailing_delimiters: &["}"],
         },
     )
@@ -923,7 +926,7 @@ fn split_elisp_function(block: &Block) -> Result<Vec<Block>> {
             let kind = if is_gap {
                 BlockKind::Gap
             } else {
-                classify_code_chunk(chunk)
+                classify_code_chunk(chunk, CommentSyntax::of(Language::Elisp))
             };
             create_sub_block_with_kind(
                 block,
@@ -1019,6 +1022,7 @@ fn split_python_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_before_body,
             comment_kinds: &["comment", "line_comment", "block_comment"],
+            comment_syntax: CommentSyntax::of(Language::Python),
             trailing_delimiters: &[],
         },
     )
@@ -1034,6 +1038,7 @@ fn split_ruby_method(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_before_body,
             comment_kinds: &["comment"],
+            comment_syntax: CommentSyntax::of(Language::Ruby),
             trailing_delimiters: &["end"],
         },
     )
@@ -1053,6 +1058,7 @@ fn split_js_function(block: &Block, lang: Language) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["comment", "line_comment", "block_comment"],
+            comment_syntax: CommentSyntax::of(lang),
             trailing_delimiters: &["}"],
         },
     )
@@ -1068,6 +1074,7 @@ fn split_swift_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: Some("statements"),
             signature_end: signature_end_offset,
             comment_kinds: &["comment", "multiline_comment"],
+            comment_syntax: CommentSyntax::of(Language::Swift),
             trailing_delimiters: &["}"],
         },
     )
@@ -1111,6 +1118,7 @@ fn split_kotlin_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: Some("block"),
             signature_end: signature_end_offset,
             comment_kinds: &["line_comment", "block_comment"],
+            comment_syntax: CommentSyntax::of(Language::Kotlin),
             trailing_delimiters: &["}"],
         },
     )
@@ -1132,7 +1140,11 @@ fn split_kotlin_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    review_unit_blocks_from_member_spans(block, collect_kotlin_type_items(body, content))
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_kotlin_type_items(body, content),
+        CommentSyntax::of(Language::Kotlin),
+    )
 }
 
 fn split_java_function(block: &Block) -> Result<Vec<Block>> {
@@ -1149,6 +1161,7 @@ fn split_java_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["line_comment", "block_comment"],
+            comment_syntax: CommentSyntax::of(Language::Java),
             trailing_delimiters: &["}"],
         },
     )
@@ -1179,7 +1192,11 @@ fn split_java_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    review_unit_blocks_from_member_spans(block, collect_java_type_items(body))
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_java_type_items(body),
+        CommentSyntax::of(Language::Java),
+    )
 }
 
 fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
@@ -1237,7 +1254,7 @@ fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
             return Ok(());
         }
 
-        let kind = classify_code_chunk(chunk);
+        let kind = classify_code_chunk(chunk, CommentSyntax::of(Language::CSharp));
         blocks.push(create_sub_block_with_kind(
             block,
             chunk,
@@ -1298,7 +1315,11 @@ fn split_csharp_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    review_unit_blocks_from_member_spans(block, collect_csharp_type_items(body))
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_csharp_type_items(body),
+        CommentSyntax::of(Language::CSharp),
+    )
 }
 
 fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
@@ -1314,7 +1335,11 @@ fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    review_unit_blocks_from_member_spans(block, collect_ruby_scope_items(scope_node, content))
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_ruby_scope_items(scope_node, content),
+        CommentSyntax::of(Language::Ruby),
+    )
 }
 
 fn split_php_function(block: &Block) -> Result<Vec<Block>> {
@@ -1327,6 +1352,7 @@ fn split_php_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["comment"],
+            comment_syntax: CommentSyntax::of(Language::Php),
             trailing_delimiters: &["}"],
         },
     )
@@ -1356,7 +1382,11 @@ fn split_php_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    review_unit_blocks_from_member_spans(block, collect_php_type_items(body))
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_php_type_items(body),
+        CommentSyntax::of(Language::Php),
+    )
 }
 
 fn split_c_function(block: &Block) -> Result<Vec<Block>> {
@@ -1369,6 +1399,7 @@ fn split_c_function(block: &Block) -> Result<Vec<Block>> {
             body_statement_kind: None,
             signature_end: signature_end_offset,
             comment_kinds: &["comment"],
+            comment_syntax: CommentSyntax::of(Language::C),
             trailing_delimiters: &["}"],
         },
     )
@@ -1540,7 +1571,7 @@ fn split_function_with_parser(
 
     if last_end < content.len() {
         let tail = &content[last_end..];
-        let kind = classify_code_chunk(tail);
+        let kind = classify_code_chunk(tail, config.comment_syntax);
         if !tail.is_empty() && kind != BlockKind::Gap {
             blocks.push(create_sub_block_with_kind(
                 block,
@@ -1681,6 +1712,7 @@ impl MemberSpan {
 fn review_unit_blocks_from_member_spans(
     parent: &Block,
     members: Vec<MemberSpan>,
+    syntax: CommentSyntax,
 ) -> Result<Vec<Block>> {
     if members.is_empty() {
         return split_code(parent);
@@ -1697,7 +1729,7 @@ fn review_unit_blocks_from_member_spans(
                 chunk,
                 cursor,
                 member.start_byte,
-                classify_code_chunk(chunk),
+                classify_code_chunk(chunk, syntax),
             )?);
         }
         blocks.push(create_sub_block_with_kind(
@@ -1717,7 +1749,7 @@ fn review_unit_blocks_from_member_spans(
             chunk,
             cursor,
             content.len(),
-            classify_code_chunk(chunk),
+            classify_code_chunk(chunk, syntax),
         )?);
     }
 
@@ -1801,7 +1833,7 @@ fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
             offset += line.len();
             continue;
         }
-        if code_comments::line_is_c_style_comment(trimmed) || trimmed.starts_with('#') {
+        if code_comments::line_is_c_style_comment(trimmed) {
             saw_comment = true;
             offset += line.len();
             continue;
@@ -1898,7 +1930,7 @@ fn gap_prefix_length(gap: &str) -> usize {
     gap.rfind('\n').map(|idx| idx + 1).unwrap_or(gap.len())
 }
 
-fn classify_code_chunk(chunk: &str) -> BlockKind {
+fn classify_code_chunk(chunk: &str, syntax: CommentSyntax) -> BlockKind {
     let trimmed = chunk.trim();
     if trimmed.is_empty() {
         return BlockKind::Gap;
@@ -1908,7 +1940,7 @@ fn classify_code_chunk(chunk: &str) -> BlockKind {
         return BlockKind::Gap;
     }
 
-    if code_comments::chunk_is_comment_only(chunk) {
+    if code_comments::chunk_is_comment_only(chunk, syntax) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph
@@ -2642,6 +2674,44 @@ mod tests {
                 "nested child range must remain absolute"
             );
             assert!(parent.byte_span().contains(&child.byte_span()));
+        }
+    }
+
+    #[test]
+    fn test_c_family_code_lines_are_not_comment_units() {
+        let cases = [
+            (
+                Language::C,
+                BlockKind::Function,
+                "int run(int *out) {\n    *out = 1;\n\n#if DEBUG\n#define TRACE 1\n#endif\n\n    return 0;\n}\n",
+            ),
+            (
+                Language::Cpp,
+                BlockKind::Function,
+                "int run(int *out) {\n    *out = 1;\n\n#if DEBUG\n#define TRACE 1\n#endif\n\n    return 0;\n}\n",
+            ),
+            (
+                Language::CSharp,
+                BlockKind::Method,
+                "public int Run() {\n#region setup\n    var total = 0;\n#endregion\n\n    return total;\n}\n",
+            ),
+        ];
+
+        for (language, kind, content) in cases {
+            let block = make_block(content, kind);
+            let units = split_result_for_child_navigation(&block, language)
+                .unwrap()
+                .blocks;
+            assert_eq!(merge_blocks(units.clone()), content);
+            let comments = units
+                .iter()
+                .filter(|unit| unit.kind == BlockKind::Comment)
+                .map(|unit| unit.content.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                comments.is_empty(),
+                "{language:?} code labelled as comment: {comments:?}"
+            );
         }
     }
 }

@@ -1,6 +1,6 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
-use crate::code_comments;
+use crate::code_comments::{self, CommentSyntax};
 use crate::complexity;
 use crate::optimizer;
 use crate::review_units::MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES;
@@ -611,29 +611,34 @@ pub(crate) fn fallback_split_blocks(
     lang: Language,
 ) -> Vec<Block> {
     collect_valid_paragraph_blocks(content, |chunk, start, end, is_gap| {
-        let kind = classify_fallback_chunk(chunk, mode, is_gap);
+        let kind = classify_fallback_chunk(chunk, mode, is_gap, CommentSyntax::of(lang));
         create_fallback_block(content, chunk, kind, start, end, lang)
     })
 }
 
-fn classify_fallback_chunk(chunk: &str, mode: FallbackMode, is_gap: bool) -> BlockKind {
+fn classify_fallback_chunk(
+    chunk: &str,
+    mode: FallbackMode,
+    is_gap: bool,
+    syntax: CommentSyntax,
+) -> BlockKind {
     if is_gap || chunk.trim().is_empty() {
         return BlockKind::Gap;
     }
 
     match mode {
-        FallbackMode::Code => classify_code_paragraph(chunk),
+        FallbackMode::Code => classify_code_paragraph(chunk, syntax),
         FallbackMode::Text => BlockKind::Paragraph,
     }
 }
 
-fn classify_code_paragraph(chunk: &str) -> BlockKind {
+fn classify_code_paragraph(chunk: &str, syntax: CommentSyntax) -> BlockKind {
     let trimmed = chunk.trim();
     if trimmed.is_empty() {
         return BlockKind::Gap;
     }
 
-    if code_comments::chunk_is_comment_only(chunk) {
+    if code_comments::chunk_is_comment_only(chunk, syntax) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph
@@ -743,7 +748,7 @@ fn push_non_empty_toml_gap(
         return Ok(());
     }
 
-    let kind = if code_comments::chunk_is_comment_only(chunk) {
+    let kind = if code_comments::chunk_is_comment_only(chunk, CommentSyntax::of(Language::Toml)) {
         BlockKind::Comment
     } else {
         BlockKind::Gap

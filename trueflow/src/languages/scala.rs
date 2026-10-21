@@ -4,7 +4,7 @@ use super::{
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
-use crate::code_comments;
+use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
@@ -589,7 +589,7 @@ fn classify_review_chunk(chunk: &str) -> BlockKind {
     if trimmed.chars().all(|ch| matches!(ch, '}' | ';')) {
         return BlockKind::Gap;
     }
-    if code_comments::chunk_is_comment_only(chunk) {
+    if code_comments::chunk_is_comment_only(chunk, CommentSyntax::of(Language::Scala)) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph

@@ -166,7 +166,7 @@ fn language_from_shebang(header: &[u8]) -> Option<Language> {
 /// Bump this whenever unchanged bytes can split differently: splitter or
 /// optimizer logic, language registrations, or grammar upgrades. Persisted
 /// scan caches are keyed on it, so stale blocks are never reused.
-pub(crate) const SPLITTER_REVISION: u32 = 6;
+pub(crate) const SPLITTER_REVISION: u32 = 7;
 
 #[derive(Debug, Clone)]
 pub struct ParsedFile {

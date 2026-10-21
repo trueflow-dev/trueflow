@@ -4,6 +4,7 @@ use super::{
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
+use crate::code_comments::CommentSyntax;
 use crate::complexity;
 
 use anyhow::{Context, Result};
@@ -315,7 +316,7 @@ fn push_non_empty_gap(
 
     blocks.push(create_file_block(
         chunk,
-        data_interstitial_kind(chunk, is_json_structural_noise),
+        data_interstitial_kind(chunk, is_json_structural_noise, CommentSyntax::of(lang)),
         content,
         start,
         end,
