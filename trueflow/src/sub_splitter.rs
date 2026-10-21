@@ -1132,12 +1132,7 @@ fn split_kotlin_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_kotlin_type_items(block, body, content)?;
-    if items.is_empty() {
-        split_code(block)
-    } else {
-        Ok(items)
-    }
+    review_unit_blocks_from_member_spans(block, collect_kotlin_type_items(body, content))
 }
 
 fn split_java_function(block: &Block) -> Result<Vec<Block>> {
@@ -1184,12 +1179,7 @@ fn split_java_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_java_type_items(block, body)?;
-    if items.is_empty() {
-        split_code(block)
-    } else {
-        Ok(items)
-    }
+    review_unit_blocks_from_member_spans(block, collect_java_type_items(body))
 }
 
 fn split_csharp_function(block: &Block) -> Result<Vec<Block>> {
@@ -1308,12 +1298,7 @@ fn split_csharp_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_csharp_type_items(block, body)?;
-    if items.is_empty() {
-        split_code(block)
-    } else {
-        Ok(items)
-    }
+    review_unit_blocks_from_member_spans(block, collect_csharp_type_items(body))
 }
 
 fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
@@ -1329,12 +1314,7 @@ fn split_ruby_scope(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_ruby_scope_items(block, scope_node)?;
-    if items.is_empty() {
-        split_code(block)
-    } else {
-        Ok(items)
-    }
+    review_unit_blocks_from_member_spans(block, collect_ruby_scope_items(scope_node, content))
 }
 
 fn split_php_function(block: &Block) -> Result<Vec<Block>> {
@@ -1376,12 +1356,7 @@ fn split_php_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_php_type_items(block, body)?;
-    if items.is_empty() {
-        split_code(block)
-    } else {
-        Ok(items)
-    }
+    review_unit_blocks_from_member_spans(block, collect_php_type_items(body))
 }
 
 fn split_c_function(block: &Block) -> Result<Vec<Block>> {
@@ -1679,93 +1654,141 @@ fn collect_swift_type_items(
     Ok(blocks)
 }
 
-fn collect_java_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
-    let mut blocks = Vec::new();
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        let kind = match child.kind() {
-            "field_declaration" => BlockKind::Variable,
-            "constant_declaration" => BlockKind::Const,
-            "method_declaration"
-            | "constructor_declaration"
-            | "compact_constructor_declaration" => BlockKind::Method,
-            "class_declaration" => BlockKind::Class,
-            "interface_declaration" => BlockKind::Interface,
-            "enum_declaration" => BlockKind::Enum,
-            "record_declaration" => BlockKind::Struct,
-            "annotation_type_declaration" => BlockKind::Type,
-            _ => continue,
-        };
-        blocks.push(create_sub_block_with_kind(
-            parent,
-            &parent.content[child.start_byte()..child.end_byte()],
-            child.start_byte(),
-            child.end_byte(),
-            kind,
-        )?);
-    }
-    Ok(blocks)
+/// A recognised member of a type or scope body, relative to the parent block.
+#[derive(Debug, Clone, Copy)]
+struct MemberSpan {
+    start_byte: usize,
+    end_byte: usize,
+    kind: BlockKind,
 }
 
-fn collect_kotlin_type_items(
+impl MemberSpan {
+    fn of_node(node: tree_sitter::Node<'_>, kind: BlockKind) -> Self {
+        Self {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            kind,
+        }
+    }
+}
+
+/// Turn recognised members into review units that tile the parent exactly.
+///
+/// `members` are sibling nodes in source order, so they never overlap.
+/// Bytes outside every member (type headers, closing delimiters, comments,
+/// initializers, unrecognised members) become their own units so that
+/// approving every unit really covers the whole parent.
+fn review_unit_blocks_from_member_spans(
     parent: &Block,
-    body: tree_sitter::Node<'_>,
-    content: &str,
+    members: Vec<MemberSpan>,
 ) -> Result<Vec<Block>> {
-    let mut blocks = Vec::new();
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        let kind = match child.kind() {
-            "function_declaration" => {
-                if find_named_descendant(child, "function_body").is_some() {
-                    BlockKind::Method
-                } else {
-                    BlockKind::FunctionSignature
-                }
-            }
-            "property_declaration" => {
-                classify_kotlin_property_kind(&content[child.start_byte()..child.end_byte()])
-            }
-            "class_declaration" => classify_kotlin_class_kind(child, content),
-            "object_declaration" | "companion_object" => BlockKind::Class,
-            "secondary_constructor" => BlockKind::Method,
-            _ => continue,
-        };
+    if members.is_empty() {
+        return split_code(parent);
+    }
+
+    let content = parent.content.as_str();
+    let mut blocks = Vec::with_capacity(members.len() * 2 + 1);
+    let mut cursor = 0;
+    for member in members {
+        if cursor < member.start_byte {
+            let chunk = &content[cursor..member.start_byte];
+            blocks.push(create_sub_block_with_kind(
+                parent,
+                chunk,
+                cursor,
+                member.start_byte,
+                classify_code_chunk(chunk),
+            )?);
+        }
         blocks.push(create_sub_block_with_kind(
             parent,
-            &parent.content[child.start_byte()..child.end_byte()],
-            child.start_byte(),
-            child.end_byte(),
-            kind,
+            &content[member.start_byte..member.end_byte],
+            member.start_byte,
+            member.end_byte,
+            member.kind,
+        )?);
+        cursor = member.end_byte;
+    }
+
+    if cursor < content.len() {
+        let chunk = &content[cursor..];
+        blocks.push(create_sub_block_with_kind(
+            parent,
+            chunk,
+            cursor,
+            content.len(),
+            classify_code_chunk(chunk),
         )?);
     }
+
     Ok(blocks)
 }
 
-fn collect_csharp_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
-    let mut blocks = Vec::new();
+fn collect_java_type_items(body: tree_sitter::Node<'_>) -> Vec<MemberSpan> {
     let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        let kind = match child.kind() {
-            "field_declaration" | "property_declaration" | "event_declaration" => {
-                BlockKind::Variable
-            }
-            "method_declaration" | "constructor_declaration" => BlockKind::Method,
-            "class_declaration" => BlockKind::Class,
-            "interface_declaration" => BlockKind::Interface,
-            "enum_declaration" => BlockKind::Enum,
-            "record_declaration" | "struct_declaration" => BlockKind::Struct,
-            _ => continue,
-        };
-        blocks.push(create_sub_block_with_kind(
-            parent,
-            &parent.content[child.start_byte()..child.end_byte()],
-            child.start_byte(),
-            child.end_byte(),
-            kind,
-        )?);
-    }
-    Ok(blocks)
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "field_declaration" => BlockKind::Variable,
+                "constant_declaration" => BlockKind::Const,
+                "method_declaration"
+                | "constructor_declaration"
+                | "compact_constructor_declaration" => BlockKind::Method,
+                "class_declaration" => BlockKind::Class,
+                "interface_declaration" => BlockKind::Interface,
+                "enum_declaration" => BlockKind::Enum,
+                "record_declaration" => BlockKind::Struct,
+                "annotation_type_declaration" => BlockKind::Type,
+                _ => return None,
+            };
+            Some(MemberSpan::of_node(child, kind))
+        })
+        .collect()
+}
+
+fn collect_kotlin_type_items(body: tree_sitter::Node<'_>, content: &str) -> Vec<MemberSpan> {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "function_declaration" => {
+                    if find_named_descendant(child, "function_body").is_some() {
+                        BlockKind::Method
+                    } else {
+                        BlockKind::FunctionSignature
+                    }
+                }
+                "property_declaration" => {
+                    classify_kotlin_property_kind(&content[child.start_byte()..child.end_byte()])
+                }
+                "class_declaration" => classify_kotlin_class_kind(child, content),
+                "object_declaration" | "companion_object" => BlockKind::Class,
+                "secondary_constructor" => BlockKind::Method,
+                _ => return None,
+            };
+            Some(MemberSpan::of_node(child, kind))
+        })
+        .collect()
+}
+
+fn collect_csharp_type_items(body: tree_sitter::Node<'_>) -> Vec<MemberSpan> {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "field_declaration" | "property_declaration" | "event_declaration" => {
+                    BlockKind::Variable
+                }
+                "method_declaration" | "constructor_declaration" => BlockKind::Method,
+                "class_declaration" => BlockKind::Class,
+                "interface_declaration" => BlockKind::Interface,
+                "enum_declaration" => BlockKind::Enum,
+                "record_declaration" | "struct_declaration" => BlockKind::Struct,
+                _ => return None,
+            };
+            Some(MemberSpan::of_node(child, kind))
+        })
+        .collect()
 }
 
 fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
@@ -1790,49 +1813,27 @@ fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
     None
 }
 
-fn collect_ruby_scope_items(
-    parent: &Block,
-    scope_node: tree_sitter::Node<'_>,
-) -> Result<Vec<Block>> {
+/// Direct members of a Ruby scope. A nested `class`/`module` is a single
+/// unit; its own members are never emitted again alongside it.
+fn collect_ruby_scope_items(scope_node: tree_sitter::Node<'_>, content: &str) -> Vec<MemberSpan> {
     let Some(body) = scope_node.child_by_field_name("body") else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
 
-    let mut blocks = Vec::new();
-    let mut pending = ruby_scope_body_children(body);
-    while let Some(child) = pending.pop() {
-        let kind = match child.kind() {
-            "class" => BlockKind::Class,
-            "module" => BlockKind::Module,
-            "method" | "singleton_method" => BlockKind::Method,
-            "assignment" if ruby_assignment_targets_constant(child) => BlockKind::Const,
-            "call" if ruby_call_is_import(child, &parent.content) => BlockKind::Import,
-            _ => continue,
-        };
-
-        blocks.push(create_sub_block_with_kind(
-            parent,
-            &parent.content[child.start_byte()..child.end_byte()],
-            child.start_byte(),
-            child.end_byte(),
-            kind,
-        )?);
-
-        if matches!(child.kind(), "class" | "module")
-            && let Some(body) = child.child_by_field_name("body")
-        {
-            pending.extend(ruby_scope_body_children(body));
-        }
-    }
-
-    Ok(blocks)
-}
-
-fn ruby_scope_body_children(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
     let mut cursor = body.walk();
-    let mut children = body.named_children(&mut cursor).collect::<Vec<_>>();
-    children.reverse();
-    children
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "class" => BlockKind::Class,
+                "module" => BlockKind::Module,
+                "method" | "singleton_method" => BlockKind::Method,
+                "assignment" if ruby_assignment_targets_constant(child) => BlockKind::Const,
+                "call" if ruby_call_is_import(child, content) => BlockKind::Import,
+                _ => return None,
+            };
+            Some(MemberSpan::of_node(child, kind))
+        })
+        .collect()
 }
 
 fn ruby_call_is_import(node: tree_sitter::Node<'_>, content: &str) -> bool {
@@ -1842,26 +1843,20 @@ fn ruby_call_is_import(node: tree_sitter::Node<'_>, content: &str) -> bool {
     )
 }
 
-fn collect_php_type_items(parent: &Block, body: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
-    let mut blocks = Vec::new();
+fn collect_php_type_items(body: tree_sitter::Node<'_>) -> Vec<MemberSpan> {
     let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        let kind = match child.kind() {
-            "const_declaration" | "enum_case" => BlockKind::Const,
-            "property_declaration" => BlockKind::Variable,
-            "method_declaration" => BlockKind::Method,
-            "use_declaration" => BlockKind::Impl,
-            _ => continue,
-        };
-        blocks.push(create_sub_block_with_kind(
-            parent,
-            &parent.content[child.start_byte()..child.end_byte()],
-            child.start_byte(),
-            child.end_byte(),
-            kind,
-        )?);
-    }
-    Ok(blocks)
+    body.named_children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "const_declaration" | "enum_case" => BlockKind::Const,
+                "property_declaration" => BlockKind::Variable,
+                "method_declaration" => BlockKind::Method,
+                "use_declaration" => BlockKind::Impl,
+                _ => return None,
+            };
+            Some(MemberSpan::of_node(child, kind))
+        })
+        .collect()
 }
 
 fn collect_c_type_items(parent: &Block, type_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
@@ -2420,6 +2415,113 @@ mod tests {
             !chunks
                 .iter()
                 .any(|block| block.kind == BlockKind::Module && block.content == content)
+        );
+    }
+
+    fn padded_members(template: &str, count: usize) -> String {
+        (0..count)
+            .map(|index| template.replace("{n}", &index.to_string()))
+            .collect()
+    }
+
+    fn assert_review_units_tile_parent(
+        content: &str,
+        kind: BlockKind,
+        lang: Language,
+    ) -> Vec<Block> {
+        let block = make_block(content, kind);
+        assert!(block.line_span().len() > MAX_REVIEW_UNIT_SPAN_LINES);
+        let result = split_result(&block, lang).unwrap();
+        assert_eq!(result.semantics, SubSplitSemantics::ReviewUnits);
+        let mut cursor = block.start_byte;
+        for unit in &result.blocks {
+            assert_eq!(
+                unit.start_byte, cursor,
+                "review unit {:?} must start where the previous unit ended",
+                unit.content
+            );
+            cursor = unit.end_byte;
+        }
+        assert_eq!(cursor, block.end_byte);
+        assert_eq!(merge_blocks(result.blocks.clone()), content);
+        result.blocks
+    }
+
+    #[test]
+    fn test_java_type_review_units_cover_header_and_non_members() {
+        let content = format!(
+            "/** Worker docs. */\nclass Worker extends SecuredController {{\n    static {{\n        init();\n    }}\n\n    private final int scale = 2;\n{}}}\n",
+            padded_members("\n    int process{n}(int value) {\n        return value * scale;\n    }\n", 8)
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Class, Language::Java);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.content.contains("extends SecuredController")
+                    && unit.kind != BlockKind::Gap)
+        );
+    }
+
+    #[test]
+    fn test_kotlin_type_review_units_cover_header_and_enum_entries() {
+        let content = format!(
+            "enum class Mode(val weight: Int) : Weighted {{\n    FAST(1),\n    SLOW(2);\n{}}}\n",
+            padded_members("\n    fun weigh{n}(value: Int): Int {\n        return value * weight\n    }\n", 8)
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Enum, Language::Kotlin);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.content.contains("FAST(1)") && unit.kind != BlockKind::Gap)
+        );
+    }
+
+    #[test]
+    fn test_csharp_type_review_units_cover_header_and_operators() {
+        let content = format!(
+            "public class Money : IComparable {{\n    public static Money operator +(Money a, Money b) => a;\n{}}}\n",
+            padded_members("\n    public int Scale{n}(int value) {\n        return value;\n    }\n", 8)
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Class, Language::CSharp);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.content.contains("operator +") && unit.kind != BlockKind::Gap)
+        );
+    }
+
+    #[test]
+    fn test_php_type_review_units_cover_header() {
+        let content = format!(
+            "class Worker extends BaseController {{\n{}}}\n",
+            padded_members("\n    public function process{n}($value) {\n        return $value;\n    }\n", 8)
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Class, Language::Php);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.content.contains("extends BaseController")
+                    && unit.kind != BlockKind::Gap)
+        );
+    }
+
+    #[test]
+    fn test_ruby_scope_review_units_cover_calls_without_overlap() {
+        let content = format!(
+            "class UsersController < ApplicationController\n  before_action :skip_auth\n\n  class Helper\n    def help\n      1\n    end\n  end\n{}end\n",
+            padded_members("\n  def action{n}\n    render :ok\n  end\n", 8)
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Class, Language::Ruby);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Class));
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.content.contains("before_action") && unit.kind != BlockKind::Gap)
         );
     }
 
