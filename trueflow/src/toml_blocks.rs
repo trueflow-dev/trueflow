@@ -184,7 +184,7 @@ fn scan_comma_separated_items(
                 continue;
             }
             string_mode = None;
-            index += closing_quote_len(mode);
+            index += closing_quote_len(bytes, index, mode);
             continue;
         }
 
@@ -310,7 +310,7 @@ fn find_assignment_value_start(source: &str) -> Option<usize> {
                 continue;
             }
             string_mode = None;
-            index += closing_quote_len(mode);
+            index += closing_quote_len(bytes, index, mode);
             continue;
         }
 
@@ -359,7 +359,7 @@ fn find_matching_delimiter(
                 continue;
             }
             string_mode = None;
-            index += closing_quote_len(mode);
+            index += closing_quote_len(bytes, index, mode);
             continue;
         }
 
@@ -430,7 +430,7 @@ fn scan_key_value_block(source: &str, start: usize) -> usize {
                 continue;
             }
             string_mode = None;
-            index += closing_quote_len(mode);
+            index += closing_quote_len(bytes, index, mode);
             continue;
         }
 
@@ -499,11 +499,21 @@ fn opening_quote_len(bytes: &[u8], index: usize) -> usize {
     }
 }
 
-fn closing_quote_len(mode: StringMode) -> usize {
-    match mode {
-        StringMode::Basic | StringMode::Literal => 1,
-        StringMode::MultilineBasic | StringMode::MultilineLiteral => 3,
-    }
+/// Length of the closing delimiter at `index`. A multiline string may end
+/// with up to two extra quotes that belong to its content (`""""` or
+/// `"""""`), so the whole run of up to five quotes closes it.
+fn closing_quote_len(bytes: &[u8], index: usize, mode: StringMode) -> usize {
+    const MAX_MULTILINE_CLOSING_RUN: usize = 5;
+    let quote = match mode {
+        StringMode::Basic | StringMode::Literal => return 1,
+        StringMode::MultilineBasic => b'"',
+        StringMode::MultilineLiteral => b'\'',
+    };
+    bytes[index..]
+        .iter()
+        .take(MAX_MULTILINE_CLOSING_RUN)
+        .take_while(|byte| **byte == quote)
+        .count()
 }
 
 fn advance_string(bytes: &[u8], index: usize, mode: StringMode) -> Option<usize> {
@@ -657,6 +667,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["name = \"demo\"\n"]
         );
+    }
+
+    #[test]
+    fn split_document_closes_multiline_strings_ending_in_extra_quotes() {
+        let source = "quote = \"\"\"She said \"hi\"\"\"\"\"\nraw = '''it''''\n\n[owner]\nname = \"platform\"\n";
+        let spans = split_document(source).unwrap();
+        let sections = spans
+            .iter()
+            .filter(|span| span.kind == BlockKind::Section)
+            .map(|span| &source[span.start..span.end])
+            .collect::<Vec<_>>();
+
+        assert_eq!(sections, vec!["[owner]\nname = \"platform\"\n"]);
     }
 
     #[test]
