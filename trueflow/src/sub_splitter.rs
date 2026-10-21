@@ -116,6 +116,18 @@ pub fn split_result_for_child_navigation(block: &Block, lang: Language) -> Resul
     )
 }
 
+/// Semantic children that child navigation reveals under `block`: the forced
+/// child split without gaps or a child covering the parent's whole byte span
+/// (which would be the parent again, not a child).
+pub fn child_navigation_blocks(block: &Block, lang: Language) -> Result<Vec<Block>> {
+    let parent_span = block.byte_span();
+    Ok(split_result_for_child_navigation(block, lang)?
+        .blocks
+        .into_iter()
+        .filter(|child| child.kind != BlockKind::Gap && child.byte_span() != parent_span)
+        .collect())
+}
+
 fn split_result_with_options(
     block: &Block,
     lang: Language,

@@ -4762,16 +4762,9 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
         return false;
     };
 
-    let Ok(sub_split) = sub_splitter::split_result_for_child_navigation(&block, language) else {
+    let Ok(child_blocks) = sub_splitter::child_navigation_blocks(&block, language) else {
         return false;
     };
-
-    let child_blocks = sub_split
-        .blocks
-        .into_iter()
-        .filter(|child| child.kind != BlockKind::Gap)
-        .filter(|child| !is_identity_subblock(&block, child))
-        .collect::<Vec<_>>();
     if child_blocks.is_empty() {
         return false;
     }
@@ -4804,13 +4797,6 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
     state.content_frame_cache.clear();
 
     true
-}
-
-fn is_identity_subblock(parent: &crate::block::Block, child: &crate::block::Block) -> bool {
-    child.kind == parent.kind
-        && child.line_span() == parent.line_span()
-        && child.byte_span() == parent.byte_span()
-        && child.hash == parent.hash
 }
 
 fn refresh_review_state_after_refinement(state: &mut AppState, previous_remaining: usize) {
@@ -10098,20 +10084,6 @@ mod diff_scope_tests {
             crate::block::LineSpan::new(start_line, end_line),
             crate::block::ByteSpan::new(start_byte, end_byte),
         )
-    }
-
-    #[test]
-    fn identity_subblock_requires_matching_byte_span() {
-        let parent = test_block("same".to_string(), BlockKind::Code, 0, 1);
-        let shifted_child = Block::new(
-            "same".to_string(),
-            BlockKind::Code,
-            crate::block::LineSpan::new(0, 1),
-            crate::block::ByteSpan::new(10, 14),
-        );
-
-        assert!(is_identity_subblock(&parent, &parent));
-        assert!(!is_identity_subblock(&parent, &shifted_child));
     }
 
     fn build_test_state(
@@ -16386,6 +16358,46 @@ mod diff_scope_tests {
             compute_next_review_target(&state, first_sentence_id),
             sentence_children.get(1).copied()
         );
+    }
+
+    #[test]
+    fn handle_child_on_unsplittable_rust_struct_is_noop() {
+        let file_path = temp_test_file_path("tui_child_unsplittable_struct");
+        let content = "struct Point {\n    x: i32,\n}\n";
+        let (mut state, _file_id, block_id) = build_state_with_block_file_metadata(
+            &file_path,
+            content,
+            content,
+            0,
+            3,
+            BlockKind::Struct,
+            Language::Rust,
+        );
+
+        handle_child(&mut state);
+
+        assert_eq!(state.navigator.current_id(), block_id);
+        assert_eq!(state.reviewable_nodes, HashSet::from([block_id]));
+        assert!(state.navigator.tree.node(block_id).children.is_empty());
+    }
+
+    #[test]
+    fn handle_child_on_single_sentence_paragraph_is_noop() {
+        let content = "# Root\nOnly one sentence.\n";
+        let (mut state, _file_id, _root_section) =
+            build_state_with_markdown_file("docs/guide.md", content);
+
+        handle_child(&mut state);
+        handle_child(&mut state);
+        handle_next(&mut state);
+        let paragraph_id = state.navigator.current_id();
+        let reviewable_before = state.reviewable_nodes.clone();
+
+        handle_child(&mut state);
+
+        assert_eq!(state.navigator.current_id(), paragraph_id);
+        assert_eq!(state.reviewable_nodes, reviewable_before);
+        assert!(state.navigator.tree.node(paragraph_id).children.is_empty());
     }
 
     #[test]
