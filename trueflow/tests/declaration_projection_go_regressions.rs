@@ -152,3 +152,47 @@ fn multi_name_const_spec_has_one_exact_syntactic_review_owner() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn grouped_var_single_spec_keeps_spec_documentation() -> Result<()> {
+    for keyword in ["var", "const"] {
+        let source = format!(
+            "package api\n\n{keyword} (\n\t// Timeout bounds requests.\n\tTimeout = 5\n)\n"
+        );
+        let facts = project_source(Path::new("api/limits.go"), Language::Go, &source)?;
+        let timeout = facts
+            .declarations()
+            .iter()
+            .find(|declaration| declaration.name == "Timeout")
+            .with_context(|| format!("missing grouped {keyword} Timeout"))?;
+        let documentation = timeout
+            .components
+            .iter()
+            .filter(|component| component.role == SourceComponentRole::Documentation)
+            .map(|component| component.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            documentation,
+            ["// Timeout bounds requests."],
+            "grouped {keyword} spec must keep its own documentation: {:?}",
+            timeout.components
+        );
+
+        let edited = project_source(
+            Path::new("api/limits.go"),
+            Language::Go,
+            &source.replace("bounds requests", "caps requests"),
+        )?;
+        let edited_timeout = edited
+            .declarations()
+            .iter()
+            .find(|declaration| declaration.name == "Timeout")
+            .with_context(|| format!("missing edited grouped {keyword} Timeout"))?;
+        assert_ne!(
+            timeout.projection_hash, edited_timeout.projection_hash,
+            "editing the grouped {keyword} spec documentation must change its projection"
+        );
+    }
+
+    Ok(())
+}

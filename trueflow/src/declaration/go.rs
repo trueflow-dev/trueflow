@@ -816,10 +816,12 @@ fn is_immediately_before(source: &str, previous_end: usize, next_start: usize) -
 }
 
 fn is_grouped_declaration(declaration: Node<'_>) -> bool {
+    // tree-sitter-go puts a `var (...)` group's parenthesis inside `var_spec_list`, but a
+    // `const (...)` group's parenthesis directly in the declaration.
     let mut cursor = declaration.walk();
     declaration
         .children(&mut cursor)
-        .any(|child| child.kind() == "(")
+        .any(|child| matches!(child.kind(), "(" | "var_spec_list"))
 }
 
 fn trim_range_end(source: &str, mut range: Range<usize>) -> Option<Range<usize>> {
