@@ -343,34 +343,29 @@ fn equivalent_revision_and_range_targets_keep_ordered_capture_provenance_identit
         HEAD
     );
 
+    // Both batches keep their own provenance above, but the same declaration is
+    // reviewed once: the first ordered occurrence wins.
     let launch = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
-    let [revision_target, range_target] = launch.targets() else {
+    let [target] = launch.targets() else {
         bail!(
-            "expected one changed declaration from each ordered batch, got {:?}",
+            "expected the equivalent changed declaration once, got {:?}",
             launch.targets()
         );
     };
-    assert_eq!(revision_target.snapshot_pair_id, revision_pair.id);
-    assert_eq!(range_target.snapshot_pair_id, range_pair.id);
-    assert_ne!(
-        revision_target.snapshot_pair_id,
-        range_target.snapshot_pair_id
-    );
+    assert_eq!(target.snapshot_pair_id, revision_pair.id);
     assert_eq!(
-        revision_target.snapshot.id,
+        target.snapshot.id,
         revision_pair
             .head
             .as_ref()
             .context("revision display head")?
             .id
     );
-    assert_eq!(
-        range_target.snapshot.id,
-        range_pair.head.as_ref().context("range display head")?.id
+    assert_ne!(
+        revision_pair.id, range_pair.id,
+        "the batches keep distinct capture identities"
     );
-    assert_ne!(revision_target.snapshot.id, range_target.snapshot.id);
-    assert_eq!(revision_target.declaration.name, "selected");
-    assert_eq!(range_target.declaration.name, "selected");
+    assert_eq!(target.declaration.name, "selected");
 
     Ok(())
 }
