@@ -160,11 +160,22 @@ fn first_meaningful_line(block: &crate::block::Block) -> Option<&str> {
         .filter(|line| !line.is_empty());
     if should_skip_attribute_lines(block.kind) {
         non_empty_lines
-            .find(|line| !line.starts_with("#["))
+            .find(|line| !is_attribute_or_comment_line(line))
             .or_else(|| non_empty_lines.next())
     } else {
         non_empty_lines.next()
     }
+}
+
+/// Lines that may precede a declaration's keyword: Rust attributes, decorators
+/// and annotations, and the line, block, and doc comments of C-like and
+/// `#`-comment languages.
+fn is_attribute_or_comment_line(line: &str) -> bool {
+    line.starts_with('#')
+        || line.starts_with('@')
+        || line.starts_with("//")
+        || line.starts_with("/*")
+        || line.starts_with('*')
 }
 
 fn humanize_block_kind(kind: BlockKind) -> String {
@@ -531,6 +542,38 @@ mod tests {
             semantic_block_identifier(&block),
             Some("Config".to_string())
         );
+    }
+
+    #[test]
+    fn semantic_block_identifier_skips_leading_doc_comments() {
+        for (content, kind, name) in [
+            (
+                "/// One-shot cancellation.\n#[derive(Debug, Clone, Default)]\npub struct AiCancellationToken(Arc<AtomicBool>);\n",
+                BlockKind::Struct,
+                "AiCancellationToken",
+            ),
+            (
+                "/**\n * Starts the run.\n */\nexport function start(options) {\n}\n",
+                BlockKind::Function,
+                "start",
+            ),
+            (
+                "# Retries the request.\ndef retry(request):\n    pass\n",
+                BlockKind::Function,
+                "retry",
+            ),
+            (
+                "@dataclass(frozen=True)\nclass Settings:\n    name: str\n",
+                BlockKind::Class,
+                "Settings",
+            ),
+        ] {
+            assert_eq!(
+                semantic_block_identifier(&block(content, kind, 1)),
+                Some(name.to_string()),
+                "{content}"
+            );
+        }
     }
 
     #[test]
