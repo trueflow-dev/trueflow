@@ -660,13 +660,14 @@ impl DeclarationRecordAppender for RecordingAppender {
     }
 }
 
-#[test]
-fn comment_on_deleted_declaration_exports_for_the_deleting_revision_target() -> TestResult {
-    const NOTE: &str = "why was the old entry point removed?";
+const DELETION_NOTE: &str = "why was the old entry point removed?";
+
+/// Commits `old`, deletes it, and comments on the deletion through the declaration runtime.
+fn deleted_declaration_comment(name: &str) -> Result<(FeedbackScenario, CommitId, Record)> {
     const BASE_SOURCE: &str = "pub fn kept() -> u8 {\n    0\n}\n\npub fn old() -> u8 {\n    1\n}\n";
     const HEAD_SOURCE: &str = "pub fn kept() -> u8 {\n    0\n}\n";
 
-    let scenario = FeedbackScenario::new("declaration_feedback_deleted_revision_target")?;
+    let scenario = FeedbackScenario::new(name)?;
     scenario.write(PATH, BASE_SOURCE)?;
     scenario.commit_all("add old entry point")?;
     scenario.write(PATH, HEAD_SOURCE)?;
@@ -688,9 +689,20 @@ fn comment_on_deleted_declaration_exports_for_the_deleting_revision_target() -> 
     };
     let mut runtime =
         DeclarationAppRuntime::new(prepared, identity, RecordingAppender::default(), 120, 20)?;
-    runtime.submit(DeclarationReviewActionKind::Comment, Some(NOTE.to_string()))?;
-    let records = runtime.into_appender().records;
-    scenario.write_reviews(&records)?;
+    runtime.submit(
+        DeclarationReviewActionKind::Comment,
+        Some(DELETION_NOTE.to_string()),
+    )?;
+    let [comment] = <[Record; 1]>::try_from(runtime.into_appender().records)
+        .map_err(|records| anyhow::anyhow!("expected one comment, got {records:#?}"))?;
+    Ok((scenario, deleting, comment))
+}
+
+#[test]
+fn comment_on_deleted_declaration_exports_for_the_deleting_revision_target() -> TestResult {
+    let (scenario, deleting, comment) =
+        deleted_declaration_comment("declaration_feedback_deleted_revision_target")?;
+    scenario.write_reviews(&[comment])?;
 
     let entries = scenario.feedback_json_in_process(&[
         "--since",
@@ -709,7 +721,44 @@ fn comment_on_deleted_declaration_exports_for_the_deleting_revision_target() -> 
         entries[0]["declaration"]["path"], PATH,
         "the deleted surface must still resolve against the comparison base"
     );
-    assert_eq!(entries[0]["reviews"][0]["note"], NOTE);
+    assert_eq!(entries[0]["reviews"][0]["note"], DELETION_NOTE);
+    Ok(())
+}
+
+#[test]
+fn deletion_comment_is_resolved_only_by_a_deletion_approval() -> TestResult {
+    let (scenario, _, comment) =
+        deleted_declaration_comment("declaration_feedback_deletion_resolution")?;
+    let mut surface_approval = comment.clone();
+    surface_approval.id = "surface-approval".to_string();
+    surface_approval.timestamp = comment.timestamp + 1;
+    surface_approval.verdict = Verdict::Approved;
+    surface_approval.note = None;
+    surface_approval.comment_context = None;
+    surface_approval.declaration_deletion = None;
+    surface_approval.validate()?;
+    scenario.write_reviews(&[comment.clone(), surface_approval])?;
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+    assert_eq!(
+        entries.len(),
+        1,
+        "approving the surface itself must not resolve a comment on its deletion: \
+         {entries:#?}"
+    );
+
+    let mut deletion_approval = comment.clone();
+    deletion_approval.id = "deletion-approval".to_string();
+    deletion_approval.timestamp = comment.timestamp + 1;
+    deletion_approval.verdict = Verdict::Approved;
+    deletion_approval.note = None;
+    deletion_approval.comment_context = None;
+    deletion_approval.validate()?;
+    scenario.write_reviews(&[comment, deletion_approval])?;
+    let entries = scenario.feedback_json_in_process(&["--since", "all"])?;
+    assert!(
+        entries.is_empty(),
+        "approving the deletion must resolve its comment: {entries:#?}"
+    );
     Ok(())
 }
 

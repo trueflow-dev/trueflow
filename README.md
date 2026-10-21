@@ -590,9 +590,15 @@ function declarations are also supported. Partial projectors cover root Nix
 let/output bindings and Just recipes/aliases; their limits remain visible as
 capability diagnostics. All source-visible visibilities are included.
 Approvals, comments, and rejections are stored as declaration-specific records
-and remain separate from ordinary block-review coverage. Declaration comments
-are available through JSON/XML feedback export and GitHub pull-request
-feedback.
+and remain separate from ordinary block-review coverage. A verdict applies to
+the surface (path, semantic key, and projection) in any later session, so a
+later approval resolves earlier comments. Reviewing a deleted declaration is
+its own decision: approving a surface when it was added does not hide its
+later deletion, and approving the deletion does not cover the surface if it
+returns. Declaration comments are available through JSON/XML feedback export
+and GitHub pull-request feedback; comments on a deletion belong to the
+revision that deleted the surface, so `--target` selects them by that
+revision.
 
 Declaration Review keys are intentionally fixed to its two-pane model:
 

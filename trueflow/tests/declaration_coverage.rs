@@ -6,7 +6,7 @@ use trueflow::commands::mark::{StructuredMarkRequest, build_structured_record};
 use trueflow::declaration::coverage::{
     CoverageBindingKind, DeclarationCoverageBinding, DeclarationCoverageIndex,
 };
-use trueflow::declaration::diff::{DeclarationDiff, diff_declarations};
+use trueflow::declaration::diff::{DeclarationChangeKind, DeclarationDiff, diff_declarations};
 use trueflow::declaration::review::{
     DeclarationReviewDiffBatch, DeclarationReviewQuery, collect_declaration_review,
 };
@@ -20,8 +20,8 @@ use trueflow::hashing::BytesHash;
 use trueflow::repo_path::RepoPath;
 use trueflow::store::{
     BlockState, CommentAnchor, CommitId, DeclarationAnchorRange, DeclarationCommentAnchor,
-    DeclarationRecordLocator, Identity, Record, RepoRef, ReviewCheck, ReviewIndex, ReviewTargetRef,
-    ReviewedDeclarationSnapshot, VcsSystem, Verdict,
+    DeclarationDeletion, DeclarationRecordLocator, Identity, Record, RepoRef, ReviewCheck,
+    ReviewIndex, ReviewTargetRef, ReviewedDeclarationSnapshot, VcsSystem, Verdict,
 };
 
 const REVISION: &str = "0123456789abcdef";
@@ -394,6 +394,111 @@ fn ambiguous_same_path_matches_block_a_unique_proven_rename() -> Result<()> {
     ] {
         assert!(binding(&index, pair_id, declaration_id).is_none());
     }
+    Ok(())
+}
+
+fn deleted_target(
+    pair_id: &str,
+    snapshot_id: &str,
+    path: &str,
+    source: &str,
+) -> Result<(DeclarationReviewDiffBatch, SourceSnapshot, DeclarationNode)> {
+    let base = snapshot(snapshot_id, path, source);
+    let (batch, diff) = batch(vec![pair(
+        pair_id,
+        Some(base.clone()),
+        None,
+        PathPairEvidence::Unmatched,
+    )])?;
+    let unit = match diff.units.as_slice() {
+        [unit] => unit,
+        other => anyhow::bail!("expected one deleted unit, got {other:#?}"),
+    };
+    assert_eq!(unit.change_kind, DeclarationChangeKind::Deleted);
+    let declaration = unit.base.clone().context("deleted unit keeps its base")?;
+    Ok((batch, base, declaration))
+}
+
+fn deletion_record(
+    id: &str,
+    snapshot: &SourceSnapshot,
+    declaration: &DeclarationNode,
+    timestamp: i64,
+) -> Result<Record> {
+    let mut record = record(id, snapshot, declaration, Verdict::Approved, timestamp)?;
+    record.declaration_deletion = Some(DeclarationDeletion {
+        head_revision: CommitId::new("fedcba9876543210")?,
+    });
+    record.validate()?;
+    Ok(record)
+}
+
+#[test]
+fn deleted_declaration_is_not_covered_by_prior_surface_approval() -> Result<()> {
+    let source = "pub fn gone(value: u8) -> u8 { value }\n";
+    let (added_batch, head, added) =
+        added_target("added-pair", "added-head", "src/lib.rs", source, "gone")?;
+    let surface_approval = record("surface-approval", &head, &added, Verdict::Approved, 10)?;
+    let (deleting_batch, base, deleted) =
+        deleted_target("deleting-pair", "deleting-base", "src/lib.rs", source)?;
+    assert_eq!(
+        (&added.key, &added.projection_hash),
+        (&deleted.key, &deleted.projection_hash),
+        "fixture must delete exactly the approved surface"
+    );
+
+    let index = DeclarationCoverageIndex::build(
+        std::slice::from_ref(&deleting_batch),
+        std::slice::from_ref(&surface_approval),
+    )?;
+    assert!(
+        binding(&index, "deleting-pair", &deleted.id).is_none(),
+        "approving the surface when it was added must not review its deletion"
+    );
+    let collected = collect_declaration_review(
+        &DeclarationReviewQuery::new(vec![deleting_batch.clone()])
+            .with_records(vec![surface_approval.clone()]),
+    )?;
+    assert_eq!(
+        collected
+            .items
+            .iter()
+            .map(|item| &item.declaration.id)
+            .collect::<Vec<_>>(),
+        [&deleted.id],
+        "the deletion must stay reviewable"
+    );
+
+    let deletion_approval = deletion_record("deletion-approval", &base, &deleted, 20)?;
+    let records = vec![surface_approval, deletion_approval];
+    let reloaded = DeclarationCoverageIndex::build(std::slice::from_ref(&deleting_batch), &records)?;
+    assert_binding(
+        &reloaded,
+        "deleting-pair",
+        &deleted.id,
+        1,
+        CoverageBindingKind::ExactLocator,
+        &Verdict::Approved,
+    );
+
+    let (recaptured_batch, _, recaptured) =
+        deleted_target("recaptured-pair", "recaptured-base", "src/lib.rs", source)?;
+    let recaptured_index = DeclarationCoverageIndex::build(&[recaptured_batch], &records)?;
+    assert_binding(
+        &recaptured_index,
+        "recaptured-pair",
+        &recaptured.id,
+        1,
+        CoverageBindingKind::SamePathKeyHash,
+        &Verdict::Approved,
+    );
+
+    let surface_index =
+        DeclarationCoverageIndex::build(&[added_batch], std::slice::from_ref(&records[1]))?;
+    assert!(
+        binding(&surface_index, "added-pair", &added.id).is_none(),
+        "approving a deletion must not review the surface when it is added again"
+    );
     Ok(())
 }
 

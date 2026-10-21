@@ -53,6 +53,7 @@ struct OccurrenceKey {
 #[derive(Debug, Clone)]
 struct CandidateOccurrence {
     key: OccurrenceKey,
+    change: ReviewedChange,
     locator: DeclarationRecordLocator,
     rename_sources: Vec<DeclarationRecordLocator>,
 }
@@ -63,19 +64,41 @@ enum CandidateMatch {
     Ambiguous,
 }
 
-/// Revision-independent identity of a declaration review: one surface at one path, by
-/// semantic key and projection. Coverage binds its `SamePathKeyHash` tier on it and feedback
-/// export keys latest verdicts on it, so a later approval resolves an earlier comment in both
-/// no matter which snapshot either record was captured from.
+/// Which change a declaration review covers. A record never binds an occurrence of the other
+/// kind: approving a surface when it was added or changed says nothing about removing it, and
+/// approving its removal says nothing about a later re-addition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DeclarationSurfaceIdentity<'a> {
+enum ReviewedChange {
+    Surface,
+    Deletion,
+}
+
+impl ReviewedChange {
+    fn of_record(record: &Record) -> Self {
+        match record.declaration_deletion {
+            Some(_) => Self::Deletion,
+            None => Self::Surface,
+        }
+    }
+
+    fn of_unit(unit: &DeclarationDiffUnit) -> Self {
+        match unit.change_kind {
+            DeclarationChangeKind::Added | DeclarationChangeKind::Changed => Self::Surface,
+            DeclarationChangeKind::Deleted => Self::Deletion,
+        }
+    }
+}
+
+/// One surface at one path, by semantic key and projection: the `SamePathKeyHash` tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SurfaceKey<'a> {
     path: &'a RepoPath,
     declaration_key: &'a DeclarationKey,
     projection_hash: &'a DeclarationProjectionHash,
 }
 
-impl<'a> DeclarationSurfaceIdentity<'a> {
-    pub fn of_locator(locator: &'a DeclarationRecordLocator) -> Self {
+impl<'a> SurfaceKey<'a> {
+    fn of_locator(locator: &'a DeclarationRecordLocator) -> Self {
         Self {
             path: &locator.path,
             declaration_key: &locator.declaration_key,
@@ -84,10 +107,30 @@ impl<'a> DeclarationSurfaceIdentity<'a> {
     }
 }
 
+/// Revision-independent identity of a declaration review: the surface coverage binds at its
+/// `SamePathKeyHash` tier plus the reviewed change kind coverage requires to match. Feedback
+/// export keys latest verdicts on it, so a later approval resolves an earlier comment exactly
+/// when the TUI treats it as reviewed, whichever snapshot either record was captured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeclarationSurfaceIdentity<'a> {
+    change: ReviewedChange,
+    surface: SurfaceKey<'a>,
+}
+
+impl<'a> DeclarationSurfaceIdentity<'a> {
+    /// `None` for records without a declaration locator.
+    pub fn of_record(record: &'a Record) -> Option<Self> {
+        record.declaration_locator.as_ref().map(|locator| Self {
+            change: ReviewedChange::of_record(record),
+            surface: SurfaceKey::of_locator(locator),
+        })
+    }
+}
+
 struct CandidateLookup<'a> {
     exact: HashMap<&'a DeclarationRecordLocator, CandidateMatch>,
-    same_path: HashMap<DeclarationSurfaceIdentity<'a>, CandidateMatch>,
-    rename: HashMap<DeclarationSurfaceIdentity<'a>, CandidateMatch>,
+    same_path: HashMap<SurfaceKey<'a>, CandidateMatch>,
+    rename: HashMap<SurfaceKey<'a>, CandidateMatch>,
     key_hash: HashMap<(&'a DeclarationKey, &'a DeclarationProjectionHash), CandidateMatch>,
     hash: HashMap<&'a DeclarationProjectionHash, CandidateMatch>,
 }
@@ -104,17 +147,9 @@ impl<'a> CandidateLookup<'a> {
         for (index, candidate) in candidates.iter().enumerate() {
             let locator = &candidate.locator;
             insert_match(&mut lookup.exact, locator, index);
-            insert_match(
-                &mut lookup.same_path,
-                DeclarationSurfaceIdentity::of_locator(locator),
-                index,
-            );
+            insert_match(&mut lookup.same_path, SurfaceKey::of_locator(locator), index);
             for source in &candidate.rename_sources {
-                insert_match(
-                    &mut lookup.rename,
-                    DeclarationSurfaceIdentity::of_locator(source),
-                    index,
-                );
+                insert_match(&mut lookup.rename, SurfaceKey::of_locator(source), index);
             }
             insert_match(
                 &mut lookup.key_hash,
@@ -131,7 +166,7 @@ impl<'a> CandidateLookup<'a> {
         &self,
         locator: &DeclarationRecordLocator,
     ) -> Option<(CoverageBindingKind, CandidateMatch)> {
-        let surface = DeclarationSurfaceIdentity::of_locator(locator);
+        let surface = SurfaceKey::of_locator(locator);
         let hash = &locator.projection_hash;
         // An ambiguous stronger tier is still a match: never fall through it.
         self.exact
@@ -213,6 +248,11 @@ impl DeclarationCoverageIndex {
                 continue;
             };
             let candidate = &candidates[candidate_index];
+            // The record still identifies its strongest occurrence, so it never falls through
+            // to a weaker tier; it just covers nothing when that occurrence is the other change.
+            if candidate.change != ReviewedChange::of_record(record) {
+                continue;
+            }
             let replacement = DeclarationCoverageBinding {
                 record_index,
                 kind,
@@ -272,7 +312,7 @@ fn collect_candidates(batches: &[DeclarationReviewDiffBatch]) -> Result<Vec<Cand
             insert_candidate(
                 &mut candidates,
                 &mut candidate_indices,
-                candidate_occurrence(pair, snapshot, declaration)?,
+                candidate_occurrence(pair, ReviewedChange::of_unit(unit), snapshot, declaration)?,
             )?;
         }
 
@@ -284,7 +324,12 @@ fn collect_candidates(batches: &[DeclarationReviewDiffBatch]) -> Result<Vec<Cand
                     pair.id.as_str()
                 )
             })?;
-            let mut candidate = candidate_occurrence(pair, head, &declaration_match.head)?;
+            let mut candidate = candidate_occurrence(
+                pair,
+                ReviewedChange::Surface,
+                head,
+                &declaration_match.head,
+            )?;
             if is_conservative_file_rename(pair, declaration_match) {
                 let base = pair.base.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -310,7 +355,7 @@ fn insert_candidate(
 ) -> Result<()> {
     if let Some(index) = indices.get(&candidate.key).copied() {
         let existing = &mut candidates[index];
-        if existing.locator != candidate.locator {
+        if existing.change != candidate.change || existing.locator != candidate.locator {
             bail!(
                 "declaration occurrence {} for pair {} has conflicting projections",
                 candidate.key.declaration_id.as_str(),
@@ -333,6 +378,7 @@ fn insert_candidate(
 
 fn candidate_occurrence(
     pair: &SnapshotPair,
+    change: ReviewedChange,
     snapshot: &SourceSnapshot,
     declaration: &DeclarationNode,
 ) -> Result<CandidateOccurrence> {
@@ -342,6 +388,7 @@ fn candidate_occurrence(
             snapshot_id: snapshot.id.clone(),
             declaration_id: declaration.id.clone(),
         },
+        change,
         locator: locator_for(snapshot, declaration)?,
         rename_sources: Vec::new(),
     })

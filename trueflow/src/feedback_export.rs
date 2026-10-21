@@ -656,7 +656,7 @@ fn collect_declaration_feedback_entries(
 ) -> Result<Vec<FeedbackEntry>> {
     let mut candidates = Vec::new();
     // Like block verdicts, declaration verdicts are revision-independent: a later approval
-    // from any snapshot of the same surface resolves earlier comments on it.
+    // from any snapshot of the same reviewed surface change resolves earlier comments on it.
     let mut latest = HashMap::<DeclarationSurfaceIdentity<'_>, (i64, usize, &'static str)>::new();
     for (index, record) in records.iter().enumerate() {
         if !matches!(record.target, ReviewTargetRef::Declaration { .. })
@@ -664,11 +664,13 @@ fn collect_declaration_feedback_entries(
         {
             continue;
         }
-        let Some(locator) = record.declaration_locator.as_ref() else {
+        let (Some(locator), Some(surface)) = (
+            record.declaration_locator.as_ref(),
+            DeclarationSurfaceIdentity::of_record(record),
+        ) else {
             continue;
         };
-        candidates.push((index, record, locator));
-        let surface = DeclarationSurfaceIdentity::of_locator(locator);
+        candidates.push((index, record, locator, surface));
         if latest
             .get(&surface)
             .is_none_or(|(timestamp, existing_index, _)| {
@@ -681,9 +683,9 @@ fn collect_declaration_feedback_entries(
     }
 
     let mut grouped = HashMap::<DeclarationFeedbackEntryKey, FeedbackEntry>::new();
-    for (index, record, locator) in candidates {
+    for (index, record, locator, surface) in candidates {
         let latest_verdict = latest
-            .get(&DeclarationSurfaceIdentity::of_locator(locator))
+            .get(&surface)
             .map_or("unreviewed", |(_, _, verdict)| *verdict);
         // Historical verdicts still participate above, but excluded records need
         // neither source IO nor semantic projection.

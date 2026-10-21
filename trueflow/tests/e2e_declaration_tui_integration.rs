@@ -9,8 +9,9 @@ use trueflow::cli::TuiReviewMode;
 use trueflow::commands::review::ResolvedReviewQuery;
 use trueflow::commands::tui::declaration::{
     DeclarationAppRuntime, DeclarationPane, DeclarationRecordAppender, DeclarationReviewActionKind,
-    DeclarationReviewStatus as SurfaceStatus, GraphSelection, Relationship,
-    RelationshipDestination, RelationshipGroup, RelationshipState, prepare_declaration_launch,
+    DeclarationReviewStatus as SurfaceStatus, GraphSelection, PreparedDeclarationLaunch,
+    Relationship, RelationshipDestination, RelationshipGroup, RelationshipState,
+    prepare_declaration_launch,
 };
 use trueflow::commands::tui::{TuiRuntimeKind, resolve_tui_launch};
 use trueflow::config::{BlockFilters, TrueflowConfig};
@@ -598,6 +599,83 @@ fn approval_persists_exact_v5_binding_and_only_advances_after_append() -> Result
         Some(&original)
     );
     assert_eq!(failing.into_appender().attempts, 1);
+    Ok(())
+}
+
+fn revision_query(revision: CommitId) -> ResolvedReviewQuery {
+    ResolvedReviewQuery {
+        filters: BlockFilters::default(),
+        scan_options: ScanOptions::default(),
+        content_source: ReviewContentSource::Revision(revision.clone()),
+        path_selection: ReviewPathSelection::All,
+        diff_selection: ReviewDiffSelection::Targets(vec![ReviewDiffTarget::Revision(revision)]),
+    }
+}
+
+fn approve_only_target(prepared: PreparedDeclarationLaunch, name: &str) -> Result<Record> {
+    let names = prepared
+        .targets()
+        .iter()
+        .map(|target| target.declaration.name.as_str())
+        .collect::<Vec<_>>();
+    ensure!(names == [name], "expected only {name} to review, got {names:?}");
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
+    runtime.submit(DeclarationReviewActionKind::Approve, None)?;
+    only_record(runtime.into_appender().records)
+}
+
+#[test]
+fn deletion_of_an_approved_surface_is_reviewed_once_and_stays_reviewed() -> Result<()> {
+    const KEPT: &str = "pub fn kept() {}\n";
+    let repo = TestRepo::new("declaration_tui_deletion_review")?;
+    repo.write("src/lib.rs", KEPT)?;
+    repo.commit_all("add kept")?;
+    repo.write(
+        "src/lib.rs",
+        &format!("{KEPT}\npub fn gone(value: u8) -> u8 {{\n    value\n}}\n"),
+    )?;
+    repo.commit_all("add gone")?;
+    let adding = revision_query(head_revision(&repo)?);
+    let addition_approval = approve_only_target(
+        prepare_declaration_launch(&repo.path, &adding, Vec::new())?,
+        "gone",
+    )?;
+    assert!(addition_approval.declaration_deletion.is_none());
+
+    repo.write("src/lib.rs", KEPT)?;
+    repo.commit_all("remove gone")?;
+    let deleting_revision = head_revision(&repo)?;
+    let deleting = revision_query(deleting_revision.clone());
+    let deletion = prepare_declaration_launch(
+        &repo.path,
+        &deleting,
+        vec![addition_approval.clone()],
+    )?;
+    assert_eq!(
+        deletion.status(),
+        &CollectionStatus::Ready,
+        "approving gone when it was added must not hide its deletion"
+    );
+    let deletion_approval = approve_only_target(deletion, "gone")?;
+    assert_eq!(
+        deletion_approval
+            .declaration_deletion
+            .as_ref()
+            .map(|deletion| &deletion.head_revision),
+        Some(&deleting_revision)
+    );
+
+    let reloaded = prepare_declaration_launch(
+        &repo.path,
+        &deleting,
+        vec![addition_approval, deletion_approval],
+    )?;
+    assert!(
+        reloaded.targets().is_empty(),
+        "the approved deletion must stay reviewed on reload"
+    );
+    assert_eq!(reloaded.status(), &CollectionStatus::FullyReviewed);
     Ok(())
 }
 
