@@ -144,7 +144,8 @@ impl Generation {
     }
 
     fn finish(&mut self) -> Result<(ExitStatus, String, String)> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Bounds a hung test only; callers assert their own timing expectations.
+        let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(status) = self.child.try_wait()? {
                 return Ok((
@@ -273,7 +274,8 @@ fn focus_generation_rejects_provider_errors_invalid_json_and_invented_evidence_w
                 }
                 _ => {}
             }
-            let mut generation = Generation::spawn(&repo, provider, failure, "5")?;
+            // These providers fail or answer at once; the deadline only bounds a hang.
+            let mut generation = Generation::spawn(&repo, provider, failure, "60")?;
             let (status, stdout, stderr) = generation.finish()?;
             assert!(
                 !status.success(),

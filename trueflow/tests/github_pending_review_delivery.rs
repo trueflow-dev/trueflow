@@ -36,7 +36,10 @@ const GENERAL_DECLARATION_NOTE: &str = "general-only declaration feedback";
 const GENERAL_DECLARATION_SOURCE: &str =
     "/// Converts one value.\npub fn convert(value: u8) -> u8 {\n    value\n}\n";
 const ARGV_CALL_SEPARATOR: u8 = 0x01;
-const CONCURRENT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
+// A safety bound against hangs, not a performance assertion: the first worker
+// scans the repository before it reaches fake gh, which takes longer on a
+// loaded machine. An early worker exit is still detected immediately.
+const CONCURRENT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(60);
 const CONCURRENT_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type TestResult = Result<()>;
