@@ -282,7 +282,9 @@ code worth human attention for its expected review value per minute. It consider
 all unreviewed leaf candidates in the selected scope, including commented or
 rejected code; valid approvals remain excluded. Scan/review filters still apply.
 Durations accept explicit `m` or `s` units, from one second through 60 minutes.
-Non-interactive generation requires `--duration`.
+Non-interactive generation requires `--duration`. A `--path` that matches no
+scanned source file is an error, and a scope without unreviewed blocks is
+reported as such rather than as a reading-budget problem.
 
 Trueflow supplies source-pinned evidence: existing complexity metadata, lexical
 entry-point/trust-boundary/write/error/concurrency signals, effective review

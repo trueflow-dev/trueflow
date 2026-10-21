@@ -131,6 +131,12 @@ fn capture_with(
     database: &ReviewDatabase,
     repo: Option<&gix::Repository>,
 ) -> Result<FocusInventory> {
+    if let FocusScope::Under(path) = scope {
+        ensure!(
+            review.tree.nodes().iter().any(|node| node.path.is_under(path)),
+            "--path {path} matches no scanned source files; check the path and scan/review filters"
+        );
+    }
     let mut nodes: Vec<_> = review
         .unreviewed_block_nodes
         .iter()

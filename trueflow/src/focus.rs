@@ -292,6 +292,10 @@ pub fn generate(
     duration: ReviewDuration,
     mut ask: impl FnMut(&str) -> Result<String>,
 ) -> Result<FocusSpecification> {
+    ensure!(
+        !inventory.candidates.is_empty(),
+        "no unreviewed complete blocks remain in this focus scope; approved and filtered blocks are excluded"
+    );
     let mut candidates: Vec<_> = inventory
         .candidates
         .iter()
@@ -390,4 +394,50 @@ Candidates:
         bail!("no focus candidates");
     }
     Ok(batches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::BlockKind;
+    use crate::hashing::BytesHash;
+    use crate::repo_path::RepoPath;
+
+    fn candidate() -> FocusCandidate {
+        FocusCandidate {
+            target: ReviewLocation {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                start_line: 1,
+                end_line: 3,
+                start_byte: 0,
+                end_byte: 40,
+                content_hash: BytesHash::from_bytes(b"pub fn run() { save(); }"),
+            },
+            estimated_seconds: 16,
+            kind: BlockKind::Function,
+            evidence: Vec::new(),
+            excerpt: "pub fn run() { save(); }".into(),
+        }
+    }
+
+    fn inventory(candidates: Vec<FocusCandidate>, diagnostics: Vec<String>) -> FocusInventory {
+        FocusInventory {
+            candidates,
+            snapshot_hash: BytesHash::from_bytes(b"snapshot"),
+            diagnostics,
+        }
+    }
+
+    #[test]
+    fn empty_inventory_is_not_reported_as_a_reading_budget_problem() {
+        let error = generate(
+            &inventory(Vec::new(), Vec::new()),
+            ReviewDuration::from_seconds(3600).unwrap(),
+            |_| unreachable!("no candidates means no model call"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no unreviewed"), "{error}");
+        assert!(!error.contains("budget") && !error.contains("duration"), "{error}");
+    }
 }

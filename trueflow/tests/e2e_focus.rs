@@ -159,3 +159,17 @@ fn focus_plan_reopens_when_unplanned_paths_exceed_the_inventory_cap() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn focus_reports_a_path_that_matches_nothing_instead_of_a_budget() -> Result<()> {
+    let repo = repository("focus_missing_scope")?;
+    for args in [
+        &["focus", "--candidates", "--path", "srcc"][..],
+        &["focus", "--duration", "60m", "--path", "srcc", "--json"][..],
+    ] {
+        let error = repo.run_err(args)?;
+        assert!(error.contains("srcc"), "{args:?}: {error}");
+        assert!(!error.contains("budget"), "{args:?}: {error}");
+    }
+    Ok(())
+}
