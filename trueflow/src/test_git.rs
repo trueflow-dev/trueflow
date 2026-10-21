@@ -43,6 +43,20 @@ fn init_git_repo(path: &Path) {
     run_git(path, &["config", "user.name", "Test User"]);
 }
 
+/// A `--depth 1` clone of `source`, so its HEAD is the shallow boundary.
+pub(crate) fn shallow_clone(source: &Path) -> PathBuf {
+    let clone = temp_test_dir("shallow_clone").join("clone");
+    let clone_arg = clone
+        .to_str()
+        .unwrap_or_else(|| panic!("clone path must be UTF-8: {clone:?}"));
+    let source_url = format!("file://{}", source.display());
+    run_git(
+        source,
+        &["clone", "-q", "--depth", "1", &source_url, clone_arg],
+    );
+    clone
+}
+
 pub(crate) fn run_git(path: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)

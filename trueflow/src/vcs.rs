@@ -736,11 +736,7 @@ pub(crate) fn file_state_for_path_in_revision_base(
         .object()?
         .peel_to_commit()
         .context("revision must resolve to a commit")?;
-    let base_tree = if let Some(parent_id) = commit.parent_ids().next() {
-        repo.find_commit(parent_id)?.tree()?
-    } else {
-        repo.empty_tree()
-    };
+    let base_tree = first_parent_tree(repo, &commit)?;
     file_state_for_path_in_tree(&base_tree, repo_relative_path.as_str(), output_path)
 }
 
@@ -982,11 +978,7 @@ pub(crate) fn file_diffs_for_revision(
         .peel_to_commit()
         .context("revision must resolve to a commit")?;
     let head_tree = commit.tree()?;
-    let base_tree = if let Some(parent_id) = commit.parent_ids().next() {
-        repo.find_commit(parent_id)?.tree()?
-    } else {
-        repo.empty_tree()
-    };
+    let base_tree = first_parent_tree(repo, &commit)?;
     diffs_for_paths_between_trees(repo, &base_tree, &head_tree, selected_destinations)
 }
 
@@ -1328,16 +1320,34 @@ pub fn files_changed_main_to_head_in_repo(repo: &gix::Repository) -> Result<Hash
     collect_changed_paths(repo, Some(&base_tree), Some(&head_tree))
 }
 
-pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> Result<Vec<CommitInfo>> {
+/// Up to `limit` of HEAD's newest first-parent commits. A commit that cannot
+/// be read ends the walk without discarding the newer commits already read.
+#[derive(Debug)]
+pub struct RecentCommits {
+    pub commits: Vec<CommitInfo>,
+    /// Why the walk stopped before reaching `limit` or the root, if it did.
+    pub unreadable: Option<anyhow::Error>,
+}
+
+pub fn recent_commits_in_repo(repo: &gix::Repository, limit: usize) -> RecentCommits {
     let mut history = FirstParentHistory::from_head(repo);
     let mut commits = Vec::new();
     while commits.len() < limit {
-        let Some(commit) = history.next_commit(repo)? else {
-            break;
-        };
-        commits.push(commit);
+        match history.next_commit(repo) {
+            Ok(Some(commit)) => commits.push(commit),
+            Ok(None) => break,
+            Err(error) => {
+                return RecentCommits {
+                    commits,
+                    unreadable: Some(error),
+                };
+            }
+        }
     }
-    Ok(commits)
+    RecentCommits {
+        commits,
+        unreadable: None,
+    }
 }
 
 /// Resumable walk of HEAD's first-parent chain, newest first.
@@ -1372,7 +1382,7 @@ impl FirstParentHistory {
             id: CommitId::new(id.to_string())?,
             summary,
         };
-        self.next = commit.parent_ids().next().map(gix::Id::detach);
+        self.next = first_parent_id(repo, &commit)?;
         Ok(Some(info))
     }
 }
@@ -1392,12 +1402,35 @@ pub fn files_changed_in_revision_in_repo(
         .peel_to_commit()
         .context("revision must resolve to a commit")?;
     let commit_tree = commit.tree()?;
-    let parent_tree = if let Some(parent_id) = commit.parent_ids().next() {
-        repo.find_commit(parent_id)?.tree()?
-    } else {
-        repo.empty_tree()
-    };
+    let parent_tree = first_parent_tree(repo, &commit)?;
     collect_changed_paths(repo, Some(&parent_tree), Some(&commit_tree))
+}
+
+/// `commit`'s first parent as this repository knows it. A shallow clone's
+/// boundary commits have no parents here, so they act as roots, the way
+/// `git log` and `git show` treat them.
+pub(crate) fn first_parent_id(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+) -> Result<Option<gix::ObjectId>> {
+    let is_shallow_boundary = repo
+        .shallow_commits()?
+        .is_some_and(|boundary| boundary.contains(&commit.id));
+    if is_shallow_boundary {
+        return Ok(None);
+    }
+    Ok(commit.parent_ids().next().map(gix::Id::detach))
+}
+
+/// The tree `commit` changed: its first parent's, or empty for a root.
+pub(crate) fn first_parent_tree<'repo>(
+    repo: &'repo gix::Repository,
+    commit: &gix::Commit<'repo>,
+) -> Result<gix::Tree<'repo>> {
+    Ok(match first_parent_id(repo, commit)? {
+        Some(parent_id) => repo.find_commit(parent_id)?.tree()?,
+        None => repo.empty_tree(),
+    })
 }
 
 pub fn files_changed_in_range(start: &str, end: &str) -> Result<HashSet<ChangedPath>> {
@@ -2407,5 +2440,75 @@ mod tests {
             signing_key_with_gpg_format("openpgp").as_deref(),
             Some("/tmp/signing.pub")
         );
+    }
+
+    /// A three-commit history in which every commit touches `lib.rs`.
+    fn three_commit_repo(name: &str) -> PathBuf {
+        use crate::test_git::{run_git, temp_git_repo};
+
+        let source = temp_git_repo(name);
+        for body in ["one", "two", "three"] {
+            std::fs::write(
+                source.join("lib.rs"),
+                format!("pub fn value() -> &'static str {{ \"{body}\" }}\n"),
+            )
+            .unwrap();
+            run_git(&source, &["add", "."]);
+            run_git(&source, &["commit", "-q", "-m", body]);
+        }
+        source
+    }
+
+    #[test]
+    fn shallow_boundary_commit_is_treated_as_root() {
+        let source = three_commit_repo("shallow_boundary_root");
+        let repo = gix::open(crate::test_git::shallow_clone(&source)).unwrap();
+        assert!(repo.is_shallow(), "fixture must be a shallow clone");
+        let lib = RepoPath::new("lib.rs").unwrap();
+
+        let changed = files_changed_in_revision_in_repo(&repo, "HEAD").unwrap();
+        assert!(
+            changed.contains(&ChangedPath::identity(lib.clone())),
+            "the boundary commit adds every file it contains: {changed:?}"
+        );
+        let diff = diff_for_file_in_revision(&repo, "HEAD", &lib).unwrap();
+        assert!(!diff.into_hunks().is_empty());
+        assert!(
+            file_state_for_path_in_revision_base(&repo, "HEAD", &lib, &lib)
+                .unwrap()
+                .is_none(),
+            "a root commit has no base file"
+        );
+
+        let recent = recent_commits_in_repo(&repo, 5);
+        assert_eq!(recent.commits.len(), 1);
+        assert!(recent.unreadable.is_none(), "{:?}", recent.unreadable);
+        let mut history = FirstParentHistory::from_head(&repo);
+        assert!(history.next_commit(&repo).unwrap().is_some());
+        assert!(history.is_exhausted());
+        assert!(history.next_commit(&repo).unwrap().is_none());
+    }
+
+    #[test]
+    fn recent_commits_keep_commits_read_before_an_unreadable_parent() {
+        use crate::test_git::run_git_stdout;
+
+        let root_path = three_commit_repo("recent_commits_unreadable_parent");
+        let root_commit = run_git_stdout(&root_path, &["rev-list", "--max-parents=0", "HEAD"]);
+        let root_commit = root_commit.trim();
+        let (fanout, rest) = root_commit.split_at(2);
+        std::fs::remove_file(root_path.join(".git/objects").join(fanout).join(rest)).unwrap();
+        let repo = gix::open(&root_path).unwrap();
+
+        let recent = recent_commits_in_repo(&repo, 5);
+        assert_eq!(
+            recent
+                .commits
+                .iter()
+                .map(|commit| commit.summary.as_str())
+                .collect::<Vec<_>>(),
+            ["three", "two"]
+        );
+        assert!(recent.unreadable.is_some());
     }
 }

@@ -2851,3 +2851,35 @@ fn check_ignores_changes_under_scan_ignored_paths() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn review_reviews_shallow_clone_boundary_commit_as_root() -> Result<()> {
+    let source = TestRepo::new("shallow_clone_source")?;
+    for body in ["one", "two", "three"] {
+        source.write(
+            "src/lib.rs",
+            &format!("pub fn value() -> &'static str {{\n    \"{body}\"\n}}\n"),
+        )?;
+        source.commit_all(body)?;
+    }
+    let clone_path = temp_test_dir("shallow_clone").join("clone");
+    source.git(&[
+        "clone",
+        "-q",
+        "--depth",
+        "1",
+        &format!("file://{}", source.path.display()),
+        clone_path.to_str().context("utf-8 clone path")?,
+    ])?;
+    let clone = TestRepo { path: clone_path };
+
+    let output = clone.run_raw(&["review", "--target", "rev:HEAD", "--json"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        output.status.success(),
+        "the shallow boundary commit must be reviewable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(review_paths(&stdout)?, ["src/lib.rs"]);
+    Ok(())
+}

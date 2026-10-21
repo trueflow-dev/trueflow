@@ -791,8 +791,12 @@ fn history(
     let mut status = "Git history unavailable: no repository.".to_owned();
     let mut pin = "unavailable".to_owned();
     if let Some(repo) = repo {
-        match vcs::recent_commits_in_repo(repo, MAX_HISTORY_COMMITS + 1) {
-            Ok(commits) if !commits.is_empty() => {
+        let vcs::RecentCommits {
+            commits,
+            unreadable,
+        } = vcs::recent_commits_in_repo(repo, MAX_HISTORY_COMMITS + 1);
+        match (commits.is_empty(), unreadable) {
+            (false, unreadable) => {
                 let truncated = commits.len() > MAX_HISTORY_COMMITS;
                 let commits = &commits[..commits.len().min(MAX_HISTORY_COMMITS)];
                 pin = commits
@@ -800,14 +804,17 @@ fn history(
                     .map(|commit| commit.id.as_str())
                     .collect::<Vec<_>>()
                     .join(",");
+                let window_end = match (unreadable, truncated) {
+                    (Some(error), _) => format!(
+                        "; older history unreadable: {}",
+                        bounded(&error.to_string(), 512)
+                    ),
+                    (None, true) => "; history truncated at commit limit".to_owned(),
+                    (None, false) => String::new(),
+                };
                 status = format!(
-                    "Git history available: {} recent first-parent commits inspected{}; file-local patches, not current-block line attribution. No merge-side traversal, rename following, or full-history claim.",
+                    "Git history available: {} recent first-parent commits inspected{window_end}; file-local patches, not current-block line attribution. No merge-side traversal, rename following, or full-history claim.",
                     commits.len(),
-                    if truncated {
-                        "; history truncated at commit limit"
-                    } else {
-                        ""
-                    }
                 );
                 for commit in commits {
                     if let Err(error) = append_commit_history(repo, commit, paths, &mut result) {
@@ -837,12 +844,12 @@ fn history(
                     );
                 }
             }
-            Ok(_) => {
+            (true, None) => {
                 status =
                     "Git history unavailable: no readable HEAD commit (empty or unborn repository)."
                         .into();
             }
-            Err(error) => {
+            (true, Some(error)) => {
                 status = format!(
                     "Git history unavailable: first-parent traversal failed: {}",
                     bounded(&error.to_string(), 512)
@@ -881,10 +888,7 @@ fn append_commit_history(
         .object()?
         .peel_to_commit()?;
     let head = commit.tree()?;
-    let base = match commit.parent_ids().next() {
-        Some(parent) => repo.find_commit(parent)?.tree()?,
-        None => repo.empty_tree(),
-    };
+    let base = vcs::first_parent_tree(repo, &commit)?;
     let changes = vcs::files_changed_in_revision_in_repo(repo, info.id.as_str())?;
     let mut selected = Vec::new();
     let mut pins = BTreeMap::new();
@@ -1262,6 +1266,37 @@ mod tests {
                     && e.detail.contains("fix another critical bug"))
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shallow_clone_history_inspects_the_boundary_commit() {
+        let source = temp_git_repo("focus-evidence-shallow");
+        let initial = "pub fn authorize(ok: bool) { if ok { write(); } }\n";
+        std::fs::write(source.join("auth.rs"), initial).unwrap();
+        run_git(&source, &["add", "."]);
+        run_git(&source, &["commit", "-qm", "initial"]);
+        std::fs::write(source.join("auth.rs"), initial.replace("if ok", "if !ok")).unwrap();
+        run_git(&source, &["commit", "-qam", "fix authorization"]);
+        let clone = gix::open(crate::test_git::shallow_clone(&source)).unwrap();
+        let fixture = review(&[("auth.rs", &initial.replace("if ok", "if !ok"))]);
+
+        let inventory = capture(&fixture, &ReviewDatabase::default(), Some(&clone));
+
+        assert!(
+            inventory
+                .diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::GitHistory
+                    && d.message.starts_with("Git history available: 1 recent")),
+            "{:?}",
+            inventory.diagnostics
+        );
+        assert!(
+            inventory.candidates[0]
+                .evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::GitPatch && e.detail.contains("if !ok"))
+        );
     }
 
     #[test]

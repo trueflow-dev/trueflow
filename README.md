@@ -487,7 +487,9 @@ temporary files, then exits as the signal would; a second signal exits at once.
 Without `--target`, the TUI opens a review scope selector listing all files,
 the diff against main, and HEAD's first-parent commits. Older commits load in
 pages of 50 as the selection nears the end of the list, so `j`/Down reaches any
-commit back to the root. When launched from a subdirectory, only commits that
+commit back to the root. In a shallow clone the oldest fetched commit is the
+root: it lists last and reviews as adding every file it contains, as `git show`
+does. When launched from a subdirectory, only commits that
 touch it are listed. Each commit's remaining-review status is computed in the
 background only while its row is on screen.
 

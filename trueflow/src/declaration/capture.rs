@@ -222,9 +222,7 @@ fn immutable_endpoints<'repo>(
     match target {
         ReviewDiffTarget::Revision(revision) => {
             let head = resolved_commit(repo, revision, "revision")?;
-            let base = head
-                .parent_ids()
-                .next()
+            let base = vcs::first_parent_id(repo, &head)?
                 .map(|id| repo.find_commit(id))
                 .transpose()?;
             Ok((base, head))

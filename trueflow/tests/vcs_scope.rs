@@ -19,7 +19,9 @@ fn test_recent_commits_in_repo_returns_head_first() -> Result<()> {
     repo.commit_all("Second commit")?;
 
     let git_repo = gix::open(&repo.path)?;
-    let commits = trueflow::vcs::recent_commits_in_repo(&git_repo, 8)?;
+    let recent = trueflow::vcs::recent_commits_in_repo(&git_repo, 8);
+    assert!(recent.unreadable.is_none(), "{:?}", recent.unreadable);
+    let commits = recent.commits;
 
     assert!(commits.len() >= 2, "expected at least two commits");
     assert_eq!(commits[0].summary, "Second commit");
