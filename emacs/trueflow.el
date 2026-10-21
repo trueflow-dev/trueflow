@@ -59,29 +59,9 @@ change how explicit absolute or relative path values are resolved."
   "Face for comments in Trueflow code blocks."
   :group 'trueflow)
 
-(defface trueflow-code-add-face
-  '((t :inherit trueflow-code-face :foreground "#2e7d32" :weight bold))
-  "Face for added lines in Trueflow code blocks."
-  :group 'trueflow)
-
-(defface trueflow-code-del-face
-  '((t :inherit trueflow-code-face :foreground "#c62828" :weight bold))
-  "Face for removed lines in Trueflow code blocks."
-  :group 'trueflow)
-
 (defface trueflow-code-gutter-face
   '((t :inherit trueflow-code-face :foreground "#928374"))
   "Face for the Trueflow code gutter."
-  :group 'trueflow)
-
-(defface trueflow-code-gutter-add-face
-  '((t :inherit trueflow-code-gutter-face :foreground "#2e7d32" :weight bold))
-  "Face for the Trueflow add gutter."
-  :group 'trueflow)
-
-(defface trueflow-code-gutter-del-face
-  '((t :inherit trueflow-code-gutter-face :foreground "#c62828" :weight bold))
-  "Face for the Trueflow delete gutter."
   :group 'trueflow)
 
 ;;; Classes
@@ -303,7 +283,7 @@ when they contain a path separator. Bare command names are resolved via
         (insert (propertize (concat line "\n") 'face 'shadow))))))
 
 (defun trueflow--insert-content (content)
-  "Insert CONTENT with diff-style highlights."
+  "Insert CONTENT, the raw source of a review block, with a gutter."
   (let* ((lines (split-string content "\n" nil))
          (count (length lines))
          (ends-with-newline (string-suffix-p "\n" content)))
@@ -314,33 +294,19 @@ when they contain a path separator. Bare command names are resolved via
                   (insert "\n")))))
 
 (defun trueflow--insert-content-line (line)
-  "Insert LINE with diff-style highlights."
-  (let* ((gutter (lambda (symbol face)
-                   (insert (propertize
-                            (concat (make-string trueflow--gutter-left ?\s)
-                                    (if symbol (char-to-string symbol) " ")
-                                    (make-string trueflow--gutter-right ?\s))
-                            'face face))))
-         (comment-line (lambda (text)
-                         (let ((trimmed (string-trim-left text)))
-                           (or (string-prefix-p "//" trimmed)
-                               (string-prefix-p "#" trimmed)
-                               (string-prefix-p "/*" trimmed)
-                               (string-prefix-p "*" trimmed))))))
-    (cond
-     ((string-prefix-p "+" line)
-      (funcall gutter ?+ 'trueflow-code-gutter-add-face)
-      (insert (propertize (substring line 1)
-                          'face 'trueflow-code-add-face)))
-     ((string-prefix-p "-" line)
-      (funcall gutter ?- 'trueflow-code-gutter-del-face)
-      (insert (propertize (substring line 1)
-                          'face 'trueflow-code-del-face)))
-     (t
-      (funcall gutter nil 'trueflow-code-gutter-face)
-      (insert (propertize line 'face (if (funcall comment-line line)
-                                         'trueflow-code-comment-face
-                                       'trueflow-code-face)))))))
+  "Insert raw source LINE after a blank gutter.
+
+Review content is source text, not a diff, so leading `+' and `-' are
+ordinary characters."
+  (let ((trimmed (string-trim-left line)))
+    (insert (propertize (make-string (+ trueflow--gutter-left 1 trueflow--gutter-right) ?\s)
+                        'face 'trueflow-code-gutter-face))
+    (insert (propertize line 'face (if (or (string-prefix-p "//" trimmed)
+                                           (string-prefix-p "#" trimmed)
+                                           (string-prefix-p "/*" trimmed)
+                                           (string-prefix-p "*" trimmed))
+                                       'trueflow-code-comment-face
+                                     'trueflow-code-face)))))
 
 (defun trueflow--insert-actions (text)
   "Insert TEXT near the bottom of the window."

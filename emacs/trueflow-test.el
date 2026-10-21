@@ -356,3 +356,13 @@
         (should (string-match-p "boom" (error-message-string err)))
         (should (string-match-p "partial" (error-message-string err)))))
     (should-not (file-exists-p (expand-file-name "*trueflow-log*" root)))))
+
+(ert-deftest trueflow-insert-content-renders-leading-markers-as-source ()
+  "Review content is raw source, so leading + and - are ordinary text."
+  (with-temp-buffer
+    (trueflow--insert-content "- item\n+ more\n")
+    (should (string-match-p "^ +- item$" (buffer-string)))
+    (should (string-match-p "^ +\\+ more$" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "item")
+    (should (eq (get-text-property (1- (point)) 'face) 'trueflow-code-face))))
