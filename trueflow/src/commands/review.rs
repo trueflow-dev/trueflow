@@ -23,6 +23,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
 use tracing::info;
 
 pub use crate::targets::{ReviewTarget, RevisionExpr, RevisionRangeExpr};
@@ -1062,24 +1063,28 @@ pub fn print_review_summary(summary: ReviewSummary, json: bool) -> Result<()> {
         unreviewed_files.len(),
         total_blocks
     );
+    let mut out = BufWriter::new(std::io::stdout().lock());
     if json {
-        println!("{}", serde_json::to_string_pretty(&unreviewed_files)?);
+        serde_json::to_writer_pretty(&mut out, &unreviewed_files)?;
+        writeln!(out)?;
     } else if unreviewed_files.is_empty() {
-        println!("All clear! No unreviewed blocks found.");
+        writeln!(out, "All clear! No unreviewed blocks found.")?;
     } else {
         for file in unreviewed_files {
-            println!("File: {}", file.path);
+            writeln!(out, "File: {}", file.path)?;
             for block in file.blocks {
-                println!(
+                writeln!(
+                    out,
                     "  [Unreviewed] L{}-L{} (Hash: {}) Kind: {}",
                     block.start_line, block.end_line, block.hash, block.kind
-                );
+                )?;
                 if let Some(first_line) = block.content.lines().next() {
-                    println!("    > {}", first_line.trim());
+                    writeln!(out, "    > {}", first_line.trim())?;
                 }
             }
         }
     }
+    out.flush()?;
 
     Ok(())
 }
