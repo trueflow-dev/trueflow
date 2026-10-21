@@ -774,18 +774,22 @@ Press C-c C-c to commit, C-c C-k to cancel."
   (interactive)
   (unless trueflow-comment-target-block
     (error "Not in a valid trueflow comment buffer"))
-  (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+  (let ((content (buffer-substring-no-properties (point-min) (point-max)))
+        (after-commit trueflow-comment-after-commit-function)
+        (status-buf trueflow-comment-status-buffer))
     (setq content (replace-regexp-in-string "^#.*\n" "" content))
     (setq content (string-trim content))
     (if (string-empty-p content)
         (message "Comment aborted (empty)")
       (trueflow--run-mark trueflow-comment-target-block "comment" content)
       (message "Comment recorded"))
+    ;; `quit-window' kills this buffer and its local state, so the
+    ;; follow-up is read above.
     (quit-window t)
-    (if trueflow-comment-after-commit-function
-        (funcall trueflow-comment-after-commit-function)
-      (when (buffer-live-p trueflow-comment-status-buffer)
-        (with-current-buffer trueflow-comment-status-buffer
+    (if after-commit
+        (funcall after-commit)
+      (when (buffer-live-p status-buf)
+        (with-current-buffer status-buf
           (trueflow-refresh))))))
 
 (defun trueflow-comment-abort ()

@@ -300,3 +300,45 @@
       (when (get-buffer "*trueflow-focus*")
         (kill-buffer "*trueflow-focus*"))
       (kill-buffer status-buf))))
+
+(ert-deftest trueflow-comment-commit-runs-after-commit-callback ()
+  "Committing a comment should mark it and refresh the focus session."
+  (let* ((status-buf (generate-new-buffer " *trueflow-test-status*"))
+         (focus-buf (generate-new-buffer " *trueflow-test-focus*"))
+         (remaining-scan (trueflow-test--scan-data '("b" "c")))
+         mark-args
+         opened)
+    (unwind-protect
+        (progn
+          (with-current-buffer status-buf
+            (trueflow-mode)
+            (setq-local trueflow-last-scan-data (trueflow-test--scan-data '("a" "b" "c")))
+            (setq-local trueflow-review-items (trueflow-test--review-items '("a" "b" "c")))
+            (setq-local trueflow-review-index 0))
+          (switch-to-buffer focus-buf)
+          (trueflow-focus-mode)
+          (setq-local trueflow-focus-current-block (trueflow-test--block "a"))
+          (setq-local trueflow-focus-status-buffer status-buf)
+          (cl-letf (((symbol-function 'trueflow--run-command)
+                     (lambda (args)
+                       (setq mark-args args)
+                       ""))
+                    ((symbol-function 'trueflow-refresh)
+                     (lambda ()
+                       (setq trueflow-last-scan-data remaining-scan)))
+                    ((symbol-function 'trueflow-focus-open)
+                     (lambda (block _status-buf current-idx total-count)
+                       (setq opened (list (alist-get 'hash block) current-idx total-count)))))
+            (trueflow-focus-comment)
+            (should (eq major-mode 'trueflow-comment-mode))
+            (goto-char (point-max))
+            (insert "looks off")
+            (trueflow-comment-commit))
+          (should (equal mark-args
+                         '("mark" "--fingerprint" "a" "--verdict" "comment"
+                           "--path" "src/lib.rs" "--line" "3" "--note" "looks off")))
+          (should (equal opened '("b" 1 2))))
+      (when (get-buffer "*trueflow-comment*")
+        (kill-buffer "*trueflow-comment*"))
+      (kill-buffer status-buf)
+      (kill-buffer focus-buf))))
