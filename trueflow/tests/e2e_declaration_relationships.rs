@@ -599,6 +599,55 @@ fn type_definition_only_server_resolves_projected_type_use() -> Result<()> {
 }
 
 #[test]
+fn documented_type_declaration_reconciles_its_identifier_not_its_doc_comment() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "/** Payload data. */\n",
+        "export interface Payload {}\n",
+        "export function decode(input: Payload) {}\n",
+    );
+    let uri = Url::parse("file:///review/workspace/src/payload.ts")?;
+    let facts = project_source(Path::new("src/payload.ts"), Language::TypeScript, SOURCE)?;
+    let payload =
+        declaration_named(facts.declarations(), "Payload", DeclarationKind::Interface).clone();
+    let decode =
+        declaration_named(facts.declarations(), "decode", DeclarationKind::Function).clone();
+    let document = ProjectedDocument::new(uri.clone(), SOURCE, facts);
+    let index = RelationshipProjectionIndex::new(RelationshipScope::Workspace, [document]);
+
+    let payload_identifier = location_at(&uri, 1, 17, 1, 24);
+    let uses_types = plan_uses_types(&index, &decode.id, PositionEncoding::Utf16)?;
+    let mut backend = FakeRelationshipBackend::new(
+        [RelationshipCapability::TypeDefinition],
+        [vec![payload_identifier.clone()]],
+    );
+    let execution = execute_relationship_plan(&uses_types, &mut backend)?;
+    backend.assert_exhausted();
+    let RelationshipOutcome::Complete { edges } =
+        reconcile_relationship_execution(&uses_types, execution, &index)?
+    else {
+        panic!("documented type use did not complete");
+    };
+    assert_eq!(
+        edges
+            .iter()
+            .map(|edge| edge.target.clone())
+            .collect::<Vec<_>>(),
+        vec![RelationshipTarget::InReview(payload.id.clone())],
+        "the type definition at the identifier must reconcile to the documented Payload"
+    );
+
+    let used_by = plan_used_by(&index, &payload.id, PositionEncoding::Utf16)?;
+    let mut backend = FakeRelationshipBackend::new([RelationshipCapability::References], [vec![]]);
+    execute_relationship_plan(&used_by, &mut backend)?;
+    assert_eq!(
+        backend.requests,
+        vec![references_request(&uri, 1, 17, false)],
+        "UsedBy must query the declaration identifier, not the word inside its doc comment"
+    );
+    Ok(())
+}
+
+#[test]
 fn uses_types_preserves_every_location_from_one_resolution_response_in_order() -> Result<()> {
     const SOURCE: &str = "export function decode(input: ExternalPayload) {}\n";
     let uri = Url::parse("file:///review/workspace/src/decode.ts")?;

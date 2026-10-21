@@ -15,11 +15,11 @@ use crate::declaration::relationships::{
     RelationshipKind, RelationshipLocation, RelationshipMethod, RelationshipOutcome,
     RelationshipProjectionIndex, RelationshipProvenance, RelationshipProvider,
     RelationshipRequestKey, RelationshipResult, RelationshipScope, RelationshipTarget,
-    SourceGeneration, WorkspaceTrust, execute_relationship_plan, lsp_position_for_byte_offset,
-    plan_used_by, plan_uses_types, reconcile_relationship_execution,
+    SourceGeneration, WorkspaceTrust, declaration_name_start, execute_relationship_plan,
+    lsp_position_for_byte_offset, plan_used_by, plan_uses_types, reconcile_relationship_execution,
 };
 use crate::declaration::snapshot::SnapshotId;
-use crate::declaration::{DeclarationId, SourceComponentRole, TypeUseRole, project_source};
+use crate::declaration::{DeclarationId, TypeUseRole, project_source};
 
 use super::{
     DeclarationAppRuntime, PreparedDeclarationLaunch, PreparedDeclarationTarget, Relationship,
@@ -197,7 +197,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
                 document_hash: document_hash.clone(),
             };
             let synchronization = exact_synchronization(&absolute, &uri, &exact_source, &documents);
-            let name_start = declaration_name_start(target)?;
+            let name_start = declaration_name_start(&exact_source, &target.declaration)?;
             let mut selection_ranges = Vec::with_capacity(2);
             for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
                 let range = Range::new(
@@ -498,47 +498,6 @@ impl Drop for ProductionRelationshipCoordinator {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-fn declaration_name_start(target: &PreparedDeclarationTarget) -> Result<usize> {
-    let declaration = &target.declaration;
-    for component in &declaration.components {
-        if matches!(
-            component.role,
-            SourceComponentRole::Documentation
-                | SourceComponentRole::Attribute
-                | SourceComponentRole::Layout
-        ) {
-            continue;
-        }
-        for (relative, _) in component.text.match_indices(&declaration.name) {
-            let start = component.source_range.start + relative;
-            let end = start + declaration.name.len();
-            if is_identifier_boundary(target.snapshot.source(), start, end)
-                && !declaration
-                    .type_use_sites
-                    .iter()
-                    .any(|site| site.source_range == (start..end))
-            {
-                return Ok(start);
-            }
-        }
-    }
-    Err(anyhow!(
-        "declaration identifier is absent from its projected source components"
-    ))
-}
-
-fn is_identifier_boundary(source: &str, start: usize, end: usize) -> bool {
-    let before = source
-        .get(..start)
-        .and_then(|prefix| prefix.chars().next_back());
-    let after = source.get(end..).and_then(|suffix| suffix.chars().next());
-    !before.is_some_and(is_identifier_continue) && !after.is_some_and(is_identifier_continue)
-}
-
-fn is_identifier_continue(character: char) -> bool {
-    character == '_' || character == '$' || character.is_alphanumeric()
 }
 
 fn exact_synchronization(
@@ -1219,7 +1178,10 @@ fn execute_with_provider(
         }
     }
 
-    let name_start = match declaration_name_start(&request.target) {
+    let name_start = match declaration_name_start(
+        request.target.snapshot.source(),
+        &request.target.declaration,
+    ) {
         Ok(start) => start,
         Err(error) => return failed_results(request, error.to_string()),
     };

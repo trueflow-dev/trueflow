@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 use crate::analysis::Language;
 use crate::declaration::{
     DeclarationId, DeclarationKey, DeclarationKind, DeclarationNode, FileDeclarationFacts,
-    TypeUseRole,
+    SourceComponentRole, TypeUseRole,
 };
 use crate::hashing::hex_digest;
 
@@ -754,20 +754,55 @@ fn declaration_name_location(
     declaration: &DeclarationNode,
     encoding: PositionEncoding,
 ) -> Result<Location> {
-    let source = document
-        .source
-        .get(declaration.source_span.clone())
-        .ok_or_else(|| anyhow!("projected declaration span is outside its source document"))?;
-    let relative = source
-        .find(&declaration.name)
-        .ok_or_else(|| anyhow!("projected declaration name is absent from its source span"))?;
-    let start = declaration.source_span.start + relative;
+    let start = declaration_name_start(&document.source, declaration)?;
     location_for_byte_range(
         &document.uri,
         &document.source,
         start..start + declaration.name.len(),
         encoding,
     )
+}
+
+/// Byte offset of the declaration's identifier within `source`, searched only in projected
+/// surface components (never documentation or attributes) at identifier word boundaries.
+pub fn declaration_name_start(source: &str, declaration: &DeclarationNode) -> Result<usize> {
+    for component in &declaration.components {
+        if matches!(
+            component.role,
+            SourceComponentRole::Documentation
+                | SourceComponentRole::Attribute
+                | SourceComponentRole::Layout
+        ) {
+            continue;
+        }
+        for (relative, _) in component.text.match_indices(&declaration.name) {
+            let start = component.source_range.start + relative;
+            let end = start + declaration.name.len();
+            if is_identifier_boundary(source, start, end)
+                && !declaration
+                    .type_use_sites
+                    .iter()
+                    .any(|site| site.source_range == (start..end))
+            {
+                return Ok(start);
+            }
+        }
+    }
+    Err(anyhow!(
+        "declaration identifier is absent from its projected source components"
+    ))
+}
+
+fn is_identifier_boundary(source: &str, start: usize, end: usize) -> bool {
+    let before = source
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back());
+    let after = source.get(end..).and_then(|suffix| suffix.chars().next());
+    !before.is_some_and(is_identifier_continue) && !after.is_some_and(is_identifier_continue)
+}
+
+fn is_identifier_continue(character: char) -> bool {
+    character == '_' || character == '$' || character.is_alphanumeric()
 }
 
 fn location_for_byte_range(
