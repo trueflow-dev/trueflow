@@ -135,3 +135,29 @@ pub(crate) fn default_code_sub_split(_kind: BlockKind) -> SubSplitRegistration {
         splitter: crate::sub_splitter::split_code_review_units,
     }
 }
+
+/// Classifies top-level text between YAML/JSON values. Blank lines and
+/// structural punctuation are a `Gap`; comment lines are a `Comment`; any
+/// other text (directives, stray content) is a reviewable `Preamble`.
+pub(crate) fn data_interstitial_kind(
+    chunk: &str,
+    is_structural_line: fn(&str) -> bool,
+) -> BlockKind {
+    let mut saw_comment = false;
+    for line in chunk.lines().map(str::trim) {
+        if line.is_empty() || is_structural_line(line) {
+            continue;
+        }
+        if crate::code_comments::chunk_is_comment_only(line) {
+            saw_comment = true;
+            continue;
+        }
+        return BlockKind::Preamble;
+    }
+
+    if saw_comment {
+        BlockKind::Comment
+    } else {
+        BlockKind::Gap
+    }
+}

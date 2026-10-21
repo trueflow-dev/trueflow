@@ -1,6 +1,6 @@
 use super::{
     LanguageRegistration, LanguageSubSplitSemantics, SubSplitRegistration, TopLevelRegistration,
-    default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
+    data_interstitial_kind, default_map_kind, no_attribute_nodes, no_nested_blocks, no_test_ranges,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan};
@@ -405,7 +405,7 @@ fn push_non_empty_gap(
 
     blocks.push(create_file_block(
         chunk,
-        BlockKind::Gap,
+        data_interstitial_kind(chunk, is_yaml_structural_noise),
         content,
         start,
         end,

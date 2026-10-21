@@ -210,3 +210,24 @@ fn test_yaml_sub_block_review_prefers_container_children_over_scalar_fragments()
 
     Ok(())
 }
+
+#[test]
+fn test_yaml_comments_between_top_level_keys_are_reviewable() {
+    let source = "# yaml-language-server: $schema=https://example.com/schema.json\nreplicas: 3\n# keep >= 2 for HA\nminReplicas: 2\n";
+
+    let blocks = block_splitter::split(source, Language::Yaml).blocks;
+
+    let gaps_with_text = blocks
+        .iter()
+        .filter(|block| block.kind == BlockKind::Gap && !block.content.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert!(gaps_with_text.is_empty(), "blocks={blocks:#?}");
+    for comment in ["# yaml-language-server", "# keep >= 2 for HA"] {
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Comment && block.content.contains(comment)),
+            "missing Comment block for {comment:?}: {blocks:#?}"
+        );
+    }
+}

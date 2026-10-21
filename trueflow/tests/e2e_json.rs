@@ -214,3 +214,23 @@ fn test_json_sub_block_review_prefers_container_children_over_scalar_fragments()
 
     Ok(())
 }
+
+#[test]
+fn test_jsonc_comments_between_top_level_pairs_are_reviewable() {
+    let source = "{\n  \"replicas\": 3,\n  // keep >= 2 for HA\n  \"minReplicas\": 2\n}\n";
+
+    let blocks = block_splitter::split(source, Language::Json).blocks;
+
+    assert!(
+        !blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::Gap && block.content.contains("keep >= 2")),
+        "blocks={blocks:#?}"
+    );
+    assert!(
+        blocks.iter().any(|block| {
+            block.kind != BlockKind::Gap && block.content.contains("// keep >= 2 for HA")
+        }),
+        "blocks={blocks:#?}"
+    );
+}
