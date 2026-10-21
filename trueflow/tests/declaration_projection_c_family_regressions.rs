@@ -11,7 +11,7 @@ use trueflow::declaration::snapshot::{
 };
 use trueflow::declaration::{
     DeclarationKind, DeclarationNode, FileDeclarationFacts, SourceComponentRole, TypeUseRole,
-    project_source,
+    Visibility, project_source,
 };
 
 fn project(path: &str, language: Language, source: &str) -> Result<FileDeclarationFacts> {
@@ -599,6 +599,64 @@ fn c_preprocessor_alternative_branches_are_inventoried() -> Result<()> {
             ("b", "int b(void);"),
             ("c", "int c(void);"),
             ("d", "int d(void);"),
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cpp_preprocessor_blocks_inside_class_bodies_keep_members() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "class Codec {\n",
+        "public:\n",
+        "    int version;\n",
+        "#ifdef FEATURE\n",
+        "    int flags;\n",
+        "    void tune();\n",
+        "#else\n",
+        "private:\n",
+        "    void fallback();\n",
+        "#endif\n",
+        "    void reset();\n",
+        "};\n",
+    );
+
+    let facts = project("src/codec.cpp", Language::Cpp, SOURCE)?;
+    let codec = declaration_named(&facts, "Codec", DeclarationKind::Class)?;
+    assert_eq!(
+        codec.projection_text,
+        concat!(
+            "class Codec {\n",
+            "public:\n",
+            "    int version;\n",
+            "#ifdef FEATURE\n",
+            "    int flags;\n",
+            "#else\n",
+            "private:\n",
+            "#endif\n",
+            "};",
+        )
+    );
+    let methods = facts
+        .declarations()
+        .iter()
+        .filter(|declaration| declaration.kind == DeclarationKind::Method)
+        .map(|declaration| {
+            (
+                declaration.name.as_str(),
+                declaration.projection_text.as_str(),
+                declaration.visibility.clone(),
+                declaration.parent_part.as_ref() == Some(&codec.id),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        [
+            ("tune", "void tune();", Visibility::Public, true),
+            ("fallback", "void fallback();", Visibility::Private, true),
+            ("reset", "void reset();", Visibility::Private, true),
         ]
     );
 

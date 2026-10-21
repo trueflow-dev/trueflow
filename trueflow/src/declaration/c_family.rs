@@ -550,12 +550,12 @@ impl Projector<'_> {
 
         if let Some(body) = specifier.child_by_field_name("body") {
             let children_start = self.declarations.len();
-            let member_visibility = if specifier.kind() == "class_specifier" {
+            let mut member_visibility = if specifier.kind() == "class_specifier" {
                 Visibility::Private
             } else {
                 Visibility::Public
             };
-            self.collect_member_scope(body, &id, &name_info.name, member_visibility)?;
+            self.collect_member_scope(body, &id, &name_info.name, &mut member_visibility)?;
             self.declarations[aggregate_index].children = self.declarations[children_start..]
                 .iter()
                 .filter(|declaration| declaration.parent_part.as_ref() == Some(&id))
@@ -570,7 +570,7 @@ impl Projector<'_> {
         body: Node<'_>,
         parent_id: &DeclarationId,
         parent_name: &str,
-        mut visibility: Visibility,
+        visibility: &mut Visibility,
     ) -> Result<()> {
         let mut pending = Vec::<Part>::new();
         let mut cursor = body.walk();
@@ -581,7 +581,16 @@ impl Projector<'_> {
             }
             if child.kind() == "access_specifier" {
                 pending.clear();
-                visibility = access_visibility(child, self.source).unwrap_or(visibility);
+                if let Some(access) = access_visibility(child, self.source) {
+                    *visibility = access;
+                }
+                continue;
+            }
+            if is_preprocessor_container(child.kind()) {
+                // Access specifiers inside a conditional block apply textually to the
+                // members that follow it, so the block shares the enclosing visibility.
+                pending.clear();
+                self.collect_member_scope(child, parent_id, parent_name, visibility)?;
                 continue;
             }
             self.expire_detached_docs(child.start_byte(), &mut pending);
@@ -788,39 +797,7 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
     let mut previous_end = open_end;
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
-        let prefix_start = whitespace_suffix_start(source, previous_end, member.start_byte());
-        let member_end = if member.kind() == "access_specifier" {
-            access_specifier_end(member, source)
-        } else {
-            member.end_byte()
-        };
-        match member.kind() {
-            "access_specifier" => parts.push(Part {
-                range: prefix_start..member_end,
-                role: SourceComponentRole::AggregateShape,
-            }),
-            "field_declaration" | "declaration" => {
-                // Callable and nested aggregate children exclusively own their surfaces.
-                let owned_by_child = contains_callable_declarator(member)
-                    || aggregate_specifier(member)
-                        .is_some_and(|specifier| is_aggregate_declaration(member, specifier));
-                if !owned_by_child {
-                    if prefix_start < member.start_byte() {
-                        parts.push(Part {
-                            range: prefix_start..member.start_byte(),
-                            role: SourceComponentRole::AggregateShape,
-                        });
-                    }
-                    parts.extend(field_shape_parts(member));
-                }
-            }
-            "function_definition" | "template_declaration" => {
-                // Callable children exclusively own their signatures; bodies never enter
-                // aggregate shape projections.
-            }
-            _ => {}
-        }
-        previous_end = member_end;
+        push_member_parts(member, source, &mut parts, &mut previous_end);
     }
     let close_start =
         whitespace_suffix_start(source, previous_end, body.end_byte().saturating_sub(1));
@@ -837,6 +814,80 @@ fn aggregate_parts(item: Node<'_>, specifier: Node<'_>, source: &str) -> Vec<Par
         });
     }
     parts
+}
+
+fn push_member_parts(
+    member: Node<'_>,
+    source: &str,
+    parts: &mut Vec<Part>,
+    previous_end: &mut usize,
+) {
+    let prefix_start = whitespace_suffix_start(source, *previous_end, member.start_byte());
+    let member_end = if member.kind() == "access_specifier" {
+        access_specifier_end(member, source)
+    } else {
+        member.end_byte()
+    };
+    match member.kind() {
+        "access_specifier" => parts.push(Part {
+            range: prefix_start..member_end,
+            role: SourceComponentRole::AggregateShape,
+        }),
+        "field_declaration" | "declaration" => {
+            // Callable and nested aggregate children exclusively own their surfaces.
+            let owned_by_child = contains_callable_declarator(member)
+                || aggregate_specifier(member)
+                    .is_some_and(|specifier| is_aggregate_declaration(member, specifier));
+            if !owned_by_child {
+                if prefix_start < member.start_byte() {
+                    parts.push(Part {
+                        range: prefix_start..member.start_byte(),
+                        role: SourceComponentRole::AggregateShape,
+                    });
+                }
+                parts.extend(field_shape_parts(member));
+            }
+        }
+        "function_definition" | "template_declaration" => {
+            // Callable children exclusively own their signatures; bodies never enter
+            // aggregate shape projections.
+        }
+        kind if is_preprocessor_container(kind) => {
+            push_preprocessor_parts(member, source, parts, previous_end);
+            return;
+        }
+        _ => {}
+    }
+    *previous_end = member_end;
+}
+
+/// Conditional directives inside an aggregate body are part of its shape; the members they
+/// guard are projected exactly as unguarded members.
+fn push_preprocessor_parts(
+    directive: Node<'_>,
+    source: &str,
+    parts: &mut Vec<Part>,
+    previous_end: &mut usize,
+) {
+    let mut cursor = directive.walk();
+    for (index, child) in directive.children(&mut cursor).enumerate() {
+        let field = u32::try_from(index)
+            .ok()
+            .and_then(|index| directive.field_name_for_child(index));
+        if child.is_named() && !matches!(field, Some("condition" | "name")) {
+            push_member_parts(child, source, parts, previous_end);
+            continue;
+        }
+        if node_text(child, source).is_none_or(|text| text.trim().is_empty()) {
+            continue;
+        }
+        parts.push(Part {
+            range: whitespace_suffix_start(source, *previous_end, child.start_byte())
+                ..child.end_byte(),
+            role: SourceComponentRole::AggregateShape,
+        });
+        *previous_end = child.end_byte();
+    }
 }
 
 fn field_shape_parts(field: Node<'_>) -> Vec<Part> {
