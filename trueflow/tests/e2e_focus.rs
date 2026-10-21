@@ -136,6 +136,16 @@ fn focus_loaded_plan_resumes_without_approving_unselected_content() -> Result<()
     Ok(())
 }
 
+fn evidence_id<'a>(candidate: &'a Value, kind: &str) -> Result<&'a Value> {
+    candidate["evidence"]
+        .as_array()
+        .context("evidence")?
+        .iter()
+        .find(|evidence| evidence["kind"] == kind)
+        .map(|evidence| &evidence["id"])
+        .with_context(|| format!("{kind} evidence"))
+}
+
 #[test]
 fn focus_plan_reopens_when_unplanned_paths_exceed_the_inventory_cap() -> Result<()> {
     let repo = repository("focus_plan_scope")?;
@@ -156,6 +166,61 @@ fn focus_plan_reopens_when_unplanned_paths_exceed_the_inventory_cap() -> Result<
     assert_eq!(
         reopened["steps"][0]["target"],
         page["candidates"][0]["target"]
+    );
+    Ok(())
+}
+
+#[test]
+fn focus_plan_survives_comments_and_unrelated_commits() -> Result<()> {
+    let repo = repository("focus_plan_mutable_evidence")?;
+    repo.commit_all("initial")?;
+    let page = inventory(&repo)?;
+    let candidate = &page["candidates"][0];
+    let mut cited = plan(candidate, 300);
+    cited["steps"][0]["evidence"] = json!([
+        evidence_id(candidate, "human_review")?,
+        evidence_id(candidate, "history_status")?
+    ]);
+    repo.write("plan.json", &cited.to_string())?;
+    repo.run(&["focus", "--plan", "plan.json", "--json"])?;
+    let onboard = parse_json(&repo.run(&["onboard", "--candidates", "--path", "src"])?)?;
+    let same = onboard["candidates"]
+        .as_array()
+        .context("candidates")?
+        .iter()
+        .find(|other| other["target"] == candidate["target"])
+        .context("same target")?;
+    repo.run(&[
+        "mark",
+        "--fingerprint",
+        same["fingerprint"].as_str().context("fingerprint")?,
+        "--path",
+        "src/lib.rs",
+        "--verdict",
+        "comment",
+        "--note",
+        "Check the underflow before release.",
+        "--quiet",
+    ])?;
+    repo.write("NOTES.txt", "unrelated\n")?;
+    repo.commit_all("unrelated change")?;
+    let pending = inventory(&repo)?;
+    let current = pending["candidates"]
+        .as_array()
+        .context("pending")?
+        .iter()
+        .find(|c| c["target"] == candidate["target"])
+        .context("commented card stays pending")?;
+    assert_ne!(
+        current["evidence"], candidate["evidence"],
+        "the cited observations must have changed for this regression to apply"
+    );
+    repo.run(&["focus", "--plan", "plan.json", "--json"])?;
+    cited["steps"][0]["evidence"] = json!(["ev-invented"]);
+    repo.write("plan.json", &cited.to_string())?;
+    assert!(
+        repo.run_err(&["focus", "--plan", "plan.json", "--json"])?
+            .contains("invented")
     );
     Ok(())
 }

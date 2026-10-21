@@ -197,19 +197,39 @@ impl FocusInventory {
 }
 
 impl FocusEvidence {
+    /// Cites an immutable observation: the ID pins its exact detail and provenance.
     fn new(
         target: &ReviewLocation,
         kind: EvidenceKind,
         detail: String,
         provenance: String,
     ) -> Result<Self> {
-        let bytes = serde_json::to_vec(&(1, target, kind, &detail, &provenance))?;
-        Ok(Self {
-            id: format!("ev-{}", BytesHash::from_bytes(&bytes)),
+        let identity = serde_json::to_vec(&(1, target, kind, &detail, &provenance))?;
+        Ok(Self::identified(&identity, kind, detail, provenance))
+    }
+
+    /// Cites the current state of a target subject that changes while the target does not
+    /// (its effective review records, the recent-history window). The ID names only the
+    /// target and kind, so comments and unrelated commits keep a saved plan's references
+    /// valid; reopening shows the current detail and provenance. Each target has at most
+    /// one current-state observation per kind.
+    fn current_state(
+        target: &ReviewLocation,
+        kind: EvidenceKind,
+        detail: String,
+        provenance: String,
+    ) -> Result<Self> {
+        let identity = serde_json::to_vec(&(1, target, kind, "current state"))?;
+        Ok(Self::identified(&identity, kind, detail, provenance))
+    }
+
+    fn identified(identity: &[u8], kind: EvidenceKind, detail: String, provenance: String) -> Self {
+        Self {
+            id: format!("ev-{}", BytesHash::from_bytes(identity)),
             kind,
             detail,
             provenance,
-        })
+        }
     }
 }
 
@@ -359,7 +379,7 @@ fn capture_with(
             review_detail
                 .push_str("\nReview notes truncated; provenance hashes all effective records.");
         }
-        evidence.push(FocusEvidence::new(
+        evidence.push(FocusEvidence::current_state(
             &target,
             EvidenceKind::HumanReview,
             review_detail,
@@ -386,7 +406,7 @@ fn capture_with(
                     test_target.path, test_target.start_line, test_target.end_line, bounded(&source_sample(&test_block.content), 320)),
                 serde_json::to_string(&test_target)?)?);
         }
-        if let Some(observations) = history.get(&node.path) {
+        if let Some(observations) = history.observations.get(&node.path) {
             for observation in observations {
                 evidence.push(FocusEvidence::new(
                     &target,
@@ -396,6 +416,12 @@ fn capture_with(
                 )?);
             }
         }
+        evidence.push(FocusEvidence::current_state(
+            &target,
+            EvidenceKind::HistoryStatus,
+            history.window.status.clone(),
+            history.window.pin.clone(),
+        )?);
         let excerpt = excerpt(&sample);
         payload_bytes = payload_bytes.saturating_add(excerpt.len()).saturating_add(
             evidence
@@ -703,11 +729,22 @@ struct Observation {
     provenance: String,
 }
 
+/// Which recent commits were inspected; it moves with every new commit.
+struct HistoryWindow {
+    status: String,
+    pin: String,
+}
+
+struct History {
+    observations: BTreeMap<RepoPath, Vec<Observation>>,
+    window: HistoryWindow,
+}
+
 fn history(
     repo: Option<&gix::Repository>,
     paths: &BTreeSet<RepoPath>,
     diagnostics: &mut Vec<FocusDiagnostic>,
-) -> Result<BTreeMap<RepoPath, Vec<Observation>>> {
+) -> Result<History> {
     let mut result: BTreeMap<_, _> = paths
         .iter()
         .cloned()
@@ -775,14 +812,10 @@ fn history(
         }
     }
     diagnostics.push(FocusDiagnostic::new(DiagnosticKind::GitHistory, &status));
-    for observations in result.values_mut() {
-        observations.push(Observation {
-            kind: EvidenceKind::HistoryStatus,
-            detail: status.clone(),
-            provenance: pin.clone(),
-        });
-    }
-    Ok(result)
+    Ok(History {
+        observations: result,
+        window: HistoryWindow { status, pin },
+    })
 }
 
 fn bounded_blob(tree: &gix::Tree<'_>, path: &RepoPath) -> Result<String> {
