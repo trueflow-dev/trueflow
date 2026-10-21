@@ -194,8 +194,10 @@ pub struct AiPick<Id> {
     pub checks: Vec<String>,
 }
 
-/// Ranks the most consequential non-empty class by explicit signals, then fits
-/// the reading budget. Ties keep canonical order.
+/// Ranks the most consequential non-empty class by review value per minute:
+/// explicit signal weight per estimated reading second, so short data shapes and
+/// interfaces outrank a long body with a similar score. Blocks without signals
+/// only fill the remaining budget, in canonical order.
 pub fn heuristic_pass<Id: Copy>(
     candidates: &[PassCandidate<'_, Id>],
     budget: ReviewDuration,
@@ -216,31 +218,61 @@ pub fn heuristic_pass<Id: Copy>(
             let reading = reading_lines(candidate);
             let signals = signals(candidate, reading.changed);
             let score = signals.iter().map(PassSignal::weight).sum::<usize>();
-            (
+            let estimated_seconds = reading_seconds(reading.read);
+            let rank = HeuristicRank {
+                has_signal: score > 0,
+                milli_score_per_second: score.saturating_mul(1000) / estimated_seconds,
                 score,
-                index,
+                canonical_index: index,
+            };
+            (
+                rank,
                 PassCard {
                     id: candidate.id,
-                    estimated_seconds: reading_seconds(reading.read),
+                    estimated_seconds,
                     why: PassWhy::Signals(signals),
                 },
             )
         })
         .collect::<Vec<_>>();
-    // Scores descend; the canonical index makes the order total and deterministic.
-    ranked.sort_unstable_by(
-        |(left_score, left_index, _), (right_score, right_index, _)| {
-            right_score
-                .cmp(left_score)
-                .then(left_index.cmp(right_index))
-        },
-    );
-    let cards = fit_budget(ranked.into_iter().map(|(_, _, card)| card), budget);
+    ranked.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let cards = fit_budget(ranked.into_iter().map(|(_, card)| card), budget);
     PassPlan {
         source: PassSource::Heuristic,
         budget,
         remainder: candidates.len() - cards.len(),
         cards,
+    }
+}
+
+/// Sort key for heuristic cards; ascending order is best first. The canonical
+/// index makes the order total and deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeuristicRank {
+    has_signal: bool,
+    milli_score_per_second: usize,
+    score: usize,
+    canonical_index: usize,
+}
+
+impl Ord for HeuristicRank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .has_signal
+            .cmp(&self.has_signal)
+            .then(
+                other
+                    .milli_score_per_second
+                    .cmp(&self.milli_score_per_second),
+            )
+            .then(other.score.cmp(&self.score))
+            .then(self.canonical_index.cmp(&other.canonical_index))
+    }
+}
+
+impl PartialOrd for HeuristicRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -532,6 +564,30 @@ mod tests {
         let plan = heuristic_pass(&candidates, budget(60));
 
         assert_eq!(ids(&plan), vec![1]);
+        assert_eq!(plan.remainder, 1);
+    }
+
+    #[test]
+    fn heuristic_pass_prefers_review_value_per_minute_over_raw_signal_volume() {
+        // A long risky function scores higher than each short data shape, but
+        // three shapes deliver more signal per minute than one long body.
+        let long_body = format!(
+            "pub fn sync(dir: &Path) {{\n    Command::new(\"git\").output();\n{}}}\n",
+            lines(60)
+        );
+        let mut long = candidate(0, BlockKind::Function, &long_body);
+        long.complexity = Some(20);
+        let shape = "pub struct Config {\n    name: String,\n}\n";
+        let candidates = [
+            long,
+            candidate(1, BlockKind::Struct, shape),
+            candidate(2, BlockKind::Enum, shape),
+            candidate(3, BlockKind::Struct, shape),
+        ];
+
+        let plan = heuristic_pass(&candidates, budget(150));
+
+        assert_eq!(ids(&plan), vec![1, 2, 3]);
         assert_eq!(plan.remainder, 1);
     }
 
