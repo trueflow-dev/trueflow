@@ -393,8 +393,10 @@
      `.gitignore` matches are scanned. `--lib shallow_boundary revision_ranges_parse
      --test bug_regressions whole_repo_scopes_include_tracked`
 ** TODO DEF_TODO Follow-ups found by the 2026-10-21 sweep
-   - [ ] Deleting previously approved code passes `check`: base-only diff units
-     bind to the old content approval. Needs a deletion review identity.
+   - [X] Deleting previously approved code passes `check`: base-only diff units
+     bind to the old content approval. Deletions now have their own signed
+     `block_deletion` review identity (`mark --deleted-in`).
+     `--test bug_regressions deleting_approved_code moved_code deletion_feedback`
    - [ ] A merged duplicate declaration records its review against the first
      occurrence only; the other occurrence reappears next launch.
    - [ ] Focus plans citing Git patch evidence become unopenable once eight
