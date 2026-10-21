@@ -114,8 +114,7 @@ impl TreeHash {
 
 pub fn hash_str(input: &str) -> String {
     let mut hasher = Sha256::new();
-    let normalized = canonicalize(input);
-    hasher.update(normalized);
+    emit_canonical(input, |piece| hasher.update(piece));
     hex_digest(hasher.finalize())
 }
 
@@ -129,23 +128,34 @@ pub fn hash_bytes(input: &[u8]) -> String {
 /// - Trims trailing whitespace from lines.
 /// - Replaces Windows/Mac line endings with \n.
 /// - Ensures a single trailing newline.
-pub fn canonicalize(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-
+#[cfg(test)]
+fn canonicalize(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
+    emit_canonical(input, |piece| output.push_str(piece));
+    output
+}
+
+/// Emits the canonical form of `input` (see `canonicalize`) as consecutive
+/// pieces. Runs of lines that canonicalization leaves unchanged are emitted
+/// as one borrowed slice, so hashing a block needs no copy of its content.
+fn emit_canonical<'a>(input: &'a str, mut emit: impl FnMut(&'a str)) {
     let bytes = input.as_bytes();
+    let mut run_start = 0;
     let mut line_start = 0;
     let mut index = 0;
 
     while index < bytes.len() {
-        if matches!(bytes[index], b'\r' | b'\n') {
-            output.push_str(input[line_start..index].trim_end());
-            output.push('\n');
-
-            if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
-                index += 1;
+        let terminator = bytes[index];
+        if matches!(terminator, b'\r' | b'\n') {
+            let line = &input[line_start..index];
+            let kept_len = line.trim_end().len();
+            if terminator == b'\r' || kept_len != line.len() {
+                emit(&input[run_start..line_start + kept_len]);
+                emit("\n");
+                if terminator == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+                run_start = index + 1;
             }
             line_start = index + 1;
         }
@@ -153,11 +163,11 @@ pub fn canonicalize(input: &str) -> String {
     }
 
     if line_start < input.len() {
-        output.push_str(input[line_start..].trim_end());
-        output.push('\n');
+        emit(&input[run_start..line_start + input[line_start..].trim_end().len()]);
+        emit("\n");
+    } else {
+        emit(&input[run_start..]);
     }
-
-    output
 }
 
 #[cfg(test)]
@@ -203,6 +213,13 @@ mod tests {
         assert_eq!(canonicalize("foo  \n"), "foo\n");
         assert_eq!(canonicalize("  foo"), "  foo\n");
         assert_eq!(canonicalize(""), "");
+        // Changed lines between unchanged runs must splice back exactly.
+        assert_eq!(canonicalize("a\nb \nc\n"), "a\nb\nc\n");
+        assert_eq!(canonicalize("a\r\nb\nc"), "a\nb\nc\n");
+        assert_eq!(canonicalize("a\n  \n"), "a\n\n");
+        assert_eq!(canonicalize("\n\n"), "\n\n");
+        assert_eq!(canonicalize("x\u{a0}\ny\t"), "x\ny\n");
+        assert_eq!(hash_str("a\nb \nc"), hash_str("a\nb\nc\n"));
     }
 
     #[test]
