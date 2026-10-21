@@ -365,23 +365,26 @@ fn display_side<'a>(
 
 /// Every language without a declaration projector has Unsupported capabilities, so the
 /// capability alone decides; partial projectors such as Nix and Just are never unsupported.
+/// Capture reports such files as capability notices without loading them.
 fn collect_unsupported_languages(
     batch: &DeclarationReviewDiffBatch,
     unsupported_languages: &mut Vec<Language>,
 ) {
-    unsupported_languages.extend(
-        batch
-            .snapshot_pairs
-            .iter()
-            .flat_map(|pair| pair.base.iter().chain(pair.head.iter()))
-            .filter(|snapshot| {
-                matches!(
-                    capabilities_for(snapshot.language).inventory,
-                    Capability::Unsupported { .. }
-                )
-            })
-            .map(|snapshot| snapshot.language),
-    );
+    let snapshot_languages = batch
+        .snapshot_pairs
+        .iter()
+        .flat_map(|pair| pair.base.iter().chain(pair.head.iter()))
+        .map(|snapshot| snapshot.language);
+    let notice_languages = batch
+        .capability_notices
+        .iter()
+        .map(|notice| notice.language);
+    unsupported_languages.extend(snapshot_languages.chain(notice_languages).filter(|language| {
+        matches!(
+            capabilities_for(*language).inventory,
+            Capability::Unsupported { .. }
+        )
+    }));
 }
 
 const fn declaration_kind_priority(kind: DeclarationKind) -> u8 {

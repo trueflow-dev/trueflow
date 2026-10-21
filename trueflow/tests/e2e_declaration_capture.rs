@@ -4,12 +4,14 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use trueflow::analysis::Language;
 use trueflow::commands::review::ResolvedReviewQuery;
+use trueflow::commands::tui::declaration::{PreparedDeclarationLaunch, prepare_declaration_launch};
 use trueflow::config::BlockFilters;
 use trueflow::declaration::capture::{
     CaptureBatch, CaptureEndpointProvenance, capture_declaration_sources,
     capture_declaration_sources_with_hook,
 };
 use trueflow::declaration::diff::diff_declarations;
+use trueflow::declaration::review::DeclarationReviewStatus;
 use trueflow::declaration::snapshot::{PathPairEvidence, SnapshotPair};
 use trueflow::repo_path::RepoPath;
 use trueflow::scanner::ScanOptions;
@@ -756,4 +758,96 @@ fn capture_budget_rejects_aggregate_selected_sources_before_finalization() -> Re
         "selected declaration sources exceeding the aggregate budget must be rejected before loading completes",
         &["4194304", "aggregate", "limit"],
     )
+}
+
+fn launch_names(prepared: &PreparedDeclarationLaunch) -> Vec<&str> {
+    prepared
+        .targets()
+        .iter()
+        .map(|target| target.declaration.name.as_str())
+        .collect()
+}
+
+#[test]
+fn unsupported_language_non_utf8_or_large_file_does_not_block_supported_declarations()
+-> Result<()> {
+    let repo = TestRepo::new("declaration_capture_unsupported_unread")?;
+    repo.write("src/lib.rs", "pub fn kept() -> u8 { 0 }\n")?;
+    std::fs::write(repo.path.join("legacy.php"), b"<?php function caf\xe9() {}\n")?;
+    write_sparse_source(&repo, "vendor/app.min.js", MAX_DECLARATION_SOURCE_BYTES + 1)?;
+    repo.commit_all("mixed languages")?;
+    let head = commit_id(&repo, "HEAD")?;
+
+    for (scope, query) in [
+        ("worktree", worktree_query(ReviewPathSelection::All)),
+        ("revision", revision_query(head)),
+    ] {
+        let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())
+            .with_context(|| format!("{scope} launch must not read unsupported sources"))?;
+        assert_eq!(launch_names(&prepared), ["kept"], "{scope}");
+        assert_eq!(
+            prepared.status(),
+            &DeclarationReviewStatus::UnsupportedLanguage {
+                languages: vec![Language::JavaScript, Language::Php],
+            },
+            "{scope}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_utf8_projectable_file_is_a_per_file_diagnostic() -> Result<()> {
+    const BROKEN: &str = "src/broken.rs";
+    let repo = TestRepo::new("declaration_capture_invalid_utf8")?;
+    repo.write("src/lib.rs", "pub fn kept() -> u8 { 0 }\n")?;
+    repo.write(BROKEN, "pub fn broken() {}\n")?;
+    repo.commit_all("base")?;
+    std::fs::write(repo.path.join(BROKEN), b"pub fn broken() { \xff }\n")?;
+    repo.write("src/lib.rs", "pub fn kept() -> u16 { 0 }\n")?;
+    let dirty = dirty_query(&["src/lib.rs", BROKEN])?;
+    let worktree = worktree_query(ReviewPathSelection::All);
+    let dirty_batches = capture_declaration_sources(&repo.path, &dirty)?;
+    let dirty_launch = prepare_declaration_launch(&repo.path, &dirty, Vec::new())?;
+    let worktree_batches = capture_declaration_sources(&repo.path, &worktree)?;
+    let worktree_launch = prepare_declaration_launch(&repo.path, &worktree, Vec::new())?;
+    repo.commit_all("break one file")?;
+    let revision = revision_query(commit_id(&repo, "HEAD")?);
+    let revision_batches = capture_declaration_sources(&repo.path, &revision)?;
+    let revision_launch = prepare_declaration_launch(&repo.path, &revision, Vec::new())?;
+
+    for (scope, batches, prepared) in [
+        ("dirty", dirty_batches, dirty_launch),
+        ("worktree", worktree_batches, worktree_launch),
+        ("revision", revision_batches, revision_launch),
+    ] {
+        let batch = one_batch(&batches)?;
+        assert_eq!(
+            batch
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.path.as_deref(), diagnostic.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(Some(Path::new(BROKEN)), "skipped invalid UTF-8 file")],
+            "{scope}"
+        );
+        assert!(
+            batch.pairs.iter().all(|pair| {
+                pair.base
+                    .iter()
+                    .chain(pair.head.iter())
+                    .all(|snapshot| snapshot.path != Path::new(BROKEN))
+            }),
+            "{scope}: the undecodable file must not be half-captured"
+        );
+        assert_eq!(launch_names(&prepared), ["kept"], "{scope}");
+        assert_eq!(
+            prepared.status(),
+            &DeclarationReviewStatus::Partial {
+                diagnostic_count: 1
+            },
+            "{scope}"
+        );
+    }
+    Ok(())
 }

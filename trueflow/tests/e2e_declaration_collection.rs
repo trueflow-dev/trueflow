@@ -11,9 +11,9 @@ use trueflow::commands::tui::{
 };
 use trueflow::config::BlockFilters;
 use trueflow::config::TrueflowConfig;
-use trueflow::declaration::Visibility;
 use trueflow::declaration::capture::capture_declaration_sources;
-use trueflow::declaration::diff::{DeclarationDiff, DiffDiagnosticKind, diff_declarations};
+use trueflow::declaration::diff::{DeclarationDiff, diff_declarations};
+use trueflow::declaration::{Capability, Visibility};
 use trueflow::declaration::review::{
     DeclarationReviewDiffBatch, DeclarationReviewQuery, DeclarationReviewStatus,
     collect_declaration_review,
@@ -496,11 +496,17 @@ fn mixed_rust_and_unsupported_java_collection_retains_reviewable_items_and_unsup
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(
         captured_inventory,
-        [
-            (RepoPath::new("src/Converter.java")?, Language::Java),
-            (RepoPath::new("src/lib.rs")?, Language::Rust),
-        ],
-        "the real repository scope must carry both changed files into declaration capture"
+        [(RepoPath::new("src/lib.rs")?, Language::Rust)],
+        "only the projectable changed file is loaded into declaration capture"
+    );
+    assert_eq!(
+        capture
+            .capability_notices
+            .iter()
+            .map(|notice| (notice.path.clone(), notice.language))
+            .collect::<Vec<_>>(),
+        [(RepoPath::new("src/Converter.java")?, Language::Java)],
+        "the changed Java file is reported from its path without being loaded"
     );
 
     let pairs = capture.pairs.clone();
@@ -510,18 +516,10 @@ fn mixed_rust_and_unsupported_java_collection_retains_reviewable_items_and_unsup
         1,
         "the changed Rust declaration must survive diff projection as a review target"
     );
-    assert!(
-        diff.diagnostics.iter().any(|diagnostic| {
-            diagnostic.kind == DiffDiagnosticKind::ProjectionDiagnostic
-                && diagnostic.message.contains("Java")
-                && diagnostic.message.contains("no declaration projector")
-        }),
-        "the changed Java declaration must be diagnosed as unsupported: {:?}",
-        diff.diagnostics
-    );
 
     let collection = collect_declaration_review(&DeclarationReviewQuery::new(vec![
-        DeclarationReviewDiffBatch::new(pairs, diff),
+        DeclarationReviewDiffBatch::new(pairs, diff)
+            .with_capability_notices(capture.capability_notices.clone()),
     ]))?;
     let reviewable = collection
         .items
@@ -540,13 +538,12 @@ fn mixed_rust_and_unsupported_java_collection_retains_reviewable_items_and_unsup
         "unsupported Java must not discard the independently reviewable Rust declaration"
     );
     assert!(
-        collection.diagnostics.iter().any(|diagnostic| {
-            diagnostic.kind == DiffDiagnosticKind::ProjectionDiagnostic
-                && diagnostic.message.contains("Java")
-                && diagnostic.message.contains("no declaration projector")
+        collection.capability_notices.iter().any(|notice| {
+            notice.language == Language::Java
+                && matches!(notice.inventory, Capability::Unsupported { .. })
         }),
-        "collection must retain the Java unsupported diagnostic: {:?}",
-        collection.diagnostics
+        "collection must retain the Java unsupported notice: {:?}",
+        collection.capability_notices
     );
     assert_eq!(
         collection.status,

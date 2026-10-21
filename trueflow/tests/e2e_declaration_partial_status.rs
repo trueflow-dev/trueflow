@@ -10,8 +10,9 @@ use trueflow::commands::tui::declaration::{
     prepare_declaration_launch,
 };
 use trueflow::config::BlockFilters;
+use trueflow::declaration::Capability;
 use trueflow::declaration::capture::capture_declaration_sources;
-use trueflow::declaration::diff::{DiffDiagnosticKind, diff_declarations};
+use trueflow::declaration::diff::diff_declarations;
 use trueflow::declaration::review::DeclarationReviewStatus;
 use trueflow::repo_path::RepoPath;
 use trueflow::scanner::ScanOptions;
@@ -81,16 +82,25 @@ fn mixed_unsupported_projection_remains_visible_during_and_after_supported_revie
         "fixture capture failed: {:?}",
         capture.diagnostics
     );
-    let java_pair = capture
-        .pairs
-        .iter()
-        .find(|pair| {
-            pair.head.as_ref().is_some_and(|snapshot| {
-                snapshot.path == std::path::Path::new("src/Converter.java")
-                    && snapshot.language == Language::Java
-            })
-        })
-        .context("capture omitted the changed Java path")?;
+    let java_path = RepoPath::new("src/Converter.java")?;
+    assert!(
+        capture.capability_notices.iter().any(|notice| {
+            notice.path == java_path
+                && notice.language == Language::Java
+                && matches!(notice.inventory, Capability::Unsupported { .. })
+        }),
+        "changed src/Converter.java must be reported as unsupported: {:?}",
+        capture.capability_notices
+    );
+    assert!(
+        capture.pairs.iter().all(|pair| {
+            pair.base
+                .iter()
+                .chain(pair.head.iter())
+                .all(|snapshot| snapshot.language != Language::Java)
+        }),
+        "unsupported Java must be reported without loading its source"
+    );
     let rust_pair = capture
         .pairs
         .iter()
@@ -114,16 +124,6 @@ fn mixed_unsupported_projection_remains_visible_during_and_after_supported_revie
         }),
         "changed Rust declaration did not become reviewable: {:?}",
         diff.units
-    );
-    assert!(
-        diff.diagnostics.iter().any(|diagnostic| {
-            diagnostic.snapshot_pair_id == java_pair.id
-                && diagnostic.kind == DiffDiagnosticKind::ProjectionDiagnostic
-                && diagnostic.message.contains("Java")
-                && diagnostic.message.contains("no declaration projector")
-        }),
-        "changed src/Converter.java did not retain its Java unsupported reason: {:?}",
-        diff.diagnostics
     );
 
     let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;

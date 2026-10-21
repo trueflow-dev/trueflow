@@ -661,23 +661,29 @@ fn endpoint(revision: CommitId, block_state: BlockState) -> CaptureEndpointProve
     }
 }
 
+/// Languages with a declaration projector; only their sources are read and budgeted.
 fn declaration_language(path: &RepoPath) -> Option<Language> {
     let language = detected_language(path)?;
-    (!matches!(
-        capabilities_for(language).inventory,
-        Capability::NotApplicable { .. }
-    ))
-    .then_some(language)
+    match capabilities_for(language).inventory {
+        Capability::Complete | Capability::Partial { .. } => Some(language),
+        Capability::NotApplicable { .. } | Capability::Unsupported { .. } => None,
+    }
 }
 
+/// Files without a projector are reported from their path alone, never loaded: an
+/// undecodable or oversized unsupported file must not block the supported declarations.
 fn declaration_file_capability(path: &RepoPath) -> Option<DeclarationFileCapability> {
     let language = detected_language(path)?;
-    let inventory = capabilities_for(language).inventory;
-    matches!(&inventory, Capability::NotApplicable { .. }).then(|| DeclarationFileCapability {
-        path: path.clone(),
-        language,
-        inventory,
-    })
+    match capabilities_for(language).inventory {
+        Capability::Complete | Capability::Partial { .. } => None,
+        inventory @ (Capability::NotApplicable { .. } | Capability::Unsupported { .. }) => {
+            Some(DeclarationFileCapability {
+                path: path.clone(),
+                language,
+                inventory,
+            })
+        }
+    }
 }
 
 fn detected_language(path: &RepoPath) -> Option<Language> {
