@@ -488,3 +488,27 @@ fn c_and_cpp_aliases_statics_and_constants_are_exact_inventory_targets() -> Resu
 
     Ok(())
 }
+
+#[test]
+fn cpp_lambda_constant_projects_its_signature_without_the_body() -> Result<()> {
+    const SOURCE: &str = "const auto twice = [](int x) -> int {\n    return x * 2;\n};\n";
+    const EDITED: &str = "const auto twice = [](int x) -> int {\n    return x + x;\n};\n";
+
+    let facts = project("src/lambda.cpp", Language::Cpp, SOURCE)?;
+    let twice = declaration_named(&facts, "twice", DeclarationKind::Constant)?;
+    assert_single_component(
+        twice,
+        SOURCE,
+        SourceComponentRole::Signature,
+        "const auto twice = [](int x) -> int",
+    )?;
+
+    let edited = project("src/lambda.cpp", Language::Cpp, EDITED)?;
+    assert_eq!(
+        twice.projection_hash,
+        declaration_named(&edited, "twice", DeclarationKind::Constant)?.projection_hash,
+        "a lambda body edit must not change the constant's projection"
+    );
+
+    Ok(())
+}

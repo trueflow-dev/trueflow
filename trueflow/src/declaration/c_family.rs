@@ -316,7 +316,10 @@ impl Projector<'_> {
                 qualifier: None,
             },
             DeclarationKind::TypeAlias,
-            SourceComponentRole::TypeAlias,
+            Part {
+                range: item.byte_range(),
+                role: SourceComponentRole::TypeAlias,
+            },
             attachments,
             parent_id,
             parent_name,
@@ -357,6 +360,17 @@ impl Projector<'_> {
         } else {
             visibility
         };
+        let surface = match lambda_body(declarators[0]) {
+            Some(body) => Part {
+                range: item.start_byte()
+                    ..whitespace_suffix_start(self.source, item.start_byte(), body.start_byte()),
+                role: SourceComponentRole::Signature,
+            },
+            None => Part {
+                range: item.byte_range(),
+                role: SourceComponentRole::Value,
+            },
+        };
         self.add_inventory_declaration(
             item,
             NameInfo {
@@ -365,7 +379,7 @@ impl Projector<'_> {
                 qualifier: None,
             },
             kind,
-            SourceComponentRole::Value,
+            surface,
             attachments,
             parent_id,
             parent_name,
@@ -379,16 +393,13 @@ impl Projector<'_> {
         item: Node<'_>,
         name_info: NameInfo,
         kind: DeclarationKind,
-        role: SourceComponentRole,
+        surface: Part,
         mut attachments: Vec<Part>,
         parent_id: Option<DeclarationId>,
         parent_name: Option<&str>,
         visibility: Visibility,
     ) -> Result<()> {
-        attachments.push(Part {
-            range: item.byte_range(),
-            role,
-        });
+        attachments.push(surface);
         if self.parts_have_errors(item, &attachments) {
             self.diagnostics.push(ProjectionDiagnostic::new(format!(
                 "omitted C/C++ {kind:?} {} because its projected surface contains a syntax error",
@@ -968,6 +979,17 @@ fn value_key_discriminator(item: Node<'_>, source: &str) -> String {
         .into_iter()
         .filter_map(|part| source.get(part.range))
         .collect()
+}
+
+/// The body of a lambda initializer, which never enters the value's review surface.
+fn lambda_body(declarator: Node<'_>) -> Option<Node<'_>> {
+    if declarator.kind() != "init_declarator" {
+        return None;
+    }
+    declarator
+        .child_by_field_name("value")
+        .filter(|value| value.kind() == "lambda_expression")?
+        .child_by_field_name("body")
 }
 
 fn callable_declarators(node: Node<'_>) -> Option<Vec<Node<'_>>> {
