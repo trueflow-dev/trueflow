@@ -1875,11 +1875,20 @@ fn parse_pull_request_url(raw: &str) -> Result<PullRequestRef> {
         .path_segments()
         .map(|segments| segments.collect::<Vec<_>>())
         .unwrap_or_default();
-    let [owner, repo, "pull", number] = segments.as_slice() else {
+    let [owner, repo, "pull", number, tab @ ..] = segments.as_slice() else {
         return Err(anyhow!(
             "Invalid pull request URL '{raw}'. {PULL_REQUEST_REFERENCE_HELP}"
         ));
     };
+    // Browser tab pages and trailing slashes still name the same pull request.
+    if !matches!(
+        tab,
+        [] | [""] | ["files" | "commits" | "checks"] | ["files" | "commits" | "checks", ""]
+    ) {
+        return Err(anyhow!(
+            "Invalid pull request URL '{raw}'. {PULL_REQUEST_REFERENCE_HELP}"
+        ));
+    }
 
     Ok(PullRequestRef::HostedRepository {
         host: host.to_string(),
@@ -2126,6 +2135,43 @@ mod tests {
                 number: 11,
             }
         );
+    }
+
+    #[test]
+    fn pull_request_ref_accepts_tab_and_trailing_slash_urls() {
+        for url in [
+            "https://github.com/jmqd/trueflow/pull/11/",
+            "https://github.com/jmqd/trueflow/pull/11/files",
+            "https://github.com/jmqd/trueflow/pull/11/commits",
+            "https://github.com/jmqd/trueflow/pull/11/checks",
+            "https://github.com/jmqd/trueflow/pull/11/files/",
+        ] {
+            assert_eq!(
+                PullRequestRef::from_cli(url).unwrap(),
+                PullRequestRef::HostedRepository {
+                    host: "github.com".to_string(),
+                    owner: "jmqd".to_string(),
+                    repo: "trueflow".to_string(),
+                    number: 11,
+                },
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_request_ref_rejects_unknown_url_suffixes() {
+        for url in [
+            "https://github.com/jmqd/trueflow/pull/11/unknown",
+            "https://github.com/jmqd/trueflow/pull/11/files/extra",
+            "https://github.com/jmqd/trueflow/pull/11//",
+        ] {
+            let err = PullRequestRef::from_cli(url).unwrap_err();
+            assert!(
+                err.to_string().contains(super::PULL_REQUEST_REFERENCE_HELP),
+                "{url}: {err}"
+            );
+        }
     }
 
     #[test]
