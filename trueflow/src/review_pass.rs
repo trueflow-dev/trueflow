@@ -235,7 +235,7 @@ pub fn heuristic_pass<Id: Copy>(
             )
         })
         .collect::<Vec<_>>();
-    ranked.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    ranked.sort_unstable_by_key(|(rank, _)| *rank);
     let cards = fit_budget(ranked.into_iter().map(|(_, card)| card), budget);
     PassPlan {
         source: PassSource::Heuristic,
