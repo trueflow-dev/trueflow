@@ -269,3 +269,34 @@
                            (trueflow--review-items-from-scan-data
                             (trueflow-test--scan-data '("a" "b"))))
                    '("src/lib.rs" "src/lib.rs")))))
+
+(ert-deftest trueflow-subdivide-at-point-opens-focus ()
+  "Splitting a status-buffer block should open the focus view on its parts."
+  (let ((block '((hash . "parent")
+                 (content . "fn parent() {}\n")
+                 (start_line . 4)
+                 (end_line . 4)
+                 (kind . "function")
+                 (file . "src/a.rs")))
+        (status-buf (generate-new-buffer " *trueflow-test-status*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'magit-current-section)
+                   (lambda () (make-instance 'trueflow-block)))
+                  ((symbol-function 'trueflow--section-value) (lambda (_) block))
+                  ((symbol-function 'trueflow-root) (lambda (&optional _) "/repo/"))
+                  ((symbol-function 'trueflow--run-command)
+                   (lambda (_args)
+                     '(((hash . "child")
+                        (content . "child_body();\n")
+                        (start_line . 4)
+                        (end_line . 4)
+                        (kind . "CodeParagraph"))))))
+          (with-current-buffer status-buf
+            (trueflow-mode)
+            (trueflow-subdivide-at-point))
+          (with-current-buffer "*trueflow-focus*"
+            (should (eq trueflow-focus-status-buffer status-buf))
+            (should (string-match-p "child_body" (buffer-string)))))
+      (when (get-buffer "*trueflow-focus*")
+        (kill-buffer "*trueflow-focus*"))
+      (kill-buffer status-buf))))

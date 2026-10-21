@@ -646,8 +646,9 @@ next refreshed item is shown instead of skipping ahead."
       (cl-decf trueflow-review-index)
       (trueflow-focus-update))))
 
-(defun trueflow-focus-open (block status-buf current-idx total-count)
-  "Open the focus buffer for BLOCK. CURRENT-IDX and TOTAL-COUNT show progress."
+(defun trueflow-focus-open (block status-buf &optional current-idx total-count)
+  "Open the focus buffer for BLOCK.
+When CURRENT-IDX and TOTAL-COUNT are given, show them as review progress."
   (let ((buf (get-buffer-create "*trueflow-focus*")))
     (switch-to-buffer buf)
     (trueflow-focus-mode)
@@ -667,7 +668,10 @@ next refreshed item is shown instead of skipping ahead."
       (insert "\n\n")
       (trueflow--insert-content (alist-get 'content block))
       (trueflow--insert-actions
-       (format "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit  (%d / %d)" current-idx total-count)))
+       (concat "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit"
+               (if (and current-idx total-count)
+                   (format "  (%d / %d)" current-idx total-count)
+                 ""))))
     (goto-char (point-min))))
 
 (defun trueflow-focus-subdivide ()
