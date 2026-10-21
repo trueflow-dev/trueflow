@@ -6947,10 +6947,19 @@ fn block_file_path(tree: &Tree, node_id: TreeNodeId) -> Option<String> {
         })
 }
 
+/// Sub-block rows shown in a block header; the rest collapse into one
+/// "… N more" row so a large split cannot crowd out the code area.
+const SUBBLOCK_TREE_MAX_ROWS: usize = 6;
+
 fn subblock_tree_lines(tree: &Tree, node_id: TreeNodeId) -> Vec<String> {
     let children = block_child_ids(tree, node_id);
     let mut lines = Vec::new();
     append_subblock_tree_lines(tree, &children, &mut lines);
+    if lines.len() > SUBBLOCK_TREE_MAX_ROWS {
+        let hidden = lines.len() - SUBBLOCK_TREE_MAX_ROWS;
+        lines.truncate(SUBBLOCK_TREE_MAX_ROWS);
+        lines.push(format!("     … {hidden} more sub-blocks"));
+    }
     lines
 }
 
@@ -16976,6 +16985,60 @@ mod diff_scope_tests {
                 "     │  └─ CodeParagraph".to_string(),
                 "     └─ function second".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn block_header_caps_large_subblock_tree_to_keep_code_area_usable() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let parent = builder.add_block(
+            file,
+            "impl".to_string(),
+            "src/lib.rs".to_string(),
+            test_block("impl Thing {}\n".to_string(), BlockKind::Impl, 0, 42),
+            Language::Rust,
+        );
+        for index in 0..40 {
+            builder.add_block(
+                parent,
+                "function".to_string(),
+                "src/lib.rs".to_string(),
+                test_block(
+                    format!("fn method_{index}(&self) {{}}\n"),
+                    BlockKind::Function,
+                    index + 1,
+                    index + 2,
+                ),
+                Language::Rust,
+            );
+        }
+        let tree = builder.finalize();
+
+        let header = block_header_lines(&tree, parent)
+            .unwrap_or_else(|| panic!("impl block should have a header"));
+        let layout = compute_focus_layout(
+            Rect::new(0, 0, 100, 40),
+            usize_to_u16_saturating(header.len()),
+            0,
+        );
+
+        assert!(
+            layout.code.height >= 5,
+            "header of {} rows left a {}-row code area",
+            header.len(),
+            layout.code.height
+        );
+        assert_eq!(
+            header.last().map(String::as_str),
+            Some("     … 34 more sub-blocks")
         );
     }
 
