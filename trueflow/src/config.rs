@@ -8,7 +8,9 @@ use toml_edit::{DocumentMut, Entry, Item, Table, value};
 use crate::block::BlockKind;
 use crate::cli::TuiReviewMode;
 use crate::feedback_since::FeedbackSinceExpr;
+use crate::focus::ReviewDuration;
 use crate::repo_path::RepoPath;
+use crate::review_pass::{DEFAULT_PASS_BUDGET, ReviewPass};
 use crate::scanner::{ScanCacheMode, ScanOptions};
 
 const CONFIG_FILE_NAME: &str = "trueflow.toml";
@@ -42,6 +44,15 @@ pub struct TuiConfig {
     pub diff_focus_context_lines: usize,
     #[serde(default = "default_tui_diff_line_numbers")]
     pub diff_line_numbers: TuiDiffLineNumbers,
+    /// Review pass a launch starts with; CLI `--pass` takes precedence.
+    #[serde(default)]
+    pub pass: ReviewPass,
+    /// Reading budget for focused passes; CLI `--budget` takes precedence.
+    #[serde(
+        default = "default_pass_budget",
+        deserialize_with = "deserialize_pass_budget"
+    )]
+    pub pass_budget: ReviewDuration,
     #[serde(default)]
     pub keybinds: TuiKeybindsConfig,
     #[serde(default)]
@@ -62,6 +73,7 @@ pub struct TuiKeybindsConfig {
     pub speed_read: char,
     pub root: char,
     pub recap_done: char,
+    pub focused_pass: char,
     pub quit: char,
 }
 
@@ -129,6 +141,11 @@ struct TuiKeybindsConfigRepr {
     )]
     recap_done: char,
     #[serde(
+        default = "default_tui_keybind_focused_pass",
+        deserialize_with = "deserialize_single_char"
+    )]
+    focused_pass: char,
+    #[serde(
         default = "default_tui_keybind_quit",
         deserialize_with = "deserialize_single_char"
     )]
@@ -150,6 +167,7 @@ impl From<TuiKeybindsConfigRepr> for TuiKeybindsConfig {
             speed_read: repr.speed_read,
             root: repr.root,
             recap_done: repr.recap_done,
+            focused_pass: repr.focused_pass,
             quit: repr.quit,
         }
     }
@@ -180,6 +198,7 @@ fn validate_tui_keybinds(config: &TuiKeybindsConfig) -> std::result::Result<(), 
         ("speed_read", config.speed_read),
         ("root", config.root),
         ("recap_done", config.recap_done),
+        ("focused_pass", config.focused_pass),
         ("quit", config.quit),
     ];
 
@@ -482,6 +501,8 @@ impl Default for TuiConfig {
             diff_focus_mode: default_tui_diff_focus_mode(),
             diff_focus_context_lines: default_diff_focus_context_lines(),
             diff_line_numbers: default_tui_diff_line_numbers(),
+            pass: ReviewPass::default(),
+            pass_budget: default_pass_budget(),
             keybinds: TuiKeybindsConfig::default(),
             speed_read: TuiSpeedReadConfig::default(),
         }
@@ -503,6 +524,7 @@ impl Default for TuiKeybindsConfig {
             speed_read: default_tui_keybind_speed_read(),
             root: default_tui_keybind_root(),
             recap_done: default_tui_keybind_recap_done(),
+            focused_pass: default_tui_keybind_focused_pass(),
             quit: default_tui_keybind_quit(),
         }
     }
@@ -581,6 +603,10 @@ fn default_tui_diff_line_numbers() -> TuiDiffLineNumbers {
     TuiDiffLineNumbers::Disabled
 }
 
+fn default_pass_budget() -> ReviewDuration {
+    DEFAULT_PASS_BUDGET
+}
+
 fn default_tui_keybind_scroll_up() -> char {
     'k'
 }
@@ -627,6 +653,10 @@ fn default_tui_keybind_root() -> char {
 
 fn default_tui_keybind_recap_done() -> char {
     'd'
+}
+
+fn default_tui_keybind_focused_pass() -> char {
+    'f'
 }
 
 fn default_tui_keybind_quit() -> char {
@@ -957,6 +987,18 @@ where
     Ok(ch)
 }
 
+fn deserialize_pass_budget<'de, D>(deserializer: D) -> std::result::Result<ReviewDuration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    value.parse().map_err(|err| {
+        serde::de::Error::custom(format!(
+            "invalid pass_budget {value:?}: {err:#} (use seconds or minutes, e.g. \"90s\" or \"5m\", up to 60m)"
+        ))
+    })
+}
+
 pub fn update_speed_read_defaults_in_file(
     path: &Path,
     default_wpm: u16,
@@ -1151,6 +1193,8 @@ cache = false
             defaults.tui.diff_focus_context_lines
         );
         assert_eq!(cfg.tui.diff_line_numbers, defaults.tui.diff_line_numbers);
+        assert_eq!(cfg.tui.pass, defaults.tui.pass);
+        assert_eq!(cfg.tui.pass_budget, defaults.tui.pass_budget);
         assert_eq!(cfg.tui.keybinds, defaults.tui.keybinds);
         assert_eq!(cfg.tui.speed_read.enabled, defaults.tui.speed_read.enabled);
         assert_eq!(
@@ -1198,6 +1242,42 @@ cache = false
         assert_eq!(cfg.ai.model, defaults.ai.model);
         assert_eq!(cfg.ai.max_context_lines, defaults.ai.max_context_lines);
         assert_eq!(cfg.ai.cache, defaults.ai.cache);
+    }
+
+    #[test]
+    fn tui_config_parses_focused_pass_budget_and_keybind() {
+        let defaults: TrueflowConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.tui.pass, ReviewPass::Full);
+        assert_eq!(defaults.tui.pass_budget.seconds(), 300);
+        assert_eq!(defaults.tui.keybinds.focused_pass, 'f');
+
+        let cfg: TrueflowConfig = toml::from_str(
+            "[tui]\npass = \"focused\"\npass_budget = \"90s\"\n\n[tui.keybinds]\nfocused_pass = \"z\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tui.pass, ReviewPass::Focused);
+        assert_eq!(cfg.tui.pass_budget.seconds(), 90);
+        assert_eq!(cfg.tui.keybinds.focused_pass, 'z');
+    }
+
+    #[test]
+    fn tui_config_rejects_invalid_pass_budgets_and_conflicting_pass_key() {
+        for budget in ["0m", "61m", "5", "1h", " 5m"] {
+            let err =
+                toml::from_str::<TrueflowConfig>(&format!("[tui]\npass_budget = \"{budget}\"\n"))
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("pass_budget"),
+                "unexpected error for {budget:?}: {err}"
+            );
+        }
+        let err =
+            toml::from_str::<TrueflowConfig>("[tui.keybinds]\nfocused_pass = \"a\"\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate TUI keybind 'a' for approve and focused_pass"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::{
     handle_scroll_page_down, handle_scroll_page_up, handle_speed_read_key_binding,
     key_code_accepts_repeat_in_normal_mode, key_event_for_press_event,
     key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
-    keybind_action_for_key_code, recap_action_for_key_code, set_focus_for_current_node,
+    keybind_action_for_key_code, recap_action_for_state, set_focus_for_current_node,
     should_rerender_on_event, sync_speed_read_focus, toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
@@ -147,6 +147,7 @@ pub struct ScriptedSessionRecap {
 pub enum ScriptedSessionAction {
     Exit,
     ReviewSomethingElse,
+    ContinueFullReview,
 }
 
 impl From<RecapAction> for ScriptedSessionAction {
@@ -154,6 +155,7 @@ impl From<RecapAction> for ScriptedSessionAction {
         match action {
             RecapAction::Exit => Self::Exit,
             RecapAction::ReviewSomethingElse => Self::ReviewSomethingElse,
+            RecapAction::ContinueFullReview => Self::ContinueFullReview,
         }
     }
 }
@@ -368,8 +370,7 @@ where
         if matches!(ui_mode, UiMode::Recap) {
             if key_event.kind == KeyEventKind::Press {
                 self.pending_session_action =
-                    recap_action_for_key_code(&self.state.keybinds, key_code)
-                        .map(ScriptedSessionAction::from);
+                    recap_action_for_state(&self.state, key_code).map(ScriptedSessionAction::from);
             }
             return Ok(());
         }

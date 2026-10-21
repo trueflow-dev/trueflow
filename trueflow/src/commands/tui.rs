@@ -28,6 +28,7 @@ use crate::config::{
 };
 use crate::context::TrueflowContext;
 use crate::declaration::review::{DeclarationReviewDiffBatch, DeclarationReviewQuery};
+use crate::focus::ReviewDuration;
 use crate::github::{
     GhGitHubClient, PullRequestCommit, PullRequestMetadata, PullRequestRef,
     prepare_pull_request_review,
@@ -38,6 +39,10 @@ use crate::repo_path::RepoPath;
 use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::{ReviewAnchor, ReviewOrder};
+use crate::review_pass::{
+    AiPick, CandidateChange, CandidateClass, PassCandidate, PassCard, PassPlan, PassWhy,
+    ReviewPass, format_reading_estimate,
+};
 use crate::review_scope::{
     DiffQuery, ScopeOption, ScopePreset, commit_scope_option, default_scope_options,
 };
@@ -864,25 +869,24 @@ impl ScopeSelector {
 
 enum ScopeSelection {
     Quit,
-    Selected(ScopePreset),
+    Selected {
+        scope: ScopePreset,
+        pass: ReviewPass,
+    },
 }
 
 enum AppExit {
     Quit,
     ReviewSomethingElse,
+    /// Reload the same scope and walk every pending block after a focused pass.
+    ContinueFullReview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecapAction {
     Exit,
     ReviewSomethingElse,
-}
-
-struct LaunchSelection {
-    scope: ScopePreset,
-    review: CollectedReview,
-    scope_label: String,
-    initial_view_mode: ViewMode,
+    ContinueFullReview,
 }
 
 #[derive(Debug, Clone)]
@@ -891,6 +895,24 @@ struct CliReviewRequest {
     scope: ScopePreset,
     scope_label: String,
     initial_view_mode: ViewMode,
+}
+
+impl CliReviewRequest {
+    fn for_scope(scope: ScopePreset) -> Result<Self> {
+        Ok(Self {
+            request: scope.to_review_request()?,
+            scope_label: scope.label(),
+            scope,
+            initial_view_mode: ViewMode::Diff,
+        })
+    }
+}
+
+/// A reloadable launch: what to collect and which pass to walk.
+#[derive(Debug, Clone)]
+struct QueuedLaunch {
+    request: CliReviewRequest,
+    pass: ReviewPass,
 }
 
 // --- Application Logic ---
@@ -1037,13 +1059,44 @@ struct AppState {
     onboarding: Option<OnboardingState>,
 }
 
+/// A fixed queue of selected cards: an onboarding/focus plan or a focused pass.
 struct OnboardingState {
     title: String,
     description: String,
     cards: Vec<crate::onboarding::OnboardingCard>,
     finished: bool,
-    purpose: crate::onboarding::ReviewPurpose,
+    purpose: CardQueuePurpose,
     details_scroll: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardQueuePurpose {
+    /// A portable `onboard`/`focus` plan pinned to captured source.
+    Plan(crate::onboarding::ReviewPurpose),
+    /// A focused pass over the scope's pending blocks; the rest stay pending.
+    FocusedPass { remainder: usize },
+}
+
+impl CardQueuePurpose {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Plan(purpose) => purpose.label(),
+            Self::FocusedPass { .. } => "Focused pass",
+        }
+    }
+
+    /// Plans are pinned to captured source; passes keep the scope's diff/source toggle.
+    const fn allows_view_toggle(self) -> bool {
+        matches!(self, Self::FocusedPass { .. })
+    }
+
+    /// Pending blocks a full review of the same scope would still show.
+    const fn continuable_remainder(self) -> Option<usize> {
+        match self {
+            Self::FocusedPass { remainder } if remainder > 0 => Some(remainder),
+            Self::FocusedPass { .. } | Self::Plan(_) => None,
+        }
+    }
 }
 
 const MOUSE_WHEEL_SCROLL_LINES: u16 = 3;
@@ -1501,6 +1554,28 @@ pub struct TuiRunRequest<'a> {
     pub since: Option<&'a str>,
     pub only: &'a [BlockKind],
     pub exclude: &'a [BlockKind],
+    pub pass: Option<ReviewPass>,
+    pub budget: Option<ReviewDuration>,
+}
+
+/// The pass a launch starts with by default and the budget every focused pass uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassDefaults {
+    pass: ReviewPass,
+    budget: ReviewDuration,
+}
+
+impl PassDefaults {
+    fn resolve(
+        config: &TuiConfig,
+        pass: Option<ReviewPass>,
+        budget: Option<ReviewDuration>,
+    ) -> Self {
+        Self {
+            pass: pass.unwrap_or(config.pass),
+            budget: budget.unwrap_or(config.pass_budget),
+        }
+    }
 }
 
 pub fn run(context: &TrueflowContext, request: TuiRunRequest<'_>) -> Result<()> {
@@ -1514,10 +1589,15 @@ pub fn run(context: &TrueflowContext, request: TuiRunRequest<'_>) -> Result<()> 
         request.exclude,
     )?;
     if launch.mode == TuiReviewMode::Declarations {
+        anyhow::ensure!(
+            request.pass.is_none() && request.budget.is_none(),
+            "--pass and --budget choose block review passes and cannot be used in declaration review mode"
+        );
         return declaration::terminal::run(&config, &request);
     }
     let scan_options = config.scan.resolve_options();
     let filters = config.review.resolve_filters(request.only, request.exclude);
+    let pass_defaults = PassDefaults::resolve(&config.tui, request.pass, request.budget);
 
     if let Some(pull_request) =
         resolve_pull_request_target_for_tui(request.all, request.target, request.since)?
@@ -1528,12 +1608,11 @@ pub fn run(context: &TrueflowContext, request: TuiRunRequest<'_>) -> Result<()> 
             &scan_options,
             &filters,
             &pull_request,
-            request.only,
-            request.exclude,
+            pass_defaults,
         );
     }
 
-    let pending_cli_requests = cli_review_request(
+    let pending_launches = cli_review_request(
         request.all,
         request.target,
         request.since,
@@ -1541,14 +1620,19 @@ pub fn run(context: &TrueflowContext, request: TuiRunRequest<'_>) -> Result<()> 
         request.exclude,
     )?
     .into_iter()
+    .map(|request| QueuedLaunch {
+        request,
+        pass: pass_defaults.pass,
+    })
     .collect::<VecDeque<_>>();
     run_tui_review_loop(
         context,
         &config,
         &scan_options,
         &filters,
-        pending_cli_requests,
+        pending_launches,
         true,
+        pass_defaults,
     )
 }
 
@@ -1635,7 +1719,13 @@ fn build_onboarding_state(
             ai: TuiAiState::for_mode(AiMode::Off, None, config.ai.max_context_lines, false),
         },
     )?;
-    configure_onboarding(&mut state, title, description, cards, purpose)?;
+    configure_onboarding(
+        &mut state,
+        title,
+        description,
+        cards,
+        CardQueuePurpose::Plan(purpose),
+    )?;
     Ok(state)
 }
 
@@ -1644,7 +1734,7 @@ fn configure_onboarding(
     title: String,
     description: String,
     cards: Vec<crate::onboarding::OnboardingCard>,
-    purpose: crate::onboarding::ReviewPurpose,
+    purpose: CardQueuePurpose,
 ) -> Result<()> {
     let selected = cards
         .iter()
@@ -1703,27 +1793,15 @@ fn run_tui_review_loop(
     config: &TrueflowConfig,
     scan_options: &crate::scanner::ScanOptions,
     filters: &BlockFilters,
-    mut pending_cli_requests: VecDeque<CliReviewRequest>,
+    mut pending_launches: VecDeque<QueuedLaunch>,
     allow_scope_selector: bool,
+    pass_defaults: PassDefaults,
 ) -> Result<()> {
     let mut session = TerminalSession::enter()?;
     let run_result = (|| {
         loop {
-            let launch = if let Some(request) = pending_cli_requests.pop_front() {
-                let review = {
-                    let query = resolve_review_request(
-                        request.request,
-                        filters.clone(),
-                        scan_options.clone(),
-                    )?;
-                    collect_review(&query)?
-                };
-                LaunchSelection {
-                    scope: request.scope,
-                    review,
-                    scope_label: request.scope_label,
-                    initial_view_mode: request.initial_view_mode,
-                }
+            let launch = if let Some(launch) = pending_launches.pop_front() {
+                launch
             } else if allow_scope_selector {
                 let LoadedScopeSelector {
                     selector,
@@ -1734,52 +1812,66 @@ fn run_tui_review_loop(
                     selector,
                     status_poller,
                     &config.tui.keybinds,
+                    pass_defaults,
                 )?;
                 match selection {
                     ScopeSelection::Quit => return Ok(()),
-                    ScopeSelection::Selected(scope) => {
-                        let review = load_review_state(&scope, filters, scan_options)?;
-                        LaunchSelection {
-                            scope_label: scope.label(),
-                            scope,
-                            review,
-                            initial_view_mode: ViewMode::Diff,
-                        }
-                    }
+                    ScopeSelection::Selected { scope, pass } => QueuedLaunch {
+                        request: CliReviewRequest::for_scope(scope)?,
+                        pass,
+                    },
                 }
             } else {
                 return Ok(());
             };
 
+            let review = {
+                let query = resolve_review_request(
+                    launch.request.request.clone(),
+                    filters.clone(),
+                    scan_options.clone(),
+                )?;
+                collect_review(&query)?
+            };
             let mut state = build_review_state(
                 context,
-                launch.review,
-                launch.scope,
+                review,
+                launch.request.scope.clone(),
                 ReviewStateBuildOptions {
                     confirm_batch: config.tui.confirm_batch_sub_blocks,
                     block_diff_focus_mode: block_diff_focus_mode_from_config(&config.tui),
                     diff_line_numbers: config.tui.diff_line_numbers,
                     keybinds: config.tui.keybinds,
-                    scope_label: launch.scope_label,
-                    initial_view_mode: launch.initial_view_mode,
+                    scope_label: launch.request.scope_label.clone(),
+                    initial_view_mode: launch.request.initial_view_mode,
                     speed_read_config: config.tui.speed_read.clone(),
                     speed_read_config_path: speed_read_config_path_for_repo_root(),
                     ai: tui_ai_state_for_config(config),
                 },
             )?;
 
-            match run_ai_review_kickoff(session.terminal_mut(), &mut state)? {
-                AiReviewKickoffExit::Quit => return Ok(()),
-                AiReviewKickoffExit::Continue => {}
+            match run_ai_review_kickoff(
+                session.terminal_mut(),
+                &mut state,
+                launch.pass,
+                pass_defaults.budget,
+            )? {
+                ReviewStart::Quit => return Ok(()),
+                ReviewStart::Full => {}
+                ReviewStart::Focused(plan) => start_focused_pass(&mut state, &plan)?,
             }
 
             match run_app(context, &mut session, state)? {
                 AppExit::Quit => return Ok(()),
                 AppExit::ReviewSomethingElse => {
-                    if pending_cli_requests.is_empty() && !allow_scope_selector {
+                    if pending_launches.is_empty() && !allow_scope_selector {
                         return Ok(());
                     }
                 }
+                AppExit::ContinueFullReview => pending_launches.push_front(QueuedLaunch {
+                    pass: ReviewPass::Full,
+                    ..launch
+                }),
             }
         }
     })();
@@ -1810,21 +1902,27 @@ fn run_pull_request_review(
     scan_options: &crate::scanner::ScanOptions,
     filters: &BlockFilters,
     pull_request: &PullRequestRef,
-    _only: &[BlockKind],
-    _exclude: &[BlockKind],
+    pass_defaults: PassDefaults,
 ) -> Result<()> {
     let repo_root = vcs::git_root_from_workdir()?
         .ok_or_else(|| anyhow!("git repository required for pull request review targets"))?;
     let client = GhGitHubClient;
     let prepared = prepare_pull_request_review(&repo_root, pull_request, &client)?;
-    let pending_cli_requests = build_pull_request_cli_requests(&prepared.metadata)?;
+    let pending_launches = build_pull_request_cli_requests(&prepared.metadata)?
+        .into_iter()
+        .map(|request| QueuedLaunch {
+            request,
+            pass: pass_defaults.pass,
+        })
+        .collect();
     run_tui_review_loop(
         context,
         config,
         scan_options,
         filters,
-        pending_cli_requests,
+        pending_launches,
         false,
+        pass_defaults,
     )
 }
 
@@ -2296,6 +2394,141 @@ fn clear_ai_review_plan_priorities(state: &mut AppState) {
     reset_review_focus_to_first_block(state);
 }
 
+/// Pending leaf blocks in canonical order. Containers are excluded because their
+/// approvals would cover descendants outside the pass.
+fn focused_pass_candidates(state: &AppState) -> Vec<PassCandidate<'_, TreeNodeId>> {
+    let tree = &state.navigator.tree;
+    let canonical = ReviewOrder::from_tree(tree, &state.reviewable_nodes);
+    canonical
+        .iter_node_ids()
+        .filter(|&node_id| !tree.is_container_block(node_id))
+        .filter_map(|node_id| {
+            let node = tree.node(node_id);
+            let block = node.block.as_ref()?;
+            let base = state
+                .diff_block_sides
+                .get(&node_id)
+                .and_then(|sides| sides.base.as_ref());
+            let change = match (state.block_change_kinds.get(&node_id), base) {
+                (None, _) => CandidateChange::Unchanged,
+                (Some(BlockChangeKind::Added), _) | (Some(BlockChangeKind::Changed), None) => {
+                    CandidateChange::Added
+                }
+                (Some(BlockChangeKind::Deleted), _) => CandidateChange::Deleted,
+                (Some(BlockChangeKind::Changed), Some(base)) => CandidateChange::Changed {
+                    base: &base.content,
+                },
+            };
+            Some(PassCandidate {
+                id: node_id,
+                kind: block.kind,
+                class: CandidateClass::of(node),
+                content: &block.content,
+                change,
+                complexity: block.complexity,
+            })
+        })
+        .collect()
+}
+
+fn heuristic_pass_for_state(state: &AppState, budget: ReviewDuration) -> PassPlan<TreeNodeId> {
+    crate::review_pass::heuristic_pass(&focused_pass_candidates(state), budget)
+}
+
+fn ai_pass_for_state(
+    state: &AppState,
+    plan: &AiReviewPlan,
+    budget: ReviewDuration,
+) -> PassPlan<TreeNodeId> {
+    let presented = ai_review_plan_presented_node_ids(state);
+    let picks = plan
+        .priority_blocks
+        .iter()
+        .filter_map(|priority| {
+            presented.get(&priority.block_id).map(|&id| AiPick {
+                id,
+                reason: priority.reason.clone(),
+                checks: priority.checks.clone(),
+            })
+        })
+        .collect();
+    crate::review_pass::ai_pass(&focused_pass_candidates(state), picks, budget)
+}
+
+/// Restricts the session to the pass's cards. An empty plan leaves the full queue.
+fn start_focused_pass(state: &mut AppState, plan: &PassPlan<TreeNodeId>) -> Result<()> {
+    if plan.cards.is_empty() {
+        return Ok(());
+    }
+    let title = state.scope_label.clone();
+    configure_onboarding(
+        state,
+        title,
+        focused_pass_summary(plan),
+        plan.cards.iter().map(focused_pass_card).collect(),
+        CardQueuePurpose::FocusedPass {
+            remainder: plan.remainder,
+        },
+    )
+}
+
+fn focused_pass_summary(plan: &PassPlan<TreeNodeId>) -> String {
+    format!(
+        "{} of {} pending blocks · ~{} of {} budget · chosen by {}",
+        plan.cards.len(),
+        plan.cards.len() + plan.remainder,
+        format_reading_estimate(plan.estimated_seconds()),
+        format_reading_estimate(plan.budget.seconds()),
+        plan.source.label(),
+    )
+}
+
+fn focused_pass_card(card: &PassCard<TreeNodeId>) -> crate::onboarding::OnboardingCard {
+    let estimate = format_reading_estimate(card.estimated_seconds);
+    let (description, details) = match &card.why {
+        PassWhy::Signals(signals) if signals.is_empty() => (
+            format!("Why: fills the budget in canonical order; no weighted signal · ~{estimate}"),
+            format!(
+                "Heuristic focused pass\nNo weighted signal matched this block. It fills the remaining reading budget in canonical review order.\n\nReading estimate: ~{estimate}"
+            ),
+        ),
+        PassWhy::Signals(signals) => {
+            let observed = signals.iter().map(ToString::to_string).collect::<Vec<_>>();
+            (
+                format!("Why: {} · ~{estimate}", observed.join(" · ")),
+                format!(
+                    "Heuristic focused pass\nStructural and lexical observations, not findings:\n{}\n\nReading estimate: ~{estimate}",
+                    observed
+                        .iter()
+                        .map(|signal| format!("• {signal}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            )
+        }
+        PassWhy::AiPlan { reason, checks } => (
+            format!("AI: {reason} · ~{estimate}"),
+            format!(
+                "AI review plan\n{reason}\n\nChecks:\n{}\n\nReading estimate: ~{estimate}",
+                if checks.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    checks
+                        .iter()
+                        .map(|check| format!("• {check}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            ),
+        ),
+    };
+    crate::onboarding::OnboardingCard {
+        node_id: card.id,
+        description,
+        details: Some(details),
+    }
+}
+
 fn reset_review_focus_to_first_block(state: &mut AppState) {
     let Some(first_block) = state.review_order.first_reviewable_block() else {
         state.focus_block = None;
@@ -2396,6 +2629,7 @@ fn render_ai_review_plan_screen(
     plan: &AiReviewPlan,
     coverage: &AiReviewPlanCoverage,
     scroll: u16,
+    footer: &str,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
@@ -2413,18 +2647,59 @@ fn render_ai_review_plan_screen(
         chunks[0],
     );
     frame.render_widget(
-        Paragraph::new(ai_review_plan_ready_footer(&state.keybinds))
+        Paragraph::new(footer.to_string())
             .alignment(Alignment::Center)
             .style(Style::default().bg(palette.bg).fg(palette.fg)),
         chunks[1],
     );
 }
 
-fn ai_review_plan_ready_footer(keybinds: &TuiKeybindsConfig) -> String {
+/// `focused pass: 5 cards ~4m 20s (AI review plan)`.
+fn focused_pass_offer(plan: &PassPlan<TreeNodeId>) -> String {
     format!(
-        "{}/{} scroll  •  Enter start targeted order  •  Esc canonical order  •  {} quit",
-        keybinds.scroll_down, keybinds.scroll_up, keybinds.quit,
+        "focused pass: {} card{} ~{} ({})",
+        plan.cards.len(),
+        if plan.cards.len() == 1 { "" } else { "s" },
+        format_reading_estimate(plan.estimated_seconds()),
+        plan.source.label(),
     )
+}
+
+fn ai_review_plan_ready_footer(
+    keybinds: &TuiKeybindsConfig,
+    pass: ReviewPass,
+    focused: &PassPlan<TreeNodeId>,
+) -> String {
+    let scroll = format!("{}/{} scroll", keybinds.scroll_down, keybinds.scroll_up);
+    let offer = focused_pass_offer(focused);
+    match pass {
+        ReviewPass::Full => format!(
+            "{scroll}  •  Enter targeted order  •  {} {offer}  •  Esc canonical order  •  {} quit",
+            keybinds.focused_pass, keybinds.quit,
+        ),
+        ReviewPass::Focused => format!(
+            "{scroll}  •  Enter {offer}  •  Esc heuristic focused pass  •  {} quit",
+            keybinds.quit,
+        ),
+    }
+}
+
+/// Footer for screens where only canonical or heuristic starts are possible.
+fn ai_review_kickoff_fallback_footer(
+    keybinds: &TuiKeybindsConfig,
+    pass: ReviewPass,
+    start_keys: &str,
+) -> String {
+    match pass {
+        ReviewPass::Full => format!(
+            "{start_keys} canonical order  •  {} heuristic focused pass  •  {} quit",
+            keybinds.focused_pass, keybinds.quit
+        ),
+        ReviewPass::Focused => format!(
+            "{start_keys} heuristic focused pass  •  {} quit",
+            keybinds.quit
+        ),
+    }
 }
 
 fn ai_review_plan_scroll_limit(
@@ -2486,12 +2761,13 @@ fn render_ai_review_kickoff_loading(
     state: &AppState,
     coverage: &AiReviewPlanCoverage,
     frame_index: usize,
+    pass: ReviewPass,
 ) {
     let message = format!(
         "{}  Planning a targeted review…",
         ai_loading_hint_text(frame_index)
     );
-    let footer = format!("Esc canonical order  •  {} quit", state.keybinds.quit);
+    let footer = ai_review_kickoff_fallback_footer(&state.keybinds, pass, "Esc");
     render_ai_review_kickoff_status(
         frame,
         state,
@@ -2507,9 +2783,10 @@ fn render_ai_review_plan_unavailable(
     state: &AppState,
     coverage: &AiReviewPlanCoverage,
     message: &str,
+    pass: ReviewPass,
 ) {
     let message = format!("AI review plan unavailable: {message}");
-    let footer = format!("Enter/Esc canonical order  •  {} quit", state.keybinds.quit);
+    let footer = ai_review_kickoff_fallback_footer(&state.keybinds, pass, "Enter/Esc");
     render_ai_review_kickoff_status(
         frame,
         state,
@@ -2520,9 +2797,11 @@ fn render_ai_review_plan_unavailable(
     );
 }
 
-enum AiReviewKickoffExit {
-    Continue,
+/// How a review session starts once any AI briefing is dismissed.
+enum ReviewStart {
     Quit,
+    Full,
+    Focused(PassPlan<TreeNodeId>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2535,6 +2814,7 @@ enum AiReviewKickoffKeyAction {
     End,
     StartTargeted,
     StartCanonical,
+    StartFocused,
     Quit,
     Ignore,
 }
@@ -2545,6 +2825,7 @@ fn ai_review_kickoff_key_action(
 ) -> AiReviewKickoffKeyAction {
     match key_code {
         KeyCode::Char(ch) if ch == keybinds.quit => AiReviewKickoffKeyAction::Quit,
+        KeyCode::Char(ch) if ch == keybinds.focused_pass => AiReviewKickoffKeyAction::StartFocused,
         KeyCode::Enter => AiReviewKickoffKeyAction::StartTargeted,
         KeyCode::Esc => AiReviewKickoffKeyAction::StartCanonical,
         KeyCode::Char(ch) if ch == keybinds.scroll_down => AiReviewKickoffKeyAction::ScrollDown,
@@ -2605,20 +2886,40 @@ fn ai_review_plan_unavailable_message(state: &AppState) -> String {
     }
 }
 
+/// Starts without AI picks: canonical order for a full review, heuristics for a focused pass.
+fn start_without_ai_picks(
+    state: &mut AppState,
+    pass: ReviewPass,
+    budget: ReviewDuration,
+) -> ReviewStart {
+    clear_ai_review_plan_priorities(state);
+    match pass {
+        ReviewPass::Full => ReviewStart::Full,
+        ReviewPass::Focused => ReviewStart::Focused(heuristic_pass_for_state(state, budget)),
+    }
+}
+
 fn run_ai_review_kickoff(
     terminal: &mut TuiTerminal,
     state: &mut AppState,
-) -> Result<AiReviewKickoffExit> {
-    if !state.ai.mode.review_plan_enabled() || state.reviewable_nodes.is_empty() {
-        return Ok(AiReviewKickoffExit::Continue);
-    }
-    let Some(request) = ai_review_plan_request_for_state(state) else {
-        return Ok(AiReviewKickoffExit::Continue);
+    pass: ReviewPass,
+    budget: ReviewDuration,
+) -> Result<ReviewStart> {
+    let request = if state.ai.mode.review_plan_enabled() && !state.reviewable_nodes.is_empty() {
+        ai_review_plan_request_for_state(state)
+    } else {
+        None
+    };
+    let Some(request) = request else {
+        return Ok(match pass {
+            ReviewPass::Full => ReviewStart::Full,
+            ReviewPass::Focused => ReviewStart::Focused(heuristic_pass_for_state(state, budget)),
+        });
     };
     let coverage = request.coverage.clone();
     let Some(provider) = state.ai.review_plan_provider.clone() else {
         let message = ai_review_plan_unavailable_message(state);
-        return run_ai_review_plan_unavailable(terminal, state, &coverage, &message);
+        return run_ai_review_plan_unavailable(terminal, state, &coverage, &message, pass, budget);
     };
     let options = crate::ai::AiExecutionOptions::default();
     let _cancel_on_exit = options.cancellation.cancel_on_drop();
@@ -2629,7 +2930,9 @@ fn run_ai_review_kickoff(
     }) {
         Ok(receiver) => receiver,
         Err(error) => {
-            return run_ai_review_plan_unavailable(terminal, state, &coverage, &error);
+            return run_ai_review_plan_unavailable(
+                terminal, state, &coverage, &error, pass, budget,
+            );
         }
     };
 
@@ -2638,16 +2941,18 @@ fn run_ai_review_kickoff(
     let mut next_frame_at = Instant::now() + AI_LOADING_FRAME_INTERVAL;
     loop {
         terminal.draw(|frame| {
-            render_ai_review_kickoff_loading(frame, state, &coverage, frame_index);
+            render_ai_review_kickoff_loading(frame, state, &coverage, frame_index, pass);
         })?;
 
         match receiver.try_recv() {
             Ok(Ok(plan)) => {
                 apply_ai_review_plan_priorities(state, &plan);
-                return run_ai_review_plan_ready(terminal, state, &coverage, &plan);
+                return run_ai_review_plan_ready(terminal, state, &coverage, &plan, pass, budget);
             }
             Ok(Err(error)) => {
-                return run_ai_review_plan_unavailable(terminal, state, &coverage, &error);
+                return run_ai_review_plan_unavailable(
+                    terminal, state, &coverage, &error, pass, budget,
+                );
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 return run_ai_review_plan_unavailable(
@@ -2655,6 +2960,8 @@ fn run_ai_review_kickoff(
                     state,
                     &coverage,
                     "provider worker disconnected",
+                    pass,
+                    budget,
                 );
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -2664,12 +2971,12 @@ fn run_ai_review_kickoff(
         match event {
             Some(Event::Key(key_event)) if key_event.kind == KeyEventKind::Press => {
                 match ai_review_kickoff_key_action(key_event.code, &state.keybinds) {
-                    AiReviewKickoffKeyAction::Quit => {
-                        return Ok(AiReviewKickoffExit::Quit);
-                    }
+                    AiReviewKickoffKeyAction::Quit => return Ok(ReviewStart::Quit),
                     AiReviewKickoffKeyAction::StartCanonical => {
-                        clear_ai_review_plan_priorities(state);
-                        return Ok(AiReviewKickoffExit::Continue);
+                        return Ok(start_without_ai_picks(state, pass, budget));
+                    }
+                    AiReviewKickoffKeyAction::StartFocused => {
+                        return Ok(start_without_ai_picks(state, ReviewPass::Focused, budget));
                     }
                     _ => {}
                 }
@@ -2688,13 +2995,20 @@ fn run_ai_review_plan_ready(
     state: &mut AppState,
     coverage: &AiReviewPlanCoverage,
     plan: &AiReviewPlan,
-) -> Result<AiReviewKickoffExit> {
+    pass: ReviewPass,
+    budget: ReviewDuration,
+) -> Result<ReviewStart> {
+    // An AI plan without usable picks offers the heuristic pass under its own label.
+    let focused = Some(ai_pass_for_state(state, plan, budget))
+        .filter(|focused| !focused.cards.is_empty())
+        .unwrap_or_else(|| heuristic_pass_for_state(state, budget));
+    let footer = ai_review_plan_ready_footer(&state.keybinds, pass, &focused);
     let mut scroll = 0;
     let mut needs_render = true;
     loop {
         if needs_render {
             terminal.draw(|frame| {
-                render_ai_review_plan_screen(frame, state, plan, coverage, scroll);
+                render_ai_review_plan_screen(frame, state, plan, coverage, scroll, &footer);
             })?;
             needs_render = false;
         }
@@ -2707,15 +3021,18 @@ fn run_ai_review_plan_ready(
                     continue;
                 };
                 match action {
-                    AiReviewKickoffKeyAction::Quit => {
-                        return Ok(AiReviewKickoffExit::Quit);
-                    }
+                    AiReviewKickoffKeyAction::Quit => return Ok(ReviewStart::Quit),
                     AiReviewKickoffKeyAction::StartTargeted => {
-                        return Ok(AiReviewKickoffExit::Continue);
+                        return Ok(match pass {
+                            ReviewPass::Full => ReviewStart::Full,
+                            ReviewPass::Focused => ReviewStart::Focused(focused),
+                        });
+                    }
+                    AiReviewKickoffKeyAction::StartFocused => {
+                        return Ok(ReviewStart::Focused(focused));
                     }
                     AiReviewKickoffKeyAction::StartCanonical => {
-                        clear_ai_review_plan_priorities(state);
-                        return Ok(AiReviewKickoffExit::Continue);
+                        return Ok(start_without_ai_picks(state, pass, budget));
                     }
                     AiReviewKickoffKeyAction::ScrollDown => {
                         let size = terminal.size()?;
@@ -2779,25 +3096,27 @@ fn run_ai_review_plan_unavailable(
     state: &mut AppState,
     coverage: &AiReviewPlanCoverage,
     message: &str,
-) -> Result<AiReviewKickoffExit> {
+    pass: ReviewPass,
+    budget: ReviewDuration,
+) -> Result<ReviewStart> {
     let mut needs_render = true;
     loop {
         if needs_render {
             terminal.draw(|frame| {
-                render_ai_review_plan_unavailable(frame, state, coverage, message);
+                render_ai_review_plan_unavailable(frame, state, coverage, message, pass);
             })?;
             needs_render = false;
         }
         match event::read()? {
             Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                 match ai_review_kickoff_key_action(key_event.code, &state.keybinds) {
-                    AiReviewKickoffKeyAction::Quit => {
-                        return Ok(AiReviewKickoffExit::Quit);
-                    }
+                    AiReviewKickoffKeyAction::Quit => return Ok(ReviewStart::Quit),
                     AiReviewKickoffKeyAction::StartTargeted
                     | AiReviewKickoffKeyAction::StartCanonical => {
-                        clear_ai_review_plan_priorities(state);
-                        return Ok(AiReviewKickoffExit::Continue);
+                        return Ok(start_without_ai_picks(state, pass, budget));
+                    }
+                    AiReviewKickoffKeyAction::StartFocused => {
+                        return Ok(start_without_ai_picks(state, ReviewPass::Focused, budget));
                     }
                     _ => {}
                 }
@@ -3038,6 +3357,7 @@ fn run_scope_selector(
     mut selector: ScopeSelector,
     mut status_poller: ScopeSelectorStatusPoller,
     keybinds: &TuiKeybindsConfig,
+    pass_defaults: PassDefaults,
 ) -> Result<ScopeSelection> {
     let mut needs_render = true;
     let mut event_pump = EventPump::default();
@@ -3050,7 +3370,9 @@ fn run_scope_selector(
 
         if needs_render {
             let mut visible_options = 0..0;
-            terminal.draw(|f| visible_options = render_scope_selector(f, &selector, keybinds))?;
+            terminal.draw(|f| {
+                visible_options = render_scope_selector(f, &selector, keybinds, pass_defaults);
+            })?;
             status_poller.sync_visible(&mut selector, visible_options);
             needs_render = false;
         }
@@ -3114,7 +3436,23 @@ fn run_scope_selector(
             KeyCode::Esc => return Ok(ScopeSelection::Quit),
             KeyCode::Enter => {
                 if let Some(scope) = selector.selected_scope() {
-                    return Ok(ScopeSelection::Selected(scope));
+                    return Ok(ScopeSelection::Selected {
+                        scope,
+                        pass: pass_defaults.pass,
+                    });
+                }
+            }
+            KeyCode::Char(ch)
+                if ch == keybinds.focused_pass
+                    && !key_event.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                if let Some(scope) = selector.selected_scope() {
+                    return Ok(ScopeSelection::Selected {
+                        scope,
+                        pass: ReviewPass::Focused,
+                    });
                 }
             }
             _ => {}
@@ -3193,12 +3531,13 @@ fn run_app(
 
                 if matches!(ui_mode, UiMode::Recap) {
                     if key_event.kind == KeyEventKind::Press
-                        && let Some(action) = recap_action_for_key_code(&state.keybinds, key_code)
+                        && let Some(action) = recap_action_for_state(&state, key_code)
                     {
                         flush_pending_speed_read_defaults(&mut state)?;
                         return Ok(match action {
                             RecapAction::Exit => AppExit::Quit,
                             RecapAction::ReviewSomethingElse => AppExit::ReviewSomethingElse,
+                            RecapAction::ContinueFullReview => AppExit::ContinueFullReview,
                         });
                     }
                     continue;
@@ -3232,7 +3571,11 @@ fn run_app(
                         KeybindAction::Note => {
                             handle_note_action(&mut state)?;
                         }
-                        KeybindAction::ToggleView if state.onboarding.is_some() => {}
+                        KeybindAction::ToggleView
+                            if state
+                                .onboarding
+                                .as_ref()
+                                .is_some_and(|queue| !queue.purpose.allows_view_toggle()) => {}
                         KeybindAction::ToggleView => {
                             state.view_mode = match state.view_mode {
                                 ViewMode::Source => ViewMode::Diff,
@@ -4325,6 +4668,19 @@ fn recap_done_action_text(keybinds: &TuiKeybindsConfig) -> String {
     format_key_action(recap_done_key(keybinds), "choose scope")
 }
 
+/// Recap keys for the current session; a focused pass with a remainder adds Enter.
+fn recap_action_for_state(state: &AppState, key_code: KeyCode) -> Option<RecapAction> {
+    let continuable = state
+        .onboarding
+        .as_ref()
+        .and_then(|queue| queue.purpose.continuable_remainder())
+        .is_some();
+    match key_code {
+        KeyCode::Enter if continuable => Some(RecapAction::ContinueFullReview),
+        _ => recap_action_for_key_code(&state.keybinds, key_code),
+    }
+}
+
 fn recap_action_for_key_code(
     keybinds: &TuiKeybindsConfig,
     key_code: KeyCode,
@@ -5303,6 +5659,7 @@ fn render_scope_selector(
     frame: &mut Frame,
     selector: &ScopeSelector,
     keybinds: &TuiKeybindsConfig,
+    pass_defaults: PassDefaults,
 ) -> std::ops::Range<usize> {
     let palette = UiPalette::default();
     let area = frame.area();
@@ -5381,7 +5738,7 @@ fn render_scope_selector(
     if layout.hints.height > 0 && layout.hints.width > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                scope_selector_hint_text(keybinds),
+                scope_selector_hint_text(keybinds, pass_defaults),
                 Style::default().fg(palette.dim).bg(palette.bg),
             )))
             .alignment(Alignment::Left)
@@ -5519,15 +5876,17 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
 
     if is_recap_mode(state) {
         render_recap_view(frame, state, content_area, &palette);
-        let hint = if let Some(plan) = &state.onboarding {
-            format!(
+        let hint = match state.onboarding.as_ref().map(|queue| queue.purpose) {
+            Some(CardQueuePurpose::Plan(purpose)) => format!(
                 "Press [{}] finish {} or [{}/Esc] exit",
                 recap_done_key(&state.keybinds),
-                plan.purpose.label().to_ascii_lowercase(),
+                purpose.label().to_ascii_lowercase(),
                 state.keybinds.quit
-            )
-        } else {
-            recap_footer_hint_text(&state.keybinds)
+            ),
+            Some(purpose @ CardQueuePurpose::FocusedPass { .. }) => {
+                focused_pass_recap_hint_text(&state.keybinds, purpose.continuable_remainder())
+            }
+            None => recap_footer_hint_text(&state.keybinds),
         };
         render_recap_footer(frame, footer_area, &palette, hint);
     } else {
@@ -5656,23 +6015,30 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
         ai_hint_line_count,
     );
     let ui_mode = current_ui_mode(state);
-    let actions_lines = if state.onboarding.is_some() && !matches!(ui_mode, UiMode::SpeedRead) {
+    let actions_lines = if let Some(queue) = state
+        .onboarding
+        .as_ref()
+        .filter(|_| !matches!(ui_mode, UiMode::SpeedRead))
+    {
         let keys = &state.keybinds;
-        pack_action_phrases(
-            focus_layout.actions.width,
-            &[
-                format_key_action(keys.approve, "approve"),
-                format_key_action(keys.note, note_action_label(keys.note)),
-                format_key_action(keys.prev, "prev card"),
-                format!("[{}/Space]skip/next", keys.next),
-                "[PgUp/PgDown]scroll".to_string(),
-                "[F1]evidence/details".to_string(),
-                format_key_action(keys.quit, "quit"),
-            ],
-        )
-        .into_iter()
-        .map(|line| styled_ai_hint_line(line, palette))
-        .collect()
+        let mut actions = vec![
+            format_key_action(keys.approve, "approve"),
+            format_key_action(keys.note, note_action_label(keys.note)),
+            format_key_action(keys.prev, "prev card"),
+            format!("[{}/Space]skip/next", keys.next),
+        ];
+        if queue.purpose.allows_view_toggle() {
+            actions.push(format_key_action(keys.toggle_view, "mode"));
+        }
+        actions.extend([
+            "[PgUp/PgDown]scroll".to_string(),
+            "[F1]evidence/details".to_string(),
+            format_key_action(keys.quit, "quit"),
+        ]);
+        pack_action_phrases(focus_layout.actions.width, &actions)
+            .into_iter()
+            .map(|line| styled_ai_hint_line(line, palette))
+            .collect()
     } else {
         build_action_lines(
             focus_layout.actions.width,
@@ -6576,9 +6942,17 @@ fn format_header_row(text: &str, palette: &UiPalette, bold: bool) -> Line<'stati
     Line::from(Span::styled(text.to_string(), style))
 }
 
-fn scope_selector_hint_text(keybinds: &TuiKeybindsConfig) -> String {
+fn scope_selector_hint_text(keybinds: &TuiKeybindsConfig, pass_defaults: PassDefaults) -> String {
+    let budget = format_reading_estimate(pass_defaults.budget.seconds());
+    let start = match pass_defaults.pass {
+        ReviewPass::Full => format!(
+            "[Enter] review all  [{}] focused pass (~{budget})",
+            keybinds.focused_pass
+        ),
+        ReviewPass::Focused => format!("[Enter] focused pass (~{budget})"),
+    };
     format!(
-        "[Enter] select  [{}/{}] move  [{}] quit",
+        "{start}  [{}/{}] move  [{}] quit",
         keybinds.scroll_down, keybinds.scroll_up, keybinds.quit
     )
 }
@@ -6951,6 +7325,18 @@ fn recap_footer_hint_text(keybinds: &TuiKeybindsConfig) -> String {
     )
 }
 
+fn focused_pass_recap_hint_text(keybinds: &TuiKeybindsConfig, remainder: Option<usize>) -> String {
+    let rest = format!(
+        "[{}] choose scope  [{}/Esc] exit",
+        recap_done_key(keybinds),
+        keybinds.quit
+    );
+    match remainder {
+        Some(_) => format!("Press [Enter] continue full review  {rest}"),
+        None => format!("Press {rest}"),
+    }
+}
+
 fn render_recap_footer(frame: &mut Frame, area: Rect, palette: &UiPalette, hint: String) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -6968,9 +7354,29 @@ fn render_recap_footer(frame: &mut Frame, area: Rect, palette: &UiPalette, hint:
 
 fn recap_summary_lines(state: &AppState) -> Vec<String> {
     if let Some(plan) = &state.onboarding {
+        let (completed, heading, outside) = match plan.purpose {
+            CardQueuePurpose::Plan(purpose) => (
+                format!("{} pass complete", purpose.label()),
+                format!("Plan: {}", plan.title),
+                "This completes only the selected pass, not the repository review.".to_string(),
+            ),
+            CardQueuePurpose::FocusedPass { remainder: 0 } => (
+                "Focused pass complete".to_string(),
+                format!("Scope: {}", plan.title),
+                "Every pending block in this scope was part of the pass.".to_string(),
+            ),
+            CardQueuePurpose::FocusedPass { remainder } => (
+                "Focused pass complete".to_string(),
+                format!("Scope: {}", plan.title),
+                format!(
+                    "Outside this pass: {remainder} pending block{} in this scope remain unreviewed.",
+                    if remainder == 1 { "" } else { "s" }
+                ),
+            ),
+        };
         return vec![
-            format!("{} pass complete", plan.purpose.label()),
-            format!("Plan: {}", plan.title),
+            completed,
+            heading,
             plan.description.clone(),
             String::new(),
             format!("Selected cards: {}", plan.cards.len()),
@@ -6981,7 +7387,7 @@ fn recap_summary_lines(state: &AppState) -> Vec<String> {
                 "Still unreviewed in this pass: {} cards",
                 state.remaining_blocks
             ),
-            "This completes only the selected pass, not the repository review.".to_string(),
+            outside,
         ];
     }
     let mut lines = vec![
@@ -9006,7 +9412,7 @@ mod diff_scope_tests {
             .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
         terminal
             .draw(|frame| {
-                render_ai_review_plan_screen(frame, &state, &plan, &coverage, 0);
+                render_ai_review_plan_screen(frame, &state, &plan, &coverage, 0, "");
             })
             .unwrap_or_else(|error| panic!("failed to render review plan: {error}"));
         let buffer = terminal.backend().buffer();
@@ -9063,7 +9469,7 @@ mod diff_scope_tests {
             .unwrap_or_else(|error| panic!("failed to build test terminal: {error}"));
         terminal
             .draw(|frame| {
-                render_ai_review_plan_screen(frame, &state, &plan, &coverage, 0);
+                render_ai_review_plan_screen(frame, &state, &plan, &coverage, 0, "");
             })
             .unwrap_or_else(|error| panic!("failed to render review plan: {error}"));
         let buffer = terminal.backend().buffer();
@@ -9131,10 +9537,34 @@ mod diff_scope_tests {
     #[test]
     fn ai_review_kickoff_key_actions_use_configured_navigation() {
         let keybinds = TuiKeybindsConfig::default();
+        let (state, _file, block_ids) = build_state_with_file_block_count(1);
+        let focused = crate::review_pass::ai_pass(
+            &focused_pass_candidates(&state),
+            vec![AiPick {
+                id: block_ids[0],
+                reason: "shared state".to_string(),
+                checks: Vec::new(),
+            }],
+            crate::review_pass::DEFAULT_PASS_BUDGET,
+        );
+        let offer = format!(
+            "focused pass: 1 card ~{} (AI review plan)",
+            format_reading_estimate(focused.estimated_seconds())
+        );
 
         assert_eq!(
-            ai_review_plan_ready_footer(&keybinds),
-            "j/k scroll  •  Enter start targeted order  •  Esc canonical order  •  q quit"
+            ai_review_plan_ready_footer(&keybinds, ReviewPass::Full, &focused),
+            format!(
+                "j/k scroll  •  Enter targeted order  •  f {offer}  •  Esc canonical order  •  q quit"
+            )
+        );
+        assert_eq!(
+            ai_review_plan_ready_footer(&keybinds, ReviewPass::Focused, &focused),
+            format!("j/k scroll  •  Enter {offer}  •  Esc heuristic focused pass  •  q quit")
+        );
+        assert_eq!(
+            ai_review_kickoff_key_action(KeyCode::Char('f'), &keybinds),
+            AiReviewKickoffKeyAction::StartFocused
         );
 
         assert_eq!(ai_review_plan_viewport_height(Rect::new(0, 0, 80, 24)), 21);
@@ -9239,7 +9669,7 @@ mod diff_scope_tests {
 
         terminal
             .draw(|frame| {
-                render_ai_review_kickoff_loading(frame, &state, &coverage, 0);
+                render_ai_review_kickoff_loading(frame, &state, &coverage, 0, ReviewPass::Full);
             })
             .unwrap_or_else(|error| panic!("failed to render loading screen: {error}"));
         let buffer = terminal.backend().buffer();
@@ -9253,6 +9683,7 @@ mod diff_scope_tests {
         assert!(screen.contains("Planning a targeted review"));
         assert!(screen.contains("Context: 2/3 blocks listed (partial)"));
         assert!(screen.contains("Esc canonical order"));
+        assert!(screen.contains("f heuristic focused pass"));
 
         terminal
             .draw(|frame| {
@@ -9261,6 +9692,7 @@ mod diff_scope_tests {
                     &state,
                     &coverage,
                     "provider worker disconnected",
+                    ReviewPass::Focused,
                 );
             })
             .unwrap_or_else(|error| panic!("failed to render unavailable screen: {error}"));
@@ -9272,7 +9704,8 @@ mod diff_scope_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(screen.contains("AI review plan unavailable: provider worker disconnected"));
-        assert!(screen.contains("Enter/Esc canonical order"));
+        assert!(screen.contains("Enter/Esc heuristic focused pass"));
+        assert!(!screen.contains("canonical order"));
     }
 
     #[test]
@@ -9389,7 +9822,7 @@ mod diff_scope_tests {
                 description: "A container cannot be a standalone approval target.".to_string(),
                 details: None,
             }],
-            crate::onboarding::ReviewPurpose::Onboarding,
+            CardQueuePurpose::Plan(crate::onboarding::ReviewPurpose::Onboarding),
         );
         assert!(result.is_err());
         assert!(state.onboarding.is_none());
@@ -9469,6 +9902,180 @@ mod diff_scope_tests {
         assert!(recap.contains("Onboarding pass complete"));
         assert!(recap.contains("finish onboarding"));
         assert!(!recap.contains("review something else"));
+    }
+
+    fn focused_pass_test_state(budget_seconds: usize) -> (AppState, TreeNodeId, Vec<TreeNodeId>) {
+        let (mut state, file, ids) = build_state_with_file_block_count(3);
+        let budget = crate::focus::ReviewDuration::from_seconds(budget_seconds).unwrap();
+        let plan = heuristic_pass_for_state(&state, budget);
+        start_focused_pass(&mut state, &plan).unwrap();
+        (state, file, ids)
+    }
+
+    fn render_screen(state: &mut AppState, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn focused_pass_walks_only_selected_cards_and_keeps_the_diff_toggle() {
+        // Each one-line block costs 12s, so a 24s budget selects two of three.
+        let (mut state, file, ids) = focused_pass_test_state(24);
+        let queue = state.onboarding.as_ref().unwrap();
+        assert_eq!(
+            queue.purpose,
+            CardQueuePurpose::FocusedPass { remainder: 1 }
+        );
+        assert!(queue.purpose.allows_view_toggle());
+        assert_eq!(
+            queue
+                .cards
+                .iter()
+                .map(|card| card.node_id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[1]]
+        );
+        assert!(queue.description.contains("2 of 3 pending blocks"));
+        assert!(queue.description.contains("chosen by heuristics"));
+        assert_eq!(state.view_mode, ViewMode::Diff);
+        assert_eq!(state.navigator.current_id(), ids[0]);
+        assert!(!state.navigator.is_visible(ids[2]));
+        assert_eq!(state.remaining_blocks, 2);
+
+        let screen = render_screen(&mut state, 100, 30);
+        let words = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("Focused pass: All · Card 1/2"), "{screen}");
+        assert!(words.contains("[m]ode"), "{screen}");
+
+        // A pass never widens: the file and unselected blocks cannot be marked.
+        for forbidden in [state.navigator.tree.root(), file, ids[2]] {
+            let action =
+                PendingAction::from_node(&state.navigator.tree, forbidden, Verdict::Approved);
+            let result = execute_action_with(&mut state, action, |_| {
+                panic!("a target outside the pass must never reach the review store")
+            });
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn finished_focused_pass_offers_to_continue_the_full_review() {
+        let (mut state, _file, ids) = focused_pass_test_state(24);
+        let mut marked = Vec::new();
+        for selected in [ids[0], ids[1]] {
+            assert_eq!(state.navigator.current_id(), selected);
+            let action =
+                PendingAction::from_node(&state.navigator.tree, selected, Verdict::Approved);
+            execute_action_with(&mut state, action, |params| {
+                marked.push(params.fingerprint);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(marked.len(), 2);
+        assert!(is_recap_mode(&state));
+
+        let recap = recap_summary_lines(&state).join("\n");
+        assert!(recap.contains("Focused pass complete"), "{recap}");
+        assert!(
+            recap.contains("Outside this pass: 1 pending block in this scope remain unreviewed."),
+            "{recap}"
+        );
+        let screen = render_screen(&mut state, 100, 30);
+        assert!(screen.contains("[Enter] continue full review"), "{screen}");
+        assert_eq!(
+            recap_action_for_state(&state, KeyCode::Enter),
+            Some(RecapAction::ContinueFullReview)
+        );
+        assert_eq!(
+            recap_action_for_state(&state, KeyCode::Char('d')),
+            Some(RecapAction::ReviewSomethingElse)
+        );
+        assert_eq!(
+            recap_action_for_state(&state, KeyCode::Char('q')),
+            Some(RecapAction::Exit)
+        );
+    }
+
+    #[test]
+    fn focused_pass_covering_the_whole_scope_does_not_offer_continuation() {
+        let (mut state, _file, ids) = focused_pass_test_state(300);
+        for selected in [ids[0], ids[1], ids[2]] {
+            let action =
+                PendingAction::from_node(&state.navigator.tree, selected, Verdict::Approved);
+            execute_action_with(&mut state, action, |_| Ok(())).unwrap();
+        }
+        assert!(is_recap_mode(&state));
+        let recap = recap_summary_lines(&state).join("\n");
+        assert!(recap.contains("Every pending block in this scope was part of the pass."));
+        assert_eq!(recap_action_for_state(&state, KeyCode::Enter), None);
+        let screen = render_screen(&mut state, 100, 30);
+        assert!(!screen.contains("continue full review"), "{screen}");
+    }
+
+    #[test]
+    fn ai_focused_pass_follows_plan_priorities_and_keeps_their_reasons() {
+        let (mut state, _file, ids) = build_state_with_file_block_count(3);
+        let plan = AiReviewPlan {
+            summary: "Review shared state first.".to_string(),
+            global_checks: Vec::new(),
+            priority_blocks: vec![
+                AiReviewPlanPriority {
+                    block_id: "B0003".to_string(),
+                    reason: "Guards shared state.".to_string(),
+                    checks: vec!["Lock order".to_string()],
+                },
+                AiReviewPlanPriority {
+                    block_id: "B0099".to_string(),
+                    reason: "Invented block.".to_string(),
+                    checks: Vec::new(),
+                },
+            ],
+        };
+
+        let pass = ai_pass_for_state(&state, &plan, crate::review_pass::DEFAULT_PASS_BUDGET);
+        assert_eq!(
+            pass.cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+            vec![ids[2]]
+        );
+        assert_eq!(pass.remainder, 2);
+
+        start_focused_pass(&mut state, &pass).unwrap();
+        let queue = state.onboarding.as_ref().unwrap();
+        assert!(queue.description.contains("chosen by AI review plan"));
+        assert!(
+            queue.cards[0]
+                .description
+                .starts_with("AI: Guards shared state.")
+        );
+        assert!(
+            queue.cards[0]
+                .details
+                .as_deref()
+                .unwrap()
+                .contains("• Lock order")
+        );
+        assert_eq!(state.navigator.current_id(), ids[2]);
+    }
+
+    #[test]
+    fn empty_focused_pass_leaves_the_full_queue() {
+        let (mut state, _file, ids) = build_state_with_file_block_count(2);
+        let empty = crate::review_pass::ai_pass(
+            &focused_pass_candidates(&state),
+            Vec::new(),
+            crate::review_pass::DEFAULT_PASS_BUDGET,
+        );
+        start_focused_pass(&mut state, &empty).unwrap();
+        assert!(state.onboarding.is_none());
+        assert_eq!(state.reviewable_nodes, ids.into_iter().collect());
     }
 
     impl AiSuggestionProvider for StaticAiSuggestionProvider {
@@ -10381,13 +10988,9 @@ mod diff_scope_tests {
     #[test]
     fn block_diff_focus_mode_uses_configured_context() {
         let config = TuiConfig {
-            mode: TuiReviewMode::Blocks,
-            confirm_batch_sub_blocks: BatchConfirmPolicy::Threshold(2),
             diff_focus_mode: TuiDiffFocusMode::ChangedWithContext,
             diff_focus_context_lines: 7,
-            diff_line_numbers: TuiDiffLineNumbers::Disabled,
-            keybinds: crate::config::TuiKeybindsConfig::default(),
-            speed_read: crate::config::TuiSpeedReadConfig::default(),
+            ..TuiConfig::default()
         };
         let mode = block_diff_focus_mode_from_config(&config);
         assert_eq!(
@@ -10469,6 +11072,7 @@ mod diff_scope_tests {
             speed_read: 's',
             root: 'z',
             recap_done: 'd',
+            focused_pass: 'w',
             quit: 'x',
         };
         assert_eq!(
@@ -10508,11 +11112,29 @@ mod diff_scope_tests {
             speed_read: 's',
             root: 'z',
             recap_done: 'd',
+            focused_pass: 'w',
             quit: 'x',
         };
+        let budget = crate::focus::ReviewDuration::from_seconds(90).unwrap();
         assert_eq!(
-            scope_selector_hint_text(&keybinds),
-            "[Enter] select  [m/i] move  [x] quit"
+            scope_selector_hint_text(
+                &keybinds,
+                PassDefaults {
+                    pass: ReviewPass::Full,
+                    budget,
+                }
+            ),
+            "[Enter] review all  [w] focused pass (~1m 30s)  [m/i] move  [x] quit"
+        );
+        assert_eq!(
+            scope_selector_hint_text(
+                &keybinds,
+                PassDefaults {
+                    pass: ReviewPass::Focused,
+                    budget,
+                }
+            ),
+            "[Enter] focused pass (~1m 30s)  [m/i] move  [x] quit"
         );
     }
 
@@ -10634,7 +11256,12 @@ mod diff_scope_tests {
         let mut visible = 0..0;
         terminal
             .draw(|frame| {
-                visible = render_scope_selector(frame, &selector, &TuiKeybindsConfig::default());
+                visible = render_scope_selector(
+                    frame,
+                    &selector,
+                    &TuiKeybindsConfig::default(),
+                    PassDefaults::resolve(&TuiConfig::default(), None, None),
+                );
             })
             .unwrap_or_else(|error| panic!("failed to render scope selector: {error}"));
         assert!(visible.contains(&9), "visible rows: {visible:?}");
@@ -11304,6 +11931,7 @@ mod diff_scope_tests {
             speed_read: 's',
             root: 'z',
             recap_done: 'd',
+            focused_pass: 'w',
             quit: 'x',
         };
         let palette = UiPalette::default();
@@ -16659,6 +17287,7 @@ mod diff_scope_tests {
             speed_read: 's',
             root: 'z',
             recap_done: 'f',
+            focused_pass: 'w',
             quit: 'x',
         };
         assert_eq!(

@@ -685,6 +685,10 @@ impl FocusPty {
     const COLS: u16 = 120;
 
     fn open(repo: &TestRepo) -> Result<Self> {
+        Self::open_with(repo, &["focus", "--plan", "focus.json", "--duration", "5m"])
+    }
+
+    fn open_with(repo: &TestRepo, args: &[&str]) -> Result<Self> {
         let pair = native_pty_system().openpty(PtySize {
             rows: Self::ROWS,
             cols: Self::COLS,
@@ -692,7 +696,7 @@ impl FocusPty {
             pixel_height: 0,
         })?;
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_trueflow"));
-        cmd.args(["focus", "--plan", "focus.json", "--duration", "5m"]);
+        cmd.args(args);
         cmd.cwd(&repo.path);
         configure_tui_pty_command(&mut cmd, repo);
         // Acquire fallible handles before spawning so setup errors cannot orphan a child.
@@ -973,5 +977,80 @@ fn pty_focus_preserves_selected_order_evidence_approvals_and_resume_scope() -> R
             "focus must preserve selected and unselected source"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn pty_focused_pass_reviews_a_budgeted_subset_then_continues_the_full_review() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let repo = TestRepo::new("focused_pass_pty")?;
+    repo.write(
+        "trueflow.toml",
+        "[scan]\nuse_cache = false\nwrite_cache = false\n[ai]\nmode = \"off\"\n",
+    )?;
+    let helpers = |suffix: &str| -> String {
+        (0..6)
+            .map(|n| format!("fn helper_{n}() -> u32 {{\n    {n}{suffix}\n}}\n\n"))
+            .collect()
+    };
+    repo.write("src/lib.rs", &helpers(""))?;
+    repo.commit_all("base")?;
+    repo.write(
+        "src/lib.rs",
+        &format!(
+            "{}pub fn run_git(dir: &Path) -> io::Result<Output> {{\n    Command::new(\"git\").current_dir(dir).output()\n}}\n",
+            helpers(" + 1")
+        ),
+    )?;
+    repo.commit_all("change helpers and shell out")?;
+    let revision = run_git_output(&repo.path, &["rev-parse", "HEAD"])?;
+    let target = format!("rev:{}", revision.trim());
+
+    // run_git costs 16s and each one-line helper change 18s, so 40s holds two cards.
+    let mut session = FocusPty::open_with(
+        &repo,
+        &[
+            "tui", "--target", &target, "--pass", "focused", "--budget", "40s",
+        ],
+    )?;
+    session.wait_screen(
+        "to open the trust-boundary block first in a focused pass",
+        |screen| {
+            screen.contains("Focused pass")
+                && screen.contains("Card 1/2")
+                && screen.contains("pub fn run_git")
+                && screen.contains("trust boundary")
+        },
+    )?;
+    session.send(b"a")?;
+    session.wait_screen("to advance to the second card", |screen| {
+        screen.contains("Card 2/2") && screen.contains("helper_0")
+    })?;
+    session.send(b" ")?;
+    session.wait_screen("to recap the pass and offer the remainder", |screen| {
+        screen.contains("Focused pass complete")
+            && screen.contains("Outside this pass: 5 pending blocks")
+            && screen.contains("[Enter] continue full review")
+    })?;
+    session.send(b"\r")?;
+    session.wait_screen(
+        "to reload the scope as a full review without the approved block",
+        |screen| {
+            screen.contains("Diff Mode")
+                && screen.contains("6 remaining")
+                && !screen.contains("Focused pass")
+        },
+    )?;
+    session.send(b"q")?;
+    session.finish()?;
+
+    let records = read_review_records(&repo.path.join(".trueflow/reviews.jsonl"))?;
+    assert_eq!(
+        records.len(),
+        1,
+        "only the approved card may be recorded; the skipped card and remainder stay pending"
+    );
     Ok(())
 }

@@ -5,9 +5,11 @@ use crate::build_info;
 use crate::commands::feedback::FeedbackFormat;
 use crate::commands::review::ReviewTarget;
 use crate::feedback_since::FeedbackSinceExpr;
+use crate::focus::ReviewDuration;
 use crate::github::PullRequestRef;
 use crate::logging::LoggingMode;
 use crate::repo_path::RepoPath;
+use crate::review_pass::ReviewPass;
 use crate::store::{ReviewCheck, Verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
@@ -241,6 +243,14 @@ pub enum Commands {
         /// Exclude block types (e.g. "gap", "comment", "whitespace")
         #[arg(long)]
         exclude: Vec<BlockKind>,
+
+        /// Walk every pending block (`full`) or a reading-budgeted subset (`focused`); defaults to [tui].pass
+        #[arg(long, value_enum)]
+        pass: Option<ReviewPass>,
+
+        /// Reading budget for focused passes, e.g. 5m or 90s; defaults to [tui].pass_budget
+        #[arg(long, value_name = "DURATION")]
+        budget: Option<ReviewDuration>,
     },
 }
 
@@ -380,6 +390,7 @@ mod tests {
                 exclude,
                 mode,
                 trust_lsp_workspace,
+                ..
             } => {
                 assert!(!all);
                 assert_eq!(
@@ -412,7 +423,11 @@ mod tests {
                 exclude,
                 mode,
                 trust_lsp_workspace,
+                pass,
+                budget,
             } => {
+                assert!(pass.is_none());
+                assert!(budget.is_none());
                 assert!(!all);
                 assert!(target.is_empty());
                 assert!(since.is_none());
@@ -422,6 +437,31 @@ mod tests {
                 assert!(!trust_lsp_workspace);
             }
             _ => panic!("expected tui command"),
+        }
+    }
+
+    #[test]
+    fn tui_command_parses_focused_pass_and_budget() {
+        use crate::focus::ReviewDuration;
+        use crate::review_pass::ReviewPass;
+
+        let cli = Cli::parse_from(["trueflow", "tui", "--pass", "focused", "--budget", "90s"]);
+        match cli.command {
+            Commands::Tui { pass, budget, .. } => {
+                assert_eq!(pass, Some(ReviewPass::Focused));
+                assert_eq!(budget.map(ReviewDuration::seconds), Some(90));
+            }
+            _ => panic!("expected tui command"),
+        }
+        for invalid in [
+            ["trueflow", "tui", "--pass", "skim"],
+            ["trueflow", "tui", "--budget", "61m"],
+            ["trueflow", "tui", "--budget", "5"],
+        ] {
+            assert!(
+                Cli::try_parse_from(invalid).is_err(),
+                "{invalid:?} should fail"
+            );
         }
     }
 
@@ -626,6 +666,7 @@ mod tests {
                 exclude,
                 mode,
                 trust_lsp_workspace,
+                ..
             } => {
                 assert!(!all);
                 assert_eq!(
@@ -716,6 +757,7 @@ mod tests {
                 exclude,
                 mode,
                 trust_lsp_workspace,
+                ..
             } => {
                 assert!(!all);
                 assert!(target.is_empty());

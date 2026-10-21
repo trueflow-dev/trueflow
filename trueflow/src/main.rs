@@ -119,6 +119,8 @@ fn main() -> Result<()> {
             since,
             only,
             exclude,
+            pass,
+            budget,
         } => commands::tui::run(
             &context,
             commands::tui::TuiRunRequest {
@@ -129,6 +131,8 @@ fn main() -> Result<()> {
                 since: since.as_deref(),
                 only,
                 exclude,
+                pass: *pass,
+                budget: *budget,
             },
         ),
     }
