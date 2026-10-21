@@ -12,13 +12,24 @@ pub struct ScopeOption {
 pub enum ScopePreset {
     All,
     MainDiff,
-    Commit { id: String, summary: String },
-    RevisionRange { start: String, end: String },
+    /// Uncommitted changes: diffs compare `HEAD` to the working tree.
+    DirtyWorktree,
+    Commit {
+        id: String,
+        summary: String,
+    },
+    RevisionRange {
+        start: String,
+        end: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffQuery {
     MainDiff {
+        path: String,
+    },
+    DirtyWorktree {
         path: String,
     },
     Revision {
@@ -37,6 +48,7 @@ impl ScopePreset {
         match self {
             ScopePreset::All => "entire review".to_string(),
             ScopePreset::MainDiff => "diff vs main".to_string(),
+            ScopePreset::DirtyWorktree => "dirty worktree".to_string(),
             ScopePreset::Commit { id, summary } => {
                 let short_id = short_commit_id(id);
                 let summary = truncate_text(summary, 32);
@@ -61,6 +73,9 @@ impl ScopePreset {
             ScopePreset::All | ScopePreset::MainDiff => DiffQuery::MainDiff {
                 path: path.to_string(),
             },
+            ScopePreset::DirtyWorktree => DiffQuery::DirtyWorktree {
+                path: path.to_string(),
+            },
             ScopePreset::Commit { id, .. } => DiffQuery::Revision {
                 revision: id.clone(),
                 path: path.to_string(),
@@ -77,6 +92,9 @@ impl ScopePreset {
         match self {
             ScopePreset::All => Ok(ReviewRequest::AllFiles),
             ScopePreset::MainDiff => Ok(ReviewRequest::Targets(vec![ReviewTarget::MainDiff])),
+            ScopePreset::DirtyWorktree => {
+                Ok(ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree]))
+            }
             ScopePreset::Commit { id, .. } => {
                 Ok(ReviewRequest::Targets(vec![ReviewTarget::Revision(
                     RevisionExpr::new(id.clone())?,
@@ -216,6 +234,22 @@ mod tests {
             DiffQuery::MainDiff {
                 path: "src/lib.rs".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn dirty_worktree_scope_diffs_and_reloads_the_working_tree() {
+        assert_eq!(
+            ScopePreset::DirtyWorktree.diff_query_for_path("src/lib.rs"),
+            DiffQuery::DirtyWorktree {
+                path: "src/lib.rs".to_string(),
+            }
+        );
+        assert_eq!(
+            ScopePreset::DirtyWorktree
+                .to_review_request()
+                .unwrap_or_else(|error| panic!("expected dirty review request: {error}")),
+            ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree])
         );
     }
 

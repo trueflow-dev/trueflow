@@ -881,6 +881,55 @@ pub(crate) fn diff_for_file(repo: &gix::Repository, path: &RepoPath) -> Result<F
     Ok(diffs.take(path))
 }
 
+/// Diff of `path` from `HEAD` to the working tree: what `--target dirty`
+/// reviews. A path missing from `HEAD` diffs as added, a path missing from
+/// the working tree as deleted.
+pub(crate) fn diff_for_file_in_worktree(
+    repo: &gix::Repository,
+    path: &RepoPath,
+) -> Result<FileDiff> {
+    use gix::diff::blob::ResourceKind;
+    use gix::diff::blob::pipeline::{Mode, WorktreeRoots};
+
+    let workdir = repo
+        .workdir()
+        .context("working-tree diffs need a repository with a working tree")?;
+    let head_tree = repo.find_tree(repo.head_tree_id_or_empty()?)?;
+    let (head_id, head_kind) = match head_tree.lookup_entry_by_path(path.as_str())? {
+        Some(entry) => (entry.object_id(), entry.mode().kind()),
+        None => (gix::ObjectId::null(repo.object_hash()), EntryKind::Blob),
+    };
+    let worktree_kind = match std::fs::symlink_metadata(workdir.join(path.as_str())) {
+        Ok(metadata) if metadata.file_type().is_symlink() => EntryKind::Link,
+        _ => EntryKind::Blob,
+    };
+
+    let mut diff_cache = repo.diff_resource_cache(
+        Mode::ToGit,
+        WorktreeRoots {
+            old_root: None,
+            new_root: Some(workdir.to_path_buf()),
+        },
+    )?;
+    let rela_path = path.as_str().into();
+    diff_cache.set_resource(
+        head_id,
+        head_kind,
+        rela_path,
+        ResourceKind::OldOrSource,
+        &repo.objects,
+    )?;
+    // The worktree side is read from disk, so its id is never consulted.
+    diff_cache.set_resource(
+        gix::ObjectId::null(repo.object_hash()),
+        worktree_kind,
+        rela_path,
+        ResourceKind::NewOrDestination,
+        &repo.objects,
+    )?;
+    file_diff_from_change(&mut diff_cache, ChangedPath::identity(path.clone()))
+}
+
 pub(crate) fn file_diffs_for_main_to_head(
     repo: &gix::Repository,
     selected_destinations: &[RepoPath],
@@ -1687,6 +1736,47 @@ mod tests {
             external.changed_path(),
             &ChangedPath::identity(selected[3].clone())
         );
+    }
+
+    #[test]
+    fn diff_for_file_in_worktree_compares_head_to_working_tree() {
+        use crate::test_git::{run_git, temp_git_repo};
+        use std::fs;
+
+        let repo_path = temp_git_repo("worktree_file_diff");
+        fs::write(repo_path.join("tracked.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        fs::write(repo_path.join("clean.rs"), "fn clean() {}\n").unwrap();
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "base"]);
+        fs::write(repo_path.join("tracked.rs"), "fn a() {}\nfn edited() {}\n").unwrap();
+        fs::write(repo_path.join("untracked.rs"), "fn new() {}\n").unwrap();
+        let repo = gix::open(&repo_path).unwrap();
+        let lines = |path: &str| {
+            diff_for_file_in_worktree(&repo, &RepoPath::new(path).unwrap())
+                .unwrap()
+                .into_hunks()
+                .into_iter()
+                .flat_map(|hunk| hunk.lines)
+                .filter(|line| line.kind != DiffLineKind::Context)
+                .map(|line| (line.kind, line.text))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            lines("tracked.rs"),
+            vec![
+                (DiffLineKind::Removed, "fn b() {}\n".to_string()),
+                (DiffLineKind::Added, "fn edited() {}\n".to_string()),
+            ]
+        );
+        assert_eq!(
+            lines("untracked.rs"),
+            vec![(DiffLineKind::Added, "fn new() {}\n".to_string())]
+        );
+        assert!(matches!(
+            diff_for_file_in_worktree(&repo, &RepoPath::new("clean.rs").unwrap()).unwrap(),
+            FileDiff::NoTextChanges { .. }
+        ));
     }
 
     #[test]

@@ -800,6 +800,7 @@ fn review_coverage_status_cache_key(
     let scope_key = match scope {
         ScopePreset::All => "all".to_string(),
         ScopePreset::MainDiff => "main-diff".to_string(),
+        ScopePreset::DirtyWorktree => "dirty-worktree".to_string(),
         ScopePreset::Commit { id, .. } => format!("commit:{id}"),
         ScopePreset::RevisionRange { start, end } => format!("revision-range:{start}..{end}"),
     };
@@ -813,7 +814,7 @@ fn review_coverage_status_cache_key(
 fn scope_selector_status_should_refresh_when_cached(scope: &ScopePreset) -> bool {
     matches!(
         scope,
-        ScopePreset::MainDiff | ScopePreset::RevisionRange { .. }
+        ScopePreset::MainDiff | ScopePreset::DirtyWorktree | ScopePreset::RevisionRange { .. }
     )
 }
 
@@ -2217,7 +2218,9 @@ fn scope_preset_for_cli_targets(all: bool, targets: &[ReviewTarget]) -> (ScopePr
     }
 
     match targets {
-        [] | [ReviewTarget::DirtyWorktree] => (ScopePreset::MainDiff, "dirty worktree".to_string()),
+        [] | [ReviewTarget::DirtyWorktree] => {
+            (ScopePreset::DirtyWorktree, "dirty worktree".to_string())
+        }
         [ReviewTarget::MainDiff] => (ScopePreset::MainDiff, "diff vs main".to_string()),
         [ReviewTarget::File(path)] => (ScopePreset::MainDiff, format!("file {path}")),
         [ReviewTarget::Dir(path)] => (ScopePreset::MainDiff, format!("dir:{path}")),
@@ -5666,7 +5669,7 @@ fn review_scope_revision(state: &AppState) -> Result<Option<crate::store::Commit
             end,
             state.repo_root.as_deref(),
         )?)),
-        ScopePreset::All | ScopePreset::MainDiff => {
+        ScopePreset::All | ScopePreset::MainDiff | ScopePreset::DirtyWorktree => {
             Ok(vcs::snapshot_from_workdir().repo_ref_revision)
         }
     }
@@ -7823,7 +7826,7 @@ fn load_file_contents_for_scope(
     path: &RepoPath,
 ) -> Option<String> {
     match scope {
-        ScopePreset::All | ScopePreset::MainDiff => {
+        ScopePreset::All | ScopePreset::MainDiff | ScopePreset::DirtyWorktree => {
             let path = repo_root
                 .map(|repo_root| repo_root.join(path.as_str()))
                 .unwrap_or_else(|| PathBuf::from(path.as_str()));
@@ -8962,6 +8965,9 @@ fn cached_file_diff_for_node<'a>(
             let repo = repo_for_tui_state(state.repo_root.as_deref())?;
             match query {
                 DiffQuery::MainDiff { path } => vcs::diff_for_file(&repo, &RepoPath::new(path)?),
+                DiffQuery::DirtyWorktree { path } => {
+                    vcs::diff_for_file_in_worktree(&repo, &RepoPath::new(path)?)
+                }
                 DiffQuery::Revision { revision, path } => {
                     vcs::diff_for_file_in_revision(&repo, &revision, &RepoPath::new(path)?)
                 }
@@ -11858,7 +11864,9 @@ mod diff_scope_tests {
                     diagnostics: Vec::new(),
                 }),
                 ScopePreset::Commit { .. } => Err(anyhow::anyhow!("lookup failed")),
-                ScopePreset::RevisionRange { .. } => panic!("unexpected test scope"),
+                ScopePreset::DirtyWorktree | ScopePreset::RevisionRange { .. } => {
+                    panic!("unexpected test scope")
+                }
             },
         )
         .unwrap_or_else(|error| panic!("expected selector with statuses: {error}"));
@@ -12849,7 +12857,7 @@ mod diff_scope_tests {
             request.request,
             ReviewRequest::Targets(vec![ReviewTarget::DirtyWorktree])
         );
-        assert_eq!(request.scope, ScopePreset::MainDiff);
+        assert_eq!(request.scope, ScopePreset::DirtyWorktree);
         assert_eq!(request.scope_label, "dirty worktree");
     }
     #[test]
@@ -18084,6 +18092,57 @@ mod diff_scope_tests {
                 .iter()
                 .all(|line| !line.contains("(No diff changes in this block)")),
             "expected real diff rows for commit scope block, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn dirty_target_diff_mode_shows_uncommitted_hunks() {
+        // GIVEN: `main` with only an uncommitted working-tree edit
+        let repo_root = temp_git_repo("tui_dirty_target_diff");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|error| panic!("failed to create fixture directory: {error}"));
+        fs::write(&file_path, "fn demo() {\n    committed();\n}\n")
+            .unwrap_or_else(|error| panic!("failed to write committed fixture: {error}"));
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-m", "Initial"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        let edited = "fn demo() {\n    uncommitted();\n}\n";
+        fs::write(&file_path, edited)
+            .unwrap_or_else(|error| panic!("failed to write working-tree edit: {error}"));
+
+        // WHEN: the `--target dirty` scope renders the block in diff mode
+        let (scope, _) = scope_preset_for_cli_targets(false, &[ReviewTarget::DirtyWorktree]);
+        let mut state = build_test_state(scope, HashMap::new());
+        state.repo_root = Some(repo_root);
+        state.view_mode = ViewMode::Diff;
+        let node = ContentNodeSnapshot {
+            id: state.navigator.tree.root(),
+            kind: TreeNodeKind::Block,
+            path: RepoPath::new("src/lib.rs").unwrap(),
+            children: Vec::new(),
+            block: Some(test_block(edited.to_string(), BlockKind::Function, 0, 3)),
+            language: Some(Language::Rust),
+        };
+        let content = build_block_lines(&mut state, &node, &UiPalette::default(), 10, 80);
+        let rendered = content
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        // THEN: the HEAD-to-working-tree hunk is shown
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.trim_start().starts_with('+') && line.contains("uncommitted();")),
+            "expected the uncommitted edit as an added row, got: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.trim_start().starts_with('-') && line.contains("committed();")),
+            "expected the HEAD line as a removed row, got: {rendered:?}"
         );
     }
 
