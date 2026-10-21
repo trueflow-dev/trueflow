@@ -4943,9 +4943,14 @@ fn handle_child(state: &mut AppState) {
     }
 }
 
+/// Splits `node_id` into its child-navigation blocks and inserts them as tree
+/// children. Blocks the tree already has as nodes (members a scanner emits as
+/// siblings of a non-container parent, such as a Zig union's fields and
+/// methods) are not inserted again; with nothing new the node is left as it
+/// was and `false` is returned.
 fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bool {
     let node = state.navigator.tree.node(node_id);
-    let Some(block) = node.block.clone() else {
+    let Some(block) = node.block.as_ref() else {
         return false;
     };
     let Some(language) = node.language else {
@@ -4955,11 +4960,21 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
     let Ok(sub_splitter::SubSplitResult {
         blocks: child_blocks,
         ..
-    }) = sub_splitter::child_navigation_split(&block, language)
+    }) = sub_splitter::child_navigation_split(block, language)
     else {
         return false;
     };
-    if child_blocks.is_empty() {
+    let new_child_blocks = child_blocks
+        .into_iter()
+        .filter(|child| {
+            state
+                .navigator
+                .tree
+                .find_block_node(&node.path, child)
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+    if new_child_blocks.is_empty() {
         return false;
     }
 
@@ -4971,10 +4986,7 @@ fn expand_current_node_children(state: &mut AppState, node_id: TreeNodeId) -> bo
     let inserted_ids = state
         .navigator
         .tree
-        .insert_block_children(node_id, child_blocks);
-    if inserted_ids.is_empty() {
-        return false;
-    }
+        .insert_block_children(node_id, new_child_blocks);
 
     for child_id in &inserted_ids {
         state.reviewable_nodes.insert(*child_id);
@@ -11201,8 +11213,9 @@ mod diff_scope_tests {
         repo_path: &str,
         file_content: &str,
     ) -> (AppState, TreeNodeId, TreeNodeId) {
-        build_state_with_markdown_blocks(
+        build_state_with_language_blocks(
             repo_path,
+            Language::Markdown,
             file_content,
             block_splitter::split(file_content, Language::Markdown).blocks,
         )
@@ -11213,8 +11226,9 @@ mod diff_scope_tests {
         file_content: &str,
     ) -> (AppState, TreeNodeId, TreeNodeId) {
         let end_line = file_content.lines().count();
-        build_state_with_markdown_blocks(
+        build_state_with_language_blocks(
             repo_path,
+            Language::Markdown,
             file_content,
             vec![test_block(
                 file_content.to_string(),
@@ -11225,15 +11239,29 @@ mod diff_scope_tests {
         )
     }
 
-    fn build_state_with_markdown_blocks(
+    fn build_state_with_scanned_file(
         repo_path: &str,
+        language: Language,
+        file_content: &str,
+    ) -> (AppState, TreeNodeId, TreeNodeId) {
+        build_state_with_language_blocks(
+            repo_path,
+            language,
+            file_content,
+            block_splitter::split(file_content, language).blocks,
+        )
+    }
+
+    fn build_state_with_language_blocks(
+        repo_path: &str,
+        language: Language,
         file_content: &str,
         blocks: Vec<Block>,
     ) -> (AppState, TreeNodeId, TreeNodeId) {
         let file_state = FileState::from_text(
             RepoPath::new(repo_path)
                 .unwrap_or_else(|error| panic!("invalid repo path {repo_path}: {error}")),
-            Language::Markdown,
+            language,
             file_content.as_bytes(),
             blocks,
         );
@@ -17477,6 +17505,51 @@ mod diff_scope_tests {
             compute_next_review_target(&state, first_sentence_id),
             sentence_children.get(1).copied()
         );
+    }
+
+    #[test]
+    fn handle_child_on_zig_union_with_member_blocks_does_not_duplicate_nodes() {
+        let content = "const std = @import(\"std\");\n\nconst U = union(enum) {\n    a: u32,\n    b: bool,\n\n    pub fn f(self: U) void {\n        _ = self;\n    }\n};\n\npub fn main() void {\n    std.debug.print(\"hi\\n\", .{});\n}\n";
+        let (mut state, file_id, _first) =
+            build_state_with_scanned_file("src/u.zig", Language::Zig, content);
+        let union_id = state
+            .navigator
+            .tree
+            .node(file_id)
+            .children
+            .iter()
+            .copied()
+            .find(|id| {
+                state
+                    .navigator
+                    .tree
+                    .node(*id)
+                    .block
+                    .as_ref()
+                    .is_some_and(|block| {
+                        block.kind == BlockKind::Type && block.content.contains("union")
+                    })
+            })
+            .unwrap_or_else(|| panic!("expected a union block under the file"));
+        assert!(state.navigator.tree.node(union_id).children.is_empty());
+        state.navigator.set_current(union_id);
+
+        handle_child(&mut state);
+
+        let mut keys = HashSet::new();
+        for node in state.navigator.tree.nodes() {
+            let Some(block) = node.block.as_ref() else {
+                continue;
+            };
+            assert!(
+                keys.insert((node.path.clone(), block.hash.clone(), block.byte_span())),
+                "duplicate block node {:?}",
+                block.content
+            );
+        }
+        assert_eq!(state.navigator.current_id(), union_id);
+        assert!(state.reviewable_nodes.contains(&union_id));
+        assert!(state.navigator.tree.node(union_id).children.is_empty());
     }
 
     #[test]
