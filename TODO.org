@@ -237,6 +237,20 @@
      when the chunk size changed; the existing test pinned the jump.
    - Verified by
      `cargo nextest run --features tui-test-support --lib rechunk`.
+** TODO DEF_TODO [Medium] Bound the scan cache and keep tests out of $HOME
+   - Every scan root gets its own `~/.trueflow/cache/scan-<dir>-<hash>.json`
+     and nothing ever evicts entries (IO-7). Tests that scan temporary repos
+     without a `cache_dir` write into the developer's real home: the cache
+     grew from 76,771 to 80,914 files (603 MB) during one session of
+     `cargo nextest` runs.
+   - Fix both: point test scans at their temp dir, and cap or evict the
+     cache by age or size.
+** TODO DEF_TODO [Low] Make deadline-bound tests robust to host load
+   - `e2e_focus_generation` runs `trueflow focus --timeout 5`; on a loaded
+     host the same binary took 1.05-5.09 s serially and the provider timed
+     out. `github_feedback_serializes_concurrent_workers` similarly times
+     out waiting for its fake `gh` to signal readiness. Both pass in
+     isolation; raise the deadlines or make them independent of wall time.
 * TODO [High] Review Chain Of Trust
   Reviews can be signed by known PGP keys, and this can extend/scale into a network
   of trusted code. For example, open source libraries could accumulate layers of
@@ -536,7 +550,13 @@ Two things:
    - [X] Measured base 0147a6e vs 83b7363, release `review --all --json`,
      instructions, byte-identical output: trueflow cold -44%, warm -71%;
      billiards (1602 files) cold -95.5%, warm -85%; rust-lang/rust sparse
-     checkout warm -87%.
+     checkout warm -87%. With a populated database (2,433 exact-hint
+     records), trueflow warm -68% and cold -43%, output still identical.
+   - [ ] Shrink the review units coverage keeps for reuse (`2555218`). Peak
+     memory on rust-lang/rust warm rose 769 -> 835 MB from base to HEAD, and
+     these units are the likely cause (alone they added 4 MB on trueflow and
+     18 MB on billiards). Review reads only each unit's kind, byte span,
+     hash, and whether it is blank.
    - [X] Measured fat LTO + `codegen-units = 1`: -0.3% to -1.0%
      instructions for a 7-minute clean release build; not adopted.
    - [ ] Find the superlinear cold scan of rust-lang/rust sources: a
