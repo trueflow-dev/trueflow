@@ -8102,8 +8102,13 @@ fn build_source_context_content(
     )
 }
 
+/// Rows a view can address: `content_height` and ratatui's scroll offset are
+/// `u16`, so longer content is cut to a window of this many rows.
+const MAX_VIEW_ROWS: usize = u16::MAX as usize;
+
 /// Source content for `raw_lines` (file lines from `start_line`) rendered as
-/// `lines`, word-wrapped into rows of `code_width` cells.
+/// `lines`, word-wrapped into rows of `code_width` cells. Content taller than
+/// `MAX_VIEW_ROWS` keeps only the whole lines of a window around the focus.
 fn wrapped_source_content(
     lines: Vec<Line<'static>>,
     raw_lines: &[String],
@@ -8112,26 +8117,57 @@ fn wrapped_source_content(
     code_width: u16,
 ) -> BuiltContent {
     let wrapped = wrap_lines_into_rows(lines, code_width);
-    let focus_row_range = focus_line_range.and_then(|range| wrapped.row_range(range));
-    let comment_rows = raw_lines
-        .iter()
-        .enumerate()
-        .map(|(index, text)| CommentContextRow {
+    let window = row_window_lines(&wrapped.line_row_prefixes, focus_line_range);
+    let prefixes = &wrapped.line_row_prefixes;
+    let row_base = prefixes[window.start];
+    let focus_row_range = focus_line_range
+        .and_then(|range| {
+            wrapped.row_range(&(range.start.max(window.start)..range.end.min(window.end)))
+        })
+        .map(|rows| rows.start - row_base..rows.end - row_base);
+    let comment_rows = window
+        .clone()
+        .map(|index| CommentContextRow {
             scope_line_index: start_line.saturating_add(index),
-            text: text.clone(),
-            display_row_range: wrapped.line_row_prefixes[index]
-                ..wrapped.line_row_prefixes[index.saturating_add(1)],
+            text: raw_lines[index].clone(),
+            display_row_range: prefixes[index] - row_base..prefixes[index + 1] - row_base,
             anchor: CommentAnchorRowCapture::SourceLine {
                 line_index: start_line.saturating_add(index),
             },
         })
         .collect();
+    let row_end = prefixes[window.end];
+    let mut rows = wrapped.rows;
+    rows.truncate(row_end);
+    rows.drain(..row_base);
     BuiltContent {
-        total_lines: wrapped.rows.len(),
-        lines: wrapped.rows,
+        total_lines: rows.len(),
+        lines: rows,
         focus_row_range,
         comment_rows: Some(comment_rows),
     }
+}
+
+/// Lines whose rows fit in `MAX_VIEW_ROWS`, starting about half a window
+/// above the focus and pulled back when that would run past the end.
+fn row_window_lines(
+    line_row_prefixes: &[usize],
+    focus_line_range: Option<&std::ops::Range<usize>>,
+) -> std::ops::Range<usize> {
+    let line_count = line_row_prefixes.len().saturating_sub(1);
+    let total_rows = line_row_prefixes[line_count];
+    if total_rows <= MAX_VIEW_ROWS {
+        return 0..line_count;
+    }
+    let focus_row =
+        focus_line_range.map_or(0, |range| line_row_prefixes[range.start.min(line_count)]);
+    let start_row = focus_row
+        .saturating_sub(MAX_VIEW_ROWS / 2)
+        .min(total_rows - MAX_VIEW_ROWS);
+    let first = line_row_prefixes.partition_point(|&row| row < start_row);
+    let end_row = line_row_prefixes[first] + MAX_VIEW_ROWS;
+    let end = line_row_prefixes.partition_point(|&row| row <= end_row) - 1;
+    first..end
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14791,6 +14827,41 @@ mod diff_scope_tests {
         assert_eq!(
             rendered_wrapped_row_count(&content.lines, 20),
             content.total_lines
+        );
+    }
+
+    #[test]
+    fn source_view_focus_on_block_past_u16_rows_is_visible() {
+        let file_path = temp_test_file_path("tui_source_past_u16_rows");
+        let block_line = 69_000;
+        let block_content = "fn target_block_past_u16_rows() {}\n";
+        let file_content = (0..70_000)
+            .map(|index| {
+                if index == block_line {
+                    block_content.to_string()
+                } else {
+                    "filler\n".to_string()
+                }
+            })
+            .collect::<String>();
+        let (mut state, _file_id, _block_id) = build_state_with_block_file(
+            &file_path,
+            &file_content,
+            block_content,
+            block_line,
+            block_line + 1,
+        );
+        state.pending_focus_scroll = true;
+
+        let screen = render_screen(&mut state, 100, 30);
+
+        // The header names the block too, so only look below its frame.
+        let code_area = screen
+            .split_once('└')
+            .map_or(screen.as_str(), |(_, code)| code);
+        assert!(
+            code_area.contains("target_block_past_u16_rows"),
+            "block beyond row 65,535 must be scrolled into view:\n{screen}"
         );
     }
 
