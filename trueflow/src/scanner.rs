@@ -639,9 +639,29 @@ fn write_cache(root: &Path, options: &ScanOptions, files: Vec<CachedFileEntry>) 
     Ok(result?)
 }
 
+/// The code that produced cached blocks. A cache written by any other
+/// producer must miss, because unchanged bytes may now split differently.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct CacheProducer {
+    trueflow_version: &'static str,
+    splitter_revision: u32,
+}
+
+impl CacheProducer {
+    const CURRENT: Self = Self {
+        trueflow_version: crate::build_info::VERSION,
+        splitter_revision: analysis::SPLITTER_REVISION,
+    };
+}
+
 fn scan_options_fingerprint(options: &ScanOptions) -> String {
+    cache_fingerprint(options, CacheProducer::CURRENT)
+}
+
+fn cache_fingerprint(options: &ScanOptions, producer: CacheProducer) -> String {
     #[derive(Serialize)]
     struct CacheOptionsFingerprint<'a> {
+        producer: CacheProducer,
         ignore_names: &'a [String],
         ignore_globs: &'a [String],
         ignore_path_prefixes: Vec<&'a str>,
@@ -664,6 +684,7 @@ fn scan_options_fingerprint(options: &ScanOptions) -> String {
     ignore_path_prefixes.dedup();
 
     let fingerprint = CacheOptionsFingerprint {
+        producer,
         ignore_names: &ignore_names,
         ignore_globs: &ignore_globs,
         ignore_path_prefixes,
@@ -1852,6 +1873,71 @@ mod tests {
             panic!("rescanned cache should be readable");
         };
         assert_eq!(cache_entry.format_version, SCAN_CACHE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn scan_cache_rejects_entries_from_another_producer() {
+        let source = "pub fn current() {}\n";
+        let stale_content = "pub fn stale() {}\n";
+        let path = RepoPath::new("src/lib.rs").unwrap();
+        let other_producers = [
+            CacheProducer {
+                splitter_revision: analysis::SPLITTER_REVISION + 1,
+                ..CacheProducer::CURRENT
+            },
+            CacheProducer {
+                trueflow_version: "0.0.0-older",
+                ..CacheProducer::CURRENT
+            },
+        ];
+
+        for (index, producer) in other_producers.into_iter().enumerate() {
+            let repo = temp_test_dir(&format!("scanner_other_producer_cache_{index}"));
+            let cache_dir = temp_test_dir(&format!("scanner_other_producer_store_{index}"));
+            let full_path = repo.join(path.as_str());
+            fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            fs::write(&full_path, source).unwrap();
+            let options = ScanOptions {
+                cache_dir: Some(cache_dir),
+                ..ScanOptions::default()
+            };
+            let metadata = fs::metadata(&full_path).unwrap();
+            let stale_entry = CacheEntry {
+                format_version: SCAN_CACHE_FORMAT_VERSION,
+                root_hash: cache_root_hash(&repo),
+                options_fingerprint: cache_fingerprint(&options, producer),
+                files: vec![CachedFileEntry {
+                    path: path.clone(),
+                    stamp: file_stamp(&metadata).unwrap(),
+                    outcome: CachedFileOutcome::Included {
+                        file_state: FileState::from_text(
+                            path.clone(),
+                            Language::Rust,
+                            source.as_bytes(),
+                            vec![Block::new(
+                                stale_content.to_string(),
+                                BlockKind::Function,
+                                LineSpan::new(0, 1),
+                                ByteSpan::new(0, stale_content.len()),
+                            )],
+                        ),
+                        diagnostics: Vec::new(),
+                    },
+                }],
+            };
+            let cache_file = cache_path(&repo, &options).unwrap();
+            fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+            fs::write(&cache_file, serde_json::to_string(&stale_entry).unwrap()).unwrap();
+
+            let result = scan_paths(&repo, &HashSet::from([path.clone()]), &options).unwrap();
+
+            assert_eq!(
+                result.cache.read,
+                ScanCacheReadStatus::Miss,
+                "{producer:?} must not be reused"
+            );
+            assert_eq!(result.files[0].blocks[0].content, source.trim_end());
+        }
     }
 
     #[cfg(windows)]
