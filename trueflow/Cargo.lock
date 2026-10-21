@@ -3682,16 +3682,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-asciidoc"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64a6292f9f1be51892c0fda2f09b0c648bd755018846a8516c788cfe5e54f745"
-dependencies = [
- "cc",
- "tree-sitter",
-]
-
-[[package]]
 name = "tree-sitter-bash"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4028,7 +4018,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
- "tree-sitter-asciidoc",
  "tree-sitter-bash",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
@@ -4064,7 +4053,6 @@ dependencies = [
  "url",
  "uuid",
  "vt100",
- "walkdir",
 ]
 
 [[package]]
