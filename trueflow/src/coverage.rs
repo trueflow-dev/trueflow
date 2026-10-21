@@ -145,7 +145,7 @@ impl<'a> CoverageIndex<'a> {
             recorded_block_spans_by_path: HashMap::new(),
         };
         let mut diagnostics = Vec::new();
-        let mut unresolved_block_records = Vec::new();
+        let mut deferred_block_records = Vec::new();
 
         for (record_index, record) in database.records().iter().enumerate() {
             let binding = match &record.target {
@@ -155,13 +155,15 @@ impl<'a> CoverageIndex<'a> {
                     })?;
                     continue;
                 }
-                ReviewTargetRef::Block { hash } => match lookups.bind_block_record(record, hash) {
-                    Err(RecordBindingFailure::Unresolved { .. }) if record.path_hint.is_some() => {
-                        unresolved_block_records.push((record_index, hash));
-                        continue;
+                ReviewTargetRef::Block { hash } => {
+                    match lookups.bind_block_record_first_pass(record, hash) {
+                        FirstPassBlockBinding::Bound(binding) => binding,
+                        FirstPassBlockBinding::Deferred => {
+                            deferred_block_records.push((record_index, hash));
+                            continue;
+                        }
                     }
-                    binding => binding,
-                },
+                }
                 ReviewTargetRef::File { hash } => lookups.bind_path_target_record(
                     record,
                     hash,
@@ -182,10 +184,13 @@ impl<'a> CoverageIndex<'a> {
         // forced child split, of short blocks too, and of children of
         // children) target units the default review-unit split never
         // produces. Register those units lazily, only under the blocks that
-        // contain such an otherwise unresolved record, then bind only those
-        // records again so every earlier binding stays as it was.
+        // contain such a deferred record, then bind only those records again
+        // so every earlier binding stays as it was. A located record is
+        // deferred whenever its exact lookup misses, before any path
+        // fallback, so an identical unit elsewhere in the file cannot capture
+        // the approval of a child that only exists once registered.
         let mut expanded_blocks = HashSet::new();
-        for (record_index, _) in &unresolved_block_records {
+        for (record_index, _) in &deferred_block_records {
             let record = &database.records()[*record_index];
             if let Some(path) = &record.path_hint {
                 lookups.register_child_navigation_units(
@@ -195,7 +200,7 @@ impl<'a> CoverageIndex<'a> {
                 );
             }
         }
-        for (record_index, hash) in unresolved_block_records {
+        for (record_index, hash) in deferred_block_records {
             let binding = lookups.bind_block_record(&database.records()[record_index], hash);
             coverage.apply_binding(&lookups, record_index, binding, &mut diagnostics);
         }
@@ -704,6 +709,12 @@ enum RecordBindingFailure {
     },
 }
 
+enum FirstPassBlockBinding {
+    Bound(Result<RecordBinding, RecordBindingFailure>),
+    /// Bound once child-navigation units are registered.
+    Deferred,
+}
+
 #[derive(Debug, Default)]
 struct CoverageFacts {
     linked_record_indices: Vec<usize>,
@@ -900,28 +911,37 @@ impl<'a> CoverageLookups<'a> {
         push_lookup(&mut self.block_by_hash, block.hash.clone(), unit_id);
     }
 
+    /// Binds a block record before child-navigation units exist. A record
+    /// with a path and line binds only exactly here; on a miss it waits for
+    /// those units (it may target a child expanded in the TUI) rather than
+    /// fall back to an identical unit elsewhere in the file. Other records
+    /// bind fully, and only a path-hinted record that resolves nowhere waits.
+    fn bind_block_record_first_pass(
+        &self,
+        record: &Record,
+        hash: &crate::store::TreeHash,
+    ) -> FirstPassBlockBinding {
+        match self.bind_exact_block_record(record, hash) {
+            Some(binding) => FirstPassBlockBinding::Bound(binding),
+            None if record.line_hint.is_some() && record.path_hint.is_some() => {
+                FirstPassBlockBinding::Deferred
+            }
+            None => match self.bind_block_record(record, hash) {
+                Err(RecordBindingFailure::Unresolved { .. }) if record.path_hint.is_some() => {
+                    FirstPassBlockBinding::Deferred
+                }
+                binding => FirstPassBlockBinding::Bound(binding),
+            },
+        }
+    }
+
     fn bind_block_record(
         &self,
         record: &Record,
         hash: &crate::store::TreeHash,
     ) -> Result<RecordBinding, RecordBindingFailure> {
-        if let (Some(path_hint), Some(line_hint)) = (&record.path_hint, record.line_hint) {
-            let candidates = unique_unit_candidates(
-                self.block_exact
-                    .get(&(path_hint.clone(), hash.clone(), line_hint))
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-            match candidates.as_slice() {
-                [unit_id] => {
-                    return Ok(RecordBinding {
-                        unit_id: unit_id.clone(),
-                        relation: BindingRelation::Exact,
-                    });
-                }
-                [] => {}
-                _ => return Err(self.ambiguous_failure(record, candidates)),
-            }
+        if let Some(binding) = self.bind_exact_block_record(record, hash) {
+            return binding;
         }
 
         if let Some(path_hint) = &record.path_hint {
@@ -958,6 +978,32 @@ impl<'a> CoverageLookups<'a> {
                 record_id: record.id.clone(),
             }),
             _ => Err(self.ambiguous_failure(record, candidates)),
+        }
+    }
+
+    /// The binding of a record with a path and line to the units starting on
+    /// that line with its hash, or `None` when no such unit exists.
+    fn bind_exact_block_record(
+        &self,
+        record: &Record,
+        hash: &crate::store::TreeHash,
+    ) -> Option<Result<RecordBinding, RecordBindingFailure>> {
+        let (Some(path_hint), Some(line_hint)) = (&record.path_hint, record.line_hint) else {
+            return None;
+        };
+        let candidates = unique_unit_candidates(
+            self.block_exact
+                .get(&(path_hint.clone(), hash.clone(), line_hint))
+                .cloned()
+                .unwrap_or_default(),
+        );
+        match candidates.as_slice() {
+            [] => None,
+            [unit_id] => Some(Ok(RecordBinding {
+                unit_id: unit_id.clone(),
+                relation: BindingRelation::Exact,
+            })),
+            _ => Some(Err(self.ambiguous_failure(record, candidates))),
         }
     }
 
@@ -1308,6 +1354,92 @@ mod tests {
         }
         assert!(coverage.has_block_records_within(&path, method));
         assert!(!coverage.has_block_records_within(&path, &grandchildren[0]));
+    }
+
+    fn sequential_function_tree(sources: &[&str]) -> (Tree, Vec<Block>) {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let src = builder.add_dir(root, "src".to_string(), "src".to_string());
+        let file = builder.add_file(
+            src,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let mut start_line = 0;
+        let mut start_byte = 0;
+        let mut blocks = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let end_line = start_line + source.lines().count();
+            let block = test_block_at(
+                (*source).to_string(),
+                BlockKind::Function,
+                start_line,
+                end_line,
+                start_byte,
+            );
+            start_line = end_line;
+            start_byte = block.end_byte;
+            builder.add_block(
+                file,
+                format!("function-{index}"),
+                "src/lib.rs".to_string(),
+                block.clone(),
+                Language::Rust,
+            );
+            blocks.push(block);
+        }
+        (builder.finalize(), blocks)
+    }
+
+    #[test]
+    fn approvals_of_tui_expanded_children_bind_despite_identical_unit_elsewhere() {
+        let steps = (1..=30)
+            .map(|step| format!("    step_{step:02}();\n"))
+            .collect::<String>();
+        let long = format!("fn long() -> Result<()> {{\n{steps}\n    Ok(())\n}}\n");
+        let short = "fn short() -> Result<()> {\n    let a = 1;\n    let b = 2;\n\n    Ok(())\n}\n";
+        let (tree, blocks) = sequential_function_tree(&[&long, short]);
+        let [long_block, short_block] = &blocks[..] else {
+            panic!("expected two functions");
+        };
+        let long_units = sub_splitter::split_result(long_block, Language::Rust)
+            .unwrap()
+            .blocks;
+        let children = sub_splitter::child_navigation_split(short_block, Language::Rust)
+            .unwrap()
+            .blocks;
+        let last_child = children
+            .last()
+            .unwrap_or_else(|| panic!("expected children of the short function"));
+        let shared_unit = long_units
+            .iter()
+            .find(|unit| unit.hash == last_child.hash)
+            .unwrap_or_else(|| {
+                panic!("expected a long-function unit equal to {last_child:?}: {long_units:?}")
+            });
+        let database = ReviewDatabase::from_records(approved_child_records(&children));
+        let coverage = CoverageIndex::build(&tree, &database).unwrap();
+        let path = RepoPath::new("src/lib.rs").unwrap();
+
+        assert_eq!(coverage.diagnostics(), &[]);
+        for child in &children {
+            assert_eq!(
+                coverage
+                    .block(&path, child)
+                    .direct_latest_verdict_for(&ReviewCheck::review()),
+                Some(&Verdict::Approved),
+                "child {child:?}"
+            );
+        }
+        assert_eq!(
+            coverage
+                .block(&path, shared_unit)
+                .direct_latest_verdict_for(&ReviewCheck::review()),
+            None,
+            "the long function's never-viewed unit must stay unapproved"
+        );
     }
 
     #[test]
