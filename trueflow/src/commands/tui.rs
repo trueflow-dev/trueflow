@@ -13808,6 +13808,15 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn tui_keyboard_enhancement_flags_report_shifted_characters() {
+        // Without alternate keys, Kitty-protocol terminals report Shift+c as
+        // `Char('c')` + SHIFT, so `C` would trigger the lowercase `c` binding
+        // and the note editor could not type capitals.
+        let flags = tui_keyboard_enhancement_flags();
+        assert!(flags.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+    }
+
+    #[test]
     fn enter_tui_mode_requests_keyboard_enhancement_flags() {
         let mut output = Vec::new();
         enter_tui_mode(
@@ -13819,7 +13828,7 @@ mod diff_scope_tests {
         let rendered =
             String::from_utf8(output).unwrap_or_else(|err| panic!("invalid ansi bytes: {err}"));
         assert!(
-            rendered.contains("\u{1b}[>11u"),
+            rendered.contains("\u{1b}[>15u"),
             "expected keyboard enhancement push sequence in output: {rendered:?}"
         );
     }

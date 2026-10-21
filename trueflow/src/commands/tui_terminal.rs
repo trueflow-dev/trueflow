@@ -102,10 +102,14 @@ impl TerminalCapabilities {
     }
 }
 
+/// Kitty-protocol flags pushed on entry. `REPORT_ALTERNATE_KEYS` makes the
+/// terminal send the shifted character (`C`, `!`) with SHIFT cleared; without
+/// it, Shift+c arrives as `Char('c')` + SHIFT and matches lowercase bindings.
 pub(crate) fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
 pub(crate) fn enter_tui_mode<W: io::Write>(
@@ -524,7 +528,7 @@ mod tests {
         let rendered =
             String::from_utf8(output).unwrap_or_else(|error| panic!("invalid ansi bytes: {error}"));
         assert!(rendered.contains("\u{1b}[?2004h"));
-        assert!(!rendered.contains("\u{1b}[>11u"));
+        assert!(!rendered.contains("\u{1b}[>15u"));
     }
 
     #[test]
