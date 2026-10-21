@@ -57,6 +57,7 @@ fn classify_node(node: Node<'_>, content: &str, in_container: bool) -> Option<Bl
         "test_declaration" => Some(BlockKind::Function),
         "using_namespace_declaration" => Some(BlockKind::Import),
         "container_field" => Some(BlockKind::Variable),
+        "comment" => Some(BlockKind::Comment),
         _ => None,
     }
 }

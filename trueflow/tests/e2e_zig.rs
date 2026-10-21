@@ -235,3 +235,26 @@ fn test_zig_function_like_sub_splits_cover_methods_and_tests() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_zig_top_level_comments_are_comment_blocks() {
+    let source = "// Copyright notice for this module.\nconst std = @import(\"std\");\n\n/// Adds two numbers.\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n";
+
+    let blocks = block_splitter::split(source, Language::Zig).blocks;
+
+    for comment in ["// Copyright notice", "/// Adds two numbers."] {
+        assert!(
+            blocks.iter().any(|block| {
+                block.kind == BlockKind::Comment && block.content.contains(comment)
+            }),
+            "missing Comment block for {comment:?}: {blocks:#?}"
+        );
+    }
+    assert!(
+        !blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::Code
+                && block.content.trim_start().starts_with("//")),
+        "blocks={blocks:#?}"
+    );
+}
