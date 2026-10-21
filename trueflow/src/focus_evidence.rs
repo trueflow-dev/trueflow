@@ -556,18 +556,21 @@ fn term_matches(line: &str, term: &str) -> bool {
         return line.contains(term);
     }
     let bytes = line.as_bytes();
-    // ASCII lowercasing preserves byte offsets, so indices stay valid in `bytes`.
-    let haystack = line.to_ascii_lowercase();
-    let needle = term.to_ascii_lowercase();
-    haystack.match_indices(&needle).any(|(start, _)| {
-        let starts_segment = start == 0
-            || !bytes[start - 1].is_ascii_alphanumeric()
-            || bytes[start].is_ascii_uppercase();
-        let rest = &bytes[start + needle.len()..];
-        let rest = rest.strip_prefix(b"s").unwrap_or(rest);
-        let ends_segment = rest.first().is_none_or(|byte| !byte.is_ascii_lowercase());
-        starts_segment && ends_segment
-    })
+    let needle = term.as_bytes();
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(start, window)| {
+            if !window.eq_ignore_ascii_case(needle) {
+                return false;
+            }
+            let starts_segment = start == 0
+                || !bytes[start - 1].is_ascii_alphanumeric()
+                || bytes[start].is_ascii_uppercase();
+            let rest = &bytes[start + needle.len()..];
+            let rest = rest.strip_prefix(b"s").unwrap_or(rest);
+            starts_segment && rest.first().is_none_or(|byte| !byte.is_ascii_lowercase())
+        })
 }
 
 fn excerpt(sample: &str) -> String {
