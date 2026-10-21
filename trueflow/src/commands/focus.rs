@@ -137,6 +137,8 @@ pub fn run(context: &TrueflowContext, args: &FocusArgs) -> Result<()> {
     let (specification, collected, inventory) = match loaded {
         Some(plan) => (plan, collected, inventory),
         None => {
+            // An empty scope or budget is the answer; don't ask for an LLM first.
+            crate::focus::eligible_candidates(&inventory, duration)?;
             let mut ai = config.ai.clone();
             ai.mode = AiMode::ReviewPlan;
             let availability = resolve_ai_availability(&ai, &AiEnvironment::detect_current());

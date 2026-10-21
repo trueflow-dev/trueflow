@@ -399,8 +399,10 @@
      occurrence only; the other occurrence reappears next launch.
    - [ ] Focus plans citing Git patch evidence become unopenable once eight
      newer commits push the cited commit out of the history window.
-   - [ ] Focus generation checks for an LLM before reporting an empty scope;
-     `onboard --candidates --path <typo>` silently returns zero candidates.
+   - [X] Focus generation checked for an LLM before reporting an empty scope;
+     `onboard --candidates --path <typo>` silently returned zero candidates.
+     `--test e2e_focus focus_reports_an_empty --test e2e_onboarding
+     candidate_query_rejects`
    - [ ] A diff where a file becomes a same-named directory cannot be reviewed
      in one tree (it errors with a narrowing hint).
    - [ ] The scripted TUI harness duplicates `run_app` key dispatch and has
@@ -409,10 +411,10 @@
      structural children drop leading comments and closing delimiters.
    - [ ] Emacs: approving a sub-block in the split view redraws the status view
      into `*trueflow-focus*`.
-  - [X] `inspect --path` rejected the current-directory-relative paths that
-    `mark --path` accepts from a subdirectory (scan paths were already
-    repo-relative); both now share one resolver.
-    `--test e2e_inspect inspect_path_from_subdirectory`
+   - [X] `inspect --path` rejected the current-directory-relative paths that
+     `mark --path` accepts from a subdirectory (scan paths were already
+     repo-relative); both now share one resolver.
+     `--test e2e_inspect inspect_path_from_subdirectory`
    - [ ] The default scan cache lives in `~/.trueflow/cache`, the same folder
      name as project stores.
    - [ ] Root-view cursor scrolling still counts one row per line, short

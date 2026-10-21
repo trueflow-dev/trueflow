@@ -9,7 +9,7 @@ use crate::block::BlockKind;
 use crate::commands::review::CollectedReview;
 use crate::coverage::CoverageIndex;
 use crate::hashing::BytesHash;
-use crate::onboarding::ReviewLocation;
+use crate::onboarding::{ReviewLocation, ensure_path_matches_source};
 use crate::repo_path::RepoPath;
 use crate::store::{FileStore, ReviewCheck, ReviewDatabase, ReviewStore};
 use crate::vcs::{self, DiffLineKind, FileDiff};
@@ -239,14 +239,7 @@ fn capture_with(
     repo: Option<&gix::Repository>,
 ) -> Result<FocusInventory> {
     if let FocusScope::Under(path) = scope {
-        ensure!(
-            review
-                .tree
-                .nodes()
-                .iter()
-                .any(|node| node.path.is_under(path)),
-            "--path {path} matches no scanned source files; check the path and scan/review filters"
-        );
+        ensure_path_matches_source(review, path)?;
     }
     let mut nodes: Vec<_> = review
         .unreviewed_block_nodes

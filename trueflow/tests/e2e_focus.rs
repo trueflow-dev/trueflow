@@ -238,3 +238,40 @@ fn focus_reports_a_path_that_matches_nothing_instead_of_a_budget() -> Result<()>
     }
     Ok(())
 }
+
+#[test]
+fn focus_reports_an_empty_scope_before_checking_for_an_llm() -> Result<()> {
+    let repo = repository("focus_empty_scope_without_llm")?;
+    // The configured provider's CLI is absent from PATH, so no LLM is available.
+    repo.write(
+        "trueflow.toml",
+        "[scan]\nuse_cache = false\nwrite_cache = false\n[ai]\nprovider = \"codex_cli\"\nmodel = \"fixture-model\"\n",
+    )?;
+    // Onboarding candidates carry the review fingerprint focus candidates omit.
+    let onboarding = parse_json(&repo.run(&["onboard", "--candidates"])?)?;
+    for candidate in onboarding["candidates"].as_array().context("candidates")? {
+        repo.run(&[
+            "mark",
+            "--fingerprint",
+            candidate["fingerprint"].as_str().context("fingerprint")?,
+            "--path",
+            candidate["target"]["path"].as_str().context("path")?,
+            "--verdict",
+            "approved",
+            "--quiet",
+        ])?;
+    }
+    assert_eq!(inventory(&repo)?["total_candidates"], json!(0));
+
+    let home = repo.path.to_str().context("home path")?;
+    let error = repo
+        .run_with_env(
+            &["focus", "--duration", "5m", "--path", "src", "--json"],
+            &[("HOME", home), ("PATH", "/usr/bin:/bin")],
+        )
+        .expect_err("an empty scope cannot produce a focus plan")
+        .to_string();
+    assert!(error.contains("no unreviewed"), "{error}");
+    assert!(!error.contains("LLM"), "{error}");
+    Ok(())
+}

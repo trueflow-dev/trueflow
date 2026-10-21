@@ -139,6 +139,14 @@ fn candidate_pagination_and_subdirectory_queries_are_repository_scoped() -> Resu
     Ok(())
 }
 
+#[test]
+fn candidate_query_rejects_a_path_that_matches_no_file() -> Result<()> {
+    let repo = repository("onboarding_missing_scope")?;
+    let error = repo.run_err(&["onboard", "--candidates", "--path", "srcc"])?;
+    assert!(error.contains("--path srcc"), "{error}");
+    Ok(())
+}
+
 /// Runs `onboard` against a fake Codex CLI that writes `plan` as its final message.
 #[cfg(unix)]
 fn generate_with_fake_codex(

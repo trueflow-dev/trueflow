@@ -308,6 +308,20 @@ pub struct CandidatePage {
     candidates: Vec<ReviewCandidate>,
 }
 
+/// A user-selected `--path` must name scanned source; a typo is an error, not an
+/// empty result.
+pub(crate) fn ensure_path_matches_source(review: &CollectedReview, path: &RepoPath) -> Result<()> {
+    ensure!(
+        review
+            .tree
+            .nodes()
+            .iter()
+            .any(|node| node.path.is_under(path)),
+        "--path {path} matches no scanned source files; check the path and scan/review filters"
+    );
+    Ok(())
+}
+
 /// Stable path/source ordering makes pages reproducible while the repository is unchanged.
 pub fn candidate_page(
     review: &CollectedReview,
@@ -319,6 +333,9 @@ pub fn candidate_page(
         (1..=MAX_CARDS).contains(&limit),
         "candidate limit must be 1..={MAX_CARDS}"
     );
+    if let Some(path) = path {
+        ensure_path_matches_source(review, path)?;
+    }
     let mut nodes: Vec<_> = review
         .unreviewed_block_nodes
         .iter()

@@ -272,7 +272,8 @@ Pages use stable path/source order, not importance order; the LLM can query
 different paths and read full source before selecting. Queries always cover the
 repository root, even when invoked from a subdirectory, and honor scan/review
 filters and existing approval coverage. Pagination reflects current worktree and
-review state; final target resolution is authoritative.
+review state; final target resolution is authoritative. A `--path` that matches
+no scanned source file is an error naming the path, not an empty page.
 
 ### Focus a short review on consequential code
 
@@ -293,7 +294,8 @@ rejected code; valid approvals remain excluded. Scan/review filters still apply.
 Durations accept explicit `m` or `s` units, from one second through 60 minutes.
 Non-interactive generation requires `--duration`. A `--path` that matches no
 scanned source file is an error, and a scope without unreviewed blocks is
-reported as such rather than as a reading-budget problem.
+reported as such (before any LLM availability check) rather than as a
+reading-budget problem.
 
 Trueflow supplies source-pinned evidence: existing complexity metadata, lexical
 entry-point/trust-boundary/write/error/concurrency signals, effective review

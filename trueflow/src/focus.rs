@@ -288,18 +288,17 @@ fn validate_evidence(step: &FocusStep, candidate: &FocusCandidate) -> Result<()>
     Ok(())
 }
 
-/// Bounded multi-pass selection covers every eligible candidate before reducing shortlists.
-/// No heuristic chooses the final queue, and no canonical prefix silently limits discovery.
-pub fn generate(
+/// Candidates that fit the requested reading budget. Fails for an empty scope or
+/// budget before any LLM is needed.
+pub fn eligible_candidates(
     inventory: &FocusInventory,
     duration: ReviewDuration,
-    mut ask: impl FnMut(&str) -> Result<String>,
-) -> Result<FocusSpecification> {
+) -> Result<Vec<&FocusCandidate>> {
     ensure!(
         !inventory.candidates.is_empty(),
         "no unreviewed complete blocks remain in this focus scope; approved and filtered blocks are excluded"
     );
-    let mut candidates: Vec<_> = inventory
+    let candidates: Vec<_> = inventory
         .candidates
         .iter()
         .filter(|candidate| candidate.estimated_seconds <= duration.seconds())
@@ -308,6 +307,17 @@ pub fn generate(
         !candidates.is_empty(),
         "no unreviewed complete blocks fit the requested reading budget; choose a longer duration or another scope"
     );
+    Ok(candidates)
+}
+
+/// Bounded multi-pass selection covers every eligible candidate before reducing shortlists.
+/// No heuristic chooses the final queue, and no canonical prefix silently limits discovery.
+pub fn generate(
+    inventory: &FocusInventory,
+    duration: ReviewDuration,
+    mut ask: impl FnMut(&str) -> Result<String>,
+) -> Result<FocusSpecification> {
+    let mut candidates = eligible_candidates(inventory, duration)?;
     let mut calls = 0;
     loop {
         let batches = prompt_batches(
