@@ -904,7 +904,10 @@ impl ShapeBuilder<'_> {
 
     fn flush_docs(&mut self) {
         for (prefix_start, line) in std::mem::take(&mut self.pending_docs) {
-            self.push_part(prefix_start..line.start, SourceComponentRole::AggregateShape);
+            self.push_part(
+                prefix_start..line.start,
+                SourceComponentRole::AggregateShape,
+            );
             self.previous_end = line.end;
             self.push_part(line, SourceComponentRole::Documentation);
         }
@@ -940,7 +943,10 @@ impl ShapeBuilder<'_> {
         };
         match shape {
             MemberShape::Shape if member.kind() == "access_specifier" => {
-                self.push_part(prefix_start..member_end, SourceComponentRole::AggregateShape);
+                self.push_part(
+                    prefix_start..member_end,
+                    SourceComponentRole::AggregateShape,
+                );
                 self.last_shape_member_end = Some(member_end);
             }
             MemberShape::Shape => {

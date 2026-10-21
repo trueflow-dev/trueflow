@@ -521,7 +521,8 @@ fn projected_item_ranges(item: Node<'_>, kind: DeclarationKind, source: &str) ->
         && let Some(body) = item.child_by_field_name("body")
         && let Some(header_end) = opening_delimiter_end(body, source)
     {
-        let mut ranges = vec![item.start_byte()..header_end];
+        let mut ranges = Vec::new();
+        ranges.push(item.start_byte()..header_end);
         if kind == DeclarationKind::Module {
             let mut cursor = body.walk();
             ranges.extend(

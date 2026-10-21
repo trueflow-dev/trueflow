@@ -170,7 +170,9 @@ fn leading_comment_range(source: &str, declaration_start: usize) -> Option<Range
     let mut block_start = end;
     let mut line_end = end;
     loop {
-        let line_start = prefix[..line_end].rfind('\n').map_or(0, |newline| newline + 1);
+        let line_start = prefix[..line_end]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
         let trimmed = prefix[line_start..line_end].trim_start();
         if !trimmed.starts_with('#') || trimmed.starts_with("#!") {
             break;

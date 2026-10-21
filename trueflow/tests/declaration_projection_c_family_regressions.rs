@@ -592,7 +592,10 @@ fn c_preprocessor_alternative_branches_are_inventoried() -> Result<()> {
         facts
             .declarations()
             .iter()
-            .map(|declaration| (declaration.name.as_str(), declaration.projection_text.as_str()))
+            .map(|declaration| (
+                declaration.name.as_str(),
+                declaration.projection_text.as_str()
+            ))
             .collect::<Vec<_>>(),
         [
             ("a", "int a(void);"),

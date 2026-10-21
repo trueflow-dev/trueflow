@@ -7,9 +7,7 @@ use crate::repo_path::RepoPath;
 use crate::store::{Record, Verdict};
 
 use super::coverage::DeclarationCoverageIndex;
-use super::diff::{
-    DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic,
-};
+use super::diff::{DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic};
 use super::snapshot::{SnapshotPair, SnapshotPairId, SourceSnapshot};
 use super::{
     Capability, DeclarationFileCapability, DeclarationId, DeclarationKind, DeclarationNode,
