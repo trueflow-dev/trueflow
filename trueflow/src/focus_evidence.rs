@@ -508,7 +508,11 @@ pub(crate) fn signal(kind: EvidenceKind, line: &str) -> bool {
         EvidenceKind::TrustBoundary => &[
             "request",
             "authorize",
-            "authenticat",
+            "authorized",
+            "authorization",
+            "authenticate",
+            "authenticated",
+            "authentication",
             "permission",
             "deserialize",
             "parse(",
@@ -540,7 +544,30 @@ pub(crate) fn signal(kind: EvidenceKind, line: &str) -> bool {
         ],
         _ => &[],
     };
-    terms.iter().any(|term| line.contains(term))
+    terms.iter().any(|term| term_matches(line, term))
+}
+
+/// Alphabetic terms are identifier words: they match a whole snake_case or
+/// camelCase segment, case-insensitively, optionally plural, so `request` finds
+/// `HttpRequest` and `request_id` but not `requested`. Other terms carry their
+/// own delimiters and match literally.
+fn term_matches(line: &str, term: &str) -> bool {
+    if !term.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return line.contains(term);
+    }
+    let bytes = line.as_bytes();
+    // ASCII lowercasing preserves byte offsets, so indices stay valid in `bytes`.
+    let haystack = line.to_ascii_lowercase();
+    let needle = term.to_ascii_lowercase();
+    haystack.match_indices(&needle).any(|(start, _)| {
+        let starts_segment = start == 0
+            || !bytes[start - 1].is_ascii_alphanumeric()
+            || bytes[start].is_ascii_uppercase();
+        let rest = &bytes[start + needle.len()..];
+        let rest = rest.strip_prefix(b"s").unwrap_or(rest);
+        let ends_segment = rest.first().is_none_or(|byte| !byte.is_ascii_lowercase());
+        starts_segment && ends_segment
+    })
 }
 
 fn excerpt(sample: &str) -> String {
@@ -1001,6 +1028,36 @@ mod tests {
         repo: Option<&gix::Repository>,
     ) -> FocusInventory {
         capture_with(review, &FocusScope::Repository, database, repo).unwrap()
+    }
+
+    #[test]
+    fn lexical_signal_words_match_whole_identifier_segments() {
+        for line in [
+            "handle(request)",
+            "let request_id = next();",
+            "let input: HttpRequest = read();",
+            "for request in requests {",
+        ] {
+            assert!(signal(EvidenceKind::TrustBoundary, line), "{line}");
+        }
+        for line in [
+            "(Some(plan), requested, _) => {",
+            "let tokenizer = Tokenizer::new();",
+            "// Command::new(\"git\")",
+        ] {
+            assert!(!signal(EvidenceKind::TrustBoundary, line), "{line}");
+        }
+        assert!(signal(
+            EvidenceKind::Concurrency,
+            "let guard: MutexGuard<'_, T>;"
+        ));
+        assert!(signal(EvidenceKind::Concurrency, "thread::spawn(worker);"));
+        assert!(!signal(EvidenceKind::Concurrency, "let threaded = false;"));
+        assert!(!signal(EvidenceKind::Concurrency, "update atomically"));
+        assert!(signal(
+            EvidenceKind::TrustBoundary,
+            "let out = Command::new(\"git\");"
+        ));
     }
 
     #[test]
