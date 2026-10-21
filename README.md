@@ -654,6 +654,10 @@ Malformed or unsupported history records stop review loading with the offending
 line number. Trueflow does not silently discard records or repair truncated
 history: restore or correct the log before relying on its review coverage.
 
+A block's latest verdict decides its coverage, except that a newer approval
+covering it (of its file, directory, or enclosing block, or of every child
+expanded with `C`) wins over its older comment or rejection. A comment or
+rejection made after such an approval still keeps the block pending.
 ### GitHub pull requests
 
 Pull request review is fetch-only. `trueflow tui --target pr:11` resolves the
