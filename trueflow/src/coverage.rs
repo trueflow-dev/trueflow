@@ -131,13 +131,13 @@ pub struct CoverageIndex<'a> {
 
 impl<'a> CoverageIndex<'a> {
     pub fn build(tree: &'a Tree, database: &'a ReviewDatabase) -> anyhow::Result<Self> {
-        let lookups = CoverageLookups::from_tree(tree);
+        let mut lookups = CoverageLookups::from_tree(tree);
         let mut coverage = Self {
             tree,
             database,
             diagnostics: Vec::new(),
             unit_facts: HashMap::new(),
-            block_units: lookups.block_units.clone(),
+            block_units: std::mem::take(&mut lookups.block_units),
             block_nodes_by_path: HashMap::new(),
             record_bindings: HashMap::new(),
         };
