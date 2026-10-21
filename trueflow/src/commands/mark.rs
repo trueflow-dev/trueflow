@@ -182,21 +182,88 @@ fn normalize_path_hint_from_workdir(path: Option<RepoPath>) -> Option<RepoPath> 
 }
 
 pub fn run(context: &TrueflowContext, params: MarkParams) -> Result<()> {
-    run_with_signing_mode(context, params, SigningMode::Interactive)
+    run_batch(context, vec![params])
 }
 
-pub(crate) fn run_with_noninteractive_signing(
+/// Records every mark in `batch`, all or none: each record is built and
+/// signed before any is appended.
+pub(crate) fn run_batch(context: &TrueflowContext, batch: Vec<MarkParams>) -> Result<()> {
+    run_batch_with_signing_mode(context, batch, SigningMode::Interactive)
+}
+
+pub(crate) fn run_batch_with_noninteractive_signing(
     context: &TrueflowContext,
-    params: MarkParams,
+    batch: Vec<MarkParams>,
 ) -> Result<()> {
-    run_with_signing_mode(context, params, SigningMode::NonInteractive)
+    run_batch_with_signing_mode(context, batch, SigningMode::NonInteractive)
 }
 
-fn run_with_signing_mode(
+fn run_batch_with_signing_mode(
     _context: &TrueflowContext,
-    params: MarkParams,
+    batch: Vec<MarkParams>,
     signing_mode: SigningMode,
 ) -> Result<()> {
+    for params in &batch {
+        validate_mark_params(params)?;
+    }
+    let store = FileStore::new()?;
+
+    let runtime_config = runtime_config_from_git_config(vcs::git_config_from_workdir().ok());
+    let email = runtime_config.email;
+    let identity = Identity::Email {
+        email: email.clone(),
+    };
+    let repo_snapshot = vcs::snapshot_from_workdir();
+    let repo_ref = match repo_snapshot.repo_ref_revision.clone() {
+        Some(revision) => RepoRef::Vcs {
+            system: VcsSystem::Git,
+            revision,
+        },
+        None => RepoRef::Unknown,
+    };
+    let mut records = batch
+        .into_iter()
+        .map(|params| build_mark_record(params, &identity, &repo_ref, &repo_snapshot))
+        .collect::<Result<Vec<_>>>()?;
+
+    let signed_msg = match runtime_config.terminal_suspend_requirement {
+        TerminalSuspendRequirement::Required => {
+            let signing_key = runtime_config.signing_key.as_deref();
+            let gpg = GpgClient::new();
+            let public_key = with_noninteractive_signing_context(
+                gpg.export_public_key(signing_key),
+                signing_mode,
+            )?;
+            for record in &mut records {
+                let payload = record.signing_payload()?;
+                let signature = with_noninteractive_signing_context(
+                    gpg.sign_detached(&payload, signing_key, signing_mode),
+                    signing_mode,
+                )?;
+                record.attestations = Some(vec![Attestation {
+                    kind: AttestationKind::Pgp,
+                    canonicalization: Canonicalization::JcsV1,
+                    signature,
+                    public_key: public_key.clone(),
+                }]);
+            }
+            " (Signed)"
+        }
+        TerminalSuspendRequirement::NotRequired => "",
+    };
+
+    for record in &records {
+        store.append(record)?;
+        info!(
+            "Recorded verdict '{}' for {} by {email}{signed_msg}",
+            record.verdict,
+            record.target.lookup_key()
+        );
+    }
+    Ok(())
+}
+
+fn validate_mark_params(params: &MarkParams) -> Result<()> {
     if params.verdict == Verdict::Comment
         && params
             .note
@@ -211,9 +278,17 @@ fn run_with_signing_mode(
     {
         anyhow::bail!("comment scope end must be greater than start");
     }
+    Ok(())
+}
 
+fn build_mark_record(
+    params: MarkParams,
+    identity: &Identity,
+    repo_ref: &RepoRef,
+    repo_snapshot: &vcs::RepoSnapshot,
+) -> Result<Record> {
     info!(
-        "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?}, comment_scope={:?}, comment_context_present={}, comment_anchor_present={}, signing_mode={:?})",
+        "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?}, comment_scope={:?}, comment_context_present={}, comment_anchor_present={})",
         &params.fingerprint,
         &params.verdict,
         &params.check,
@@ -223,32 +298,7 @@ fn run_with_signing_mode(
         params.comment_scope,
         params.comment_context.is_some(),
         params.comment_anchor.is_some(),
-        signing_mode,
     );
-    let store = FileStore::new()?;
-
-    let runtime_config = runtime_config_from_git_config(vcs::git_config_from_workdir().ok());
-    let should_sign = matches!(
-        runtime_config.terminal_suspend_requirement,
-        TerminalSuspendRequirement::Required
-    );
-    let email = runtime_config.email;
-    let signing_key = runtime_config.signing_key;
-    let gpg = GpgClient::new();
-
-    let identity = Identity::Email {
-        email: email.clone(),
-    };
-
-    let repo_snapshot = vcs::snapshot_from_workdir();
-    let repo_ref = match repo_snapshot.repo_ref_revision.clone() {
-        Some(revision) => RepoRef::Vcs {
-            system: VcsSystem::Git,
-            revision,
-        },
-        None => RepoRef::Unknown,
-    };
-
     let MarkParams {
         fingerprint,
         target_kind,
@@ -266,7 +316,7 @@ fn run_with_signing_mode(
     let target_kind = infer_target_kind(target_kind, &fingerprint, path_hint.as_ref(), line)?;
     let target = target_kind.parse_target(&fingerprint)?;
     let block_state: BlockState = vcs::block_state_for_path(
-        &repo_snapshot,
+        repo_snapshot,
         path_hint.as_ref().map(RepoPath::as_str),
         target.lookup_key(),
     )
@@ -274,10 +324,10 @@ fn run_with_signing_mode(
 
     let mut record = Record::new(
         target,
-        check.clone(),
-        verdict.clone(),
-        identity,
-        repo_ref,
+        check,
+        verdict,
+        identity.clone(),
+        repo_ref.clone(),
         block_state,
     );
     record.path_hint = path_hint;
@@ -286,36 +336,7 @@ fn run_with_signing_mode(
     record.comment_scope = comment_scope;
     record.comment_context = comment_context;
     record.comment_anchor = comment_anchor;
-
-    if should_sign {
-        let payload = record.signing_payload()?;
-        let signature = with_noninteractive_signing_context(
-            gpg.sign_detached(&payload, signing_key.as_deref(), signing_mode),
-            signing_mode,
-        )?;
-        let public_key = with_noninteractive_signing_context(
-            gpg.export_public_key(signing_key.as_deref()),
-            signing_mode,
-        )?;
-        record.attestations = Some(vec![Attestation {
-            kind: AttestationKind::Pgp,
-            canonicalization: Canonicalization::JcsV1,
-            signature,
-            public_key,
-        }]);
-    }
-
-    store.append(&record)?;
-    info!(
-        "mark recorded (fingerprint={}, check={}, verdict={})",
-        fingerprint,
-        check.as_str(),
-        verdict.as_str()
-    );
-
-    let signed_msg = if should_sign { " (Signed)" } else { "" };
-    info!("Recorded verdict '{verdict}' for {fingerprint} by {email}{signed_msg}");
-    Ok(())
+    Ok(record)
 }
 
 fn infer_target_kind(

@@ -478,9 +478,10 @@ where
                     let Some(runner) = runner.as_mut() else {
                         bail!("submit is not supported in the scripted test harness")
                     };
-                    execute_action_with(state, action, |params| {
-                        let scripted_action = ScriptedMarkAction::from(params);
-                        runner.run_mark(&scripted_action)
+                    execute_action_with(state, action, |batch| {
+                        batch.into_iter().try_for_each(|params| {
+                            runner.run_mark(&ScriptedMarkAction::from(params))
+                        })
                     })
                 });
                 record_action_result(&mut self.state, result);

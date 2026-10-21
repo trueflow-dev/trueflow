@@ -5573,11 +5573,11 @@ fn execute_action(
     state: &mut AppState,
     action: PendingAction,
 ) -> Result<()> {
-    execute_action_with(state, action, |params| {
-        let noninteractive_params = params.clone();
+    execute_action_with(state, action, |batch| {
+        let noninteractive_batch = batch.clone();
         execute_mark_for_tui(
-            move || mark::run_with_noninteractive_signing(context, noninteractive_params),
-            || session.suspend(|| mark::run(context, params)),
+            move || mark::run_batch_with_noninteractive_signing(context, noninteractive_batch),
+            || session.suspend(|| mark::run_batch(context, batch)),
         )
     })
 }
@@ -5598,7 +5598,7 @@ where
 
 fn execute_action_with<F>(state: &mut AppState, action: PendingAction, run_mark: F) -> Result<()>
 where
-    F: FnOnce(mark::MarkParams) -> Result<()>,
+    F: FnOnce(Vec<mark::MarkParams>) -> Result<()>,
 {
     let (node_id, verdict, note) = match action {
         PendingAction::Single {
@@ -5618,28 +5618,67 @@ where
     } else {
         compute_next_review_target(state, node_id)
     };
-    let params = mark_params_for_action(state, node_id, verdict.clone(), note)?;
+    let batch = mark_params_for_action(state, node_id, verdict.clone(), note)?;
     cancel_ai_suggestion(state);
-    run_mark(params)?;
+    run_mark(batch)?;
 
     let impact = apply_action_locally(state, node_id, &verdict, next_id);
     state.session_recap.record_action(&verdict, impact);
     Ok(())
 }
 
+/// The marks that record `verdict` on `node_id`, shaped by
+/// [`review_session::action_record_shape`] so that an approval covers
+/// exactly the blocks the session removes.
 fn mark_params_for_action(
     state: &mut AppState,
     node_id: TreeNodeId,
     verdict: Verdict,
     note: Option<String>,
-) -> Result<mark::MarkParams> {
-    if state.onboarding.is_some() {
-        anyhow::ensure!(
-            state.reviewable_nodes.contains(&node_id)
-                && matches!(state.navigator.tree.node(node_id).kind, TreeNodeKind::Block),
-            "onboarding actions may only mark a selected pending card"
-        );
+) -> Result<Vec<mark::MarkParams>> {
+    let shape = match state.onboarding {
+        Some(_) => {
+            anyhow::ensure!(
+                state.reviewable_nodes.contains(&node_id)
+                    && matches!(state.navigator.tree.node(node_id).kind, TreeNodeKind::Block),
+                "onboarding actions may only mark a selected pending card"
+            );
+            review_session::ActionRecordShape::Node
+        }
+        None => review_session::action_record_shape(
+            &state.navigator,
+            node_id,
+            &verdict,
+            review_tree_content(&state.review_scope),
+        ),
+    };
+    match shape {
+        review_session::ActionRecordShape::Node => {
+            Ok(vec![node_mark_params(state, node_id, verdict, note)?])
+        }
+        review_session::ActionRecordShape::Blocks(block_ids) => block_ids
+            .into_iter()
+            .map(|block_id| node_mark_params(state, block_id, verdict.clone(), note.clone()))
+            .collect(),
     }
+}
+
+fn review_tree_content(scope: &ScopePreset) -> review_session::ReviewTreeContent {
+    match scope {
+        ScopePreset::All => review_session::ReviewTreeContent::FullScan,
+        ScopePreset::MainDiff
+        | ScopePreset::DirtyWorktree
+        | ScopePreset::Commit { .. }
+        | ScopePreset::RevisionRange { .. } => review_session::ReviewTreeContent::Diff,
+    }
+}
+
+fn node_mark_params(
+    state: &mut AppState,
+    node_id: TreeNodeId,
+    verdict: Verdict,
+    note: Option<String>,
+) -> Result<mark::MarkParams> {
     let node = state.navigator.tree.node(node_id);
     let (fingerprint, target_kind) = fingerprint_and_target_kind_for_node(node);
 
@@ -9762,8 +9801,10 @@ mod diff_scope_tests {
     use crate::context::TrueflowContext;
     use crate::repo_path::RepoPath;
     use crate::scanner::ScanOptions;
-    use crate::store::{CommitId, ReviewTargetKind};
-    use crate::test_git::{run_git, run_git_stdout, temp_git_repo, temp_test_dir};
+    use crate::store::{
+        BlockState, CommitId, Identity, Record, RepoRef, ReviewStore, ReviewTargetKind,
+    };
+    use crate::test_git::{CurrentDirGuard, run_git, run_git_stdout, temp_git_repo, temp_test_dir};
     use crate::tree::{TreeBuilder, build_tree_from_files};
     use clap::Parser;
     use ratatui::{Terminal, backend::TestBackend};
@@ -10459,8 +10500,8 @@ mod diff_scope_tests {
             assert_eq!(state.navigator.current_id(), selected);
             let action =
                 PendingAction::from_node(&state.navigator.tree, selected, Verdict::Approved);
-            execute_action_with(&mut state, action, |params| {
-                marked.push(params.fingerprint);
+            execute_action_with(&mut state, action, |batch| {
+                marked.extend(batch.into_iter().map(|params| params.fingerprint));
                 Ok(())
             })
             .unwrap();
@@ -15157,7 +15198,7 @@ mod diff_scope_tests {
 
         let expected_fingerprint =
             fingerprint_and_target_kind_for_node(state.navigator.tree.node(block_id)).0;
-        let params = mark_params_for_action(
+        let params = node_mark_params(
             &mut state,
             block_id,
             Verdict::Comment,
@@ -15238,7 +15279,7 @@ mod diff_scope_tests {
 
         let expected_fingerprint =
             fingerprint_and_target_kind_for_node(state.navigator.tree.node(block_id)).0;
-        let params = mark_params_for_action(
+        let params = node_mark_params(
             &mut state,
             block_id,
             Verdict::Comment,
@@ -15306,7 +15347,7 @@ mod diff_scope_tests {
             state.content_height,
         );
 
-        let params = mark_params_for_action(
+        let params = node_mark_params(
             &mut state,
             block_id,
             Verdict::Comment,
@@ -15374,7 +15415,7 @@ mod diff_scope_tests {
             state.content_height,
         );
 
-        let params = mark_params_for_action(
+        let params = node_mark_params(
             &mut state,
             block_id,
             Verdict::Comment,
@@ -15539,6 +15580,170 @@ mod diff_scope_tests {
         );
     }
 
+    fn commit_rust_lib(repo_root: &Path, content: &str, message: &str) {
+        fs::create_dir_all(repo_root.join("src"))
+            .unwrap_or_else(|error| panic!("failed to create src: {error}"));
+        fs::write(repo_root.join("src/lib.rs"), content)
+            .unwrap_or_else(|error| panic!("failed to write src/lib.rs: {error}"));
+        run_git(repo_root, &["add", "."]);
+        run_git(repo_root, &["commit", "-qm", message]);
+    }
+
+    /// The TUI state for `scope` over the repository in the current directory.
+    fn repo_review_state(scope: ScopePreset, only: &[BlockKind]) -> AppState {
+        let filters = TrueflowConfig::default().review.resolve_filters(only, &[]);
+        let review = load_review_state(&scope, &filters, &ScanOptions::default())
+            .unwrap_or_else(|error| panic!("failed to collect review: {error}"));
+        let context = TrueflowContext::new(Cli::parse_from(["trueflow", "tui"]));
+        build_review_state(
+            &context,
+            review,
+            scope,
+            ReviewStateBuildOptions {
+                confirm_batch: BatchConfirmPolicy::Never,
+                block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+                diff_line_numbers: TuiDiffLineNumbers::Disabled,
+                keybinds: TuiKeybindsConfig::default(),
+                scope_label: "test".to_string(),
+                initial_view_mode: ViewMode::Source,
+                speed_read_config: TuiSpeedReadConfig::default(),
+                speed_read_defaults: SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
+                ai: TuiAiState::empty(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("failed to build review state: {error}"))
+    }
+
+    /// Approves `node_id` as the TUI does and appends what it marks to the
+    /// review store in the current directory.
+    fn approve_and_store(state: &mut AppState, node_id: TreeNodeId) -> Vec<mark::MarkParams> {
+        let action = PendingAction::from_node(&state.navigator.tree, node_id, Verdict::Approved);
+        let mut marked = Vec::new();
+        execute_action_with(state, action, |batch| {
+            marked.extend(batch);
+            Ok(())
+        })
+        .unwrap_or_else(|error| panic!("approval failed: {error}"));
+        let store = FileStore::new().unwrap_or_else(|error| panic!("no store: {error}"));
+        for params in &marked {
+            let target = params
+                .target_kind
+                .unwrap_or_else(|| panic!("TUI marks name their target kind"))
+                .parse_target(&params.fingerprint)
+                .unwrap_or_else(|error| panic!("invalid target: {error}"));
+            let mut record = Record::new(
+                target,
+                params.check.clone(),
+                params.verdict.clone(),
+                Identity::Email {
+                    email: "test@example.com".to_string(),
+                },
+                RepoRef::Unknown,
+                BlockState::Committed,
+            );
+            record.path_hint = params.path.clone();
+            record.line_hint = params.line;
+            store
+                .append(&record)
+                .unwrap_or_else(|error| panic!("failed to store record: {error}"));
+        }
+        marked
+    }
+
+    /// The first lines of the blocks an unfiltered full review leaves pending.
+    fn pending_block_heads_in_full_review() -> Vec<String> {
+        let filters = TrueflowConfig::default().review.resolve_filters(&[], &[]);
+        load_review_summary(&ScopePreset::All, &filters, &ScanOptions::default())
+            .unwrap_or_else(|error| panic!("failed to collect full review: {error}"))
+            .files
+            .into_iter()
+            .flat_map(|file| file.blocks)
+            .map(|block| block.content.lines().next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn file_node(state: &AppState, path: &str) -> TreeNodeId {
+        state
+            .navigator
+            .tree
+            .find_by_path(path)
+            .unwrap_or_else(|| panic!("expected a node for {path}"))
+    }
+
+    #[test]
+    fn batch_file_approval_in_main_diff_leaves_unchanged_blocks_pending() {
+        let repo_root = temp_git_repo("tui_batch_file_approval_main_diff");
+        let unchanged = "pub fn unchanged() -> u32 {\n    1\n}\n";
+        commit_rust_lib(
+            &repo_root,
+            &format!("{unchanged}\npub fn changed() -> u32 {{\n    2\n}}\n"),
+            "base",
+        );
+        run_git(&repo_root, &["branch", "-M", "main"]);
+        run_git(&repo_root, &["switch", "-qc", "feature"]);
+        commit_rust_lib(
+            &repo_root,
+            &format!("{unchanged}\npub fn changed() -> u32 {{\n    3\n}}\n"),
+            "change one function",
+        );
+        let _cwd = CurrentDirGuard::push(&repo_root);
+        let mut state = repo_review_state(ScopePreset::MainDiff, &[]);
+        let file = file_node(&state, "src/lib.rs");
+
+        approve_and_store(&mut state, file);
+
+        assert_eq!(
+            pending_block_heads_in_full_review(),
+            vec!["pub fn unchanged() -> u32 {".to_string()],
+            "approving the diff's file node must cover only the changed block"
+        );
+    }
+
+    #[test]
+    fn batch_file_approval_under_only_filter_leaves_filtered_blocks_pending() {
+        let repo_root = temp_git_repo("tui_batch_file_approval_only_filter");
+        commit_rust_lib(
+            &repo_root,
+            "pub struct Config {\n    pub size: u32,\n}\n\npub fn first() -> u32 {\n    1\n}\n\npub fn second() -> u32 {\n    2\n}\n",
+            "base",
+        );
+        let _cwd = CurrentDirGuard::push(&repo_root);
+        let mut state = repo_review_state(ScopePreset::All, &[BlockKind::Function]);
+        let file = file_node(&state, "src/lib.rs");
+
+        approve_and_store(&mut state, file);
+
+        assert_eq!(
+            pending_block_heads_in_full_review(),
+            vec!["pub struct Config {".to_string()],
+            "approving the file under --only function must not cover the struct"
+        );
+    }
+
+    #[test]
+    fn batch_file_approval_of_fully_shown_file_records_the_file() {
+        let repo_root = temp_git_repo("tui_batch_file_approval_full_scope");
+        commit_rust_lib(
+            &repo_root,
+            "pub fn first() -> u32 {\n    1\n}\n\npub fn second() -> u32 {\n    2\n}\n",
+            "base",
+        );
+        let _cwd = CurrentDirGuard::push(&repo_root);
+        let mut state = repo_review_state(ScopePreset::All, &[]);
+        let file = file_node(&state, "src/lib.rs");
+
+        let marked = approve_and_store(&mut state, file);
+
+        assert_eq!(
+            marked
+                .iter()
+                .map(|params| params.target_kind)
+                .collect::<Vec<_>>(),
+            vec![Some(ReviewTargetKind::File)]
+        );
+        assert_eq!(pending_block_heads_in_full_review(), Vec::<String>::new());
+    }
+
     #[test]
     fn mark_params_for_action_persists_source_comment_anchor_for_visible_source_block() {
         let file_path = temp_test_file_path("tui_source_comment_anchor");
@@ -15570,7 +15775,7 @@ mod diff_scope_tests {
             state.content_height,
         );
 
-        let params = mark_params_for_action(
+        let params = node_mark_params(
             &mut state,
             block_id,
             Verdict::Comment,
@@ -15690,7 +15895,7 @@ mod diff_scope_tests {
             state.content_height,
         );
 
-        let params = mark_params_for_action(
+        let params = node_mark_params(
             &mut state,
             block_id,
             Verdict::Comment,
@@ -15757,7 +15962,7 @@ mod diff_scope_tests {
             state.content_height,
         );
 
-        let params = mark_params_for_action(
+        let params = node_mark_params(
             &mut state,
             block_id,
             Verdict::Comment,

@@ -1,5 +1,6 @@
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::{ReviewAnchor, ReviewOrder};
+use crate::store::Verdict;
 use crate::tree::{TreeNodeId, TreeNodeKind};
 use std::collections::HashSet;
 
@@ -15,6 +16,71 @@ pub fn action_block_ids(navigator: &ReviewNavigator, node_id: TreeNodeId) -> Vec
         }
         _ => navigator.visible_descendant_block_ids(node_id),
     }
+}
+
+/// What a review tree holds of the content its nodes hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewTreeContent {
+    /// Every block of the scanned files, so a node's hash identifies exactly
+    /// the blocks under it.
+    FullScan,
+    /// Only the blocks a diff changed, while file and directory nodes still
+    /// hash whole files, so their hashes also identify blocks the tree omits.
+    Diff,
+}
+
+/// How a review action is written to the review store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionRecordShape {
+    /// One record of the acted-on node itself.
+    Node,
+    /// One block record per listed block: the blocks the session removes.
+    Blocks(Vec<TreeNodeId>),
+}
+
+/// How to record `verdict` on `node_id` so that an approval never covers
+/// code the session did not select. An approval of a file, directory, root
+/// or container block records the node itself only when its hash identifies
+/// nothing but blocks the session shows: in a full scan, with every block
+/// under it (and the node itself, when it is a block) pending in the
+/// session. Blocks a filter left out, unchanged blocks of a diff and blocks
+/// approved earlier all fail that test, so the approval instead records
+/// each block the session removes. Comments and rejections cover nothing,
+/// so they keep one record of the node, whose note is about the node.
+pub fn action_record_shape(
+    navigator: &ReviewNavigator,
+    node_id: TreeNodeId,
+    verdict: &Verdict,
+    content: ReviewTreeContent,
+) -> ActionRecordShape {
+    match verdict {
+        Verdict::Comment | Verdict::Rejected => ActionRecordShape::Node,
+        Verdict::Approved => {
+            let block_ids = action_block_ids(navigator, node_id);
+            let node_is_exactly_its_shown_blocks = block_ids == [node_id]
+                || match content {
+                    ReviewTreeContent::FullScan => every_block_under_is_shown(navigator, node_id),
+                    ReviewTreeContent::Diff => false,
+                };
+            if node_is_exactly_its_shown_blocks {
+                ActionRecordShape::Node
+            } else {
+                ActionRecordShape::Blocks(block_ids)
+            }
+        }
+    }
+}
+
+fn every_block_under_is_shown(navigator: &ReviewNavigator, node_id: TreeNodeId) -> bool {
+    let mut stack = vec![node_id];
+    while let Some(id) = stack.pop() {
+        let node = navigator.tree.node(id);
+        if matches!(node.kind, TreeNodeKind::Block) && !navigator.is_visible_block(id) {
+            return false;
+        }
+        stack.extend(node.children.iter().copied());
+    }
+    true
 }
 
 pub fn next_review_target(
@@ -168,6 +234,67 @@ mod tests {
             .collect::<HashSet<_>>();
         let expected = HashSet::from([first, second]);
         assert_eq!(selected, expected);
+    }
+
+    #[test]
+    fn file_approval_records_the_file_only_when_its_whole_scan_is_shown() {
+        let build = || {
+            let mut builder = TreeBuilder::new();
+            let root = builder.root();
+            let file = builder.add_file(
+                root,
+                "lib.rs".to_string(),
+                "lib.rs".to_string(),
+                "file-hash".to_string(),
+                Language::Rust,
+            );
+            let first = builder.add_block(
+                file,
+                "first".to_string(),
+                "lib.rs".to_string(),
+                test_block(BlockKind::Function, 1),
+                Language::Rust,
+            );
+            let second = builder.add_block(
+                file,
+                "second".to_string(),
+                "lib.rs".to_string(),
+                test_block(BlockKind::Struct, 10),
+                Language::Rust,
+            );
+            (builder.finalize(), root, file, first, second)
+        };
+        let (tree, root, file, first, second) = build();
+        let all_shown = navigator_from_blocks(tree, &[first, second]);
+        let first_shown = navigator_from_blocks(build().0, &[first]);
+        let approved = Verdict::Approved;
+
+        assert_eq!(
+            action_record_shape(&all_shown, file, &approved, ReviewTreeContent::FullScan),
+            ActionRecordShape::Node
+        );
+        assert_eq!(
+            action_record_shape(&all_shown, file, &approved, ReviewTreeContent::Diff),
+            ActionRecordShape::Blocks(vec![first, second])
+        );
+        assert_eq!(
+            action_record_shape(&first_shown, file, &approved, ReviewTreeContent::FullScan),
+            ActionRecordShape::Blocks(vec![first])
+        );
+        assert_eq!(
+            action_record_shape(&first_shown, root, &approved, ReviewTreeContent::FullScan),
+            ActionRecordShape::Blocks(vec![first])
+        );
+        assert_eq!(
+            action_record_shape(&first_shown, first, &approved, ReviewTreeContent::Diff),
+            ActionRecordShape::Node
+        );
+        for verdict in [Verdict::Comment, Verdict::Rejected] {
+            assert_eq!(
+                action_record_shape(&first_shown, file, &verdict, ReviewTreeContent::Diff),
+                ActionRecordShape::Node
+            );
+        }
     }
 
     #[test]

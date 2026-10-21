@@ -493,7 +493,12 @@ Main review actions:
 - `PageUp`, `PageDown`, `Space`, `Home`, and `End` scroll by page or jump to the top/bottom of the current code view
 - Outside the root view, `h`/`l` and Left/Right move to the previous/next semantic sibling
 - `P`/`C` move to the semantic parent/child
-- `a` approve
+- `a` approve. On a file, directory, container, or the root it approves the
+  pending blocks shown under it and records exactly those: one approval per
+  block in a diff or `--only`/`--exclude` scope, or whenever a block under the
+  node is not pending, so unchanged, filtered, and earlier-reviewed blocks are
+  never covered by it. Only an unfiltered all-files review in which every block
+  under the node is pending records the node itself.
 - `c` add a comment (`Enter` submits, `Ctrl+J` inserts a newline, and the TUI requires comment text before submit)
 - `m` toggle diff/source
   - diff-mode line numbers are disabled by default; set `[tui] diff_line_numbers = "old_new"` to restore the old/new gutter
@@ -649,15 +654,15 @@ Records with a path bind only to that repository path and matching content.
 Moving lines within the same file can preserve coverage; narrowing review scope
 or removing the original file never transfers its approval to another file.
 Records without a path use content-only identity and must resolve unambiguously.
+A block's latest verdict decides its coverage, except that a newer approval
+covering it (of its file, directory, or enclosing block, or of every child
+expanded with `C`) wins over its older comment or rejection. A comment or
+rejection made after such an approval still keeps the block pending.
 
 Malformed or unsupported history records stop review loading with the offending
 line number. Trueflow does not silently discard records or repair truncated
 history: restore or correct the log before relying on its review coverage.
 
-A block's latest verdict decides its coverage, except that a newer approval
-covering it (of its file, directory, or enclosing block, or of every child
-expanded with `C`) wins over its older comment or rejection. A comment or
-rejection made after such an approval still keeps the block pending.
 ### GitHub pull requests
 
 Pull request review is fetch-only. `trueflow tui --target pr:11` resolves the
