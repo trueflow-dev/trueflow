@@ -40,6 +40,10 @@ const ARGV_CALL_SEPARATOR: u8 = 0x01;
 // scans the repository before it reaches fake gh, which takes longer on a
 // loaded machine. An early worker exit is still detected immediately.
 const CONCURRENT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(60);
+// How long the second worker must stay blocked behind the first worker's
+// ledger lock. It must stay well below fake gh's 15s release wait, or the
+// first worker gives up while the second is still being observed.
+const CONCURRENT_EXCLUSION_WINDOW: Duration = Duration::from_secs(5);
 const CONCURRENT_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type TestResult = Result<()>;
@@ -503,7 +507,7 @@ fn concurrent_feedback_command(
 }
 
 fn assert_second_append_is_absent(second_append: &Path, worker: &mut Option<Child>) -> TestResult {
-    let deadline = Instant::now() + CONCURRENT_SIGNAL_TIMEOUT;
+    let deadline = Instant::now() + CONCURRENT_EXCLUSION_WINDOW;
     loop {
         assert!(
             !second_append.exists(),
