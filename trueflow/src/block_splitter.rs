@@ -2633,7 +2633,11 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(result.strategy, BlockSplitStrategy::Structured);
         let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Namespace));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Namespace)
+        );
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Const));
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Method));
@@ -2663,7 +2667,11 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
         assert_eq!(result.strategy, BlockSplitStrategy::Structured);
         let blocks = result.blocks;
         assert!(blocks.iter().any(|block| block.kind == BlockKind::Import));
-        assert!(blocks.iter().any(|block| block.kind == BlockKind::Namespace));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Namespace)
+        );
         assert!(
             blocks
                 .iter()
@@ -3143,9 +3151,18 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
     fn only_bodyless_module_declarations_are_import_like() {
         for (content, language) in [
             ("pub mod inner {\n    pub fn run() {}\n}\n", Language::Rust),
-            ("namespace net {\nint init() { return 1; }\n}\n", Language::Cpp),
-            ("namespace Net {\n    class Client {}\n}\n", Language::CSharp),
-            ("<?php\nnamespace Net {\n    function init() {}\n}\n", Language::Php),
+            (
+                "namespace net {\nint init() { return 1; }\n}\n",
+                Language::Cpp,
+            ),
+            (
+                "namespace Net {\n    class Client {}\n}\n",
+                Language::CSharp,
+            ),
+            (
+                "<?php\nnamespace Net {\n    function init() {}\n}\n",
+                Language::Php,
+            ),
             ("module Net\n  LIMIT = 4\nend\n", Language::Ruby),
         ] {
             let blocks = split_blocks(content, language);

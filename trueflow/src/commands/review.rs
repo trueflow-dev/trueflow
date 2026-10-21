@@ -2514,7 +2514,8 @@ mod tests {
 
     #[test]
     fn diff_container_residue_tracks_own_lines_outside_children() {
-        let base = "struct A;\n\nimpl Foo for A {\n    fn run(&self) -> i32 {\n        1\n    }\n}\n";
+        let base =
+            "struct A;\n\nimpl Foo for A {\n    fn run(&self) -> i32 {\n        1\n    }\n}\n";
         let body_only = changed_impl_and_method(
             base,
             &base.replace("        1\n", "        let value = 2;\n\n        value\n"),

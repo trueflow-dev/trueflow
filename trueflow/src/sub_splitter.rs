@@ -2438,7 +2438,11 @@ mod tests {
             .unwrap()
             .blocks;
         assert!(chunks.iter().any(|block| block.kind == BlockKind::Const));
-        assert!(chunks.iter().any(|block| block.kind == BlockKind::Namespace));
+        assert!(
+            chunks
+                .iter()
+                .any(|block| block.kind == BlockKind::Namespace)
+        );
         assert!(chunks.iter().any(|block| block.kind == BlockKind::Class));
         assert!(
             !chunks

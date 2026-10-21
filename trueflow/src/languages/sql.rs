@@ -368,7 +368,10 @@ mod tests {
             .filter(|block| block.kind != BlockKind::Gap)
             .map(|block| block.content.as_str())
             .collect::<String>();
-        assert!(covered.contains('='), "operator must be reviewable: {blocks:#?}");
+        assert!(
+            covered.contains('='),
+            "operator must be reviewable: {blocks:#?}"
+        );
     }
 
     #[test]
@@ -409,8 +412,15 @@ mod tests {
                 "{source:?} must be reviewable: {blocks:#?}"
             );
         }
-        for text in ["create view v as select 1", "drop schema app", "alter database app"] {
-            assert!(!classify_statement_text_prefix(text).is_import_like(), "{text}");
+        for text in [
+            "create view v as select 1",
+            "drop schema app",
+            "alter database app",
+        ] {
+            assert!(
+                !classify_statement_text_prefix(text).is_import_like(),
+                "{text}"
+            );
         }
     }
 }

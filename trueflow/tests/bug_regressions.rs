@@ -2541,7 +2541,10 @@ fn inline_module_outside_lib_rs_is_reviewable() -> Result<()> {
 
     let summary = review_all(&repo)?;
     let contents = unreviewed_contents(&summary);
-    assert_eq!(summary.total_blocks, 1, "only the inline module: {contents:?}");
+    assert_eq!(
+        summary.total_blocks, 1,
+        "only the inline module: {contents:?}"
+    );
     assert!(
         contents.iter().any(|content| content.contains("fn run")),
         "inline module body must be reviewable: {contents:?}"
