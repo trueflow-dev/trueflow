@@ -891,18 +891,27 @@ fn load_from_config_paths(paths: &[PathBuf]) -> Result<TrueflowConfig> {
         return Ok(TrueflowConfig::default());
     }
 
-    let mut merged = toml::Value::Table(toml::Table::new());
-    for path in paths {
-        let value = read_config_value(path)?;
-        merge_toml_values(&mut merged, value);
-    }
-
-    merged.try_into().with_context(|| {
+    let values = paths
+        .iter()
+        .map(|path| read_config_value(path))
+        .collect::<Result<Vec<_>>>()?;
+    merge_config_values(values).with_context(|| {
         format!(
             "Failed to parse merged config from {}",
             config_path_list(paths)
         )
     })
+}
+
+/// Merges config layers key-by-key, later layers winning, and parses the result.
+fn merge_config_values(
+    values: impl IntoIterator<Item = toml::Value>,
+) -> std::result::Result<TrueflowConfig, toml::de::Error> {
+    let mut merged = toml::Value::Table(toml::Table::new());
+    for value in values {
+        merge_toml_values(&mut merged, value);
+    }
+    merged.try_into()
 }
 
 fn read_config_value(path: &Path) -> Result<toml::Value> {
@@ -999,30 +1008,145 @@ where
     })
 }
 
-pub fn update_speed_read_defaults_in_file(
-    path: &Path,
-    default_wpm: u16,
-    default_chunk_words: u8,
-) -> Result<()> {
-    let mut document = if path.is_file() {
-        let source = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config for update: {}", path.display()))?;
-        source
-            .parse::<DocumentMut>()
-            .with_context(|| format!("Failed to parse config for update: {}", path.display()))?
-    } else {
-        DocumentMut::new()
-    };
+/// Persists TUI speed-read defaults into the config layer that governs them.
+///
+/// The target is the closest project `trueflow.toml` (between `project_root`
+/// and the start directory) that already sets a speed-read default, so a
+/// nested override is updated rather than shadowing the save; otherwise it is
+/// `project_root/trueflow.toml`. The global `~/.trueflow.toml` is never
+/// rewritten. The update is validated against every layer [`load`] merges.
+#[derive(Debug, Clone)]
+pub struct SpeedReadDefaultsWriter {
+    start_dir: PathBuf,
+    home_dir: Option<PathBuf>,
+    project_root: PathBuf,
+}
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create config parent directory: {}",
-                parent.display()
-            )
-        })?;
+impl SpeedReadDefaultsWriter {
+    pub fn new(start_dir: PathBuf, home_dir: Option<PathBuf>, project_root: PathBuf) -> Self {
+        Self {
+            start_dir,
+            home_dir,
+            project_root,
+        }
     }
 
+    /// Writer for the layers `load` reads from the current directory; saves
+    /// default to `project_root`, or the current directory without one.
+    pub fn for_current_dir(project_root: Option<PathBuf>) -> Result<Self> {
+        let start_dir = std::env::current_dir()?;
+        let project_root = project_root.unwrap_or_else(|| start_dir.clone());
+        Ok(Self::new(start_dir, dirs::home_dir(), project_root))
+    }
+
+    /// Writer for a project rooted at `dir` with no global config layer.
+    #[cfg(test)]
+    pub(crate) fn in_dir(dir: PathBuf) -> Self {
+        Self::new(dir.clone(), None, dir)
+    }
+
+    pub fn save(&self, default_wpm: u16, default_chunk_words: u8) -> Result<()> {
+        let mut layers = config_paths_for_start_dir(&self.start_dir, self.home_dir.as_deref())
+            .into_iter()
+            .map(|path| read_config_value(&path).map(|value| (path, value)))
+            .collect::<Result<Vec<_>>>()?;
+        let path = self.target_path(&layers);
+
+        let source = if path.is_file() {
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read config for update: {}", path.display()))?
+        } else {
+            String::new()
+        };
+        let updated =
+            speed_read_defaults_document(&path, &source, default_wpm, default_chunk_words)?;
+
+        let invalid_update = || {
+            format!(
+                "Updated speed-read defaults would make config invalid: {}",
+                path.display()
+            )
+        };
+        let updated_value: toml::Value = toml::from_str(&updated).with_context(invalid_update)?;
+        match layers.iter_mut().find(|(layer, _)| *layer == path) {
+            Some((_, value)) => *value = updated_value,
+            None => {
+                let index = project_layer_insert_index(&layers, &path);
+                layers.insert(index, (path.clone(), updated_value));
+            }
+        }
+        merge_config_values(layers.into_iter().map(|(_, value)| value))
+            .with_context(invalid_update)?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create config parent directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(&path, updated)
+            .with_context(|| format!("Failed to write config update: {}", path.display()))?;
+
+        Ok(())
+    }
+
+    fn target_path(&self, layers: &[(PathBuf, toml::Value)]) -> PathBuf {
+        layers
+            .iter()
+            .rev()
+            .find(|(path, value)| {
+                is_ancestor_config_layer(path)
+                    && path
+                        .parent()
+                        .is_some_and(|dir| dir.starts_with(&self.project_root))
+                    && sets_speed_read_default(value)
+            })
+            .map(|(path, _)| path.clone())
+            .unwrap_or_else(|| self.project_root.join(CONFIG_FILE_NAME))
+    }
+}
+
+fn is_ancestor_config_layer(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(CONFIG_FILE_NAME))
+}
+
+fn sets_speed_read_default(value: &toml::Value) -> bool {
+    value
+        .get("tui")
+        .and_then(|tui| tui.get("speed_read"))
+        .is_some_and(|speed_read| {
+            speed_read.get("default_wpm").is_some()
+                || speed_read.get("default_chunk_words").is_some()
+        })
+}
+
+/// Position of a new ancestor `trueflow.toml` in load order: after the global
+/// file and farther ancestors, before layers in its subdirectories.
+fn project_layer_insert_index(layers: &[(PathBuf, toml::Value)], path: &Path) -> usize {
+    let Some(dir) = path.parent() else {
+        return layers.len();
+    };
+    layers
+        .iter()
+        .position(|(layer, _)| {
+            is_ancestor_config_layer(layer)
+                && layer.parent().is_some_and(|layer_dir| layer_dir.starts_with(dir))
+        })
+        .unwrap_or(layers.len())
+}
+
+fn speed_read_defaults_document(
+    path: &Path,
+    source: &str,
+    default_wpm: u16,
+    default_chunk_words: u8,
+) -> Result<String> {
+    let mut document = source
+        .parse::<DocumentMut>()
+        .with_context(|| format!("Failed to parse config for update: {}", path.display()))?;
     let tui_table = child_table_like(document.as_table_mut(), "tui", "tui")?;
     let speed_read_table = child_table_like(tui_table, "speed_read", "tui.speed_read")?;
     speed_read_table.insert("default_wpm", value(i64::from(default_wpm)));
@@ -1030,19 +1154,7 @@ pub fn update_speed_read_defaults_in_file(
         "default_chunk_words",
         value(i64::from(default_chunk_words)),
     );
-
-    let updated = document.to_string();
-    let _: TrueflowConfig = toml::from_str(&updated).with_context(|| {
-        format!(
-            "Updated speed-read defaults would make config invalid: {}",
-            path.display()
-        )
-    })?;
-
-    std::fs::write(path, updated)
-        .with_context(|| format!("Failed to write config update: {}", path.display()))?;
-
-    Ok(())
+    Ok(document.to_string())
 }
 
 /// Returns `parent[key]` as a standard or inline table, creating a table when absent.
@@ -1852,11 +1964,19 @@ max_context_lines = 24
         temp_config_dir(name).join("trueflow.toml")
     }
 
+    /// Saves speed-read defaults for a project rooted at `path`'s directory.
+    fn save_speed_read_defaults_at(path: &Path, default_wpm: u16, chunk_words: u8) -> Result<()> {
+        let dir = path
+            .parent()
+            .unwrap_or_else(|| panic!("config path should have a parent"));
+        SpeedReadDefaultsWriter::in_dir(dir.to_path_buf()).save(default_wpm, chunk_words)
+    }
+
     #[test]
     fn update_speed_read_defaults_creates_and_writes_config() {
         let path = temp_speed_read_config_path("speed_read_create");
 
-        update_speed_read_defaults_in_file(&path, 360, 3)
+        save_speed_read_defaults_at(&path, 360, 3)
             .unwrap_or_else(|err| panic!("update config: {err}"));
 
         let content =
@@ -1880,7 +2000,7 @@ confirm_batch_sub_blocks = 2
 "#;
         write_config(&path, initial);
 
-        update_speed_read_defaults_in_file(&path, 420, 4)
+        save_speed_read_defaults_at(&path, 420, 4)
             .unwrap_or_else(|err| panic!("update config: {err}"));
 
         let content =
@@ -1911,7 +2031,7 @@ max_chunk_words = 5
 "#;
         write_config(&path, initial);
 
-        let err = update_speed_read_defaults_in_file(&path, 100, 6).unwrap_err();
+        let err = save_speed_read_defaults_at(&path, 100, 6).unwrap_err();
 
         assert!(
             err.to_string()
@@ -1929,7 +2049,7 @@ max_chunk_words = 5
         let initial = "tui = \"not a table\"\n";
         write_config(&path, initial);
 
-        let err = update_speed_read_defaults_in_file(&path, 360, 3).unwrap_err();
+        let err = save_speed_read_defaults_at(&path, 360, 3).unwrap_err();
 
         assert!(
             err.to_string().contains("Expected [tui] to be a table"),
@@ -1946,7 +2066,7 @@ max_chunk_words = 5
         let initial = "[tui]\nspeed_read = \"not a table\"\n";
         write_config(&path, initial);
 
-        let err = update_speed_read_defaults_in_file(&path, 360, 3).unwrap_err();
+        let err = save_speed_read_defaults_at(&path, 360, 3).unwrap_err();
 
         assert!(
             err.to_string()
@@ -1968,7 +2088,7 @@ max_chunk_words = 5
             let path = temp_speed_read_config_path("speed_read_inline_tables");
             write_config(&path, initial);
 
-            update_speed_read_defaults_in_file(&path, 360, 3)
+            save_speed_read_defaults_at(&path, 360, 3)
                 .unwrap_or_else(|err| panic!("update {initial:?}: {err}"));
 
             let content =
@@ -1979,5 +2099,79 @@ max_chunk_words = 5
             assert_eq!(parsed.tui.speed_read.default_chunk_words, 3, "{content}");
             assert!(parsed.tui.speed_read.enabled, "{content}");
         }
+    }
+
+    #[test]
+    fn speed_read_save_from_subdirectory_updates_the_governing_layer() {
+        let root = temp_config_dir("speed_read_governing_layer");
+        let nested = root.join("nested");
+        write_config(
+            &nested.join("trueflow.toml"),
+            "[tui.speed_read]\ndefault_wpm = 400\n",
+        );
+
+        SpeedReadDefaultsWriter::new(nested.clone(), None, root.clone())
+            .save(500, 3)
+            .unwrap_or_else(|err| panic!("save speed-read defaults: {err}"));
+
+        let cfg = load_from_start_dir(&nested, None)
+            .unwrap_or_else(|err| panic!("load config: {err}"));
+        assert_eq!(cfg.tui.speed_read.default_wpm, 500);
+        assert_eq!(cfg.tui.speed_read.default_chunk_words, 3);
+        assert!(
+            !root.join("trueflow.toml").exists(),
+            "the nested layer governs the defaults, so the root file stays untouched"
+        );
+    }
+
+    #[test]
+    fn speed_read_save_validates_against_global_layer_without_rewriting_it() {
+        let root = temp_config_dir("speed_read_layered_validation");
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let workdir = repo.join("nested");
+        std::fs::create_dir_all(&workdir).unwrap_or_else(|err| panic!("create workdir: {err}"));
+        let global = "[tui.keybinds]\napprove = \"y\"\n\n[tui.speed_read]\nmax_wpm = 1200\nmax_chunk_words = 8\ndefault_wpm = 400\n";
+        write_config(&home.join(".trueflow.toml"), global);
+        let root_config = "[tui.keybinds]\nnote = \"a\"\n";
+        write_config(&repo.join("trueflow.toml"), root_config);
+
+        SpeedReadDefaultsWriter::new(workdir.clone(), Some(home.clone()), repo.clone())
+            .save(1000, 7)
+            .unwrap_or_else(|err| panic!("save speed-read defaults: {err}"));
+
+        let cfg = load_from_start_dir(&workdir, Some(&home))
+            .unwrap_or_else(|err| panic!("load config: {err}"));
+        assert_eq!(cfg.tui.speed_read.default_wpm, 1000);
+        assert_eq!(cfg.tui.speed_read.default_chunk_words, 7);
+        assert_eq!(
+            std::fs::read_to_string(home.join(".trueflow.toml"))
+                .unwrap_or_else(|err| panic!("read global config: {err}")),
+            global
+        );
+        assert!(!workdir.join("trueflow.toml").exists());
+    }
+
+    #[test]
+    fn speed_read_save_rejects_updates_invalid_in_the_merged_config() {
+        let root = temp_config_dir("speed_read_layered_rejection");
+        let home = root.join("home");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap_or_else(|err| panic!("create repo: {err}"));
+        write_config(
+            &home.join(".trueflow.toml"),
+            "[tui.speed_read]\nmax_wpm = 600\n",
+        );
+
+        let err = SpeedReadDefaultsWriter::new(repo.clone(), Some(home), repo.clone())
+            .save(800, 2)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Updated speed-read defaults would make config invalid"),
+            "unexpected error: {err}"
+        );
+        assert!(!repo.join("trueflow.toml").exists());
     }
 }

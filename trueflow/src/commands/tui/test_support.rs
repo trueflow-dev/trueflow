@@ -14,6 +14,7 @@ use super::{
     toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
+use crate::config::SpeedReadDefaultsWriter;
 use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
 use crate::commands::mark;
 use crate::commands::review::{BlockChangeKind, FileChangeKind};
@@ -641,7 +642,7 @@ where
         highlighted_line_cache: HashMap::new(),
         speed_read: SpeedReadController::new(
             TuiSpeedReadConfig::default(),
-            PathBuf::from("trueflow.toml"),
+            SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
         ),
         ai: TuiAiState::empty(),
         onboarding: None,
@@ -739,7 +740,7 @@ fn build_state_with_single_rust_block_file(
         highlighted_line_cache: HashMap::new(),
         speed_read: SpeedReadController::new(
             TuiSpeedReadConfig::default(),
-            PathBuf::from("trueflow.toml"),
+            SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
         ),
         ai: TuiAiState::empty(),
         onboarding: None,

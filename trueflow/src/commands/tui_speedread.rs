@@ -1,7 +1,5 @@
 use crate::block::Block;
-use crate::config::{
-    TuiSpeedReadConfig, TuiSpeedReadPunctuationDwell, update_speed_read_defaults_in_file,
-};
+use crate::config::{SpeedReadDefaultsWriter, TuiSpeedReadConfig, TuiSpeedReadPunctuationDwell};
 use crate::review_speedread::{
     PlaybackState, PunctuationDwellMode, SpeedReadModel, new_model as build_speed_read_model,
     next_wpm_step_down, next_wpm_step_up, rechunk_preserving_progress, set_wpm, step_next,
@@ -10,7 +8,6 @@ use crate::review_speedread::{
 use crate::tree::{TreeNodeId, TreeNodeKind};
 use anyhow::Result;
 use crossterm::event::KeyCode;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const SPEED_READ_PERSIST_DEBOUNCE: Duration = Duration::from_millis(512);
@@ -40,11 +37,11 @@ pub(crate) struct SpeedReadController {
     active: Option<SpeedReadUiState>,
     persisted_defaults: PersistedSpeedReadDefaults,
     pending_persist: Option<PendingSpeedReadPersist>,
-    config_path: PathBuf,
+    defaults_writer: SpeedReadDefaultsWriter,
 }
 
 impl SpeedReadController {
-    pub(crate) fn new(config: TuiSpeedReadConfig, config_path: PathBuf) -> Self {
+    pub(crate) fn new(config: TuiSpeedReadConfig, defaults_writer: SpeedReadDefaultsWriter) -> Self {
         let default_wpm = config.default_wpm.clamp(config.min_wpm, config.max_wpm);
         let default_chunk_words = config
             .default_chunk_words
@@ -58,7 +55,7 @@ impl SpeedReadController {
                 default_chunk_words,
             },
             pending_persist: None,
-            config_path,
+            defaults_writer,
         }
     }
 
@@ -291,18 +288,19 @@ impl SpeedReadController {
         Ok(true)
     }
 
+    /// Saves the pending defaults. A failed save is dropped rather than
+    /// retried, so one bad config cannot repeat the error on every idle tick
+    /// or block leaving the session; the next adjustment schedules a new save.
     pub(crate) fn flush_pending_defaults(&mut self) -> Result<()> {
-        let Some(pending) = self.pending_persist else {
+        let Some(pending) = self.pending_persist.take() else {
             return Ok(());
         };
 
-        update_speed_read_defaults_in_file(
-            &self.config_path,
+        self.defaults_writer.save(
             pending.defaults.default_wpm,
             pending.defaults.default_chunk_words,
         )?;
         self.persisted_defaults = pending.defaults;
-        self.pending_persist = None;
         Ok(())
     }
 

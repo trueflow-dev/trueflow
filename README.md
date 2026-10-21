@@ -455,6 +455,13 @@ default_chunk_words = 2
 
 See `trueflow.example.toml` for the default settings.
 
+Adjusting the speed-read speed or chunk size in the TUI saves `default_wpm` and
+`default_chunk_words` to the closest project `trueflow.toml` that already sets
+either, otherwise to the repository root's `trueflow.toml`; `~/.trueflow.toml`
+is never rewritten. The update is checked against all merged config files. A
+save that fails is shown in the footer and the session continues; pressing the
+exit key again leaves without saving.
+
 Ordinary AI review plans distribute their bounded manifest across files and
 source/test groups, share excerpt space, and retain changed-head context.
 Clipped source is labeled partial; priorities only reorder the ordinary queue.

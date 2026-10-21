@@ -23,8 +23,9 @@ use crate::commands::review::{
     review_request_from_cli_targets,
 };
 use crate::config::{
-    AiMode, BatchConfirmPolicy, BlockFilters, TrueflowConfig, TuiConfig, TuiDiffFocusMode,
-    TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, load as load_config,
+    AiMode, BatchConfirmPolicy, BlockFilters, SpeedReadDefaultsWriter, TrueflowConfig, TuiConfig,
+    TuiDiffFocusMode, TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig,
+    load as load_config,
 };
 use crate::context::TrueflowContext;
 use crate::declaration::review::{DeclarationReviewDiffBatch, DeclarationReviewQuery};
@@ -1195,7 +1196,7 @@ struct ReviewStateBuildOptions {
     scope_label: String,
     initial_view_mode: ViewMode,
     speed_read_config: TuiSpeedReadConfig,
-    speed_read_config_path: PathBuf,
+    speed_read_defaults: SpeedReadDefaultsWriter,
     ai: TuiAiState,
 }
 
@@ -1799,7 +1800,7 @@ fn build_onboarding_state(
             scope_label: format!("{}: {title}", purpose.label()),
             initial_view_mode: ViewMode::Source,
             speed_read_config: config.tui.speed_read.clone(),
-            speed_read_config_path: speed_read_config_path_for_repo_root(),
+            speed_read_defaults: speed_read_defaults_writer()?,
             ai: TuiAiState::for_mode(AiMode::Off, None, config.ai.max_context_lines, false),
         },
     )?;
@@ -1934,7 +1935,7 @@ fn run_tui_review_loop(
                     scope_label: launch.request.scope_label.clone(),
                     initial_view_mode: launch.request.initial_view_mode,
                     speed_read_config: config.tui.speed_read.clone(),
-                    speed_read_config_path: speed_read_config_path_for_repo_root(),
+                    speed_read_defaults: speed_read_defaults_writer()?,
                     ai: tui_ai_state_for_config(config),
                 },
             )?;
@@ -2327,7 +2328,7 @@ fn build_review_state(
         highlighted_line_cache: HashMap::new(),
         speed_read: SpeedReadController::new(
             options.speed_read_config,
-            options.speed_read_config_path,
+            options.speed_read_defaults,
         ),
         ai,
         onboarding: None,
@@ -3350,11 +3351,8 @@ where
     }
 }
 
-fn speed_read_config_path_for_repo_root() -> PathBuf {
-    match vcs::git_root_from_workdir() {
-        Ok(Some(root)) => root.join("trueflow.toml"),
-        Ok(None) | Err(_) => PathBuf::from("trueflow.toml"),
-    }
+fn speed_read_defaults_writer() -> Result<SpeedReadDefaultsWriter> {
+    SpeedReadDefaultsWriter::for_current_dir(vcs::git_root_from_workdir().ok().flatten())
 }
 
 #[derive(Default)]
@@ -3569,7 +3567,7 @@ fn run_app(
             if handle_speed_read_autoplay_timeout(&mut state, now) {
                 rerender = true;
             }
-            if flush_due_speed_read_defaults(&mut state, now)? {
+            if flush_due_speed_read_defaults(&mut state, now) {
                 rerender = true;
             }
             if rerender {
@@ -3620,12 +3618,14 @@ fn run_app(
                     if key_event.kind == KeyEventKind::Press
                         && let Some(action) = recap_action_for_state(&state, key_code)
                     {
-                        flush_pending_speed_read_defaults(&mut state)?;
-                        return Ok(match action {
-                            RecapAction::Exit => AppExit::Quit,
-                            RecapAction::ReviewSomethingElse => AppExit::ReviewSomethingElse,
-                            RecapAction::ContinueFullReview => AppExit::ContinueFullReview,
-                        });
+                        if flush_pending_speed_read_defaults(&mut state) {
+                            return Ok(match action {
+                                RecapAction::Exit => AppExit::Quit,
+                                RecapAction::ReviewSomethingElse => AppExit::ReviewSomethingElse,
+                                RecapAction::ContinueFullReview => AppExit::ContinueFullReview,
+                            });
+                        }
+                        needs_render = true;
                     }
                     continue;
                 }
@@ -3681,8 +3681,9 @@ fn run_app(
                             sync_speed_read_focus(&mut state);
                         }
                         KeybindAction::Quit => {
-                            flush_pending_speed_read_defaults(&mut state)?;
-                            return Ok(AppExit::Quit);
+                            if flush_pending_speed_read_defaults(&mut state) {
+                                return Ok(AppExit::Quit);
+                            }
                         }
                     }
                     needs_render = true;
@@ -4240,12 +4241,35 @@ fn handle_speed_read_autoplay_timeout(state: &mut AppState, now: Instant) -> boo
         .handle_autoplay_timeout(now, state.navigator.current_id())
 }
 
-fn flush_due_speed_read_defaults(state: &mut AppState, now: Instant) -> Result<bool> {
-    state.speed_read.flush_due_defaults(now)
+/// Saves due speed-read defaults; returns whether the screen needs a redraw.
+fn flush_due_speed_read_defaults(state: &mut AppState, now: Instant) -> bool {
+    match state.speed_read.flush_due_defaults(now) {
+        Ok(flushed) => flushed,
+        Err(error) => {
+            report_speed_read_save_failure(state, &error);
+            true
+        }
+    }
 }
 
-fn flush_pending_speed_read_defaults(state: &mut AppState) -> Result<()> {
-    state.speed_read.flush_pending_defaults()
+/// Saves pending speed-read defaults before leaving; returns whether the
+/// session may exit. A failure stays on screen until the next key press, so
+/// repeating the exit key leaves without the unsaved defaults.
+fn flush_pending_speed_read_defaults(state: &mut AppState) -> bool {
+    match state.speed_read.flush_pending_defaults() {
+        Ok(()) => true,
+        Err(error) => {
+            report_speed_read_save_failure(state, &error);
+            false
+        }
+    }
+}
+
+fn report_speed_read_save_failure(state: &mut AppState, error: &anyhow::Error) {
+    state.action_error = Some(format!(
+        "Speed-read defaults not saved: {}",
+        single_line_error(error)
+    ));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6034,7 +6058,10 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
             }
             None => recap_footer_hint_text(&state.keybinds),
         };
-        render_recap_footer(frame, footer_area, &palette, hint);
+        match &state.action_error {
+            Some(error) => render_action_error(frame, error, footer_area, &palette),
+            None => render_recap_footer(frame, footer_area, &palette, hint),
+        }
     } else {
         render_active_node(frame, state, content_area, &palette);
         render_footer(frame, state, footer_area, &palette);
@@ -7429,14 +7456,18 @@ fn render_right_aligned_line(frame: &mut Frame, area: Rect, line: &Line<'_>) {
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
     if let Some(error) = &state.action_error {
-        let style = Style::default().fg(palette.del).bg(palette.bg);
-        frame.render_widget(Paragraph::new(Span::styled(error.clone(), style)), area);
+        render_action_error(frame, error, area, palette);
         return;
     }
     let counts = footer_progress_counts(state);
     render_footer_progress_bar(frame, counts, area, palette);
     let line = footer_progress_line(state, palette);
     render_right_aligned_line(frame, area, &line);
+}
+
+fn render_action_error(frame: &mut Frame, error: &str, area: Rect, palette: &UiPalette) {
+    let style = Style::default().fg(palette.del).bg(palette.bg);
+    frame.render_widget(Paragraph::new(Span::styled(error, style)), area);
 }
 
 fn render_recap_view(frame: &mut Frame, state: &AppState, area: Rect, palette: &UiPalette) {
@@ -10362,7 +10393,7 @@ mod diff_scope_tests {
             highlighted_line_cache: HashMap::new(),
             speed_read: SpeedReadController::new(
                 TuiSpeedReadConfig::default(),
-                PathBuf::from("trueflow.toml"),
+                SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
             ),
             ai: TuiAiState::empty(),
             onboarding: None,
@@ -10437,7 +10468,7 @@ mod diff_scope_tests {
             highlighted_line_cache: HashMap::new(),
             speed_read: SpeedReadController::new(
                 TuiSpeedReadConfig::default(),
-                PathBuf::from("trueflow.toml"),
+                SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
             ),
             ai: TuiAiState::empty(),
             onboarding: None,
@@ -10586,7 +10617,7 @@ mod diff_scope_tests {
             highlighted_line_cache: HashMap::new(),
             speed_read: SpeedReadController::new(
                 TuiSpeedReadConfig::default(),
-                PathBuf::from("trueflow.toml"),
+                SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
             ),
             ai: TuiAiState::empty(),
             onboarding: None,
@@ -10714,7 +10745,7 @@ mod diff_scope_tests {
             highlighted_line_cache: HashMap::new(),
             speed_read: SpeedReadController::new(
                 TuiSpeedReadConfig::default(),
-                PathBuf::from("trueflow.toml"),
+                SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
             ),
             ai: TuiAiState::empty(),
             onboarding: None,
@@ -10800,7 +10831,7 @@ mod diff_scope_tests {
             highlighted_line_cache: HashMap::new(),
             speed_read: SpeedReadController::new(
                 TuiSpeedReadConfig::default(),
-                PathBuf::from("trueflow.toml"),
+                SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
             ),
             ai: TuiAiState::empty(),
             onboarding: None,
@@ -10914,7 +10945,7 @@ mod diff_scope_tests {
             highlighted_line_cache: HashMap::new(),
             speed_read: SpeedReadController::new(
                 TuiSpeedReadConfig::default(),
-                PathBuf::from("trueflow.toml"),
+                SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
             ),
             ai: TuiAiState::empty(),
             onboarding: None,
@@ -12785,7 +12816,7 @@ mod diff_scope_tests {
                 scope_label: "rev:abc1234..HEAD".to_string(),
                 initial_view_mode: ViewMode::Source,
                 speed_read_config: TuiSpeedReadConfig::default(),
-                speed_read_config_path: PathBuf::from("trueflow.toml"),
+                speed_read_defaults: SpeedReadDefaultsWriter::in_dir(PathBuf::from(".")),
                 ai: TuiAiState::empty(),
             },
         )
@@ -18085,7 +18116,7 @@ mod diff_scope_tests {
             ..TuiSpeedReadConfig::default()
         };
         let (mut state, _) = build_state_with_single_block("alpha beta gamma delta");
-        state.speed_read = SpeedReadController::new(config, config_path.clone());
+        state.speed_read = SpeedReadController::new(config, SpeedReadDefaultsWriter::in_dir(dir));
 
         toggle_speed_read_mode(&mut state);
         assert!(handle_speed_read_key_binding(
@@ -18106,6 +18137,100 @@ mod diff_scope_tests {
         assert!(
             !config_path.exists(),
             "boundary no-op speed-read adjustments should not create a config file"
+        );
+    }
+
+    #[test]
+    fn speed_read_persist_respects_layered_bounds() {
+        let dir = temp_test_dir("speed_read_layered_bounds_persist");
+        let home = dir.join("home");
+        let project = dir.join("project");
+        fs::create_dir_all(&home)
+            .unwrap_or_else(|error| panic!("failed to create {home:?}: {error}"));
+        fs::create_dir_all(&project)
+            .unwrap_or_else(|error| panic!("failed to create {project:?}: {error}"));
+        fs::write(
+            home.join(".trueflow.toml"),
+            "[tui.speed_read]\nmax_wpm = 1200\n",
+        )
+        .unwrap_or_else(|error| panic!("failed to write global config: {error}"));
+        let config = TuiSpeedReadConfig {
+            default_wpm: 900,
+            max_wpm: 1200,
+            ..TuiSpeedReadConfig::default()
+        };
+        let (mut state, _) = build_state_with_single_block("alpha beta gamma delta");
+        state.speed_read = SpeedReadController::new(
+            config,
+            SpeedReadDefaultsWriter::new(project.clone(), Some(home), project.clone()),
+        );
+
+        toggle_speed_read_mode(&mut state);
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char('=')
+        ));
+        let wpm = state
+            .speed_read
+            .as_ref()
+            .map(|mode| mode.model.settings.wpm)
+            .unwrap_or_else(|| panic!("expected speed read mode"));
+        assert!(wpm > 900, "expected the raised speed to exceed built-in max");
+
+        let result = state.speed_read.flush_pending_defaults();
+        assert!(result.is_ok(), "save failed: {result:?}");
+        let saved = fs::read_to_string(project.join("trueflow.toml"))
+            .unwrap_or_else(|error| panic!("failed to read saved config: {error}"));
+        assert!(saved.contains(&format!("default_wpm = {wpm}")), "{saved}");
+    }
+
+    #[test]
+    fn speed_read_save_failure_is_reported_in_footer_without_exiting() {
+        let dir = temp_test_dir("speed_read_save_failure_status");
+        fs::create_dir_all(&dir)
+            .unwrap_or_else(|error| panic!("failed to create {dir:?}: {error}"));
+        let config_path = dir.join("trueflow.toml");
+        fs::write(&config_path, "[tui\n")
+            .unwrap_or_else(|error| panic!("failed to write {config_path:?}: {error}"));
+        let (mut state, _) = build_state_with_single_block("alpha beta gamma delta");
+        state.speed_read = SpeedReadController::new(
+            TuiSpeedReadConfig::default(),
+            SpeedReadDefaultsWriter::in_dir(dir),
+        );
+
+        toggle_speed_read_mode(&mut state);
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char('=')
+        ));
+        assert!(flush_due_speed_read_defaults(
+            &mut state,
+            Instant::now() + std::time::Duration::from_secs(1),
+        ));
+        let Some(error) = state.action_error.clone() else {
+            panic!("expected the idle save failure to be shown in the footer");
+        };
+        assert!(error.contains("Speed-read defaults not saved"), "{error}");
+        assert!(render_screen(&mut state, 120, 24).contains("Speed-read defaults not saved"));
+
+        assert!(clear_action_error(&mut state));
+        assert!(handle_speed_read_key_binding(
+            &mut state,
+            KeyCode::Char('=')
+        ));
+        assert!(!flush_pending_speed_read_defaults(&mut state));
+        assert!(
+            state.action_error.is_some(),
+            "expected the save failure on exit to be shown in the footer"
+        );
+        assert!(
+            flush_pending_speed_read_defaults(&mut state),
+            "the failed save is dropped, so exiting again proceeds"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap_or_default(),
+            "[tui\n",
+            "a failed save must not rewrite the config"
         );
     }
 
