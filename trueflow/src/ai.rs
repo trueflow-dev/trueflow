@@ -1983,7 +1983,11 @@ mod tests {
         );
 
         assert!(request.prompt.contains("NEW_MARKER"), "{}", request.prompt);
-        assert!(request.prompt.contains("[base partial;"), "{}", request.prompt);
+        assert!(
+            request.prompt.contains("[base partial;"),
+            "{}",
+            request.prompt
+        );
         assert!(request.prompt.matches("old();").count() < 80);
     }
 
@@ -2009,7 +2013,10 @@ mod tests {
             let suggestion = AiSuggestion::from_provider_text(raw)
                 .unwrap_or_else(|error| panic!("expected suggestion: {error}"));
 
-            assert_eq!(suggestion.explanation.as_deref(), Some(expected_explanation));
+            assert_eq!(
+                suggestion.explanation.as_deref(),
+                Some(expected_explanation)
+            );
             assert_eq!(suggestion.proposed_change.as_deref(), Some(expected_change));
         }
     }

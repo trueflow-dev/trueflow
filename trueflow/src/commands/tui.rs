@@ -15976,9 +15976,11 @@ mod diff_scope_tests {
         );
         assert!(request.review_set.overview.contains("Review blocks: 1"));
         assert!(request.review_set.overview.contains("fn checked() {"));
-        assert!(request.prompt.contains(
-            "fn checked() {\n    call();\n[source partial; remaining lines omitted]"
-        ));
+        assert!(
+            request
+                .prompt
+                .contains("fn checked() {\n    call();\n[source partial; remaining lines omitted]")
+        );
     }
 
     #[test]
