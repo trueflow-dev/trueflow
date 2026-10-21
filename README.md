@@ -458,6 +458,9 @@ source/test groups, share excerpt space, and retain changed-head context.
 Clipped source is labeled partial; priorities only reorder the ordinary queue.
 CLI provider execution has a 120-second default timeout and bounded output.
 Leaving the AI-plan loading screen cancels its provider process group.
+Ctrl-C, SIGTERM, or SIGHUP while a provider runs (for example during `focus` or
+`onboard` generation) first stops the provider's process group and removes its
+temporary files, then exits as the signal would; a second signal exits at once.
 
 ## Interfaces
 

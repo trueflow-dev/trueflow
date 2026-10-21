@@ -73,6 +73,7 @@ async-lsp = { version = "0.2.4", features = ["tokio"] }
 tokio = { version = "1.53.0", features = ["io-util", "process", "rt", "sync", "time"] }
 tower = "0.5"
 tokio-util = { version = "0.7.18", features = ["compat"] }
+signal-hook = "0.3"
 
 # [dependencies]
 # dioxus = "0.4.3"

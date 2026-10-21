@@ -399,3 +399,38 @@ fn focus_generation_hanging_providers_obey_the_cli_deadline() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn focus_generation_interrupt_stops_the_provider_process_group() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (flag, signal) in [("-INT", 2), ("-TERM", 15), ("-HUP", 1)] {
+        let (repo, _) = fixture("claude")?;
+        let mut generation = Generation::spawn(&repo, "claude", "hang", "30")?;
+        generation.ready()?;
+        let pid: u32 = fs::read_to_string(generation.directory.join("provider.pid"))?.parse()?;
+        Command::new("/bin/kill")
+            .args([flag, &generation.child.id().to_string()])
+            .status()?;
+        let (status, stdout, stderr) = generation.finish()?;
+        assert_eq!(
+            status.signal(),
+            Some(signal),
+            "{flag} must still end trueflow with its default action: {status}: {stderr}"
+        );
+        let provider_alive = Command::new("/bin/kill")
+            .args(["-0", "--", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?
+            .success();
+        assert!(
+            !provider_alive,
+            "{flag} must stop the provider process group before trueflow exits"
+        );
+        assert!(stdout.trim().is_empty());
+        assert!(records(&repo)?.is_empty());
+    }
+    Ok(())
+}

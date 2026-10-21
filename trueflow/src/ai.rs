@@ -1134,6 +1134,7 @@ enum AiExecutionStopped {
     Timeout,
     Cancelled,
     OutputLimit,
+    Interrupted,
 }
 
 impl std::fmt::Display for AiExecutionStopped {
@@ -1142,11 +1143,81 @@ impl std::fmt::Display for AiExecutionStopped {
             Self::Timeout => "AI provider timed out",
             Self::Cancelled => "AI provider cancelled",
             Self::OutputLimit => "AI provider exceeded output limit",
+            Self::Interrupted => "AI provider interrupted by a signal",
         })
     }
 }
 
 impl std::error::Error for AiExecutionStopped {}
+
+/// Defers SIGINT, SIGTERM, and SIGHUP while a provider runs. The provider has
+/// its own process group, so these signals reach only trueflow; deferring them
+/// lets trueflow kill that group and remove temporary files before the signal's
+/// default action ends the process. A second signal acts immediately.
+#[cfg(unix)]
+struct DeferredSignals {
+    received: Vec<(std::ffi::c_int, Arc<AtomicBool>)>,
+    handlers: Vec<signal_hook::SigId>,
+}
+
+#[cfg(unix)]
+impl DeferredSignals {
+    fn register() -> Result<Self> {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+
+        let mut deferred = Self {
+            received: Vec::new(),
+            handlers: Vec::new(),
+        };
+        for signal in [SIGINT, SIGTERM, SIGHUP] {
+            let flag = Arc::new(AtomicBool::new(false));
+            // Registered first, so the first signal only arms it.
+            deferred
+                .handlers
+                .push(signal_hook::flag::register_conditional_default(
+                    signal,
+                    Arc::clone(&flag),
+                )?);
+            deferred
+                .handlers
+                .push(signal_hook::flag::register(signal, Arc::clone(&flag))?);
+            deferred.received.push((signal, flag));
+        }
+        Ok(deferred)
+    }
+
+    fn received(&self) -> Option<std::ffi::c_int> {
+        self.received
+            .iter()
+            .find(|(_, flag)| flag.load(Ordering::Acquire))
+            .map(|(signal, _)| *signal)
+    }
+
+    /// Restores prior signal handling, then performs any deferred default action.
+    fn finish(mut self) -> Result<()> {
+        let received = self.received();
+        self.unregister();
+        if let Some(signal) = received {
+            signal_hook::low_level::emulate_default_handler(signal)?;
+            // Only reached when the signal's default action does not terminate.
+            return Err(AiExecutionStopped::Interrupted.into());
+        }
+        Ok(())
+    }
+
+    fn unregister(&mut self) {
+        for handler in self.handlers.drain(..) {
+            signal_hook::low_level::unregister(handler);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DeferredSignals {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
 
 struct FinalMessageCleanup<'a>(Option<&'a PathBuf>);
 
@@ -1222,6 +1293,26 @@ fn run_cli_invocation_with_options(
     invocation: &AiCliInvocation,
     options: &AiExecutionOptions,
 ) -> Result<AiCliRunOutput> {
+    #[cfg(unix)]
+    {
+        let signals = DeferredSignals::register()?;
+        // The provider group is dead and temporary files are gone before any
+        // deferred signal's default action runs.
+        let output = run_cli_invocation_until(invocation, options, || signals.received().is_some());
+        signals.finish()?;
+        output
+    }
+    #[cfg(not(unix))]
+    {
+        run_cli_invocation_until(invocation, options, || false)
+    }
+}
+
+fn run_cli_invocation_until(
+    invocation: &AiCliInvocation,
+    options: &AiExecutionOptions,
+    interrupted: impl Fn() -> bool,
+) -> Result<AiCliRunOutput> {
     let _cleanup = FinalMessageCleanup(invocation.final_message_path.as_ref());
     if options.cancellation.is_cancelled() {
         return Err(AiExecutionStopped::Cancelled.into());
@@ -1270,6 +1361,9 @@ fn run_cli_invocation_with_options(
                 .is_some_and(|metadata| metadata.len() > options.max_output_bytes as u64);
             if options.cancellation.is_cancelled() {
                 break Err(AiExecutionStopped::Cancelled.into());
+            }
+            if interrupted() {
+                break Err(AiExecutionStopped::Interrupted.into());
             }
             if overflow.load(Ordering::Acquire) || file_overflow {
                 break Err(AiExecutionStopped::OutputLimit.into());
