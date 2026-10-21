@@ -521,8 +521,18 @@ fn projected_item_ranges(item: Node<'_>, kind: DeclarationKind, source: &str) ->
         && let Some(body) = item.child_by_field_name("body")
         && let Some(header_end) = opening_delimiter_end(body, source)
     {
-        let mut ranges = Vec::with_capacity(2);
-        ranges.push(item.start_byte()..header_end);
+        let mut ranges = vec![item.start_byte()..header_end];
+        if kind == DeclarationKind::Module {
+            let mut cursor = body.walk();
+            ranges.extend(
+                body.named_children(&mut cursor)
+                    .filter(|child| is_inner_documentation(*child, source))
+                    .map(|documentation| {
+                        leading_whitespace_start(source, documentation.start_byte(), header_end)
+                            ..documentation.end_byte()
+                    }),
+            );
+        }
         if let Some(close_start) = closing_delimiter_start(body, source) {
             let close_with_layout = leading_whitespace_start(source, close_start, header_end);
             if close_with_layout < item.end_byte() {
@@ -673,7 +683,7 @@ fn collect_attribute_semantics(
     includes: &[Range<usize>],
     semantics: &mut Vec<SemanticRange>,
 ) {
-    if node.kind() == "attribute_item"
+    if matches!(node.kind(), "attribute_item" | "inner_attribute_item")
         && includes
             .iter()
             .any(|included| included.start <= node.start_byte() && included.end >= node.end_byte())
@@ -823,6 +833,18 @@ fn is_outer_documentation(node: Node<'_>, source: &str) -> bool {
         || (text.starts_with("/**") && !text.starts_with("/***"))
 }
 
+/// `//!`, `/*! */` and `#![doc = ...]` inside an inline module document the module itself.
+fn is_inner_documentation(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "line_comment" | "block_comment" => {
+            let text = node_text(node, source).unwrap_or_default().trim_start();
+            text.starts_with("//!") || text.starts_with("/*!")
+        }
+        "inner_attribute_item" => is_doc_attribute(node, source),
+        _ => false,
+    }
+}
+
 fn is_documentation_text(text: &str) -> bool {
     let text = text.trim_start();
     (text.starts_with("///") && !text.starts_with("////"))
@@ -834,7 +856,9 @@ fn is_documentation_text(text: &str) -> bool {
 fn is_doc_attribute(node: Node<'_>, source: &str) -> bool {
     let Some(text) = node_text(node, source)
         .map(str::trim_start)
-        .and_then(|text| text.strip_prefix("#["))
+        .and_then(|text| text.strip_prefix('#'))
+        .map(|text| text.strip_prefix('!').unwrap_or(text))
+        .and_then(|text| text.strip_prefix('['))
     else {
         return false;
     };

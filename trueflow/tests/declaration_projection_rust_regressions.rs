@@ -7,7 +7,8 @@ use trueflow::declaration::snapshot::{
     PathPairEvidence, SnapshotId, SnapshotPair, SnapshotPairId, SourceSnapshot,
 };
 use trueflow::declaration::{
-    Capability, DeclarationKind, DeclarationNode, FileDeclarationFacts, TypeUseRole, project_source,
+    Capability, DeclarationKind, DeclarationNode, FileDeclarationFacts, SourceComponentRole,
+    TypeUseRole, project_source,
 };
 
 fn project(source: &str) -> Result<FileDeclarationFacts> {
@@ -250,6 +251,58 @@ fn named_rust_union_is_projected_or_explicitly_marks_aggregate_projection_partia
             "Rust aggregate projection for a named union must be Complete with an exact aggregate or explicitly Partial, got {capability:?}"
         ),
     }
+
+    Ok(())
+}
+
+#[test]
+fn inline_module_inner_documentation_is_part_of_the_module_projection() -> Result<()> {
+    const SOURCE: &str = concat!(
+        "/// Outer docs.\n",
+        "pub mod codec {\n",
+        "    //! Encodes frames.\n",
+        "    #![doc = \"Wire format.\"]\n",
+        "    #![allow(dead_code)]\n",
+        "    // plain note\n",
+        "    pub fn encode() {}\n",
+        "}\n",
+    );
+
+    let facts = project(SOURCE)?;
+    let codec = declaration_named(&facts, "codec", DeclarationKind::Module)?;
+    assert_eq!(
+        codec.projection_text,
+        concat!(
+            "/// Outer docs.\n",
+            "pub mod codec {\n",
+            "    //! Encodes frames.\n",
+            "    #![doc = \"Wire format.\"]\n",
+            "}",
+        )
+    );
+    let documentation = codec
+        .components
+        .iter()
+        .filter(|component| component.role == SourceComponentRole::Documentation)
+        .map(|component| component.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        documentation,
+        [
+            "/// Outer docs.\n",
+            "//! Encodes frames.\n",
+            "#![doc = \"Wire format.\"]"
+        ]
+    );
+    let encode = declaration_named(&facts, "encode", DeclarationKind::Function)?;
+    assert_eq!(encode.projection_text, "pub fn encode()");
+
+    let edited = project(&SOURCE.replace("Encodes frames.", "Decodes frames."))?;
+    assert_ne!(
+        codec.projection_hash,
+        declaration_named(&edited, "codec", DeclarationKind::Module)?.projection_hash,
+        "editing a module's inner documentation must change its projection"
+    );
 
     Ok(())
 }
