@@ -2319,6 +2319,40 @@ fn test_feedback_xml_escapes_cdata_end() -> Result<()> {
 }
 
 #[test]
+fn test_feedback_xml_replaces_xml_forbidden_control_characters() -> Result<()> {
+    let repo = TestRepo::new("feedback_xml_control_chars")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn core() {\n\t// page\u{0C}break \u{1B}[0m\r\n}\n",
+    )?;
+    repo.commit_all("Add lib")?;
+
+    let hash = first_scan_block_hash_in_process(&repo)?;
+    let record = build_review_record(
+        &hash,
+        ReviewRecordOverrides {
+            verdict: Some("rejected"),
+            note: Some("pasted\u{0B}note\u{7}"),
+            ..Default::default()
+        },
+    );
+    write_reviews_jsonl(&repo.path.join(".trueflow"), &[record])?;
+
+    let output = repo.run(&["feedback", "--format", "xml"])?;
+    let forbidden = output
+        .chars()
+        .filter(|ch| {
+            matches!(ch, '\u{0}'..='\u{8}' | '\u{B}' | '\u{C}' | '\u{E}'..='\u{1F}')
+                || matches!(ch, '\u{FFFE}' | '\u{FFFF}')
+        })
+        .collect::<Vec<_>>();
+    assert!(forbidden.is_empty(), "XML 1.0 forbids {forbidden:?}: {output}");
+    assert!(output.contains("\t// page\u{FFFD}break \u{FFFD}[0m"));
+    assert!(output.contains("<comment>pasted\u{FFFD}note\u{FFFD}</comment>"));
+    Ok(())
+}
+
+#[test]
 fn review_dirty_staged_only_modification_is_not_empty() -> Result<()> {
     let repo = TestRepo::new("review_dirty_staged_modification")?;
     repo.write("src/lib.rs", "pub fn value() -> i32 { 1 }\n")?;

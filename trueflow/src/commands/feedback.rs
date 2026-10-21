@@ -2701,12 +2701,37 @@ fn reviews_xml(reviews: &[crate::store::Record]) -> String {
 }
 
 fn escape_cdata(s: &str) -> Cow<'_, str> {
+    let s = replace_xml_forbidden_chars(s);
     if s.contains("]]>") {
         Cow::Owned(s.replace("]]>", "]]]]><![CDATA[>"))
     } else {
-        Cow::Borrowed(s)
+        s
     }
 }
+
+/// XML 1.0 `Char`. Other code points (C0 controls except tab/LF/CR, U+FFFE,
+/// U+FFFF) are illegal anywhere, including CDATA and character references.
+fn is_xml_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..
+    )
+}
+
+/// Replaces characters XML 1.0 cannot represent with U+FFFD so scanned text
+/// (form feeds, ANSI escapes) never makes the whole export unparsable.
+fn replace_xml_forbidden_chars(s: &str) -> Cow<'_, str> {
+    if s.chars().all(is_xml_char) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(
+            s.chars()
+                .map(|ch| if is_xml_char(ch) { ch } else { '\u{FFFD}' })
+                .collect(),
+        )
+    }
+}
+
 fn block_xml_open_tag(block: &FeedbackBlockView) -> String {
     let common = format!(
         "    <block start_line=\"{}\" end_line=\"{}\" kind=\"{}\" hash=\"{}\"",
@@ -2725,7 +2750,9 @@ fn block_xml_open_tag(block: &FeedbackBlockView) -> String {
 }
 
 fn escape_xml(s: &str) -> Cow<'_, str> {
-    let Some(first_escape) = s.find(['&', '<', '>', '"', '\'']) else {
+    let Some(first_escape) =
+        s.find(|ch| matches!(ch, '&' | '<' | '>' | '"' | '\'') || !is_xml_char(ch))
+    else {
         return Cow::Borrowed(s);
     };
 
@@ -2738,6 +2765,7 @@ fn escape_xml(s: &str) -> Cow<'_, str> {
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
             '\'' => escaped.push_str("&apos;"),
+            ch if !is_xml_char(ch) => escaped.push('\u{FFFD}'),
             _ => escaped.push(ch),
         }
     }
