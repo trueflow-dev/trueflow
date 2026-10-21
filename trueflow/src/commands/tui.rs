@@ -40,8 +40,8 @@ use crate::review_metadata;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::{ReviewAnchor, ReviewOrder};
 use crate::review_pass::{
-    AiPick, CandidateChange, CandidateClass, PassCandidate, PassCard, PassPlan, PassSignal,
-    PassWhy, ReviewPass, format_reading_estimate,
+    AiPick, PassCandidate, PassCard, PassPlan, PassScope, PassSignal, PassWhy, ReviewPass,
+    format_reading_estimate,
 };
 use crate::review_scope::{
     DiffQuery, ScopeOption, ScopePreset, commit_scope_option, default_scope_options,
@@ -1836,7 +1836,7 @@ fn configure_onboarding(
     anyhow::ensure!(
         selected.iter().all(|&id| match purpose {
             CardQueuePurpose::Plan(_) => !state.navigator.tree.is_container_block(id),
-            CardQueuePurpose::FocusedPass { .. } => !has_pending_descendant(state, id),
+            CardQueuePurpose::FocusedPass { .. } => !pass_scope(state).has_pending_descendant(id),
         }),
         "onboarding cards must be leaf blocks: container approvals cover unselected descendants"
     );
@@ -2484,50 +2484,17 @@ fn clear_ai_review_plan_priorities(state: &mut AppState) {
     reset_review_focus_to_first_block(state);
 }
 
-/// Pending blocks in canonical order. Containers with pending descendants are
-/// excluded because their approvals would cover blocks outside the pass.
-fn focused_pass_candidates(state: &AppState) -> Vec<PassCandidate<'_, TreeNodeId>> {
-    let tree = &state.navigator.tree;
-    let canonical = ReviewOrder::from_tree(tree, &state.reviewable_nodes);
-    canonical
-        .iter_node_ids()
-        .filter(|&node_id| !has_pending_descendant(state, node_id))
-        .filter_map(|node_id| {
-            let node = tree.node(node_id);
-            let block = node.block.as_ref()?;
-            let base = state
-                .diff_block_sides
-                .get(&node_id)
-                .and_then(|sides| sides.base.as_ref());
-            let change = match (state.block_change_kinds.get(&node_id), base) {
-                (None, _) => CandidateChange::Unchanged,
-                (Some(BlockChangeKind::Added), _) | (Some(BlockChangeKind::Changed), None) => {
-                    CandidateChange::Added
-                }
-                (Some(BlockChangeKind::Deleted), _) => CandidateChange::Deleted,
-                (Some(BlockChangeKind::Changed), Some(base)) => CandidateChange::Changed {
-                    base: &base.content,
-                },
-            };
-            Some(PassCandidate {
-                id: node_id,
-                kind: block.kind,
-                class: CandidateClass::of(node),
-                content: &block.content,
-                change,
-                complexity: block.complexity,
-            })
-        })
-        .collect()
+fn pass_scope(state: &AppState) -> PassScope<'_> {
+    PassScope {
+        tree: &state.navigator.tree,
+        pending: &state.reviewable_nodes,
+        diff_block_sides: &state.diff_block_sides,
+        block_change_kinds: &state.block_change_kinds,
+    }
 }
 
-fn has_pending_descendant(state: &AppState, node_id: TreeNodeId) -> bool {
-    state.navigator.tree.is_container_block(node_id)
-        && state
-            .navigator
-            .visible_descendant_block_ids(node_id)
-            .into_iter()
-            .any(|id| id != node_id && state.reviewable_nodes.contains(&id))
+fn focused_pass_candidates(state: &AppState) -> Vec<PassCandidate<'_, TreeNodeId>> {
+    pass_scope(state).candidates()
 }
 
 fn heuristic_pass_for_state(state: &AppState, budget: ReviewDuration) -> PassPlan<TreeNodeId> {

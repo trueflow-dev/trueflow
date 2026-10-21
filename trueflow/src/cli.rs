@@ -127,6 +127,14 @@ pub enum Commands {
         /// Exclude block types (e.g. "gap", "comment", "whitespace")
         #[arg(long)]
         exclude: Vec<BlockKind>,
+
+        /// List every pending block (`full`) or only a reading-budgeted, explained subset (`focused`, heuristic)
+        #[arg(long, value_enum, default_value_t = ReviewPass::Full)]
+        pass: ReviewPass,
+
+        /// Reading budget for `--pass focused`, e.g. 5m or 90s; defaults to [tui].pass_budget
+        #[arg(long, value_name = "DURATION")]
+        budget: Option<ReviewDuration>,
     },
     /// Export feedback for LLM/Agent consumption
     Feedback {

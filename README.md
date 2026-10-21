@@ -501,6 +501,7 @@ changes: read the consequential slice first, then decide whether to continue.
 trueflow tui --target main --pass focused              # 5m default budget
 trueflow tui --target pr:11 --pass focused --budget 10m  # each PR commit gets its own pass
 trueflow tui --budget 2m    # then press f on any scope-selector row
+trueflow review --target main --pass focused --json   # same heuristic subset for agents
 ```
 
 - **Selection.** With `[ai] mode` including `review_plan`, the pass takes the
@@ -521,6 +522,11 @@ trueflow tui --budget 2m    # then press f on any scope-selector row
   the AI plan's checks. `a`, `c`, `h`/`l`/Space, and `m` (diff/source) work as in
   onboarding. Parent, child, and root navigation are disabled so an approval
   never covers unselected code.
+- **CLI.** `trueflow review --pass focused [--budget 5m] [--json]` prints the
+  heuristic pass without opening the TUI: `pass`, `source`, `budget_seconds`,
+  `estimated_seconds`, `remainder`, and `cards` (each with `path`,
+  `fingerprint`, `kind`, the `review --json` line range, `estimated_seconds`,
+  `why`, and `content`). It never calls an LLM or records a verdict.
 - **Remainder.** Unselected blocks stay pending. The recap reports how many
   remain; Enter reloads the same scope as a full review, `d` reviews something
   else (the scope selector, or the next commit of a PR), and `q` quits.

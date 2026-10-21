@@ -11,12 +11,24 @@ use std::hash::Hash;
 
 use crate::analysis::Language;
 use crate::block::BlockKind;
+use crate::commands::review::{BlockChangeKind, DiffBlockSides};
 use crate::focus::ReviewDuration;
 use crate::focus_evidence::{EvidenceKind, SourceClass, signal as lexical_signal, source_class};
-use crate::tree::TreeNode;
+use crate::review_order::ReviewOrder;
+use crate::tree::{Tree, TreeNode, TreeNodeId};
 
-/// Which part of a scope's pending queue a TUI review session walks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, serde::Deserialize)]
+/// Which part of a scope's pending queue a review walks or lists.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewPass {
     /// Every pending block, in canonical review order.
@@ -102,8 +114,68 @@ pub struct PassCandidate<'a, Id> {
     pub complexity: Option<u32>,
 }
 
+/// The pending blocks of a collected review scope.
+#[derive(Clone, Copy)]
+pub struct PassScope<'a> {
+    pub tree: &'a Tree,
+    pub pending: &'a HashSet<TreeNodeId>,
+    pub diff_block_sides: &'a HashMap<TreeNodeId, DiffBlockSides>,
+    pub block_change_kinds: &'a HashMap<TreeNodeId, BlockChangeKind>,
+}
+
+impl<'a> PassScope<'a> {
+    /// Pending blocks in canonical order. Containers with pending descendants
+    /// are excluded because their approvals would cover blocks outside a pass.
+    pub fn candidates(self) -> Vec<PassCandidate<'a, TreeNodeId>> {
+        let canonical = ReviewOrder::from_tree(self.tree, self.pending);
+        canonical
+            .iter_node_ids()
+            .filter(|&node_id| !self.has_pending_descendant(node_id))
+            .filter_map(|node_id| {
+                let node = self.tree.node(node_id);
+                let block = node.block.as_ref()?;
+                let base = self
+                    .diff_block_sides
+                    .get(&node_id)
+                    .and_then(|sides| sides.base.as_ref());
+                let change = match (self.block_change_kinds.get(&node_id), base) {
+                    (None, _) => CandidateChange::Unchanged,
+                    (Some(BlockChangeKind::Added), _) | (Some(BlockChangeKind::Changed), None) => {
+                        CandidateChange::Added
+                    }
+                    (Some(BlockChangeKind::Deleted), _) => CandidateChange::Deleted,
+                    (Some(BlockChangeKind::Changed), Some(base)) => CandidateChange::Changed {
+                        base: &base.content,
+                    },
+                };
+                Some(PassCandidate {
+                    id: node_id,
+                    kind: block.kind,
+                    class: CandidateClass::of(node),
+                    content: &block.content,
+                    change,
+                    complexity: block.complexity,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether approving `node_id` would also cover another pending block.
+    pub fn has_pending_descendant(self, node_id: TreeNodeId) -> bool {
+        let mut stack = self.tree.node(node_id).children.clone();
+        while let Some(child) = stack.pop() {
+            if self.pending.contains(&child) {
+                return true;
+            }
+            stack.extend_from_slice(&self.tree.node(child).children);
+        }
+        false
+    }
+}
+
 /// Who chose a focused pass's cards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PassSource {
     AiPlan,
     Heuristic,

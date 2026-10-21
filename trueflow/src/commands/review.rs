@@ -3,12 +3,16 @@ use crate::block::{Block, BlockKind, ByteSpan};
 use crate::config::{BlockFilters, load as load_config};
 use crate::context::TrueflowContext;
 use crate::coverage::CoverageIndex;
+use crate::focus::ReviewDuration;
 use crate::policy::{
     should_skip_container_by_default, should_skip_imports_by_default,
     should_skip_whitespace_only_by_default,
 };
 use crate::repo_path::RepoPath;
 use crate::review_metadata;
+use crate::review_pass::{
+    PassScope, PassSource, PassWhy, ReviewPass, format_reading_estimate, heuristic_pass,
+};
 use crate::scanner::{self, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, Verdict};
 use crate::sub_splitter;
@@ -1134,21 +1138,159 @@ pub fn print_review_summary(summary: ReviewSummary, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(
-    _context: &TrueflowContext,
+/// Arguments of `trueflow review`.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewRunRequest<'a> {
+    pub json: bool,
+    pub all: bool,
+    pub target: &'a [ReviewTarget],
+    pub since: Option<&'a str>,
+    pub only: &'a [BlockKind],
+    pub exclude: &'a [BlockKind],
+    pub pass: ReviewPass,
+    pub budget: Option<ReviewDuration>,
+}
+
+pub fn run(_context: &TrueflowContext, request: ReviewRunRequest<'_>) -> Result<()> {
+    info!("review start ({request:?})");
+    let targets = resolve_review_command_targets(request.all, request.target, request.since)?;
+    let review_request = review_request_from_cli_targets(request.all, &targets)?;
+    match (request.pass, request.budget) {
+        (ReviewPass::Full, Some(_)) => Err(anyhow!(
+            "--budget applies to focused passes; add --pass focused"
+        )),
+        (ReviewPass::Full, None) => {
+            run_request(request.json, review_request, request.only, request.exclude)
+        }
+        (ReviewPass::Focused, budget) => run_focused_pass(
+            request.json,
+            review_request,
+            request.only,
+            request.exclude,
+            budget,
+        ),
+    }
+}
+
+/// One explained card of a focused pass, in the block coordinates of `review --json`.
+#[derive(Serialize)]
+struct FocusedPassCardReport<'a> {
+    path: &'a RepoPath,
+    fingerprint: &'a crate::hashing::TreeHash,
+    kind: BlockKind,
+    start_line: usize,
+    end_line: usize,
+    estimated_seconds: usize,
+    why: Vec<String>,
+    content: &'a str,
+}
+
+#[derive(Serialize)]
+struct FocusedPassReport<'a> {
+    pass: ReviewPass,
+    source: PassSource,
+    budget_seconds: usize,
+    estimated_seconds: usize,
+    /// Pending blocks the pass leaves for a full review of the same scope.
+    remainder: usize,
+    cards: Vec<FocusedPassCardReport<'a>>,
+}
+
+fn run_focused_pass(
     json: bool,
-    all: bool,
-    target: &[ReviewTarget],
-    since: Option<&str>,
+    request: ReviewRequest,
     only: &[BlockKind],
     exclude: &[BlockKind],
+    budget: Option<ReviewDuration>,
 ) -> Result<()> {
-    info!(
-        "review start (json={json}, all={all}, target={target:?}, since={since:?}, only={only:?}, exclude={exclude:?})"
+    let config = load_config()?;
+    let budget = budget.unwrap_or(config.tui.pass_budget);
+    let filters = config.review.resolve_filters(only, exclude);
+    let query = resolve_review_request(request, filters, config.scan.resolve_options())?;
+    let review = collect_review(&query)?;
+    for diagnostic in &review.summary.diagnostics {
+        eprintln!("warning: {}", diagnostic.display_message());
+    }
+    let pending = review
+        .unreviewed_block_nodes
+        .iter()
+        .copied()
+        .filter(|&id| matches!(review.tree.node(id).kind, tree::TreeNodeKind::Block))
+        .collect::<HashSet<_>>();
+    let scope = PassScope {
+        tree: &review.tree,
+        pending: &pending,
+        diff_block_sides: &review.diff_block_sides,
+        block_change_kinds: &review.block_change_kinds,
+    };
+    let plan = heuristic_pass(&scope.candidates(), budget);
+    let cards = plan
+        .cards
+        .iter()
+        .filter_map(|card| {
+            let node = review.tree.node(card.id);
+            let block = node.block.as_ref()?;
+            let why = match &card.why {
+                PassWhy::Signals(signals) => signals.iter().map(ToString::to_string).collect(),
+                PassWhy::AiPlan { reason, .. } => vec![reason.clone()],
+            };
+            Some(FocusedPassCardReport {
+                path: &node.path,
+                fingerprint: &block.hash,
+                kind: block.kind,
+                start_line: block.start_line,
+                end_line: block.end_line,
+                estimated_seconds: card.estimated_seconds,
+                why,
+                content: &block.content,
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = FocusedPassReport {
+        pass: ReviewPass::Focused,
+        source: plan.source,
+        budget_seconds: plan.budget.seconds(),
+        estimated_seconds: plan.estimated_seconds(),
+        remainder: plan.remainder,
+        cards,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if report.cards.is_empty() {
+        println!("All clear! No unreviewed blocks found.");
+        return Ok(());
+    }
+    println!(
+        "Focused pass: {} of {} pending blocks, ~{} of {} (chosen by {})",
+        report.cards.len(),
+        report.cards.len() + report.remainder,
+        format_reading_estimate(report.estimated_seconds),
+        format_reading_estimate(report.budget_seconds),
+        plan.source.label(),
     );
-    let targets = resolve_review_command_targets(all, target, since)?;
-    let request = review_request_from_cli_targets(all, &targets)?;
-    run_request(json, request, only, exclude)
+    for card in &report.cards {
+        println!(
+            "  {}:L{}-L{} {} ~{} (Hash: {})",
+            card.path,
+            card.start_line,
+            card.end_line,
+            card.kind,
+            format_reading_estimate(card.estimated_seconds),
+            card.fingerprint
+        );
+        for reason in &card.why {
+            println!("    why: {reason}");
+        }
+    }
+    if report.remainder > 0 {
+        println!(
+            "{} pending blocks stay outside this pass; run without --pass focused for all of them.",
+            report.remainder
+        );
+    }
+    Ok(())
 }
 
 fn resolve_review_command_targets(
