@@ -269,7 +269,8 @@ fn focus_reports_an_empty_scope_before_checking_for_an_llm() -> Result<()> {
             &["focus", "--duration", "5m", "--path", "src", "--json"],
             &[("HOME", home), ("PATH", "/usr/bin:/bin")],
         )
-        .expect_err("an empty scope cannot produce a focus plan")
+        .err()
+        .context("an empty scope cannot produce a focus plan")?
         .to_string();
     assert!(error.contains("no unreviewed"), "{error}");
     assert!(!error.contains("LLM"), "{error}");

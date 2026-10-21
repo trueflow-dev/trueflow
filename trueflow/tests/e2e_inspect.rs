@@ -140,7 +140,8 @@ fn inspect_path_from_subdirectory_resolves_like_mark_path() -> Result<()> {
 
     let error = repo
         .run_in(&["inspect", "--fingerprint", hash], &subdir)
-        .expect_err("duplicate content is ambiguous without --path")
+        .err()
+        .context("duplicate content is ambiguous without --path")?
         .to_string();
     assert!(
         error.contains("src/a.rs line") && error.contains("src/b.rs line"),
