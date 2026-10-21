@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -112,19 +112,30 @@ pub fn prepare_declaration_launch(
 
     let collection_query = DeclarationReviewQuery::new(review_batches).with_records(records);
     let collected = collect_declaration_review(&collection_query)?;
+    let mut seen = HashSet::with_capacity(collected.items.len());
     let mut targets = Vec::with_capacity(collected.items.len());
     for item in collected.items {
+        // Overlapping diff targets (for example `rev:HEAD` and `HEAD^..HEAD`) capture the
+        // same surface once per target. The declaration ID already binds path, kind, name,
+        // position, and projection, so an identical occurrence is reviewed once.
+        if !seen.insert(item.declaration.id.clone()) {
+            continue;
+        }
         let provenance = resolve_target_provenance(&captures, &item)?;
         targets.push(PreparedDeclarationTarget::from_collected(item, provenance));
     }
     let documents = build_documents(&targets)?;
+    let canonical_order = targets
+        .iter()
+        .map(|target| target.declaration.id.clone())
+        .collect();
 
     Ok(PreparedDeclarationLaunch {
         status: collected.status,
         documents,
         targets,
         capability_notices: collected.capability_notices,
-        canonical_order: collected.canonical_order,
+        canonical_order,
     })
 }
 

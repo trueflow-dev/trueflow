@@ -22,7 +22,9 @@ use trueflow::store::{
     BlockState, CURRENT_VERSION, CommentAnchor, CommitId, Identity, Record, RepoRef, ReviewCheck,
     ReviewTargetRef, VcsSystem, Verdict,
 };
-use trueflow::targets::{ReviewContentSource, ReviewDiffSelection, ReviewPathSelection};
+use trueflow::targets::{
+    CommitRange, ReviewContentSource, ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection,
+};
 use trueflow::vcs::ChangedPath;
 use trueflow_test_support::{TestRepo, run_git_output};
 
@@ -776,6 +778,49 @@ fn shell_function_declarations_are_reviewable_without_aborting_dirty_launch() ->
             "# Reports service status.\nfunction healthcheck",
         )],
         "the added function must be reviewable while deploy's body-only edit stays out of the declaration review"
+    );
+    Ok(())
+}
+
+#[test]
+fn overlapping_diff_targets_review_an_identical_declaration_once() -> Result<()> {
+    let repo = TestRepo::new("declaration_tui_overlapping_targets")?;
+    repo.write("src/a.rs", A_BASE)?;
+    repo.commit_all("base declaration surfaces")?;
+    let parent = head_revision(&repo)?;
+    repo.write("src/a.rs", A_HEAD)?;
+    repo.commit_all("change alpha")?;
+    let head = head_revision(&repo)?;
+    let query = ResolvedReviewQuery {
+        filters: BlockFilters::default(),
+        scan_options: ScanOptions::default(),
+        content_source: ReviewContentSource::Revision(head.clone()),
+        path_selection: ReviewPathSelection::All,
+        diff_selection: ReviewDiffSelection::Targets(vec![
+            ReviewDiffTarget::Revision(head.clone()),
+            ReviewDiffTarget::RevisionRange(CommitRange {
+                start: parent,
+                end: head,
+            }),
+        ]),
+    };
+
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+    assert_eq!(
+        prepared
+            .targets()
+            .iter()
+            .map(|target| target.declaration.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha"],
+        "both targets capture the same alpha surface; it must be one review item"
+    );
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity(), RecordingAppender::default(), 120, 20)?;
+    runtime.submit(DeclarationReviewActionKind::Approve, None)?;
+    assert!(
+        runtime.is_finished(),
+        "approving the merged occurrence must finish the review"
     );
     Ok(())
 }
