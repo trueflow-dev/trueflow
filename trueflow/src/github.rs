@@ -247,8 +247,11 @@ pub struct GitRemote {
 }
 
 impl GitRemote {
+    /// GitHub host, owner, and repository names are case-insensitive.
     fn matches_pull_request(&self, pr: &ResolvedPullRequestRef) -> bool {
-        self.host == pr.host && self.owner == pr.owner && self.repo == pr.repo
+        self.host.eq_ignore_ascii_case(&pr.host)
+            && self.owner.eq_ignore_ascii_case(&pr.owner)
+            && self.repo.eq_ignore_ascii_case(&pr.repo)
     }
 }
 
@@ -3028,6 +3031,49 @@ mod tests {
         assert_eq!(prepared.remote.name, "origin");
         assert_eq!(fetch_calls.len(), 1);
         assert_eq!(fetch_calls[0].1, "origin");
+    }
+
+    #[test]
+    fn prepare_pull_request_review_matches_remote_case_insensitively() {
+        let repo_root = temp_git_repo("prepare_pr_review_case");
+        run_git(
+            &repo_root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@GitHub.com:JMQD/Trueflow.git",
+            ],
+        );
+        let metadata = PullRequestMetadata {
+            pr: ResolvedPullRequestRef {
+                host: "github.com".to_string(),
+                owner: "jmqd".to_string(),
+                repo: "trueflow".to_string(),
+                number: 11,
+            },
+            title: "Seed review flow".to_string(),
+            base_ref: "main".to_string(),
+            base_sha: CommitId::new("1111111111111111111111111111111111111111").unwrap(),
+            head_ref: "feature".to_string(),
+            head_sha: CommitId::new("2222222222222222222222222222222222222222").unwrap(),
+            commits: vec![],
+        };
+        let client = FakeGitHubClient {
+            metadata: metadata.clone(),
+        };
+        for requested in [
+            PullRequestRef::Number { number: 11 },
+            PullRequestRef::from_cli("https://github.com/jmqd/TRUEFLOW/pull/11").unwrap(),
+        ] {
+            let prepared =
+                prepare_pull_request_review_with(&repo_root, &requested, &client, |_, _, _| {
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(prepared.remote.name, "origin");
+            assert_eq!(prepared.metadata, metadata);
+        }
     }
 
     #[test]
