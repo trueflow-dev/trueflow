@@ -372,12 +372,7 @@ impl<P: DeclarationRelationshipProvider> RelationshipBridge<P> {
         runtime: &mut DeclarationAppRuntime<A>,
         update: RelationshipUpdate,
     ) -> Result<bool> {
-        if self.closed
-            || runtime
-                .selected_target()
-                .map(|target| target.declaration.id.as_str())
-                != Some(update.declaration_id.as_str())
-        {
+        if self.closed || runtime.controller().is_none() {
             return Ok(false);
         }
         let Some(latest_generation) = self.latest_generations.get(&update.declaration_id) else {

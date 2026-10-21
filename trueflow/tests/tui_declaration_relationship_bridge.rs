@@ -861,6 +861,62 @@ fn inspected_relationship_destination_accepts_its_updates_without_advancing_queu
 }
 
 #[test]
+fn completion_for_a_declaration_left_while_in_flight_is_stored_for_its_return() -> Result<()> {
+    let fixture = ReviewFixture::new("relationship_bridge_unselected_completion")?;
+    let provider = FakeProvider::new(&fixture.repo.path, [Script::SupportedEmpty]);
+    let mut bridge = RelationshipBridge::new(
+        &fixture.prepared,
+        &fixture.repo.path,
+        WorkspaceTrust::TrustedForInvocation,
+        Some(LspServerProfile::RustAnalyzer),
+        provider,
+    )?;
+    let mut runtime = fixture.runtime()?;
+    let loading = bridge.request(&fixture.alpha)?;
+    assert!(apply(&mut bridge, &mut runtime, loading)?);
+
+    runtime.skip_current()?;
+    assert_eq!(
+        runtime.selected_target().map(|target| &target.declaration.id),
+        Some(&fixture.config),
+        "fixture must leave alpha before its relationships complete"
+    );
+    let completed = bridge.poll().context("missing alpha completion")?;
+    assert!(
+        apply(&mut bridge, &mut runtime, completed)?,
+        "a finished result for an unselected declaration must be stored, not discarded"
+    );
+
+    runtime.apply_relationship_state(
+        fixture.config.as_str(),
+        GraphRelationshipState::Ready(vec![RelationshipGroup {
+            label: "Used by".to_owned(),
+            relationships: vec![Relationship {
+                id: "config.used_by.alpha".to_owned(),
+                label: "alpha".to_owned(),
+                destination: RelationshipDestination::InReview {
+                    declaration_id: fixture.alpha.as_str().to_owned(),
+                },
+            }],
+        }]),
+    )?;
+    let controller = runtime.controller_mut().context("missing controller")?;
+    for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Enter] {
+        controller.handle_key(key)?;
+    }
+    assert_eq!(
+        runtime.selected_target().map(|target| &target.declaration.id),
+        Some(&fixture.alpha)
+    );
+    let visible = runtime.visible_text();
+    assert!(
+        visible.contains("No relationships found") && !visible.contains("Checking…"),
+        "returning to alpha must show its finished result: {visible}"
+    );
+    Ok(())
+}
+
+#[test]
 fn provider_results_map_exact_targets_into_stable_advisory_groups_without_reordering_review()
 -> Result<()> {
     let fixture = ReviewFixture::new("relationship_bridge_mapping")?;
