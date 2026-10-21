@@ -34,6 +34,8 @@ stores review state in an append-only flat file database, e.g.
   removes or duplicates targets; every omitted block remains in canonical
   relative order.
 - Pressing Esc on the AI briefing preserves canonical order.
+- A focused pass reviews a reading-budgeted subset first; everything it leaves
+  out stays pending until a full review.
 - Runtime config lives in `trueflow.toml`.
 - Current website-distributed binary support is Apple Silicon macOS and Linux x86_64.
 
@@ -154,6 +156,9 @@ Website/deployment/infrastructure docs live in `infra/README.md`.
 ```sh
 # Launch the TUI. The main way to use trueflow.
 trueflow tui
+
+# Review only the most consequential slice of a change in about five minutes.
+trueflow tui --target main --pass focused
 
 # Start a short, LLM-generated first-pass review of this repository
 trueflow onboard
@@ -419,6 +424,11 @@ mode = "blocks"
 # default: disabled
 # diff_line_numbers = "old_new"
 
+# Review pass: full|focused. CLI --pass takes precedence.
+pass = "full"
+# Focused-pass reading budget ("90s", "5m", up to 60m). CLI --budget takes precedence.
+pass_budget = "5m"
+
 [tui.keybinds]
 scroll_up = "k"
 scroll_down = "j"
@@ -432,6 +442,7 @@ toggle_view = "m"
 speed_read = "r"
 root = "g"
 recap_done = "d"
+focused_pass = "f"
 quit = "q"
 
 [tui.speed_read]
@@ -474,7 +485,42 @@ Main review actions:
 - `r` toggle speed-reading
 - `g` jump to root
 - `d` choose another review scope from the recap screen
+- `f` in the scope selector or on the AI briefing starts a [focused pass](#focused-passes)
 - `q` quit
+
+#### Focused passes
+
+A focused pass walks a reading-budgeted subset of a scope's pending blocks
+instead of every block. It suits high-level review of large or agent-written
+changes: read the consequential slice first, then decide whether to continue.
+
+```sh
+trueflow tui --target main --pass focused              # 5m default budget
+trueflow tui --target pr:11 --pass focused --budget 10m
+trueflow tui --budget 2m    # then press f on any scope-selector row
+```
+
+- **Selection.** With `[ai] mode` including `review_plan`, the pass takes the
+  plan's priority blocks in the model's order. Without AI, or when the plan is
+  unavailable, the briefing says so and offers an explicitly labelled heuristic
+  pass; nothing is substituted silently.
+- **Heuristics.** Ranked by explicit signal weight per estimated reading second:
+  data shapes, public interfaces, trust boundaries, writes, concurrency,
+  complexity, and change size. Code outranks tests, which outrank prose, which
+  outranks generated or vendored files (including lock files); a pass draws
+  only from the most consequential class present and is never padded with the
+  others. Lexical signals are observations, not findings.
+- **Budget.** Estimates use the onboarding formula: ten seconds per card plus
+  two per line read. A changed block costs its changed lines plus three context
+  lines on each side, not the whole block. If nothing fits, the top-ranked
+  block is kept and its estimate shows the overrun.
+- **Cards.** Each card explains why it was chosen; `F1` shows the full reason or
+  the AI plan's checks. `a`, `c`, `h`/`l`/Space, and `m` (diff/source) work as in
+  onboarding. Parent, child, and root navigation are disabled so an approval
+  never covers unselected code.
+- **Remainder.** Unselected blocks stay pending. The recap reports how many
+  remain; Enter reloads the same scope as a full review, `d` chooses another
+  scope, and `q` quits.
 
 #### Declaration Review
 
@@ -545,6 +591,7 @@ toggle_view = "v"
 speed_read = "s"
 root = "z"
 recap_done = "w"
+focused_pass = "b"
 quit = "x"
 ```
 

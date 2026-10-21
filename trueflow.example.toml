@@ -49,6 +49,11 @@ mode = "blocks"
 confirm_batch_sub_blocks = 2
 # Diff-mode line numbers: disabled|old_new. Default keeps diffs focused on +/- content.
 diff_line_numbers = "disabled"
+# Review pass a launch starts with: full|focused. A focused pass walks a
+# reading-budgeted subset chosen by the AI review plan or explicit heuristics.
+pass = "full"
+# Reading budget for focused passes, in seconds or minutes ("90s", "5m"; up to 60m).
+pass_budget = "5m"
 
 [tui.keybinds]
 # Keybind defaults. Arrow keys mirror prev/next and up/down.
@@ -64,6 +69,7 @@ toggle_view = "m"
 speed_read = "r"
 root = "g"
 recap_done = "d"
+focused_pass = "f"
 quit = "q"
 
 [tui.speed_read]
