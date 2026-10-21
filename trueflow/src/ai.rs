@@ -179,6 +179,8 @@ pub struct AiReviewPlanBlock {
     pub block_hash: TreeHash,
     pub start_line: usize,
     pub end_line: usize,
+    /// Reading estimate a focused pass would charge for this block.
+    pub estimated_seconds: usize,
     pub content: String,
 }
 
@@ -211,6 +213,7 @@ impl AiReviewPlanRequest {
         scope_label: &str,
         blocks: &[AiReviewPlanBlock],
         max_context_lines: usize,
+        focused_pass_budget_seconds: usize,
     ) -> Self {
         let selected = review_plan_manifest_indices(blocks, 120);
         let sources = selected
@@ -261,7 +264,13 @@ impl AiReviewPlanRequest {
                 )
             })
             .collect::<Vec<_>>();
-        let prompt = build_review_plan_prompt(&review_set_hash, scope_label, &coverage, &presented);
+        let prompt = build_review_plan_prompt(
+            &review_set_hash,
+            scope_label,
+            &coverage,
+            &presented,
+            focused_pass_budget_seconds,
+        );
 
         Self {
             review_set_hash,
@@ -522,7 +531,10 @@ fn build_review_plan_prompt(
     scope_label: &str,
     coverage: &AiReviewPlanCoverage,
     presented: &[(&AiReviewPlanBlock, String, Vec<String>)],
+    focused_pass_budget_seconds: usize,
 ) -> String {
+    use crate::review_pass::format_reading_estimate;
+
     let suffix = if coverage.is_partial() {
         " (partial)"
     } else {
@@ -533,12 +545,13 @@ fn build_review_plan_prompt(
         let line_start = block.start_line.saturating_add(1);
         let line_end = block.end_line.max(block.start_line.saturating_add(1));
         manifest.push_str(&format!(
-            "\n- {}\n  Path: {}\n  Language: {:?}\n  Block kind: {}\n  Block hash: {}\n  Lines: {line_start}-{line_end}\n",
+            "\n- {}\n  Path: {}\n  Language: {:?}\n  Block kind: {}\n  Block hash: {}\n  Lines: {line_start}-{line_end}\n  Reading estimate: ~{}\n",
             block_id,
             block.path,
             block.language,
             block.block_kind.as_str(),
             block.block_hash,
+            format_reading_estimate(block.estimated_seconds),
         ));
         if excerpt.is_empty() {
             manifest.push_str("  Excerpt: (excerpt omitted by context budget)\n");
@@ -572,7 +585,9 @@ Return exactly one JSON object with no Markdown and exactly these keys:\n\
 }}\n\
 Use only the supplied context. Do not run tools or inspect other files. Copy block IDs verbatim.\n\
 Return at most eight priority blocks. Avoid style-only or speculative advice.\n\
+A focused pass reads only the priority blocks, in your order, within about {budget}; prefer a coherent set whose reading estimates fit, most consequential first.\n\
 Do not include Markdown fences or any text outside the JSON object.",
+        budget = format_reading_estimate(focused_pass_budget_seconds),
         presented = coverage.presented_blocks,
         total = coverage.total_blocks,
         excerpt_lines = coverage.excerpt_lines,
@@ -2176,6 +2191,7 @@ mod tests {
             block_hash: TreeHash::from_content(&content),
             start_line: index + 1,
             end_line: index + 3,
+            estimated_seconds: 16,
             content,
         }
     }
@@ -2189,7 +2205,28 @@ mod tests {
             "changed files",
             blocks,
             max_context_lines,
+            300,
         )
+    }
+
+    #[test]
+    fn review_plan_prompt_states_reading_estimates_and_the_focused_pass_budget() {
+        let mut long = review_plan_block(1, "fn long() {}".to_string());
+        long.estimated_seconds = 410;
+        let blocks = vec![review_plan_block(0, "fn short() {}".to_string()), long];
+        let prompt = review_plan_request(&blocks, 20).prompt;
+        assert!(
+            prompt.contains("- B0001\n  Path: src/file_0.rs")
+                && prompt.contains("  Reading estimate: ~16s\n"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("  Reading estimate: ~6m 50s\n"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "A focused pass reads only the priority blocks, in your order, within about 5m"
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]

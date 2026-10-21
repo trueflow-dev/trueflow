@@ -10,7 +10,7 @@ use std::fmt;
 use std::hash::Hash;
 
 use crate::analysis::Language;
-use crate::block::BlockKind;
+use crate::block::{Block, BlockKind};
 use crate::commands::review::{BlockChangeKind, DiffBlockSides};
 use crate::focus::ReviewDuration;
 use crate::focus_evidence::{EvidenceKind, SourceClass, signal as lexical_signal, source_class};
@@ -133,21 +133,7 @@ impl<'a> PassScope<'a> {
             .filter(|&node_id| !self.has_pending_descendant(node_id))
             .filter_map(|node_id| {
                 let node = self.tree.node(node_id);
-                let block = node.block.as_ref()?;
-                let base = self
-                    .diff_block_sides
-                    .get(&node_id)
-                    .and_then(|sides| sides.base.as_ref());
-                let change = match (self.block_change_kinds.get(&node_id), base) {
-                    (None, _) => CandidateChange::Unchanged,
-                    (Some(BlockChangeKind::Added), _) | (Some(BlockChangeKind::Changed), None) => {
-                        CandidateChange::Added
-                    }
-                    (Some(BlockChangeKind::Deleted), _) => CandidateChange::Deleted,
-                    (Some(BlockChangeKind::Changed), Some(base)) => CandidateChange::Changed {
-                        base: &base.content,
-                    },
-                };
+                let (block, change) = self.block_and_change(node_id)?;
                 Some(PassCandidate {
                     id: node_id,
                     kind: block.kind,
@@ -158,6 +144,31 @@ impl<'a> PassScope<'a> {
                 })
             })
             .collect()
+    }
+
+    /// The reading estimate a pass charges for `node_id`, if it is a block.
+    pub fn estimated_seconds(self, node_id: TreeNodeId) -> Option<usize> {
+        let (block, change) = self.block_and_change(node_id)?;
+        Some(reading_seconds(reading_lines(&block.content, change).read))
+    }
+
+    fn block_and_change(self, node_id: TreeNodeId) -> Option<(&'a Block, CandidateChange<'a>)> {
+        let block = self.tree.node(node_id).block.as_ref()?;
+        let base = self
+            .diff_block_sides
+            .get(&node_id)
+            .and_then(|sides| sides.base.as_ref());
+        let change = match (self.block_change_kinds.get(&node_id), base) {
+            (None, _) => CandidateChange::Unchanged,
+            (Some(BlockChangeKind::Added), _) | (Some(BlockChangeKind::Changed), None) => {
+                CandidateChange::Added
+            }
+            (Some(BlockChangeKind::Deleted), _) => CandidateChange::Deleted,
+            (Some(BlockChangeKind::Changed), Some(base)) => CandidateChange::Changed {
+                base: &base.content,
+            },
+        };
+        Some((block, change))
     }
 
     /// Whether approving `node_id` would also cover another pending block.
@@ -300,7 +311,7 @@ pub fn heuristic_pass<Id: Copy>(
         .enumerate()
         .filter(|(_, candidate)| candidate.class == class)
         .map(|(index, candidate)| {
-            let reading = reading_lines(candidate);
+            let reading = reading_lines(candidate.content, candidate.change);
             let signals = signals(candidate, reading.changed);
             let score = signals.iter().map(PassSignal::weight).sum::<usize>();
             let estimated_seconds = reading_seconds(reading.read);
@@ -377,7 +388,9 @@ pub fn ai_pass<Id: Copy + Eq + Hash>(
         let candidate = by_id.get(&pick.id)?;
         seen.insert(pick.id).then(|| PassCard {
             id: pick.id,
-            estimated_seconds: reading_seconds(reading_lines(candidate).read),
+            estimated_seconds: reading_seconds(
+                reading_lines(candidate.content, candidate.change).read,
+            ),
             why: PassWhy::AiPlan {
                 reason: pick.reason,
                 checks: pick.checks,
@@ -427,9 +440,9 @@ struct ReadingLines {
     changed: Option<usize>,
 }
 
-fn reading_lines(candidate: &PassCandidate<'_, impl Copy>) -> ReadingLines {
-    let whole = candidate.content.lines().count().max(1);
-    match candidate.change {
+fn reading_lines(content: &str, change: CandidateChange<'_>) -> ReadingLines {
+    let whole = content.lines().count().max(1);
+    match change {
         CandidateChange::Unchanged => ReadingLines {
             read: whole,
             changed: None,
@@ -440,7 +453,7 @@ fn reading_lines(candidate: &PassCandidate<'_, impl Copy>) -> ReadingLines {
         },
         CandidateChange::Changed { base } => {
             let base = base.lines().collect::<Vec<_>>();
-            let head = candidate.content.lines().collect::<Vec<_>>();
+            let head = content.lines().collect::<Vec<_>>();
             let prefix = base
                 .iter()
                 .zip(&head)

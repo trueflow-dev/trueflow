@@ -2379,6 +2379,8 @@ fn ai_review_plan_provider_for_availability(
 }
 
 fn ai_review_plan_blocks_for_state(state: &AppState) -> Vec<(TreeNodeId, AiReviewPlanBlock)> {
+    // The same estimates a focused pass charges, so the plan can fit its budget.
+    let scope = pass_scope(state);
     let canonical_order = ReviewOrder::from_tree(&state.navigator.tree, &state.reviewable_nodes);
     canonical_order
         .iter_node_ids()
@@ -2396,6 +2398,7 @@ fn ai_review_plan_blocks_for_state(state: &AppState) -> Vec<(TreeNodeId, AiRevie
                     block_hash: block.hash.clone(),
                     start_line: block.start_line,
                     end_line: block.end_line,
+                    estimated_seconds: scope.estimated_seconds(node_id).unwrap_or_default(),
                     content: ai_block_context_content(
                         &block.content,
                         state.diff_block_sides.get(&node_id),
@@ -2426,7 +2429,10 @@ fn ai_review_plan_hash(state: &AppState, blocks: &[(TreeNodeId, AiReviewPlanBloc
     TreeHash::new(hash_str(&input))
 }
 
-fn ai_review_plan_request_for_state(state: &AppState) -> Option<AiReviewPlanRequest> {
+fn ai_review_plan_request_for_state(
+    state: &AppState,
+    focused_pass_budget: ReviewDuration,
+) -> Option<AiReviewPlanRequest> {
     if !state.ai.mode.review_plan_enabled() {
         return None;
     }
@@ -2444,6 +2450,7 @@ fn ai_review_plan_request_for_state(state: &AppState) -> Option<AiReviewPlanRequ
         &state.scope_label,
         &plan_blocks,
         state.ai.max_context_lines,
+        focused_pass_budget.seconds(),
     ))
 }
 
@@ -2982,7 +2989,7 @@ fn run_ai_review_kickoff(
     budget: ReviewDuration,
 ) -> Result<ReviewStart> {
     let request = if state.ai.mode.review_plan_enabled() && !state.reviewable_nodes.is_empty() {
-        ai_review_plan_request_for_state(state)
+        ai_review_plan_request_for_state(state, budget)
     } else {
         None
     };
@@ -9522,8 +9529,9 @@ mod diff_scope_tests {
     fn ai_review_plan_request_walks_canonical_order_and_keeps_local_coverage() {
         let (mut state, _file, _blocks) = build_state_with_file_block_count(2);
         state.ai.mode = crate::config::AiMode::ReviewPlan;
-        let request = ai_review_plan_request_for_state(&state)
-            .unwrap_or_else(|| panic!("expected review-plan request"));
+        let request =
+            ai_review_plan_request_for_state(&state, crate::review_pass::DEFAULT_PASS_BUDGET)
+                .unwrap_or_else(|| panic!("expected review-plan request"));
 
         assert_eq!(request.coverage.total_blocks, 2);
         assert_eq!(request.coverage.presented_blocks, 2);
@@ -9775,8 +9783,9 @@ mod diff_scope_tests {
     fn ai_review_plan_worker_returns_provider_plan_and_reports_spawn_failure() {
         let (mut state, _file, _blocks) = build_state_with_file_block_count(1);
         state.ai.mode = crate::config::AiMode::ReviewPlan;
-        let request = ai_review_plan_request_for_state(&state)
-            .unwrap_or_else(|| panic!("expected review-plan request"));
+        let request =
+            ai_review_plan_request_for_state(&state, crate::review_pass::DEFAULT_PASS_BUDGET)
+                .unwrap_or_else(|| panic!("expected review-plan request"));
         let provider = Arc::new(StaticAiReviewPlanProvider {
             plan: test_review_plan(),
         });
@@ -9944,7 +9953,10 @@ mod diff_scope_tests {
         assert_eq!(state.view_mode, ViewMode::Source);
         assert!(!state.navigator.is_visible(ids[1]));
         assert!(state.commented_nodes.contains(&ids[0]));
-        assert!(ai_review_plan_request_for_state(&state).is_none());
+        assert!(
+            ai_review_plan_request_for_state(&state, crate::review_pass::DEFAULT_PASS_BUDGET)
+                .is_none()
+        );
         assert!(!refresh_ai_suggestion_state(&mut state));
 
         handle_parent(&mut state);
