@@ -1368,13 +1368,17 @@ fn revisions_reachable_from_tip_with_hidden(
     Ok(revisions)
 }
 
+/// Matches the revision of the reviewed comparison. A deletion's source revision is the
+/// comparison base, which a target's revision set excludes, so it matches by the head that
+/// deleted the surface instead.
 fn record_matches_allowed_revisions(record: &Record, allowed: Option<&HashSet<String>>) -> bool {
     let Some(allowed) = allowed else {
         return true;
     };
-    match &record.repo_ref {
-        RepoRef::Vcs { revision, .. } => allowed.contains(revision.as_str()),
-        RepoRef::Unknown => false,
+    match (&record.declaration_deletion, &record.repo_ref) {
+        (Some(deletion), _) => allowed.contains(deletion.head_revision.as_str()),
+        (None, RepoRef::Vcs { revision, .. }) => allowed.contains(revision.as_str()),
+        (None, RepoRef::Unknown) => false,
     }
 }
 
@@ -2937,6 +2941,7 @@ mod tests {
             comment_context: None,
             comment_anchor: None,
             declaration_locator: None,
+            declaration_deletion: None,
             tags: None,
             attestations: None,
         }

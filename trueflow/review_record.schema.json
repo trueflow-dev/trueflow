@@ -195,6 +195,19 @@
       ],
       "type": "object"
     },
+    "DeclarationDeletion": {
+      "additionalProperties": false,
+      "description": "Marks a declaration record as reviewing the deletion of the located surface. The locator\nthen names the comparison's base snapshot, where the surface last existed, and\n`head_revision` is the head of the reviewed comparison that deleted it.",
+      "properties": {
+        "head_revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "head_revision"
+      ],
+      "type": "object"
+    },
     "DeclarationRecordLocator": {
       "additionalProperties": false,
       "properties": {
@@ -591,6 +604,44 @@
           "declaration_locator"
         ]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "declaration_deletion": {
+            "$ref": "#/$defs/DeclarationDeletion"
+          }
+        },
+        "required": [
+          "declaration_deletion"
+        ]
+      },
+      "then": {
+        "properties": {
+          "check": {
+            "const": "declaration"
+          },
+          "declaration_locator": {
+            "$ref": "#/$defs/DeclarationRecordLocator"
+          },
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "declaration"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "version": {
+            "const": 5
+          }
+        },
+        "required": [
+          "declaration_locator"
+        ]
+      }
     }
   ],
   "properties": {
@@ -629,6 +680,16 @@
       "anyOf": [
         {
           "$ref": "#/$defs/CommentScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "declaration_deletion": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeclarationDeletion"
         },
         {
           "type": "null"

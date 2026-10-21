@@ -9,6 +9,10 @@ use trueflow::commands::feedback::{
     build_pull_request_feedback_plan, feedback_entries_to_json_values, feedback_entries_to_xml,
 };
 use trueflow::commands::review::ResolvedReviewQuery;
+use trueflow::commands::tui::declaration::{
+    DeclarationAppRuntime, DeclarationRecordAppender, DeclarationReviewActionKind,
+    prepare_declaration_launch,
+};
 use trueflow::config::BlockFilters;
 use trueflow::declaration::capture::{CaptureBatch, capture_declaration_sources};
 use trueflow::declaration::diff::diff_declarations;
@@ -640,6 +644,72 @@ fn declaration_feedback_later_approval_from_another_snapshot_suppresses_comment(
         "a later approval of the same declaration surface must resolve its comment; \
          stale note {STALE_NOTE:?} was exported in {entries:#?}"
     );
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecordingAppender {
+    records: Vec<Record>,
+}
+
+impl DeclarationRecordAppender for RecordingAppender {
+    fn append(&mut self, record: &Record) -> Result<()> {
+        record.validate()?;
+        self.records.push(record.clone());
+        Ok(())
+    }
+}
+
+#[test]
+fn comment_on_deleted_declaration_exports_for_the_deleting_revision_target() -> TestResult {
+    const NOTE: &str = "why was the old entry point removed?";
+    const BASE_SOURCE: &str = "pub fn kept() -> u8 {\n    0\n}\n\npub fn old() -> u8 {\n    1\n}\n";
+    const HEAD_SOURCE: &str = "pub fn kept() -> u8 {\n    0\n}\n";
+
+    let scenario = FeedbackScenario::new("declaration_feedback_deleted_revision_target")?;
+    scenario.write(PATH, BASE_SOURCE)?;
+    scenario.commit_all("add old entry point")?;
+    scenario.write(PATH, HEAD_SOURCE)?;
+    let deleting = CommitId::new(scenario.commit_all("remove old entry point")?)?;
+
+    let prepared = prepare_declaration_launch(
+        &scenario.repo().path,
+        &revision_query(deleting.clone()),
+        Vec::new(),
+    )?;
+    let names = prepared
+        .targets()
+        .iter()
+        .map(|target| target.declaration.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["old"], "the deleted declaration is the only target");
+    let identity = Identity::Email {
+        email: "reviewer@example.com".to_string(),
+    };
+    let mut runtime =
+        DeclarationAppRuntime::new(prepared, identity, RecordingAppender::default(), 120, 20)?;
+    runtime.submit(DeclarationReviewActionKind::Comment, Some(NOTE.to_string()))?;
+    let records = runtime.into_appender().records;
+    scenario.write_reviews(&records)?;
+
+    let entries = scenario.feedback_json_in_process(&[
+        "--since",
+        "all",
+        "--target",
+        &format!("rev:{deleting}"),
+    ])?;
+    assert_eq!(
+        entries.len(),
+        1,
+        "the comment made while reviewing rev:{deleting} must export for that target: \
+         {entries:#?}"
+    );
+    assert_eq!(entries[0]["target"]["kind"], "declaration");
+    assert_eq!(
+        entries[0]["declaration"]["path"], PATH,
+        "the deleted surface must still resolve against the comparison base"
+    );
+    assert_eq!(entries[0]["reviews"][0]["note"], NOTE);
     Ok(())
 }
 

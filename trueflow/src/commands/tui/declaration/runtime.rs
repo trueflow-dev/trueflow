@@ -19,8 +19,8 @@ use crate::declaration::{
 use crate::repo_path::RepoPath;
 use crate::store::{
     CommentAnchor, DeclarationAnchorRange as RecordAnchorRange, DeclarationCommentAnchor,
-    DeclarationRecordLocator, Identity, Record, ReviewCheck, ReviewTargetRef,
-    ReviewedDeclarationSnapshot, Verdict,
+    DeclarationDeletion, DeclarationRecordLocator, Identity, Record, RepoRef, ReviewCheck,
+    ReviewTargetRef, ReviewedDeclarationSnapshot, Verdict,
 };
 
 use super::{
@@ -37,14 +37,19 @@ pub struct PreparedDeclarationTarget {
     pub declaration: DeclarationNode,
     pub diff_unit: crate::declaration::diff::DeclarationDiffUnit,
     pub latest_verdict: Option<Verdict>,
-    provenance: CaptureEndpointProvenance,
+    provenance: TargetProvenance,
+}
+
+/// Where a target's source was captured and, for a deleted surface, which comparison head
+/// deleted it. Feedback filters deletion records by that head, not by the source endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetProvenance {
+    source: CaptureEndpointProvenance,
+    deletion: Option<DeclarationDeletion>,
 }
 
 impl PreparedDeclarationTarget {
-    fn from_collected(
-        item: CollectedDeclarationItem,
-        provenance: CaptureEndpointProvenance,
-    ) -> Self {
+    fn from_collected(item: CollectedDeclarationItem, provenance: TargetProvenance) -> Self {
         Self {
             snapshot_pair_id: item.snapshot_pair_id,
             display_path: item.display_path,
@@ -142,7 +147,7 @@ pub fn prepare_declaration_launch(
 fn resolve_target_provenance(
     captures: &[CaptureBatch],
     item: &CollectedDeclarationItem,
-) -> Result<CaptureEndpointProvenance> {
+) -> Result<TargetProvenance> {
     let mut matches = Vec::new();
     for capture in captures {
         for pair in &capture.pairs {
@@ -154,20 +159,35 @@ fn resolve_target_provenance(
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.id == item.snapshot.id)
             {
-                let base = capture.provenance.base.clone().with_context(|| {
+                let source = capture.provenance.base.clone().with_context(|| {
                     format!(
                         "snapshot pair {} selected a base snapshot without base capture provenance",
                         pair.id.as_str()
                     )
                 })?;
-                matches.push(base);
+                // Only a deleted surface is displayed from the comparison base.
+                let RepoRef::Vcs { revision, .. } = &capture.provenance.head.repo_ref else {
+                    bail!(
+                        "snapshot pair {} deleted a declaration without a head revision",
+                        pair.id.as_str()
+                    );
+                };
+                matches.push(TargetProvenance {
+                    source,
+                    deletion: Some(DeclarationDeletion {
+                        head_revision: revision.clone(),
+                    }),
+                });
             }
             if pair
                 .head
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.id == item.snapshot.id)
             {
-                matches.push(capture.provenance.head.clone());
+                matches.push(TargetProvenance {
+                    source: capture.provenance.head.clone(),
+                    deletion: None,
+                });
             }
         }
     }
@@ -695,12 +715,13 @@ fn build_record(
         check: ReviewCheck::declaration(),
         verdict,
         identity,
-        repo_ref: target.provenance.repo_ref.clone(),
-        block_state: target.provenance.block_state.clone(),
+        repo_ref: target.provenance.source.repo_ref.clone(),
+        block_state: target.provenance.source.block_state.clone(),
         note: action.comment_body.clone(),
         comment_context,
         comment_anchor: Some(CommentAnchor::Declaration(anchor)),
         declaration_locator: Some(locator),
+        declaration_deletion: target.provenance.deletion.clone(),
     })
 }
 

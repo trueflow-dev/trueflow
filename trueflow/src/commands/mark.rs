@@ -5,7 +5,8 @@ use crate::path_utils;
 use crate::repo_path::RepoPath;
 use crate::store::{
     Attestation, AttestationKind, BlockState, Canonicalization, CommentAnchor, CommentScope,
-    DeclarationRecordLocator, FileStore, Identity, Record, RepoRef, ReviewCheck, ReviewStore,
+    DeclarationDeletion, DeclarationRecordLocator, FileStore, Identity, Record, RepoRef,
+    ReviewCheck, ReviewStore,
     ReviewTargetKind, ReviewTargetRef, VcsSystem, Verdict,
 };
 use crate::tree::{self, TreeNodeKind};
@@ -54,6 +55,7 @@ pub struct StructuredMarkRequest {
     pub comment_context: Option<String>,
     pub comment_anchor: Option<CommentAnchor>,
     pub declaration_locator: Option<DeclarationRecordLocator>,
+    pub declaration_deletion: Option<DeclarationDeletion>,
 }
 
 pub fn build_structured_record(request: StructuredMarkRequest) -> Result<Record> {
@@ -68,12 +70,14 @@ pub fn build_structured_record(request: StructuredMarkRequest) -> Result<Record>
         comment_context,
         comment_anchor,
         declaration_locator,
+        declaration_deletion,
     } = request;
     let mut record = Record::new(target, check, verdict, identity, repo_ref, block_state);
     record.note = note;
     record.comment_context = comment_context;
     record.comment_anchor = comment_anchor;
     record.declaration_locator = declaration_locator;
+    record.declaration_deletion = declaration_deletion;
     record.validate()?;
     Ok(record)
 }

@@ -91,6 +91,7 @@ fn declaration_record() -> Result<Record> {
         comment_context: None,
         comment_anchor: Some(CommentAnchor::Declaration(declaration_anchor())),
         declaration_locator: Some(declaration_locator("src/lib.rs", "crate::run()", 0)?),
+        declaration_deletion: None,
         tags: None,
         attestations: None,
     })
@@ -129,6 +130,7 @@ fn legacy_record(version: u32) -> Result<Record> {
             end_line: 4,
         })),
         declaration_locator: None,
+        declaration_deletion: None,
         tags: Some(vec!["signed".to_string(), "fixture".to_string()]),
         attestations: None,
     })

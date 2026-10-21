@@ -768,6 +768,7 @@ fn structured_declaration_builder_preserves_resolved_provenance_locator_and_anch
         comment_context: Some("relationship data is advisory".to_string()),
         comment_anchor: Some(CommentAnchor::Declaration(anchor.clone())),
         declaration_locator: Some(locator.clone()),
+        declaration_deletion: None,
     };
 
     let built = build_structured_record(request)?;
@@ -813,6 +814,7 @@ fn structured_declaration_builder_rejects_resolved_field_mismatches() -> Result<
         comment_context: None,
         comment_anchor: Some(CommentAnchor::Declaration(anchor)),
         declaration_locator: Some(locator),
+        declaration_deletion: None,
     };
 
     let mut wrong_locator_hash = request.clone();
@@ -879,6 +881,7 @@ fn declaration_fixture_hash_is_not_a_worktree_block_target() -> Result<()> {
         comment_context: None,
         comment_anchor: None,
         declaration_locator: Some(locator.clone()),
+        declaration_deletion: None,
     };
 
     let built = build_structured_record(request)?;

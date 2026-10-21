@@ -279,6 +279,15 @@ pub struct DeclarationRecordLocator {
     pub projection_hash: DeclarationProjectionHash,
 }
 
+/// Marks a declaration record as reviewing the deletion of the located surface. The locator
+/// then names the comparison's base snapshot, where the surface last existed, and
+/// `head_revision` is the head of the reviewed comparison that deleted it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct DeclarationDeletion {
+    pub head_revision: CommitId,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct DeclarationAnchorRange {
@@ -513,6 +522,26 @@ fn add_record_shape_constraints(schema: &mut schemars::Schema) {
                     },
                     "required": ["declaration_locator"]
                 }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "declaration_deletion": { "$ref": "#/$defs/DeclarationDeletion" }
+                    },
+                    "required": ["declaration_deletion"]
+                },
+                "then": {
+                    "properties": {
+                        "version": { "const": 5 },
+                        "target": {
+                            "properties": { "kind": { "const": "declaration" } },
+                            "required": ["kind"]
+                        },
+                        "check": { "const": "declaration" },
+                        "declaration_locator": declaration_locator
+                    },
+                    "required": ["declaration_locator"]
+                }
             }
         ]),
     );
@@ -541,6 +570,8 @@ pub struct Record {
     pub comment_anchor: Option<CommentAnchor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration_locator: Option<DeclarationRecordLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_deletion: Option<DeclarationDeletion>,
     #[schemars(inner(length(min = 1)))]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -565,6 +596,7 @@ struct RecordWire {
     comment_context: Option<String>,
     comment_anchor: Option<CommentAnchor>,
     declaration_locator: Option<DeclarationRecordLocator>,
+    declaration_deletion: Option<DeclarationDeletion>,
     tags: Option<Vec<String>>,
     attestations: Option<Vec<Attestation>>,
 }
@@ -588,6 +620,7 @@ impl From<RecordWire> for Record {
             comment_context: record.comment_context,
             comment_anchor: record.comment_anchor,
             declaration_locator: record.declaration_locator,
+            declaration_deletion: record.declaration_deletion,
             tags: record.tags,
             attestations: record.attestations,
         }
@@ -679,6 +712,9 @@ struct SignableRecordV5<'a> {
     comment_context: &'a Option<String>,
     comment_anchor: &'a Option<CommentAnchor>,
     declaration_locator: &'a Option<DeclarationRecordLocator>,
+    // Omitted when absent so records signed before deletion reviews keep their payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declaration_deletion: &'a Option<DeclarationDeletion>,
     tags: &'a Option<Vec<String>>,
 }
 
@@ -708,6 +744,7 @@ impl Record {
             comment_context: None,
             comment_anchor: None,
             declaration_locator: None,
+            declaration_deletion: None,
             tags: None,
             attestations: None,
         }
@@ -723,8 +760,10 @@ impl Record {
 
         let declaration_target = matches!(self.target, ReviewTargetRef::Declaration { .. });
         let declaration_anchor = matches!(self.comment_anchor, Some(CommentAnchor::Declaration(_)));
-        let has_declaration_shape =
-            declaration_target || self.declaration_locator.is_some() || declaration_anchor;
+        let has_declaration_shape = declaration_target
+            || self.declaration_locator.is_some()
+            || self.declaration_deletion.is_some()
+            || declaration_anchor;
         if self.version < 5 && has_declaration_shape {
             return Err(anyhow!(
                 "declaration record fields require review record version 5"
@@ -737,9 +776,12 @@ impl Record {
                     "the declaration review check requires a declaration target"
                 ));
             }
-            if self.declaration_locator.is_some() || declaration_anchor {
+            if self.declaration_locator.is_some()
+                || self.declaration_deletion.is_some()
+                || declaration_anchor
+            {
                 return Err(anyhow!(
-                    "declaration locator and anchor require a declaration target"
+                    "declaration locator, deletion, and anchor require a declaration target"
                 ));
             }
             return Ok(());
@@ -894,6 +936,7 @@ impl Record {
                 comment_context: &self.comment_context,
                 comment_anchor: &self.comment_anchor,
                 declaration_locator: &self.declaration_locator,
+                declaration_deletion: &self.declaration_deletion,
                 tags: &self.tags,
             })?),
             version => Err(anyhow!("unsupported review record version {version}")),
@@ -1583,6 +1626,7 @@ mod tests {
             comment_context: None,
             comment_anchor: None,
             declaration_locator: None,
+            declaration_deletion: None,
             tags: None,
             attestations: None,
         }
