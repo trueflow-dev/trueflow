@@ -6,6 +6,7 @@ use crate::analysis::Language;
 use crate::repo_path::RepoPath;
 use crate::store::{Record, Verdict};
 
+use super::capture::CaptureDiagnostic;
 use super::coverage::DeclarationCoverageIndex;
 use super::diff::{DeclarationChangeKind, DeclarationDiff, DeclarationDiffUnit, DiffDiagnostic};
 use super::snapshot::{SnapshotPair, SnapshotPairId, SourceSnapshot};
@@ -20,6 +21,7 @@ pub struct DeclarationReviewDiffBatch {
     snapshot_pairs: Vec<SnapshotPair>,
     diff: DeclarationDiff,
     capability_notices: Vec<DeclarationFileCapability>,
+    capture_diagnostics: Vec<CaptureDiagnostic>,
 }
 
 impl DeclarationReviewDiffBatch {
@@ -28,6 +30,7 @@ impl DeclarationReviewDiffBatch {
             snapshot_pairs,
             diff,
             capability_notices: Vec::new(),
+            capture_diagnostics: Vec::new(),
         }
     }
     pub fn with_capability_notices(
@@ -35,6 +38,12 @@ impl DeclarationReviewDiffBatch {
         capability_notices: Vec<DeclarationFileCapability>,
     ) -> Self {
         self.capability_notices = capability_notices;
+        self
+    }
+
+    /// Files capture skipped, such as invalid UTF-8; they keep the review partial.
+    pub fn with_capture_diagnostics(mut self, capture_diagnostics: Vec<CaptureDiagnostic>) -> Self {
+        self.capture_diagnostics = capture_diagnostics;
         self
     }
 
@@ -110,6 +119,7 @@ pub struct CollectedDeclarationReview {
     pub status: DeclarationReviewStatus,
     pub items: Vec<CollectedDeclarationItem>,
     pub diagnostics: Vec<DiffDiagnostic>,
+    pub capture_diagnostics: Vec<CaptureDiagnostic>,
     pub capability_notices: Vec<DeclarationFileCapability>,
     pub canonical_order: Vec<DeclarationId>,
 }
@@ -129,6 +139,7 @@ pub fn collect_declaration_review(
 ) -> Result<CollectedDeclarationReview> {
     let mut ordered_items = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut capture_diagnostics = Vec::new();
     let mut capability_notices = Vec::new();
     let mut unsupported_languages = Vec::new();
     let mut reviewable_unit_count = 0usize;
@@ -136,6 +147,7 @@ pub fn collect_declaration_review(
 
     for (batch_ordinal, batch) in query.batches.iter().enumerate() {
         diagnostics.extend(batch.diff.diagnostics.iter().cloned());
+        capture_diagnostics.extend(batch.capture_diagnostics.iter().cloned());
         capability_notices.extend(batch.capability_notices.iter().cloned());
         collect_unsupported_languages(batch, &mut unsupported_languages);
 
@@ -223,9 +235,9 @@ pub fn collect_declaration_review(
         DeclarationReviewStatus::UnsupportedLanguage {
             languages: unsupported_languages,
         }
-    } else if !diagnostics.is_empty() {
+    } else if !diagnostics.is_empty() || !capture_diagnostics.is_empty() {
         DeclarationReviewStatus::Partial {
-            diagnostic_count: diagnostics.len(),
+            diagnostic_count: diagnostics.len() + capture_diagnostics.len(),
         }
     } else if !items.is_empty() {
         DeclarationReviewStatus::Ready
@@ -239,6 +251,7 @@ pub fn collect_declaration_review(
         status,
         items,
         diagnostics,
+        capture_diagnostics,
         capability_notices,
         canonical_order,
     })

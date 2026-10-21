@@ -111,7 +111,8 @@ pub fn prepare_declaration_launch(
         let diff = diff_declarations(&capture.pairs)?;
         review_batches.push(
             DeclarationReviewDiffBatch::new(capture.pairs.clone(), diff)
-                .with_capability_notices(capture.capability_notices.clone()),
+                .with_capability_notices(capture.capability_notices.clone())
+                .with_capture_diagnostics(capture.diagnostics.clone()),
         );
     }
 

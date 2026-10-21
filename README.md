@@ -622,10 +622,12 @@ invocation includes `--trust-lsp-workspace`; without that flag, the graph shows
 an explicit unavailable state. There is no name-matching or lexical fallback.
 
 Supported declarations remain reviewable when the same scope also contains an
-unsupported language or a projection diagnostic, but the incomplete status
-stays visible before and after those declarations are reviewed. Trueflow does
-not report an unqualified declaration-review completion while any selected
-surface could not be projected.
+unsupported language, a projection diagnostic, or a source file that is not
+valid UTF-8, but the incomplete status stays visible before and after those
+declarations are reviewed. Unsupported-language files are reported by path
+and never loaded, and a file that is not valid UTF-8 is skipped as a partial
+diagnostic. Trueflow does not report an unqualified declaration-review
+completion while any selected surface could not be projected.
 
 The relationship graph uses exact projected identifier/type-use ranges and the
 language server's call hierarchy, references, declaration, definition, and type

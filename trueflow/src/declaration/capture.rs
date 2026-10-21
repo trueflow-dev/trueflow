@@ -152,6 +152,7 @@ fn capture_immutable_target(
     );
 
     let mut pairs = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut capability_notices = Vec::new();
     for changed_path in changed {
         if !changed_pair_selected(&query.path_selection, &changed_path) {
@@ -179,7 +180,7 @@ fn capture_immutable_target(
                 &target_key,
                 budget,
             )?,
-            _ => None,
+            _ => EndpointSource::Absent,
         };
         let head = match head_language {
             Some(language) => snapshot_from_tree(
@@ -190,16 +191,14 @@ fn capture_immutable_target(
                 &target_key,
                 budget,
             )?,
-            None => None,
+            None => EndpointSource::Absent,
         };
-        if base.is_none() && head.is_none() {
-            continue;
-        }
-        pairs.push(snapshot_pair(
-            target_key.as_str(),
+        pairs.extend(capture_pair(
+            &target_key,
             &changed_path,
             base,
             head,
+            &mut diagnostics,
         ));
     }
 
@@ -210,7 +209,7 @@ fn capture_immutable_target(
             base: base_id.map(|revision| endpoint(revision, BlockState::Committed)),
             head: endpoint(head_id, BlockState::Committed),
         },
-        diagnostics: Vec::new(),
+        diagnostics,
         capability_notices,
     })
 }
@@ -335,6 +334,7 @@ where
     });
 
     let mut pairs = Vec::with_capacity(selected.len());
+    let mut diagnostics = Vec::new();
     let mut fingerprints = Vec::with_capacity(selected.len());
     let target_key = format!("dirty:{}", head_id.as_str());
     for (changed_path, base_language, head_language) in &selected {
@@ -347,9 +347,9 @@ where
                 &target_key,
                 budget,
             )?,
-            None => None,
+            None => EndpointSource::Absent,
         };
-        let (head_snapshot, fingerprint) = snapshot_from_worktree(
+        let (head, fingerprint) = snapshot_from_worktree(
             workdir,
             &changed_path.location,
             *head_language,
@@ -358,14 +358,12 @@ where
             budget,
         )?;
         fingerprints.push((changed_path.location.clone(), fingerprint));
-        if base.is_none() && head_snapshot.is_none() {
-            continue;
-        }
-        pairs.push(snapshot_pair(
+        pairs.extend(capture_pair(
             &target_key,
             changed_path,
             base,
-            head_snapshot,
+            head,
+            &mut diagnostics,
         ));
     }
 
@@ -378,7 +376,7 @@ where
             base: Some(endpoint(head_id.clone(), BlockState::Committed)),
             head: endpoint(head_id, BlockState::Uncommitted),
         },
-        diagnostics: Vec::new(),
+        diagnostics,
         capability_notices,
     })
 }
@@ -400,20 +398,20 @@ where
         capability_notices,
     } = worktree_source_paths(workdir, query)?;
     let mut pairs = Vec::with_capacity(projected.len());
+    let mut diagnostics = Vec::new();
     let mut fingerprints = Vec::with_capacity(projected.len());
     let target_key = format!("worktree:{}", head_id.as_str());
     for (path, language) in projected {
         let (head, fingerprint) =
             snapshot_from_worktree(workdir, &path, Some(language), "head", &target_key, budget)?;
         fingerprints.push((path.clone(), fingerprint));
-        if let Some(head) = head {
-            pairs.push(snapshot_pair(
-                &target_key,
-                &ChangedPath::identity(path),
-                None,
-                Some(head),
-            ));
-        }
+        pairs.extend(capture_pair(
+            &target_key,
+            &ChangedPath::identity(path),
+            EndpointSource::Absent,
+            head,
+            &mut diagnostics,
+        ));
     }
 
     hook()?;
@@ -435,7 +433,7 @@ where
                 },
             ),
         },
-        diagnostics: Vec::new(),
+        diagnostics,
         capability_notices,
     })
 }
@@ -526,6 +524,70 @@ fn worktree_source_paths(workdir: &Path, query: &ResolvedReviewQuery) -> Result<
     })
 }
 
+/// One comparison endpoint of a changed path.
+enum EndpointSource {
+    Absent,
+    Captured(SourceSnapshot),
+    /// Bytes that are not UTF-8 cannot be projected; capture reports the file instead.
+    InvalidUtf8,
+}
+
+impl EndpointSource {
+    fn decode(
+        path: &RepoPath,
+        language: Language,
+        bytes: &[u8],
+        endpoint_name: &str,
+        target_key: &str,
+    ) -> Self {
+        match std::str::from_utf8(bytes) {
+            Ok(source) => Self::Captured(source_snapshot(
+                path,
+                language,
+                source,
+                endpoint_name,
+                target_key,
+            )),
+            Err(_) => Self::InvalidUtf8,
+        }
+    }
+
+    fn into_snapshot(self) -> Option<SourceSnapshot> {
+        match self {
+            Self::Captured(snapshot) => Some(snapshot),
+            Self::Absent | Self::InvalidUtf8 => None,
+        }
+    }
+}
+
+/// Pairs a changed path's endpoints. A path with an undecodable endpoint is skipped whole and
+/// reported, like block review reports invalid UTF-8 files: half a pair would misreport every
+/// declaration on the readable side as added or deleted.
+fn capture_pair(
+    target_key: &str,
+    changed_path: &ChangedPath,
+    base: EndpointSource,
+    head: EndpointSource,
+    diagnostics: &mut Vec<CaptureDiagnostic>,
+) -> Option<SnapshotPair> {
+    let invalid_path = match (&base, &head) {
+        (_, EndpointSource::InvalidUtf8) => Some(&changed_path.location),
+        (EndpointSource::InvalidUtf8, _) => Some(&changed_path.source_location),
+        _ => None,
+    };
+    if let Some(path) = invalid_path {
+        diagnostics.push(CaptureDiagnostic {
+            path: Some(PathBuf::from(path.as_str())),
+            reason: "skipped invalid UTF-8 file".to_owned(),
+        });
+        return None;
+    }
+    match (base.into_snapshot(), head.into_snapshot()) {
+        (None, None) => None,
+        (base, head) => Some(snapshot_pair(target_key, changed_path, base, head)),
+    }
+}
+
 fn snapshot_from_tree(
     tree: &gix::Tree<'_>,
     path: &RepoPath,
@@ -533,27 +595,25 @@ fn snapshot_from_tree(
     endpoint_name: &str,
     target_key: &str,
     budget: &mut CaptureBudget,
-) -> Result<Option<SourceSnapshot>> {
+) -> Result<EndpointSource> {
     let Some(entry) = tree.lookup_entry_by_path(Path::new(path.as_str()))? else {
-        return Ok(None);
+        return Ok(EndpointSource::Absent);
     };
     if !matches!(
         entry.mode().kind(),
         EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
     ) {
-        return Ok(None);
+        return Ok(EndpointSource::Absent);
     }
     budget.reserve(path, entry.id().header()?.size())?;
     let blob = entry.object()?.try_into_blob()?;
-    let source = std::str::from_utf8(&blob.data)
-        .with_context(|| format!("{} contains invalid UTF-8", path.as_str()))?;
-    Ok(Some(source_snapshot(
+    Ok(EndpointSource::decode(
         path,
         language,
-        source,
+        &blob.data,
         endpoint_name,
         target_key,
-    )))
+    ))
 }
 
 fn snapshot_from_worktree(
@@ -563,14 +623,17 @@ fn snapshot_from_worktree(
     endpoint_name: &str,
     target_key: &str,
     budget: &mut CaptureBudget,
-) -> Result<(Option<SourceSnapshot>, FileFingerprint)> {
+) -> Result<(EndpointSource, FileFingerprint)> {
     let absolute = workdir.join(path.as_str());
     let before = file_metadata(&absolute)?;
     let Some(before) = before else {
-        return Ok((None, FileFingerprint::missing()));
+        return Ok((EndpointSource::Absent, FileFingerprint::missing()));
     };
     if !before.is_file {
-        return Ok((None, FileFingerprint::from_metadata(before, None)));
+        return Ok((
+            EndpointSource::Absent,
+            FileFingerprint::from_metadata(before, None),
+        ));
     }
     budget.reserve(path, before.len)?;
     let bytes = fs::read(&absolute).with_context(|| format!("failed to read {}", path.as_str()))?;
@@ -579,21 +642,13 @@ fn snapshot_from_worktree(
         return Err(anyhow!(CAPTURE_DRIFT_ERROR));
     }
     let fingerprint = FileFingerprint::from_metadata(after, Some(BytesHash::from_bytes(&bytes)));
-    let snapshot = match language {
+    let source = match language {
         Some(language) => {
-            let source = std::str::from_utf8(&bytes)
-                .with_context(|| format!("{} contains invalid UTF-8", path.as_str()))?;
-            Some(source_snapshot(
-                path,
-                language,
-                source,
-                endpoint_name,
-                target_key,
-            ))
+            EndpointSource::decode(path, language, &bytes, endpoint_name, target_key)
         }
-        None => None,
+        None => EndpointSource::Absent,
     };
-    Ok((snapshot, fingerprint))
+    Ok((source, fingerprint))
 }
 
 fn source_snapshot(
