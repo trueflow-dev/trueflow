@@ -4091,23 +4091,13 @@ fn push_ai_review_set_snippet_lines(
     if max_lines == 0 {
         return 0;
     }
-    let mut pushed = 0;
-    let mut lines = content.lines().peekable();
-    while pushed < max_lines {
-        let Some(line) = lines.next() else {
-            break;
-        };
-        out.push(line.to_string());
-        pushed += 1;
-    }
-    if lines.peek().is_some() {
-        out.push("...".to_string());
-    }
-    if pushed == 0 {
+    let source = crate::ai::PlanSource::new(content);
+    if source.line_count() == 0 {
         out.push("(empty block)".to_string());
         return 1;
     }
-    pushed
+    out.extend(source.excerpt(max_lines));
+    max_lines.min(source.line_count())
 }
 
 fn short_ai_hash(hash: &TreeHash) -> &str {
@@ -15986,7 +15976,9 @@ mod diff_scope_tests {
         );
         assert!(request.review_set.overview.contains("Review blocks: 1"));
         assert!(request.review_set.overview.contains("fn checked() {"));
-        assert!(request.prompt.contains("fn checked() {\n    call();\n..."));
+        assert!(request.prompt.contains(
+            "fn checked() {\n    call();\n[source partial; remaining lines omitted]"
+        ));
     }
 
     #[test]
@@ -16076,6 +16068,25 @@ mod diff_scope_tests {
         assert!(request.prompt.contains("new_call();"));
         assert!(request.review_set.overview.contains("[base]"));
         assert!(request.review_set.overview.contains("[head]"));
+    }
+
+    #[test]
+    fn ai_review_set_overview_keeps_head_side_for_long_base() {
+        let content = format!("[base]\n{}\n[head]\nNEW_MARKER\n", "old();\n".repeat(20));
+        let entry = AiReviewContext {
+            path: "src/lib.rs".to_string(),
+            language: Language::Rust,
+            block_kind: BlockKind::Function,
+            block_hash: TreeHash::from_content(&content),
+            start_line: 0,
+            end_line: 20,
+            content,
+        };
+
+        let overview = ai_review_set_overview("diff vs main", &ScopePreset::MainDiff, &[entry], 80);
+
+        assert!(overview.contains("NEW_MARKER"), "{overview}");
+        assert!(overview.matches("old();").count() < AI_REVIEW_SET_CONTEXT_LINES_PER_BLOCK);
     }
 
     #[test]

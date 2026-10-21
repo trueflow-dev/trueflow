@@ -339,14 +339,15 @@ pub(crate) fn review_plan_manifest_indices(
     selected
 }
 
-struct PlanSource<'a> {
+/// Block source split into base and head sides so a line budget keeps both.
+pub(crate) struct PlanSource<'a> {
     base: Option<Vec<&'a str>>,
     head: Vec<&'a str>,
     single_side_label: Option<&'static str>,
 }
 
 impl<'a> PlanSource<'a> {
-    fn new(content: &'a str) -> Self {
+    pub(crate) fn new(content: &'a str) -> Self {
         if let Some((base, head)) = content
             .strip_prefix("[base]\n")
             .and_then(|text| text.split_once("[head]\n"))
@@ -377,11 +378,11 @@ impl<'a> PlanSource<'a> {
         }
     }
 
-    fn line_count(&self) -> usize {
+    pub(crate) fn line_count(&self) -> usize {
         self.head.len() + self.base.as_ref().map_or(0, Vec::len)
     }
 
-    fn excerpt(&self, allowance: usize) -> Vec<String> {
+    pub(crate) fn excerpt(&self, allowance: usize) -> Vec<String> {
         if allowance == 0 {
             return Vec::new();
         }
@@ -1475,7 +1476,9 @@ fn build_review_block_prompt(
 ) -> String {
     let line_start = context.start_line.saturating_add(1);
     let line_end = context.end_line.max(context.start_line.saturating_add(1));
-    let block_content = clipped_content(&context.content, max_context_lines);
+    let block_content = PlanSource::new(&context.content)
+        .excerpt(max_context_lines.max(1))
+        .join("\n");
     let review_set_line = review_set_hash
         .map(|hash| format!("Review set hash: {hash}\n"))
         .unwrap_or_default();
@@ -1485,25 +1488,6 @@ fn build_review_block_prompt(
         context.language,
         context.block_kind.as_str(),
     )
-}
-
-fn clipped_content(content: &str, max_context_lines: usize) -> String {
-    let max_context_lines = max_context_lines.max(1);
-    let mut out = String::new();
-    for (index, line) in content.lines().enumerate() {
-        if index >= max_context_lines {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str("...");
-            break;
-        }
-        if index > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    out
 }
 
 fn collapse_whitespace(raw: &str) -> String {
@@ -1956,8 +1940,24 @@ mod tests {
     fn review_hint_prompt_clips_block_content() {
         let prompt = build_review_hint_prompt(&review_context("one\ntwo\nthree"), 2);
 
-        assert!(prompt.contains("one\ntwo\n..."));
+        assert!(prompt.contains("one\ntwo\n[source partial; remaining lines omitted]"));
         assert!(!prompt.contains("three"));
+    }
+
+    #[test]
+    fn block_hint_prompt_keeps_head_side_for_long_base() {
+        let content = format!("[base]\n{}\n[head]\nNEW_MARKER\n", "old();\n".repeat(100));
+        let request = AiSuggestionRequest::new(
+            AiProvider::ClaudeCli,
+            "auto".to_string(),
+            review_set(),
+            review_context(&content),
+            80,
+        );
+
+        assert!(request.prompt.contains("NEW_MARKER"), "{}", request.prompt);
+        assert!(request.prompt.contains("[base partial;"), "{}", request.prompt);
+        assert!(request.prompt.matches("old();").count() < 80);
     }
 
     #[test]
