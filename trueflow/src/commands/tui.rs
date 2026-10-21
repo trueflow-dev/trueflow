@@ -9171,11 +9171,15 @@ fn editing_cursor_visual_offset(
         .last()
         .map(|line| editor_display_width(line))
         .unwrap_or_default();
+    // A row filled to the wrap width leaves the cursor at the start of the
+    // next row, where the following character is (or will be) drawn.
+    let (column, row) = if column >= wrap_width {
+        (0, row.saturating_add(1))
+    } else {
+        (column, row)
+    };
 
-    (
-        usize_to_u16_saturating(column.min(wrap_width.saturating_sub(1))),
-        usize_to_u16_saturating(row),
-    )
+    (usize_to_u16_saturating(column), usize_to_u16_saturating(row))
 }
 
 fn input_overlay_rect(area: Rect, body_lines: u16) -> Rect {
@@ -13246,6 +13250,13 @@ mod diff_scope_tests {
     fn editing_cursor_visual_offset_counts_display_width_for_wide_characters() {
         assert_eq!(editing_cursor_visual_offset("界a", "界".len(), 4), (2, 0));
         assert_eq!(editing_cursor_visual_offset("界a", "界a".len(), 4), (3, 0));
+    }
+
+    #[test]
+    fn editing_cursor_visual_offset_moves_to_next_row_after_exactly_full_row() {
+        assert_eq!(editing_cursor_visual_offset("abcd", 4, 4), (0, 1));
+        assert_eq!(editing_cursor_visual_offset("abcdef", 4, 4), (0, 1));
+        assert_eq!(editing_cursor_visual_offset("a界", "a界".len(), 3), (0, 1));
     }
 
     #[test]
