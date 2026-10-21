@@ -891,16 +891,18 @@ fn split_rust_impl(block: &Block) -> Result<Vec<Block>> {
         .context("Failed to parse impl")?;
     let root = tree.root_node();
     let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() == "impl_item" {
-            let items = collect_rust_impl_items(block, child)?;
-            if !items.is_empty() {
-                return Ok(items);
-            }
-        }
-    }
+    let Some(impl_node) = root
+        .children(&mut cursor)
+        .find(|child| child.kind() == "impl_item")
+    else {
+        return split_code(block);
+    };
 
-    split_code(block)
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_rust_impl_items(impl_node),
+        CommentSyntax::of(Language::Rust),
+    )
 }
 
 fn split_elisp_function(block: &Block) -> Result<Vec<Block>> {
@@ -1013,17 +1015,13 @@ fn same_tree_sitter_node(left: tree_sitter::Node<'_>, right: tree_sitter::Node<'
         && left.end_byte() == right.end_byte()
 }
 
-fn collect_rust_impl_items(parent: &Block, impl_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
+fn collect_rust_impl_items(impl_node: tree_sitter::Node<'_>) -> Vec<MemberSpan> {
     rust::collect_impl_member_spans(impl_node)
         .into_iter()
-        .map(|member| {
-            create_sub_block_with_kind(
-                parent,
-                &parent.content[member.start_byte..member.end_byte],
-                member.start_byte,
-                member.end_byte,
-                member.kind,
-            )
+        .map(|member| MemberSpan {
+            start_byte: member.start_byte,
+            end_byte: member.end_byte,
+            kind: member.kind,
         })
         .collect()
 }
@@ -1116,12 +1114,11 @@ fn split_swift_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     }
 
-    let items = collect_swift_type_items(block, body, content)?;
-    if items.is_empty() {
-        split_code(block)
-    } else {
-        Ok(items)
-    }
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_swift_type_items(body, content),
+        CommentSyntax::of(Language::Swift),
+    )
 }
 
 fn split_kotlin_function(block: &Block) -> Result<Vec<Block>> {
@@ -1442,12 +1439,11 @@ fn split_c_type(block: &Block) -> Result<Vec<Block>> {
         return split_code(block);
     };
 
-    let items = collect_c_type_items(block, type_node)?;
-    if items.is_empty() {
-        split_code(block)
-    } else {
-        Ok(items)
-    }
+    review_unit_blocks_from_member_spans(
+        block,
+        collect_c_type_items(type_node),
+        CommentSyntax::of(Language::C),
+    )
 }
 
 fn split_function_with_parser(
@@ -1681,24 +1677,15 @@ fn collect_body_nodes<'a>(
     nodes
 }
 
-fn collect_swift_type_items(
-    parent: &Block,
-    body: tree_sitter::Node<'_>,
-    content: &str,
-) -> Result<Vec<Block>> {
-    let mut blocks = Vec::new();
-    for member in swift::collect_type_member_spans(body, content) {
-        let chunk = &parent.content[member.start_byte..member.end_byte];
-        blocks.push(create_sub_block_with_kind(
-            parent,
-            chunk,
-            member.start_byte,
-            member.end_byte,
-            member.kind,
-        )?);
-    }
-
-    Ok(blocks)
+fn collect_swift_type_items(body: tree_sitter::Node<'_>, content: &str) -> Vec<MemberSpan> {
+    swift::collect_type_member_spans(body, content)
+        .into_iter()
+        .map(|member| MemberSpan {
+            start_byte: member.start_byte,
+            end_byte: member.end_byte,
+            kind: member.kind,
+        })
+        .collect()
 }
 
 /// A recognised member of a type or scope body, relative to the parent block.
@@ -1907,7 +1894,7 @@ fn collect_php_type_items(body: tree_sitter::Node<'_>) -> Vec<MemberSpan> {
         .collect()
 }
 
-fn collect_c_type_items(parent: &Block, type_node: tree_sitter::Node<'_>) -> Result<Vec<Block>> {
+fn collect_c_type_items(type_node: tree_sitter::Node<'_>) -> Vec<MemberSpan> {
     let specifier = if type_node.kind() == "type_definition" {
         type_node.child_by_field_name("type").unwrap_or(type_node)
     } else {
@@ -1915,27 +1902,21 @@ fn collect_c_type_items(parent: &Block, type_node: tree_sitter::Node<'_>) -> Res
     };
 
     let Some(body) = specifier.child_by_field_name("body") else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
 
-    let mut blocks = Vec::new();
     let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        let kind = match child.kind() {
-            "field_declaration" => BlockKind::Variable,
-            "enumerator" => BlockKind::Const,
-            "comment" => BlockKind::Comment,
-            _ => continue,
-        };
-        blocks.push(create_sub_block_with_kind(
-            parent,
-            &parent.content[child.start_byte()..child.end_byte()],
-            child.start_byte(),
-            child.end_byte(),
-            kind,
-        )?);
-    }
-    Ok(blocks)
+    body.children(&mut cursor)
+        .filter_map(|child| {
+            let kind = match child.kind() {
+                "field_declaration" => BlockKind::Variable,
+                "enumerator" => BlockKind::Const,
+                "comment" => BlockKind::Comment,
+                _ => return None,
+            };
+            Some(MemberSpan::of_node(child, kind))
+        })
+        .collect()
 }
 
 fn gap_prefix_length(gap: &str) -> usize {
@@ -2583,6 +2564,58 @@ mod tests {
                 .iter()
                 .any(|unit| unit.content.contains("before_action") && unit.kind != BlockKind::Gap)
         );
+    }
+
+    fn assert_non_gap_unit_contains(units: &[Block], needle: &str) {
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.content.contains(needle) && unit.kind != BlockKind::Gap),
+            "{needle:?} must land in a reviewable unit: {units:#?}"
+        );
+    }
+
+    #[test]
+    fn test_rust_impl_review_units_cover_header() {
+        let content = format!(
+            "impl<T: Clone> Worker<T>\nwhere\n    T: Send,\n{{\n    // Shared helpers.\n{}}}\n",
+            padded_members(
+                "\n    fn process{n}(&self, value: T) -> T {\n        value.clone()\n    }\n",
+                8
+            )
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Impl, Language::Rust);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
+        assert_non_gap_unit_contains(&units, "impl<T: Clone> Worker<T>");
+        assert_non_gap_unit_contains(&units, "T: Send");
+    }
+
+    #[test]
+    fn test_swift_enum_review_units_cover_cases() {
+        let content = format!(
+            "enum Role: String {{\n    case admin\n    case user\n{}}}\n",
+            padded_members(
+                "\n    func scale{n}(value: Int) -> Int {\n        return value\n    }\n",
+                8
+            )
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Enum, Language::Swift);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Method));
+        assert_non_gap_unit_contains(&units, "enum Role: String");
+        assert_non_gap_unit_contains(&units, "case admin");
+    }
+
+    #[test]
+    fn test_c_type_review_units_cover_header_and_preproc() {
+        let content = format!(
+            "typedef struct {{\n    int x;\n#ifdef DEBUG\n    void (*hook)(void);\n#endif\n{}}} config_t;\n",
+            padded_members("    int field{n};\n", 40)
+        );
+        let units = assert_review_units_tile_parent(&content, BlockKind::Struct, Language::C);
+        assert!(units.iter().any(|unit| unit.kind == BlockKind::Variable));
+        assert_non_gap_unit_contains(&units, "typedef struct");
+        assert_non_gap_unit_contains(&units, "hook");
+        assert_non_gap_unit_contains(&units, "config_t");
     }
 
     #[test]

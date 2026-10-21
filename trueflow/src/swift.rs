@@ -118,6 +118,7 @@ fn map_member_kind(node: Node<'_>, content: &str) -> Option<BlockKind> {
         | "subscript_declaration" => Some(BlockKind::Method),
         "protocol_function_declaration" => Some(BlockKind::FunctionSignature),
         "typealias_declaration" | "associatedtype_declaration" => Some(BlockKind::Type),
+        "enum_entry" => Some(BlockKind::Const),
         "property_declaration" | "protocol_property_declaration" => {
             Some(map_property_kind(node, content))
         }
