@@ -621,34 +621,29 @@ pub fn collect_feedback_entries(
                 .then_with(|| left.id.cmp(&right.id))
         });
     }
-    entries.sort_by(|left, right| {
-        left.file_path
-            .cmp(&right.file_path)
-            .then_with(|| {
-                left.block
-                    .as_ref()
-                    .map_or(usize::MAX, |block| block.start_line)
-                    .cmp(
-                        &right
-                            .block
-                            .as_ref()
-                            .map_or(usize::MAX, |block| block.start_line),
-                    )
-            })
-            .then_with(|| {
-                left.declaration
-                    .as_ref()
-                    .map(|declaration| declaration.semantic_key.as_str())
-                    .cmp(
-                        &right
-                            .declaration
-                            .as_ref()
-                            .map(|declaration| declaration.semantic_key.as_str()),
-                    )
-            })
-    });
+    entries.sort_by(|left, right| feedback_entry_order(left).cmp(&feedback_entry_order(right)));
 
     Ok(entries)
+}
+
+/// Total order for exported entries; entries come out of a `HashMap`, so
+/// every tie must be broken. The earliest review's `(timestamp, id)` is
+/// unique per entry because each record belongs to one entry.
+fn feedback_entry_order(entry: &FeedbackEntry) -> impl Ord + '_ {
+    let block = entry.block.as_ref();
+    (
+        entry.file_path.as_str(),
+        block.map_or(usize::MAX, |block| block.start_line),
+        entry
+            .declaration
+            .as_ref()
+            .map(|declaration| declaration.semantic_key.as_str()),
+        block.map(|block| (block.end_line, block.hash.as_str(), block.content.as_str())),
+        entry
+            .reviews
+            .first()
+            .map(|review| (review.timestamp, review.id.as_str())),
+    )
 }
 
 fn collect_declaration_feedback_entries(
@@ -1902,6 +1897,52 @@ mod tests {
         .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
 
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn collect_feedback_entries_orders_same_start_entries_deterministically() {
+        let scoped_comment = |id: &str, timestamp: i64, end_line: u32, context: &str| {
+            let mut record = build_record(id, "aaaaaaa", "src/lib.rs", timestamp, Verdict::Comment);
+            record.comment_scope = Some(crate::store::CommentScope {
+                start_line: 11,
+                end_line,
+            });
+            record.comment_context = Some(context.to_string());
+            record
+        };
+        // Inserted longest-first so only the sort, not input order, decides.
+        let records = [
+            scoped_comment("wide", 10, 13, "    a();\n    b();\n"),
+            scoped_comment("narrow-b", 30, 12, "    b();\n"),
+            scoped_comment("narrow-a", 20, 12, "    a();\n"),
+        ];
+        let canonical = resolved_context_with_span(
+            "src/lib.rs",
+            "fn core() {\n    a();\n    b();\n}\n",
+            LineSpan::new(10, 14),
+        );
+
+        for _ in 0..32 {
+            let mut resolver = FakeResolver {
+                contexts: records
+                    .iter()
+                    .map(|record| (record.id.clone(), canonical.clone()))
+                    .collect(),
+            };
+            let entries = collect_feedback_entries(
+                &records,
+                &FeedbackSinceFilter::All,
+                &unapproved_feedback_query(),
+                &mut resolver,
+            )
+            .unwrap_or_else(|error| panic!("collection should succeed: {error}"));
+
+            let ids = entries
+                .iter()
+                .map(|entry| entry.reviews[0].id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec!["narrow-a", "narrow-b", "wide"]);
+        }
     }
 
     #[test]
