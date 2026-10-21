@@ -41,7 +41,10 @@ pub(crate) struct SpeedReadController {
 }
 
 impl SpeedReadController {
-    pub(crate) fn new(config: TuiSpeedReadConfig, defaults_writer: SpeedReadDefaultsWriter) -> Self {
+    pub(crate) fn new(
+        config: TuiSpeedReadConfig,
+        defaults_writer: SpeedReadDefaultsWriter,
+    ) -> Self {
         let default_wpm = config.default_wpm.clamp(config.min_wpm, config.max_wpm);
         let default_chunk_words = config
             .default_chunk_words

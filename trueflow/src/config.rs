@@ -1048,7 +1048,7 @@ impl SpeedReadDefaultsWriter {
     }
 
     /// Writer for a project rooted at `dir` with no global config layer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "tui-test-support"))]
     pub(crate) fn in_dir(dir: PathBuf) -> Self {
         Self::new(dir.clone(), None, dir)
     }
@@ -1141,7 +1141,9 @@ fn project_layer_insert_index(layers: &[(PathBuf, toml::Value)], path: &Path) ->
         .iter()
         .position(|(layer, _)| {
             is_ancestor_config_layer(layer)
-                && layer.parent().is_some_and(|layer_dir| layer_dir.starts_with(dir))
+                && layer
+                    .parent()
+                    .is_some_and(|layer_dir| layer_dir.starts_with(dir))
         })
         .unwrap_or(layers.len())
 }
@@ -1158,10 +1160,7 @@ fn speed_read_defaults_document(
     let tui_table = child_table_like(document.as_table_mut(), "tui", "tui")?;
     let speed_read_table = child_table_like(tui_table, "speed_read", "tui.speed_read")?;
     speed_read_table.insert("default_wpm", value(i64::from(default_wpm)));
-    speed_read_table.insert(
-        "default_chunk_words",
-        value(i64::from(default_chunk_words)),
-    );
+    speed_read_table.insert("default_chunk_words", value(i64::from(default_chunk_words)));
     Ok(document.to_string())
 }
 
@@ -1786,8 +1785,7 @@ exclude = ["comment"]
         assert!(!filters.allows_block(BlockKind::Struct));
         assert!(!filters.allows_subblock(BlockKind::Struct));
 
-        let cli_excluded =
-            config.resolve_filters(&[BlockKind::Comment], &[BlockKind::Comment]);
+        let cli_excluded = config.resolve_filters(&[BlockKind::Comment], &[BlockKind::Comment]);
         assert!(
             !cli_excluded.allows_block(BlockKind::Comment),
             "an explicit CLI exclude still wins over CLI only"
@@ -2145,8 +2143,8 @@ max_chunk_words = 5
             .save(500, 3)
             .unwrap_or_else(|err| panic!("save speed-read defaults: {err}"));
 
-        let cfg = load_from_start_dir(&nested, None)
-            .unwrap_or_else(|err| panic!("load config: {err}"));
+        let cfg =
+            load_from_start_dir(&nested, None).unwrap_or_else(|err| panic!("load config: {err}"));
         assert_eq!(cfg.tui.speed_read.default_wpm, 500);
         assert_eq!(cfg.tui.speed_read.default_chunk_words, 3);
         assert!(
@@ -2167,7 +2165,7 @@ max_chunk_words = 5
         let root_config = "[tui.keybinds]\nnote = \"a\"\n";
         write_config(&repo.join("trueflow.toml"), root_config);
 
-        SpeedReadDefaultsWriter::new(workdir.clone(), Some(home.clone()), repo.clone())
+        SpeedReadDefaultsWriter::new(workdir.clone(), Some(home.clone()), repo)
             .save(1000, 7)
             .unwrap_or_else(|err| panic!("save speed-read defaults: {err}"));
 

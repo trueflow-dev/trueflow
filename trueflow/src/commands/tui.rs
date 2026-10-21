@@ -18175,7 +18175,10 @@ mod diff_scope_tests {
             .as_ref()
             .map(|mode| mode.model.settings.wpm)
             .unwrap_or_else(|| panic!("expected speed read mode"));
-        assert!(wpm > 900, "expected the raised speed to exceed built-in max");
+        assert!(
+            wpm > 900,
+            "expected the raised speed to exceed built-in max"
+        );
 
         let result = state.speed_read.flush_pending_defaults();
         assert!(result.is_ok(), "save failed: {result:?}");

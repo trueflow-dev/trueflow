@@ -14,10 +14,10 @@ use super::{
     toggle_speed_read_mode, ui, vcs,
 };
 use crate::analysis::Language;
-use crate::config::SpeedReadDefaultsWriter;
 use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
 use crate::commands::mark;
 use crate::commands::review::{BlockChangeKind, FileChangeKind};
+use crate::config::SpeedReadDefaultsWriter;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::ReviewOrder;
 use crate::review_scope::ScopePreset;
