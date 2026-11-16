@@ -1534,10 +1534,11 @@ impl StoreLocation {
             return Ok(location);
         }
 
-        let start_dir = std::env::current_dir()?;
+        let raw_start_dir = std::env::current_dir()?;
+        let start_dir = fs::canonicalize(&raw_start_dir).unwrap_or_else(|_| raw_start_dir.clone());
         let home_dir = dirs::home_dir().map(|home| fs::canonicalize(&home).unwrap_or(home));
-        let root_path =
-            existing_store_root_outside_git(&start_dir, home_dir.as_deref()).unwrap_or(start_dir);
+        let root_path = existing_store_root_outside_git(&start_dir, home_dir.as_deref())
+            .unwrap_or(raw_start_dir);
         let location = Self { root_path };
         location.ensure_trueflow_dir()?;
         Ok(location)
@@ -1560,15 +1561,26 @@ impl StoreLocation {
     }
 }
 
-/// The closest ancestor of `start_dir` holding a `.trueflow` store. The home
-/// directory is skipped: `~/.trueflow` holds the global scan cache, not the
-/// reviews of whichever non-git project happens to live under `$HOME`.
+/// The closest ancestor of `start_dir` holding a `.trueflow` store. `$HOME` and
+/// legacy cache-only `.trueflow/cache` folders are skipped so non-git projects
+/// never deposit review records into a cache directory.
 fn existing_store_root_outside_git(start_dir: &Path, home_dir: Option<&Path>) -> Option<PathBuf> {
     start_dir
         .ancestors()
         .filter(|dir| Some(*dir) != home_dir)
-        .find(|dir| dir.join(TRUEFLOW_DIR).exists())
+        .find(|dir| is_usable_trueflow_store_dir(&dir.join(TRUEFLOW_DIR)))
         .map(Path::to_path_buf)
+}
+
+fn is_usable_trueflow_store_dir(trueflow_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(trueflow_dir) else {
+        return false;
+    };
+    let names: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    names.as_slice() != [std::ffi::OsStr::new("cache")]
 }
 
 #[derive(Debug, Clone)]

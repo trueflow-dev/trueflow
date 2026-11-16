@@ -17,7 +17,8 @@ exclude = []
 # default_since = "all"
 
 [scan]
-# Read/write the scan cache under ~/.trueflow/cache by default.
+# Read/write the scan cache under the OS user cache directory by default
+# (override with `cache_dir` or `TRUEFLOW_CACHE_DIR`).
 use_cache = true
 write_cache = true
 # cache_dir = ".trueflow/cache"

@@ -24,14 +24,21 @@ static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub struct TestRepo {
     pub path: PathBuf,
+    env_dir: PathBuf,
 }
 
 impl TestRepo {
     pub fn new(name: &str) -> Result<Self> {
         let path = temp_dir("trueflow_tests", name);
+        let env_dir = create_test_env_dir("trueflow_test_envs", name)?;
         fs::create_dir_all(&path)?;
         init_git_with_identity(&path, "test@example.com", "Test User")?;
-        Ok(Self { path })
+        Ok(Self { path, env_dir })
+    }
+
+    pub fn from_path(name: &str, path: PathBuf) -> Result<Self> {
+        let env_dir = create_test_env_dir("trueflow_test_envs", name)?;
+        Ok(Self { path, env_dir })
     }
 
     pub fn fixture(name: &str) -> Result<Self> {
@@ -42,7 +49,8 @@ impl TestRepo {
             "Test User",
             "test fixture",
         )?;
-        Ok(Self { path })
+        let env_dir = create_test_env_dir("trueflow_e2e_envs", name)?;
+        Ok(Self { path, env_dir })
     }
 
     pub fn write(&self, path: &str, content: &str) -> Result<()> {
@@ -72,19 +80,19 @@ impl TestRepo {
     }
 
     pub fn run(&self, args: &[&str]) -> Result<String> {
-        run_cmd(&self.path, args)
+        run_cmd(&self.path, &self.env_dir, args)
     }
 
     pub fn run_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
-        run_cmd_with_env(&self.path, args, envs)
+        run_cmd_with_env(&self.path, &self.env_dir, args, envs)
     }
 
     pub fn run_in(&self, args: &[&str], dir: &Path) -> Result<String> {
-        run_cmd(dir, args)
+        run_cmd(dir, &self.env_dir, args)
     }
 
     pub fn run_err(&self, args: &[&str]) -> Result<String> {
-        let output = build_cmd(&self.path, args)?.output()?;
+        let output = build_cmd(&self.path, &self.env_dir, args)?.output()?;
         if output.status.success() {
             anyhow::bail!("trueflow succeeded but expected failure");
         }
@@ -92,7 +100,7 @@ impl TestRepo {
     }
 
     pub fn run_raw(&self, args: &[&str]) -> Result<std::process::Output> {
-        Ok(build_cmd(&self.path, args)?.output()?)
+        Ok(build_cmd(&self.path, &self.env_dir, args)?.output()?)
     }
 
     pub fn scan_without_cache(&self) -> Result<ScanResult> {
@@ -120,6 +128,13 @@ impl TestRepo {
         exclude: &[BlockKind],
     ) -> Result<ReviewSummary> {
         run_review_summary(dir, request, only, exclude)
+    }
+}
+
+impl Drop for TestRepo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+        let _ = fs::remove_dir_all(&self.env_dir);
     }
 }
 
@@ -255,14 +270,29 @@ fn trueflow_bin() -> Result<PathBuf> {
     )
 }
 
-fn build_cmd(dir: &Path, args: &[&str]) -> Result<Command> {
+fn create_test_env_dir(base: &str, name: &str) -> Result<PathBuf> {
+    let env_dir = temp_dir(base, name);
+    fs::create_dir_all(env_dir.join("home"))?;
+    fs::create_dir_all(env_dir.join("cache"))?;
+    Ok(env_dir)
+}
+
+fn build_cmd(dir: &Path, env_dir: &Path, args: &[&str]) -> Result<Command> {
+    let home = env_dir.join("home");
+    let cache = env_dir.join("cache");
     let mut cmd = Command::new(trueflow_bin()?);
-    cmd.args(args).current_dir(dir);
+    cmd.args(args)
+        .current_dir(dir)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("TRUEFLOW_CACHE_DIR", cache.join("trueflow-scan"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"));
     Ok(cmd)
 }
 
-fn run_cmd(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = build_cmd(dir, args)?.output()?;
+fn run_cmd(dir: &Path, env_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = build_cmd(dir, env_dir, args)?.output()?;
     if !output.status.success() {
         anyhow::bail!(
             "trueflow failed: {}",
@@ -272,8 +302,13 @@ fn run_cmd(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-fn run_cmd_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
-    let mut cmd = build_cmd(dir, args)?;
+fn run_cmd_with_env(
+    dir: &Path,
+    env_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<String> {
+    let mut cmd = build_cmd(dir, env_dir, args)?;
     for (key, value) in envs {
         cmd.env(key, value);
     }

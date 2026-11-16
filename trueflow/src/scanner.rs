@@ -3,7 +3,7 @@ use crate::block::FileState;
 use crate::hashing::hash_str;
 use crate::repo_path::RepoPath;
 use anyhow::{Result, anyhow};
-use dirs::home_dir;
+use dirs::cache_dir;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
@@ -11,12 +11,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 const DEFAULT_IGNORE_NAMES: &[&str] =
     &[".git", ".trueflow", "target", "node_modules", "mutants.out"];
 const SCAN_CACHE_FORMAT_VERSION: u32 = 4;
+const SCAN_CACHE_DIR_ENV: &str = "TRUEFLOW_CACHE_DIR";
+const MAX_SCAN_CACHE_FILES: usize = 128;
+const MAX_SCAN_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const STALE_SCAN_CACHE_TMP_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanCacheMode {
@@ -217,8 +221,14 @@ fn finalize_scan_cache_write(
     cached_entry_count: Option<usize>,
     cache_files: Vec<CachedFileEntry>,
 ) {
+    if !options.cache_mode.writes_enabled() {
+        return;
+    }
+    let Some(cache_file_path) = cache_path(root, options) else {
+        return;
+    };
     if should_write_scan_cache(options, cache, cached_entry_count, cache_files.len()) {
-        match write_cache(root, options, cache_files) {
+        match write_cache_to_path(&cache_file_path, root, options, cache_files) {
             Ok(()) => cache.write = ScanCacheWriteStatus::Wrote,
             Err(err) => {
                 cache.write = ScanCacheWriteStatus::Error;
@@ -230,7 +240,7 @@ fn finalize_scan_cache_write(
                 debug!("failed to write scan cache, continuing: {err}");
             }
         }
-    } else if options.cache_mode.writes_enabled() {
+    } else {
         cache.write = ScanCacheWriteStatus::Skipped;
     }
 }
@@ -390,8 +400,9 @@ fn load_scan_cache_for_read(
     if !options.cache_mode.reads_enabled() {
         return None;
     }
+    let cache_file_path = cache_path(root, options)?;
 
-    match load_cache_entry(root, options) {
+    match load_cache_entry_from_path(&cache_file_path, root, options) {
         Ok(Some(entry)) => {
             cache.read = ScanCacheReadStatus::Hit;
             Some(index_cached_files(entry))
@@ -559,9 +570,27 @@ enum ScanAttempt {
     Reject { diagnostics: Vec<ScanDiagnostic> },
 }
 
+#[cfg(test)]
 fn load_cache_entry(root: &Path, options: &ScanOptions) -> Result<Option<CacheEntry>> {
-    let cache_path = cache_path(root, options)?;
-    let contents = match fs::read_to_string(&cache_path) {
+    let Some(cache_file_path) = cache_path(root, options) else {
+        return Ok(None);
+    };
+    load_cache_entry_from_path(&cache_file_path, root, options)
+}
+
+#[cfg(test)]
+fn write_cache(root: &Path, options: &ScanOptions, files: Vec<CachedFileEntry>) -> Result<()> {
+    let cache_file_path =
+        cache_path(root, options).ok_or_else(|| anyhow!("scan cache path disabled"))?;
+    write_cache_to_path(&cache_file_path, root, options, files)
+}
+
+fn load_cache_entry_from_path(
+    cache_path: &Path,
+    root: &Path,
+    options: &ScanOptions,
+) -> Result<Option<CacheEntry>> {
+    let contents = match fs::read_to_string(cache_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
@@ -612,8 +641,12 @@ fn index_cached_files(entry: CacheEntry) -> HashMap<RepoPath, CachedFileEntry> {
         .collect()
 }
 
-fn write_cache(root: &Path, options: &ScanOptions, files: Vec<CachedFileEntry>) -> Result<()> {
-    let cache_path = cache_path(root, options)?;
+fn write_cache_to_path(
+    cache_path: &Path,
+    root: &Path,
+    options: &ScanOptions,
+    files: Vec<CachedFileEntry>,
+) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -636,12 +669,106 @@ fn write_cache(root: &Path, options: &ScanOptions, files: Vec<CachedFileEntry>) 
         .unwrap_or_default();
     let temporary_path =
         cache_path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    let result = fs::write(&temporary_path, contents)
-        .and_then(|()| fs::rename(&temporary_path, &cache_path));
+    let result =
+        fs::write(&temporary_path, contents).and_then(|()| fs::rename(&temporary_path, cache_path));
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
     }
-    Ok(result?)
+    result?;
+    if let Some(parent) = cache_path.parent() {
+        prune_scan_cache_dir(
+            parent,
+            cache_path,
+            MAX_SCAN_CACHE_FILES,
+            MAX_SCAN_CACHE_BYTES,
+            SystemTime::now(),
+        );
+    }
+    Ok(())
+}
+
+fn prune_scan_cache_dir(
+    cache_dir: &Path,
+    keep_file: &Path,
+    max_files: usize,
+    max_bytes: u64,
+    now: SystemTime,
+) {
+    let Ok(read_dir) = fs::read_dir(cache_dir) else {
+        return;
+    };
+
+    struct Candidate {
+        path: PathBuf,
+        size: u64,
+        modified_epoch: u64,
+        keep: bool,
+    }
+
+    let mut candidates = Vec::new();
+    let mut total_bytes = 0_u64;
+
+    for entry in read_dir.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+
+        if name.starts_with(".scan-") && name.ends_with(".tmp") {
+            let is_stale = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= STALE_SCAN_CACHE_TMP_AGE);
+            if is_stale {
+                let _ = fs::remove_file(&path);
+            }
+            continue;
+        }
+
+        if name.starts_with("scan-") && name.ends_with(".json") {
+            let size = metadata.len();
+            let modified_epoch = metadata.modified().map(system_time_to_epoch).unwrap_or(0);
+            let keep = path == keep_file;
+            total_bytes = total_bytes.saturating_add(size);
+            candidates.push(Candidate {
+                path,
+                size,
+                modified_epoch,
+                keep,
+            });
+        }
+    }
+
+    let mut remaining_files = candidates.len();
+    if remaining_files <= max_files && total_bytes <= max_bytes {
+        return;
+    }
+
+    candidates.sort_by(|a, b| {
+        a.modified_epoch
+            .cmp(&b.modified_epoch)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    for candidate in candidates {
+        if remaining_files <= max_files && total_bytes <= max_bytes {
+            break;
+        }
+        if candidate.keep {
+            continue;
+        }
+        if fs::remove_file(&candidate.path).is_ok() {
+            remaining_files = remaining_files.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(candidate.size);
+        }
+    }
 }
 
 /// The code that produced cached blocks. A cache written by any other
@@ -702,20 +829,68 @@ fn cache_fingerprint(options: &ScanOptions, producer: CacheProducer) -> String {
     hash_str(&json)
 }
 
-fn cache_path(root: &Path, options: &ScanOptions) -> Result<PathBuf> {
+fn cache_path(root: &Path, options: &ScanOptions) -> Option<PathBuf> {
     let identity = cache_identity(root);
+    let cache_root = resolve_cache_dir(&identity, options)?;
     let repo_name = identity
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
-    let cache_root = options.cache_dir.clone().unwrap_or_else(|| {
-        home_dir()
-            .unwrap_or_else(|| root.to_path_buf())
-            .join(".trueflow")
-            .join("cache")
-    });
     let root_hash = hash_str(identity.to_string_lossy().as_ref());
-    Ok(cache_root.join(format!("scan-{repo_name}-{root_hash}.json")))
+    Some(cache_root.join(format!("scan-{repo_name}-{root_hash}.json")))
+}
+
+fn resolve_cache_dir(identity: &Path, options: &ScanOptions) -> Option<PathBuf> {
+    if let Some(explicit) = &options.cache_dir {
+        return Some(explicit.clone());
+    }
+    if let Some(env_dir) = std::env::var_os(SCAN_CACHE_DIR_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(env_dir));
+    }
+    let default_dir = cache_dir()?.join("trueflow").join("scan");
+    resolve_default_cache_dir_for_identity(identity, &default_dir, &std::env::temp_dir())
+}
+
+fn resolve_default_cache_dir_for_identity(
+    identity: &Path,
+    default_cache_dir: &Path,
+    temp_dir: &Path,
+) -> Option<PathBuf> {
+    let canonical_cache = canonicalize_existing_prefix(default_cache_dir);
+    // Never write a default global cache inside the scanned directory itself
+    // (for example when HOME equals the repository root or when scanning $HOME).
+    if canonical_cache.starts_with(identity) {
+        return None;
+    }
+    let canonical_temp = canonicalize_existing_prefix(temp_dir);
+    // Do not persist ephemeral OS temp-directory scans into a real user cache
+    // outside temp_dir; isolated test homes under temp_dir remain cacheable.
+    if identity.starts_with(&canonical_temp) && !canonical_cache.starts_with(&canonical_temp) {
+        return None;
+    }
+    Some(default_cache_dir.to_path_buf())
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut suffix = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut resolved = canonical;
+            for part in suffix.into_iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        let Some(name) = cursor.file_name() else {
+            return path.to_path_buf();
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        cursor = parent;
+    }
 }
 
 fn cache_identity(root: &Path) -> PathBuf {
@@ -2023,6 +2198,97 @@ mod tests {
             );
             assert_eq!(result.files[0].blocks[0].content, source.trim_end());
         }
+    }
+
+    #[test]
+    fn resolve_default_cache_dir_skips_temp_roots_and_nested_caches() {
+        let root_parent = temp_test_dir("scanner_default_cache_rules");
+        let fake_temp = root_parent.join("tmp");
+        let fake_home = root_parent.join("home");
+        let real_cache = fake_home.join("Library/Caches/trueflow/scan");
+        let proj = root_parent.join("src/proj");
+        let temp_proj = fake_temp.join("test-repo");
+        let temp_home_cache = fake_temp.join("isolated-home/Library/Caches/trueflow/scan");
+        fs::create_dir_all(&fake_temp).unwrap();
+        fs::create_dir_all(&fake_home).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&temp_proj).unwrap();
+        fs::create_dir_all(temp_home_cache.parent().unwrap()).unwrap();
+
+        let proj_identity = cache_identity(&proj);
+        let temp_proj_identity = cache_identity(&temp_proj);
+        let home_identity = cache_identity(&fake_home);
+
+        assert_eq!(
+            resolve_default_cache_dir_for_identity(&proj_identity, &real_cache, &fake_temp),
+            Some(real_cache.clone())
+        );
+        assert_eq!(
+            resolve_default_cache_dir_for_identity(&temp_proj_identity, &real_cache, &fake_temp),
+            None,
+            "ephemeral temp roots must not pollute a user cache outside temp_dir"
+        );
+        assert_eq!(
+            resolve_default_cache_dir_for_identity(
+                &temp_proj_identity,
+                &temp_home_cache,
+                &fake_temp
+            ),
+            Some(temp_home_cache),
+            "isolated temp homes used by CLI tests should still resolve default cache paths"
+        );
+        assert_eq!(
+            resolve_default_cache_dir_for_identity(&home_identity, &real_cache, &fake_temp),
+            None,
+            "default cache must not be created inside the scanned root itself"
+        );
+
+        let _ = fs::remove_dir_all(&root_parent);
+    }
+
+    #[test]
+    fn prune_scan_cache_dir_evicts_oldest_by_count_and_bytes_and_sweeps_stale_temps() {
+        let cache_dir = temp_test_dir("scanner_prune_cache_dir");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let stale_tmp = cache_dir.join(".scan-old-0000.json.1111.tmp");
+        let fresh_tmp = cache_dir.join(".scan-fresh-0000.json.2222.tmp");
+        fs::write(&stale_tmp, b"partial").unwrap();
+        fs::write(&fresh_tmp, b"in-flight").unwrap();
+
+        let a = cache_dir.join("scan-a-0001.json");
+        let b = cache_dir.join("scan-b-0002.json");
+        let c = cache_dir.join("scan-c-0003.json");
+        let keep = cache_dir.join("scan-keep-0004.json");
+        fs::write(&a, vec![b'a'; 100]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(&b, vec![b'b'; 100]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(&c, vec![b'c'; 100]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(&keep, vec![b'k'; 100]).unwrap();
+
+        prune_scan_cache_dir(&cache_dir, &keep, 4, 1000, SystemTime::now());
+        assert!(fresh_tmp.exists(), "fresh .tmp file must not be swept");
+        fs::remove_file(&fresh_tmp).unwrap();
+
+        let future_for_stale =
+            SystemTime::now() + STALE_SCAN_CACHE_TMP_AGE + Duration::from_secs(5);
+        prune_scan_cache_dir(&cache_dir, &keep, 3, 250, future_for_stale);
+
+        assert!(!stale_tmp.exists(), "stale .tmp file should be swept");
+        assert!(!a.exists(), "oldest entry a should be evicted");
+        assert!(
+            !b.exists(),
+            "second-oldest entry b should be evicted to meet 250-byte cap"
+        );
+        assert!(
+            c.exists(),
+            "newer entry c should survive within 2-file / 200-byte budget"
+        );
+        assert!(keep.exists(), "kept file must always survive");
+
+        let _ = fs::remove_dir_all(&cache_dir);
     }
 
     #[cfg(windows)]

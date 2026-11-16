@@ -544,3 +544,141 @@ fn test_commands_write_logs_under_trueflow_directory() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn default_scan_cache_writes_outside_home_dot_trueflow_and_evicts_excess_entries() -> Result<()> {
+    let home = temp_test_dir("scan_cache_isolated_home");
+    let xdg_cache = home.join("xdg-cache");
+    fs::create_dir_all(&xdg_cache)?;
+
+    let proj = temp_test_dir("scan_cache_isolated_proj");
+    fs::create_dir_all(proj.join("src"))?;
+    fs::write(proj.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n")?;
+    run_git(&proj, &["init", "-q"])?;
+
+    let bin = env!("CARGO_BIN_EXE_trueflow");
+    let output = Command::new(bin)
+        .args(["scan", "--json"])
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &xdg_cache)
+        .env_remove("TRUEFLOW_CACHE_DIR")
+        .current_dir(&proj)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "trueflow scan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !home.join(".trueflow").exists(),
+        "default scan cache must not create ~/.trueflow"
+    );
+
+    let expected_cache_dir = if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Caches")
+            .join("trueflow")
+            .join("scan")
+    } else {
+        xdg_cache.join("trueflow").join("scan")
+    };
+    let cached_files: Vec<_> = fs::read_dir(&expected_cache_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("scan-") && name.ends_with(".json"))
+        })
+        .collect();
+    assert_eq!(cached_files.len(), 1);
+
+    let bounded_cache = temp_test_dir("scan_cache_bounded_override");
+    fs::create_dir_all(&bounded_cache)?;
+    for idx in 0..135_u32 {
+        fs::write(
+            bounded_cache.join(format!("scan-stale-{idx:03}-0000.json")),
+            b"{}",
+        )?;
+    }
+
+    let proj2 = temp_test_dir("scan_cache_bounded_proj");
+    fs::create_dir_all(proj2.join("src"))?;
+    fs::write(proj2.join("src/lib.rs"), "pub fn fresh() -> u32 { 7 }\n")?;
+    run_git(&proj2, &["init", "-q"])?;
+
+    let output2 = Command::new(bin)
+        .args(["scan", "--json"])
+        .env("HOME", &home)
+        .env("TRUEFLOW_CACHE_DIR", &bounded_cache)
+        .current_dir(&proj2)
+        .output()?;
+    assert!(
+        output2.status.success(),
+        "bounded scan failed: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+
+    let remaining_scan_files = fs::read_dir(&bounded_cache)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("scan-") && name.ends_with(".json"))
+        })
+        .count();
+    assert!(
+        remaining_scan_files <= 128,
+        "expected scan cache to evict down to <= 128 files, got {remaining_scan_files}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&proj);
+    let _ = fs::remove_dir_all(&bounded_cache);
+    let _ = fs::remove_dir_all(&proj2);
+    Ok(())
+}
+
+#[test]
+fn store_discovery_outside_git_ignores_cache_only_ancestor_dir() -> Result<()> {
+    let home = temp_test_dir("no_git_cache_ancestor_home");
+    fs::create_dir_all(&home)?;
+    let outer = temp_test_dir("no_git_cache_ancestor_outer");
+    fs::create_dir_all(outer.join(".trueflow").join("cache"))?;
+    let project = outer.join("proj");
+    fs::create_dir_all(&project)?;
+
+    let hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let output = Command::new(env!("CARGO_BIN_EXE_trueflow"))
+        .args([
+            "mark",
+            "--fingerprint",
+            hash,
+            "--verdict",
+            "approved",
+            "--quiet",
+        ])
+        .env("HOME", &home)
+        .current_dir(&project)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "trueflow mark failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        read_review_records(&project.join(".trueflow").join("reviews.jsonl"))?.len(),
+        1
+    );
+    assert!(
+        !outer.join(".trueflow").join("reviews.jsonl").exists(),
+        "cache-only .trueflow ancestor must not be adopted as a project review store"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&outer);
+    Ok(())
+}
