@@ -176,6 +176,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         }
     }
 
+    crate::tree_sitter_support::clear_thread_parsers();
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 
@@ -324,6 +325,7 @@ pub fn scan_paths<P: AsRef<Path>>(
         }
     }
 
+    crate::tree_sitter_support::clear_thread_parsers();
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 

@@ -6,7 +6,7 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Node};
 
 #[derive(Debug, Clone, Copy)]
 struct SemanticSpan {
@@ -148,11 +148,11 @@ fn collect_semantic_descendants(node: Node<'_>, content: &str, blocks: &mut Vec<
 
         let kind = map_kind(child, content);
         if should_collect_nested_child(child, content, kind) {
-            blocks.push(NestedBlock {
-                start_byte: child.start_byte(),
-                end_byte: child.end_byte(),
+            blocks.push(NestedBlock::without_complexity(
+                child.start_byte(),
+                child.end_byte(),
                 kind,
-            });
+            ));
         }
 
         if kind == BlockKind::Section || child.kind() == "element" {
@@ -199,11 +199,8 @@ fn split_section_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 }
 
 fn parse_html(content: &str) -> Result<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_html::LANGUAGE.into())
-        .context("Failed to load HTML grammar")?;
-    parser.parse(content, None).context("Failed to parse HTML")
+    crate::tree_sitter_support::parse_with_language(content, &tree_sitter_html::LANGUAGE.into())
+        .context("Failed to parse HTML")
 }
 
 fn find_primary_review_root(root: Node<'_>) -> Option<Node<'_>> {

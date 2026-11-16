@@ -8,7 +8,7 @@ use crate::code_comments::CommentSyntax;
 use crate::complexity;
 
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Node};
 
 pub(crate) fn registration() -> LanguageRegistration {
     LanguageRegistration {
@@ -359,11 +359,8 @@ fn is_json_structural_noise(chunk: &str) -> bool {
 }
 
 fn parse_tree(source: &str) -> Result<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_json::LANGUAGE.into())
-        .context("Failed to load JSON grammar")?;
-    parser.parse(source, None).context("Failed to parse JSON")
+    crate::tree_sitter_support::parse_with_language(source, &tree_sitter_json::LANGUAGE.into())
+        .context("Failed to parse JSON")
 }
 
 fn create_file_block(

@@ -2,10 +2,11 @@ use crate::block::BlockKind;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TypeMemberSpan {
+pub(crate) struct TypeMemberSpan<'a> {
     pub(crate) start_byte: usize,
     pub(crate) end_byte: usize,
     pub(crate) kind: BlockKind,
+    pub(crate) node: Option<Node<'a>>,
 }
 
 pub(crate) fn map_kind(node: Node<'_>, content: &str) -> BlockKind {
@@ -52,7 +53,10 @@ pub(crate) fn body_is_non_trivial(body: Node<'_>, content: &str) -> bool {
         >= 10
 }
 
-pub(crate) fn collect_type_member_spans(body: Node<'_>, content: &str) -> Vec<TypeMemberSpan> {
+pub(crate) fn collect_type_member_spans<'a>(
+    body: Node<'a>,
+    content: &str,
+) -> Vec<TypeMemberSpan<'a>> {
     let mut members = Vec::new();
     let mut cursor = body.walk();
     let mut pending_start: Option<usize> = None;
@@ -82,6 +86,7 @@ pub(crate) fn collect_type_member_spans(body: Node<'_>, content: &str) -> Vec<Ty
             start_byte: pending_start.unwrap_or(start_byte),
             end_byte,
             kind,
+            node: Some(child),
         });
         pending_start = None;
         pending_end = 0;
@@ -94,6 +99,7 @@ pub(crate) fn collect_type_member_spans(body: Node<'_>, content: &str) -> Vec<Ty
                 start_byte: start,
                 end_byte: end,
                 kind: BlockKind::Code,
+                node: None,
             });
         }
     }

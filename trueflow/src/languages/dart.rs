@@ -9,7 +9,7 @@ use crate::complexity;
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Node};
 
 #[derive(Debug, Clone)]
 struct SemanticSpan {
@@ -627,12 +627,11 @@ fn sub_split_registration(kind: BlockKind) -> SubSplitRegistration {
 }
 
 fn split_function_like_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
-
-    let tree = parser
-        .parse(&block.content, None)
-        .context("Failed to parse dart function-like block")?;
+    let tree = crate::tree_sitter_support::parse_with_language(
+        &block.content,
+        &tree_sitter_dart::LANGUAGE.into(),
+    )
+    .context("Failed to parse dart function-like block")?;
     let root = tree.root_node();
     let Some(body_node) = find_named_descendant(root, "function_body") else {
         return crate::sub_splitter::split_code_review_units(block);
@@ -755,12 +754,11 @@ fn classify_review_chunk(chunk: &str) -> BlockKind {
 }
 
 fn split_type_like_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
-
-    let tree = parser
-        .parse(&block.content, None)
-        .context("Failed to parse dart type-like block")?;
+    let tree = crate::tree_sitter_support::parse_with_language(
+        &block.content,
+        &tree_sitter_dart::LANGUAGE.into(),
+    )
+    .context("Failed to parse dart type-like block")?;
     let root = tree.root_node();
 
     if find_named_descendant(root, "type_alias").is_some() {
@@ -928,7 +926,7 @@ external set externalName(String value);\n\
 @Deprecated('use another name')\n\
 String get topLevelName => 'name';\n\
 set topLevelName(String value) {}\n";
-        let mut parser = Parser::new();
+        let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_dart::LANGUAGE.into())?;
         let tree = parser
             .parse(source, None)

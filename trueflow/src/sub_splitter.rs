@@ -6,12 +6,11 @@ use crate::text_split::paragraph_break_regex;
 use crate::tree_sitter_support::{
     classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
     find_named_descendant, find_named_descendant_any, kotlin_type_body, markdown_heading_level,
-    ruby_assignment_targets_constant, ruby_call_method_name,
+    parse_with_language, ruby_assignment_targets_constant, ruby_call_method_name,
 };
 use crate::{languages, nix_blocks, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
 use tracing::info;
-use tree_sitter::Parser;
 use tree_sitter_md;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,13 +563,7 @@ impl StructuralSpan for nix_blocks::NixSpan {
 
 fn split_markdown_tree(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_md::LANGUAGE.into())
-        .context("Failed to load markdown grammar")?;
-
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_md::LANGUAGE.into())
         .context("Failed to parse markdown")?;
     let root = tree.root_node();
 
@@ -688,13 +681,7 @@ fn split_markdown_flat_range_with_attached_heading(
 
     let content = block.content.as_str();
     let slice = &content[start..end];
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_md::LANGUAGE.into())
-        .context("Failed to load markdown grammar")?;
-
-    let tree = parser
-        .parse(slice, None)
+    let tree = parse_with_language(slice, &tree_sitter_md::LANGUAGE.into())
         .context("Failed to parse markdown")?;
     let root = tree.root_node();
 
@@ -922,10 +909,7 @@ fn split_rust_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_rust_impl(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_rust::LANGUAGE.into())
         .context("Failed to parse impl")?;
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -945,10 +929,7 @@ fn split_rust_impl(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_elisp_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_elisp::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_elisp::LANGUAGE.into())
         .context("Failed to parse elisp function")?;
     let root = tree.root_node();
     let Some(form_node) =
@@ -1134,10 +1115,7 @@ fn split_swift_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_swift_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_swift::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_swift::LANGUAGE.into())
         .context("Failed to parse swift type")?;
     let root = tree.root_node();
     let type_node = find_named_descendant(root, "class_declaration")
@@ -1177,10 +1155,7 @@ fn split_kotlin_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_kotlin_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_kotlin_ng::LANGUAGE.into())
         .context("Failed to parse kotlin type")?;
     let root = tree.root_node();
     let type_node = find_named_descendant_any(root, &["class_declaration", "object_declaration"]);
@@ -1220,10 +1195,7 @@ fn split_java_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_java_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_java::LANGUAGE.into())
         .context("Failed to parse java type")?;
     let root = tree.root_node();
     let type_node = find_named_descendant_any(
@@ -1343,10 +1315,7 @@ fn split_csharp_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_csharp_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_c_sharp::LANGUAGE.into())
         .context("Failed to parse csharp type")?;
     let root = tree.root_node();
     let type_node = find_named_descendant_any(
@@ -1375,10 +1344,7 @@ fn split_csharp_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_ruby_scope(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_ruby::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_ruby::LANGUAGE.into())
         .context("Failed to parse ruby scope")?;
     let root = tree.root_node();
     let scope_node = find_named_descendant_any(root, &["module", "class"]);
@@ -1411,10 +1377,7 @@ fn split_php_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_php_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_php::LANGUAGE_PHP_ONLY.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_php::LANGUAGE_PHP_ONLY.into())
         .context("Failed to parse php type")?;
     let root = tree.root_node();
     let type_node = find_named_descendant_any(
@@ -1458,10 +1421,7 @@ fn split_c_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_c_type(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
+    let tree = parse_with_language(content, &tree_sitter_c::LANGUAGE.into())
         .context("Failed to parse C type")?;
     let root = tree.root_node();
     let type_node = find_named_descendant_any(
@@ -1488,11 +1448,7 @@ fn split_function_with_parser(
     block: &ParentBlock<'_>,
     config: &FunctionSplitConfig<'_>,
 ) -> Result<Vec<Block>> {
-    let mut parser = Parser::new();
-    parser.set_language(&config.language)?;
-
-    let tree = parser
-        .parse(&block.content, None)
+    let tree = parse_with_language(&block.content, &config.language)
         .context("Failed to parse function block")?;
     let root = tree.root_node();
     let Some(function_node) = find_named_descendant_any(root, config.function_kinds) else {

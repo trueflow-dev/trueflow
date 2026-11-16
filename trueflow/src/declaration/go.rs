@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::analysis::Language;
 
@@ -46,13 +46,9 @@ pub(super) fn project(
     path: &Path,
     source: &str,
 ) -> Result<(Vec<DeclarationNode>, Vec<ProjectionDiagnostic>)> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .context("failed to load the Go grammar for declaration projection")?;
-    let tree = parser
-        .parse(source, None)
-        .context("tree-sitter did not produce a Go syntax tree")?;
+    let tree =
+        crate::tree_sitter_support::parse_with_language(source, &tree_sitter_go::LANGUAGE.into())
+            .context("tree-sitter did not produce a Go syntax tree")?;
 
     let mut comments = Vec::new();
     collect_comments(tree.root_node(), source, &mut comments);

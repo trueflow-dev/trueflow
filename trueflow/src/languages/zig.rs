@@ -8,7 +8,7 @@ use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result, anyhow};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 const TYPE_LIKE_DECLARATIONS: &[&str] = &[
     "struct_declaration",
@@ -153,10 +153,8 @@ fn collect_container_member_spans(container: Node<'_>, content: &str) -> Vec<Nes
         .named_children(&mut cursor)
         .filter_map(|child| {
             let kind = classify_node(child, content, true)?;
-            (!matches!(kind, BlockKind::Code)).then_some(NestedBlock {
-                start_byte: child.start_byte(),
-                end_byte: child.end_byte(),
-                kind,
+            (!matches!(kind, BlockKind::Code)).then(|| {
+                NestedBlock::without_complexity(child.start_byte(), child.end_byte(), kind)
             })
         })
         .collect()
@@ -229,11 +227,8 @@ fn split_type_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 }
 
 fn parse_tree(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_zig::LANGUAGE.into())
-        .context("Failed to load Zig grammar")?;
-    parser.parse(source, None).context("Failed to parse Zig")
+    crate::tree_sitter_support::parse_with_language(source, &tree_sitter_zig::LANGUAGE.into())
+        .context("Failed to parse Zig")
 }
 
 fn function_like_body(node: Node<'_>) -> Option<Node<'_>> {

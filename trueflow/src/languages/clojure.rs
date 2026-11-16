@@ -8,7 +8,7 @@ use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::sub_splitter;
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SemanticSpan {
@@ -88,11 +88,7 @@ fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<
 
     spans
         .into_iter()
-        .map(|span| NestedBlock {
-            start_byte: span.start_byte,
-            end_byte: span.end_byte,
-            kind: span.kind,
-        })
+        .map(|span| NestedBlock::without_complexity(span.start_byte, span.end_byte, span.kind))
         .collect()
 }
 
@@ -187,10 +183,7 @@ fn split_container_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 }
 
 fn parse(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser.set_language(&parser_language(source))?;
-    parser
-        .parse(source, None)
+    crate::tree_sitter_support::parse_with_language(source, &parser_language(source))
         .context("Failed to parse Clojure source")
 }
 

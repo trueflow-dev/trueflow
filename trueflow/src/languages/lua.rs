@@ -8,7 +8,7 @@ use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::sub_splitter;
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Node};
 
 pub(crate) fn registration() -> LanguageRegistration {
     LanguageRegistration {
@@ -239,10 +239,8 @@ fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<
 
     collect_named_table_items(table, content)
         .into_iter()
-        .map(|(field, kind)| NestedBlock {
-            start_byte: field.start_byte(),
-            end_byte: field.end_byte(),
-            kind,
+        .map(|(field, kind)| {
+            NestedBlock::without_complexity(field.start_byte(), field.end_byte(), kind)
         })
         .collect()
 }
@@ -454,10 +452,7 @@ fn first_module_statement(root: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn parse(source: &str) -> Result<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    parser.set_language(&parser_language(source))?;
-    parser
-        .parse(source, None)
+    crate::tree_sitter_support::parse_with_language(source, &parser_language(source))
         .context("Failed to parse lua source")
 }
 

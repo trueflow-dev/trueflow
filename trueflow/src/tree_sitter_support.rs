@@ -1,5 +1,42 @@
 use crate::block::BlockKind;
-use tree_sitter::Node;
+use anyhow::{Context, Result};
+use std::cell::RefCell;
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+
+thread_local! {
+    static THREAD_PARSERS: RefCell<Vec<(TsLanguage, Parser)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn try_parse_with_language(source: &str, language: &TsLanguage) -> Result<Option<Tree>> {
+    let cached = THREAD_PARSERS.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        pool.iter()
+            .position(|(cached_lang, _)| cached_lang == language)
+            .map(|idx| pool.swap_remove(idx).1)
+    });
+
+    let mut parser = match cached {
+        Some(parser) => parser,
+        None => {
+            let mut fresh = Parser::new();
+            fresh.set_language(language)?;
+            fresh
+        }
+    };
+    let tree = parser.parse(source, None);
+    THREAD_PARSERS.with(|cell| {
+        cell.borrow_mut().push((language.clone(), parser));
+    });
+    Ok(tree)
+}
+
+pub(crate) fn parse_with_language(source: &str, language: &TsLanguage) -> Result<Tree> {
+    try_parse_with_language(source, language)?.context("tree-sitter parse failed")
+}
+
+pub(crate) fn clear_thread_parsers() {
+    THREAD_PARSERS.with(|cell| cell.borrow_mut().clear());
+}
 
 pub(crate) fn find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     find_named_descendant_any(node, &[kind])

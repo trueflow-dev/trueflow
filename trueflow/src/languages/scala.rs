@@ -8,7 +8,7 @@ use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 const TYPE_LIKE_DECLARATIONS: &[&str] = &[
     "object_definition",
@@ -110,11 +110,7 @@ fn collect_nested_blocks(node: Node<'_>, content: &str, _lang: Language) -> Vec<
     collect_container_spans(node, content, node.kind() == "package_clause", &mut spans);
     spans
         .into_iter()
-        .map(|span| NestedBlock {
-            start_byte: span.start_byte,
-            end_byte: span.end_byte,
-            kind: span.kind,
-        })
+        .map(|span| NestedBlock::without_complexity(span.start_byte, span.end_byte, span.kind))
         .collect()
 }
 
@@ -664,11 +660,8 @@ fn push_non_child_chunk(
 }
 
 fn parse_tree(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_scala::LANGUAGE.into())
-        .context("Failed to load Scala grammar")?;
-    parser.parse(source, None).context("Failed to parse Scala")
+    crate::tree_sitter_support::parse_with_language(source, &tree_sitter_scala::LANGUAGE.into())
+        .context("Failed to parse Scala")
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {

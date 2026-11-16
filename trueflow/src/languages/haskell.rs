@@ -8,7 +8,7 @@ use crate::complexity;
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 #[derive(Debug, Clone)]
 struct SemanticSpan {
@@ -801,12 +801,7 @@ fn block_comment_depth_after(mut depth: usize, text: &str) -> usize {
 }
 
 fn parse_tree(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_haskell::LANGUAGE.into())
-        .context("Failed to load Haskell grammar")?;
-    parser
-        .parse(source, None)
+    crate::tree_sitter_support::parse_with_language(source, &tree_sitter_haskell::LANGUAGE.into())
         .context("Failed to parse Haskell")
 }
 

@@ -8,7 +8,7 @@ use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 pub(crate) fn registration() -> LanguageRegistration {
     LanguageRegistration {
@@ -173,11 +173,11 @@ fn collect_container_blocks(
                 stack.extend(pending_blocks.into_iter().rev().map(Frame::Block));
             }
             Frame::Block(block) => {
-                blocks.push(NestedBlock {
-                    start_byte: block.start_byte,
-                    end_byte: block.end_byte,
-                    kind: block.kind,
-                });
+                blocks.push(NestedBlock::without_complexity(
+                    block.start_byte,
+                    block.end_byte,
+                    block.kind,
+                ));
 
                 if block.recurse {
                     stack.push(Frame::Container {
@@ -211,11 +211,11 @@ fn collect_test_ranges(tree: &Tree, source: &str) -> Result<Vec<ByteSpan>> {
 
 fn split_function_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_elixir::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
-        .context("Failed to parse Elixir function-like block")?;
+    let tree = crate::tree_sitter_support::parse_with_language(
+        content,
+        &tree_sitter_elixir::LANGUAGE.into(),
+    )
+    .context("Failed to parse Elixir function-like block")?;
     let root = tree.root_node();
     let Some(call_node) = find_call_with_targets(
         root,
@@ -255,11 +255,11 @@ fn split_function_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 
 fn split_module_like_block(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = block.content.as_str();
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_elixir::LANGUAGE.into())?;
-    let tree = parser
-        .parse(content, None)
-        .context("Failed to parse Elixir module-like block")?;
+    let tree = crate::tree_sitter_support::parse_with_language(
+        content,
+        &tree_sitter_elixir::LANGUAGE.into(),
+    )
+    .context("Failed to parse Elixir module-like block")?;
     let root = tree.root_node();
     let Some(container) = find_call_with_targets(
         root,

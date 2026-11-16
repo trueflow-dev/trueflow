@@ -1,5 +1,6 @@
 use crate::analysis::Language;
-use tree_sitter::{Node, Parser};
+use crate::tree_sitter_support::try_parse_with_language;
+use tree_sitter::Node;
 
 pub fn calculate(content: &str, lang: Language) -> Option<u32> {
     if !supports_complexity(lang) {
@@ -29,18 +30,45 @@ pub fn calculate(content: &str, lang: Language) -> Option<u32> {
         _ => None,
     }?;
 
-    let mut parser = Parser::new();
-    if parser.set_language(&language).is_err() {
-        return None;
-    }
-
-    parser
-        .parse(content, None)
+    try_parse_with_language(content, &language)
+        .ok()
+        .flatten()
         .map(|tree| calculate_node(tree.root_node(), 0, lang, content))
 }
 
 pub(crate) fn calculate_from_node(node: Node<'_>, lang: Language, source: &str) -> Option<u32> {
-    supports_complexity(lang).then(|| calculate_node(node, 0, lang, source))
+    if !supports_complexity(lang) {
+        return None;
+    }
+    if !has_complexity_rules(lang) {
+        return Some(0);
+    }
+    Some(calculate_node(node, 0, lang, source))
+}
+
+pub(crate) fn zero_for_language(lang: Language) -> Option<u32> {
+    has_complexity_rules(lang).then_some(0)
+}
+
+fn has_complexity_rules(lang: Language) -> bool {
+    matches!(
+        lang,
+        Language::Rust
+            | Language::Swift
+            | Language::Elisp
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Java
+            | Language::Kotlin
+            | Language::CSharp
+            | Language::Ruby
+            | Language::Php
+            | Language::Go
+            | Language::C
+            | Language::Cpp
+            | Language::Python
+            | Language::Shell
+    )
 }
 
 fn supports_complexity(lang: Language) -> bool {
@@ -508,6 +536,9 @@ int process(const std::vector<int>& values, bool ready) {
         let score = calculate(code, Language::Cpp);
         assert_eq!(score, Some(4));
     }
+    #[cfg(test)]
+    use tree_sitter::Parser;
+
     #[test]
     fn test_calculate_from_node_matches_reparsed_rust_function() {
         let code = "#[inline]\nfn foo() { if true { for x in 0..10 { if x > 3 {} } } }";

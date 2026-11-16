@@ -1,6 +1,6 @@
 use crate::block::BlockKind;
 use anyhow::Result;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NixSpan {
@@ -69,9 +69,7 @@ fn split_expression_children(source: &str) -> Result<Option<Vec<NixSpan>>> {
 }
 
 fn parse_expression_tree(source: &str) -> Result<Option<Tree>> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_nix::LANGUAGE.into())?;
-    Ok(parser.parse(source, None))
+    crate::tree_sitter_support::try_parse_with_language(source, &tree_sitter_nix::LANGUAGE.into())
 }
 
 fn should_structurally_split_expression(node: Node<'_>) -> bool {

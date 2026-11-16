@@ -8,13 +8,13 @@ use crate::text_split::paragraph_break_regex;
 use crate::tree_sitter_support::{
     classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
     find_named_descendant, first_child_of_kind, kotlin_type_body, markdown_heading_level,
-    ruby_assignment_targets_constant, ruby_call_method_name,
+    parse_with_language, ruby_assignment_targets_constant, ruby_call_method_name,
 };
 use crate::{languages, rust, swift, toml_blocks};
 use anyhow::{Context, Result};
 use std::sync::LazyLock;
 use tracing::info;
-use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language as TsLanguage, Query, QueryCursor, StreamingIterator};
 
 static RUST_ATTR_QUERY: LazyLock<Query> = LazyLock::new(|| {
     compile_query(
@@ -314,13 +314,9 @@ fn complete_split(
 
 fn split_tree_sitter(content: &SourceText<'_>, lang: Language) -> Result<Vec<Block>> {
     let registration = languages::registration(lang);
-    let mut parser = Parser::new();
     let language = tree_sitter_language_for(lang, content)
         .ok_or_else(|| anyhow::anyhow!("No tree-sitter grammar configured for {lang:?}"))?;
-    parser.set_language(&language)?;
-
-    let tree = parser
-        .parse(content.as_str(), None)
+    let tree = parse_with_language(content.as_str(), &language)
         .context("Failed to parse source with tree-sitter")?;
     let root = tree.root_node();
     let test_spans = collect_test_line_spans(lang, &tree, content)?;
@@ -368,13 +364,13 @@ fn split_tree_sitter(content: &SourceText<'_>, lang: Language) -> Result<Vec<Blo
                 if start_byte > last_end_byte {
                     let gap = &content[last_end_byte..start_byte];
                     if !gap.trim().is_empty() {
-                        blocks.push(create_block(
+                        blocks.push(create_block_with_complexity(
                             gap,
                             BlockKind::Gap,
                             content,
                             last_end_byte,
                             start_byte,
-                            lang,
+                            complexity::zero_for_language(lang),
                         )?);
                     }
                 }
@@ -390,13 +386,13 @@ fn split_tree_sitter(content: &SourceText<'_>, lang: Language) -> Result<Vec<Blo
             if start_byte > last_end_byte {
                 let gap = &content[last_end_byte..start_byte];
                 if !gap.trim().is_empty() {
-                    blocks.push(create_block(
+                    blocks.push(create_block_with_complexity(
                         gap,
                         BlockKind::Gap,
                         content,
                         last_end_byte,
                         start_byte,
-                        lang,
+                        complexity::zero_for_language(lang),
                     )?);
                 }
             }
@@ -418,13 +414,13 @@ fn split_tree_sitter(content: &SourceText<'_>, lang: Language) -> Result<Vec<Blo
                 (registration.top_level.collect_nested_blocks)(child, content, lang)
                     .into_iter()
                     .filter_map(|nested| {
-                        create_block(
+                        create_block_with_complexity(
                             &content[nested.start_byte..nested.end_byte],
                             nested.kind,
                             content,
                             nested.start_byte,
                             nested.end_byte,
-                            lang,
+                            nested.complexity,
                         )
                         .ok()
                     }),
@@ -498,13 +494,13 @@ fn split_tree_sitter(content: &SourceText<'_>, lang: Language) -> Result<Vec<Blo
 
     if let Some(start) = pending_start {
         let node_content = &content[start..pending_end];
-        blocks.push(create_block(
+        blocks.push(create_block_with_complexity(
             node_content,
             BlockKind::Code,
             content,
             start,
             pending_end,
-            lang,
+            complexity::zero_for_language(lang),
         )?);
         last_end_byte = pending_end;
     }
@@ -512,13 +508,13 @@ fn split_tree_sitter(content: &SourceText<'_>, lang: Language) -> Result<Vec<Blo
     if last_end_byte < content.len() {
         let gap = &content[last_end_byte..];
         if !gap.trim().is_empty() {
-            blocks.push(create_block(
+            blocks.push(create_block_with_complexity(
                 gap,
                 BlockKind::Gap,
                 content,
                 last_end_byte,
                 content.len(),
-                lang,
+                complexity::zero_for_language(lang),
             )?);
         }
     }
@@ -560,13 +556,7 @@ fn php_tree_sitter_language(content: &str) -> TsLanguage {
 }
 
 fn split_markdown(content: &SourceText<'_>) -> Result<Vec<Block>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_md::LANGUAGE.into())
-        .context("Failed to load markdown grammar")?;
-
-    let tree = parser
-        .parse(content.as_str(), None)
+    let tree = parse_with_language(content.as_str(), &tree_sitter_md::LANGUAGE.into())
         .context("Failed to parse markdown")?;
     let root = tree.root_node();
 
@@ -773,13 +763,7 @@ struct NixBoundary {
 }
 
 fn split_nix(content: &SourceText<'_>) -> Result<Vec<Block>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_nix::LANGUAGE.into())
-        .context("Failed to load nix grammar")?;
-
-    let tree = parser
-        .parse(content.as_str(), None)
+    let tree = parse_with_language(content.as_str(), &tree_sitter_nix::LANGUAGE.into())
         .context("Failed to parse nix")?;
     let root = tree.root_node();
 
@@ -1024,29 +1008,29 @@ fn split_markdown_section_for_review(
                 > MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES);
 
     if !should_refine {
-        return Ok(vec![create_block(
+        return Ok(vec![create_block_with_complexity(
             section_content,
             BlockKind::Section,
             content,
             section.start,
             section.end,
-            Language::Markdown,
+            None,
         )?]);
     }
 
     if child_sections.is_empty() {
-        let mut blocks = vec![create_block(
+        let mut blocks = vec![create_block_with_complexity(
             section_content,
             BlockKind::Section,
             content,
             section.start,
             section.end,
-            Language::Markdown,
+            None,
         )?];
         let body_start = headings
-            .iter()
-            .find(|heading| heading.start == section.start)
-            .map(|heading| heading.end)
+            .binary_search_by_key(&section.start, |heading| heading.start)
+            .ok()
+            .map(|idx| headings[idx].end)
             .unwrap_or(section.start);
         if content[body_start..section.end].trim().is_empty() {
             return Ok(blocks);
@@ -1064,17 +1048,18 @@ fn split_markdown_section_for_review(
         return Ok(blocks);
     }
 
-    let mut blocks = vec![create_block(
+    let mut blocks = vec![create_block_with_complexity(
         section_content,
         BlockKind::Section,
         content,
         section.start,
         section.end,
-        Language::Markdown,
+        None,
     )?];
     let root_heading = headings
-        .iter()
-        .find(|heading| heading.start == section.start);
+        .binary_search_by_key(&section.start, |heading| heading.start)
+        .ok()
+        .map(|idx| &headings[idx]);
     let root_content_end = child_sections[0].start;
     let root_intro_body = root_heading
         .and_then(|heading| content.get(heading.end..root_content_end))
@@ -1105,16 +1090,15 @@ fn markdown_section_child_sections(
     section: &MarkdownSectionSpan,
     headings: &[MarkdownHeading],
 ) -> Option<Vec<MarkdownSectionSpan>> {
-    let root_heading = headings
-        .iter()
-        .find(|heading| heading.start == section.start)?;
-    let child_headings = headings
-        .iter()
-        .filter(|heading| heading.start > section.start && heading.start < section.end)
-        .cloned()
-        .collect::<Vec<_>>();
+    let root_idx = headings
+        .binary_search_by_key(&section.start, |heading| heading.start)
+        .ok()?;
+    let root_heading = &headings[root_idx];
+    let child_start = root_idx + 1;
+    let child_end = child_start
+        + headings[child_start..].partition_point(|heading| heading.start < section.end);
     Some(markdown_immediate_sections(
-        &child_headings,
+        &headings[child_start..child_end],
         root_heading.level,
         section.end,
     ))
@@ -1166,13 +1150,7 @@ fn split_markdown_flat_range_with_attached_heading(
     }
 
     let slice = &content[start..end];
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_md::LANGUAGE.into())
-        .context("Failed to load markdown grammar")?;
-
-    let tree = parser
-        .parse(slice, None)
+    let tree = parse_with_language(slice, &tree_sitter_md::LANGUAGE.into())
         .context("Failed to parse markdown")?;
     let root = tree.root_node();
 
@@ -1204,13 +1182,13 @@ fn split_markdown_flat_range_with_attached_heading(
     parts
         .into_iter()
         .map(|part| {
-            create_block(
+            create_block_with_complexity(
                 &content[part.start..part.end],
                 part.kind,
                 content,
                 part.start,
                 part.end,
-                Language::Markdown,
+                None,
             )
         })
         .collect()
@@ -1632,13 +1610,17 @@ fn collect_swift_type_items(
     let mut blocks = Vec::new();
     for member in swift::collect_type_member_spans(body, content) {
         let node_content = &content[member.start_byte..member.end_byte];
-        blocks.push(create_block(
+        let score = match member.node {
+            Some(node) => complexity::calculate_from_node(node, lang, content),
+            None => complexity::zero_for_language(lang),
+        };
+        blocks.push(create_block_with_complexity(
             node_content,
             member.kind,
             content,
             member.start_byte,
             member.end_byte,
-            lang,
+            score,
         )?);
     }
 
@@ -1653,13 +1635,17 @@ fn collect_rust_impl_items(
     rust::collect_impl_member_spans(impl_node)
         .into_iter()
         .map(|member| {
-            create_block(
+            let score = match member.node {
+                Some(node) => complexity::calculate_from_node(node, lang, content),
+                None => complexity::zero_for_language(lang),
+            };
+            create_block_with_complexity(
                 &content[member.start_byte..member.end_byte],
                 member.kind,
                 content,
                 member.start_byte,
                 member.end_byte,
-                lang,
+                score,
             )
         })
         .collect()
@@ -1681,13 +1667,13 @@ fn collect_java_type_items(
         if matches!(kind, BlockKind::Code) {
             continue;
         }
-        blocks.push(create_block(
+        blocks.push(create_block_with_complexity(
             &content[child.start_byte()..child.end_byte()],
             kind,
             content,
             child.start_byte(),
             child.end_byte(),
-            lang,
+            complexity::calculate_from_node(child, lang, content),
         )?);
     }
     Ok(blocks)
@@ -1709,13 +1695,13 @@ fn collect_kotlin_type_items(
         if matches!(kind, BlockKind::Code) {
             continue;
         }
-        blocks.push(create_block(
+        blocks.push(create_block_with_complexity(
             &content[child.start_byte()..child.end_byte()],
             kind,
             content,
             child.start_byte(),
             child.end_byte(),
-            lang,
+            complexity::calculate_from_node(child, lang, content),
         )?);
     }
     Ok(blocks)
@@ -1766,13 +1752,13 @@ fn collect_csharp_declaration_blocks(
     let mut blocks = Vec::new();
 
     if !matches!(kind, BlockKind::Code) {
-        blocks.push(create_block(
+        blocks.push(create_block_with_complexity(
             &content[node.start_byte()..node.end_byte()],
             kind,
             content,
             node.start_byte(),
             node.end_byte(),
-            lang,
+            complexity::calculate_from_node(node, lang, content),
         )?);
     }
 
@@ -1810,13 +1796,13 @@ fn collect_ruby_scope_items(
             continue;
         }
 
-        blocks.push(create_block(
+        blocks.push(create_block_with_complexity(
             &content[child.start_byte()..child.end_byte()],
             kind,
             content,
             child.start_byte(),
             child.end_byte(),
-            lang,
+            complexity::calculate_from_node(child, lang, content),
         )?);
 
         if matches!(child.kind(), "class" | "module")
@@ -1869,13 +1855,13 @@ fn collect_php_type_items(
         if matches!(kind, BlockKind::Code) {
             continue;
         }
-        blocks.push(create_block(
+        blocks.push(create_block_with_complexity(
             &content[child.start_byte()..child.end_byte()],
             kind,
             content,
             child.start_byte(),
             child.end_byte(),
-            lang,
+            complexity::calculate_from_node(child, lang, content),
         )?);
     }
     Ok(blocks)
@@ -2032,17 +2018,40 @@ fn collect_test_line_spans(
     tree: &tree_sitter::Tree,
     source: &SourceText<'_>,
 ) -> Result<Vec<LineSpan>> {
-    collect_test_ranges(lang, tree, source)?
+    let mut spans: Vec<LineSpan> = collect_test_ranges(lang, tree, source)?
         .into_iter()
         .map(|range| source.line_span(range))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(merge_overlapping_line_spans(&mut spans))
 }
 
-fn apply_test_tags(blocks: &mut [Block], test_spans: &[LineSpan]) {
+fn merge_overlapping_line_spans(spans: &mut [LineSpan]) -> Vec<LineSpan> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    spans.sort_unstable_by_key(|span| (span.start_line, span.end_line));
+    let mut merged: Vec<LineSpan> = Vec::with_capacity(spans.len());
+    for &span in spans.iter() {
+        if let Some(last) = merged.last_mut()
+            && (*last == span || span.start_line < last.end_line)
+        {
+            last.end_line = last.end_line.max(span.end_line);
+            continue;
+        }
+        merged.push(span);
+    }
+    merged
+}
+
+fn apply_test_tags(blocks: &mut [Block], merged_test_spans: &[LineSpan]) {
+    if merged_test_spans.is_empty() {
+        return;
+    }
     for block in blocks {
-        if test_spans
-            .iter()
-            .any(|test_span| block.line_span().overlaps(test_span))
+        let block_span = block.line_span();
+        let idx = merged_test_spans.partition_point(|span| span.end_line <= block_span.start_line);
+        if idx < merged_test_spans.len()
+            && block_span.overlaps(&merged_test_spans[idx])
             && !block.has_tag("test")
         {
             block.tags.push("test".to_string());
@@ -2060,6 +2069,9 @@ enum RustTestAttribute {
 }
 
 fn rust_test_attribute(attr_text: &str) -> Option<RustTestAttribute> {
+    if !attr_text.contains("test") {
+        return None;
+    }
     let compact = attr_text
         .chars()
         .filter(|ch| !ch.is_whitespace())

@@ -8,7 +8,7 @@ use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 const FUNCTION_LIKE_DECLARATIONS: &[&str] = &["function_declaration", "method_declaration"];
 
@@ -131,6 +131,11 @@ fn collect_type_declaration_blocks(declaration: Node<'_>, content: &str) -> Vec<
                     start_byte: spec.start_byte(),
                     end_byte: spec.end_byte(),
                     kind: classify_type_declaration(*spec),
+                    complexity: crate::complexity::calculate_from_node(
+                        *spec,
+                        Language::Go,
+                        content,
+                    ),
                 };
                 let members = type_like_node(*spec)
                     .map(|type_node| collect_container_member_spans(type_node, content))
@@ -151,10 +156,15 @@ fn collect_container_member_spans(type_node: Node<'_>, content: &str) -> Vec<Nes
             body.named_children(&mut cursor)
                 .filter_map(|child| {
                     let kind = classify_node(child, content, true)?;
-                    (!matches!(kind, BlockKind::Code)).then_some(NestedBlock {
+                    (!matches!(kind, BlockKind::Code)).then(|| NestedBlock {
                         start_byte: child.start_byte(),
                         end_byte: child.end_byte(),
                         kind,
+                        complexity: crate::complexity::calculate_from_node(
+                            child,
+                            Language::Go,
+                            content,
+                        ),
                     })
                 })
                 .collect()
@@ -165,10 +175,15 @@ fn collect_container_member_spans(type_node: Node<'_>, content: &str) -> Vec<Nes
                 .named_children(&mut cursor)
                 .filter_map(|child| {
                     let kind = classify_node(child, content, true)?;
-                    (!matches!(kind, BlockKind::Code)).then_some(NestedBlock {
+                    (!matches!(kind, BlockKind::Code)).then(|| NestedBlock {
                         start_byte: child.start_byte(),
                         end_byte: child.end_byte(),
                         kind,
+                        complexity: crate::complexity::calculate_from_node(
+                            child,
+                            Language::Go,
+                            content,
+                        ),
                     })
                 })
                 .collect()
@@ -274,11 +289,8 @@ fn split_type_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 }
 
 fn parse_tree(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .context("Failed to load Go grammar")?;
-    parser.parse(source, None).context("Failed to parse Go")
+    crate::tree_sitter_support::parse_with_language(source, &tree_sitter_go::LANGUAGE.into())
+        .context("Failed to parse Go")
 }
 
 fn find_type_like_descendant<'a>(node: Node<'a>) -> Option<Node<'a>> {

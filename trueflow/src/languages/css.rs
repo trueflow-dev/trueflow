@@ -6,7 +6,7 @@ use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Node};
 
 #[derive(Debug, Clone, Copy)]
 struct SemanticSpan {
@@ -90,11 +90,11 @@ fn collect_block_children(block_node: Node<'_>, content: &str, blocks: &mut Vec<
             BlockKind::Section | BlockKind::Element | BlockKind::Comment
         ) && child.kind() != "declaration"
         {
-            blocks.push(NestedBlock {
-                start_byte: child.start_byte(),
-                end_byte: child.end_byte(),
+            blocks.push(NestedBlock::without_complexity(
+                child.start_byte(),
+                child.end_byte(),
                 kind,
-            });
+            ));
         }
 
         if matches!(
@@ -117,11 +117,11 @@ fn collect_keyframe_children(list_node: Node<'_>, blocks: &mut Vec<NestedBlock>)
             continue;
         }
 
-        blocks.push(NestedBlock {
-            start_byte: child.start_byte(),
-            end_byte: child.end_byte(),
-            kind: BlockKind::Element,
-        });
+        blocks.push(NestedBlock::without_complexity(
+            child.start_byte(),
+            child.end_byte(),
+            BlockKind::Element,
+        ));
     }
 }
 
@@ -346,11 +346,8 @@ fn create_sub_block(
 }
 
 fn parse_css(content: &str) -> Result<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_css::LANGUAGE.into())
-        .context("Failed to load CSS grammar")?;
-    parser.parse(content, None).context("Failed to parse CSS")
+    crate::tree_sitter_support::parse_with_language(content, &tree_sitter_css::LANGUAGE.into())
+        .context("Failed to parse CSS")
 }
 
 fn find_primary_review_root(root: Node<'_>) -> Option<Node<'_>> {

@@ -2,13 +2,14 @@ use crate::block::BlockKind;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ImplMemberSpan {
+pub(crate) struct ImplMemberSpan<'a> {
     pub(crate) start_byte: usize,
     pub(crate) end_byte: usize,
     pub(crate) kind: BlockKind,
+    pub(crate) node: Option<Node<'a>>,
 }
 
-pub(crate) fn collect_impl_member_spans(container_node: Node<'_>) -> Vec<ImplMemberSpan> {
+pub(crate) fn collect_impl_member_spans(container_node: Node<'_>) -> Vec<ImplMemberSpan<'_>> {
     let Some(body) = container_node.child_by_field_name("body") else {
         return Vec::new();
     };
@@ -42,6 +43,7 @@ pub(crate) fn collect_impl_member_spans(container_node: Node<'_>) -> Vec<ImplMem
             start_byte: pending_start.unwrap_or(start_byte),
             end_byte,
             kind,
+            node: Some(child),
         });
         pending_start = None;
         pending_end = 0;
@@ -54,6 +56,7 @@ pub(crate) fn collect_impl_member_spans(container_node: Node<'_>) -> Vec<ImplMem
                 start_byte: start,
                 end_byte: end,
                 kind: BlockKind::Code,
+                node: None,
             });
         }
     }

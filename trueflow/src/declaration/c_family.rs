@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::analysis::Language;
 
@@ -50,12 +50,7 @@ pub(super) fn project(
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         other => bail!("the C-family declaration projector cannot parse {other:?}"),
     };
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .context("failed to load the C/C++ grammar for declaration projection")?;
-    let tree = parser
-        .parse(source, None)
+    let tree = crate::tree_sitter_support::parse_with_language(source, &grammar)
         .context("tree-sitter did not produce a C/C++ syntax tree")?;
 
     let mut comments = Vec::new();

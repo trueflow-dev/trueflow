@@ -8,7 +8,7 @@ use crate::block::{Block, BlockKind, ByteSpan, ParentBlock, SourceText};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 pub(crate) fn registration() -> LanguageRegistration {
     LanguageRegistration {
@@ -317,11 +317,11 @@ fn collect_immediate_nested_blocks(container: Node<'_>, content: &str) -> Vec<Ne
         ) {
             continue;
         }
-        blocks.push(NestedBlock {
-            start_byte: child.start_byte(),
-            end_byte: child.end_byte(),
+        blocks.push(NestedBlock::without_complexity(
+            child.start_byte(),
+            child.end_byte(),
             kind,
-        });
+        ));
     }
     blocks
 }
@@ -333,11 +333,11 @@ fn collect_record_fields(record: Node<'_>) -> Vec<NestedBlock> {
         if child.kind() != "field_declaration" {
             continue;
         }
-        fields.push(NestedBlock {
-            start_byte: child.start_byte(),
-            end_byte: child.end_byte(),
-            kind: BlockKind::Variable,
-        });
+        fields.push(NestedBlock::without_complexity(
+            child.start_byte(),
+            child.end_byte(),
+            BlockKind::Variable,
+        ));
     }
     fields
 }
@@ -349,11 +349,11 @@ fn collect_variant_constructors(variant: Node<'_>) -> Vec<NestedBlock> {
         if child.kind() != "constructor_declaration" {
             continue;
         }
-        constructors.push(NestedBlock {
-            start_byte: child.start_byte(),
-            end_byte: child.end_byte(),
-            kind: BlockKind::Enum,
-        });
+        constructors.push(NestedBlock::without_complexity(
+            child.start_byte(),
+            child.end_byte(),
+            BlockKind::Enum,
+        ));
     }
     constructors
 }
@@ -733,9 +733,15 @@ fn consume_ocaml_comment(source: &str, start: usize) -> Option<usize> {
 fn parse_best_tree(source: &str) -> Result<Tree> {
     let implementation = parse_with_language(source, &tree_sitter_ocaml::LANGUAGE_OCAML.into())
         .context("Failed to parse with OCaml implementation grammar")?;
+    if !implementation.root_node().has_error() {
+        return Ok(implementation);
+    }
     let interface =
         parse_with_language(source, &tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
             .context("Failed to parse with OCaml interface grammar")?;
+    if !interface.root_node().has_error() {
+        return Ok(interface);
+    }
 
     let implementation_score = syntax_error_score(implementation.root_node());
     let interface_score = syntax_error_score(interface.root_node());
@@ -748,11 +754,7 @@ fn parse_best_tree(source: &str) -> Result<Tree> {
 }
 
 fn parse_with_language(source: &str, language: &TsLanguage) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser.set_language(language)?;
-    parser
-        .parse(source, None)
-        .context("tree-sitter parse failed")
+    crate::tree_sitter_support::parse_with_language(source, language)
 }
 
 fn syntax_error_score(node: Node<'_>) -> usize {

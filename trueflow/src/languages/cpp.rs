@@ -8,7 +8,7 @@ use crate::code_comments::{self, CommentSyntax};
 
 use crate::text_split::paragraph_break_regex;
 use anyhow::{Context, Result};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 const FUNCTION_LIKE_DECLARATIONS: &[&str] = &["function_definition"];
 
@@ -157,6 +157,7 @@ fn collect_nested_blocks_for_node(node: Node<'_>, content: &str) -> Vec<NestedBl
                 start_byte: child.start_byte(),
                 end_byte: child.end_byte(),
                 kind,
+                complexity: crate::complexity::calculate_from_node(child, Language::Cpp, content),
             });
         }
 
@@ -361,11 +362,8 @@ fn split_container_like(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
 }
 
 fn parse_tree(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .context("Failed to load C++ grammar")?;
-    parser.parse(source, None).context("Failed to parse C++")
+    crate::tree_sitter_support::parse_with_language(source, &tree_sitter_cpp::LANGUAGE.into())
+        .context("Failed to parse C++")
 }
 
 fn find_named_descendant_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {

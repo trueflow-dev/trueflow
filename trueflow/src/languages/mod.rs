@@ -24,6 +24,18 @@ pub(crate) struct NestedBlock {
     pub(crate) start_byte: usize,
     pub(crate) end_byte: usize,
     pub(crate) kind: BlockKind,
+    pub(crate) complexity: Option<u32>,
+}
+
+impl NestedBlock {
+    pub(crate) fn without_complexity(start_byte: usize, end_byte: usize, kind: BlockKind) -> Self {
+        Self {
+            start_byte,
+            end_byte,
+            kind,
+            complexity: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
