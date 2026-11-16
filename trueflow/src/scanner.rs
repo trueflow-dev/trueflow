@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -21,6 +24,8 @@ const SCAN_CACHE_DIR_ENV: &str = "TRUEFLOW_CACHE_DIR";
 const MAX_SCAN_CACHE_FILES: usize = 128;
 const MAX_SCAN_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const STALE_SCAN_CACHE_TMP_AGE: Duration = Duration::from_secs(60 * 60);
+const SCAN_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const SCAN_WORKER_BATCH_SIZE: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanCacheMode {
@@ -146,6 +151,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
 
     let mut files = Vec::new();
     let mut cache_files = Vec::with_capacity(inventory.len());
+    let mut misses = Vec::new();
 
     for scan_input in inventory {
         // Inventory paths are unique, so each cached entry is taken at most once.
@@ -154,17 +160,20 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
             .and_then(|entries| entries.remove(&scan_input.path))
             .filter(|entry| entry.stamp == scan_input.stamp);
 
-        let attempt = match reused_entry {
+        match reused_entry {
             Some(entry) => {
                 cache.reused_files += 1;
-                ScanAttempt::Cache(entry)
+                append_cached_outcome(&entry.outcome, &mut files, &mut diagnostics);
+                cache_files.push(entry);
             }
             None => {
                 cache.rescanned_files += 1;
-                scan_file(&repo_path_base, &scan_input)
+                misses.push(scan_input);
             }
-        };
+        }
+    }
 
+    for attempt in scan_inputs_parallel(&repo_path_base, &misses) {
         match attempt {
             ScanAttempt::Cache(cache_file) => {
                 append_cached_outcome(&cache_file.outcome, &mut files, &mut diagnostics);
@@ -176,7 +185,6 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, options: &ScanOptions) -> Result<
         }
     }
 
-    crate::tree_sitter_support::clear_thread_parsers();
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 
@@ -267,6 +275,8 @@ pub fn scan_paths<P: AsRef<Path>>(
     let mut ordered_paths = paths.iter().collect::<Vec<_>>();
     ordered_paths.sort();
     let ignore_matcher = DirectScanPathIgnoreMatcher::new(options)?;
+    let mut dir_cache = HashMap::new();
+    let mut misses = Vec::new();
 
     for path in ordered_paths {
         if path.is_root() || ignore_matcher.matches(path) {
@@ -274,11 +284,16 @@ pub fn scan_paths<P: AsRef<Path>>(
             continue;
         }
 
-        let input = match admit_scan_path(&repo_path_base, path) {
-            Ok(ScanPathAdmission::Regular { full_path, stamp }) => ScanInput {
+        let input = match admit_scan_path_cached(&repo_path_base, path, &mut dir_cache) {
+            Ok(ScanPathAdmission::Regular {
+                full_path,
+                stamp,
+                file_id,
+            }) => ScanInput {
                 path: path.clone(),
                 full_path,
                 stamp,
+                file_id,
             },
             Ok(ScanPathAdmission::Link { component }) => {
                 cache_files.remove(path);
@@ -304,16 +319,21 @@ pub fn scan_paths<P: AsRef<Path>>(
 
         let cached_file = cache_files.remove(&input.path);
         let reused_entry = cached_file.filter(|entry| entry.stamp == input.stamp);
-        let attempt = match reused_entry {
+        match reused_entry {
             Some(entry) => {
                 cache.reused_files += 1;
-                ScanAttempt::Cache(entry)
+                append_cached_outcome(&entry.outcome, &mut files, &mut diagnostics);
+                cache_files.insert(input.path, entry);
             }
             None => {
                 cache.rescanned_files += 1;
-                scan_file(&repo_path_base, &input)
+                misses.push(input);
             }
-        };
+        }
+    }
+
+    let attempts = scan_inputs_parallel(&repo_path_base, &misses);
+    for (input, attempt) in misses.into_iter().zip(attempts) {
         match attempt {
             ScanAttempt::Cache(cache_file) => {
                 append_cached_outcome(&cache_file.outcome, &mut files, &mut diagnostics);
@@ -325,7 +345,6 @@ pub fn scan_paths<P: AsRef<Path>>(
         }
     }
 
-    crate::tree_sitter_support::clear_thread_parsers();
     files.sort_by(|a, b| a.path.cmp(&b.path));
     sort_diagnostics(&mut diagnostics);
 
@@ -550,6 +569,7 @@ struct ScanInput {
     path: RepoPath,
     full_path: PathBuf,
     stamp: FileStamp,
+    file_id: Option<(u64, u64)>,
 }
 
 /// These pathname observations exclude stable links and detect ordinary drift that they see.
@@ -559,11 +579,91 @@ enum ScanPathAdmission {
     Regular {
         full_path: PathBuf,
         stamp: FileStamp,
+        file_id: Option<(u64, u64)>,
     },
     Link {
         component: RepoPath,
     },
     MissingOrNonFile,
+}
+
+#[derive(Debug, Clone)]
+enum DirComponentAdmission {
+    RegularDir,
+    Link(RepoPath),
+    MissingOrNonDir,
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn scan_inputs_parallel(repo_path_base: &Path, inputs: &[ScanInput]) -> Vec<ScanAttempt> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    let parallelism = std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1);
+    if inputs.len() <= 2 || parallelism <= 1 {
+        let attempts = inputs
+            .iter()
+            .map(|input| scan_file(repo_path_base, input))
+            .collect();
+        crate::tree_sitter_support::clear_thread_parsers();
+        return attempts;
+    }
+
+    let worker_count = parallelism.min(inputs.len().div_ceil(2));
+    let slots: Vec<OnceLock<ScanAttempt>> = (0..inputs.len()).map(|_| OnceLock::new()).collect();
+    let next_index = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let slots = &slots;
+            let next_index = &next_index;
+            let _ = std::thread::Builder::new()
+                .name("trueflow-scan".to_string())
+                .stack_size(SCAN_WORKER_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    loop {
+                        let start = next_index.fetch_add(SCAN_WORKER_BATCH_SIZE, Ordering::Relaxed);
+                        if start >= inputs.len() {
+                            break;
+                        }
+                        let end = (start + SCAN_WORKER_BATCH_SIZE).min(inputs.len());
+                        for idx in start..end {
+                            let _ = slots[idx].set(scan_file(repo_path_base, &inputs[idx]));
+                        }
+                    }
+                    crate::tree_sitter_support::clear_thread_parsers();
+                });
+        }
+    });
+
+    let mut attempts = Vec::with_capacity(inputs.len());
+    let mut ran_fallback = false;
+    for (idx, mut slot) in slots.into_iter().enumerate() {
+        let attempt = match slot.take() {
+            Some(attempt) => attempt,
+            None => {
+                ran_fallback = true;
+                scan_file(repo_path_base, &inputs[idx])
+            }
+        };
+        attempts.push(attempt);
+    }
+    if ran_fallback {
+        crate::tree_sitter_support::clear_thread_parsers();
+    }
+    attempts
 }
 
 #[derive(Debug)]
@@ -922,6 +1022,7 @@ fn collect_scan_inventory(
     diagnostics: &mut Vec<ScanDiagnostic>,
 ) -> Result<Vec<ScanInput>> {
     let mut inputs = Vec::new();
+    let mut dir_cache = HashMap::new();
 
     for entry in build_walker(root, repo_path_base, options)? {
         let entry = match entry {
@@ -941,12 +1042,17 @@ fn collect_scan_inventory(
         }
 
         let path = normalize_cache_key(repo_path_base, entry.path())?;
-        match admit_scan_path(repo_path_base, &path) {
-            Ok(ScanPathAdmission::Regular { full_path, stamp }) => {
+        match admit_scan_path_cached(repo_path_base, &path, &mut dir_cache) {
+            Ok(ScanPathAdmission::Regular {
+                full_path,
+                stamp,
+                file_id,
+            }) => {
                 inputs.push(ScanInput {
                     path,
                     full_path,
                     stamp,
+                    file_id,
                 });
             }
             Ok(ScanPathAdmission::Link { component }) => {
@@ -964,7 +1070,14 @@ fn collect_scan_inventory(
         }
     }
 
-    append_gitignored_tracked_inputs(root, repo_path_base, options, &mut inputs, diagnostics)?;
+    append_gitignored_tracked_inputs(
+        root,
+        repo_path_base,
+        options,
+        &mut inputs,
+        diagnostics,
+        &mut dir_cache,
+    )?;
     inputs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(inputs)
 }
@@ -979,6 +1092,7 @@ fn append_gitignored_tracked_inputs(
     options: &ScanOptions,
     inputs: &mut Vec<ScanInput>,
     diagnostics: &mut Vec<ScanDiagnostic>,
+    dir_cache: &mut HashMap<String, DirComponentAdmission>,
 ) -> Result<()> {
     let Ok(repo) = gix::discover(root) else {
         return Ok(());
@@ -1027,11 +1141,16 @@ fn append_gitignored_tracked_inputs(
         {
             continue;
         }
-        match admit_scan_path(repo_path_base, &path) {
-            Ok(ScanPathAdmission::Regular { full_path, stamp }) => inputs.push(ScanInput {
+        match admit_scan_path_cached(repo_path_base, &path, dir_cache) {
+            Ok(ScanPathAdmission::Regular {
+                full_path,
+                stamp,
+                file_id,
+            }) => inputs.push(ScanInput {
                 path,
                 full_path,
                 stamp,
+                file_id,
             }),
             // Deleted, replaced or reached through a link: the walk would not
             // have scanned it either.
@@ -1049,36 +1168,52 @@ fn append_gitignored_tracked_inputs(
 }
 
 fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
-    let admission = match admit_scan_path(repo_path_base, &input.path) {
-        Ok(admission) => admission,
-        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
-    };
-    if let Some(rejection) = rejected_admission(input, admission) {
-        return rejection;
+    if input.file_id.is_none() {
+        let admission = match admit_scan_path(repo_path_base, &input.path) {
+            Ok(admission) => admission,
+            Err(err) => return rejected_scan_error(repo_path_base, input, &err),
+        };
+        if let Some(rejection) = rejected_admission(input, admission) {
+            return rejection;
+        }
     }
 
     let mut file = match File::open(&input.full_path) {
         Ok(file) => file,
         Err(err) => {
+            if let Ok(admission) = admit_scan_path(repo_path_base, &input.path)
+                && let Some(rejection) = rejected_admission(input, admission)
+            {
+                return rejection;
+            }
             let err = anyhow::Error::from(err);
             return cacheable_scan_error(repo_path_base, input, &err);
         }
     };
     match handle_matches_input(&file, input) {
         Ok(true) => {}
-        Ok(false) => return rejected_changed_scan(input),
+        Ok(false) => {
+            if let Ok(admission) = admit_scan_path(repo_path_base, &input.path)
+                && let Some(rejection) = rejected_admission(input, admission)
+            {
+                return rejection;
+            }
+            return rejected_changed_scan(input);
+        }
         Err(err) => return rejected_scan_error(repo_path_base, input, &err),
     }
 
-    let admission = match admit_scan_path(repo_path_base, &input.path) {
-        Ok(admission) => admission,
-        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
-    };
-    if let Some(rejection) = rejected_admission(input, admission) {
-        return rejection;
+    if input.file_id.is_none() {
+        let admission = match admit_scan_path(repo_path_base, &input.path) {
+            Ok(admission) => admission,
+            Err(err) => return rejected_scan_error(repo_path_base, input, &err),
+        };
+        if let Some(rejection) = rejected_admission(input, admission) {
+            return rejection;
+        }
     }
 
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(input.stamp.size).unwrap_or(0));
     if let Err(err) = file.read_to_end(&mut bytes) {
         let err = anyhow::Error::from(err);
         return cacheable_scan_error(repo_path_base, input, &err);
@@ -1086,15 +1221,24 @@ fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
 
     match handle_matches_input(&file, input) {
         Ok(true) => {}
-        Ok(false) => return rejected_changed_scan(input),
+        Ok(false) => {
+            if let Ok(admission) = admit_scan_path(repo_path_base, &input.path)
+                && let Some(rejection) = rejected_admission(input, admission)
+            {
+                return rejection;
+            }
+            return rejected_changed_scan(input);
+        }
         Err(err) => return rejected_scan_error(repo_path_base, input, &err),
     }
-    let admission = match admit_scan_path(repo_path_base, &input.path) {
-        Ok(admission) => admission,
-        Err(err) => return rejected_scan_error(repo_path_base, input, &err),
-    };
-    if let Some(rejection) = rejected_admission(input, admission) {
-        return rejection;
+    if input.file_id.is_none() {
+        let admission = match admit_scan_path(repo_path_base, &input.path) {
+            Ok(admission) => admission,
+            Err(err) => return rejected_scan_error(repo_path_base, input, &err),
+        };
+        if let Some(rejection) = rejected_admission(input, admission) {
+            return rejection;
+        }
     }
 
     let outcome = match analysis::parse_file(&input.path, &bytes) {
@@ -1124,11 +1268,65 @@ fn scan_file(repo_path_base: &Path, input: &ScanInput) -> ScanAttempt {
 }
 
 fn admit_scan_path(repo_path_base: &Path, path: &RepoPath) -> Result<ScanPathAdmission> {
+    let mut dir_cache = HashMap::new();
+    admit_scan_path_cached(repo_path_base, path, &mut dir_cache)
+}
+
+fn admit_scan_path_cached(
+    repo_path_base: &Path,
+    path: &RepoPath,
+    dir_cache: &mut HashMap<String, DirComponentAdmission>,
+) -> Result<ScanPathAdmission> {
     let components = path.as_str().split('/').collect::<Vec<_>>();
     let mut full_path = repo_path_base.to_path_buf();
+    let mut prefix = String::new();
 
     for (index, component) in components.iter().enumerate() {
+        if index > 0 {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
         full_path.push(component);
+
+        let is_final_component = index + 1 == components.len();
+        if !is_final_component {
+            if let Some(cached) = dir_cache.get(&prefix) {
+                match cached {
+                    DirComponentAdmission::RegularDir => continue,
+                    DirComponentAdmission::Link(link) => {
+                        return Ok(ScanPathAdmission::Link {
+                            component: link.clone(),
+                        });
+                    }
+                    DirComponentAdmission::MissingOrNonDir => {
+                        return Ok(ScanPathAdmission::MissingOrNonFile);
+                    }
+                }
+            }
+
+            let metadata = match fs::symlink_metadata(&full_path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    dir_cache.insert(prefix, DirComponentAdmission::MissingOrNonDir);
+                    return Ok(ScanPathAdmission::MissingOrNonFile);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if metadata.file_type().is_symlink() {
+                let link_component = RepoPath::new(prefix.clone())?;
+                dir_cache.insert(prefix, DirComponentAdmission::Link(link_component.clone()));
+                return Ok(ScanPathAdmission::Link {
+                    component: link_component,
+                });
+            }
+            if !metadata.file_type().is_dir() {
+                dir_cache.insert(prefix, DirComponentAdmission::MissingOrNonDir);
+                return Ok(ScanPathAdmission::MissingOrNonFile);
+            }
+            dir_cache.insert(prefix.clone(), DirComponentAdmission::RegularDir);
+            continue;
+        }
+
         let metadata = match fs::symlink_metadata(&full_path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1138,24 +1336,18 @@ fn admit_scan_path(repo_path_base: &Path, path: &RepoPath) -> Result<ScanPathAdm
         };
         if metadata.file_type().is_symlink() {
             return Ok(ScanPathAdmission::Link {
-                component: RepoPath::new(components[..=index].join("/"))?,
+                component: RepoPath::new(prefix)?,
             });
         }
-
-        let is_final_component = index + 1 == components.len();
-        if is_final_component {
-            return if metadata.file_type().is_file() {
-                Ok(ScanPathAdmission::Regular {
-                    full_path,
-                    stamp: file_stamp(&metadata)?,
-                })
-            } else {
-                Ok(ScanPathAdmission::MissingOrNonFile)
-            };
-        }
-        if !metadata.file_type().is_dir() {
-            return Ok(ScanPathAdmission::MissingOrNonFile);
-        }
+        return if metadata.file_type().is_file() {
+            Ok(ScanPathAdmission::Regular {
+                full_path,
+                stamp: file_stamp(&metadata)?,
+                file_id: file_identity(&metadata),
+            })
+        } else {
+            Ok(ScanPathAdmission::MissingOrNonFile)
+        };
     }
 
     Ok(ScanPathAdmission::MissingOrNonFile)
@@ -1175,7 +1367,9 @@ fn rejected_admission(input: &ScanInput, admission: ScanPathAdmission) -> Option
 
 fn handle_matches_input(file: &File, input: &ScanInput) -> Result<bool> {
     let metadata = file.metadata()?;
-    Ok(metadata.file_type().is_file() && file_stamp(&metadata)? == input.stamp)
+    Ok(metadata.file_type().is_file()
+        && (input.file_id.is_none() || file_identity(&metadata) == input.file_id)
+        && file_stamp(&metadata)? == input.stamp)
 }
 
 fn cacheable_scan_error(
@@ -1986,10 +2180,15 @@ mod tests {
         fs::create_dir_all(full_path.parent().unwrap()).unwrap();
         fs::write(&full_path, "pub fn local() {}\n").unwrap();
         let input = match admit_scan_path(&repo, &path).unwrap() {
-            ScanPathAdmission::Regular { full_path, stamp } => ScanInput {
+            ScanPathAdmission::Regular {
+                full_path,
+                stamp,
+                file_id,
+            } => ScanInput {
                 path: path.clone(),
                 full_path,
                 stamp,
+                file_id,
             },
             admission => panic!("expected regular admission, got {admission:?}"),
         };
@@ -2291,6 +2490,39 @@ mod tests {
         assert!(keep.exists(), "kept file must always survive");
 
         let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn scan_directory_parallel_preserves_deterministic_order() {
+        let repo = temp_test_dir("scanner_parallel_order");
+        fs::create_dir_all(repo.join("src/sub")).unwrap();
+        let mut expected = Vec::new();
+        for idx in (0..24_u32).rev() {
+            let rel = if idx % 2 == 0 {
+                format!("src/file_{idx:02}.rs")
+            } else {
+                format!("src/sub/file_{idx:02}.rs")
+            };
+            fs::write(
+                repo.join(&rel),
+                format!(
+                    "pub fn f_{idx:02}(x: i32) -> i32 {{ if x > 0 {{ x + {idx} }} else {{ 0 }} }}\n"
+                ),
+            )
+            .unwrap();
+            expected.push(rel);
+        }
+        expected.sort();
+
+        let result = scan_directory(&repo, &ScanOptions::default()).unwrap();
+        let actual: Vec<_> = result
+            .files
+            .iter()
+            .map(|file| file.path.as_str().to_string())
+            .collect();
+        assert_eq!(actual, expected);
+
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[cfg(windows)]
