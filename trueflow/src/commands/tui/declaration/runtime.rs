@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -8,7 +8,7 @@ use crate::commands::review::ResolvedReviewQuery;
 use crate::declaration::capture::{
     CaptureBatch, CaptureEndpointProvenance, capture_declaration_sources,
 };
-use crate::declaration::diff::diff_declarations;
+use crate::declaration::diff::{DeclarationChangeKind, diff_declarations};
 use crate::declaration::review::{
     CollectedDeclarationItem, DeclarationReviewDiffBatch, DeclarationReviewQuery,
     DeclarationReviewStatus as CollectionStatus, collect_declaration_review,
@@ -38,6 +38,15 @@ pub struct PreparedDeclarationTarget {
     pub diff_unit: crate::declaration::diff::DeclarationDiffUnit,
     pub latest_verdict: Option<Verdict>,
     provenance: TargetProvenance,
+    merged_occurrences: Vec<MergedDeclarationOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergedDeclarationOccurrence {
+    display_path: RepoPath,
+    snapshot: crate::declaration::snapshot::SourceSnapshot,
+    declaration: DeclarationNode,
+    provenance: TargetProvenance,
 }
 
 /// Where a target's source was captured and, for a deleted surface, which comparison head
@@ -58,6 +67,7 @@ impl PreparedDeclarationTarget {
             diff_unit: item.diff_unit,
             latest_verdict: item.latest_verdict,
             provenance,
+            merged_occurrences: Vec::new(),
         }
     }
 }
@@ -118,16 +128,34 @@ pub fn prepare_declaration_launch(
 
     let collection_query = DeclarationReviewQuery::new(review_batches).with_records(records);
     let collected = collect_declaration_review(&collection_query)?;
-    let mut seen = HashSet::with_capacity(collected.items.len());
-    let mut targets = Vec::with_capacity(collected.items.len());
+    let mut seen: BTreeMap<(DeclarationId, String, bool), usize> = BTreeMap::new();
+    let mut targets: Vec<PreparedDeclarationTarget> = Vec::with_capacity(collected.items.len());
     for item in collected.items {
         // Overlapping diff targets (for example `rev:HEAD` and `HEAD^..HEAD`) capture the
-        // same surface once per target. The declaration ID already binds path, kind, name,
-        // position, and projection, so an identical occurrence is reviewed once.
-        if !seen.insert(item.declaration.id.clone()) {
+        // same surface once per target. Merge identical occurrences onto one target and retain
+        // each occurrence so submitting a review records against every merged occurrence.
+        let provenance = resolve_target_provenance(&captures, &item)?;
+        let merge_key = (
+            item.declaration.id.clone(),
+            item.snapshot.bytes_hash().as_str().to_owned(),
+            matches!(item.diff_unit.change_kind, DeclarationChangeKind::Deleted),
+        );
+        if let Some(&target_index) = seen.get(&merge_key) {
+            let existing = &mut targets[target_index];
+            if existing.latest_verdict.is_none() {
+                existing.latest_verdict = item.latest_verdict;
+            }
+            existing
+                .merged_occurrences
+                .push(MergedDeclarationOccurrence {
+                    display_path: item.display_path,
+                    snapshot: item.snapshot,
+                    declaration: item.declaration,
+                    provenance,
+                });
             continue;
         }
-        let provenance = resolve_target_provenance(&captures, &item)?;
+        seen.insert(merge_key, targets.len());
         targets.push(PreparedDeclarationTarget::from_collected(item, provenance));
     }
     let documents = build_documents(&targets)?;
@@ -505,14 +533,16 @@ impl<A> DeclarationAppRuntime<A> {
     pub fn submit_action_with_persistence<F>(
         &mut self,
         action: &DeclarationReviewAction,
-        persist: F,
+        mut persist: F,
     ) -> Result<()>
     where
-        F: FnOnce(&Record) -> Result<()>,
+        F: FnMut(&Record) -> Result<()>,
     {
-        let (target_index, record) = self.prepare_submission(action)?;
+        let (target_index, records) = self.prepare_submission(action)?;
         // Atomicity boundary: neither status nor cursor changes until persistence succeeds.
-        persist(&record)?;
+        for record in &records {
+            persist(record)?;
+        }
         self.finish_submission(target_index, action.kind)
     }
 
@@ -528,8 +558,14 @@ impl<A> DeclarationAppRuntime<A> {
         F: FnMut(&Record) -> Result<()>,
     {
         for action in actions {
-            let (target_index, record) = self.prepare_submission(&action)?;
-            match persist(&record) {
+            let (target_index, records) = self.prepare_submission(&action)?;
+            let persisted = (|| -> Result<()> {
+                for record in &records {
+                    persist(record)?;
+                }
+                Ok(())
+            })();
+            match persisted {
                 Ok(()) => self.finish_submission(target_index, action.kind)?,
                 Err(error) => {
                     if let Some(controller) = &mut self.controller {
@@ -541,14 +577,14 @@ impl<A> DeclarationAppRuntime<A> {
         Ok(())
     }
 
-    fn prepare_submission(&self, action: &DeclarationReviewAction) -> Result<(usize, Record)> {
+    fn prepare_submission(&self, action: &DeclarationReviewAction) -> Result<(usize, Vec<Record>)> {
         let target_index = self
             .selected_target_index()
             .context("declaration review has no selected target")?;
         let target = &self.prepared.targets[target_index];
         validate_action_for_target(action, target)?;
-        let record = build_record(target, self.identity.clone(), action)?;
-        Ok((target_index, record))
+        let records = build_records(target, &self.identity, action)?;
+        Ok((target_index, records))
     }
 
     fn finish_submission(
@@ -611,8 +647,10 @@ impl<A: DeclarationRecordAppender> DeclarationAppRuntime<A> {
         let target = &self.prepared.targets[target_index];
         let action = full_declaration_action(target, kind, note);
         validate_action_for_target(&action, target)?;
-        let record = build_record(target, self.identity.clone(), &action)?;
-        self.appender.append(&record)?;
+        let records = build_records(target, &self.identity, &action)?;
+        for record in &records {
+            self.appender.append(record)?;
+        }
         self.finish_submission(target_index, kind)
     }
 
@@ -693,18 +731,47 @@ fn validate_note(action: DeclarationReviewActionKind, note: Option<&str>) -> Res
     Ok(())
 }
 
-fn build_record(
+fn build_records(
     target: &PreparedDeclarationTarget,
+    identity: &Identity,
+    action: &DeclarationReviewAction,
+) -> Result<Vec<Record>> {
+    let mut records = Vec::with_capacity(1 + target.merged_occurrences.len());
+    records.push(build_record_for_occurrence(
+        &target.display_path,
+        &target.snapshot,
+        &target.declaration,
+        &target.provenance,
+        identity.clone(),
+        action,
+    )?);
+    for merged in &target.merged_occurrences {
+        records.push(build_record_for_occurrence(
+            &merged.display_path,
+            &merged.snapshot,
+            &merged.declaration,
+            &merged.provenance,
+            identity.clone(),
+            action,
+        )?);
+    }
+    Ok(records)
+}
+
+fn build_record_for_occurrence(
+    display_path: &RepoPath,
+    snapshot: &crate::declaration::snapshot::SourceSnapshot,
+    declaration: &DeclarationNode,
+    provenance: &TargetProvenance,
     identity: Identity,
     action: &DeclarationReviewAction,
 ) -> Result<Record> {
     let reviewed_snapshot = ReviewedDeclarationSnapshot {
-        snapshot_id: target.snapshot.id.as_str().to_owned(),
-        content_hash: target.snapshot.bytes_hash().clone(),
+        snapshot_id: snapshot.id.as_str().to_owned(),
+        content_hash: snapshot.bytes_hash().clone(),
     };
-    let declaration = &target.declaration;
     let locator = DeclarationRecordLocator {
-        path: target.display_path.clone(),
+        path: display_path.clone(),
         declaration_key: declaration.key.clone(),
         source_ordinal: declaration.source_ordinal,
         source_span: declaration.source_span.clone(),
@@ -718,7 +785,7 @@ fn build_record(
     let anchor = DeclarationCommentAnchor {
         reviewed_snapshot,
         projection_hash: declaration.projection_hash.clone(),
-        source_len_bytes: target.snapshot.source().len(),
+        source_len_bytes: snapshot.source().len(),
         ranges: action_anchor
             .ranges
             .iter()
@@ -729,7 +796,7 @@ fn build_record(
             })
             .collect(),
     };
-    anchor.validate_against_source(target.snapshot.source())?;
+    anchor.validate_against_source(snapshot.source())?;
 
     let verdict = match action.kind {
         DeclarationReviewActionKind::Approve => Verdict::Approved,
@@ -745,13 +812,13 @@ fn build_record(
         check: ReviewCheck::declaration(),
         verdict,
         identity,
-        repo_ref: target.provenance.source.repo_ref.clone(),
-        block_state: target.provenance.source.block_state.clone(),
+        repo_ref: provenance.source.repo_ref.clone(),
+        block_state: provenance.source.block_state.clone(),
         note: action.comment_body.clone(),
         comment_context,
         comment_anchor: Some(CommentAnchor::Declaration(anchor)),
         declaration_locator: Some(locator),
-        declaration_deletion: target.provenance.deletion.clone(),
+        declaration_deletion: provenance.deletion.clone(),
     })
 }
 

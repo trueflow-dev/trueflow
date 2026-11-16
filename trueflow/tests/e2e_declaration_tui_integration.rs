@@ -954,6 +954,19 @@ fn overlapping_diff_targets_review_an_identical_declaration_once() -> Result<()>
         runtime.is_finished(),
         "approving the merged occurrence must finish the review"
     );
+
+    let records = runtime.into_appender().records;
+    let reloaded = prepare_declaration_launch(&repo.path, &query, records)?;
+    assert_eq!(
+        reloaded.status(),
+        &CollectionStatus::FullyReviewed,
+        "approving the merged occurrence must cover every merged duplicate occurrence on reload"
+    );
+    assert!(
+        reloaded.targets().is_empty(),
+        "second occurrence reappeared on reload: {:?}",
+        reloaded.targets()
+    );
     Ok(())
 }
 

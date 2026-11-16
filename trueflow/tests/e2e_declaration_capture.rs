@@ -854,3 +854,91 @@ fn invalid_utf8_projectable_file_is_a_per_file_diagnostic() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn immutable_and_dirty_declaration_capture_honor_scan_ignore_config() -> Result<()> {
+    let repo = TestRepo::new("declaration_capture_scan_ignores")?;
+    repo.write("src/lib.rs", "pub fn kept() -> u8 { 1 }\n")?;
+    repo.commit_all("base")?;
+
+    repo.write("src/lib.rs", "pub fn kept() -> u16 { 2 }\n")?;
+    repo.write("generated/gen.rs", "pub fn ignored_by_glob() {}\n")?;
+    repo.write("vendor_skip/skip.rs", "pub fn ignored_by_name() {}\n")?;
+    repo.write("src/legacy/old.rs", "pub fn ignored_by_prefix() {}\n")?;
+
+    let mut scan_options = ScanOptions::default();
+    scan_options.ignore_globs.push("/generated/*.rs".to_owned());
+    scan_options.ignore_names.push("vendor_skip".to_owned());
+    scan_options
+        .ignore_path_prefixes
+        .push(RepoPath::new("src/legacy")?);
+
+    let mut dirty = dirty_query(&[
+        "src/lib.rs",
+        "generated/gen.rs",
+        "vendor_skip/skip.rs",
+        "src/legacy/old.rs",
+    ])?;
+    dirty.scan_options = scan_options.clone();
+    let dirty_prepared = prepare_declaration_launch(&repo.path, &dirty, Vec::new())?;
+    assert_eq!(launch_names(&dirty_prepared), ["kept"]);
+
+    let mut worktree = worktree_query(ReviewPathSelection::All);
+    worktree.scan_options = scan_options.clone();
+    let worktree_prepared = prepare_declaration_launch(&repo.path, &worktree, Vec::new())?;
+    assert_eq!(launch_names(&worktree_prepared), ["kept"]);
+
+    repo.commit_all("commit ignored and kept files")?;
+    let mut revision = revision_query(commit_id(&repo, "HEAD")?);
+    revision.scan_options = scan_options;
+    let revision_prepared = prepare_declaration_launch(&repo.path, &revision, Vec::new())?;
+    assert_eq!(launch_names(&revision_prepared), ["kept"]);
+    Ok(())
+}
+
+#[test]
+fn worktree_declaration_capture_includes_git_tracked_gitignored_files() -> Result<()> {
+    let repo = TestRepo::new("declaration_capture_tracked_gitignored")?;
+    repo.write(".gitignore", "tracked_ignored.rs\n")?;
+    repo.write("src/lib.rs", "pub fn visible() {}\n")?;
+    repo.write("tracked_ignored.rs", "pub fn force_tracked() {}\n")?;
+    repo.git(&[
+        "add",
+        "-f",
+        "tracked_ignored.rs",
+        ".gitignore",
+        "src/lib.rs",
+    ])?;
+    repo.git(&["commit", "-m", "track gitignored rust file"])?;
+
+    let worktree = worktree_query(ReviewPathSelection::All);
+    let prepared = prepare_declaration_launch(&repo.path, &worktree, Vec::new())?;
+    let mut names = launch_names(&prepared);
+    names.sort_unstable();
+    assert_eq!(names, ["force_tracked", "visible"]);
+    Ok(())
+}
+
+#[test]
+fn dirty_declaration_capture_skips_reading_oversized_unsupported_rename_head() -> Result<()> {
+    let repo = TestRepo::new("declaration_capture_oversized_unsupported_rename")?;
+    repo.write("src/removed.rs", "pub fn removed_api() -> u8 { 1 }\n")?;
+    repo.commit_all("base")?;
+
+    repo.git(&["mv", "src/removed.rs", "blob.bin"])?;
+    write_sparse_source(&repo, "blob.bin", MAX_DECLARATION_SOURCE_BYTES + 4096)?;
+
+    let mut query = worktree_query(ReviewPathSelection::Scoped {
+        files: HashSet::new(),
+        dirs: Vec::new(),
+        changed: Some(HashSet::from([ChangedPath {
+            source_location: RepoPath::new("src/removed.rs")?,
+            location: RepoPath::new("blob.bin")?,
+        }])),
+    });
+    query.diff_selection = ReviewDiffSelection::None;
+
+    let prepared = prepare_declaration_launch(&repo.path, &query, Vec::new())?;
+    assert_eq!(launch_names(&prepared), ["removed_api"]);
+    Ok(())
+}

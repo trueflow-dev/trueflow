@@ -16,6 +16,7 @@ use crate::declaration::snapshot::{
 };
 use crate::hashing::{BytesHash, hash_bytes};
 use crate::repo_path::RepoPath;
+use crate::scanner::DirectScanPathIgnoreMatcher;
 use crate::store::{BlockState, CommitId, RepoRef, VcsSystem};
 use crate::targets::{ReviewDiffSelection, ReviewDiffTarget, ReviewPathSelection};
 use crate::vcs::{self, ChangedPath};
@@ -107,6 +108,7 @@ where
         .context("declaration capture requires a non-bare repository")?
         .to_path_buf();
 
+    let ignore = DirectScanPathIgnoreMatcher::new(&query.scan_options)?;
     let mut budget = CaptureBudget::default();
     match &query.diff_selection {
         ReviewDiffSelection::Targets(targets) => {
@@ -115,6 +117,7 @@ where
                 batches.push(capture_immutable_target(
                     &repo,
                     query,
+                    &ignore,
                     target,
                     target_index,
                     &mut budget,
@@ -124,9 +127,11 @@ where
             Ok(batches)
         }
         ReviewDiffSelection::None => match dirty_changed_paths(&query.path_selection) {
-            Some(changed) => capture_dirty(&repo, &workdir, query, changed, &mut budget, hook)
-                .map(|batch| vec![batch]),
-            None => capture_worktree_inventory(&repo, &workdir, query, &mut budget, hook)
+            Some(changed) => {
+                capture_dirty(&repo, &workdir, query, &ignore, changed, &mut budget, hook)
+                    .map(|batch| vec![batch])
+            }
+            None => capture_worktree_inventory(&repo, &workdir, query, &ignore, &mut budget, hook)
                 .map(|batch| vec![batch]),
         },
     }
@@ -135,6 +140,7 @@ where
 fn capture_immutable_target(
     repo: &gix::Repository,
     query: &ResolvedReviewQuery,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
     target: &ReviewDiffTarget,
     target_index: usize,
     budget: &mut CaptureBudget,
@@ -158,16 +164,28 @@ fn capture_immutable_target(
         if !changed_pair_selected(&query.path_selection, &changed_path) {
             continue;
         }
-        if let Some(base_tree) = base_tree.as_ref() {
+        let base_ignored = ignore.matches(&changed_path.source_location);
+        let head_ignored = ignore.matches(&changed_path.location);
+        if !base_ignored && let Some(base_tree) = base_tree.as_ref() {
             append_tree_capability_notice(
                 &mut capability_notices,
                 base_tree,
                 &changed_path.source_location,
             )?;
         }
-        append_tree_capability_notice(&mut capability_notices, &head_tree, &changed_path.location)?;
-        let base_language = declaration_language(&changed_path.source_location);
-        let head_language = declaration_language(&changed_path.location);
+        if !head_ignored {
+            append_tree_capability_notice(
+                &mut capability_notices,
+                &head_tree,
+                &changed_path.location,
+            )?;
+        }
+        let base_language = (!base_ignored)
+            .then(|| declaration_language(&changed_path.source_location))
+            .flatten();
+        let head_language = (!head_ignored)
+            .then(|| declaration_language(&changed_path.location))
+            .flatten();
         if base_language.is_none() && head_language.is_none() {
             continue;
         }
@@ -289,6 +307,7 @@ fn capture_dirty<F>(
     repo: &gix::Repository,
     workdir: &Path,
     query: &ResolvedReviewQuery,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
     changed: &HashSet<ChangedPath>,
     budget: &mut CaptureBudget,
     hook: F,
@@ -305,24 +324,32 @@ where
         .iter()
         .filter(|path| changed_pair_selected(&query.path_selection, path))
     {
-        append_tree_capability_notice(
-            &mut capability_notices,
-            &head_tree,
-            &changed_path.source_location,
-        )?;
-        append_worktree_capability_notice(
-            &mut capability_notices,
-            workdir,
-            &changed_path.location,
-        )?;
+        if !ignore.matches(&changed_path.source_location) {
+            append_tree_capability_notice(
+                &mut capability_notices,
+                &head_tree,
+                &changed_path.source_location,
+            )?;
+        }
+        if !ignore.matches(&changed_path.location) {
+            append_worktree_capability_notice(
+                &mut capability_notices,
+                workdir,
+                &changed_path.location,
+            )?;
+        }
     }
     sort_capability_notices(&mut capability_notices);
     let mut selected = changed
         .iter()
         .filter(|path| changed_pair_selected(&query.path_selection, path))
         .filter_map(|path| {
-            let base_language = declaration_language(&path.source_location);
-            let head_language = declaration_language(&path.location);
+            let base_language = (!ignore.matches(&path.source_location))
+                .then(|| declaration_language(&path.source_location))
+                .flatten();
+            let head_language = (!ignore.matches(&path.location))
+                .then(|| declaration_language(&path.location))
+                .flatten();
             (base_language.is_some() || head_language.is_some())
                 .then(|| (path.clone(), base_language, head_language))
         })
@@ -385,6 +412,7 @@ fn capture_worktree_inventory<F>(
     repo: &gix::Repository,
     workdir: &Path,
     query: &ResolvedReviewQuery,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
     budget: &mut CaptureBudget,
     hook: F,
 ) -> Result<CaptureBatch>
@@ -396,7 +424,7 @@ where
     let WorktreeSources {
         projected,
         capability_notices,
-    } = worktree_source_paths(workdir, query)?;
+    } = worktree_source_paths(repo, workdir, query, ignore)?;
     let mut pairs = Vec::with_capacity(projected.len());
     let mut diagnostics = Vec::new();
     let mut fingerprints = Vec::with_capacity(projected.len());
@@ -417,7 +445,9 @@ where
     hook()?;
     validate_worktree_generation(repo, workdir, &head_id, &status_before, &fingerprints)?;
     let uncommitted = status_before.iter().any(|path| {
-        declaration_language(path).is_some() && worktree_path_selected(&query.path_selection, path)
+        !ignore.matches(path)
+            && declaration_language(path).is_some()
+            && worktree_path_selected(&query.path_selection, path)
     });
 
     Ok(CaptureBatch {
@@ -438,8 +468,13 @@ where
     })
 }
 
-fn worktree_source_paths(workdir: &Path, query: &ResolvedReviewQuery) -> Result<WorktreeSources> {
-    let mut glob_builder = GitignoreBuilder::new(workdir);
+fn worktree_source_paths(
+    repo: &gix::Repository,
+    workdir: &Path,
+    query: &ResolvedReviewQuery,
+    ignore: &DirectScanPathIgnoreMatcher<'_>,
+) -> Result<WorktreeSources> {
+    let mut glob_builder = GitignoreBuilder::new(".");
     glob_builder.allow_unclosed_class(false);
     for pattern in &query.scan_options.ignore_globs {
         glob_builder.add_line(None, pattern)?;
@@ -489,12 +524,13 @@ fn worktree_source_paths(workdir: &Path, query: &ResolvedReviewQuery) -> Result<
         }
         !glob_matcher
             .matched_path_or_any_parents(
-                entry.path(),
+                relative,
                 entry.file_type().is_some_and(|kind| kind.is_dir()),
             )
             .is_ignore()
     });
 
+    let mut seen = HashSet::new();
     let mut projected = Vec::new();
     let mut capability_notices = Vec::new();
     for entry in builder.build() {
@@ -507,6 +543,10 @@ fn worktree_source_paths(workdir: &Path, query: &ResolvedReviewQuery) -> Result<
             .strip_prefix(workdir)
             .context("worktree walker returned a path outside the repository")?;
         let path = RepoPath::from_relative_path(relative)?;
+        if ignore.matches(&path) {
+            continue;
+        }
+        seen.insert(path.clone());
         if !worktree_path_selected(&query.path_selection, &path) {
             continue;
         }
@@ -516,12 +556,64 @@ fn worktree_source_paths(workdir: &Path, query: &ResolvedReviewQuery) -> Result<
             projected.push((path, language));
         }
     }
+
+    if let Ok(index) = repo.index_or_empty() {
+        for entry in index.entries() {
+            let is_regular_blob = entry.mode.to_tree_entry_mode().is_some_and(|mode| {
+                matches!(mode.kind(), EntryKind::Blob | EntryKind::BlobExecutable)
+            });
+            if !is_regular_blob {
+                continue;
+            }
+            let Ok(path) = RepoPath::new(entry.path(&index).to_string()) else {
+                continue;
+            };
+            if ignore.matches(&path)
+                || !seen.insert(path.clone())
+                || !worktree_path_selected(&query.path_selection, &path)
+                || !is_regular_non_symlink_worktree_file(workdir, &path)?
+            {
+                continue;
+            }
+            if let Some(notice) = declaration_file_capability(&path) {
+                capability_notices.push(notice);
+            } else if let Some(language) = declaration_language(&path) {
+                projected.push((path, language));
+            }
+        }
+    }
+
     projected.sort_by(|(left, _), (right, _)| left.cmp(right));
     sort_capability_notices(&mut capability_notices);
     Ok(WorktreeSources {
         projected,
         capability_notices,
     })
+}
+
+fn is_regular_non_symlink_worktree_file(workdir: &Path, path: &RepoPath) -> Result<bool> {
+    let mut cursor = workdir.to_path_buf();
+    let mut components = Path::new(path.as_str()).components().peekable();
+    while let Some(component) = components.next() {
+        cursor.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&cursor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Ok(false);
+        }
+        if components.peek().is_some() {
+            if !file_type.is_dir() {
+                return Ok(false);
+            }
+        } else if !file_type.is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// One comparison endpoint of a changed path.
@@ -629,6 +721,12 @@ fn snapshot_from_worktree(
     let Some(before) = before else {
         return Ok((EndpointSource::Absent, FileFingerprint::missing()));
     };
+    let Some(language) = language else {
+        return Ok((
+            EndpointSource::Absent,
+            FileFingerprint::from_metadata(before, None),
+        ));
+    };
     if !before.is_file {
         return Ok((
             EndpointSource::Absent,
@@ -642,10 +740,7 @@ fn snapshot_from_worktree(
         return Err(anyhow!(CAPTURE_DRIFT_ERROR));
     }
     let fingerprint = FileFingerprint::from_metadata(after, Some(BytesHash::from_bytes(&bytes)));
-    let source = match language {
-        Some(language) => EndpointSource::decode(path, language, &bytes, endpoint_name, target_key),
-        None => EndpointSource::Absent,
-    };
+    let source = EndpointSource::decode(path, language, &bytes, endpoint_name, target_key);
     Ok((source, fingerprint))
 }
 
@@ -906,13 +1001,17 @@ fn file_metadata(path: &Path) -> Result<Option<FileMetadata>> {
     }
 }
 
-fn fingerprint_file(workdir: &Path, path: &RepoPath) -> Result<FileFingerprint> {
+fn fingerprint_file(
+    workdir: &Path,
+    path: &RepoPath,
+    hash_contents: bool,
+) -> Result<FileFingerprint> {
     let absolute = workdir.join(path.as_str());
     let before = file_metadata(&absolute)?;
     let Some(before) = before else {
         return Ok(FileFingerprint::missing());
     };
-    if !before.is_file {
+    if !before.is_file || !hash_contents {
         return Ok(FileFingerprint::from_metadata(before, None));
     }
     let bytes = fs::read(&absolute)?;
@@ -943,7 +1042,11 @@ fn validate_worktree_generation(
         return Err(anyhow!(CAPTURE_DRIFT_ERROR));
     }
     for (path, expected) in fingerprints {
-        if fingerprint_file(workdir, path).as_ref().ok() != Some(expected) {
+        if fingerprint_file(workdir, path, expected.bytes_hash.is_some())
+            .as_ref()
+            .ok()
+            != Some(expected)
+        {
             return Err(anyhow!(CAPTURE_DRIFT_ERROR));
         }
     }
