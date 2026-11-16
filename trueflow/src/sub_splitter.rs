@@ -1,7 +1,9 @@
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, ParentBlock};
 use crate::code_comments::{self, CommentSyntax};
-use crate::review_units::{MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES, MAX_REVIEW_UNIT_SPAN_LINES};
+use crate::review_units::{
+    MAX_MARKDOWN_REVIEW_UNIT_SPAN_LINES, MAX_REVIEW_UNIT_SPAN_LINES, ReviewUnitSpan,
+};
 use crate::text_split::paragraph_break_regex;
 use crate::tree_sitter_support::{
     classify_kotlin_class_kind, classify_kotlin_property_kind, elisp_list_head_symbol,
@@ -147,14 +149,28 @@ pub fn may_split_into_review_units(block: &Block, lang: Language) -> bool {
     if is_toml_structural_kind(lang, block.kind) {
         return false;
     }
-    if is_nix_structural_candidate(lang, block.kind) {
-        // Only the parse tells whether Nix structural children exist.
-        return true;
-    }
     let plan = determine_split_plan(block.kind, lang);
     !matches!(plan, SplitPlan::IdentityReviewUnit)
         && !should_keep_parent_review_unit(plan, block)
         && plan.semantics() == SubSplitSemantics::ReviewUnits
+}
+
+pub fn review_unit_spans(block: &Block, lang: Language) -> Option<Box<[ReviewUnitSpan]>> {
+    if !may_split_into_review_units(block, lang) {
+        return None;
+    }
+    let split = split_result(block, lang).ok()?;
+    if split.semantics != SubSplitSemantics::ReviewUnits {
+        return None;
+    }
+    Some(
+        split
+            .blocks
+            .iter()
+            .map(ReviewUnitSpan::from_block)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    )
 }
 
 fn is_toml_structural_kind(lang: Language, kind: BlockKind) -> bool {

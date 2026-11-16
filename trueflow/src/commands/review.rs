@@ -14,6 +14,7 @@ use crate::review_pass::{
     PassScope, PassSource, PassWhy, ReviewPass, format_reading_estimate, heuristic_pass,
     nothing_new_reason,
 };
+use crate::review_units::{MAX_REVIEW_UNIT_SPAN_LINES, ReviewUnitSpan};
 use crate::scanner::{self, DirectScanPathIgnoreMatcher, ScanDiagnostic, ScanOptions};
 use crate::store::{FileStore, ReviewCheck, ReviewStore, ReviewedBlockChange, Verdict};
 use crate::sub_splitter;
@@ -396,7 +397,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
         return collect_diff_scoped_review(query, &diff_context, files, diagnostics);
     }
 
-    let tree = tree::build_tree_from_files(&files);
+    let (tree, indexed_files) = tree::build_tree_from_files_owned(files);
     let coverage = CoverageIndex::build(&tree, &database)?;
 
     let mut unreviewed_files = Vec::new();
@@ -404,62 +405,66 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     let mut unreviewed_block_nodes = HashSet::new();
     let mut commented_block_nodes = HashSet::new();
 
-    for file in files {
+    for file in indexed_files {
         if !query.path_selection.includes(&file.path) {
             continue;
         }
 
         let language = file.language;
-        let mut reviewable_blocks = Vec::new();
-        for block in file.blocks {
+        let mut reviewable_blocks = Vec::with_capacity(file.block_nodes.len());
+        for node_id in file.block_nodes {
+            let Some(block) = tree.node(node_id).block.as_ref() else {
+                continue;
+            };
             if !query.filters.allows_block(block.kind) {
                 continue;
             }
-            if should_skip_whitespace_only_by_default(&block, &query.filters) {
+            if should_skip_whitespace_only_by_default(block, &query.filters) {
                 continue;
             }
-            if should_skip_imports_by_default(file.path.as_str(), &block, &query.filters) {
+            if should_skip_imports_by_default(file.path.as_str(), block, &query.filters) {
                 continue;
             }
-            let node_id = tree.find_block_node(&file.path, &block);
             if should_skip_container_by_default(
-                node_id.is_some_and(|node_id| tree.is_container_block(node_id)),
-                &block,
+                tree.is_container_block(node_id),
+                block,
                 &query.filters,
             ) {
                 continue;
             }
-            reviewable_blocks.push((block, node_id));
+            reviewable_blocks.push(node_id);
         }
         total_blocks += reviewable_blocks.len();
 
+        let subblocks = SubblockCoverage {
+            language,
+            query,
+            coverage: &coverage,
+            review_check: &review_check,
+            file_path: &file.path,
+            change: ReviewedBlockChange::Content,
+        };
         let mut unreviewed_blocks = Vec::new();
-        for (block, node_id) in reviewable_blocks {
-            let block_coverage = coverage.block(&file.path, &block);
-            let effective_verdict = block_coverage.effective_latest_verdict_for(&review_check);
+        for node_id in reviewable_blocks {
+            let Some(block) = tree.node(node_id).block.as_ref() else {
+                continue;
+            };
+            let effective_verdict = coverage
+                .node(node_id)
+                .effective_latest_verdict_for(&review_check);
             if effective_verdict == Some(&Verdict::Approved) {
                 continue;
             }
 
-            let subblocks = SubblockCoverage {
-                language,
-                query,
-                coverage: &coverage,
-                review_check: &review_check,
-                file_path: &file.path,
-                change: ReviewedBlockChange::Content,
-            };
-            if subblocks.is_covered(&block, node_id, None) {
+            if subblocks.is_covered(block, Some(node_id), None) {
                 continue;
             }
 
-            if let Some(node_id) = node_id {
-                unreviewed_block_nodes.insert(node_id);
-                if effective_verdict == Some(&Verdict::Comment) {
-                    commented_block_nodes.insert(node_id);
-                }
+            unreviewed_block_nodes.insert(node_id);
+            if effective_verdict == Some(&Verdict::Comment) {
+                commented_block_nodes.insert(node_id);
             }
-            unreviewed_blocks.push(UnreviewedBlock::content(block));
+            unreviewed_blocks.push(UnreviewedBlock::content(block.clone()));
         }
 
         if !unreviewed_blocks.is_empty() {
@@ -551,31 +556,38 @@ fn collect_diff_review_presentation(
         let mut unreviewed_blocks = Vec::new();
         let residues = DiffContainerResidues::new(&file.blocks);
         for (index, review_block) in file.blocks.iter().enumerate() {
-            let display_block = review_block.display_block().clone();
+            let display_block = review_block.display_block();
             if !query.filters.allows_block(display_block.kind) {
                 continue;
             }
-            if should_skip_whitespace_only_by_default(&display_block, &query.filters) {
+            if should_skip_whitespace_only_by_default(display_block, &query.filters) {
                 continue;
             }
-            if should_skip_imports_by_default(file.path.as_str(), &display_block, &query.filters) {
+            if should_skip_imports_by_default(file.path.as_str(), display_block, &query.filters) {
                 continue;
             }
-            let Some(node_id) = tree.find_block_node(&file.path, &display_block) else {
+            let Some(node_id) = tree.find_block_node(&file.path, display_block) else {
                 continue;
             };
             if should_skip_container_by_default(
                 tree.is_container_block(node_id)
                     && residues.residue(index) == ContainerResidue::Unchanged,
-                &display_block,
+                display_block,
                 &query.filters,
             ) {
                 continue;
             }
             total_blocks += 1;
             let change = review_block.change_kind.reviewed_change();
-            let block_coverage = coverage.block_showing(&file.path, &display_block, change);
-            let effective_verdict = block_coverage.effective_latest_verdict_for(review_check);
+            let effective_verdict = if tree.node(node_id).change == change {
+                coverage
+                    .node(node_id)
+                    .effective_latest_verdict_for(review_check)
+            } else {
+                coverage
+                    .block_showing(&file.path, display_block, change)
+                    .effective_latest_verdict_for(review_check)
+            };
             if effective_verdict == Some(&Verdict::Approved) {
                 continue;
             }
@@ -588,7 +600,7 @@ fn collect_diff_review_presentation(
                 file_path: &file.path,
                 change,
             };
-            if subblocks.is_covered(&display_block, Some(node_id), None) {
+            if subblocks.is_covered(display_block, Some(node_id), None) {
                 continue;
             }
 
@@ -597,7 +609,7 @@ fn collect_diff_review_presentation(
                 commented_block_nodes.insert(node_id);
             }
             unreviewed_blocks.push(UnreviewedBlock {
-                block: display_block,
+                block: display_block.clone(),
                 change,
             });
         }
@@ -1500,8 +1512,13 @@ impl SubblockCoverage<'_, '_> {
         }
         let latest = self
             .coverage
-            .block_showing(self.file_path, block, self.change)
-            .direct_latest_for(self.review_check)
+            .direct_latest_for_span(
+                self.file_path,
+                &block.hash,
+                block.byte_span(),
+                self.change,
+                self.review_check,
+            )
             .filter(|latest| after.is_none_or(|after| latest.order > after));
         match latest {
             Some(LatestVerdict {
@@ -1514,6 +1531,71 @@ impl SubblockCoverage<'_, '_> {
             }) => self.are_review_units_covered(block, node_id, Some(order)),
             None => self.are_review_units_covered(block, node_id, after),
         }
+    }
+
+    fn is_span_covered(
+        &self,
+        span: &ReviewUnitSpan,
+        parent: &Block,
+        after: Option<RecordOrder>,
+    ) -> bool {
+        if !self.query.filters.allows_subblock(span.kind)
+            || (!self.query.filters.only_contains(span.kind) && span.is_blank)
+        {
+            return true;
+        }
+        let latest = self
+            .coverage
+            .direct_latest_for_span(
+                self.file_path,
+                &span.hash,
+                span.byte_span(),
+                self.change,
+                self.review_check,
+            )
+            .filter(|latest| after.is_none_or(|after| latest.order > after));
+        match latest {
+            Some(LatestVerdict {
+                verdict: Verdict::Approved,
+                ..
+            }) => true,
+            Some(LatestVerdict {
+                verdict: Verdict::Comment | Verdict::Rejected,
+                order,
+            }) => span
+                .to_block_from_parent(parent)
+                .is_some_and(|unit| self.are_review_units_covered(&unit, None, Some(order))),
+            None => {
+                if span.line_span().len() <= MAX_REVIEW_UNIT_SPAN_LINES
+                    && !self.coverage.has_block_records_within_span(
+                        self.file_path,
+                        span.byte_span(),
+                        self.change,
+                    )
+                {
+                    return false;
+                }
+                span.to_block_from_parent(parent)
+                    .is_some_and(|unit| self.are_review_units_covered(&unit, None, after))
+            }
+        }
+    }
+
+    fn are_unit_spans_covered(
+        &self,
+        units: &[ReviewUnitSpan],
+        parent: &Block,
+        skip_gaps: bool,
+        after: Option<RecordOrder>,
+    ) -> bool {
+        let parent_span = parent.byte_span();
+        let mut units = units
+            .iter()
+            .filter(|unit| {
+                (!skip_gaps || unit.kind != BlockKind::Gap) && unit.byte_span() != parent_span
+            })
+            .peekable();
+        units.peek().is_some() && units.all(|unit| self.is_span_covered(unit, parent, after))
     }
 
     /// Whether `block` splits into review units that are all covered. Records
@@ -1530,47 +1612,59 @@ impl SubblockCoverage<'_, '_> {
         node_id: Option<tree::TreeNodeId>,
         after: Option<RecordOrder>,
     ) -> bool {
-        let split_now;
-        let units = if self
+        if self
             .coverage
             .has_block_records_within(self.file_path, block, self.change)
         {
+            if !self.query.filters.only_contains(BlockKind::Gap)
+                && let Some(units) = node_id.and_then(|node_id| {
+                    self.coverage
+                        .review_units_for(node_id, block, self.language)
+                })
+            {
+                return self.are_unit_spans_covered(units, block, true, after);
+            }
             let Ok(split) = sub_splitter::child_navigation_split(block, self.language) else {
                 return false;
             };
             if split.semantics != sub_splitter::SubSplitSemantics::ReviewUnits {
                 return false;
             }
-            split_now = split.blocks;
-            split_now.as_slice()
-        } else {
-            // A block that stays whole, or splits only into structural
-            // children, has no review units of its own to approve.
-            if !sub_splitter::may_split_into_review_units(block, self.language) {
-                return false;
-            }
-            match node_id.and_then(|node_id| {
-                self.coverage
-                    .review_units_for(node_id, block, self.language)
-            }) {
-                Some(units) => units,
-                None => {
-                    let Ok(split) = sub_splitter::split_result(block, self.language) else {
-                        return false;
-                    };
-                    if split.semantics != sub_splitter::SubSplitSemantics::ReviewUnits {
-                        return false;
-                    }
-                    split_now = split.blocks;
-                    split_now.as_slice()
-                }
-            }
+            let mut units = split
+                .blocks
+                .iter()
+                .filter(|unit| unit.byte_span() != block.byte_span())
+                .peekable();
+            return units.peek().is_some() && units.all(|unit| self.is_covered(unit, None, after));
+        }
+
+        // A block that stays whole, or splits only into structural
+        // children, has no review units of its own to approve.
+        if !sub_splitter::may_split_into_review_units(block, self.language) {
+            return false;
+        }
+        // Every ReviewUnits splitter tiles its parent completely and never
+        // classifies alphanumeric tokens as Gap. With no excluded kinds and no
+        // direct records inside `block`, at least one non-Gap non-blank unit is
+        // unapproved.
+        if !self.query.filters.has_explicit_excludes()
+            && block
+                .content
+                .bytes()
+                .any(|byte| byte.is_ascii_alphanumeric())
+        {
+            return false;
+        }
+        if let Some(units) = node_id.and_then(|node_id| {
+            self.coverage
+                .review_units_for(node_id, block, self.language)
+        }) {
+            return self.are_unit_spans_covered(units, block, false, after);
+        }
+        let Some(units) = sub_splitter::review_unit_spans(block, self.language) else {
+            return false;
         };
-        let mut units = units
-            .iter()
-            .filter(|unit| unit.byte_span() != block.byte_span())
-            .peekable();
-        units.peek().is_some() && units.all(|unit| self.is_covered(unit, None, after))
+        self.are_unit_spans_covered(&units, block, false, after)
     }
 }
 

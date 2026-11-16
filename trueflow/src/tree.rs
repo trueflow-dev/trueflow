@@ -5,7 +5,7 @@ use crate::repo_path::RepoPath;
 use crate::store::{ApprovedTargets, ReviewedBlockChange};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TreeNodeId(usize);
@@ -78,17 +78,55 @@ pub struct TreeNode {
     pub change: ReviewedBlockChange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct BlockLookupKey {
-    hash: TreeHash,
-    byte_span: ByteSpan,
+#[derive(Debug, Clone)]
+enum SpanBlockNodes {
+    One(TreeNodeId),
+    Many(Vec<TreeNodeId>),
+}
+
+impl SpanBlockNodes {
+    fn insert(&mut self, nodes: &[TreeNode], candidate_id: TreeNodeId) -> bool {
+        let candidate_hash = &nodes[candidate_id.0].hash;
+        match self {
+            Self::One(existing_id) => {
+                if &nodes[existing_id.0].hash == candidate_hash {
+                    return false;
+                }
+                *self = Self::Many(vec![*existing_id, candidate_id]);
+                true
+            }
+            Self::Many(existing) => {
+                if existing
+                    .iter()
+                    .any(|id| &nodes[id.0].hash == candidate_hash)
+                {
+                    return false;
+                }
+                existing.push(candidate_id);
+                true
+            }
+        }
+    }
+
+    fn find(&self, nodes: &[TreeNode], hash: &TreeHash) -> Option<TreeNodeId> {
+        match self {
+            Self::One(id) => (&nodes[id.0].hash == hash).then_some(*id),
+            Self::Many(ids) => ids.iter().copied().find(|id| &nodes[id.0].hash == hash),
+        }
+    }
+}
+
+pub struct IndexedTreeFile {
+    pub path: RepoPath,
+    pub language: Language,
+    pub block_nodes: Vec<TreeNodeId>,
 }
 
 pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
     nodes_by_path: HashMap<RepoPath, TreeNodeId>,
-    block_nodes_by_path_key: HashMap<RepoPath, HashMap<BlockLookupKey, TreeNodeId>>,
+    block_nodes_by_path_span: HashMap<RepoPath, HashMap<ByteSpan, SpanBlockNodes>>,
 }
 
 impl Tree {
@@ -142,8 +180,11 @@ impl Tree {
     }
 
     pub fn find_by_path(&self, path: &str) -> Option<TreeNodeId> {
-        let path = RepoPath::new(path).ok()?;
-        self.nodes_by_path.get(&path).copied()
+        if let Some(node_id) = self.nodes_by_path.get(path) {
+            return Some(*node_id);
+        }
+        let normalized = RepoPath::new(path).ok()?;
+        self.nodes_by_path.get(&normalized).copied()
     }
 
     pub fn parent(&self, id: TreeNodeId) -> Option<TreeNodeId> {
@@ -161,14 +202,17 @@ impl Tree {
     }
 
     pub fn find_block_node(&self, path: impl AsRef<str>, block: &Block) -> Option<TreeNodeId> {
-        let path = RepoPath::new(path.as_ref()).ok()?;
-        self.block_nodes_by_path_key
-            .get(&path)?
-            .get(&BlockLookupKey {
-                hash: block.hash.clone(),
-                byte_span: block.byte_span(),
-            })
-            .copied()
+        let raw = path.as_ref();
+        let by_span = match self.block_nodes_by_path_span.get(raw) {
+            Some(by_span) => by_span,
+            None => {
+                let normalized = RepoPath::new(raw).ok()?;
+                self.block_nodes_by_path_span.get(&normalized)?
+            }
+        };
+        by_span
+            .get(&block.byte_span())?
+            .find(&self.nodes, &block.hash)
     }
     fn block_has_child_blocks(&self, id: TreeNodeId) -> bool {
         self.node(id)
@@ -233,7 +277,7 @@ impl Tree {
             kind: TreeNodeKind::Block,
             name: block_label(&block),
             path: path.clone(),
-            hash: hash.clone(),
+            hash,
             children: Vec::new(),
             block: Some(block),
             language: Some(language),
@@ -241,17 +285,12 @@ impl Tree {
         });
         self.nodes[parent.0].children.push(id);
 
-        let previous = self
-            .block_nodes_by_path_key
-            .entry(path.clone())
-            .or_default()
-            .insert(BlockLookupKey { hash, byte_span }, id);
-        assert!(
-            previous.is_none(),
-            "duplicate block lookup key: path={path}, hash={}, start_byte={}, end_byte={}",
-            self.nodes[id.0].hash,
-            byte_span.start_byte,
-            byte_span.end_byte,
+        insert_span_block_node(
+            &mut self.block_nodes_by_path_span,
+            &self.nodes,
+            path,
+            byte_span,
+            id,
         );
 
         id
@@ -468,19 +507,15 @@ impl TreeBuilder {
     }
 
     pub fn finalize(mut self) -> Tree {
-        let root_children = self
-            .children_by_id
-            .get(&self.root)
-            .cloned()
-            .unwrap_or_default();
+        let root_children = self.children_by_id.remove(&self.root).unwrap_or_default();
         self.attach_children(self.root, root_children);
         self.compute_hashes(self.root);
-        let block_nodes_by_path_key = build_block_lookup_indexes(&self.nodes);
+        let block_nodes_by_path_span = build_block_lookup_indexes(&self.nodes);
         Tree {
             nodes: self.nodes,
             root: self.root,
             nodes_by_path: self.nodes_by_path,
-            block_nodes_by_path_key,
+            block_nodes_by_path_span,
         }
     }
 
@@ -498,50 +533,50 @@ impl TreeBuilder {
                         .cmp(&b_node.kind.sort_key(&b_node.name))
                 });
             }
-            if let Some(node) = self.nodes.get_mut(current.0) {
-                node.children = children.clone();
+            for &child in children.iter().rev() {
+                if let Some(grand_children) = self.children_by_id.remove(&child) {
+                    stack.push((child, grand_children));
+                }
             }
-            stack.extend(children.into_iter().rev().map(|child| {
-                let grand_children = self.children_by_id.get(&child).cloned().unwrap_or_default();
-                (child, grand_children)
-            }));
+            if let Some(node) = self.nodes.get_mut(current.0) {
+                node.children = children;
+            }
         }
     }
 
     fn compute_hashes(&mut self, id: TreeNodeId) {
         let mut stack = vec![(id, false)];
+        let mut concatenated = String::new();
         while let Some((current, visited)) = stack.pop() {
-            if !visited {
-                stack.push((current, true));
-                let children = self.nodes[current.0].children.clone();
-                stack.extend(children.into_iter().rev().map(|child| (child, false)));
-                continue;
-            }
-
-            let children = self.nodes[current.0].children.clone();
             let kind = self.nodes[current.0].kind;
             if matches!(kind, TreeNodeKind::Block | TreeNodeKind::File) {
                 continue;
             }
-
-            let mut entries: Vec<(String, TreeHash)> = children
-                .iter()
-                .filter_map(|child| {
-                    let node = &self.nodes[child.0];
-                    if !node.kind.is_hash_entry() {
-                        return None;
+            if !visited {
+                stack.push((current, true));
+                let children = &self.nodes[current.0].children;
+                for &child in children.iter().rev() {
+                    if !matches!(
+                        self.nodes[child.0].kind,
+                        TreeNodeKind::Block | TreeNodeKind::File
+                    ) {
+                        stack.push((child, false));
                     }
-                    let entry_name = format!("{}:{}", node.kind.entry_prefix(), node.name);
-                    Some((entry_name, node.hash.clone()))
-                })
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+                continue;
+            }
 
-            let mut concatenated = String::new();
-            for (name, hash) in entries {
-                concatenated.push_str(&name);
+            concatenated.clear();
+            for &child in &self.nodes[current.0].children {
+                let node = &self.nodes[child.0];
+                if !node.kind.is_hash_entry() {
+                    continue;
+                }
+                concatenated.push_str(node.kind.entry_prefix());
                 concatenated.push(':');
-                concatenated.push_str(hash.as_str());
+                concatenated.push_str(&node.name);
+                concatenated.push(':');
+                concatenated.push_str(node.hash.as_str());
                 concatenated.push('|');
             }
             self.nodes[current.0].hash = TreeHash::new(hash_str(&concatenated));
@@ -549,10 +584,35 @@ impl TreeBuilder {
     }
 }
 
+fn insert_span_block_node(
+    by_path_span: &mut HashMap<RepoPath, HashMap<ByteSpan, SpanBlockNodes>>,
+    nodes: &[TreeNode],
+    path: &RepoPath,
+    byte_span: ByteSpan,
+    id: TreeNodeId,
+) {
+    let by_span = match by_path_span.get_mut(path.as_str()) {
+        Some(by_span) => by_span,
+        None => by_path_span.entry(path.clone()).or_default(),
+    };
+    let inserted = match by_span.get_mut(&byte_span) {
+        Some(existing) => existing.insert(nodes, id),
+        None => {
+            by_span.insert(byte_span, SpanBlockNodes::One(id));
+            true
+        }
+    };
+    assert!(
+        inserted,
+        "duplicate block lookup key: path={path}, hash={}, start_byte={}, end_byte={}",
+        nodes[id.0].hash, byte_span.start_byte, byte_span.end_byte,
+    );
+}
+
 fn build_block_lookup_indexes(
     nodes: &[TreeNode],
-) -> HashMap<RepoPath, HashMap<BlockLookupKey, TreeNodeId>> {
-    let mut by_path_key = HashMap::new();
+) -> HashMap<RepoPath, HashMap<ByteSpan, SpanBlockNodes>> {
+    let mut by_path_span = HashMap::new();
 
     for node in nodes {
         if !matches!(node.kind, TreeNodeKind::Block) {
@@ -562,28 +622,16 @@ fn build_block_lookup_indexes(
         let Some(block) = node.block.as_ref() else {
             continue;
         };
-        let byte_span = block.byte_span();
-        let previous = by_path_key
-            .entry(node.path.clone())
-            .or_insert_with(HashMap::new)
-            .insert(
-                BlockLookupKey {
-                    hash: node.hash.clone(),
-                    byte_span,
-                },
-                node.id,
-            );
-        assert!(
-            previous.is_none(),
-            "duplicate block lookup key: path={}, hash={}, start_byte={}, end_byte={}",
-            node.path,
-            node.hash,
-            byte_span.start_byte,
-            byte_span.end_byte,
+        insert_span_block_node(
+            &mut by_path_span,
+            nodes,
+            &node.path,
+            block.byte_span(),
+            node.id,
         );
     }
 
-    by_path_key
+    by_path_span
 }
 
 fn block_label(block: &Block) -> String {
@@ -593,66 +641,81 @@ fn block_label(block: &Block) -> String {
 }
 
 pub fn build_tree_from_files(files: &[FileState]) -> Tree {
+    build_tree_from_files_owned(files.to_vec()).0
+}
+
+pub fn build_tree_from_files_owned(files: Vec<FileState>) -> (Tree, Vec<IndexedTreeFile>) {
     let mut builder = TreeBuilder::new();
     let root = builder.root();
-    let mut directories: BTreeMap<RepoPath, TreeNodeId> = BTreeMap::new();
+    let mut directories: HashMap<RepoPath, TreeNodeId> = HashMap::new();
     directories.insert(RepoPath::root(), root);
+    let mut indexed_files = Vec::with_capacity(files.len());
+    let mut container_stack: Vec<(TreeNodeId, ByteSpan)> = Vec::new();
 
     for file in files {
-        let parts: Vec<&str> = file.path.as_str().split('/').collect();
-        let mut current_path = RepoPath::root();
+        let raw_path = file.path.as_str();
         let mut parent = root;
+        let mut segment_start = 0;
 
-        for (index, part) in parts.iter().enumerate() {
-            let is_file = index == parts.len().saturating_sub(1);
-            let next_path = match current_path.join(part) {
-                Ok(path) => path,
-                Err(error) => panic!("valid tree path segment expected: {error}"),
-            };
-
-            if is_file {
-                let file_id = builder.add_file(
-                    parent,
-                    part.to_string(),
-                    next_path.clone(),
-                    file.tree_hash.clone(),
-                    file.language,
-                );
-                let mut container_stack: Vec<(TreeNodeId, ByteSpan)> = Vec::new();
-                for block in file.blocks.clone() {
-                    let byte_span = block.byte_span();
-                    while let Some((_, container_span)) = container_stack.last() {
-                        if byte_span.start_byte >= container_span.end_byte
-                            || !container_span.properly_contains(&byte_span)
-                        {
-                            container_stack.pop();
-                        } else {
-                            break;
-                        }
-                    }
-
-                    let parent = container_stack.last().map(|(id, _)| *id).unwrap_or(file_id);
-
-                    let kind = block.kind;
-                    let name = block_label(&block);
-                    let node_id =
-                        builder.add_block(parent, name, next_path.clone(), block, file.language);
-
-                    if kind.can_contain_review_children() {
-                        container_stack.push((node_id, byte_span));
-                    }
+        for (slash_idx, _) in raw_path.match_indices('/') {
+            let dir_prefix = &raw_path[..slash_idx];
+            let part = &raw_path[segment_start..slash_idx];
+            let dir_id = match directories.get(dir_prefix) {
+                Some(&dir_id) => dir_id,
+                None => {
+                    let dir_path = RepoPath::new(dir_prefix).unwrap_or_else(|error| {
+                        panic!("valid tree path segment expected: {error}")
+                    });
+                    let id = builder.add_dir(parent, part.to_string(), dir_path.clone());
+                    directories.insert(dir_path, id);
+                    id
                 }
-            } else {
-                let dir_id = directories.entry(next_path.clone()).or_insert_with(|| {
-                    builder.add_dir(parent, part.to_string(), next_path.clone())
-                });
-                parent = *dir_id;
-                current_path = next_path;
+            };
+            parent = dir_id;
+            segment_start = slash_idx + 1;
+        }
+
+        let file_name = raw_path[segment_start..].to_string();
+        let file_id = builder.add_file(
+            parent,
+            file_name,
+            file.path.clone(),
+            file.tree_hash,
+            file.language,
+        );
+        container_stack.clear();
+        let mut block_nodes = Vec::with_capacity(file.blocks.len());
+        for block in file.blocks {
+            let byte_span = block.byte_span();
+            while let Some((_, container_span)) = container_stack.last() {
+                if byte_span.start_byte >= container_span.end_byte
+                    || !container_span.properly_contains(&byte_span)
+                {
+                    container_stack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            let block_parent = container_stack.last().map_or(file_id, |(id, _)| *id);
+            let kind = block.kind;
+            let name = block_label(&block);
+            let node_id =
+                builder.add_block(block_parent, name, file.path.clone(), block, file.language);
+            block_nodes.push(node_id);
+
+            if kind.can_contain_review_children() {
+                container_stack.push((node_id, byte_span));
             }
         }
+        indexed_files.push(IndexedTreeFile {
+            path: file.path,
+            language: file.language,
+            block_nodes,
+        });
     }
 
-    builder.finalize()
+    (builder.finalize(), indexed_files)
 }
 
 #[cfg(test)]

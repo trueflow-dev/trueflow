@@ -1,10 +1,11 @@
 use crate::analysis::Language;
 use crate::block::{Block, ByteSpan};
 use crate::repo_path::RepoPath;
+use crate::review_units::ReviewUnitSpan;
 use crate::store::{
     Identity, Record, ReviewCheck, ReviewDatabase, ReviewTargetRef, ReviewedBlockChange, Verdict,
 };
-use crate::sub_splitter::{self, SubSplitSemantics};
+use crate::sub_splitter;
 use crate::tree::{Tree, TreeNode, TreeNodeId, TreeNodeKind};
 use anyhow::Context;
 use serde::Serialize;
@@ -136,12 +137,13 @@ pub struct CoverageIndex<'a> {
     record_bindings: HashMap<String, RecordBinding>,
     /// Byte spans of the block units that have direct records, per path and change.
     recorded_block_spans_by_path: HashMap<(RepoPath, ReviewedBlockChange), Vec<ByteSpan>>,
-    review_units: HashMap<TreeNodeId, Vec<Block>>,
+    review_units: HashMap<TreeNodeId, Box<[ReviewUnitSpan]>>,
 }
 
 impl<'a> CoverageIndex<'a> {
     pub fn build(tree: &'a Tree, database: &'a ReviewDatabase) -> anyhow::Result<Self> {
-        let mut lookups = CoverageLookups::from_tree(tree);
+        let referenced = ReferencedTargets::from_records(database.records());
+        let mut lookups = CoverageLookups::from_tree(tree, &referenced);
         let mut coverage = Self {
             tree,
             database,
@@ -208,6 +210,7 @@ impl<'a> CoverageIndex<'a> {
                     path,
                     record.line_hint,
                     record.reviewed_block_change(),
+                    &referenced,
                     &mut expanded_blocks,
                 );
             }
@@ -297,7 +300,18 @@ impl<'a> CoverageIndex<'a> {
         block: &Block,
         change: ReviewedBlockChange,
     ) -> bool {
-        let block_span = block.byte_span();
+        self.has_block_records_within_span(path, block.byte_span(), change)
+    }
+
+    pub fn has_block_records_within_span(
+        &self,
+        path: &RepoPath,
+        block_span: ByteSpan,
+        change: ReviewedBlockChange,
+    ) -> bool {
+        if self.recorded_block_spans_by_path.is_empty() {
+            return false;
+        }
         self.recorded_block_spans_by_path
             .get(&(path.clone(), change))
             .is_some_and(|spans| {
@@ -343,11 +357,14 @@ impl<'a> CoverageIndex<'a> {
         let container_node_id = resolved_node_id
             .or_else(|| self.smallest_covering_block_node(path, block, change))
             .or_else(|| self.tree.find_by_path(path.as_str()));
-        let locator = CoverageBlockLocator::new(path, block, change);
-        let facts = self
-            .block_units
-            .get(&locator)
-            .and_then(|unit_id| self.unit_facts.get(unit_id));
+        let facts = if self.unit_facts.is_empty() {
+            None
+        } else {
+            let locator = CoverageBlockLocator::new(path, block, change);
+            self.block_units
+                .get(&locator)
+                .and_then(|unit_id| self.unit_facts.get(unit_id))
+        };
 
         BlockCoverage {
             index: self,
@@ -363,6 +380,34 @@ impl<'a> CoverageIndex<'a> {
         }
     }
 
+    pub fn direct_latest_for_span(
+        &'a self,
+        path: &RepoPath,
+        hash: &crate::store::TreeHash,
+        byte_span: ByteSpan,
+        change: ReviewedBlockChange,
+        check: &ReviewCheck,
+    ) -> Option<LatestVerdict<'a>> {
+        if self.unit_facts.is_empty() {
+            return None;
+        }
+        let locator = CoverageBlockLocator {
+            path: path.clone(),
+            hash: hash.clone(),
+            byte_span,
+            change,
+        };
+        let unit_id = self.block_units.get(&locator)?;
+        let record_indices = self.direct_record_indices_for_unit(unit_id);
+        let record_index = preferred_record_index_for_check(
+            self.database.records(),
+            record_indices,
+            check,
+            |record_index| self.binding_relation_for_record_index(record_index),
+        )?;
+        Some(LatestVerdict::of(self.database.records(), record_index))
+    }
+
     /// The review units that indexing cut from tree block `node_id`, if that
     /// node holds exactly `block` in `language` and split into review units.
     /// Units depend only on the parent's language, kind, span, and exact
@@ -373,7 +418,7 @@ impl<'a> CoverageIndex<'a> {
         node_id: TreeNodeId,
         block: &Block,
         language: Language,
-    ) -> Option<&[Block]> {
+    ) -> Option<&[ReviewUnitSpan]> {
         let node = self.tree.node(node_id);
         let indexed = node.block.as_ref()?;
         let same_block = node.language == Some(language)
@@ -383,7 +428,7 @@ impl<'a> CoverageIndex<'a> {
         if !same_block {
             return None;
         }
-        self.review_units.get(&node_id).map(Vec::as_slice)
+        self.review_units.get(&node_id).map(Box::as_ref)
     }
 
     /// `node_id` and the nodes enclosing it, nearest first, whose reviews cover the same change:
@@ -394,9 +439,7 @@ impl<'a> CoverageIndex<'a> {
         node_id: TreeNodeId,
         change: ReviewedBlockChange,
     ) -> impl Iterator<Item = TreeNodeId> + '_ {
-        self.tree
-            .ancestors(node_id)
-            .into_iter()
+        std::iter::successors(Some(node_id), move |&id| self.tree.parent(id))
             .take_while(move |ancestor_id| self.tree.node(*ancestor_id).change == change)
     }
 
@@ -411,26 +454,24 @@ impl<'a> CoverageIndex<'a> {
         self.tree.is_container_block(node_id)
     }
 
-    fn direct_record_indices_for_node(&self, node_id: TreeNodeId) -> Vec<usize> {
+    fn direct_record_indices_for_node(&self, node_id: TreeNodeId) -> &[usize] {
         self.direct_record_indices_for_unit(&CoverageUnitId::Node(node_id))
     }
 
-    fn linked_record_indices_for_node(&self, node_id: TreeNodeId) -> Vec<usize> {
+    fn linked_record_indices_for_node(&self, node_id: TreeNodeId) -> &[usize] {
         self.linked_record_indices_for_unit(&CoverageUnitId::Node(node_id))
     }
 
-    fn direct_record_indices_for_unit(&self, unit_id: &CoverageUnitId) -> Vec<usize> {
+    fn direct_record_indices_for_unit(&self, unit_id: &CoverageUnitId) -> &[usize] {
         self.unit_facts
             .get(unit_id)
-            .map(|facts| facts.direct_record_indices.clone())
-            .unwrap_or_default()
+            .map_or(&[], |facts| facts.direct_record_indices.as_slice())
     }
 
-    fn linked_record_indices_for_unit(&self, unit_id: &CoverageUnitId) -> Vec<usize> {
+    fn linked_record_indices_for_unit(&self, unit_id: &CoverageUnitId) -> &[usize] {
         self.unit_facts
             .get(unit_id)
-            .map(|facts| facts.linked_record_indices.clone())
-            .unwrap_or_default()
+            .map_or(&[], |facts| facts.linked_record_indices.as_slice())
     }
 
     fn latest_record_index_for_node(
@@ -440,7 +481,7 @@ impl<'a> CoverageIndex<'a> {
     ) -> Option<usize> {
         preferred_record_index_for_check(
             self.database.records(),
-            &self.direct_record_indices_for_node(node_id),
+            self.direct_record_indices_for_node(node_id),
             check,
             |record_index| self.binding_relation_for_record_index(record_index),
         )
@@ -488,22 +529,22 @@ pub struct NodeCoverage<'a> {
 impl<'a> NodeCoverage<'a> {
     pub fn linked_records(&self) -> Vec<&'a Record> {
         self.linked_record_indices_for_node(self.node_id)
-            .into_iter()
-            .map(|index| &self.index.database.records()[index])
+            .iter()
+            .map(|&index| &self.index.database.records()[index])
             .collect()
     }
 
     pub fn direct_records(&self) -> Vec<&'a Record> {
         self.record_indices_for_node(self.node_id)
-            .into_iter()
-            .map(|index| &self.index.database.records()[index])
+            .iter()
+            .map(|&index| &self.index.database.records()[index])
             .collect()
     }
 
     pub fn effective_records(&self) -> Vec<&'a Record> {
         let mut record_indices = Vec::new();
         for ancestor_id in self.enclosing_units() {
-            record_indices.extend(self.record_indices_for_node(ancestor_id));
+            record_indices.extend_from_slice(self.record_indices_for_node(ancestor_id));
         }
         sort_record_indices(record_indices, self.index.database.records())
             .into_iter()
@@ -511,14 +552,27 @@ impl<'a> NodeCoverage<'a> {
             .collect()
     }
 
-    pub fn direct_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
+    pub fn direct_latest_for(&self, check: &ReviewCheck) -> Option<LatestVerdict<'a>> {
+        if self.index.unit_facts.is_empty() {
+            return None;
+        }
         let record_index = self
             .index
             .latest_record_index_for_node(self.node_id, check)?;
-        Some(&self.index.database.records()[record_index].verdict)
+        Some(LatestVerdict::of(
+            self.index.database.records(),
+            record_index,
+        ))
+    }
+
+    pub fn direct_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
+        self.direct_latest_for(check).map(|latest| latest.verdict)
     }
 
     pub fn effective_latest_verdict_for(&self, check: &ReviewCheck) -> Option<&'a Verdict> {
+        if self.index.unit_facts.is_empty() {
+            return None;
+        }
         let records = self.index.database.records();
         let record_index = effective_record_index(
             records,
@@ -567,8 +621,8 @@ impl<'a> NodeCoverage<'a> {
         distinct_identity_count_matching(
             self.index
                 .direct_record_indices_for_node(self.node_id)
-                .into_iter()
-                .map(|index| &self.index.database.records()[index]),
+                .iter()
+                .map(|&index| &self.index.database.records()[index]),
             check,
             verdict_requirement,
         )
@@ -606,11 +660,11 @@ impl<'a> NodeCoverage<'a> {
         })
     }
 
-    fn record_indices_for_node(&self, node_id: TreeNodeId) -> Vec<usize> {
+    fn record_indices_for_node(&self, node_id: TreeNodeId) -> &'a [usize] {
         self.index.direct_record_indices_for_node(node_id)
     }
 
-    fn linked_record_indices_for_node(&self, node_id: TreeNodeId) -> Vec<usize> {
+    fn linked_record_indices_for_node(&self, node_id: TreeNodeId) -> &'a [usize] {
         self.index.linked_record_indices_for_node(node_id)
     }
 }
@@ -646,7 +700,8 @@ impl<'a> BlockCoverage<'a> {
     pub fn effective_records(&self) -> Vec<&'a Record> {
         let mut record_indices = self.direct_record_indices.clone();
         for ancestor_id in self.enclosing_units(self.resolved_node_id.or(self.container_node_id)) {
-            record_indices.extend(self.index.direct_record_indices_for_node(ancestor_id));
+            record_indices
+                .extend_from_slice(self.index.direct_record_indices_for_node(ancestor_id));
         }
 
         unique_sorted_record_indices(record_indices, self.index.database.records())
@@ -855,6 +910,53 @@ type BlockExactKey = (ReviewedBlockChange, RepoPath, crate::store::TreeHash, u32
 type BlockPathHashKey = (ReviewedBlockChange, RepoPath, crate::store::TreeHash);
 type BlockHashKey = (ReviewedBlockChange, crate::store::TreeHash);
 
+struct ReferencedTargets<'a> {
+    block_hashes: HashSet<&'a crate::store::TreeHash>,
+    block_paths: HashSet<&'a RepoPath>,
+    has_hash_only_block_records: bool,
+    file_hashes: HashSet<&'a crate::store::TreeHash>,
+    tree_hashes: HashSet<&'a crate::store::TreeHash>,
+}
+
+impl<'a> ReferencedTargets<'a> {
+    fn from_records(records: &'a [Record]) -> Self {
+        let mut referenced = Self {
+            block_hashes: HashSet::new(),
+            block_paths: HashSet::new(),
+            has_hash_only_block_records: false,
+            file_hashes: HashSet::new(),
+            tree_hashes: HashSet::new(),
+        };
+        for record in records {
+            match &record.target {
+                ReviewTargetRef::Block { hash } => {
+                    referenced.block_hashes.insert(hash);
+                    match &record.path_hint {
+                        Some(path) => {
+                            referenced.block_paths.insert(path);
+                        }
+                        None => {
+                            referenced.has_hash_only_block_records = true;
+                        }
+                    }
+                }
+                ReviewTargetRef::File { hash } => {
+                    referenced.file_hashes.insert(hash);
+                }
+                ReviewTargetRef::Tree { hash } => {
+                    referenced.tree_hashes.insert(hash);
+                }
+                ReviewTargetRef::Declaration { .. } => {}
+            }
+        }
+        referenced
+    }
+
+    fn may_match_block_in_path(&self, path: &RepoPath) -> bool {
+        self.has_hash_only_block_records || self.block_paths.contains(path)
+    }
+}
+
 #[derive(Debug, Default)]
 struct CoverageLookups<'a> {
     block_units: HashMap<CoverageBlockLocator, CoverageUnitId>,
@@ -868,11 +970,11 @@ struct CoverageLookups<'a> {
     tree_by_hash: HashMap<crate::store::TreeHash, Vec<CoverageUnitId>>,
     candidate_descriptions: HashMap<CoverageUnitId, CoverageCandidate>,
     /// Review units cut from each tree block, kept for review to reuse.
-    review_units: HashMap<TreeNodeId, Vec<Block>>,
+    review_units: HashMap<TreeNodeId, Box<[ReviewUnitSpan]>>,
 }
 
 impl<'a> CoverageLookups<'a> {
-    fn from_tree(tree: &'a Tree) -> Self {
+    fn from_tree(tree: &'a Tree, referenced: &ReferencedTargets<'_>) -> Self {
         let mut lookups = Self::default();
 
         for node in tree.nodes() {
@@ -885,49 +987,58 @@ impl<'a> CoverageLookups<'a> {
                         .entry(&node.path)
                         .or_default()
                         .push(node);
-                    lookups.register_tree_block(node);
+                    if referenced.block_hashes.contains(&node.hash)
+                        && referenced.may_match_block_in_path(&node.path)
+                    {
+                        lookups.register_tree_block(node);
+                    }
                 }
                 TreeNodeKind::File => {
-                    let unit_id = lookups.register_tree_node(node);
-                    push_lookup(
-                        &mut lookups.file_by_path_hash,
-                        (node.path.clone(), node.hash.clone()),
-                        unit_id.clone(),
-                    );
-                    push_lookup(&mut lookups.file_by_hash, node.hash.clone(), unit_id);
+                    if referenced.file_hashes.contains(&node.hash) {
+                        let unit_id = lookups.register_tree_node(node);
+                        push_lookup(
+                            &mut lookups.file_by_path_hash,
+                            (node.path.clone(), node.hash.clone()),
+                            unit_id.clone(),
+                        );
+                        push_lookup(&mut lookups.file_by_hash, node.hash.clone(), unit_id);
+                    }
                 }
                 TreeNodeKind::Root | TreeNodeKind::Directory => {
-                    let unit_id = lookups.register_tree_node(node);
-                    push_lookup(
-                        &mut lookups.tree_by_path_hash,
-                        (node.path.clone(), node.hash.clone()),
-                        unit_id.clone(),
-                    );
-                    push_lookup(&mut lookups.tree_by_hash, node.hash.clone(), unit_id);
+                    if referenced.tree_hashes.contains(&node.hash) {
+                        let unit_id = lookups.register_tree_node(node);
+                        push_lookup(
+                            &mut lookups.tree_by_path_hash,
+                            (node.path.clone(), node.hash.clone()),
+                            unit_id.clone(),
+                        );
+                        push_lookup(&mut lookups.tree_by_hash, node.hash.clone(), unit_id);
+                    }
                 }
             }
         }
 
-        for node in tree.nodes() {
-            let Some(block) = node.block.as_ref() else {
-                continue;
-            };
-            let Some(language) = node.language else {
-                continue;
-            };
-            if !sub_splitter::may_split_into_review_units(block, language) {
-                continue;
+        if !referenced.block_hashes.is_empty() {
+            for node in tree.nodes() {
+                if !referenced.may_match_block_in_path(&node.path) {
+                    continue;
+                }
+                let Some(block) = node.block.as_ref() else {
+                    continue;
+                };
+                let Some(language) = node.language else {
+                    continue;
+                };
+                let Some(units) = sub_splitter::review_unit_spans(block, language) else {
+                    continue;
+                };
+                for unit in &units {
+                    if referenced.block_hashes.contains(&unit.hash) {
+                        lookups.register_generated_span(&node.path, unit, node.change);
+                    }
+                }
+                lookups.review_units.insert(node.id, units);
             }
-            let Ok(split) = sub_splitter::split_result(block, language) else {
-                continue;
-            };
-            if split.semantics != SubSplitSemantics::ReviewUnits {
-                continue;
-            }
-            for generated_block in &split.blocks {
-                lookups.register_generated_block(node.path.clone(), generated_block, node.change);
-            }
-            lookups.review_units.insert(node.id, split.blocks);
         }
 
         lookups
@@ -949,16 +1060,52 @@ impl<'a> CoverageLookups<'a> {
         let Some(block) = node.block.as_ref() else {
             return;
         };
-        self.register_block_candidate(node.path.clone(), block, node.change, Some(node.id));
+        self.register_block_span_candidate(
+            &node.path,
+            &block.hash,
+            block.start_line,
+            block.end_line,
+            block.start_byte,
+            block.end_byte,
+            node.change,
+            Some(node.id),
+        );
     }
 
     fn register_generated_block(
         &mut self,
-        path: RepoPath,
+        path: &RepoPath,
         block: &Block,
         change: ReviewedBlockChange,
     ) {
-        self.register_block_candidate(path, block, change, None);
+        self.register_block_span_candidate(
+            path,
+            &block.hash,
+            block.start_line,
+            block.end_line,
+            block.start_byte,
+            block.end_byte,
+            change,
+            None,
+        );
+    }
+
+    fn register_generated_span(
+        &mut self,
+        path: &RepoPath,
+        span: &ReviewUnitSpan,
+        change: ReviewedBlockChange,
+    ) {
+        self.register_block_span_candidate(
+            path,
+            &span.hash,
+            span.start_line,
+            span.end_line,
+            span.start_byte,
+            span.end_byte,
+            change,
+            None,
+        );
     }
 
     /// The change a unit's review covers.
@@ -979,6 +1126,7 @@ impl<'a> CoverageLookups<'a> {
         path: &RepoPath,
         line: Option<u32>,
         change: ReviewedBlockChange,
+        referenced: &ReferencedTargets<'_>,
         expanded_blocks: &mut HashSet<CoverageBlockLocator>,
     ) {
         let mut pending = self
@@ -998,7 +1146,9 @@ impl<'a> CoverageLookups<'a> {
                 continue;
             };
             for child in split.blocks {
-                self.register_generated_block(path.clone(), &child, change);
+                if referenced.block_hashes.contains(&child.hash) {
+                    self.register_generated_block(path, &child, change);
+                }
                 if block_contains_line(&child, line) {
                     pending.push((child, language));
                 }
@@ -1006,14 +1156,24 @@ impl<'a> CoverageLookups<'a> {
         }
     }
 
-    fn register_block_candidate(
+    #[allow(clippy::too_many_arguments)]
+    fn register_block_span_candidate(
         &mut self,
-        path: RepoPath,
-        block: &Block,
+        path: &RepoPath,
+        hash: &crate::store::TreeHash,
+        start_line: usize,
+        end_line: usize,
+        start_byte: usize,
+        end_byte: usize,
         change: ReviewedBlockChange,
         tree_node_id: Option<TreeNodeId>,
     ) {
-        let locator = CoverageBlockLocator::new(&path, block, change);
+        let locator = CoverageBlockLocator {
+            path: path.clone(),
+            hash: hash.clone(),
+            byte_span: ByteSpan::new(start_byte, end_byte),
+            change,
+        };
         if self.block_units.contains_key(&locator) {
             return;
         }
@@ -1027,31 +1187,27 @@ impl<'a> CoverageLookups<'a> {
             unit_id.clone(),
             CoverageCandidate::Block {
                 path: path.clone(),
-                hash: block.hash.clone(),
-                start_line: block.start_line,
-                end_line: block.end_line,
-                start_byte: block.start_byte,
-                end_byte: block.end_byte,
+                hash: hash.clone(),
+                start_line,
+                end_line,
+                start_byte,
+                end_byte,
             },
         );
 
-        if let Ok(start_line) = u32::try_from(block.start_line) {
+        if let Ok(start_line) = u32::try_from(start_line) {
             push_lookup(
                 &mut self.block_exact,
-                (change, path.clone(), block.hash.clone(), start_line),
+                (change, path.clone(), hash.clone(), start_line),
                 unit_id.clone(),
             );
         }
         push_lookup(
             &mut self.block_by_path_hash,
-            (change, path, block.hash.clone()),
+            (change, path.clone(), hash.clone()),
             unit_id.clone(),
         );
-        push_lookup(
-            &mut self.block_by_hash,
-            (change, block.hash.clone()),
-            unit_id,
-        );
+        push_lookup(&mut self.block_by_hash, (change, hash.clone()), unit_id);
     }
 
     /// Binds a block record before child-navigation units exist. A record

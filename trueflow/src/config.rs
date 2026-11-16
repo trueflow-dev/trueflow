@@ -858,6 +858,10 @@ impl BlockFilters {
     pub fn only_contains(&self, kind: BlockKind) -> bool {
         self.only.as_ref().is_some_and(|only| only.contains(&kind))
     }
+
+    pub fn has_explicit_excludes(&self) -> bool {
+        !self.exclude.is_empty()
+    }
 }
 
 pub fn load() -> Result<TrueflowConfig> {
