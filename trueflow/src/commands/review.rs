@@ -308,6 +308,12 @@ pub fn resolve_review_request(
 }
 
 pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
+    collect_review_with_database(query).map(|(collected, _)| collected)
+}
+
+pub(crate) fn collect_review_with_database(
+    query: &ResolvedReviewQuery,
+) -> Result<(CollectedReview, crate::store::ReviewDatabase)> {
     info!(
         "review collect (content_source={:?}, path_selection={:?}, diff_selection={:?})",
         query.content_source, query.path_selection, query.diff_selection
@@ -325,7 +331,7 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
     let review_check = ReviewCheck::review();
 
     if matches!(query.path_selection, ReviewPathSelection::Empty) {
-        return Ok(empty_collected_review());
+        return Ok((empty_collected_review(), database));
     }
 
     let load_scope = review_load_scope(&query.path_selection);
@@ -394,7 +400,8 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
             diff_targets,
             review_check: &review_check,
         };
-        return collect_diff_scoped_review(query, &diff_context, files, diagnostics);
+        let collected = collect_diff_scoped_review(query, &diff_context, files, diagnostics)?;
+        return Ok((collected, database));
     }
 
     let (tree, indexed_files) = tree::build_tree_from_files_owned(files);
@@ -478,20 +485,23 @@ pub fn collect_review(query: &ResolvedReviewQuery) -> Result<CollectedReview> {
 
     sort_unreviewed_files(&mut unreviewed_files);
 
-    Ok(CollectedReview {
-        diff_selection: query.diff_selection.clone(),
-        summary: ReviewSummary {
-            files: unreviewed_files,
-            total_blocks,
-            diagnostics,
+    Ok((
+        CollectedReview {
+            diff_selection: query.diff_selection.clone(),
+            summary: ReviewSummary {
+                files: unreviewed_files,
+                total_blocks,
+                diagnostics,
+            },
+            tree,
+            unreviewed_block_nodes,
+            commented_block_nodes,
+            diff_block_sides: HashMap::new(),
+            file_change_kinds: HashMap::new(),
+            block_change_kinds: HashMap::new(),
         },
-        tree,
-        unreviewed_block_nodes,
-        commented_block_nodes,
-        diff_block_sides: HashMap::new(),
-        file_change_kinds: HashMap::new(),
-        block_change_kinds: HashMap::new(),
-    })
+        database,
+    ))
 }
 
 fn collect_diff_scoped_review(
@@ -1896,9 +1906,11 @@ fn reserve_unique_positional_matches(
                     == vcs::BlockDiffChangeKind::ReviewableChanges
         })
         .collect::<Vec<_>>();
+    let mut sorted_hunks = hunks.iter().collect::<Vec<_>>();
+    sorted_hunks.sort_by_key(|hunk| (hunk.old_start, hunk.new_start));
     let mapped_base_ranges = base_blocks
         .iter()
-        .map(|block| mapped_head_range_for_base_block(block, hunks))
+        .map(|block| mapped_head_range_for_base_block(block, &sorted_hunks))
         .collect::<Vec<_>>();
 
     let base_choices = base_blocks
@@ -1983,30 +1995,29 @@ fn unique_best_overlap(overlaps: impl Iterator<Item = (usize, u32)>) -> Option<u
 }
 fn mapped_head_range_for_base_block(
     base_block: &Block,
-    hunks: &[vcs::DiffHunk],
+    sorted_hunks: &[&vcs::DiffHunk],
 ) -> std::ops::Range<u32> {
     let old_start = u32::try_from(base_block.start_line.saturating_add(1)).unwrap_or(u32::MAX);
     let old_end_inclusive = u32::try_from(base_block.end_line)
         .unwrap_or(u32::MAX)
         .max(old_start);
-    let start = map_base_line_to_head_anchor(old_start, hunks);
-    let end_anchor = map_base_line_to_head_anchor(old_end_inclusive, hunks);
+    let start = map_base_line_to_head_anchor(old_start, sorted_hunks);
+    let end_anchor = map_base_line_to_head_anchor(old_end_inclusive, sorted_hunks);
     start..end_anchor.saturating_add(1)
 }
 
-fn map_base_line_to_head_anchor(old_line: u32, hunks: &[vcs::DiffHunk]) -> u32 {
+fn map_base_line_to_head_anchor(old_line: u32, sorted_hunks: &[&vcs::DiffHunk]) -> u32 {
     let mut old_cursor = 1u32;
     let mut new_cursor = 1u32;
-    let mut sorted_hunks = hunks.iter().collect::<Vec<_>>();
-    sorted_hunks.sort_by_key(|hunk| (hunk.old_start, hunk.new_start));
 
     for hunk in sorted_hunks {
-        while old_cursor < hunk.old_start {
-            if old_line == old_cursor {
-                return new_cursor;
+        if old_cursor < hunk.old_start {
+            if old_line >= old_cursor && old_line < hunk.old_start {
+                return new_cursor.saturating_add(old_line - old_cursor);
             }
-            old_cursor = old_cursor.saturating_add(1);
-            new_cursor = new_cursor.saturating_add(1);
+            let gap = hunk.old_start - old_cursor;
+            old_cursor = hunk.old_start;
+            new_cursor = new_cursor.saturating_add(gap);
         }
 
         for line in &hunk.lines {
@@ -2078,22 +2089,30 @@ impl UnchangedLineIndex {
     fn overlap_for_blocks(&self, base: &Block, head: &Block) -> u32 {
         let base_range = block_line_range(base);
         let head_range = block_line_range(head);
-        self.segments
-            .iter()
-            .map(|segment| {
-                let base_overlap_start = base_range.start.max(segment.base_start);
-                let base_overlap_end = base_range.end.min(segment.base_end);
-                if base_overlap_start >= base_overlap_end {
-                    return 0;
-                }
+        let first = self
+            .segments
+            .partition_point(|segment| segment.base_end <= base_range.start);
+        let mut total = 0u32;
+        for segment in &self.segments[first..] {
+            if segment.base_start >= base_range.end {
+                break;
+            }
+            let base_overlap_start = base_range.start.max(segment.base_start);
+            let base_overlap_end = base_range.end.min(segment.base_end);
+            if base_overlap_start >= base_overlap_end {
+                continue;
+            }
 
-                let offset = base_overlap_start.saturating_sub(segment.base_start);
-                let mapped_head_start = segment.head_start.saturating_add(offset);
-                let mapped_head_end =
-                    mapped_head_start.saturating_add(base_overlap_end - base_overlap_start);
-                line_range_overlap(&(mapped_head_start..mapped_head_end), &head_range)
-            })
-            .sum()
+            let offset = base_overlap_start.saturating_sub(segment.base_start);
+            let mapped_head_start = segment.head_start.saturating_add(offset);
+            let mapped_head_end =
+                mapped_head_start.saturating_add(base_overlap_end - base_overlap_start);
+            total = total.saturating_add(line_range_overlap(
+                &(mapped_head_start..mapped_head_end),
+                &head_range,
+            ));
+        }
+        total
     }
 
     fn push_segment(&mut self, base_start: u32, base_end: u32, head_start: u32) {

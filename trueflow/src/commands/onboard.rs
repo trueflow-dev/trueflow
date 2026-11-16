@@ -148,6 +148,13 @@ pub fn run(context: &TrueflowContext, args: &OnboardArgs) -> Result<()> {
 }
 
 pub(crate) fn collect(config: &TrueflowConfig, read_only: bool) -> Result<review::CollectedReview> {
+    collect_with_database(config, read_only).map(|(collected, _)| collected)
+}
+
+pub(crate) fn collect_with_database(
+    config: &TrueflowConfig,
+    read_only: bool,
+) -> Result<(review::CollectedReview, crate::store::ReviewDatabase)> {
     let mut scan_options = config.scan.resolve_options();
     if read_only {
         scan_options.cache_mode = match scan_options.cache_mode {
@@ -160,5 +167,5 @@ pub(crate) fn collect(config: &TrueflowConfig, read_only: bool) -> Result<review
         config.review.resolve_filters(&[], &[]),
         scan_options,
     )?;
-    review::collect_review(&query)
+    review::collect_review_with_database(&query)
 }

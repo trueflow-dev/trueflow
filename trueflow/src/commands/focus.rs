@@ -88,13 +88,13 @@ pub fn run(context: &TrueflowContext, args: &FocusArgs) -> Result<()> {
         std::env::set_current_dir(root).context("failed to enter repository root for focus")?;
     }
     let config = crate::config::load()?;
-    let collected = onboard::collect(&config, true)?;
+    let (collected, database) = onboard::collect_with_database(&config, true)?;
     let scope = match (&loaded, &args.path) {
         (Some(plan), _) => plan.target_scope(),
         (None, Some(path)) => FocusScope::Under(path.clone()),
         (None, None) => FocusScope::Repository,
     };
-    let inventory = FocusInventory::capture(&collected, &scope)?;
+    let inventory = FocusInventory::capture_with_database(&collected, &scope, &database)?;
     if args.candidates {
         let page: Vec<_> = inventory
             .candidates
@@ -162,8 +162,10 @@ pub fn run(context: &TrueflowContext, args: &FocusArgs) -> Result<()> {
                 generator.generate_from_evidence(prompt, remaining)
             })?;
             drop(collected);
-            let fresh = onboard::collect(&config, true)?;
-            let fresh_inventory = FocusInventory::capture(&fresh, &scope)?;
+            drop(database);
+            let (fresh, fresh_database) = onboard::collect_with_database(&config, true)?;
+            let fresh_inventory =
+                FocusInventory::capture_with_database(&fresh, &scope, &fresh_database)?;
             ensure!(
                 fresh_inventory.snapshot_hash == inventory.snapshot_hash,
                 "source, review state or evidence changed during focus generation; regenerate the plan"

@@ -213,12 +213,13 @@ fn run_batch_with_signing_mode(
     }
     let store = FileStore::new()?;
 
-    let runtime_config = runtime_config_from_git_config(vcs::git_config_from_workdir().ok());
+    let repo_snapshot = vcs::snapshot_from_workdir();
+    let runtime_config =
+        runtime_config_from_git_config(repo_snapshot.repo().map(vcs::git_config_from_repo));
     let email = runtime_config.email;
     let identity = Identity::Email {
         email: email.clone(),
     };
-    let repo_snapshot = vcs::snapshot_from_workdir();
     let repo_ref = match repo_snapshot.repo_ref_revision.clone() {
         Some(revision) => RepoRef::Vcs {
             system: VcsSystem::Git,
@@ -226,10 +227,22 @@ fn run_batch_with_signing_mode(
         },
         None => RepoRef::Unknown,
     };
-    let mut records = batch
-        .into_iter()
-        .map(|params| build_mark_record(params, &identity, &repo_ref, &repo_snapshot))
-        .collect::<Result<Vec<_>>>()?;
+    let mut state_resolver = vcs::BatchBlockStateResolver::new(&repo_snapshot);
+    let workdir_prefix = state_resolver
+        .workdir_prefix()
+        .and_then(|prefix| RepoPath::new(prefix).ok());
+    let mut inferred_tree: Option<tree::Tree> = None;
+    let mut records = Vec::with_capacity(batch.len());
+    for params in batch {
+        records.push(build_mark_record(
+            params,
+            &identity,
+            &repo_ref,
+            &mut state_resolver,
+            workdir_prefix.as_ref(),
+            &mut inferred_tree,
+        )?);
+    }
 
     let signed_msg = match runtime_config.terminal_suspend_requirement {
         TerminalSuspendRequirement::Required => {
@@ -257,8 +270,8 @@ fn run_batch_with_signing_mode(
         TerminalSuspendRequirement::NotRequired => "",
     };
 
+    store.append_batch(&records)?;
     for record in &records {
-        store.append(record)?;
         info!(
             "Recorded verdict '{}' for {} by {email}{signed_msg}",
             record.verdict,
@@ -290,7 +303,9 @@ fn build_mark_record(
     params: MarkParams,
     identity: &Identity,
     repo_ref: &RepoRef,
-    repo_snapshot: &vcs::RepoSnapshot,
+    state_resolver: &mut vcs::BatchBlockStateResolver<'_>,
+    workdir_prefix: Option<&RepoPath>,
+    inferred_tree: &mut Option<tree::Tree>,
 ) -> Result<Record> {
     info!(
         "mark start (fingerprint={}, verdict={}, check={}, note_present={}, path={:?}, line={:?}, comment_scope={:?}, comment_context_present={}, comment_anchor_present={})",
@@ -318,20 +333,33 @@ fn build_mark_record(
         deletion,
     } = params;
 
-    let path_hint = path.as_ref().map(resolve_path_hint_from_workdir);
+    let path_hint = path.as_ref().map(|raw_path| match workdir_prefix {
+        Some(prefix) => raw_path.resolve_from_prefix(prefix),
+        None => raw_path.clone(),
+    });
     // A deletion's content is gone from the worktree, so only a block target can name it.
     let target_kind = match (target_kind, &deletion) {
         (Some(kind), _) => kind,
         (None, Some(_)) => ReviewTargetKind::Block,
-        (None, None) => infer_target_kind(&fingerprint, path_hint.as_ref(), line)?,
+        (None, None) => {
+            let tree = match inferred_tree {
+                Some(tree) => tree,
+                None => {
+                    let scan_options = load_config()?.scan.resolve_options();
+                    let scan_result = crate::scanner::scan_directory(".", &scan_options)?;
+                    inferred_tree.insert(tree::build_tree_from_files(&scan_result.files))
+                }
+            };
+            infer_target_kind_with_tree(tree, &fingerprint, path_hint.as_ref(), line)?
+        }
     };
     let target = target_kind.parse_target(&fingerprint)?;
-    let block_state: BlockState = vcs::block_state_for_path(
-        repo_snapshot,
-        path_hint.as_ref().map(RepoPath::as_str),
-        target.lookup_key(),
-    )
-    .into();
+    let block_state: BlockState = state_resolver
+        .block_state_for_path(
+            path_hint.as_ref().map(RepoPath::as_str),
+            target.lookup_key(),
+        )
+        .into();
 
     let mut record = Record::new(
         target,
@@ -352,25 +380,21 @@ fn build_mark_record(
     Ok(record)
 }
 
-fn infer_target_kind(
+fn infer_target_kind_with_tree(
+    tree: &tree::Tree,
     fingerprint: &str,
     path_hint: Option<&RepoPath>,
     line_hint: Option<u32>,
 ) -> Result<ReviewTargetKind> {
-    // Hashes must come from the same configured scan as `scan`/`review`.
-    let scan_options = load_config()?.scan.resolve_options();
-    let scan_result = crate::scanner::scan_directory(".", &scan_options)?;
-    let tree = tree::build_tree_from_files(&scan_result.files);
-
     if let Some(kind) =
-        infer_target_kind_from_tree_location(&tree, fingerprint, path_hint, line_hint)?
+        infer_target_kind_from_tree_location(tree, fingerprint, path_hint, line_hint)?
     {
         return Ok(kind);
     }
 
     // Unmatched hashes stay Block targets: deleted diff blocks and generated
     // review units are valid Block records absent from the current tree.
-    Ok(infer_target_kind_from_tree(&tree, fingerprint).unwrap_or(ReviewTargetKind::Block))
+    Ok(infer_target_kind_from_tree(tree, fingerprint).unwrap_or(ReviewTargetKind::Block))
 }
 
 fn infer_target_kind_from_tree_location(

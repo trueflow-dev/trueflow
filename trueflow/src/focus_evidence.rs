@@ -176,8 +176,16 @@ pub struct FocusInventory {
 impl FocusInventory {
     pub fn capture(review: &CollectedReview, scope: &FocusScope) -> Result<Self> {
         let database = FileStore::new()?.load_database()?;
+        Self::capture_with_database(review, scope, &database)
+    }
+
+    pub fn capture_with_database(
+        review: &CollectedReview,
+        scope: &FocusScope,
+        database: &ReviewDatabase,
+    ) -> Result<Self> {
         let repo = vcs::repo_from_workdir();
-        let mut inventory = capture_with(review, scope, &database, repo.as_ref().ok())?;
+        let mut inventory = capture_with(review, scope, database, repo.as_ref().ok())?;
         if let Err(error) = repo {
             inventory.diagnostics.push(FocusDiagnostic::new(
                 DiagnosticKind::GitHistory,
@@ -352,9 +360,9 @@ fn capture_with(
                 ),
             )?;
         }
-        let block_coverage = coverage.block_showing(&node.path, block, node.change);
-        let records = block_coverage.effective_records();
-        let latest = block_coverage.effective_latest_verdict_for(&ReviewCheck::review());
+        let node_coverage = coverage.node(id);
+        let records = node_coverage.effective_records();
+        let latest = node_coverage.effective_latest_verdict_for(&ReviewCheck::review());
         let records_pin = BytesHash::from_bytes(&serde_json::to_vec(&records)?).to_string();
         let mut review_detail = match latest {
             Some(verdict) => format!("Effective stored human review verdict: {verdict}. Records are review-store claims, not verified reviewer identity or test coverage."),
@@ -811,8 +819,11 @@ fn history(
                     "Git history available: {} recent first-parent commits inspected{window_end}; file-local patches, not current-block line attribution. No merge-side traversal, rename following, or full-history claim.",
                     commits.len(),
                 );
+                let mut history_bytes = 0usize;
                 for commit in commits {
-                    if let Err(error) = append_commit_history(repo, commit, paths, &mut result) {
+                    if let Err(error) =
+                        append_commit_history(repo, commit, paths, &mut result, &mut history_bytes)
+                    {
                         let message = format!(
                             "Git history unavailable in {}: {}",
                             commit.id,
@@ -820,21 +831,19 @@ fn history(
                         );
                         diagnostics
                             .push(FocusDiagnostic::new(DiagnosticKind::GitHistory, &message));
+                        let provenance = commit.id.to_string();
                         for observations in result.values_mut() {
+                            history_bytes =
+                                history_bytes.saturating_add(message.len() + provenance.len());
                             observations.push(Observation {
                                 kind: EvidenceKind::HistoryStatus,
                                 detail: message.clone(),
-                                provenance: commit.id.to_string(),
+                                provenance: provenance.clone(),
                             });
                         }
                     }
-                    let bytes: usize = result
-                        .values()
-                        .flatten()
-                        .map(|o| o.detail.len() + o.provenance.len())
-                        .sum();
                     ensure!(
-                        bytes <= MAX_INVENTORY_BYTES,
+                        history_bytes <= MAX_INVENTORY_BYTES,
                         "focus history exceeds {MAX_INVENTORY_BYTES} payload bytes; narrow the path scope"
                     );
                 }
@@ -877,6 +886,7 @@ fn append_commit_history(
     info: &vcs::CommitInfo,
     paths: &BTreeSet<RepoPath>,
     output: &mut BTreeMap<RepoPath, Vec<Observation>>,
+    history_bytes: &mut usize,
 ) -> Result<()> {
     let commit = repo
         .rev_parse_single(info.id.as_str())?
@@ -884,94 +894,128 @@ fn append_commit_history(
         .peel_to_commit()?;
     let head = commit.tree()?;
     let base = vcs::first_parent_tree(repo, &commit)?;
-    let changes = vcs::files_changed_in_revision_in_repo(repo, info.id.as_str())?;
-    let mut selected = Vec::new();
-    let mut pins = BTreeMap::new();
-    for change in changes {
-        if !paths.contains(&change.location) {
-            continue;
-        }
-        let source = &change.source_location;
-        let pin = (|| -> Result<String> {
-            Ok(format!(
-                "commit={} base_blob={} head_blob={} source={} destination={}",
-                info.id,
-                bounded_blob(&base, source)?,
-                bounded_blob(&head, &change.location)?,
-                source,
-                change.location
-            ))
-        })();
-        match pin {
-            Ok(pin) => {
-                pins.insert(change.location.clone(), pin);
-                selected.push(change.location);
+    let mut staged_observations = BTreeMap::new();
+    vcs::visit_selected_diffs_between_trees(
+        repo,
+        &base,
+        &head,
+        |change| {
+            if !paths.contains(&change.location) {
+                return Ok(None);
             }
-            Err(error) => {
-                if let Some(observations) = output.get_mut(&change.location) {
-                    observations.push(Observation {
-                        kind: EvidenceKind::HistoryStatus,
-                        detail: format!(
+            let source = &change.source_location;
+            let pin = (|| -> Result<String> {
+                Ok(format!(
+                    "commit={} base_blob={} head_blob={} source={} destination={}",
+                    info.id,
+                    bounded_blob(&base, source)?,
+                    bounded_blob(&head, &change.location)?,
+                    source,
+                    change.location
+                ))
+            })();
+            match pin {
+                Ok(pin) => Ok(Some(pin)),
+                Err(error) => {
+                    if let Some(observations) = output.get_mut(&change.location) {
+                        let detail = format!(
                             "Git patch unavailable in {}: {}",
                             info.id,
                             bounded(&error.to_string(), 512)
-                        ),
-                        provenance: info.id.to_string(),
-                    });
+                        );
+                        let provenance = info.id.to_string();
+                        *history_bytes =
+                            history_bytes.saturating_add(detail.len() + provenance.len());
+                        observations.push(Observation {
+                            kind: EvidenceKind::HistoryStatus,
+                            detail,
+                            provenance,
+                        });
+                    }
+                    Ok(None)
                 }
             }
-        }
-    }
-    selected.sort();
-    // Keep at most sixteen bounded file diffs live; noisy earlier paths cannot
-    // consume a first-N history quota and hide later candidates.
-    for batch in selected.chunks(16) {
-        let mut diffs = vcs::file_diffs_for_revision(repo, info.id.as_str(), batch)?;
-        for path in batch {
-            let diff = diffs.take(path);
-            let observations = output
-                .get_mut(path)
-                .context("selected history path missing")?;
-            let provenance = pins
-                .remove(path)
-                .context("selected history provenance missing")?;
-            match diff {
-            FileDiff::Text { hunks, .. } => {
-                let mut removed = String::new();
-                let mut added = String::new();
-                let mut patch = String::new();
-                let mut patch_truncated = false;
-                for hunk in &hunks {
-                    for line in &hunk.lines {
-                        let (prefix, normalized) = match line.kind {
-                            DiffLineKind::Added => ('+', &mut added),
-                            DiffLineKind::Removed => ('-', &mut removed),
-                            DiffLineKind::Context => continue,
-                        };
-                        normalized.push_str(line.text.trim_end());
-                        normalized.push('\n');
-                        let remaining = MAX_PATCH_BYTES.saturating_sub(patch.len());
-                        if remaining > 2 {
-                            patch.push(prefix);
-                            let text = bounded(&line.text, remaining - 2);
-                            patch.push_str(text);
-                            if !text.ends_with('\n') { patch.push('\n'); }
-                            patch_truncated |= text.len() != line.text.len();
-                        } else { patch_truncated = true; }
+        },
+        |change, provenance, diff| {
+            let path = change.location;
+            let observation = match diff {
+                FileDiff::Text { hunks, .. } => {
+                    let mut removed = String::new();
+                    let mut added = String::new();
+                    let mut patch = String::new();
+                    let mut patch_truncated = false;
+                    for hunk in &hunks {
+                        for line in &hunk.lines {
+                            let (prefix, normalized) = match line.kind {
+                                DiffLineKind::Added => ('+', &mut added),
+                                DiffLineKind::Removed => ('-', &mut removed),
+                                DiffLineKind::Context => continue,
+                            };
+                            normalized.push_str(line.text.trim_end());
+                            normalized.push('\n');
+                            let remaining = MAX_PATCH_BYTES.saturating_sub(patch.len());
+                            if remaining > 2 {
+                                patch.push(prefix);
+                                let text = bounded(&line.text, remaining - 2);
+                                patch.push_str(text);
+                                if !text.ends_with('\n') {
+                                    patch.push('\n');
+                                }
+                                patch_truncated |= text.len() != line.text.len();
+                            } else {
+                                patch_truncated = true;
+                            }
+                        }
+                    }
+                    let label = if removed == added {
+                        "mechanical trailing-whitespace-only change; discounted churn"
+                    } else {
+                        "substantive textual change; corrective intent is unverified, not inferred from the message"
+                    };
+                    Observation {
+                        kind: EvidenceKind::GitPatch,
+                        provenance,
+                        detail: format!(
+                            "Commit {} ({}) — {label}. File-local evidence for {path}; generated/vendor/test classification still applies.{} \n{patch}",
+                            info.id,
+                            bounded(&info.summary, 160),
+                            if patch_truncated {
+                                " Patch excerpt truncated."
+                            } else {
+                                ""
+                            }
+                        ),
                     }
                 }
-                let label = if removed == added { "mechanical trailing-whitespace-only change; discounted churn" }
-                    else { "substantive textual change; corrective intent is unverified, not inferred from the message" };
-                observations.push(Observation { kind: EvidenceKind::GitPatch, provenance,
-                    detail: format!("Commit {} ({}) — {label}. File-local evidence for {path}; generated/vendor/test classification still applies.{} \n{patch}",
-                        info.id, bounded(&info.summary, 160), if patch_truncated { " Patch excerpt truncated." } else { "" }) });
-            }
-            FileDiff::Unavailable { reason, .. } => observations.push(Observation { kind: EvidenceKind::HistoryStatus,
-                detail: format!("Git patch unavailable in {} for {path}: {reason:?}", info.id), provenance }),
-            FileDiff::NoTextChanges { .. } => observations.push(Observation { kind: EvidenceKind::HistoryStatus,
-                detail: format!("Commit {} changed file identity/metadata without a text patch for {path}; not substantive churn evidence.", info.id), provenance }),
-        }
-        }
+                FileDiff::Unavailable { reason, .. } => Observation {
+                    kind: EvidenceKind::HistoryStatus,
+                    detail: format!(
+                        "Git patch unavailable in {} for {path}: {reason:?}",
+                        info.id
+                    ),
+                    provenance,
+                },
+                FileDiff::NoTextChanges { .. } => Observation {
+                    kind: EvidenceKind::HistoryStatus,
+                    detail: format!(
+                        "Commit {} changed file identity/metadata without a text patch for {path}; not substantive churn evidence.",
+                        info.id
+                    ),
+                    provenance,
+                },
+            };
+            staged_observations.insert(path, observation);
+            Ok(())
+        },
+    )?;
+
+    for (path, observation) in staged_observations {
+        let observations = output
+            .get_mut(&path)
+            .context("selected history path missing")?;
+        *history_bytes =
+            history_bytes.saturating_add(observation.detail.len() + observation.provenance.len());
+        observations.push(observation);
     }
     Ok(())
 }

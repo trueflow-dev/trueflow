@@ -18,6 +18,12 @@ pub struct RepoSnapshot {
     repo: Option<gix::Repository>,
 }
 
+impl RepoSnapshot {
+    pub fn repo(&self) -> Option<&gix::Repository> {
+        self.repo.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
     Context,
@@ -479,8 +485,7 @@ impl GitSigningFormat {
     }
 }
 
-pub fn git_config_from_workdir() -> Result<GitConfig> {
-    let repo = repo_from_workdir()?;
+pub fn git_config_from_repo(repo: &gix::Repository) -> GitConfig {
     let config = repo.config_snapshot();
     let email = config.string("user.email").map_or_else(
         || "unknown@localhost".to_string(),
@@ -495,7 +500,12 @@ pub fn git_config_from_workdir() -> Result<GitConfig> {
                 .map(|value| value.to_string()),
             GitSigningFormat::NotOpenPgp => None,
         };
-    Ok(GitConfig { email, signing_key })
+    GitConfig { email, signing_key }
+}
+
+pub fn git_config_from_workdir() -> Result<GitConfig> {
+    let repo = repo_from_workdir()?;
+    Ok(git_config_from_repo(&repo))
 }
 
 pub fn dirty_files_from_workdir() -> Result<HashSet<RepoPath>> {
@@ -560,66 +570,139 @@ fn repo_path(path: &gix::bstr::BStr) -> Result<RepoPath> {
     RepoPath::new(path.to_str_lossy().as_ref())
 }
 
+pub struct BatchBlockStateResolver<'a> {
+    repo: Option<&'a gix::Repository>,
+    workdir_prefix: Option<String>,
+    head_tree_loaded: bool,
+    head_tree: Option<gix::Tree<'a>>,
+    head_block_hashes: HashMap<RepoPath, Option<HashSet<String>>>,
+    dirty_loaded: bool,
+    dirty_files: Option<HashSet<RepoPath>>,
+}
+
+impl<'a> BatchBlockStateResolver<'a> {
+    pub fn new(repo_snapshot: &'a RepoSnapshot) -> Self {
+        let repo = repo_snapshot.repo.as_ref();
+        let workdir_prefix = repo
+            .and_then(|repo| repo.workdir())
+            .and_then(path_utils::current_workdir_prefix_for_repo_root);
+        Self {
+            repo,
+            workdir_prefix,
+            head_tree_loaded: false,
+            head_tree: None,
+            head_block_hashes: HashMap::new(),
+            dirty_loaded: false,
+            dirty_files: None,
+        }
+    }
+
+    pub fn workdir_prefix(&self) -> Option<&str> {
+        self.workdir_prefix.as_deref()
+    }
+
+    pub fn block_state_for_path(
+        &mut self,
+        path_hint: Option<&str>,
+        fingerprint: &str,
+    ) -> BlockStateResult {
+        let Some(repo) = self.repo else {
+            return BlockStateResult::Unknown;
+        };
+        let Some(path) = path_hint else {
+            return BlockStateResult::Unknown;
+        };
+        let candidate_paths =
+            path_utils::repo_path_candidates(path, self.workdir_prefix.as_deref(), repo.workdir());
+        tracing::debug!(
+            path_hint = %path,
+            ?candidate_paths,
+            "resolving block state path candidates"
+        );
+
+        for candidate in &candidate_paths {
+            let Ok(candidate_path) = RepoPath::new(candidate) else {
+                continue;
+            };
+            if self
+                .head_hashes_for_path(repo, &candidate_path)
+                .is_some_and(|hashes| hashes.contains(fingerprint))
+            {
+                tracing::debug!(
+                    path_hint = %path,
+                    resolved_path = %candidate,
+                    "block state resolved as committed"
+                );
+                return BlockStateResult::Committed;
+            }
+        }
+
+        if !self.dirty_loaded {
+            self.dirty_loaded = true;
+            self.dirty_files = dirty_files(repo).ok();
+        }
+        if let Some(dirty) = &self.dirty_files
+            && candidate_paths
+                .iter()
+                .filter_map(|candidate| RepoPath::new(candidate).ok())
+                .any(|candidate| dirty.contains(&candidate))
+        {
+            tracing::debug!(
+                path_hint = %path,
+                ?candidate_paths,
+                "block state resolved as uncommitted"
+            );
+            return BlockStateResult::Uncommitted;
+        }
+
+        tracing::debug!(
+            path_hint = %path,
+            ?candidate_paths,
+            "block state resolution fell back to unknown"
+        );
+        BlockStateResult::Unknown
+    }
+
+    fn head_hashes_for_path(
+        &mut self,
+        repo: &'a gix::Repository,
+        path: &RepoPath,
+    ) -> Option<&HashSet<String>> {
+        if !self.head_block_hashes.contains_key(path) {
+            if !self.head_tree_loaded {
+                self.head_tree_loaded = true;
+                self.head_tree = repo.head_tree().ok();
+            }
+            let hashes = self.head_tree.as_ref().and_then(|head_tree| {
+                let entry = head_tree
+                    .lookup_entry_by_path(Path::new(path.as_str()))
+                    .ok()??;
+                if entry.mode().kind() == EntryKind::Tree {
+                    return Some(HashSet::new());
+                }
+                let blob = entry.object().ok()?.try_into_blob().ok()?;
+                let parsed = analysis::parse_file(path, &blob.data).ok()?;
+                Some(
+                    parsed
+                        .file_state
+                        .blocks
+                        .into_iter()
+                        .map(|block| block.hash.as_str().to_owned())
+                        .collect(),
+                )
+            });
+            self.head_block_hashes.insert(path.clone(), hashes);
+        }
+        self.head_block_hashes.get(path).and_then(Option::as_ref)
+    }
+}
+
 pub fn block_state_for_path(
     repo_snapshot: &RepoSnapshot,
     path_hint: Option<&str>,
     fingerprint: &str,
 ) -> BlockStateResult {
-    let Some(repo) = &repo_snapshot.repo else {
-        return BlockStateResult::Unknown;
-    };
-    let Some(path) = path_hint else {
-        return BlockStateResult::Unknown;
-    };
-    let workdir_prefix = repo
-        .workdir()
-        .and_then(path_utils::current_workdir_prefix_for_repo_root);
-    let candidate_paths =
-        path_utils::repo_path_candidates(path, workdir_prefix.as_deref(), repo.workdir());
-    tracing::debug!(
-        path_hint = %path,
-        ?candidate_paths,
-        "resolving block state path candidates"
-    );
-
-    for candidate in &candidate_paths {
-        let Ok(candidate_path) = RepoPath::new(candidate) else {
-            continue;
-        };
-        if let Ok(blocks) = head_blocks_for_path(repo, &candidate_path)
-            && blocks
-                .iter()
-                .any(|block| block.hash.as_str() == fingerprint)
-        {
-            tracing::debug!(
-                path_hint = %path,
-                resolved_path = %candidate,
-                "block state resolved as committed"
-            );
-            return BlockStateResult::Committed;
-        }
-    }
-
-    if let Ok(dirty) = dirty_files(repo)
-        && candidate_paths
-            .iter()
-            .filter_map(|candidate| RepoPath::new(candidate).ok())
-            .any(|candidate| dirty.contains(&candidate))
-    {
-        tracing::debug!(
-            path_hint = %path,
-            ?candidate_paths,
-            "block state resolved as uncommitted"
-        );
-        return BlockStateResult::Uncommitted;
-    }
-
-    tracing::debug!(
-        path_hint = %path,
-        ?candidate_paths,
-        "block state resolution fell back to unknown"
-    );
-    BlockStateResult::Unknown
+    BatchBlockStateResolver::new(repo_snapshot).block_state_for_path(path_hint, fingerprint)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1020,6 +1103,38 @@ pub(crate) fn file_diffs_for_range(
     let start_tree = start_commit.tree()?;
     let end_tree = end_commit.tree()?;
     diffs_for_paths_between_trees(repo, &start_tree, &end_tree, selected_destinations)
+}
+
+pub(crate) fn visit_selected_diffs_between_trees<T, S, F>(
+    repo: &gix::Repository,
+    base_tree: &gix::Tree<'_>,
+    head_tree: &gix::Tree<'_>,
+    mut select: S,
+    mut visit: F,
+) -> Result<()>
+where
+    S: FnMut(&ChangedPath) -> Result<Option<T>>,
+    F: FnMut(ChangedPath, T, FileDiff) -> Result<()>,
+{
+    let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
+    let changes = repo.diff_tree_to_tree(Some(base_tree), Some(head_tree), None)?;
+    for change in changes {
+        let change_ref = change.to_ref();
+        if !is_blob_change(&change_ref) {
+            continue;
+        }
+        let Ok(changed_path) = ChangedPath::from_change(&change_ref) else {
+            continue;
+        };
+        let Some(selected) = select(&changed_path)? else {
+            continue;
+        };
+        diff_cache.set_resource_by_change(change_ref, &repo.objects)?;
+        let file_diff = file_diff_from_change(&mut diff_cache, changed_path.clone())?;
+        diff_cache.clear_resource_cache_keep_allocation();
+        visit(changed_path, selected, file_diff)?;
+    }
+    Ok(())
 }
 
 fn diffs_for_paths_between_trees(

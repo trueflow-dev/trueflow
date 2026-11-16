@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -1513,6 +1513,13 @@ pub trait ReviewStore {
     fn read_history(&self) -> Result<Vec<Record>>;
     fn append(&self, record: &Record) -> Result<()>;
 
+    fn append_batch(&self, records: &[Record]) -> Result<()> {
+        for record in records {
+            self.append(record)?;
+        }
+        Ok(())
+    }
+
     fn load_database(&self) -> Result<ReviewDatabase>
     where
         Self: Sized,
@@ -1608,7 +1615,16 @@ impl JsonlStoreBackend {
     }
 
     fn append(&self, record: &Record) -> Result<()> {
-        record.validate()?;
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    fn append_batch(&self, records: &[Record]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        for record in records {
+            record.validate()?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1626,9 +1642,12 @@ impl JsonlStoreBackend {
             }
         }
 
-        let mut line = serde_json::to_string(record)?;
-        line.push('\n');
-        file.write_all(line.as_bytes())?;
+        let mut writer = BufWriter::new(file);
+        for record in records {
+            serde_json::to_writer(&mut writer, record)?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
         Ok(())
     }
 }
@@ -1673,6 +1692,10 @@ impl ReviewStore for FileStore {
 
     fn append(&self, record: &Record) -> Result<()> {
         self.backend.append(record)
+    }
+
+    fn append_batch(&self, records: &[Record]) -> Result<()> {
+        self.backend.append_batch(records)
     }
 }
 

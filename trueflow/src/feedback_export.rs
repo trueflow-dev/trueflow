@@ -232,8 +232,11 @@ pub trait FeedbackContextResolver {
 pub struct RepoFeedbackContextResolver<'a> {
     default_snapshot: FeedbackSnapshot,
     scan_options: &'a ScanOptions,
+    ignore_matcher: DirectScanPathIgnoreMatcher<'a>,
     workdir_prefix: Option<&'a str>,
     repo_root: Option<PathBuf>,
+    cached_repo: Option<gix::Repository>,
+    revision_commit_ids: HashMap<String, gix::ObjectId>,
     snapshot_files: HashMap<FeedbackSnapshot, SnapshotFileCache>,
     committed_declaration_sources:
         HashMap<gix::ObjectId, HashMap<RepoPath, HashMap<String, DeclarationFeedbackSource>>>,
@@ -276,12 +279,16 @@ impl<'a> RepoFeedbackContextResolver<'a> {
         repo_root: Option<PathBuf>,
     ) -> Result<Self> {
         let default_snapshot = snapshot_from_content_source(content_source);
+        let ignore_matcher = DirectScanPathIgnoreMatcher::new(scan_options)?;
         let snapshot_files = HashMap::new();
         Ok(Self {
             default_snapshot,
             scan_options,
+            ignore_matcher,
             workdir_prefix,
             repo_root,
+            cached_repo: None,
+            revision_commit_ids: HashMap::new(),
             snapshot_files,
             committed_declaration_sources: HashMap::new(),
         })
@@ -295,8 +302,10 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
             &self.default_snapshot,
             &mut self.snapshot_files,
             self.scan_options,
+            &self.ignore_matcher,
             self.workdir_prefix,
             self.repo_root.as_deref(),
+            &mut self.cached_repo,
         )
     }
 
@@ -310,10 +319,17 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
         let RepoRef::Vcs { revision, .. } = &record.repo_ref else {
             return Ok(None);
         };
-        let repo = match self.repo_root.as_deref() {
-            Some(root) => gix::discover(root)?,
-            None => gix::discover(".")?,
-        };
+        if matches!(record.block_state, BlockState::Committed)
+            && let Some(commit_id) = self.revision_commit_ids.get(revision.as_str())
+            && let Some(source) = self
+                .committed_declaration_sources
+                .get(commit_id)
+                .and_then(|paths| paths.get(&locator.path))
+                .and_then(|snapshots| snapshots.get(&locator.reviewed_snapshot.snapshot_id))
+        {
+            return resolve_declaration_feedback(record, std::slice::from_ref(source));
+        }
+        let repo = discover_or_reuse_repo(&mut self.cached_repo, self.repo_root.as_deref())?;
         let path = Path::new(locator.path.as_str());
         let (commit_id, bytes) = match &record.block_state {
             BlockState::Committed => {
@@ -322,6 +338,8 @@ impl FeedbackContextResolver for RepoFeedbackContextResolver<'_> {
                     .object()?
                     .peel_to_commit()?;
                 let commit_id = commit.id().detach();
+                self.revision_commit_ids
+                    .insert(revision.as_str().to_owned(), commit_id);
                 if let Some(source) = self
                     .committed_declaration_sources
                     .get(&commit_id)
@@ -1405,13 +1423,32 @@ fn snapshot_from_content_source(content_source: &ReviewContentSource) -> Feedbac
     }
 }
 
+fn discover_or_reuse_repo<'a>(
+    cached_repo: &'a mut Option<gix::Repository>,
+    repo_root: Option<&Path>,
+) -> Result<&'a gix::Repository> {
+    match cached_repo {
+        Some(repo) => Ok(repo),
+        None => {
+            let repo = match repo_root {
+                Some(root) => gix::discover(root)?,
+                None => vcs::repo_from_workdir()?,
+            };
+            Ok(cached_repo.insert(repo))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_feedback_context(
     record: &Record,
     default_snapshot: &FeedbackSnapshot,
     snapshot_files: &mut HashMap<FeedbackSnapshot, SnapshotFileCache>,
     scan_options: &ScanOptions,
+    ignore_matcher: &DirectScanPathIgnoreMatcher,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
+    cached_repo: &mut Option<gix::Repository>,
 ) -> Result<ResolvedFeedbackContext> {
     for snapshot in candidate_snapshots_for_record(record, default_snapshot)
         .iter()
@@ -1426,16 +1463,20 @@ fn resolve_feedback_context(
                 snapshot,
                 path_hint,
                 scan_options,
+                ignore_matcher,
                 workdir_prefix,
                 repo_root,
+                cached_repo,
                 strict,
             )?,
             None => complete_snapshot_file_cache(
                 snapshot_files,
                 snapshot,
                 scan_options,
+                ignore_matcher,
                 workdir_prefix,
                 repo_root,
+                cached_repo,
                 strict,
             )?,
         };
@@ -1533,8 +1574,10 @@ fn candidate_snapshots_for_record(
 fn load_snapshot_files_strict(
     snapshot: &FeedbackSnapshot,
     scan_options: &ScanOptions,
+    ignore_matcher: &DirectScanPathIgnoreMatcher,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
+    cached_repo: &mut Option<gix::Repository>,
 ) -> Result<Vec<FileState>> {
     match snapshot {
         FeedbackSnapshot::Workdir => Ok(scanner::scan_directory(
@@ -1543,18 +1586,8 @@ fn load_snapshot_files_strict(
         )?
         .files),
         FeedbackSnapshot::Revision(revision) => {
-            let repo = if let Some(repo_root) = repo_root {
-                gix::discover(repo_root)?
-            } else {
-                vcs::repo_from_workdir()?
-            };
-            Ok(vcs::file_states_in_revision(
-                &repo,
-                revision,
-                workdir_prefix,
-                &DirectScanPathIgnoreMatcher::new(scan_options)?,
-            )?
-            .files)
+            let repo = discover_or_reuse_repo(cached_repo, repo_root)?;
+            Ok(vcs::file_states_in_revision(repo, revision, workdir_prefix, ignore_matcher)?.files)
         }
     }
 }
@@ -1563,8 +1596,10 @@ fn load_snapshot_files_for_paths_strict(
     snapshot: &FeedbackSnapshot,
     paths: &HashSet<RepoPath>,
     scan_options: &ScanOptions,
+    ignore_matcher: &DirectScanPathIgnoreMatcher,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
+    cached_repo: &mut Option<gix::Repository>,
 ) -> Result<Vec<FileState>> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -1578,17 +1613,13 @@ fn load_snapshot_files_for_paths_strict(
         )?
         .files),
         FeedbackSnapshot::Revision(revision) => {
-            let repo = if let Some(repo_root) = repo_root {
-                gix::discover(repo_root)?
-            } else {
-                vcs::repo_from_workdir()?
-            };
+            let repo = discover_or_reuse_repo(cached_repo, repo_root)?;
             Ok(vcs::file_states_for_paths_in_revision(
-                &repo,
+                repo,
                 revision,
                 paths,
                 workdir_prefix,
-                &DirectScanPathIgnoreMatcher::new(scan_options)?,
+                ignore_matcher,
             )?
             .files)
         }
@@ -1598,31 +1629,53 @@ fn load_snapshot_files_for_paths_strict(
 fn load_snapshot_files_best_effort(
     snapshot: &FeedbackSnapshot,
     scan_options: &ScanOptions,
+    ignore_matcher: &DirectScanPathIgnoreMatcher,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
+    cached_repo: &mut Option<gix::Repository>,
 ) -> Vec<FileState> {
-    load_snapshot_files_strict(snapshot, scan_options, workdir_prefix, repo_root)
-        .unwrap_or_default()
+    load_snapshot_files_strict(
+        snapshot,
+        scan_options,
+        ignore_matcher,
+        workdir_prefix,
+        repo_root,
+        cached_repo,
+    )
+    .unwrap_or_default()
 }
 
 fn load_snapshot_files_for_paths_best_effort(
     snapshot: &FeedbackSnapshot,
     paths: &HashSet<RepoPath>,
     scan_options: &ScanOptions,
+    ignore_matcher: &DirectScanPathIgnoreMatcher,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
+    cached_repo: &mut Option<gix::Repository>,
 ) -> Vec<FileState> {
-    load_snapshot_files_for_paths_strict(snapshot, paths, scan_options, workdir_prefix, repo_root)
-        .unwrap_or_default()
+    load_snapshot_files_for_paths_strict(
+        snapshot,
+        paths,
+        scan_options,
+        ignore_matcher,
+        workdir_prefix,
+        repo_root,
+        cached_repo,
+    )
+    .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snapshot_file_cache_for_path<'a>(
     snapshot_files: &'a mut HashMap<FeedbackSnapshot, SnapshotFileCache>,
     snapshot: &FeedbackSnapshot,
     path: &RepoPath,
     scan_options: &ScanOptions,
+    ignore_matcher: &DirectScanPathIgnoreMatcher,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
+    cached_repo: &mut Option<gix::Repository>,
     strict: bool,
 ) -> Result<&'a SnapshotFileCache> {
     let cache = snapshot_files.entry(snapshot.clone()).or_default();
@@ -1636,16 +1689,20 @@ fn snapshot_file_cache_for_path<'a>(
             snapshot,
             &paths,
             scan_options,
+            ignore_matcher,
             workdir_prefix,
             repo_root,
+            cached_repo,
         )?
     } else {
         load_snapshot_files_for_paths_best_effort(
             snapshot,
             &paths,
             scan_options,
+            ignore_matcher,
             workdir_prefix,
             repo_root,
+            cached_repo,
         )
     };
     merge_snapshot_files(cache, files);
@@ -1653,23 +1710,41 @@ fn snapshot_file_cache_for_path<'a>(
     Ok(cache)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_snapshot_file_cache<'a>(
     snapshot_files: &'a mut HashMap<FeedbackSnapshot, SnapshotFileCache>,
     snapshot: &FeedbackSnapshot,
     scan_options: &ScanOptions,
+    ignore_matcher: &DirectScanPathIgnoreMatcher,
     workdir_prefix: Option<&str>,
     repo_root: Option<&Path>,
+    cached_repo: &mut Option<gix::Repository>,
     strict: bool,
 ) -> Result<&'a SnapshotFileCache> {
     let already_complete = snapshot_files
         .get(snapshot)
         .is_some_and(|cache| cache.complete);
     if !already_complete {
-        let files = if strict {
-            load_snapshot_files_strict(snapshot, scan_options, workdir_prefix, repo_root)?
+        let mut files = if strict {
+            load_snapshot_files_strict(
+                snapshot,
+                scan_options,
+                ignore_matcher,
+                workdir_prefix,
+                repo_root,
+                cached_repo,
+            )?
         } else {
-            load_snapshot_files_best_effort(snapshot, scan_options, workdir_prefix, repo_root)
+            load_snapshot_files_best_effort(
+                snapshot,
+                scan_options,
+                ignore_matcher,
+                workdir_prefix,
+                repo_root,
+                cached_repo,
+            )
         };
+        files.sort_by(|a, b| a.path.cmp(&b.path));
         let cache = snapshot_files.entry(snapshot.clone()).or_default();
         cache.files = files;
         cache.complete = true;
@@ -1712,9 +1787,9 @@ fn resolve_record_in_files(record: &Record, files: &[FileState]) -> Option<(Stri
         |file: &FileState| block_in_file(file).map(|block| (file.path.as_str().to_string(), block));
     match record.path_hint.as_ref() {
         Some(path_hint) => files
-            .iter()
-            .find(|file| file.path == *path_hint)
-            .and_then(resolve),
+            .binary_search_by(|file| file.path.cmp(path_hint))
+            .ok()
+            .and_then(|index| resolve(&files[index])),
         None => files.iter().find_map(resolve),
     }
 }
