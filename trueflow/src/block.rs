@@ -310,6 +310,7 @@ impl Block {
     ///
     /// To cut several blocks from one source, build a [`SourceText`] once and
     /// call [`SourceText::block`]; this constructor indexes the source anew.
+    #[cfg(any(test, feature = "tui-test-support"))]
     pub(crate) fn from_file_range(
         full_source: &str,
         kind: BlockKind,

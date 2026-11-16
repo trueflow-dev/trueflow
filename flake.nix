@@ -112,7 +112,6 @@
               cargo-mutants
               cargo-pgo
               cargo-udeps
-              cargo-watch
 
               # Website / infrastructure tooling
               # NOTE: on local Darwin here, the flake-pinned nix AWS CLI hangs
