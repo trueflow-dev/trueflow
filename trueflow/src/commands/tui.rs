@@ -5741,7 +5741,8 @@ fn node_mark_params(
         .transpose()?
         .flatten();
     // A base-only diff block is reviewed as the comparison's deletion of it.
-    let deletion = match node.change {
+    let node_change = node.change;
+    let deletion = match node_change {
         ReviewedBlockChange::Content => None,
         ReviewedBlockChange::Deleted => Some(BlockDeletion {
             head_revision: review_scope_revision(state)?.context(
@@ -5749,6 +5750,7 @@ fn node_mark_params(
             )?,
         }),
     };
+    let provenance = historical_mark_provenance(state, node_change)?;
 
     Ok(mark::MarkParams {
         fingerprint,
@@ -5762,6 +5764,7 @@ fn node_mark_params(
         comment_context,
         comment_anchor,
         deletion,
+        provenance,
     })
 }
 
@@ -5792,6 +5795,38 @@ fn decorate_comment_anchor_for_action(
             path,
             rows: rows.clone(),
         }),
+    }))
+}
+
+fn historical_mark_provenance(
+    state: &AppState,
+    change: ReviewedBlockChange,
+) -> Result<Option<mark::MarkProvenance>> {
+    let revision = match (&state.review_scope, change) {
+        (ScopePreset::Commit { id, .. }, ReviewedBlockChange::Content) => Some(
+            resolve_review_scope_revision(id, state.repo_root.as_deref())?,
+        ),
+        (ScopePreset::Commit { id, .. }, ReviewedBlockChange::Deleted) => {
+            let head = resolve_review_scope_revision(id, state.repo_root.as_deref())?;
+            let base =
+                resolve_review_scope_revision(&format!("{id}~1"), state.repo_root.as_deref())
+                    .unwrap_or(head);
+            Some(base)
+        }
+        (ScopePreset::RevisionRange { end, .. }, ReviewedBlockChange::Content) => Some(
+            resolve_review_scope_revision(end, state.repo_root.as_deref())?,
+        ),
+        (ScopePreset::RevisionRange { start, .. }, ReviewedBlockChange::Deleted) => Some(
+            resolve_review_scope_revision(start, state.repo_root.as_deref())?,
+        ),
+        (ScopePreset::All | ScopePreset::MainDiff | ScopePreset::DirtyWorktree, _) => None,
+    };
+    Ok(revision.map(|revision| mark::MarkProvenance {
+        repo_ref: crate::store::RepoRef::Vcs {
+            system: crate::store::VcsSystem::Git,
+            revision,
+        },
+        block_state: crate::store::BlockState::Committed,
     }))
 }
 
@@ -13453,6 +13488,139 @@ mod diff_scope_tests {
             })
         );
         assert_eq!(content.deletion, None);
+    }
+
+    #[test]
+    fn fetch_only_pr_range_marks_stamp_reviewed_revisions_instead_of_worktree_head() {
+        let repo_root = crate::test_git::temp_git_repo("tui_fetch_only_pr_provenance");
+        let file_path = repo_root.join("src/lib.rs");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, "pub struct OldGone;\n").unwrap();
+        crate::test_git::run_git(&repo_root, &["add", "."]);
+        crate::test_git::run_git(&repo_root, &["commit", "-m", "base"]);
+        crate::test_git::run_git(&repo_root, &["branch", "-M", "main"]);
+        let base_sha = crate::test_git::run_git_stdout(&repo_root, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        // Create a PR commit without leaving `HEAD` on it: check out `main` and advance `main`.
+        crate::test_git::run_git(&repo_root, &["checkout", "-b", "pr-branch"]);
+        fs::write(&file_path, "pub fn added() -> u32 { 7 }\n").unwrap();
+        crate::test_git::run_git(&repo_root, &["add", "."]);
+        crate::test_git::run_git(&repo_root, &["commit", "-m", "pr change"]);
+        let pr_head_sha = crate::test_git::run_git_stdout(&repo_root, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        crate::test_git::run_git(&repo_root, &["checkout", "main"]);
+        fs::write(repo_root.join("README.md"), "# main\n").unwrap();
+        crate::test_git::run_git(&repo_root, &["add", "."]);
+        crate::test_git::run_git(&repo_root, &["commit", "-m", "advance main"]);
+        let main_head_sha = crate::test_git::run_git_stdout(&repo_root, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert_ne!(main_head_sha, pr_head_sha);
+
+        let _guard = CurrentDirGuard::push(&repo_root);
+        let query = resolve_review_request(
+            ReviewRequest::Targets(vec![
+                crate::targets::ReviewTarget::from_cli(&format!("rev:{base_sha}..{pr_head_sha}"))
+                    .unwrap(),
+            ]),
+            BlockFilters::default(),
+            crate::scanner::ScanOptions::default(),
+        )
+        .unwrap();
+        let collected = collect_review(&query).unwrap();
+        let mut state = build_review_state(
+            &TrueflowContext::new(Cli::parse_from(["trueflow", "tui"])),
+            collected,
+            ScopePreset::RevisionRange {
+                start: base_sha.clone(),
+                end: pr_head_sha.clone(),
+            },
+            ReviewStateBuildOptions {
+                confirm_batch: BatchConfirmPolicy::Never,
+                block_diff_focus_mode: vcs::BlockDiffFocusMode::WholeBlock,
+                diff_line_numbers: TuiDiffLineNumbers::Disabled,
+                keybinds: TuiKeybindsConfig::default(),
+                scope_label: "PR #7".to_string(),
+                initial_view_mode: ViewMode::Diff,
+                speed_read_config: TuiSpeedReadConfig::default(),
+                speed_read_defaults: SpeedReadDefaultsWriter::in_dir(repo_root.clone()),
+                ai: TuiAiState::empty(),
+            },
+        )
+        .unwrap();
+        state.repo_root = Some(repo_root.clone());
+
+        let mut content_id = None;
+        let mut deleted_id = None;
+        for &node_id in &state.reviewable_nodes {
+            match state.navigator.tree.node(node_id).change {
+                ReviewedBlockChange::Content => content_id = Some(node_id),
+                ReviewedBlockChange::Deleted => deleted_id = Some(node_id),
+            }
+        }
+        let content_id = content_id.unwrap_or_else(|| panic!("expected added block node"));
+        let deleted_id = deleted_id.unwrap_or_else(|| panic!("expected deleted block node"));
+
+        let content_params = node_mark_params(
+            &mut state,
+            content_id,
+            Verdict::Comment,
+            Some("check added".to_string()),
+        )
+        .unwrap();
+        let deleted_params = node_mark_params(
+            &mut state,
+            deleted_id,
+            Verdict::Comment,
+            Some("check deleted".to_string()),
+        )
+        .unwrap();
+
+        let ctx = TrueflowContext::new(Cli::parse_from(["trueflow", "tui"]));
+        mark::run_batch(&ctx, vec![content_params, deleted_params]).unwrap();
+
+        let records = crate::store::FileStore::for_root(&repo_root)
+            .unwrap()
+            .read_history()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        let added_record = records
+            .iter()
+            .find(|r| r.note.as_deref() == Some("check added"))
+            .unwrap();
+        let deleted_record = records
+            .iter()
+            .find(|r| r.note.as_deref() == Some("check deleted"))
+            .unwrap();
+
+        assert_eq!(
+            added_record.repo_ref,
+            crate::store::RepoRef::Vcs {
+                system: crate::store::VcsSystem::Git,
+                revision: CommitId::new(&pr_head_sha).unwrap(),
+            },
+            "fetch-only PR review must stamp PR head commit, not local worktree HEAD"
+        );
+        assert_eq!(
+            added_record.block_state,
+            crate::store::BlockState::Committed
+        );
+        assert_eq!(
+            deleted_record.repo_ref,
+            crate::store::RepoRef::Vcs {
+                system: crate::store::VcsSystem::Git,
+                revision: CommitId::new(&base_sha).unwrap(),
+            },
+            "deleted block in range review must stamp base commit as repo_ref"
+        );
+        assert_eq!(
+            deleted_record.block_state,
+            crate::store::BlockState::Committed
+        );
     }
 
     #[test]

@@ -1054,6 +1054,57 @@ fn github_declaration_mapper_uses_general_feedback_without_inventing_coordinates
 }
 
 #[test]
+fn github_declaration_mapper_inlines_deleted_declaration_on_left_side() -> TestResult {
+    let fixture = pull_request_fixture(
+        "declaration_feedback_github_deleted_left_side",
+        &[
+            DECLARATION_SOURCE,
+            "pub fn replacement() -> u8 {\n    0\n}\n",
+        ],
+    )?;
+    let (snapshot, declaration) =
+        projected_snapshot("source:deleted-decl", PATH, DECLARATION_SOURCE)?;
+    let mut record = declaration_record(
+        "deleted-decl",
+        &fixture.metadata.base_sha,
+        &snapshot,
+        &declaration,
+        AnchorSelection::Signature,
+        "deleted declaration left-side note",
+    )?;
+    record.declaration_deletion = Some(trueflow::store::DeclarationDeletion {
+        head_revision: fixture.metadata.head_sha.clone(),
+    });
+    record.validate()?;
+
+    let repo = gix::discover(&fixture.repo.path)?;
+    let plan = build_pull_request_feedback_plan(
+        &repo,
+        &fixture.metadata,
+        std::slice::from_ref(&record),
+        &HashSet::new(),
+    )?;
+
+    assert_eq!(plan.staged_record_ids, vec!["deleted-decl".to_string()]);
+    assert_eq!(plan.draft.comments.len(), 1);
+    let comment = &plan.draft.comments[0];
+    assert_eq!(comment.path, RepoPath::new(PATH)?);
+    assert_eq!(comment.line, 2);
+    assert_eq!(comment.side, GitHubCommentSide::Left);
+    assert_eq!(comment.start_line, None);
+    assert_eq!(comment.start_side, None);
+    assert_eq!(comment.body, "deleted declaration left-side note");
+    assert!(
+        !plan
+            .draft
+            .body
+            .contains("deleted declaration left-side note"),
+        "deleted declaration comment mapped inline must not be duplicated in review body"
+    );
+    Ok(())
+}
+
+#[test]
 fn exact_resolution_rejects_same_snapshot_id_with_wrong_source_hash() -> TestResult {
     let (snapshot, declaration) =
         projected_snapshot("source:hash-bound", PATH, DECLARATION_SOURCE)?;

@@ -1520,7 +1520,7 @@ pub fn build_pull_request_feedback_plan(
             continue;
         }
 
-        let Some(record_revision) = record_revision(record) else {
+        let Some(record_revision) = effective_pull_request_record_revision(record) else {
             continue;
         };
         if !pull_request_contains_revision(metadata, record_revision) {
@@ -1623,18 +1623,21 @@ fn map_declaration_anchor_to_github_comment(
             PullRequestFeedbackSkipReason::DeclarationAnchorUnsupported,
         ));
     }
-    let Some(revision) = record_revision(record) else {
+    let Some(effective_revision) = effective_pull_request_record_revision(record) else {
         return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
     };
-    if !pull_request_contains_revision(metadata, revision) {
+    if !pull_request_contains_revision(metadata, effective_revision) {
         return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
     }
+    let Some(source_revision) = record_revision(record) else {
+        return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
+    };
     let Some(locator) = record.declaration_locator.as_ref() else {
         return Ok(Err(
             PullRequestFeedbackSkipReason::DeclarationAnchorUnsupported,
         ));
     };
-    let Some(source) = source_blob_in_revision(repo, revision, &locator.path)? else {
+    let Some(source) = source_blob_in_revision(repo, source_revision, &locator.path)? else {
         return Ok(Err(
             PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
         ));
@@ -1667,7 +1670,7 @@ fn map_declaration_anchor_to_github_comment(
 
     let range = &anchor.ranges[0];
     let Some(source_anchor) = declaration_range_source_anchor(
-        revision,
+        source_revision,
         &locator.path,
         &source,
         range.start_byte,
@@ -1675,7 +1678,135 @@ fn map_declaration_anchor_to_github_comment(
     ) else {
         return Ok(Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange));
     };
-    map_source_anchor_to_github_comment(repo, metadata, merge_base, &source_anchor, note)
+    match &record.declaration_deletion {
+        None => {
+            map_source_anchor_to_github_comment(repo, metadata, merge_base, &source_anchor, note)
+        }
+        Some(_) => map_deleted_declaration_anchor_to_github_comment(
+            repo,
+            metadata,
+            merge_base,
+            &source_anchor,
+            note,
+        ),
+    }
+}
+
+fn map_deleted_declaration_anchor_to_github_comment(
+    repo: &gix::Repository,
+    metadata: &PullRequestMetadata,
+    merge_base: &CommitId,
+    source_anchor: &SourceCommentAnchor,
+    note: &str,
+) -> Result<std::result::Result<GitHubInlineComment, PullRequestFeedbackSkipReason>> {
+    let first_source_line = match source_anchor.start_line.checked_add(1) {
+        Some(line) if line <= source_anchor.end_line => line,
+        _ => return Ok(Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange)),
+    };
+    let lines = (first_source_line..=source_anchor.end_line).collect::<Vec<_>>();
+    let translated = if source_anchor.revision == *merge_base {
+        if !path_exists_in_revision(repo, merge_base, &source_anchor.path)? {
+            return Ok(Err(
+                PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+            ));
+        }
+        TranslatedSourceAnchor {
+            path: source_anchor.path.clone(),
+            first_line: first_source_line,
+            last_line: source_anchor.end_line,
+        }
+    } else if let Some(base_commit_index) = metadata
+        .commits
+        .iter()
+        .position(|commit| commit.sha == source_anchor.revision)
+    {
+        let Some(deleting_commit) = metadata.commits.get(base_commit_index + 1) else {
+            return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
+        };
+        let diff_anchor = DiffCommentAnchor {
+            revision: deleting_commit.sha.clone(),
+            path: source_anchor.path.clone(),
+            rows: lines
+                .iter()
+                .map(|&old_line| crate::store::DiffCommentAnchorRow {
+                    kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                    old_line: Some(old_line),
+                    new_line: None,
+                })
+                .collect(),
+        };
+        match translate_left_diff_anchor_to_base(repo, metadata, merge_base, &diff_anchor, &lines)?
+        {
+            Ok(translated) => translated,
+            Err(reason) => return Ok(Err(reason)),
+        }
+    } else if source_anchor.revision == metadata.base_sha {
+        let mut path = source_anchor.path.clone();
+        let mut mapped_lines = lines;
+        if !path_exists_in_revision(repo, merge_base, &path)? {
+            let Some(source_path) =
+                pure_rename_source(repo, merge_base, &metadata.base_sha, &path)?
+            else {
+                return Ok(Err(PullRequestFeedbackSkipReason::PathRemappingUnsupported));
+            };
+            path = source_path;
+        } else {
+            let hunks = vcs::diff_hunks_for_file_in_range(
+                repo,
+                merge_base.as_str(),
+                metadata.base_sha.as_str(),
+                &path,
+            )?;
+            if !hunks.is_empty() {
+                let Some(previous_lines) = mapped_lines
+                    .into_iter()
+                    .map(|line| translate_new_line_to_old_line_strict(line, &hunks))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Ok(Err(
+                        PullRequestFeedbackSkipReason::RangeDeletedByLaterCommit,
+                    ));
+                };
+                if !is_contiguous(&previous_lines) {
+                    return Ok(Err(PullRequestFeedbackSkipReason::AmbiguousLineTranslation));
+                }
+                mapped_lines = previous_lines;
+            }
+        }
+        let Some(&first_line) = mapped_lines.first() else {
+            return Ok(Err(PullRequestFeedbackSkipReason::InvalidSourceAnchorRange));
+        };
+        let last_line = *mapped_lines.last().unwrap_or(&first_line);
+        TranslatedSourceAnchor {
+            path,
+            first_line,
+            last_line,
+        }
+    } else {
+        return Ok(Err(PullRequestFeedbackSkipReason::MissingPullRequestCommit));
+    };
+
+    if !head_diff_contains_left_side_range(
+        repo,
+        metadata,
+        merge_base,
+        &translated.path,
+        translated.first_line,
+        translated.last_line,
+    )? {
+        return Ok(Err(PullRequestFeedbackSkipReason::NotPresentInPrHeadDiff));
+    }
+
+    Ok(Ok(GitHubInlineComment {
+        path: translated.path,
+        line: translated.last_line,
+        side: GitHubCommentSide::Left,
+        start_line: (translated.first_line != translated.last_line)
+            .then_some(translated.first_line),
+        start_side: (translated.first_line != translated.last_line)
+            .then_some(GitHubCommentSide::Left),
+        body: note.to_string(),
+    }))
 }
 
 fn declaration_range_source_anchor(
@@ -2415,6 +2546,19 @@ fn pull_request_contains_revision(metadata: &PullRequestMetadata, revision: &Com
         .commits
         .iter()
         .any(|commit| &commit.sha == revision)
+}
+
+fn effective_pull_request_record_revision(record: &Record) -> Option<&CommitId> {
+    match (
+        &record.declaration_deletion,
+        &record.block_deletion,
+        &record.repo_ref,
+    ) {
+        (Some(deletion), _, _) => Some(&deletion.head_revision),
+        (None, Some(deletion), _) => Some(&deletion.head_revision),
+        (None, None, RepoRef::Vcs { revision, .. }) => Some(revision),
+        (None, None, RepoRef::Unknown) => None,
+    }
 }
 
 fn record_revision(record: &Record) -> Option<&CommitId> {
@@ -5801,5 +5945,43 @@ mod tests {
             tags: None,
             attestations: None,
         }
+    }
+
+    #[test]
+    fn build_pull_request_feedback_plan_stages_deleted_block_with_base_repo_ref() -> Result<()> {
+        let (repo_root, metadata) = pull_request_fixture_with_file_contents(
+            "pr_feedback_deleted_block_base_repo_ref",
+            "pub fn removed() -> u32 { 1 }\npub fn kept() -> u32 { 2 }\n",
+            "pub fn kept() -> u32 { 2 }\n",
+        )?;
+        let repo = gix::discover(&repo_root)?;
+        let mut record = review_record(
+            "deleted-block-comment",
+            &metadata.base_sha,
+            Some(diff_anchor(
+                &metadata,
+                vec![crate::store::DiffCommentAnchorRow {
+                    kind: crate::store::CommentAnchorDiffLineKind::Removed,
+                    old_line: Some(1),
+                    new_line: None,
+                }],
+            )?),
+            Some("why remove this?"),
+        );
+        record.block_deletion = Some(crate::store::BlockDeletion {
+            head_revision: metadata.head_sha.clone(),
+        });
+
+        let plan = build_pull_request_feedback_plan(
+            &repo,
+            &metadata,
+            std::slice::from_ref(&record),
+            &HashSet::new(),
+        )?;
+        assert_eq!(plan.draft.comments.len(), 1);
+        assert_eq!(plan.draft.comments[0].side, GitHubCommentSide::Left);
+        assert_eq!(plan.draft.comments[0].line, 1);
+        assert_eq!(plan.draft.comments[0].body, "why remove this?");
+        Ok(())
     }
 }

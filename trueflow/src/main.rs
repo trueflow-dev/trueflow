@@ -60,6 +60,7 @@ fn main() -> Result<()> {
                             .map(|head_revision| trueflow::store::BlockDeletion { head_revision })
                     })
                     .transpose()?,
+                provenance: None,
             },
         ),
         Commands::Check => commands::check::run(&context),

@@ -28,6 +28,12 @@ fn with_noninteractive_signing_context<T>(result: Result<T>, mode: SigningMode) 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkProvenance {
+    pub repo_ref: RepoRef,
+    pub block_state: BlockState,
+}
+
 #[derive(Debug, Clone)]
 pub struct MarkParams {
     pub fingerprint: String,
@@ -42,6 +48,9 @@ pub struct MarkParams {
     pub comment_anchor: Option<CommentAnchor>,
     /// Set when the mark reviews the block's deletion rather than its content.
     pub deletion: Option<BlockDeletion>,
+    /// Explicit provenance when marking an immutable historical scope (e.g. a
+    /// fetched PR or commit range whose revision differs from worktree `HEAD`).
+    pub provenance: Option<MarkProvenance>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +340,7 @@ fn build_mark_record(
         comment_context,
         comment_anchor,
         deletion,
+        provenance,
     } = params;
 
     let path_hint = path.as_ref().map(|raw_path| match workdir_prefix {
@@ -354,19 +364,28 @@ fn build_mark_record(
         }
     };
     let target = target_kind.parse_target(&fingerprint)?;
-    let block_state: BlockState = state_resolver
-        .block_state_for_path(
-            path_hint.as_ref().map(RepoPath::as_str),
-            target.lookup_key(),
-        )
-        .into();
+    let (record_repo_ref, block_state) = match provenance {
+        Some(MarkProvenance {
+            repo_ref,
+            block_state,
+        }) => (repo_ref, block_state),
+        None => {
+            let block_state: BlockState = state_resolver
+                .block_state_for_path(
+                    path_hint.as_ref().map(RepoPath::as_str),
+                    target.lookup_key(),
+                )
+                .into();
+            (repo_ref.clone(), block_state)
+        }
+    };
 
     let mut record = Record::new(
         target,
         check,
         verdict,
         identity.clone(),
-        repo_ref.clone(),
+        record_repo_ref,
         block_state,
     );
     record.path_hint = path_hint;
