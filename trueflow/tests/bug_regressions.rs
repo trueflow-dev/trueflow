@@ -3215,3 +3215,113 @@ fn deletion_feedback_is_resolved_only_by_a_deletion_approval() -> Result<()> {
     assert!(check_passes(&repo)?);
     Ok(())
 }
+
+#[test]
+fn main_diff_errors_when_head_and_main_have_no_merge_base() -> Result<()> {
+    let source = TestRepo::new("shallow_missing_merge_base_source")?;
+    source.write("src/shared.rs", "pub fn shared() -> u8 {\n    1\n}\n")?;
+    source.commit_all("base")?;
+    source.git(&["branch", "-M", "main"])?;
+
+    source.git(&["switch", "-c", "feature"])?;
+    source.write("src/feature_1.rs", "pub fn f1() {}\n")?;
+    source.commit_all("feature 1")?;
+    source.write("src/feature_2.rs", "pub fn f2() {}\n")?;
+    source.commit_all("feature 2")?;
+
+    source.git(&["switch", "main"])?;
+    source.write("src/main_1.rs", "pub fn m1() {}\n")?;
+    source.commit_all("main 1")?;
+    source.write("src/main_2.rs", "pub fn m2() {}\n")?;
+    source.commit_all("main 2")?;
+
+    let shallow_on_main_path = temp_test_dir("shallow_on_main").join("clone");
+    source.git(&[
+        "clone",
+        "-q",
+        "--depth",
+        "1",
+        "--branch",
+        "main",
+        &format!("file://{}", source.path.display()),
+        shallow_on_main_path.to_str().context("utf-8 clone path")?,
+    ])?;
+    let shallow_on_main = TestRepo::from_path("shallow_on_main", shallow_on_main_path)?;
+    let same_tip = shallow_on_main.run(&["review", "--target", "main", "--json"])?;
+    assert!(json_array(&same_tip)?.is_empty());
+
+    let diverged_path = temp_test_dir("shallow_diverged").join("clone");
+    source.git(&[
+        "clone",
+        "-q",
+        "--depth",
+        "1",
+        "--no-single-branch",
+        "--branch",
+        "feature",
+        &format!("file://{}", source.path.display()),
+        diverged_path.to_str().context("utf-8 clone path")?,
+    ])?;
+    let diverged = TestRepo::from_path("shallow_diverged", diverged_path)?;
+    let output = diverged.run_raw(&["review", "--target", "main", "--json"])?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "diverged shallow clone without merge base must fail instead of diffing from main tip; stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("no merge base"),
+        "expected missing merge base explanation, got: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn review_diff_supports_replacing_file_with_directory_and_reverse() -> Result<()> {
+    let repo = TestRepo::new("file_directory_replacement_diff")?;
+    repo.write("notes", "pub fn legacy_note() -> u8 {\n    1\n}\n")?;
+    repo.write(
+        "config/app.rs",
+        "pub fn nested_config() -> u8 {\n    2\n}\n",
+    )?;
+    repo.commit_all("base")?;
+    repo.git(&["branch", "-M", "main"])?;
+    approve_every_block(&repo)?;
+
+    repo.git(&["switch", "-c", "feature"])?;
+    std::fs::remove_file(repo.path.join("notes"))?;
+    repo.write("notes/today.rs", "pub fn today_note() -> u8 {\n    3\n}\n")?;
+    std::fs::remove_dir_all(repo.path.join("config"))?;
+    repo.write("config", "pub fn flat_config() -> u8 {\n    4\n}\n")?;
+    repo.commit_all("swap file and directory roles")?;
+
+    let files = json_array(&repo.run(&["review", "--target", "main", "--json"])?)?;
+    let mut paths = files
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        ["config", "config/app.rs", "notes", "notes/today.rs"]
+    );
+
+    for file in &files {
+        let path = file["path"].as_str().context("file path")?;
+        for block in file["blocks"].as_array().context("blocks")? {
+            if block["change"] == "deleted" {
+                mark_block(&repo, block, path, &["--deleted-in", "HEAD"])?;
+            } else {
+                mark_block(&repo, block, path, &[])?;
+            }
+        }
+    }
+
+    assert!(
+        json_array(&repo.run(&["review", "--target", "main", "--json"])?)?.is_empty(),
+        "reviewing both replaced files and directories must clear main diff"
+    );
+    assert!(check_passes(&repo)?);
+    Ok(())
+}

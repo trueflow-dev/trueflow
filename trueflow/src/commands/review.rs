@@ -928,32 +928,7 @@ type DiffReviewTreeBuild = (
     HashMap<tree::TreeNodeId, BlockChangeKind>,
 );
 
-/// A diff can delete file `notes` and add `notes/today.md`. The review tree
-/// indexes nodes by path, so one tree cannot hold both a file and a directory
-/// at `notes`; report that instead of tripping the tree's uniqueness assert.
-fn reject_file_directory_collisions(files: &[DiffReviewFile]) -> Result<()> {
-    let file_paths = files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<HashSet<_>>();
-    for file in files {
-        let path = file.path.as_str();
-        for (separator, _) in path.match_indices('/') {
-            let ancestor = &path[..separator];
-            if file_paths.contains(ancestor) {
-                return Err(anyhow!(
-                    "cannot review `{ancestor}`: the selected changes replace a file with a \
-                     directory of the same name (or the reverse), and one review tree cannot \
-                     show both; narrow the review with `file:`/`dir:` targets"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn build_tree_from_diff_review_files(files: &[DiffReviewFile]) -> Result<DiffReviewTreeBuild> {
-    reject_file_directory_collisions(files)?;
     let mut builder = tree::TreeBuilder::new();
     let root = builder.root();
     let mut directories = HashMap::from([(RepoPath::root(), root)]);

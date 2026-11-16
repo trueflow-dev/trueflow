@@ -125,7 +125,8 @@ pub struct IndexedTreeFile {
 pub struct Tree {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
-    nodes_by_path: HashMap<RepoPath, TreeNodeId>,
+    files_by_path: HashMap<RepoPath, TreeNodeId>,
+    dirs_by_path: HashMap<RepoPath, TreeNodeId>,
     block_nodes_by_path_span: HashMap<RepoPath, HashMap<ByteSpan, SpanBlockNodes>>,
 }
 
@@ -179,12 +180,25 @@ impl Tree {
         values.remove(&self.root).unwrap_or_else(|| json!({}))
     }
 
-    pub fn find_by_path(&self, path: &str) -> Option<TreeNodeId> {
-        if let Some(node_id) = self.nodes_by_path.get(path) {
+    pub fn find_file_by_path(&self, path: &str) -> Option<TreeNodeId> {
+        if let Some(node_id) = self.files_by_path.get(path) {
             return Some(*node_id);
         }
         let normalized = RepoPath::new(path).ok()?;
-        self.nodes_by_path.get(&normalized).copied()
+        self.files_by_path.get(&normalized).copied()
+    }
+
+    pub fn find_dir_by_path(&self, path: &str) -> Option<TreeNodeId> {
+        if let Some(node_id) = self.dirs_by_path.get(path) {
+            return Some(*node_id);
+        }
+        let normalized = RepoPath::new(path).ok()?;
+        self.dirs_by_path.get(&normalized).copied()
+    }
+
+    pub fn find_by_path(&self, path: &str) -> Option<TreeNodeId> {
+        self.find_file_by_path(path)
+            .or_else(|| self.find_dir_by_path(path))
     }
 
     pub fn parent(&self, id: TreeNodeId) -> Option<TreeNodeId> {
@@ -341,7 +355,8 @@ pub struct TreeBuilder {
     nodes: Vec<TreeNode>,
     root: TreeNodeId,
     children_by_id: HashMap<TreeNodeId, Vec<TreeNodeId>>,
-    nodes_by_path: HashMap<RepoPath, TreeNodeId>,
+    files_by_path: HashMap<RepoPath, TreeNodeId>,
+    dirs_by_path: HashMap<RepoPath, TreeNodeId>,
 }
 
 impl Default for TreeBuilder {
@@ -365,13 +380,14 @@ impl TreeBuilder {
             language: None,
             change: ReviewedBlockChange::Content,
         };
-        let mut nodes_by_path = HashMap::new();
-        nodes_by_path.insert(RepoPath::root(), root);
+        let mut dirs_by_path = HashMap::new();
+        dirs_by_path.insert(RepoPath::root(), root);
         Self {
             nodes: vec![root_node],
             root,
             children_by_id: HashMap::new(),
-            nodes_by_path,
+            files_by_path: HashMap::new(),
+            dirs_by_path,
         }
     }
 
@@ -480,7 +496,6 @@ impl TreeBuilder {
         );
 
         let id = TreeNodeId(self.nodes.len());
-        let is_hash_entry = kind.is_hash_entry();
         let index_path = path.clone();
         let node = TreeNode {
             id,
@@ -495,12 +510,22 @@ impl TreeBuilder {
             change: ReviewedBlockChange::Content,
         };
         self.nodes.push(node);
-        if is_hash_entry {
-            let previous = self.nodes_by_path.insert(index_path.clone(), id);
-            assert!(
-                previous.is_none(),
-                "tree node path must be unique: {index_path}"
-            );
+        match kind {
+            TreeNodeKind::File => {
+                let previous = self.files_by_path.insert(index_path.clone(), id);
+                assert!(
+                    previous.is_none(),
+                    "tree file path must be unique: {index_path}"
+                );
+            }
+            TreeNodeKind::Directory => {
+                let previous = self.dirs_by_path.insert(index_path.clone(), id);
+                assert!(
+                    previous.is_none(),
+                    "tree directory path must be unique: {index_path}"
+                );
+            }
+            TreeNodeKind::Root | TreeNodeKind::Block => {}
         }
         self.children_by_id.entry(parent).or_default().push(id);
         id
@@ -514,7 +539,8 @@ impl TreeBuilder {
         Tree {
             nodes: self.nodes,
             root: self.root,
-            nodes_by_path: self.nodes_by_path,
+            files_by_path: self.files_by_path,
+            dirs_by_path: self.dirs_by_path,
             block_nodes_by_path_span,
         }
     }

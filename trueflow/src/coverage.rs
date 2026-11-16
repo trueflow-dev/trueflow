@@ -356,7 +356,7 @@ impl<'a> CoverageIndex<'a> {
             .filter(|node_id| self.tree.node(*node_id).change == change);
         let container_node_id = resolved_node_id
             .or_else(|| self.smallest_covering_block_node(path, block, change))
-            .or_else(|| self.tree.find_by_path(path.as_str()));
+            .or_else(|| self.tree.find_file_by_path(path.as_str()));
         let facts = if self.unit_facts.is_empty() {
             None
         } else {

@@ -1410,7 +1410,19 @@ pub(crate) fn resolved_main_diff(
 pub fn main_diff_range(repo: &gix::Repository) -> Result<CommitRange> {
     let head = repo.head_commit()?.id().detach();
     let main = mainline_commit(repo)?.id().detach();
-    let base = repo.merge_base(head, main).map_or(main, |id| id.detach());
+    let base = if head == main {
+        main
+    } else {
+        repo.merge_base(head, main)
+            .with_context(|| {
+                if repo.is_shallow() {
+                    "HEAD and main branch have no merge base in this shallow clone; deepen history or pass an explicit revision range"
+                } else {
+                    "HEAD and main branch have no merge base; pass an explicit revision range"
+                }
+            })?
+            .detach()
+    };
     Ok(CommitRange {
         start: CommitId::new(base.to_string())?,
         end: CommitId::new(head.to_string())?,
