@@ -1534,11 +1534,9 @@ pub struct StoreLocation {
 }
 
 impl StoreLocation {
-    pub fn discover() -> Result<Self> {
+    pub fn discover_readonly() -> Result<Self> {
         if let Ok(Some(root)) = vcs::git_root_from_workdir() {
-            let location = Self { root_path: root };
-            location.ensure_trueflow_dir()?;
-            return Ok(location);
+            return Ok(Self { root_path: root });
         }
 
         let raw_start_dir = std::env::current_dir()?;
@@ -1546,7 +1544,11 @@ impl StoreLocation {
         let home_dir = dirs::home_dir().map(|home| fs::canonicalize(&home).unwrap_or(home));
         let root_path = existing_store_root_outside_git(&start_dir, home_dir.as_deref())
             .unwrap_or(raw_start_dir);
-        let location = Self { root_path };
+        Ok(Self { root_path })
+    }
+
+    pub fn discover() -> Result<Self> {
+        let location = Self::discover_readonly()?;
         location.ensure_trueflow_dir()?;
         Ok(location)
     }
@@ -1660,6 +1662,11 @@ pub struct FileStore {
 impl FileStore {
     pub fn new() -> Result<Self> {
         let location = StoreLocation::discover()?;
+        Self::from_location(location)
+    }
+
+    pub fn open_readonly() -> Result<Self> {
+        let location = StoreLocation::discover_readonly()?;
         Self::from_location(location)
     }
 

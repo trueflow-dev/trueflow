@@ -2,6 +2,7 @@ pub mod check;
 pub mod feedback;
 pub mod focus;
 pub mod inspect;
+pub mod log;
 pub mod mark;
 pub mod onboard;
 pub mod review;

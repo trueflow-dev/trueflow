@@ -234,6 +234,8 @@ pub enum Commands {
         #[arg(long)]
         id: Option<String>,
     },
+    /// List review records in reverse-chronological order
+    Log(crate::commands::log::LogArgs),
     /// Select a time-budgeted, evidence-grounded review of unreviewed code
     Focus(crate::commands::focus::FocusArgs),
     /// Generate a focused first-pass review of the repository's fundamental code
