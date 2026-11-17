@@ -111,9 +111,7 @@ pub fn run(
     };
     let matched = find_matching_block(&files, fingerprint, location)?;
     if split {
-        let sub_blocks =
-            sub_splitter::split_result_for_child_navigation(&matched.block, matched.language)?
-                .blocks;
+        let sub_blocks = sub_splitter::split(&matched.block, matched.language)?;
         if coverage {
             let (tree, database) = load_coverage_inputs(&files)?;
             let coverage_index = CoverageIndex::build(&tree, &database)?;

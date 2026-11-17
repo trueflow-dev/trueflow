@@ -325,12 +325,12 @@ fn test_inspect_split_reports_absolute_byte_spans() -> Result<()> {
 }
 
 #[test]
-fn inspect_split_expands_short_blocks_and_subdir_discovers_repo_root() -> Result<()> {
-    let repo = TestRepo::new("inspect_short_split_and_subdir_root")?;
-    repo.write(
-        "lib/service.rs",
-        "pub fn run() {\n    step_one();\n\n    step_two();\n}\n",
-    )?;
+fn inspect_split_from_subdirectory_discovers_repo_root() -> Result<()> {
+    let repo = TestRepo::new("inspect_subdir_root")?;
+    let body = (0..36)
+        .map(|idx| format!("    step_{idx}();\n\n"))
+        .collect::<String>();
+    repo.write("lib/service.rs", &format!("pub fn run() {{\n{body}}}\n"))?;
     repo.write("cmd/main.rs", "fn main() {}\n")?;
     repo.commit_all("initial")?;
 
@@ -352,7 +352,7 @@ fn inspect_split_expands_short_blocks_and_subdir_discovers_repo_root() -> Result
     let sub_blocks: Vec<Value> = serde_json::from_str(&output)?;
     assert!(
         sub_blocks.len() >= 2,
-        "inspect --split from sibling subdir must find and split short function: {sub_blocks:#?}"
+        "inspect --split from sibling subdir must find and split function: {sub_blocks:#?}"
     );
     Ok(())
 }

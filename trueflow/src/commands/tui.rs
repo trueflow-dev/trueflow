@@ -6579,7 +6579,8 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     } else {
         build_action_lines(actions_width, ui_mode, &state.keybinds, palette)
     };
-    let requested_actions_height = usize_to_u16_saturating(actions_lines.len()).max(ACTIONS_HEIGHT);
+    let requested_actions_height = usize_to_u16_saturating(actions_lines.len())
+        .clamp(ACTIONS_HEIGHT, ACTIONS_HEIGHT + CONTROLS_PADDING_HEIGHT);
     let focus_layout = compute_focus_layout_with_actions(
         area,
         usize_to_u16_saturating(header_lines.len()),
