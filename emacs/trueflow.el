@@ -201,11 +201,21 @@ when they contain a path separator. Bare command names are resolved via
         "<unknown>"
       (file-relative-name absolute root))))
 
+(defun trueflow--inspect-split-args (block)
+  "Build `inspect --split' CLI arguments for BLOCK with path and line."
+  (let ((args (list "inspect" "--fingerprint" (alist-get 'hash block)))
+        (path (alist-get 'file block))
+        (start-line (alist-get 'start_line block)))
+    (when (and (stringp path) (not (string-empty-p path)))
+      (setq args (append args (list "--path" path))))
+    (when (integerp start-line)
+      (setq args (append args (list "--line" (number-to-string start-line)))))
+    (append args (list "--split"))))
+
 (defun trueflow--fetch-subblocks (block)
   "Return sub-blocks for BLOCK or nil on failure."
   (condition-case nil
-      (trueflow--run-command
-       (list "inspect" "--fingerprint" (alist-get 'hash block) "--split"))
+      (trueflow--run-command (trueflow--inspect-split-args block))
     (error nil)))
 
 (defun trueflow--match-first (regex content)
@@ -408,18 +418,50 @@ deletion by the worktree changes on top of HEAD."
               (trueflow--insert-unreviewed-files))))
     (magit-section-update-highlight)))
 
+(defvar-local trueflow-initial-remaining-blocks nil
+  "Highest observed unreviewed block count in this status buffer session.")
+(defvar-local trueflow-focus-current-block nil)
+(defvar-local trueflow-focus-status-buffer nil)
+(defvar-local trueflow-focus-subblocks nil)
+(defvar-local trueflow-review-items nil
+  "List of all blocks to review.")
+(defvar-local trueflow-review-index 0
+  "Current index in `trueflow-review-items`.")
+(defvar-local trueflow-last-scan-data nil
+  "The last data retrieved from trueflow CLI.")
+(defvar-local trueflow-comment-target-block nil
+  "The review block being commented on.")
+(defvar-local trueflow-comment-status-buffer nil
+  "The buffer to return to after commenting.")
+(defvar-local trueflow-comment-after-commit-function nil
+  "Optional function to call after committing a comment.")
+
 (defun trueflow--insert-unreviewed-files ()
   "Insert unreviewed files tree."
   (let ((args (list "review" "--json")))
     (dolist (type trueflow-exclude-types)
       (setq args (append args (list "--exclude" type))))
-    
-    (let ((files (trueflow--run-command args)))
+
+    (let* ((files (trueflow--run-command args))
+           (remaining-blocks
+            (cl-loop for file in files
+                     sum (length (trueflow--ensure-list (alist-get 'blocks file)))))
+           (initial-blocks
+            (setq-local trueflow-initial-remaining-blocks
+                        (if trueflow-initial-remaining-blocks
+                            (max trueflow-initial-remaining-blocks remaining-blocks)
+                          remaining-blocks)))
+           (reviewed-blocks (max 0 (- initial-blocks remaining-blocks))))
       (setq trueflow-last-scan-data files)
       (if (seq-empty-p files)
-          (insert "  All clear! No unreviewed changes found.\n")
+          (if (> reviewed-blocks 0)
+              (insert (format "  All clear! No unreviewed changes found (%d reviewed).\n"
+                              reviewed-blocks))
+            (insert "  All clear! No unreviewed changes found.\n"))
         (magit-insert-section (unreviewed)
-          (magit-insert-heading (format "Unreviewed Files (%d)" (length files)))
+          (magit-insert-heading
+           (format "Unreviewed Files (%d files · %d reviewed, %d remaining)"
+                   (length files) reviewed-blocks remaining-blocks))
           (seq-doseq (file files)
             (trueflow--insert-file file))
           (insert "\n"))))))
@@ -428,7 +470,7 @@ deletion by the worktree changes on top of HEAD."
   "Insert a single FILE-STRUCT section."
   (let ((path (alist-get 'path file-struct))
         (blocks (trueflow--ensure-list (alist-get 'blocks file-struct))))
-    (magit-insert-section (trueflow-file path t :type 'trueflow-file)
+    (magit-insert-section (trueflow-file path t)
       (magit-insert-heading (format "%s (%d blocks)" path (length blocks)))
       (magit-insert-section-body
         (seq-doseq (block blocks)
@@ -436,45 +478,60 @@ deletion by the worktree changes on top of HEAD."
 
 (defun trueflow--insert-block (path block-struct)
   "Insert a single BLOCK-STRUCT section for PATH."
-  (let ((hash (alist-get 'hash block-struct))
-        (content (alist-get 'content block-struct))
-        (start (alist-get 'start_line block-struct))
-        (end (alist-get 'end_line block-struct)))
-    (magit-insert-section (trueflow-block (trueflow--annotate-block path block-struct)
-                                          :type 'trueflow-block)
+  (let* ((hash (alist-get 'hash block-struct))
+         (content (alist-get 'content block-struct))
+         (start-0 (or (alist-get 'start_line block-struct) 0))
+         (display-start (1+ start-0))
+         (display-end (max display-start (or (alist-get 'end_line block-struct) display-start))))
+    (magit-insert-section (trueflow-block (trueflow--annotate-block path block-struct))
       (magit-insert-heading
-       (format "L%d-L%d (%s...)" start end (trueflow--short-hash hash)))
+       (format "L%d-L%d (%s...)" display-start display-end (trueflow--short-hash hash)))
       (magit-insert-section-body
         (trueflow--insert-content content)
         (insert "\n")))))
 
 ;;; Commands
 
+(defun trueflow--status-directory (status-buf)
+  "Return `default-directory' from STATUS-BUF when live, or `default-directory'."
+  (if (and status-buf (buffer-live-p status-buf))
+      (buffer-local-value 'default-directory status-buf)
+    default-directory))
+
 (defun trueflow-approve-at-point ()
   "Approve the block at point."
   (interactive)
-  (trueflow--mark-at-point "approved" nil))
+  (if (derived-mode-p 'trueflow-focus-mode)
+      (trueflow-focus-approve)
+    (trueflow--mark-at-point "approved" nil)))
 
 (defun trueflow-reject-at-point ()
   "Reject the block at point."
   (interactive)
-  (trueflow--mark-at-point "rejected" nil))
+  (if (derived-mode-p 'trueflow-focus-mode)
+      (trueflow-focus-reject)
+    (trueflow--mark-at-point "rejected" nil)))
 
 (defun trueflow-comment-at-point ()
   "Comment on the block at point."
   (interactive)
-  (let ((section (magit-current-section)))
-    (unless (cl-typep section 'trueflow-block)
-      (user-error "Not on a block"))
-    (let* ((block (trueflow--section-value section))
-           (status-buf (current-buffer))
-           (buf (get-buffer-create "*trueflow-comment*")))
-      (pop-to-buffer buf '((display-buffer-below-selected) (window-height . 10)))
-      (trueflow-comment-mode)
-      (erase-buffer)
-      (setq-local trueflow-comment-target-block block)
-      (setq-local trueflow-comment-status-buffer status-buf)
-      (insert "# Write your comment below. Press C-c C-c to finish, C-c C-k to cancel.\n\n"))))
+  (if (derived-mode-p 'trueflow-focus-mode)
+      (trueflow-focus-comment)
+    (let ((section (magit-current-section)))
+      (unless (cl-typep section 'trueflow-block)
+        (user-error "Not on a block"))
+      (let* ((block (trueflow--section-value section))
+             (status-buf (current-buffer))
+             (status-dir (trueflow--status-directory status-buf))
+             (buf (get-buffer-create "*trueflow-comment*")))
+        (pop-to-buffer buf '((display-buffer-below-selected) (window-height . 10)))
+        (trueflow-comment-mode)
+        (setq-local default-directory status-dir)
+        (erase-buffer)
+        (setq-local trueflow-comment-target-block block)
+        (setq-local trueflow-comment-status-buffer status-buf)
+        (setq-local trueflow-comment-after-commit-function nil)
+        (insert "# Write your comment below. Press C-c C-c to finish, C-c C-k to cancel.\n\n")))))
 
 (defun trueflow--mark-at-point (verdict note)
   "Mark block at point with VERDICT and NOTE."
@@ -484,21 +541,36 @@ deletion by the worktree changes on top of HEAD."
     (trueflow--run-mark (trueflow--section-value section) verdict note)
     (trueflow-refresh)))
 
+(defun trueflow--visit-block (block root)
+  "Visit BLOCK's file relative to ROOT at BLOCK's 0-indexed `start_line'."
+  (let ((path (alist-get 'file block))
+        (start (or (alist-get 'start_line block) 0)))
+    (unless (and (stringp path) (not (string-empty-p path)))
+      (user-error "Block has no file path"))
+    (find-file (expand-file-name path root))
+    (goto-char (point-min))
+    (forward-line start)))
+
 (defun trueflow-edit-at-point ()
-  "Jump to the file location of the block at point."
+  "Jump to the file location of the block or file at point."
   (interactive)
-  (let ((section (magit-current-section)))
+  (let ((section (magit-current-section))
+        (root (trueflow-root)))
     (cond
      ((cl-typep section 'trueflow-block)
       (let* ((block (trueflow--section-value section))
-             (file-section (oref section parent)) ;; Fallback to oref for parent of block
-             (path (trueflow--section-value file-section))
-             (start (alist-get 'start_line block)))
-        (find-file path)
-        (goto-char (point-min))
-        (forward-line start)))
+             (annotated (if (alist-get 'file block)
+                            block
+                          (let ((parent (and (slot-boundp section 'parent)
+                                             (oref section parent))))
+                            (if parent
+                                (trueflow--annotate-block (trueflow--section-value parent) block)
+                              block)))))
+        (trueflow--visit-block annotated root)))
      ((cl-typep section 'trueflow-file)
-      (find-file (trueflow--section-value section)))
+      (find-file (expand-file-name (trueflow--section-value section) root)))
+     ((and (derived-mode-p 'trueflow-focus-mode) trueflow-focus-current-block)
+      (trueflow--visit-block trueflow-focus-current-block root))
      (t (user-error "Not on a file or block")))))
 
 (defun trueflow-visit-at-point ()
@@ -522,6 +594,8 @@ deletion by the worktree changes on top of HEAD."
     (define-key map (kbd "a") #'trueflow-focus-approve)
     (define-key map (kbd "x") #'trueflow-focus-reject)
     (define-key map (kbd "c") #'trueflow-focus-comment)
+    (define-key map (kbd "e") #'trueflow-edit-at-point)
+    (define-key map (kbd "RET") #'trueflow-visit-at-point)
     (define-key map (kbd "n") #'trueflow-focus-next)
     (define-key map (kbd "p") #'trueflow-focus-prev)
     (define-key map (kbd "s") #'trueflow-focus-subdivide)
@@ -533,16 +607,6 @@ deletion by the worktree changes on top of HEAD."
 (define-derived-mode trueflow-focus-mode special-mode "Trueflow Focus"
   "Mode for focused review of a single block."
   (hack-dir-local-variables-non-file-buffer))
-
-(defvar-local trueflow-focus-current-block nil)
-(defvar-local trueflow-focus-status-buffer nil)
-(defvar-local trueflow-focus-subblocks nil)
-(defvar-local trueflow-review-items nil
-  "List of all blocks to review.")
-(defvar-local trueflow-review-index 0
-  "Current index in `trueflow-review-items`.")
-(defvar-local trueflow-last-scan-data nil
-  "The last data retrieved from trueflow CLI.")
 
 (defun trueflow--annotate-block (path block)
   "Return a copy of BLOCK annotated with its file PATH."
@@ -630,13 +694,15 @@ next refreshed item is shown instead of skipping ahead."
 (defun trueflow-focus-open (block status-buf &optional current-idx total-count)
   "Open the focus buffer for BLOCK.
 When CURRENT-IDX and TOTAL-COUNT are given, show them as review progress."
-  (let ((buf (get-buffer-create "*trueflow-focus*")))
+  (let ((buf (get-buffer-create "*trueflow-focus*"))
+        (status-dir (trueflow--status-directory status-buf)))
     (switch-to-buffer buf)
     (trueflow-focus-mode)
+    (setq-local default-directory status-dir)
     (setq trueflow-focus-current-block block)
     (setq trueflow-focus-subblocks (trueflow--fetch-subblocks block))
     (setq trueflow-focus-status-buffer status-buf)
-    
+
     ;; Visual centering/margin
     (let* ((width (window-width))
            (content-width 80) ;; Target width for code
@@ -649,7 +715,7 @@ When CURRENT-IDX and TOTAL-COUNT are given, show them as review progress."
       (insert "\n\n")
       (trueflow--insert-content (alist-get 'content block))
       (trueflow--insert-actions
-       (concat "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit"
+       (concat "Actions: [a]pprove  [x]reject  [c]omment  [s]plit  [e]dit  [n]ext  [p]rev  [q]uit"
                (if (and current-idx total-count)
                    (format "  (%d / %d)" current-idx total-count)
                  ""))))
@@ -659,21 +725,21 @@ When CURRENT-IDX and TOTAL-COUNT are given, show them as review progress."
   "Subdivide the current block into sub-blocks and display them."
   (interactive)
   (when trueflow-focus-current-block
-    (let* ((hash (alist-get 'hash trueflow-focus-current-block))
-           (sub-blocks (or trueflow-focus-subblocks
-                           (trueflow--run-command (list "inspect" "--fingerprint" hash "--split")))))
+    (let ((sub-blocks (or trueflow-focus-subblocks
+                          (trueflow--run-command
+                           (trueflow--inspect-split-args trueflow-focus-current-block)))))
       (setq trueflow-focus-subblocks sub-blocks)
       (let ((inhibit-read-only t))
         (erase-buffer)
         (trueflow--insert-review-header trueflow-focus-current-block sub-blocks)
         (insert "\n\n")
-        
+
         (magit-insert-section (sub-blocks)
           (seq-doseq (block sub-blocks)
              (trueflow--insert-block (alist-get 'file trueflow-focus-current-block) block)))
-        
+
         (trueflow--insert-actions
-         "Actions: [a]pprove  [x]reject  [c]omment  [n]ext  [p]rev  [q]uit")
+         "Actions: [a]pprove  [x]reject  [c]omment  [e]dit  [n]ext  [p]rev  [q]uit")
         (goto-char (point-min))))))
 
 (defun trueflow--refresh-focus-session (status-buf current-hash)
@@ -692,20 +758,24 @@ When CURRENT-IDX and TOTAL-COUNT are given, show them as review progress."
     (trueflow--refresh-focus-session trueflow-focus-status-buffer
                                      (alist-get 'hash trueflow-focus-current-block))))
 
+(defun trueflow--refresh-focus-subblock (status-buf parent-hash)
+  "Refresh STATUS-BUF after a sub-block action and keep PARENT-HASH split."
+  (trueflow--refresh-focus-session status-buf parent-hash)
+  (let ((focus-buf (get-buffer "*trueflow-focus*")))
+    (when (and focus-buf
+               (equal (alist-get 'hash (buffer-local-value
+                                        'trueflow-focus-current-block focus-buf))
+                      parent-hash))
+      (with-current-buffer focus-buf
+        (trueflow-focus-subdivide)))))
+
 (defun trueflow--focus-subblock-action (section verdict)
   "Apply VERDICT to the sub-block SECTION of the split focus view.
 Refresh the status buffer and, while the parent block still needs review,
 re-render its split view."
   (let ((parent-hash (alist-get 'hash trueflow-focus-current-block)))
     (trueflow--run-mark (trueflow--section-value section) verdict nil)
-    (trueflow--refresh-focus-session trueflow-focus-status-buffer parent-hash)
-    (let ((focus-buf (get-buffer "*trueflow-focus*")))
-      (when (and focus-buf
-                 (equal (alist-get 'hash (buffer-local-value
-                                          'trueflow-focus-current-block focus-buf))
-                        parent-hash))
-        (with-current-buffer focus-buf
-          (trueflow-focus-subdivide))))))
+    (trueflow--refresh-focus-subblock trueflow-focus-status-buffer parent-hash)))
 
 (defun trueflow--focus-verdict (verdict)
   "Apply VERDICT to the sub-block at point, or else to the focused block."
@@ -725,18 +795,27 @@ re-render its split view."
 (defun trueflow-focus-comment ()
   (interactive)
   (when trueflow-focus-current-block
-    (let* ((block trueflow-focus-current-block)
-           (hash (alist-get 'hash block))
+    (let* ((section (magit-current-section))
+           (on-subblock (cl-typep section 'trueflow-block))
+           (parent-hash (alist-get 'hash trueflow-focus-current-block))
+           (block (if on-subblock
+                      (trueflow--section-value section)
+                    trueflow-focus-current-block))
            (status-buf trueflow-focus-status-buffer)
+           (status-dir (trueflow--status-directory status-buf))
            (buf (get-buffer-create "*trueflow-comment*")))
       (pop-to-buffer buf '((display-buffer-below-selected) (window-height . 10)))
       (trueflow-comment-mode)
+      (setq-local default-directory status-dir)
       (erase-buffer)
       (setq-local trueflow-comment-target-block block)
       (setq-local trueflow-comment-status-buffer status-buf)
       (setq-local trueflow-comment-after-commit-function
-                  (lambda ()
-                    (trueflow--refresh-focus-session status-buf hash)))
+                  (if on-subblock
+                      (lambda ()
+                        (trueflow--refresh-focus-subblock status-buf parent-hash))
+                    (lambda ()
+                      (trueflow--refresh-focus-session status-buf parent-hash))))
       (insert "# Write your comment below. Press C-c C-c to finish, C-c C-k to cancel.\n\n"))))
 
 (defun trueflow-focus-skip ()
@@ -756,15 +835,6 @@ re-render its split view."
   "Major mode for writing Trueflow comments.
 Press C-c C-c to commit, C-c C-k to cancel."
   :group 'trueflow)
-
-(defvar-local trueflow-comment-target-block nil
-  "The review block being commented on.")
-
-(defvar-local trueflow-comment-status-buffer nil
-  "The buffer to return to after commenting.")
-
-(defvar-local trueflow-comment-after-commit-function nil
-  "Optional function to call after committing a comment.")
 
 (defun trueflow-comment-commit ()
   "Submit the comment in the current buffer."
