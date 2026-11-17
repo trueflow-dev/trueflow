@@ -1,17 +1,9 @@
 use super::{
-    AppState, EditingActionResult, Event, InputCursor, InputMode, KeyCode, KeyEvent, KeyEventKind,
-    KeybindAction, RecapAction, Rect, SessionRecap, SpeedReadController, TuiAiState,
-    TuiDiffLineNumbers, TuiKeybindsConfig, TuiSpeedReadConfig, UiMode, ViewMode,
-    clear_action_error, clear_focus_scroll, current_ui_mode, editing_key_action_for_event,
-    execute_action_with, handle_advance_review_target, handle_child, handle_confirm_cancel,
-    handle_editing_key_action, handle_editing_submit_with, handle_mouse_event, handle_next,
-    handle_note_action, handle_parent, handle_paste_event, handle_prev, handle_scroll_line_down,
-    handle_scroll_line_up, handle_scroll_page_down, handle_scroll_page_up,
-    handle_speed_read_key_binding, key_code_accepts_repeat_in_normal_mode,
-    key_event_for_press_event, key_event_for_press_or_repeat_event, keybind_action_accepts_repeat,
-    keybind_action_for_key_code, recap_action_for_state, record_action_result,
-    set_focus_for_current_node, should_rerender_on_event, sync_speed_read_focus,
-    toggle_speed_read_mode, ui, vcs,
+    AppEventHost, AppState, DispatchOutcome, Event, InputCursor, InputMode, KeyEvent, RecapAction,
+    Rect, SessionRecap, SpeedReadController, TuiAiState, TuiDiffLineNumbers, TuiKeybindsConfig,
+    TuiSpeedReadConfig, UiMode, ViewMode, current_ui_mode, dispatch_app_event, execute_action_with,
+    handle_action_with, handle_confirm_batch_with, handle_editing_submit_with, handle_note_action,
+    handle_parent, record_action_result, set_focus_for_current_node, ui, vcs,
 };
 use crate::analysis::Language;
 use crate::block::{Block, BlockKind, ByteSpan, LineSpan};
@@ -344,183 +336,123 @@ where
             .map(|mode| mode.model.playback)
     }
 
+    pub fn speed_read_cursor(&self) -> Option<usize> {
+        self.state
+            .speed_read
+            .active_for(self.state.navigator.current_id())
+            .map(|mode| mode.model.cursor)
+    }
+
+    pub fn enable_onboarding_card_on_current(&mut self, details: &str) {
+        let node_id = self.state.navigator.current_id();
+        self.state.onboarding = Some(super::OnboardingState {
+            title: "Guided".to_string(),
+            description: "Pinned".to_string(),
+            cards: vec![crate::onboarding::OnboardingCard {
+                node_id,
+                description: "Inspect boundary".to_string(),
+                details: Some(details.to_string()),
+            }],
+            finished: false,
+            purpose: super::CardQueuePurpose::Plan(crate::onboarding::ReviewPurpose::Focus),
+            details_scroll: None,
+        });
+    }
+
+    pub fn is_onboarding_details_open(&self) -> bool {
+        self.state
+            .onboarding
+            .as_ref()
+            .is_some_and(|queue| queue.details_scroll.is_some())
+    }
+
     fn apply_event(&mut self, event: &Event) -> Result<()> {
-        if should_rerender_on_event(event) {
-            return Ok(());
-        }
-
-        if let Event::Paste(pasted) = event {
-            let _ = handle_paste_event(&mut self.state, pasted);
-            return Ok(());
-        }
-
-        if let Event::Mouse(mouse_event) = event {
-            let _ = handle_mouse_event(&mut self.state, *mouse_event);
-            return Ok(());
-        }
-
-        if key_event_for_press_or_repeat_event(event).is_some() {
-            clear_action_error(&mut self.state);
-        }
-
-        let input_mode = match self.state.input_mode {
-            InputMode::Normal => TestInputMode::Normal,
-            InputMode::Editing { .. } => TestInputMode::Editing,
-            InputMode::ConfirmBatch { .. } => TestInputMode::ConfirmBatch,
+        let mut host = ScriptedAppEventHost {
+            mark_action_runner: &mut self.mark_action_runner,
+            pending_session_action: &mut self.pending_session_action,
         };
-
-        match input_mode {
-            TestInputMode::Normal => self.apply_normal_mode_event(event),
-            TestInputMode::Editing => self.apply_editing_mode_event(event),
-            TestInputMode::ConfirmBatch => self.apply_confirm_batch_event(event),
-        }
-    }
-
-    fn apply_normal_mode_event(&mut self, event: &Event) -> Result<()> {
-        let Some(key_event) = key_event_for_press_or_repeat_event(event) else {
-            return Ok(());
-        };
-        let key_code = key_event.code;
-        let ui_mode = current_ui_mode(&self.state);
-
-        if matches!(ui_mode, UiMode::Recap) {
-            if key_event.kind == KeyEventKind::Press {
-                self.pending_session_action =
-                    recap_action_for_state(&self.state, key_code).map(ScriptedSessionAction::from);
-            }
-            return Ok(());
-        }
-
-        if matches!(ui_mode, UiMode::SpeedRead)
-            && key_event.kind == KeyEventKind::Press
-            && handle_speed_read_key_binding(&mut self.state, key_code)
-        {
-            return Ok(());
-        }
-
-        if let Some(action) = keybind_action_for_key_code(&self.state.keybinds, key_code) {
-            if key_event.kind == KeyEventKind::Repeat && !keybind_action_accepts_repeat(action) {
-                return Ok(());
-            }
-
-            match action {
-                KeybindAction::Up => handle_scroll_line_up(&mut self.state),
-                KeybindAction::Down => handle_scroll_line_down(&mut self.state),
-                KeybindAction::Prev => handle_prev(&mut self.state),
-                KeybindAction::Next => handle_next(&mut self.state),
-                KeybindAction::Parent => handle_parent(&mut self.state),
-                KeybindAction::Child => handle_child(&mut self.state),
-                KeybindAction::Approve => {
-                    bail!("approve is not supported in the scripted test harness")
-                }
-                KeybindAction::Note => handle_note_action(&mut self.state)?,
-                KeybindAction::ToggleView => {
-                    self.state.view_mode = match self.state.view_mode {
-                        ViewMode::Source => ViewMode::Diff,
-                        ViewMode::Diff => ViewMode::Source,
-                    };
-                    let preferred_focus = self.state.focus_block;
-                    set_focus_for_current_node(&mut self.state, preferred_focus);
-                }
-                KeybindAction::SpeedRead => toggle_speed_read_mode(&mut self.state),
-                KeybindAction::Root => {
-                    self.state.navigator.jump_root();
-                    clear_focus_scroll(&mut self.state);
-                    sync_speed_read_focus(&mut self.state);
-                }
-                KeybindAction::Quit => {}
-            }
-            return Ok(());
-        }
-
-        if key_event.kind == KeyEventKind::Repeat
-            && matches!(key_code, KeyCode::Char(' '))
-            && self.state.navigator.current_id() != self.state.navigator.tree.root()
-        {
-            return Ok(());
-        }
-
-        if key_event.kind == KeyEventKind::Repeat
-            && !key_code_accepts_repeat_in_normal_mode(key_code)
-        {
-            return Ok(());
-        }
-
-        match key_code {
-            KeyCode::Char(' ')
-                if key_event.kind == KeyEventKind::Press
-                    && self.state.navigator.current_id() != self.state.navigator.tree.root() =>
-            {
-                handle_advance_review_target(&mut self.state);
-            }
-            KeyCode::Char(' ') | KeyCode::PageDown => handle_scroll_page_down(&mut self.state),
-            KeyCode::PageUp => handle_scroll_page_up(&mut self.state),
-            KeyCode::Home => self.state.scroll_offset = 0,
-            KeyCode::End => {
-                self.state.scroll_offset = self
-                    .state
-                    .content_height
-                    .saturating_sub(self.state.viewport_height);
-            }
-            KeyCode::Enter
-                if key_event.kind == KeyEventKind::Press
-                    && self.state.navigator.current_id() == self.state.navigator.tree.root() =>
-            {
-                handle_child(&mut self.state);
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    fn apply_editing_mode_event(&mut self, event: &Event) -> Result<()> {
-        let Some(key_event) = key_event_for_press_or_repeat_event(event) else {
-            return Ok(());
-        };
-
-        match handle_editing_key_action(&mut self.state, editing_key_action_for_event(&key_event)) {
-            EditingActionResult::Submit => {
-                let runner = &mut self.mark_action_runner;
-                let result = handle_editing_submit_with(&mut self.state, |action, state| {
-                    let Some(runner) = runner.as_mut() else {
-                        bail!("submit is not supported in the scripted test harness")
-                    };
-                    execute_action_with(state, action, |batch| {
-                        batch.into_iter().try_for_each(|params| {
-                            runner.run_mark(&ScriptedMarkAction::from(params))
-                        })
-                    })
-                });
-                record_action_result(&mut self.state, result);
-            }
-            EditingActionResult::Handled | EditingActionResult::Noop => {}
-        }
-
-        Ok(())
-    }
-
-    fn apply_confirm_batch_event(&mut self, event: &Event) -> Result<()> {
-        let Some(key_event) = key_event_for_press_event(event) else {
-            return Ok(());
-        };
-
-        match key_event.code {
-            KeyCode::Esc => handle_confirm_cancel(&mut self.state),
-            KeyCode::Enter => {
-                bail!("confirm batch submit is not supported in the scripted test harness")
-            }
-            _ => {}
-        }
-
+        let _ = dispatch_app_event(&mut self.state, event, &mut host)?;
         Ok(())
     }
 }
 
-enum TestInputMode {
-    Normal,
-    Editing,
-    ConfirmBatch,
+struct ScriptedAppEventHost<'a> {
+    mark_action_runner: &'a mut Option<Box<dyn MarkActionRunner>>,
+    pending_session_action: &'a mut Option<ScriptedSessionAction>,
+}
+
+impl AppEventHost for ScriptedAppEventHost<'_> {
+    fn on_approve(&mut self, state: &mut AppState) -> Result<()> {
+        let runner = &mut self.mark_action_runner;
+        let mut missing_runner = false;
+        let result = handle_action_with(state, Verdict::Approved, |action, state| {
+            let Some(runner) = runner.as_mut() else {
+                missing_runner = true;
+                bail!("approve requires an installed MarkActionRunner in ScriptedTui")
+            };
+            execute_action_with(state, action, |batch| {
+                batch
+                    .into_iter()
+                    .try_for_each(|params| runner.run_mark(&ScriptedMarkAction::from(params)))
+            })
+        });
+        if missing_runner {
+            return result;
+        }
+        record_action_result(state, result);
+        Ok(())
+    }
+
+    fn on_editing_submit(&mut self, state: &mut AppState) -> Result<()> {
+        let runner = &mut self.mark_action_runner;
+        let mut missing_runner = false;
+        let result = handle_editing_submit_with(state, |action, state| {
+            let Some(runner) = runner.as_mut() else {
+                missing_runner = true;
+                bail!("submit requires an installed MarkActionRunner in ScriptedTui")
+            };
+            execute_action_with(state, action, |batch| {
+                batch
+                    .into_iter()
+                    .try_for_each(|params| runner.run_mark(&ScriptedMarkAction::from(params)))
+            })
+        });
+        if missing_runner {
+            return result;
+        }
+        record_action_result(state, result);
+        Ok(())
+    }
+
+    fn on_confirm_batch(&mut self, state: &mut AppState) -> Result<()> {
+        let runner = &mut self.mark_action_runner;
+        let mut missing_runner = false;
+        let result = handle_confirm_batch_with(state, |action, state| {
+            let Some(runner) = runner.as_mut() else {
+                missing_runner = true;
+                bail!("confirm batch submit requires an installed MarkActionRunner in ScriptedTui")
+            };
+            execute_action_with(state, action, |batch| {
+                batch
+                    .into_iter()
+                    .try_for_each(|params| runner.run_mark(&ScriptedMarkAction::from(params)))
+            })
+        });
+        if missing_runner {
+            return result;
+        }
+        record_action_result(state, result);
+        Ok(())
+    }
+
+    fn on_recap_action(&mut self, _state: &mut AppState, action: RecapAction) -> DispatchOutcome {
+        *self.pending_session_action = Some(ScriptedSessionAction::from(action));
+        DispatchOutcome::Noop
+    }
+
+    fn on_quit(&mut self, _state: &mut AppState) -> DispatchOutcome {
+        DispatchOutcome::Noop
+    }
 }
 
 fn current_or_ancestor_file_id(state: &AppState, start: TreeNodeId) -> Option<TreeNodeId> {

@@ -3,11 +3,11 @@ use crate::config::{SpeedReadDefaultsWriter, TuiSpeedReadConfig, TuiSpeedReadPun
 use crate::review_speedread::{
     PlaybackState, PunctuationDwellMode, SpeedReadModel, new_model as build_speed_read_model,
     next_wpm_step_down, next_wpm_step_up, rechunk_preserving_progress, set_wpm, step_next,
-    step_prev, tick_interval_with_punctuation_ms,
+    step_next_sentence, step_prev, step_prev_sentence, tick_interval_with_punctuation_ms,
 };
 use crate::tree::{TreeNodeId, TreeNodeKind};
 use anyhow::Result;
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 
 const SPEED_READ_PERSIST_DEBOUNCE: Duration = Duration::from_millis(512);
@@ -175,30 +175,56 @@ impl SpeedReadController {
         true
     }
 
-    pub(crate) fn handle_key_binding(
+    pub(crate) fn pause(&mut self) {
+        if let Some(mode) = self.active.as_mut() {
+            mode.model.playback = PlaybackState::Paused;
+            mode.next_tick_at = None;
+        }
+    }
+
+    pub(crate) fn handle_key_event(
         &mut self,
-        key_code: KeyCode,
+        key_event: &KeyEvent,
         current_node_id: TreeNodeId,
     ) -> bool {
         if !self.is_active_for(current_node_id) {
             return false;
         }
+        if key_event
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return false;
+        }
 
-        match key_code {
+        let is_press = key_event.kind == KeyEventKind::Press;
+        match key_event.code {
             KeyCode::Esc => {
-                self.active = None;
+                if is_press {
+                    self.active = None;
+                }
                 true
             }
             KeyCode::Char(' ') => {
-                self.toggle_playback();
+                if is_press {
+                    self.toggle_playback();
+                }
                 true
             }
-            KeyCode::Char('j') => {
+            KeyCode::Char('j' | 'h') | KeyCode::Left => {
                 self.step_prev();
                 true
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('l') | KeyCode::Right => {
                 self.step_next_or_exit();
+                true
+            }
+            KeyCode::Char('J' | '{') | KeyCode::Up => {
+                self.step_prev_sentence();
+                true
+            }
+            KeyCode::Char('L' | '}') | KeyCode::Down => {
+                self.step_next_sentence_or_exit();
                 true
             }
             KeyCode::Char('-') => {
@@ -218,11 +244,25 @@ impl SpeedReadController {
                 true
             }
             KeyCode::Char('0') => {
-                self.reset_to_persisted_defaults();
+                if is_press {
+                    self.reset_to_persisted_defaults();
+                }
                 true
             }
             _ => false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_key_binding(
+        &mut self,
+        key_code: KeyCode,
+        current_node_id: TreeNodeId,
+    ) -> bool {
+        self.handle_key_event(
+            &KeyEvent::new(key_code, KeyModifiers::NONE),
+            current_node_id,
+        )
     }
 
     pub(crate) fn handle_autoplay_timeout(
@@ -329,6 +369,33 @@ impl SpeedReadController {
                 should_exit = true;
             } else {
                 step_next(&mut mode.model, loop_playback);
+                update_next_tick(mode, punctuation_dwell, punctuation_dwell_multiplier);
+            }
+        }
+        if should_exit {
+            self.active = None;
+        }
+    }
+
+    fn step_prev_sentence(&mut self) {
+        let punctuation_dwell = self.config.punctuation_dwell;
+        let punctuation_dwell_multiplier = self.config.punctuation_dwell_multiplier;
+        if let Some(mode) = self.active.as_mut() {
+            step_prev_sentence(&mut mode.model);
+            update_next_tick(mode, punctuation_dwell, punctuation_dwell_multiplier);
+        }
+    }
+
+    fn step_next_sentence_or_exit(&mut self) {
+        let mut should_exit = false;
+        let punctuation_dwell = self.config.punctuation_dwell;
+        let punctuation_dwell_multiplier = self.config.punctuation_dwell_multiplier;
+        if let Some(mode) = self.active.as_mut() {
+            let loop_playback = self.config.loop_playback;
+            if !step_next_sentence(&mut mode.model, loop_playback) {
+                mode.model.playback = PlaybackState::Paused;
+                should_exit = true;
+            } else {
                 update_next_tick(mode, punctuation_dwell, punctuation_dwell_multiplier);
             }
         }

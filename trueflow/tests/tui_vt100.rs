@@ -1,7 +1,7 @@
 #![cfg(feature = "tui-test-support")]
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::sync::{Arc, Mutex};
 use trueflow::commands::review::{BlockChangeKind, FileChangeKind};
 use trueflow::commands::tui::test_support::{
@@ -1352,5 +1352,98 @@ fn speed_read_space_only_dispatches_while_current_mode_is_speed_read() -> Result
         "did not expect space to revive speed read off the active block"
     );
 
+    Ok(())
+}
+
+#[test]
+fn speed_read_repeat_keys_step_phrases_without_leaking_to_normal_navigation() -> Result<()> {
+    let mut app = ScriptedTui::with_root_files(VT100Backend::new(80, 18), ["a.rs", "b.rs"])?;
+    // Enter a.rs -> its block.
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+    app.send_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE))?;
+    app.send_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))?;
+    assert!(app.is_speed_read_active());
+    assert_eq!(app.speed_read_cursor(), Some(0));
+
+    // Holding `l` sends Repeat events: it must step within speed-read rather than
+    // falling through to Normal mode `KeybindAction::Next` and jumping to b.rs!
+    app.send_key(KeyEvent::new_with_kind(
+        KeyCode::Char('l'),
+        KeyModifiers::NONE,
+        KeyEventKind::Repeat,
+    ))?;
+    assert!(
+        app.is_speed_read_active(),
+        "Repeat `l` must stay in speed-read instead of leaking to normal navigation"
+    );
+    assert_eq!(app.speed_read_cursor(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn speed_read_pauses_when_opening_comment_overlay_and_jumps_sentences() -> Result<()> {
+    let prose = "First sentence has four words. Second sentence starts here now! Third ends.\n";
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(90, 18),
+        "src/lib.rs",
+        prose,
+        prose,
+        0,
+        1,
+    )?;
+
+    app.send_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))?;
+    assert_eq!(app.speed_read_cursor(), Some(0));
+
+    // Jump forward one sentence (`L`) and backward one sentence (`J`).
+    app.send_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT))?;
+    let second_sentence_cursor = app.speed_read_cursor().unwrap_or(0);
+    assert!(
+        second_sentence_cursor > 0,
+        "expected `L` to jump to the start of the second sentence"
+    );
+    app.send_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))?;
+    assert_eq!(app.speed_read_cursor(), Some(0));
+
+    // Start autoplay (`Space`), then open comment overlay (`c`): playback must pause.
+    app.send_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))?;
+    assert_eq!(app.speed_read_playback(), Some(PlaybackState::Playing));
+    app.send_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))?;
+    assert!(app.is_editing());
+    assert_eq!(
+        app.speed_read_playback(),
+        Some(PlaybackState::Paused),
+        "opening comment overlay must pause active speed-read playback"
+    );
+    Ok(())
+}
+
+#[test]
+fn scripted_tui_enforces_onboarding_guards_and_f1_details_via_shared_dispatcher() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(80, 20),
+        "src/lib.rs",
+        "pub fn auth() {}\n",
+        "pub fn auth() {}\n",
+        0,
+        1,
+    )?;
+    app.enable_onboarding_card_on_current("Detailed focus evidence");
+
+    // `g` (Root) is disabled during onboarding/focus card queues.
+    app.send_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))?;
+    assert!(
+        !app.is_at_root(),
+        "shared dispatcher must block jumping to root during onboarding/focus"
+    );
+
+    // `F1` opens and closes the focus/onboarding details panel.
+    app.send_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))?;
+    assert!(
+        app.is_onboarding_details_open(),
+        "shared dispatcher must toggle onboarding details on F1"
+    );
+    app.send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?;
+    assert!(!app.is_onboarding_details_open());
     Ok(())
 }

@@ -34,6 +34,7 @@ pub struct SpeedReadSettings {
 pub struct SpeedReadModel {
     pub tokens: Vec<Token>,
     pub phrases: Vec<Phrase>,
+    pub sentence_starts: Vec<usize>,
     pub cursor: usize,
     pub playback: PlaybackState,
     pub settings: SpeedReadSettings,
@@ -46,6 +47,33 @@ pub fn tokenize_prose(text: &str) -> Vec<Token> {
             is_word: true,
         })
         .collect()
+}
+
+pub fn build_sentence_starts(tokens: &[Token]) -> Vec<usize> {
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.is_word)
+        .map(|token| token.text.as_str())
+        .collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut starts = vec![0];
+    for (idx, word) in words.iter().enumerate() {
+        if idx + 1 < words.len() && ends_sentence(word) {
+            starts.push(idx + 1);
+        }
+    }
+    starts
+}
+
+fn ends_sentence(word: &str) -> bool {
+    let trimmed = word.trim_end_matches(['"', '\'', ')', ']', '}']);
+    trimmed
+        .chars()
+        .last()
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?'))
 }
 
 pub fn build_phrases(tokens: &[Token], chunk_words: u8) -> Vec<Phrase> {
@@ -77,9 +105,11 @@ pub fn build_phrases(tokens: &[Token], chunk_words: u8) -> Vec<Phrase> {
 pub fn new_model(text: &str, wpm: u16, chunk_words: u8) -> SpeedReadModel {
     let tokens = tokenize_prose(text);
     let phrases = build_phrases(&tokens, chunk_words);
+    let sentence_starts = build_sentence_starts(&tokens);
     SpeedReadModel {
         tokens,
         phrases,
+        sentence_starts,
         cursor: 0,
         playback: PlaybackState::Paused,
         settings: SpeedReadSettings { wpm, chunk_words },
@@ -99,6 +129,43 @@ pub fn step_next(model: &mut SpeedReadModel, loop_playback: bool) {
 
 pub fn step_prev(model: &mut SpeedReadModel) {
     model.cursor = model.cursor.saturating_sub(1);
+}
+
+pub fn step_next_sentence(model: &mut SpeedReadModel, loop_playback: bool) -> bool {
+    if model.phrases.is_empty() {
+        return false;
+    }
+    let chunk_words = usize::from(model.settings.chunk_words.max(1));
+    for &word_start in &model.sentence_starts {
+        let target_cursor = (word_start / chunk_words).min(model.phrases.len().saturating_sub(1));
+        if target_cursor > model.cursor {
+            model.cursor = target_cursor;
+            return true;
+        }
+    }
+    if loop_playback {
+        model.cursor = 0;
+        true
+    } else {
+        false
+    }
+}
+
+pub fn step_prev_sentence(model: &mut SpeedReadModel) {
+    if model.phrases.is_empty() {
+        return;
+    }
+    let chunk_words = usize::from(model.settings.chunk_words.max(1));
+    let mut best = 0;
+    for &word_start in &model.sentence_starts {
+        let target_cursor = (word_start / chunk_words).min(model.phrases.len().saturating_sub(1));
+        if target_cursor < model.cursor {
+            best = target_cursor;
+        } else {
+            break;
+        }
+    }
+    model.cursor = best;
 }
 
 pub fn set_wpm(model: &mut SpeedReadModel, new_wpm: u16, min: u16, max: u16) {

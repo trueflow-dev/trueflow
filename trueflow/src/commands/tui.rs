@@ -3694,207 +3694,253 @@ fn run_app(
         let Some(event) = event else {
             continue;
         };
-        if should_rerender_on_event(&event) {
-            needs_render = true;
-            continue;
+        let mut host = LiveAppEventHost { session, context };
+        match dispatch_app_event(&mut state, &event, &mut host)? {
+            DispatchOutcome::Noop => {}
+            DispatchOutcome::Render => needs_render = true,
+            DispatchOutcome::Exit(exit) => return Ok(exit),
         }
+    }
+}
 
-        if let Event::Paste(pasted) = &event {
-            if handle_paste_event(&mut state, pasted) {
-                needs_render = true;
+enum DispatchOutcome {
+    Noop,
+    Render,
+    Exit(AppExit),
+}
+
+trait AppEventHost {
+    fn on_approve(&mut self, state: &mut AppState) -> Result<()>;
+    fn on_editing_submit(&mut self, state: &mut AppState) -> Result<()>;
+    fn on_confirm_batch(&mut self, state: &mut AppState) -> Result<()>;
+    fn on_recap_action(&mut self, state: &mut AppState, action: RecapAction) -> DispatchOutcome;
+    fn on_quit(&mut self, state: &mut AppState) -> DispatchOutcome;
+}
+
+struct LiveAppEventHost<'a, 'b> {
+    session: &'a mut TerminalSession,
+    context: &'b TrueflowContext,
+}
+
+impl AppEventHost for LiveAppEventHost<'_, '_> {
+    fn on_approve(&mut self, state: &mut AppState) -> Result<()> {
+        let result = handle_action(self.session, self.context, state, Verdict::Approved);
+        record_action_result(state, result);
+        Ok(())
+    }
+
+    fn on_editing_submit(&mut self, state: &mut AppState) -> Result<()> {
+        let result = handle_editing_submit(self.session, self.context, state);
+        record_action_result(state, result);
+        Ok(())
+    }
+
+    fn on_confirm_batch(&mut self, state: &mut AppState) -> Result<()> {
+        let result = handle_confirm_batch(self.session, self.context, state);
+        record_action_result(state, result);
+        Ok(())
+    }
+
+    fn on_recap_action(&mut self, state: &mut AppState, action: RecapAction) -> DispatchOutcome {
+        if flush_pending_speed_read_defaults(state) {
+            DispatchOutcome::Exit(match action {
+                RecapAction::Exit => AppExit::Quit,
+                RecapAction::ReviewSomethingElse => AppExit::ReviewSomethingElse,
+                RecapAction::ContinueFullReview => AppExit::ContinueFullReview,
+                RecapAction::NextFocusedPass => AppExit::NextFocusedPass,
+            })
+        } else {
+            DispatchOutcome::Render
+        }
+    }
+
+    fn on_quit(&mut self, state: &mut AppState) -> DispatchOutcome {
+        if flush_pending_speed_read_defaults(state) {
+            DispatchOutcome::Exit(AppExit::Quit)
+        } else {
+            DispatchOutcome::Render
+        }
+    }
+}
+
+fn dispatch_app_event<H: AppEventHost>(
+    state: &mut AppState,
+    event: &Event,
+    host: &mut H,
+) -> Result<DispatchOutcome> {
+    if should_rerender_on_event(event) {
+        return Ok(DispatchOutcome::Render);
+    }
+
+    if let Event::Paste(pasted) = event {
+        return Ok(if handle_paste_event(state, pasted) {
+            DispatchOutcome::Render
+        } else {
+            DispatchOutcome::Noop
+        });
+    }
+
+    if let Event::Mouse(mouse_event) = event {
+        return Ok(if handle_mouse_event(state, *mouse_event) {
+            DispatchOutcome::Render
+        } else {
+            DispatchOutcome::Noop
+        });
+    }
+
+    let mut cleared_error = false;
+    if key_event_for_press_or_repeat_event(event).is_some() && clear_action_error(state) {
+        cleared_error = true;
+    }
+    let default_outcome = if cleared_error {
+        DispatchOutcome::Render
+    } else {
+        DispatchOutcome::Noop
+    };
+
+    match &state.input_mode {
+        InputMode::Normal => {
+            let Some(key_event) = key_event_for_press_or_repeat_event(event) else {
+                return Ok(default_outcome);
+            };
+            let key_code = key_event.code;
+            let ui_mode = current_ui_mode(state);
+            if handle_selected_review_details_key(state, key_code) {
+                return Ok(DispatchOutcome::Render);
             }
-            continue;
-        }
 
-        if let Event::Mouse(mouse_event) = &event {
-            if handle_mouse_event(&mut state, *mouse_event) {
-                needs_render = true;
+            if matches!(ui_mode, UiMode::Recap) {
+                if key_event.kind == KeyEventKind::Press
+                    && let Some(action) = recap_action_for_state(state, key_code)
+                {
+                    return Ok(host.on_recap_action(state, action));
+                }
+                return Ok(default_outcome);
             }
-            continue;
-        }
 
-        if key_event_for_press_or_repeat_event(&event).is_some() && clear_action_error(&mut state) {
-            needs_render = true;
-        }
+            if matches!(ui_mode, UiMode::SpeedRead)
+                && handle_speed_read_key_event(state, &key_event)
+            {
+                return Ok(DispatchOutcome::Render);
+            }
 
-        match &state.input_mode {
-            InputMode::Normal => {
-                let Some(key_event) = key_event_for_press_or_repeat_event(&event) else {
-                    continue;
-                };
-                let key_code = key_event.code;
-                let ui_mode = current_ui_mode(&state);
-                if handle_selected_review_details_key(&mut state, key_code) {
-                    needs_render = true;
-                    continue;
+            if let Some(action) = keybind_action_for_key_event(&state.keybinds, &key_event) {
+                if key_event.kind == KeyEventKind::Repeat && !keybind_action_accepts_repeat(action)
+                {
+                    return Ok(default_outcome);
                 }
 
-                if matches!(ui_mode, UiMode::Recap) {
+                match action {
+                    KeybindAction::Up => handle_scroll_line_up(state),
+                    KeybindAction::Down => handle_scroll_line_down(state),
+                    KeybindAction::Prev => handle_prev(state),
+                    KeybindAction::Next => handle_next(state),
+                    KeybindAction::Parent => handle_parent(state),
+                    KeybindAction::Child => handle_child(state),
+                    KeybindAction::Approve => host.on_approve(state)?,
+                    KeybindAction::Note => handle_note_action(state)?,
+                    KeybindAction::ToggleView
+                        if state
+                            .onboarding
+                            .as_ref()
+                            .is_some_and(|queue| !queue.purpose.allows_view_toggle()) => {}
+                    KeybindAction::ToggleView => {
+                        state.view_mode = match state.view_mode {
+                            ViewMode::Source => ViewMode::Diff,
+                            ViewMode::Diff => ViewMode::Source,
+                        };
+                        let preferred_focus = state.focus_block;
+                        set_focus_for_current_node(state, preferred_focus);
+                    }
+                    KeybindAction::SpeedRead => toggle_speed_read_mode(state),
+                    KeybindAction::Root if state.onboarding.is_some() => {}
+                    KeybindAction::Root => {
+                        state.navigator.jump_root();
+                        clear_focus_scroll(state);
+                        sync_speed_read_focus(state);
+                    }
+                    KeybindAction::Quit => return Ok(host.on_quit(state)),
+                }
+                return Ok(DispatchOutcome::Render);
+            }
+
+            if key_event.kind == KeyEventKind::Repeat
+                && matches!(key_code, KeyCode::Char(' '))
+                && state.navigator.current_id() != state.navigator.tree.root()
+            {
+                return Ok(default_outcome);
+            }
+
+            if key_event.kind == KeyEventKind::Repeat
+                && !key_code_accepts_repeat_in_normal_mode(key_code)
+            {
+                return Ok(default_outcome);
+            }
+
+            match key_code {
+                KeyCode::Char(' ')
                     if key_event.kind == KeyEventKind::Press
-                        && let Some(action) = recap_action_for_state(&state, key_code)
-                    {
-                        if flush_pending_speed_read_defaults(&mut state) {
-                            return Ok(match action {
-                                RecapAction::Exit => AppExit::Quit,
-                                RecapAction::ReviewSomethingElse => AppExit::ReviewSomethingElse,
-                                RecapAction::ContinueFullReview => AppExit::ContinueFullReview,
-                                RecapAction::NextFocusedPass => AppExit::NextFocusedPass,
-                            });
-                        }
-                        needs_render = true;
-                    }
-                    continue;
-                }
-
-                if matches!(ui_mode, UiMode::SpeedRead)
-                    && key_event.kind == KeyEventKind::Press
-                    && handle_speed_read_key_binding(&mut state, key_code)
+                        && state.navigator.current_id() != state.navigator.tree.root() =>
                 {
-                    needs_render = true;
-                    continue;
+                    handle_advance_review_target(state);
+                    Ok(DispatchOutcome::Render)
                 }
-
-                if let Some(action) = keybind_action_for_key_event(&state.keybinds, &key_event) {
-                    if key_event.kind == KeyEventKind::Repeat
-                        && !keybind_action_accepts_repeat(action)
-                    {
-                        continue;
-                    }
-
-                    match action {
-                        KeybindAction::Up => handle_scroll_line_up(&mut state),
-                        KeybindAction::Down => handle_scroll_line_down(&mut state),
-                        KeybindAction::Prev => handle_prev(&mut state),
-                        KeybindAction::Next => handle_next(&mut state),
-                        KeybindAction::Parent => handle_parent(&mut state),
-                        KeybindAction::Child => handle_child(&mut state),
-                        KeybindAction::Approve => {
-                            let result =
-                                handle_action(session, context, &mut state, Verdict::Approved);
-                            record_action_result(&mut state, result);
-                        }
-                        KeybindAction::Note => {
-                            handle_note_action(&mut state)?;
-                        }
-                        KeybindAction::ToggleView
-                            if state
-                                .onboarding
-                                .as_ref()
-                                .is_some_and(|queue| !queue.purpose.allows_view_toggle()) => {}
-                        KeybindAction::ToggleView => {
-                            state.view_mode = match state.view_mode {
-                                ViewMode::Source => ViewMode::Diff,
-                                ViewMode::Diff => ViewMode::Source,
-                            };
-                            let preferred_focus = state.focus_block;
-                            set_focus_for_current_node(&mut state, preferred_focus);
-                        }
-                        KeybindAction::SpeedRead => toggle_speed_read_mode(&mut state),
-                        KeybindAction::Root if state.onboarding.is_some() => {}
-                        KeybindAction::Root => {
-                            state.navigator.jump_root();
-                            clear_focus_scroll(&mut state);
-                            sync_speed_read_focus(&mut state);
-                        }
-                        KeybindAction::Quit => {
-                            if flush_pending_speed_read_defaults(&mut state) {
-                                return Ok(AppExit::Quit);
-                            }
-                        }
-                    }
-                    needs_render = true;
-                    continue;
+                KeyCode::Char(' ') | KeyCode::PageDown => {
+                    handle_scroll_page_down(state);
+                    Ok(DispatchOutcome::Render)
                 }
-
-                if key_event.kind == KeyEventKind::Repeat
-                    && matches!(key_code, KeyCode::Char(' '))
-                    && state.navigator.current_id() != state.navigator.tree.root()
+                KeyCode::PageUp => {
+                    handle_scroll_page_up(state);
+                    Ok(DispatchOutcome::Render)
+                }
+                KeyCode::Home => {
+                    state.scroll_offset = 0;
+                    Ok(DispatchOutcome::Render)
+                }
+                KeyCode::End => {
+                    state.scroll_offset =
+                        state.content_height.saturating_sub(state.viewport_height);
+                    Ok(DispatchOutcome::Render)
+                }
+                KeyCode::Enter
+                    if key_event.kind == KeyEventKind::Press
+                        && state.navigator.current_id() == state.navigator.tree.root() =>
                 {
-                    continue;
+                    handle_child(state);
+                    Ok(DispatchOutcome::Render)
                 }
-
-                if key_event.kind == KeyEventKind::Repeat
-                    && !key_code_accepts_repeat_in_normal_mode(key_code)
-                {
-                    continue;
-                }
-
-                match key_code {
-                    KeyCode::Char(' ')
-                        if key_event.kind == KeyEventKind::Press
-                            && state.navigator.current_id() != state.navigator.tree.root() =>
-                    {
-                        handle_advance_review_target(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Char(' ') => {
-                        handle_scroll_page_down(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::PageUp => {
-                        handle_scroll_page_up(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::PageDown => {
-                        handle_scroll_page_down(&mut state);
-                        needs_render = true;
-                    }
-                    KeyCode::Home => {
-                        state.scroll_offset = 0;
-                        needs_render = true;
-                    }
-                    KeyCode::End => {
-                        state.scroll_offset =
-                            state.content_height.saturating_sub(state.viewport_height);
-                        needs_render = true;
-                    }
-                    KeyCode::Enter
-                        if key_event.kind == KeyEventKind::Press
-                            && state.navigator.current_id() == state.navigator.tree.root() =>
-                    {
-                        handle_child(&mut state);
-                        needs_render = true;
-                    }
-                    _ => {}
-                }
+                _ => Ok(default_outcome),
             }
-            InputMode::Editing { .. } => {
-                let Some(key_event) = key_event_for_press_or_repeat_event(&event) else {
-                    continue;
-                };
+        }
+        InputMode::Editing { .. } => {
+            let Some(key_event) = key_event_for_press_or_repeat_event(event) else {
+                return Ok(default_outcome);
+            };
 
-                match handle_editing_key_action(
-                    &mut state,
-                    editing_key_action_for_event(&key_event),
-                ) {
-                    EditingActionResult::Submit => {
-                        let result = handle_editing_submit(session, context, &mut state);
-                        record_action_result(&mut state, result);
-                        needs_render = true;
-                    }
-                    EditingActionResult::Handled => {
-                        needs_render = true;
-                    }
-                    EditingActionResult::Noop => {}
+            match handle_editing_key_action(state, editing_key_action_for_event(&key_event)) {
+                EditingActionResult::Submit => {
+                    host.on_editing_submit(state)?;
+                    Ok(DispatchOutcome::Render)
                 }
+                EditingActionResult::Handled => Ok(DispatchOutcome::Render),
+                EditingActionResult::Noop => Ok(default_outcome),
             }
-            InputMode::ConfirmBatch { .. } => {
-                let Some(key_event) = key_event_for_press_event(&event) else {
-                    continue;
-                };
+        }
+        InputMode::ConfirmBatch { .. } => {
+            let Some(key_event) = key_event_for_press_event(event) else {
+                return Ok(default_outcome);
+            };
 
-                match key_event.code {
-                    KeyCode::Enter => {
-                        let result = handle_confirm_batch(session, context, &mut state);
-                        record_action_result(&mut state, result);
-                        needs_render = true;
-                    }
-                    KeyCode::Esc => {
-                        handle_confirm_cancel(&mut state);
-                        needs_render = true;
-                    }
-                    _ => {}
+            match key_event.code {
+                KeyCode::Enter => {
+                    host.on_confirm_batch(state)?;
+                    Ok(DispatchOutcome::Render)
                 }
+                KeyCode::Esc => {
+                    handle_confirm_cancel(state);
+                    Ok(DispatchOutcome::Render)
+                }
+                _ => Ok(default_outcome),
             }
         }
     }
@@ -4345,6 +4391,13 @@ fn toggle_speed_read_mode(state: &mut AppState) {
     }
 }
 
+fn handle_speed_read_key_event(state: &mut AppState, key_event: &KeyEvent) -> bool {
+    state
+        .speed_read
+        .handle_key_event(key_event, state.navigator.current_id())
+}
+
+#[cfg(test)]
 fn handle_speed_read_key_binding(state: &mut AppState, key_code: KeyCode) -> bool {
     state
         .speed_read
@@ -5426,13 +5479,22 @@ fn handle_action(
     state: &mut AppState,
     verdict: Verdict,
 ) -> Result<()> {
+    handle_action_with(state, verdict, |action, state| {
+        execute_action(session, context, state, action)
+    })
+}
+
+fn handle_action_with<F>(state: &mut AppState, verdict: Verdict, on_action: F) -> Result<()>
+where
+    F: FnOnce(PendingAction, &mut AppState) -> Result<()>,
+{
     let action =
         PendingAction::from_node(&state.navigator.tree, state.navigator.current_id(), verdict);
 
     if let Some(count) = batch_confirmation_count_for_action(state, &action) {
         state.input_mode = InputMode::ConfirmBatch { action, count };
     } else {
-        execute_action(session, context, state, action)?;
+        on_action(action, state)?;
     }
     Ok(())
 }
@@ -5446,6 +5508,7 @@ fn batch_confirmation_count_for_action(state: &AppState, action: &PendingAction)
 }
 
 fn handle_note_action(state: &mut AppState) -> Result<()> {
+    state.speed_read.pause();
     let action = PendingAction::from_node(
         &state.navigator.tree,
         state.navigator.current_id(),
@@ -6929,7 +6992,7 @@ fn build_speed_read_lines(
 }
 
 fn center_text(text: &str, width: usize) -> String {
-    let len = text.chars().count();
+    let len = UnicodeWidthStr::width(text);
     if len >= width {
         return text.to_string();
     }
@@ -7488,13 +7551,17 @@ fn build_action_lines(
             quit_action,
         ],
         UiMode::SpeedRead => vec![
+            approve_action,
+            note_action,
             "[Space]play/pause".to_string(),
             "[j]prev".to_string(),
             "[l]next".to_string(),
+            "[J/L]sentence".to_string(),
             "[-/=]wpm".to_string(),
             "[[/]]words".to_string(),
             "[0]reset".to_string(),
             format!("[{}/Esc]exit", keybinds.speed_read),
+            quit_action,
         ],
         UiMode::Recap => vec![recap_done_action_text(keybinds), quit_action],
     };
