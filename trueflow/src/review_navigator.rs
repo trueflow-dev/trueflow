@@ -7,6 +7,7 @@ pub struct ReviewNavigator {
     visible_nodes: HashSet<TreeNodeId>,
     visible_block_nodes: HashSet<TreeNodeId>,
     collapsible_approved_blocks: HashSet<TreeNodeId>,
+    directory_cursors: HashMap<TreeNodeId, TreeNodeId>,
     visible_block_descendant_counts: HashMap<TreeNodeId, usize>,
     current: TreeNodeId,
 }
@@ -19,10 +20,26 @@ impl ReviewNavigator {
             visible_nodes: visible.nodes,
             visible_block_nodes: visible.block_nodes,
             collapsible_approved_blocks: HashSet::new(),
+            directory_cursors: HashMap::new(),
             visible_block_descendant_counts: visible.block_descendant_counts,
             tree,
             current: root,
         })
+    }
+
+    pub fn directory_cursor(&self, dir_id: TreeNodeId) -> Option<TreeNodeId> {
+        self.directory_cursors.get(&dir_id).copied()
+    }
+
+    pub fn set_directory_cursor(&mut self, dir_id: TreeNodeId, target: Option<TreeNodeId>) {
+        match target {
+            Some(target) => {
+                self.directory_cursors.insert(dir_id, target);
+            }
+            None => {
+                self.directory_cursors.remove(&dir_id);
+            }
+        }
     }
 
     pub fn with_collapsible_approved_blocks(

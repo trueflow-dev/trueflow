@@ -899,7 +899,8 @@ impl DeclarationController {
                 Some(draft) if self.rejection_draft => format!("Reject: {draft}"),
                 Some(draft) => format!("Comment: {draft}"),
                 None => {
-                    "[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned()
+                    "[a]pprove [c]omment [r]eject [Space]skip [Tab]pane [o]relations [Backspace]back [q]uit"
+                        .to_owned()
                 }
             },
             banner: match (&self.save_error, self.comment_draft.is_some()) {
@@ -1389,8 +1390,10 @@ impl DeclarationController {
         if let Some(error) = &self.save_error {
             lines.push(error.clone());
         }
-        lines
-            .push("[a]pprove [c]omment [r]eject [Tab]pane [o]relations [Backspace]back".to_owned());
+        lines.push(
+            "[a]pprove [c]omment [r]eject [Space]skip [Tab]pane [o]relations [Backspace]back [q]uit"
+                .to_owned(),
+        );
         lines.push("Declaration Review".to_owned());
         lines.join("\n")
     }
@@ -1447,17 +1450,23 @@ pub fn layout_for(inner_width: u16, active_pane: DeclarationPane) -> Declaration
     }
 }
 
+pub(in crate::commands::tui::declaration) fn declaration_pane_row_height(
+    review_area_height: u16,
+) -> u16 {
+    if review_area_height >= 4 {
+        review_area_height - 4
+    } else {
+        review_area_height.saturating_sub(1)
+    }
+}
+
 /// Renders the complete declaration surface, including its body-free title, footer, and banner.
 pub fn render_declaration_review(
     frame: &mut Frame<'_>,
     area: Rect,
     controller: &DeclarationController,
 ) {
-    let row_height = if area.height >= 4 {
-        area.height - 4
-    } else {
-        area.height.saturating_sub(1)
-    };
+    let row_height = declaration_pane_row_height(area.height);
     let model = controller.render_model_for(area.width, row_height);
     if area.height < 4 {
         render_model(area, frame.buffer_mut(), &model);

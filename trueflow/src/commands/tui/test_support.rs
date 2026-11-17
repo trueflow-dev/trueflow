@@ -325,6 +325,19 @@ where
         self.state.navigator.current_id() == self.state.navigator.tree.root()
     }
 
+    pub fn set_confirm_batch(&mut self, policy: crate::config::BatchConfirmPolicy) {
+        self.state.confirm_batch = policy;
+    }
+
+    pub fn current_node_path(&self) -> String {
+        self.state
+            .navigator
+            .tree
+            .node(self.state.navigator.current_id())
+            .path
+            .to_string()
+    }
+
     pub fn is_speed_read_active(&self) -> bool {
         matches!(current_ui_mode(&self.state), UiMode::SpeedRead)
     }
@@ -510,23 +523,44 @@ where
 {
     let mut builder = TreeBuilder::new();
     let root = builder.root();
+    let mut dirs: HashMap<String, TreeNodeId> = HashMap::new();
     let mut visible = HashSet::new();
     let mut root_cursor = None;
 
     for name in file_names {
-        let name = name.into();
+        let full_path = name.into();
+        let mut parent = root;
+        let mut prefix = String::new();
+        let parts: Vec<&str> = full_path.split('/').collect();
+        for dir_part in &parts[..parts.len().saturating_sub(1)] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(dir_part);
+            let dir_id = *dirs.entry(prefix.clone()).or_insert_with(|| {
+                let id = builder.add_dir(parent, (*dir_part).to_string(), prefix.clone());
+                if parent == root {
+                    root_cursor.get_or_insert(id);
+                }
+                id
+            });
+            parent = dir_id;
+        }
+        let leaf_name = (*parts.last().unwrap_or(&full_path.as_str())).to_string();
         let file = builder.add_file(
-            root,
-            name.clone(),
-            name.clone(),
-            format!("{name}-hash"),
+            parent,
+            leaf_name.clone(),
+            full_path.clone(),
+            format!("{full_path}-hash"),
             Language::Rust,
         );
-        root_cursor.get_or_insert(file);
+        if parent == root {
+            root_cursor.get_or_insert(file);
+        }
         let block_id = builder.add_block(
             file,
-            format!("{}-block", name.trim_end_matches(".rs")),
-            name,
+            format!("{}-block", leaf_name.trim_end_matches(".rs")),
+            full_path,
             synthetic_block(
                 "fn item() {}\n".to_string(),
                 BlockKind::Function,

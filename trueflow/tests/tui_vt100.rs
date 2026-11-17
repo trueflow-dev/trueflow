@@ -1447,3 +1447,122 @@ fn scripted_tui_enforces_onboarding_guards_and_f1_details_via_shared_dispatcher(
     assert!(!app.is_onboarding_details_open());
     Ok(())
 }
+
+#[test]
+fn root_and_directory_actions_target_highlighted_entry() -> Result<()> {
+    let mut app = ScriptedTui::with_root_files(
+        VT100Backend::new(80, 20),
+        ["src/a.rs", "src/b.rs", "top.rs"],
+    )?;
+    let (runner, recorded) = recording_mark_action_runner();
+    app.install_mark_action_runner(runner);
+    app.render()?;
+
+    // Root lists `src/` then `top.rs`; move down (`j`) to highlight `top.rs` and press `a`.
+    app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))?;
+    assert_eq!(app.root_cursor_label().as_deref(), Some("top.rs"));
+    app.send_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))?;
+
+    {
+        let actions = recorded
+            .lock()
+            .map_err(|error| anyhow!("lock poisoned: {error}"))?;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].path.as_deref(),
+            Some("top.rs"),
+            "approving at root must target the highlighted entry, not the whole repository"
+        );
+    }
+    assert_eq!(app.remaining_blocks(), 2);
+
+    // Return to root (`g`), enter `src/` (`Enter`), move down (`j`) to `b.rs`, and press `Enter`.
+    app.send_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+    assert_eq!(app.current_node_path(), "src");
+    app.send_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))?;
+    app.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+    assert_eq!(
+        app.current_node_path(),
+        "src/b.rs",
+        "directory view j + Enter must enter the highlighted second file"
+    );
+    Ok(())
+}
+
+#[test]
+fn container_block_approval_triggers_named_batch_confirmation() -> Result<()> {
+    let content = "pub fn big() {\n    step_one();\n\n    step_two();\n}\n";
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(90, 22),
+        "src/lib.rs",
+        content,
+        content,
+        0,
+        5,
+    )?;
+    app.set_confirm_batch(trueflow::config::BatchConfirmPolicy::Threshold(2));
+
+    // Expand children (`C`) so `big()` becomes a container block with multiple visible children,
+    // then ascend (`P`) back to the container block itself and press `a`.
+    app.send_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE))?;
+    app.send_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT))?;
+    app.send_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))?;
+    app.render()?;
+
+    let screen = app.backend().screen_contents();
+    assert!(
+        screen.contains("Batch Action")
+            && screen.contains("'function big'")
+            && screen.contains("(src/lib.rs)"),
+        "container block approval must prompt named Batch Action confirmation:\n{screen}"
+    );
+    Ok(())
+}
+
+#[test]
+fn combining_marks_stay_attached_on_wrap_and_narrow_action_bar_is_unclipped() -> Result<()> {
+    let mut app = ScriptedTui::with_single_rust_block_file(
+        VT100Backend::new(42, 22),
+        "src/lib.rs",
+        "pub fn f() {}\n",
+        "pub fn f() {}\n",
+        0,
+        1,
+    )?;
+    app.render()?;
+    let narrow_screen = app.backend().screen_contents();
+    assert!(
+        narrow_screen.contains("[q]uit"),
+        "narrow focus layout must size action bar height dynamically so [q]uit is never clipped:\n{narrow_screen}"
+    );
+
+    // Open note overlay (`c`) on a narrow width and fill the first editor row up to the exact
+    // cell width ending with `'e'` + combining acute `'\u{0301}'`, followed by `'Z'`.
+    app.send_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))?;
+    app.render()?;
+    // Find inner wrap width of overlay (`input_overlay_width(42) - 2` = `38 - 2` = `36`, wait:
+    // let's check with exact fill of 35 `'a'`s + `"e\u{0301}Z"` when inner width is 36!).
+    // Even simpler: test any inner width W by filling 100 chars? Better: check that `"e\u{0301}"`
+    // appears intact on screen and `\u{0301}` never leads a wrapped line!
+    for width_probe in 30..42 {
+        let mut probe_app = ScriptedTui::with_single_rust_block_file(
+            VT100Backend::new(width_probe, 22),
+            "src/lib.rs",
+            "pub fn f() {}\n",
+            "pub fn f() {}\n",
+            0,
+            1,
+        )?;
+        probe_app.send_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))?;
+        let text = format!("{}e\u{0301}Z", "a".repeat(usize::from(width_probe) - 7));
+        press_text(&mut probe_app, &text)?;
+        probe_app.render()?;
+        let screen = probe_app.backend().screen_contents();
+        assert!(
+            !screen.contains("│\u{0301}Z"),
+            "combining accent must stay attached to base char `e` at width {width_probe}:\n{screen}"
+        );
+    }
+    Ok(())
+}

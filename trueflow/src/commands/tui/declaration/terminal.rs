@@ -20,7 +20,7 @@ use super::super::{
 use super::relationship_bridge::ProductionRelationshipCoordinator;
 use super::{
     DeclarationAppRuntime, DeclarationLayout, DeclarationPane, PreparedDeclarationLaunch,
-    prepare_declaration_launch, render_declaration_review,
+    declaration_pane_row_height, prepare_declaration_launch, render_declaration_review,
 };
 use crate::declaration::relationships::WorkspaceTrust;
 
@@ -62,8 +62,12 @@ pub(in crate::commands::tui) fn run(
                 prepared,
                 identity,
                 area.width,
-                area.height.saturating_sub(1),
+                terminal_pane_row_height(area.height, false),
             )?;
+            let has_status = runtime.incomplete_status_text().is_some();
+            if has_status {
+                runtime.resize(area.width, terminal_pane_row_height(area.height, true));
+            }
             let exit = run_runtime(
                 &mut session,
                 &mut runtime,
@@ -170,7 +174,8 @@ fn run_runtime(
         let event = event::read()?;
         match event {
             Event::Resize(width, height) => {
-                runtime.resize(width, height.saturating_sub(1));
+                let has_status = runtime.incomplete_status_text().is_some();
+                runtime.resize(width, terminal_pane_row_height(height, has_status));
             }
             Event::Paste(text) => {
                 if let Some(controller) = runtime.controller_mut()
@@ -244,4 +249,11 @@ fn run_runtime(
             _ => {}
         }
     }
+}
+
+fn terminal_pane_row_height(terminal_height: u16, has_status_line: bool) -> u16 {
+    let review_height = terminal_height
+        .saturating_sub(1)
+        .saturating_sub(u16::from(has_status_line));
+    declaration_pane_row_height(review_height)
 }

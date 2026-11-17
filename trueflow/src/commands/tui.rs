@@ -1012,7 +1012,7 @@ enum PendingAction {
 impl PendingAction {
     fn from_node(tree: &Tree, id: TreeNodeId, verdict: Verdict) -> Self {
         match tree.node(id).kind {
-            TreeNodeKind::Block => Self::Single {
+            TreeNodeKind::Block if !tree.is_container_block(id) => Self::Single {
                 node_id: id,
                 verdict,
                 note: None,
@@ -1022,6 +1022,14 @@ impl PendingAction {
                 verdict,
                 note: None,
             },
+        }
+    }
+
+    fn node_id(&self) -> TreeNodeId {
+        match self {
+            PendingAction::Single { node_id, .. } | PendingAction::Batch { node_id, .. } => {
+                *node_id
+            }
         }
     }
 
@@ -1557,18 +1565,12 @@ struct ContentNodeSnapshot {
     id: TreeNodeId,
     kind: TreeNodeKind,
     path: RepoPath,
-    children: Vec<TreeNodeId>,
     block: Option<crate::block::Block>,
     language: Option<Language>,
 }
 
 impl ContentNodeSnapshot {
     fn from_node(node: &crate::tree::TreeNode) -> Self {
-        let children = if matches!(node.kind, TreeNodeKind::Directory) {
-            node.children.clone()
-        } else {
-            Vec::new()
-        };
         let block = if matches!(node.kind, TreeNodeKind::Block) {
             node.block.clone()
         } else {
@@ -1578,7 +1580,6 @@ impl ContentNodeSnapshot {
             id: node.id,
             kind: node.kind,
             path: node.path.clone(),
-            children,
             block,
             language: node.language,
         }
@@ -3904,7 +3905,10 @@ fn dispatch_app_event<H: AppEventHost>(
                 }
                 KeyCode::Enter
                     if key_event.kind == KeyEventKind::Press
-                        && state.navigator.current_id() == state.navigator.tree.root() =>
+                        && matches!(
+                            state.navigator.tree.node(state.navigator.current_id()).kind,
+                            TreeNodeKind::Root | TreeNodeKind::Directory
+                        ) =>
                 {
                     handle_child(state);
                     Ok(DispatchOutcome::Render)
@@ -5009,27 +5013,41 @@ fn handle_child(state: &mut AppState) {
     if state.onboarding.is_some() {
         return;
     }
-    if state.navigator.current_id() == state.navigator.tree.root() {
-        let root_children = visible_root_children(state);
-        reseat_root_cursor(state, &root_children);
+    let current = state.navigator.current_id();
+    match state.navigator.tree.node(current).kind {
+        TreeNodeKind::Root => {
+            let root_children = visible_root_children(state);
+            reseat_root_cursor(state, &root_children);
 
-        if let Some(target) = state.root_cursor {
-            state.navigator.set_current(target);
+            if let Some(target) = state.root_cursor {
+                state.navigator.set_current(target);
+                state.scroll_offset = 0;
+                set_focus_for_current_node(state, None);
+                sync_speed_read_focus(state);
+            }
+        }
+        TreeNodeKind::Directory => {
+            let dir_children = visible_directory_children(state, current);
+            reseat_directory_cursor(state, current, &dir_children);
+
+            if let Some(target) = state.navigator.directory_cursor(current) {
+                state.navigator.set_current(target);
+                state.scroll_offset = 0;
+                set_focus_for_current_node(state, None);
+                sync_speed_read_focus(state);
+            }
+        }
+        TreeNodeKind::File | TreeNodeKind::Block => {
+            if state.navigator.first_visible_child(current).is_none()
+                && state.navigator.tree.node(current).children.is_empty()
+            {
+                let _ = expand_current_node_children(state, current);
+            }
+            state.navigator.descend();
             state.scroll_offset = 0;
             set_focus_for_current_node(state, None);
             sync_speed_read_focus(state);
         }
-    } else {
-        let current = state.navigator.current_id();
-        if state.navigator.first_visible_child(current).is_none()
-            && state.navigator.tree.node(current).children.is_empty()
-        {
-            let _ = expand_current_node_children(state, current);
-        }
-        state.navigator.descend();
-        state.scroll_offset = 0;
-        set_focus_for_current_node(state, None);
-        sync_speed_read_focus(state);
     }
 }
 
@@ -5131,18 +5149,20 @@ fn refresh_review_state_after_refinement(
 }
 
 fn handle_scroll_line_up(state: &mut AppState) {
-    if state.navigator.current_id() == state.navigator.tree.root() {
-        move_root_cursor(state, -1);
-    } else {
-        scroll_up_by(state, 1);
+    let current = state.navigator.current_id();
+    match state.navigator.tree.node(current).kind {
+        TreeNodeKind::Root => move_root_cursor(state, -1),
+        TreeNodeKind::Directory => move_directory_cursor(state, current, -1),
+        TreeNodeKind::File | TreeNodeKind::Block => scroll_up_by(state, 1),
     }
 }
 
 fn handle_scroll_line_down(state: &mut AppState) {
-    if state.navigator.current_id() == state.navigator.tree.root() {
-        move_root_cursor(state, 1);
-    } else {
-        scroll_down_by(state, 1);
+    let current = state.navigator.current_id();
+    match state.navigator.tree.node(current).kind {
+        TreeNodeKind::Root => move_root_cursor(state, 1),
+        TreeNodeKind::Directory => move_directory_cursor(state, current, 1),
+        TreeNodeKind::File | TreeNodeKind::Block => scroll_down_by(state, 1),
     }
 }
 
@@ -5484,12 +5504,82 @@ fn handle_action(
     })
 }
 
+fn visible_directory_children(state: &AppState, dir_id: TreeNodeId) -> Vec<TreeNodeId> {
+    state
+        .navigator
+        .tree
+        .node(dir_id)
+        .children
+        .iter()
+        .copied()
+        .filter(|id| state.navigator.is_visible(*id))
+        .collect()
+}
+
+fn reseat_directory_cursor(state: &mut AppState, dir_id: TreeNodeId, children: &[TreeNodeId]) {
+    let valid = state
+        .navigator
+        .directory_cursor(dir_id)
+        .filter(|id| children.contains(id))
+        .or_else(|| children.first().copied());
+    state.navigator.set_directory_cursor(dir_id, valid);
+}
+
+fn move_directory_cursor(state: &mut AppState, dir_id: TreeNodeId, offset: isize) {
+    let children = visible_directory_children(state, dir_id);
+    if children.is_empty() {
+        state.navigator.set_directory_cursor(dir_id, None);
+        state.scroll_offset = 0;
+        return;
+    }
+
+    reseat_directory_cursor(state, dir_id, &children);
+    let current = state
+        .navigator
+        .directory_cursor(dir_id)
+        .and_then(|id| children.iter().position(|&child| child == id))
+        .unwrap_or(0);
+    let last_index = children.len().saturating_sub(1);
+    let next = current
+        .checked_add_signed(offset)
+        .unwrap_or(if offset.is_negative() { 0 } else { last_index })
+        .min(last_index);
+    state
+        .navigator
+        .set_directory_cursor(dir_id, children.get(next).copied());
+    if state.viewport_height > 0 {
+        state.scroll_offset = scroll_offset_to_keep_rows_visible(
+            state.scroll_offset,
+            state.viewport_height,
+            next..next.saturating_add(1),
+            children.len().max(usize::from(state.content_height)),
+        );
+    }
+}
+
+fn action_target_node_id(state: &mut AppState) -> TreeNodeId {
+    let current = state.navigator.current_id();
+    match state.navigator.tree.node(current).kind {
+        TreeNodeKind::Root => {
+            let root_children = visible_root_children(state);
+            reseat_root_cursor(state, &root_children);
+            state.root_cursor.unwrap_or(current)
+        }
+        TreeNodeKind::Directory => {
+            let dir_children = visible_directory_children(state, current);
+            reseat_directory_cursor(state, current, &dir_children);
+            state.navigator.directory_cursor(current).unwrap_or(current)
+        }
+        TreeNodeKind::File | TreeNodeKind::Block => current,
+    }
+}
+
 fn handle_action_with<F>(state: &mut AppState, verdict: Verdict, on_action: F) -> Result<()>
 where
     F: FnOnce(PendingAction, &mut AppState) -> Result<()>,
 {
-    let action =
-        PendingAction::from_node(&state.navigator.tree, state.navigator.current_id(), verdict);
+    let target_id = action_target_node_id(state);
+    let action = PendingAction::from_node(&state.navigator.tree, target_id, verdict);
 
     if let Some(count) = batch_confirmation_count_for_action(state, &action) {
         state.input_mode = InputMode::ConfirmBatch { action, count };
@@ -5509,11 +5599,8 @@ fn batch_confirmation_count_for_action(state: &AppState, action: &PendingAction)
 
 fn handle_note_action(state: &mut AppState) -> Result<()> {
     state.speed_read.pause();
-    let action = PendingAction::from_node(
-        &state.navigator.tree,
-        state.navigator.current_id(),
-        Verdict::Comment,
-    );
+    let target_id = action_target_node_id(state);
+    let action = PendingAction::from_node(&state.navigator.tree, target_id, Verdict::Comment);
     let draft = current_comment_draft(state);
     cancel_ai_suggestion(state);
     state.input_mode = InputMode::Editing { action };
@@ -5697,8 +5784,14 @@ where
         } => (node_id, verdict, note),
     };
 
-    let next_id = if matches!(verdict, Verdict::Comment) {
-        Some(node_id)
+    let current_before = state.navigator.current_id();
+    let acting_on_listing_entry = current_before != node_id
+        && matches!(
+            state.navigator.tree.node(current_before).kind,
+            TreeNodeKind::Root | TreeNodeKind::Directory
+        );
+    let next_id = if matches!(verdict, Verdict::Comment) || acting_on_listing_entry {
+        Some(current_before)
     } else {
         compute_next_review_target(state, node_id)
     };
@@ -5707,6 +5800,9 @@ where
     run_mark(batch)?;
 
     let impact = apply_action_locally(state, node_id, &verdict, next_id);
+    if acting_on_listing_entry && state.remaining_blocks == 0 {
+        state.navigator.jump_root();
+    }
     state.session_recap.record_action(&verdict, impact);
     Ok(())
 }
@@ -6454,13 +6550,9 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
     };
     let ai_hint_line_count = usize_to_u16_saturating(ai_hint_lines.as_ref().map_or(0, Vec::len));
 
-    let focus_layout = compute_focus_layout(
-        area,
-        usize_to_u16_saturating(header_lines.len()),
-        ai_hint_line_count,
-    );
     let ui_mode = current_ui_mode(state);
-    let actions_lines = if let Some(queue) = state
+    let actions_width = focus_code_width(area);
+    let actions_lines: Vec<Line<'static>> = if let Some(queue) = state
         .onboarding
         .as_ref()
         .filter(|_| !matches!(ui_mode, UiMode::SpeedRead))
@@ -6480,18 +6572,20 @@ fn render_active_node(frame: &mut Frame, state: &mut AppState, area: Rect, palet
             "[F1]evidence/details".to_string(),
             format_key_action(keys.quit, "quit"),
         ]);
-        pack_action_phrases(focus_layout.actions.width, &actions)
+        pack_action_phrases(actions_width, &actions)
             .into_iter()
             .map(|line| styled_ai_hint_line(line, palette))
             .collect()
     } else {
-        build_action_lines(
-            focus_layout.actions.width,
-            ui_mode,
-            &state.keybinds,
-            palette,
-        )
+        build_action_lines(actions_width, ui_mode, &state.keybinds, palette)
     };
+    let requested_actions_height = usize_to_u16_saturating(actions_lines.len()).max(ACTIONS_HEIGHT);
+    let focus_layout = compute_focus_layout_with_actions(
+        area,
+        usize_to_u16_saturating(header_lines.len()),
+        ai_hint_line_count,
+        requested_actions_height,
+    );
     let node_snapshot = ContentNodeSnapshot::from_node(node);
     let full_code_width = focus_layout.code.width.max(1);
     let mut render_code_width = full_code_width;
@@ -6907,11 +7001,11 @@ fn build_speed_read_lines(
     state: &AppState,
     node_id: TreeNodeId,
     palette: &UiPalette,
-    width: u16,
+    code_width: u16,
 ) -> Option<(Vec<Line<'static>>, usize)> {
     let mode = state.speed_read.active_for(node_id)?;
 
-    let width = usize::from(width.max(1));
+    let width = usize::from(code_width.max(1));
     let current_phrase = mode
         .model
         .phrases
@@ -6987,8 +7081,9 @@ fn build_speed_read_lines(
         )));
     }
 
-    let line_count = lines.len();
-    Some((lines, line_count))
+    let wrapped = wrap_lines_into_rows(lines, code_width).rows;
+    let line_count = wrapped.len();
+    Some((wrapped, line_count))
 }
 
 fn center_text(text: &str, width: usize) -> String {
@@ -8321,15 +8416,7 @@ fn build_source_context_content(
                 code_width,
             );
         }
-        return BuiltContent {
-            lines: vec![Line::from(Span::styled(
-                "(File missing)",
-                Style::default().fg(palette.context).bg(palette.code_bg),
-            ))],
-            total_lines: 1,
-            focus_row_range: None,
-            comment_rows: None,
-        };
+        return content_message("(File missing)", None, palette, code_width);
     };
 
     let highlight_line_span = focus_line_span_for_node(state, node, file_lines.len());
@@ -8837,18 +8924,13 @@ fn wrap_text_to_width(text: &str, width: usize) -> Vec<String> {
 
     for ch in text.chars() {
         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width > 0 && current_width.saturating_add(ch_width) > width {
+        if ch_width > 0 && current_width > 0 && current_width.saturating_add(ch_width) > width {
             wrapped.push(std::mem::take(&mut current));
             current_width = 0;
         }
 
         current.push(ch);
         current_width = current_width.saturating_add(ch_width);
-
-        if current_width >= width {
-            wrapped.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
     }
 
     if !current.is_empty() || wrapped.is_empty() {
@@ -8870,19 +8952,13 @@ fn wrapped_text_line_count(text: &str, width: usize) -> usize {
 
     for ch in text.chars() {
         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width > 0 && current_width.saturating_add(ch_width) > width {
+        if ch_width > 0 && current_width > 0 && current_width.saturating_add(ch_width) > width {
             rows = rows.saturating_add(1);
             current_width = 0;
         }
 
         current_width = current_width.saturating_add(ch_width);
         current_has_chars = true;
-
-        if current_width >= width {
-            rows = rows.saturating_add(1);
-            current_width = 0;
-            current_has_chars = false;
-        }
     }
 
     if current_has_chars || rows == 0 {
@@ -8913,6 +8989,7 @@ fn content_message(
     message: &str,
     source_hint_keybinds: Option<&TuiKeybindsConfig>,
     palette: &UiPalette,
+    code_width: u16,
 ) -> BuiltContent {
     let mut lines = vec![Line::from(Span::styled(
         message.to_string(),
@@ -8924,12 +9001,7 @@ fn content_message(
             Style::default().fg(palette.dim).bg(palette.code_bg),
         )));
     }
-    BuiltContent {
-        total_lines: lines.len(),
-        lines,
-        focus_row_range: None,
-        comment_rows: None,
-    }
+    wrapped_listing_content(lines, code_width)
 }
 
 fn build_diff_context_content(
@@ -8945,7 +9017,7 @@ fn build_diff_context_content(
     }
 
     let Some(file_lines) = load_file_lines(state, &node.path) else {
-        return content_message("(File missing)", None, palette);
+        return content_message("(File missing)", None, palette, code_width);
     };
     let display_line_span = focus_line_span_for_node(state, node, file_lines.len());
     let block_line_span = block_line_span_for_node(node, file_lines.len());
@@ -8954,7 +9026,7 @@ fn build_diff_context_content(
         should_include_added_block_insertion_context(state, node);
 
     let Some(file_diff) = cached_file_diff_for_node(state, node) else {
-        return content_message("(No path for diff)", None, palette);
+        return content_message("(No path for diff)", None, palette, code_width);
     };
 
     match file_diff {
@@ -9038,11 +9110,17 @@ fn build_diff_context_content(
             "(No diff changes in this file)",
             Some(&state.keybinds),
             palette,
+            code_width,
         ),
         vcs::FileDiff::Unavailable {
             reason: vcs::FileDiffUnavailableReason::Binary,
             ..
-        } => content_message("(Diff unavailable for binary file)", None, palette),
+        } => content_message(
+            "(Diff unavailable for binary file)",
+            None,
+            palette,
+            code_width,
+        ),
         vcs::FileDiff::Unavailable {
             reason: vcs::FileDiffUnavailableReason::External,
             ..
@@ -9050,6 +9128,7 @@ fn build_diff_context_content(
             "(Diff unavailable from external diff command)",
             None,
             palette,
+            code_width,
         ),
     }
 }
@@ -9253,38 +9332,34 @@ fn build_file_lines(
 }
 
 fn build_directory_lines(
-    state: &AppState,
+    state: &mut AppState,
     node: &ContentNodeSnapshot,
     palette: &UiPalette,
     _code_height: u16,
 ) -> Vec<Line<'static>> {
-    let mut entries = Vec::new();
-    for child_id in &node.children {
-        if !state.navigator.is_visible(*child_id) {
-            continue;
-        }
-        let child = state.navigator.tree.node(*child_id);
-        let label = match child.kind {
-            TreeNodeKind::Directory => format!("{}/", child.name),
-            TreeNodeKind::File => child.name.clone(),
-            TreeNodeKind::Block => format!("{}:{}", child.name, child.hash),
-            TreeNodeKind::Root => child.name.clone(),
-        };
-        entries.push(label);
-    }
-    entries.sort();
+    let children = visible_directory_children(state, node.id);
+    reseat_directory_cursor(state, node.id, &children);
+    let selected_id = state.navigator.directory_cursor(node.id);
 
-    if entries.is_empty() {
+    if children.is_empty() {
         return vec![Line::from(Span::styled(
             "(Empty)",
             Style::default().fg(palette.context).bg(palette.code_bg),
         ))];
     }
 
-    // Scrollable directory view
-    entries
-        .iter()
-        .map(|entry| format_directory_line(entry, palette))
+    children
+        .into_iter()
+        .map(|child_id| {
+            let child = state.navigator.tree.node(child_id);
+            let label = match child.kind {
+                TreeNodeKind::Directory => format!("  {}/", child.name),
+                TreeNodeKind::File => format!("  {}", child.name),
+                TreeNodeKind::Block => format!("  {}:{}", child.name, child.hash),
+                TreeNodeKind::Root => child.name.clone(),
+            };
+            format_root_entry_line(&label, palette, selected_id == Some(child_id))
+        })
         .collect()
 }
 
@@ -9396,19 +9471,6 @@ fn format_root_entry_line(entry: &str, palette: &UiPalette, selected: bool) -> L
     Line::from(Span::styled(entry.to_string(), style)).style(style)
 }
 
-fn format_directory_line(entry: &str, palette: &UiPalette) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            CONTENT_GUTTER_SPACING,
-            Style::default().fg(palette.context).bg(palette.code_bg),
-        ),
-        Span::styled(
-            entry.to_string(),
-            Style::default().fg(palette.context).bg(palette.code_bg),
-        ),
-    ])
-}
-
 fn format_context_line(
     highlighted_line_cache: &mut HashMap<HighlightLineCacheKey, Vec<HighlightToken>>,
     line: &str,
@@ -9448,8 +9510,9 @@ fn render_input_overlay(frame: &mut Frame, state: &AppState, area: Rect, palette
             )
         }
         InputMode::ConfirmBatch { count, action } => {
+            let target_desc = batch_target_description(&state.navigator.tree, action.node_id());
             let content = format!(
-                "This will apply '{}' to {} unreviewed descendant block(s).",
+                "Apply '{}' to {} unreviewed descendant block(s) in:\n{target_desc}",
                 action.verdict_label(),
                 count
             );
@@ -9738,10 +9801,37 @@ fn focus_code_width(area: Rect) -> u16 {
     area.width.min(120)
 }
 
+fn batch_target_description(tree: &Tree, node_id: TreeNodeId) -> String {
+    let node = tree.node(node_id);
+    match node.kind {
+        TreeNodeKind::Root => "the repository".to_string(),
+        TreeNodeKind::Directory => format!("directory '{}'", node.path),
+        TreeNodeKind::File => format!("file '{}'", node.path),
+        TreeNodeKind::Block => {
+            let label = node
+                .block
+                .as_ref()
+                .map(raw_block_header_segment)
+                .unwrap_or_else(|| node.name.clone());
+            format!("'{label}' ({})", node.path)
+        }
+    }
+}
+
+#[cfg(test)]
 fn compute_focus_layout(
     area: Rect,
     header_lines: u16,
     requested_ai_hint_height: u16,
+) -> FocusLayout {
+    compute_focus_layout_with_actions(area, header_lines, requested_ai_hint_height, ACTIONS_HEIGHT)
+}
+
+fn compute_focus_layout_with_actions(
+    area: Rect,
+    header_lines: u16,
+    requested_ai_hint_height: u16,
+    requested_actions_height: u16,
 ) -> FocusLayout {
     let code_width = focus_code_width(area);
     let desired_code_height = area.height.min(32);
@@ -9750,11 +9840,14 @@ fn compute_focus_layout(
     let available_height = area.height.saturating_sub(padding * 2).max(1);
     let mode_height = MODE_BANNER_HEIGHT.min(available_height);
     let available_after_mode = available_height.saturating_sub(mode_height);
-    let actions_height = ACTIONS_HEIGHT.min(available_after_mode.saturating_sub(2));
+    let actions_height = requested_actions_height.min(available_after_mode.saturating_sub(2));
+    let extra_actions = actions_height.saturating_sub(ACTIONS_HEIGHT);
     let available_after_actions = available_after_mode.saturating_sub(actions_height);
     let ai_hint_height = requested_ai_hint_height.min(available_after_actions.saturating_sub(2));
     let available_after_ai = available_after_actions.saturating_sub(ai_hint_height);
-    let controls_padding_height = CONTROLS_PADDING_HEIGHT.min(available_after_ai.saturating_sub(2));
+    let controls_padding_height = CONTROLS_PADDING_HEIGHT
+        .saturating_sub(extra_actions)
+        .min(available_after_ai.saturating_sub(2));
     let available_for_header_and_code = available_after_ai.saturating_sub(controls_padding_height);
     let min_header_height = 3.min(available_for_header_and_code);
     let desired_header_height = header_lines.saturating_add(2).max(min_header_height);
@@ -15473,6 +15566,22 @@ mod diff_scope_tests {
     }
 
     #[test]
+    fn content_message_wraps_and_counts_rendered_rows_on_narrow_panes() {
+        let keybinds = TuiKeybindsConfig::default();
+        let content = content_message(
+            "(Diff unavailable from external diff command)",
+            Some(&keybinds),
+            &UiPalette::default(),
+            20,
+        );
+        assert!(content.total_lines > 2);
+        assert_eq!(
+            rendered_wrapped_row_count(&content.lines, 20),
+            content.total_lines
+        );
+    }
+
+    #[test]
     fn root_view_metrics_count_wrapped_scope_label_rows() {
         let mut state = build_test_state(ScopePreset::MainDiff, HashMap::new());
         state.scope_label = "pull request 1234 from a long feature branch".to_string();
@@ -18859,7 +18968,6 @@ mod diff_scope_tests {
             id: state.navigator.tree.root(),
             kind: TreeNodeKind::Block,
             path: RepoPath::new("src/lib.rs").unwrap(),
-            children: Vec::new(),
             block: Some(Block {
                 hash: crate::hashing::TreeHash::new("block"),
                 content: "pub fn demo() {\n    println!(\"historical target\");\n}".to_string(),
@@ -18973,7 +19081,6 @@ mod diff_scope_tests {
             id: state.navigator.tree.root(),
             kind: TreeNodeKind::Block,
             path: RepoPath::new("src/lib.rs").unwrap(),
-            children: Vec::new(),
             block: Some(Block {
                 hash: crate::hashing::TreeHash::new("block"),
                 content: "fn main() {\n    println!(\"Hello from commit scope\");\n}".to_string(),
@@ -19029,7 +19136,6 @@ mod diff_scope_tests {
             id: state.navigator.tree.root(),
             kind: TreeNodeKind::Block,
             path: RepoPath::new("src/lib.rs").unwrap(),
-            children: Vec::new(),
             block: Some(test_block(edited.to_string(), BlockKind::Function, 0, 3)),
             language: Some(Language::Rust),
         };
