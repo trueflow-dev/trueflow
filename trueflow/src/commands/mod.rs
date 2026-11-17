@@ -5,6 +5,7 @@ pub mod inspect;
 pub mod log;
 pub mod mark;
 pub mod onboard;
+pub mod reset;
 pub mod review;
 pub mod scan;
 pub mod tui;

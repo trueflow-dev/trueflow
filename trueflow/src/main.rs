@@ -136,6 +136,7 @@ fn main() -> Result<()> {
             commands::verify::VerifySelection::from_clap_args(*all, id.as_deref()),
         ),
         Commands::Log(args) => commands::log::run(&context, args),
+        Commands::Reset(args) => commands::reset::run(&context, args),
         Commands::Onboard(args) => commands::onboard::run(&context, args),
         Commands::Focus(args) => commands::focus::run(&context, args),
         Commands::Tui {

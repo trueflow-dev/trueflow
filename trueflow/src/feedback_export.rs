@@ -979,8 +979,38 @@ impl FeedbackCursorUpdateGuard {
         })
     }
 
+    pub(crate) fn acquire_if_present(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let guard = Self::acquire(path)?;
+        if guard.cursor.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(guard))
+    }
+
     pub(crate) fn cursor(&self) -> Option<&FeedbackCursor> {
         self.cursor.as_ref()
+    }
+
+    pub(crate) fn prepare_reconciled_cursor_after_removal(
+        &self,
+        before_records: &[Record],
+        removed_record_ids: &HashSet<&str>,
+    ) -> Result<Option<FeedbackCursor>> {
+        let Some(current) = self.cursor.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(reconcile_feedback_cursor_after_removal(
+            current,
+            before_records,
+            removed_record_ids,
+        )?))
+    }
+
+    pub(crate) fn write_prepared(self, cursor: &FeedbackCursor) -> Result<()> {
+        write_feedback_cursor_atomically(&self.path, cursor)
     }
 
     pub(crate) fn commit(
@@ -1072,6 +1102,54 @@ pub(crate) fn advance_feedback_cursor(
     Ok(FeedbackCursor {
         version: FEEDBACK_CURSOR_SCHEMA_VERSION,
         checkpoint: feedback_cursor_checkpoint(records)?,
+        pending_record_ids,
+    })
+}
+
+pub(crate) fn reconcile_feedback_cursor_after_removal(
+    cursor: &FeedbackCursor,
+    before_records: &[Record],
+    removed_record_ids: &HashSet<&str>,
+) -> Result<FeedbackCursor> {
+    let validated = validate_feedback_cursor(cursor, before_records)?;
+    let surviving_prefix: Vec<&Record> = before_records[..validated.checkpoint_len]
+        .iter()
+        .filter(|record| !removed_record_ids.contains(record.id.as_str()))
+        .collect();
+    let mut pending_record_ids: Vec<String> = validated
+        .pending_record_ids
+        .into_iter()
+        .filter(|id| !removed_record_ids.contains(id.as_str()))
+        .collect();
+    pending_record_ids.sort_unstable();
+
+    let record_count = u64::try_from(surviving_prefix.len()).map_err(|_error| {
+        anyhow!(
+            "Cannot reconcile feedback cursor: prefix length {} exceeds cursor capacity",
+            surviving_prefix.len()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(FEEDBACK_CURSOR_DIGEST_DOMAIN);
+    for record in &surviving_prefix {
+        let length = u64::try_from(record.id.len()).map_err(|_error| {
+            anyhow!(
+                "Cannot hash feedback cursor record ID {:?}: byte length exceeds cursor capacity",
+                record.id
+            )
+        })?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(record.id.as_bytes());
+    }
+    let checkpoint = FeedbackCursorCheckpoint {
+        record_count,
+        last_record_id: surviving_prefix.last().map(|record| record.id.clone()),
+        record_ids_sha256: hex_digest(hasher.finalize()),
+    };
+
+    Ok(FeedbackCursor {
+        version: FEEDBACK_CURSOR_SCHEMA_VERSION,
+        checkpoint,
         pending_record_ids,
     })
 }

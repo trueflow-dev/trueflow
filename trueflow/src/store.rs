@@ -1652,6 +1652,51 @@ impl JsonlStoreBackend {
         writer.flush()?;
         Ok(())
     }
+
+    fn rewrite_with<F, T>(&self, transform: F) -> Result<T>
+    where
+        F: FnOnce(Vec<Record>) -> Result<(Option<Vec<Record>>, T)>,
+    {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.db_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let (replacement, out) = transform(Vec::new())?;
+                if let Some(records) = replacement
+                    && !records.is_empty()
+                {
+                    if let Some(parent) = self.db_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    self.append_batch(&records)?;
+                }
+                return Ok(out);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        file.lock_exclusive()?;
+
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        let current_records = parse_records_jsonl(&content)?;
+        let (replacement, out) = transform(current_records)?;
+        if let Some(records) = replacement {
+            let mut serialized = Vec::new();
+            for record in &records {
+                record.validate()?;
+                serde_json::to_writer(&mut serialized, record)?;
+                serialized.push(b'\n');
+            }
+            file.seek(SeekFrom::Start(0))?;
+            file.set_len(0)?;
+            file.write_all(&serialized)?;
+            file.flush()?;
+        }
+        Ok(out)
+    }
 }
 
 pub struct FileStore {
@@ -1689,6 +1734,13 @@ impl FileStore {
 
     pub fn trueflow_dir(&self) -> PathBuf {
         self.location.trueflow_dir()
+    }
+
+    pub fn rewrite_history_with<F, T>(&self, transform: F) -> Result<T>
+    where
+        F: FnOnce(Vec<Record>) -> Result<(Option<Vec<Record>>, T)>,
+    {
+        self.backend.rewrite_with(transform)
     }
 }
 
