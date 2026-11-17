@@ -3325,3 +3325,26 @@ fn review_diff_supports_replacing_file_with_directory_and_reverse() -> Result<()
     assert!(check_passes(&repo)?);
     Ok(())
 }
+
+#[test]
+fn check_surfaces_scan_diagnostics_on_stderr() -> Result<()> {
+    let repo = TestRepo::new("check_surfaces_diagnostics")?;
+    repo.write("src/lib.rs", "pub fn baseline() -> u8 {\n    1\n}\n")?;
+    repo.commit_all("base")?;
+    repo.git(&["branch", "-M", "main"])?;
+    approve_every_block(&repo)?;
+
+    repo.git(&["switch", "-c", "feature"])?;
+    repo.write("src/lib.rs", "pub fn baseline() -> u8 {\n    2\n}\n")?;
+    std::fs::write(repo.path.join("src/corrupt.rs"), [0xff_u8, 0xfe, b'\n'])?;
+    repo.commit_all("add unreviewed code and invalid utf8 file")?;
+
+    let output = repo.run_raw(&["check"])?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("src/corrupt.rs") && stderr.contains("UTF-8"),
+        "check stderr must surface scan diagnostics for skipped invalid UTF-8 files: {stderr}"
+    );
+    Ok(())
+}

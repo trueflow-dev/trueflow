@@ -94,7 +94,16 @@ pub fn run(context: &TrueflowContext, args: &FocusArgs) -> Result<()> {
         (None, Some(path)) => FocusScope::Under(path.clone()),
         (None, None) => FocusScope::Repository,
     };
-    let inventory = FocusInventory::capture_with_database(&collected, &scope, &database)?;
+    let referenced_evidence = loaded
+        .as_ref()
+        .map(FocusSpecification::referenced_evidence_ids)
+        .unwrap_or_default();
+    let inventory = FocusInventory::capture_with_database_and_referenced_evidence(
+        &collected,
+        &scope,
+        &database,
+        &referenced_evidence,
+    )?;
     if args.candidates {
         let page: Vec<_> = inventory
             .candidates

@@ -98,7 +98,9 @@ pub fn run(
 ) -> Result<()> {
     let config = load_config()?;
     let scan_options = config.scan.resolve_options();
-    let scan_result = scanner::scan_directory(".", &scan_options)?;
+    let scan_root =
+        crate::vcs::git_root_from_workdir()?.unwrap_or_else(|| std::path::PathBuf::from("."));
+    let scan_result = scanner::scan_directory(&scan_root, &scan_options)?;
     let files = scan_result.files;
     // Scanned paths are repository-relative; accept `--path` in every form
     // `mark --path` accepts, including one relative to the current directory.
@@ -109,7 +111,9 @@ pub fn run(
     };
     let matched = find_matching_block(&files, fingerprint, location)?;
     if split {
-        let sub_blocks = sub_splitter::split(&matched.block, matched.language)?;
+        let sub_blocks =
+            sub_splitter::split_result_for_child_navigation(&matched.block, matched.language)?
+                .blocks;
         if coverage {
             let (tree, database) = load_coverage_inputs(&files)?;
             let coverage_index = CoverageIndex::build(&tree, &database)?;
@@ -165,8 +169,10 @@ fn find_matching_block(
     if matches.is_empty() {
         for file in files() {
             for block in &file.blocks {
-                if let Ok(sub_blocks) = sub_splitter::split(block, file.language) {
-                    for sub_block in sub_blocks {
+                if let Ok(result) =
+                    sub_splitter::split_result_for_child_navigation(block, file.language)
+                {
+                    for sub_block in result.blocks {
                         if is_match(&sub_block) {
                             matches.push(MatchedBlock {
                                 block: sub_block,

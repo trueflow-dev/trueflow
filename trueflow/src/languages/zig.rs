@@ -385,25 +385,7 @@ fn push_review_chunk(
 }
 
 fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
-    let mut offset = 0;
-    let mut saw_comment = false;
-
-    for line in chunk.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.trim().is_empty() {
-            offset += line.len();
-            continue;
-        }
-        if code_comments::line_is_c_style_comment(trimmed) {
-            saw_comment = true;
-            offset += line.len();
-            continue;
-        }
-
-        return saw_comment.then_some(offset);
-    }
-
-    None
+    code_comments::leading_c_style_comment_prefix_len(chunk)
 }
 
 fn classify_code_chunk(chunk: &str) -> BlockKind {

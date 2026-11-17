@@ -1,3 +1,4 @@
+use crate::block::BlockKind;
 use crate::review_navigator::ReviewNavigator;
 use crate::review_order::{ReviewAnchor, ReviewOrder};
 use crate::store::Verdict;
@@ -75,7 +76,14 @@ fn every_block_under_is_shown(navigator: &ReviewNavigator, node_id: TreeNodeId) 
     let mut stack = vec![node_id];
     while let Some(id) = stack.pop() {
         let node = navigator.tree.node(id);
-        if matches!(node.kind, TreeNodeKind::Block) && !navigator.is_visible_block(id) {
+        if matches!(node.kind, TreeNodeKind::Block)
+            && !navigator.is_visible_block(id)
+            && !navigator.is_collapsible_approved_block(id)
+            && !navigator.tree.is_container_block(id)
+            && !node.block.as_ref().is_some_and(|block| {
+                block.kind == BlockKind::Gap || block.content.trim().is_empty()
+            })
+        {
             return false;
         }
         stack.extend(node.children.iter().copied());
@@ -379,5 +387,91 @@ mod tests {
 
         let next = next_review_target(&navigator, &order, &remaining, impl_block);
         assert_eq!(next, Some(tail));
+    }
+
+    #[test]
+    fn full_scan_file_approval_collapses_over_gaps_and_containers() {
+        let mut builder = TreeBuilder::new();
+        let root = builder.root();
+        let file = builder.add_file(
+            root,
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "file-hash".to_string(),
+            Language::Rust,
+        );
+        let impl_block = builder.add_block(
+            file,
+            "impl".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Impl, 1),
+            Language::Rust,
+        );
+        let method = builder.add_block(
+            impl_block,
+            "method".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Method, 2),
+            Language::Rust,
+        );
+        let gap = builder.add_block(
+            file,
+            "gap".to_string(),
+            "src/lib.rs".to_string(),
+            Block::new(
+                "\n\n".to_string(),
+                BlockKind::Gap,
+                LineSpan::new(5, 7),
+                ByteSpan::new(30, 32),
+            ),
+            Language::Rust,
+        );
+        let _ = gap;
+        let tail = builder.add_block(
+            file,
+            "tail".to_string(),
+            "src/lib.rs".to_string(),
+            test_block(BlockKind::Function, 8),
+            Language::Rust,
+        );
+        let tree = builder.finalize();
+        // Realistic full-scan navigator: leaf reviewable blocks (`method`, `tail`) are shown,
+        // while `impl_block` (container) and `gap` (whitespace) are skipped by default.
+        let navigator = navigator_from_blocks(tree, &[method, tail]);
+
+        assert_eq!(
+            action_record_shape(
+                &navigator,
+                file,
+                &Verdict::Approved,
+                ReviewTreeContent::FullScan
+            ),
+            ActionRecordShape::Node
+        );
+
+        // When `method` was already approved by the same reviewer (or earlier in this session),
+        // approving `file` still collapses to one File record instead of per-block records.
+        let mut partial = navigator;
+        assert!(partial.remove_visible_block(method));
+        assert_eq!(
+            action_record_shape(
+                &partial,
+                file,
+                &Verdict::Approved,
+                ReviewTreeContent::FullScan
+            ),
+            ActionRecordShape::Blocks(vec![tail]),
+            "without same-reviewer approval proof, do not cover `method`"
+        );
+        partial.mark_block_approved_by_session(method);
+        assert_eq!(
+            action_record_shape(
+                &partial,
+                file,
+                &Verdict::Approved,
+                ReviewTreeContent::FullScan
+            ),
+            ActionRecordShape::Node
+        );
     }
 }

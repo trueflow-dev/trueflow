@@ -1,24 +1,35 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
-pub(crate) struct CurrentDirGuard(PathBuf);
+static CWD_MUTEX: Mutex<()> = Mutex::new(());
+
+pub(crate) struct CurrentDirGuard {
+    previous: PathBuf,
+    _lock: MutexGuard<'static, ()>,
+}
 
 impl CurrentDirGuard {
     pub(crate) fn push(path: &Path) -> Self {
+        let lock = CWD_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = std::env::current_dir()
             .unwrap_or_else(|error| panic!("failed to read current directory: {error}"));
         std::env::set_current_dir(path)
             .unwrap_or_else(|error| panic!("failed to enter test directory {path:?}: {error}"));
-        Self(current)
+        Self {
+            previous: current,
+            _lock: lock,
+        }
     }
 }
 
 impl Drop for CurrentDirGuard {
     fn drop(&mut self) {
-        std::env::set_current_dir(&self.0)
-            .unwrap_or_else(|error| panic!("failed to restore current directory: {error}"));
+        let _ = std::env::set_current_dir(&self.previous);
     }
 }
 

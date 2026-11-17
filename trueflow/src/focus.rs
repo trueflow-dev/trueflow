@@ -163,6 +163,14 @@ impl FocusSpecification {
         )
     }
 
+    pub fn referenced_evidence_ids(&self) -> HashSet<&str> {
+        self.0
+            .steps
+            .iter()
+            .flat_map(|step| step.evidence.iter().map(String::as_str))
+            .collect()
+    }
+
     fn validate_candidates<'a>(
         &self,
         candidates: &[&'a FocusCandidate],

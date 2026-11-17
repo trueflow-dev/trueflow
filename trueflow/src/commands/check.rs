@@ -5,6 +5,11 @@ use tracing::{info, warn};
 
 pub fn run(_context: &TrueflowContext) -> Result<()> {
     let summary = review::collect_main_diff_summary()?;
+    for diagnostic in &summary.diagnostics {
+        let line = format!("warning: {}", diagnostic.display_message());
+        eprintln!("{line}");
+        warn!("{line}");
+    }
 
     if summary.files.is_empty() {
         info!("All clear! No unreviewed blocks found in main diff.");

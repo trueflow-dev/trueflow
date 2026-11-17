@@ -1,5 +1,5 @@
 //! Bounded, source-pinned observations, not a risk ranking or a coverage analysis.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -11,7 +11,7 @@ use crate::coverage::CoverageIndex;
 use crate::hashing::BytesHash;
 use crate::onboarding::{ReviewLocation, ensure_path_matches_source};
 use crate::repo_path::RepoPath;
-use crate::store::{FileStore, ReviewCheck, ReviewDatabase, ReviewStore};
+use crate::store::{CommitId, FileStore, ReviewCheck, ReviewDatabase, ReviewStore};
 use crate::vcs::{self, DiffLineKind, FileDiff};
 
 const MAX_CANDIDATES: usize = 20_000;
@@ -19,6 +19,7 @@ const MAX_INVENTORY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_BYTES: usize = 32 * 1024;
 const MAX_EXCERPT_BYTES: usize = 1600;
 const MAX_HISTORY_COMMITS: usize = 8;
+const MAX_LEGACY_PLAN_HISTORY_COMMITS: usize = 256;
 const MAX_HISTORY_BLOB_BYTES: u64 = 128 * 1024;
 const MAX_PATCH_BYTES: usize = 2048;
 const MAX_REVIEW_NOTES: usize = 8;
@@ -184,8 +185,28 @@ impl FocusInventory {
         scope: &FocusScope,
         database: &ReviewDatabase,
     ) -> Result<Self> {
+        Self::capture_with_database_and_referenced_evidence(
+            review,
+            scope,
+            database,
+            &HashSet::new(),
+        )
+    }
+
+    pub fn capture_with_database_and_referenced_evidence(
+        review: &CollectedReview,
+        scope: &FocusScope,
+        database: &ReviewDatabase,
+        referenced_evidence_ids: &HashSet<&str>,
+    ) -> Result<Self> {
         let repo = vcs::repo_from_workdir();
-        let mut inventory = capture_with(review, scope, database, repo.as_ref().ok())?;
+        let mut inventory = capture_with_referenced(
+            review,
+            scope,
+            database,
+            repo.as_ref().ok(),
+            referenced_evidence_ids,
+        )?;
         if let Err(error) = repo {
             inventory.diagnostics.push(FocusDiagnostic::new(
                 DiagnosticKind::GitHistory,
@@ -215,6 +236,25 @@ impl FocusEvidence {
         Ok(Self::identified(&identity, kind, detail, provenance))
     }
 
+    /// Cites an immutable commit-scoped observation: embeds `<commit_id>` alongside
+    /// the cryptographic digest so saved plans can revalidate older commits even
+    /// after newer commits advance the 8-commit discovery window.
+    fn for_commit(
+        target: &ReviewLocation,
+        commit_id: &CommitId,
+        kind: EvidenceKind,
+        detail: String,
+        provenance: String,
+    ) -> Result<Self> {
+        let identity = serde_json::to_vec(&(1, target, kind, &detail, &provenance))?;
+        Ok(Self {
+            id: format!("ev-{commit_id}-{}", BytesHash::from_bytes(&identity)),
+            kind,
+            detail,
+            provenance,
+        })
+    }
+
     /// Cites the current state of a target subject that changes while the target does not
     /// (its effective review records, the recent-history window). The ID names only the
     /// target and kind, so comments and unrelated commits keep a saved plan's references
@@ -240,11 +280,22 @@ impl FocusEvidence {
     }
 }
 
+#[cfg(test)]
 fn capture_with(
     review: &CollectedReview,
     scope: &FocusScope,
     database: &ReviewDatabase,
     repo: Option<&gix::Repository>,
+) -> Result<FocusInventory> {
+    capture_with_referenced(review, scope, database, repo, &HashSet::new())
+}
+
+fn capture_with_referenced(
+    review: &CollectedReview,
+    scope: &FocusScope,
+    database: &ReviewDatabase,
+    repo: Option<&gix::Repository>,
+    referenced_evidence_ids: &HashSet<&str>,
 ) -> Result<FocusInventory> {
     if let FocusScope::Under(path) = scope {
         ensure_path_matches_source(review, path)?;
@@ -288,7 +339,7 @@ fn capture_with(
             ),
         ));
     }
-    let history = history(repo, &paths, &mut diagnostics)?;
+    let history = history(repo, &paths, referenced_evidence_ids, &mut diagnostics)?;
     let tests = TestIndex::build(review);
     if tests.truncated {
         diagnostics.push(FocusDiagnostic::new(DiagnosticKind::RelatedTests, "Related-test index truncated; only bounded sampled tokens/paths are considered; this is not test coverage."));
@@ -412,12 +463,37 @@ fn capture_with(
         }
         if let Some(observations) = history.observations.get(&node.path) {
             for observation in observations {
-                evidence.push(FocusEvidence::new(
-                    &target,
-                    observation.kind,
-                    observation.detail.clone(),
-                    observation.provenance.clone(),
-                )?);
+                let obs_evidence = match &observation.commit_id {
+                    Some(commit_id) => FocusEvidence::for_commit(
+                        &target,
+                        commit_id,
+                        observation.kind,
+                        observation.detail.clone(),
+                        observation.provenance.clone(),
+                    )?,
+                    None => FocusEvidence::new(
+                        &target,
+                        observation.kind,
+                        observation.detail.clone(),
+                        observation.provenance.clone(),
+                    )?,
+                };
+                if !observation.from_extended_window
+                    || referenced_evidence_ids.contains(obs_evidence.id.as_str())
+                {
+                    evidence.push(obs_evidence);
+                } else if let Some(commit_id) = &observation.commit_id {
+                    let legacy = FocusEvidence::new(
+                        &target,
+                        observation.kind,
+                        observation.detail.clone(),
+                        observation.provenance.clone(),
+                    )?;
+                    if referenced_evidence_ids.contains(legacy.id.as_str()) {
+                        let _ = commit_id;
+                        evidence.push(legacy);
+                    }
+                }
             }
         }
         evidence.push(FocusEvidence::current_state(
@@ -765,6 +841,8 @@ impl TestIndex {
 }
 
 struct Observation {
+    commit_id: Option<CommitId>,
+    from_extended_window: bool,
     kind: EvidenceKind,
     detail: String,
     provenance: String,
@@ -781,9 +859,26 @@ struct History {
     window: HistoryWindow,
 }
 
+fn parse_referenced_commit_id(evidence_id: &str) -> Option<CommitId> {
+    let rest = evidence_id.strip_prefix("ev-")?;
+    let (commit_hex, digest_hex) = rest.split_once('-')?;
+    if digest_hex.len() != 64 || !digest_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    CommitId::new(commit_hex).ok()
+}
+
+fn has_legacy_hash_only_evidence_id(referenced_evidence_ids: &HashSet<&str>) -> bool {
+    referenced_evidence_ids.iter().any(|id| {
+        id.strip_prefix("ev-")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    })
+}
+
 fn history(
     repo: Option<&gix::Repository>,
     paths: &BTreeSet<RepoPath>,
+    referenced_evidence_ids: &HashSet<&str>,
     diagnostics: &mut Vec<FocusDiagnostic>,
 ) -> Result<History> {
     let mut result: BTreeMap<_, _> = paths
@@ -821,9 +916,14 @@ fn history(
                 );
                 let mut history_bytes = 0usize;
                 for commit in commits {
-                    if let Err(error) =
-                        append_commit_history(repo, commit, paths, &mut result, &mut history_bytes)
-                    {
+                    if let Err(error) = append_commit_history(
+                        repo,
+                        commit,
+                        paths,
+                        false,
+                        &mut result,
+                        &mut history_bytes,
+                    ) {
                         let message = format!(
                             "Git history unavailable in {}: {}",
                             commit.id,
@@ -836,6 +936,8 @@ fn history(
                             history_bytes =
                                 history_bytes.saturating_add(message.len() + provenance.len());
                             observations.push(Observation {
+                                commit_id: Some(commit.id.clone()),
+                                from_extended_window: false,
                                 kind: EvidenceKind::HistoryStatus,
                                 detail: message.clone(),
                                 provenance: provenance.clone(),
@@ -846,6 +948,48 @@ fn history(
                         history_bytes <= MAX_INVENTORY_BYTES,
                         "focus history exceeds {MAX_INVENTORY_BYTES} payload bytes; narrow the path scope"
                     );
+                }
+
+                if truncated && !referenced_evidence_ids.is_empty() {
+                    let mut wanted_commits: HashSet<CommitId> = referenced_evidence_ids
+                        .iter()
+                        .filter_map(|id| parse_referenced_commit_id(id))
+                        .collect();
+                    for commit in commits {
+                        wanted_commits.remove(&commit.id);
+                    }
+                    let scan_legacy = has_legacy_hash_only_evidence_id(referenced_evidence_ids);
+                    if !wanted_commits.is_empty() || scan_legacy {
+                        let mut walker = vcs::FirstParentHistory::from_head(repo);
+                        for _ in 0..commits.len() {
+                            let _ = walker.next_commit(repo);
+                        }
+                        let mut extra_index = 0usize;
+                        while !wanted_commits.is_empty()
+                            || (scan_legacy && extra_index < MAX_LEGACY_PLAN_HISTORY_COMMITS)
+                        {
+                            let Ok(Some(older)) = walker.next_commit(repo) else {
+                                break;
+                            };
+                            let should_inspect = wanted_commits.remove(&older.id)
+                                || (scan_legacy && extra_index < MAX_LEGACY_PLAN_HISTORY_COMMITS);
+                            extra_index += 1;
+                            if !should_inspect {
+                                continue;
+                            }
+                            let _ = append_commit_history(
+                                repo,
+                                &older,
+                                paths,
+                                true,
+                                &mut result,
+                                &mut history_bytes,
+                            );
+                            if history_bytes > MAX_INVENTORY_BYTES {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             (true, None) => {
@@ -885,6 +1029,7 @@ fn append_commit_history(
     repo: &gix::Repository,
     info: &vcs::CommitInfo,
     paths: &BTreeSet<RepoPath>,
+    from_extended_window: bool,
     output: &mut BTreeMap<RepoPath, Vec<Observation>>,
     history_bytes: &mut usize,
 ) -> Result<()> {
@@ -927,6 +1072,8 @@ fn append_commit_history(
                         *history_bytes =
                             history_bytes.saturating_add(detail.len() + provenance.len());
                         observations.push(Observation {
+                            commit_id: Some(info.id.clone()),
+                            from_extended_window,
                             kind: EvidenceKind::HistoryStatus,
                             detail,
                             provenance,
@@ -973,6 +1120,8 @@ fn append_commit_history(
                         "substantive textual change; corrective intent is unverified, not inferred from the message"
                     };
                     Observation {
+                        commit_id: Some(info.id.clone()),
+                        from_extended_window,
                         kind: EvidenceKind::GitPatch,
                         provenance,
                         detail: format!(
@@ -988,6 +1137,8 @@ fn append_commit_history(
                     }
                 }
                 FileDiff::Unavailable { reason, .. } => Observation {
+                    commit_id: Some(info.id.clone()),
+                    from_extended_window,
                     kind: EvidenceKind::HistoryStatus,
                     detail: format!(
                         "Git patch unavailable in {} for {path}: {reason:?}",
@@ -996,6 +1147,8 @@ fn append_commit_history(
                     provenance,
                 },
                 FileDiff::NoTextChanges { .. } => Observation {
+                    commit_id: Some(info.id.clone()),
+                    from_extended_window,
                     kind: EvidenceKind::HistoryStatus,
                     detail: format!(
                         "Commit {} changed file identity/metadata without a text patch for {path}; not substantive churn evidence.",
@@ -1067,6 +1220,7 @@ mod tests {
             unreviewed_block_nodes,
             diff_selection: ReviewDiffSelection::None,
             commented_block_nodes: Default::default(),
+            collapsible_approved_block_nodes: Default::default(),
             diff_block_sides: Default::default(),
             file_change_kinds: Default::default(),
             block_change_kinds: Default::default(),

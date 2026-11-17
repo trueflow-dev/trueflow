@@ -21,7 +21,7 @@ const TRUEFLOW_DIR: &str = ".trueflow";
 const DB_FILE: &str = "reviews.jsonl";
 pub const CURRENT_VERSION: u32 = 5;
 
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(tag = "type")]
 #[schemars(deny_unknown_fields)]
 pub enum Identity {
@@ -207,7 +207,7 @@ pub enum Canonicalization {
     JcsV1,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Attestation {
     pub kind: AttestationKind,

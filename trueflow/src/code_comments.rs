@@ -61,70 +61,158 @@ impl CommentSyntax {
     }
 }
 
-pub fn line_is_c_style_comment(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("//")
-        || trimmed_line.starts_with("/*")
-        || is_block_comment_continuation(trimmed_line)
+/// Tracks whether sequential lines or paragraph chunks are currently inside an
+/// open `/* ... */` block comment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockCommentTracker {
+    in_block_comment: bool,
 }
 
-/// A `*` line inside a block comment (` * text`, `*/`, a `****` banner), as
-/// opposed to code such as a dereference (`*out = v;`, `**pp = v;`).
-fn is_block_comment_continuation(trimmed_line: &str) -> bool {
-    let Some(rest) = trimmed_line.strip_prefix('*') else {
-        return false;
-    };
-    let rest = rest.trim_start_matches('*');
-    rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('/')
-}
+impl BlockCommentTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-pub fn chunk_is_comment_only(chunk: &str, syntax: CommentSyntax) -> bool {
-    let mut in_block_comment = false;
-    let mut saw_comment = false;
+    /// Classifies `chunk` while advancing `/* ... */` block-comment state across
+    /// every line of `chunk` so subsequent paragraph chunks see accurate state.
+    pub fn chunk_is_comment_only(&mut self, chunk: &str, syntax: CommentSyntax) -> bool {
+        let mut saw_comment = false;
+        let mut saw_code = false;
 
-    for source_line in chunk.lines() {
-        let mut line = source_line.trim_start();
+        for source_line in chunk.lines() {
+            let (line_saw_comment, line_saw_code) = self.scan_line(source_line, syntax);
+            saw_comment |= line_saw_comment;
+            saw_code |= line_saw_code;
+        }
+
+        saw_comment && !saw_code
+    }
+
+    fn scan_line(&mut self, source_line: &str, syntax: CommentSyntax) -> (bool, bool) {
+        let mut saw_comment = false;
+        let mut saw_code = false;
+        let mut rest = source_line;
+
         loop {
-            if line.is_empty() {
-                break;
-            }
-
-            if in_block_comment {
+            if self.in_block_comment {
                 saw_comment = true;
-                if let Some(end) = line.find("*/") {
-                    line = line[end + 2..].trim_start();
-                    in_block_comment = false;
+                if let Some(end) = rest.find("*/") {
+                    rest = &rest[end + 2..];
+                    self.in_block_comment = false;
                     continue;
                 }
                 break;
             }
 
-            if syntax.starts_line_comment(line) {
+            let trimmed = rest.trim_start();
+            if trimmed.is_empty() {
+                break;
+            }
+            if syntax.starts_line_comment(trimmed) {
                 saw_comment = true;
                 break;
             }
-
-            if let Some(comment) = line.strip_prefix("/*") {
+            if let Some(after_open) = trimmed.strip_prefix("/*") {
                 saw_comment = true;
-                in_block_comment = true;
-                line = comment;
+                self.in_block_comment = true;
+                rest = after_open;
                 continue;
             }
 
-            // Split chunks can begin inside a block comment, before a leading `*`.
-            if is_block_comment_continuation(line) {
-                saw_comment = true;
-                if let Some(end) = line.find("*/") {
-                    line = line[end + 2..].trim_start();
-                    continue;
+            saw_code = true;
+            match advance_code_until_comment(trimmed, syntax) {
+                CodeAdvance::EndOfLine => break,
+                CodeAdvance::LineComment => {
+                    saw_comment = true;
+                    break;
                 }
-                break;
+                CodeAdvance::BlockCommentOpen(after_open) => {
+                    saw_comment = true;
+                    self.in_block_comment = true;
+                    rest = after_open;
+                }
             }
+        }
 
-            return false;
+        (saw_comment, saw_code)
+    }
+}
+
+enum CodeAdvance<'a> {
+    EndOfLine,
+    LineComment,
+    BlockCommentOpen(&'a str),
+}
+
+fn advance_code_until_comment(code: &str, syntax: CommentSyntax) -> CodeAdvance<'_> {
+    let bytes = code.as_bytes();
+    let mut idx = 0;
+    let mut quote: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                idx = (idx + 2).min(bytes.len());
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match b {
+            b'"' | b'\'' => {
+                quote = Some(b);
+                idx += 1;
+            }
+            b'/' if bytes.get(idx + 1) == Some(&b'/') => return CodeAdvance::LineComment,
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                return CodeAdvance::BlockCommentOpen(&code[idx + 2..]);
+            }
+            b'#' if matches!(syntax, CommentSyntax::CStyleOrHash) => {
+                return CodeAdvance::LineComment;
+            }
+            _ => {
+                idx += 1;
+            }
         }
     }
 
-    saw_comment
+    CodeAdvance::EndOfLine
+}
+
+pub fn chunk_is_comment_only(chunk: &str, syntax: CommentSyntax) -> bool {
+    BlockCommentTracker::new().chunk_is_comment_only(chunk, syntax)
+}
+
+/// Byte length of leading blank/comment-only lines before the first line of code
+/// in `chunk`, using C-style (`//` and `/* ... */`) comment rules.
+pub fn leading_c_style_comment_prefix_len(chunk: &str) -> Option<usize> {
+    let mut tracker = BlockCommentTracker::new();
+    let mut offset = 0;
+    let mut saw_comment = false;
+
+    for line in chunk.split_inclusive('\n') {
+        if line.trim().is_empty() && !tracker.in_block_comment {
+            offset += line.len();
+            continue;
+        }
+        let (line_saw_comment, line_saw_code) = tracker.scan_line(line, CommentSyntax::CStyle);
+        if line_saw_code {
+            return saw_comment.then_some(offset);
+        }
+        if line_saw_comment {
+            saw_comment = true;
+            offset += line.len();
+            continue;
+        }
+        return saw_comment.then_some(offset);
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -161,15 +249,18 @@ mod tests {
             assert!(!chunk_is_comment_only("*out = value;", syntax));
             assert!(!chunk_is_comment_only("**slot = value;", syntax));
         }
-        assert!(!line_is_c_style_comment("*out = value;"));
+        assert_eq!(leading_c_style_comment_prefix_len("*out = value;\n"), None);
     }
 
     #[test]
-    fn chunk_is_comment_only_keeps_block_comment_continuations() {
-        assert!(chunk_is_comment_only(
-            " * Returns the value.\n *\n *****/",
-            CommentSyntax::CStyle
-        ));
+    fn tracker_keeps_block_comment_continuations_after_open_marker() {
+        let mut tracker = BlockCommentTracker::new();
+        assert!(tracker.chunk_is_comment_only("/* Summary.", CommentSyntax::CStyle));
+        assert!(
+            tracker
+                .chunk_is_comment_only(" * Returns the value.\n *\n *****/", CommentSyntax::CStyle)
+        );
+        assert!(!tracker.chunk_is_comment_only("    * quantity;", CommentSyntax::CStyle));
     }
 
     #[test]
@@ -185,7 +276,25 @@ mod tests {
     }
 
     #[test]
-    fn line_is_c_style_comment_accepts_closing_block_markers() {
-        assert!(line_is_c_style_comment("*/"));
+    fn string_literal_slash_star_does_not_open_block_comment() {
+        let mut tracker = BlockCommentTracker::new();
+        assert!(!tracker.chunk_is_comment_only("let glob = \"/*\";", CommentSyntax::CStyle));
+        assert!(!tracker.chunk_is_comment_only("    * scale;", CommentSyntax::CStyle));
+        assert_eq!(
+            leading_c_style_comment_prefix_len("/* doc\n * cont\n */\n    * scale;\n"),
+            Some("/* doc\n * cont\n */\n".len())
+        );
+    }
+
+    #[test]
+    fn wrapped_multiplication_after_blank_line_is_code_not_comment() {
+        assert!(
+            !chunk_is_comment_only("    * quantity;", CommentSyntax::CStyle),
+            "wrapped `* quantity;` without an open `/*` block comment must be code"
+        );
+        assert!(
+            !chunk_is_comment_only("    * scale + offset;", CommentSyntax::CStyleOrHash),
+            "wrapped `* scale + offset;` without an open `/*` block comment must be code"
+        );
     }
 }

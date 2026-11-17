@@ -276,3 +276,30 @@ fn focus_reports_an_empty_scope_before_checking_for_an_llm() -> Result<()> {
     assert!(!error.contains("LLM"), "{error}");
     Ok(())
 }
+
+#[test]
+fn focus_plan_citing_git_patch_survives_more_than_eight_newer_commits() -> Result<()> {
+    let repo = repository("focus_plan_git_patch_window")?;
+    repo.commit_all("initial")?;
+    repo.write(
+        "src/lib.rs",
+        "pub fn authorize(token: &str) -> bool {\n    !token.is_empty() && token.starts_with(\"tok_\")\n}\n",
+    )?;
+    repo.commit_all("tighten auth check")?;
+
+    let page = inventory(&repo)?;
+    let candidate = &page["candidates"][0];
+    let mut cited = plan(candidate, 300);
+    cited["steps"][0]["evidence"] = json!([evidence_id(candidate, "git_patch")?]);
+    repo.write("plan.json", &cited.to_string())?;
+    repo.run(&["focus", "--plan", "plan.json", "--json"])?;
+
+    for idx in 0..10 {
+        repo.write("NOTES.txt", &format!("unrelated {idx}\n"))?;
+        repo.commit_all(&format!("unrelated {idx}"))?;
+    }
+
+    let reopened = parse_json(&repo.run(&["focus", "--plan", "plan.json", "--json"])?)?;
+    assert_eq!(reopened["steps"][0]["target"], candidate["target"]);
+    Ok(())
+}

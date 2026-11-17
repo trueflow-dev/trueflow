@@ -2298,6 +2298,7 @@ fn build_review_state(
         tree,
         unreviewed_block_nodes,
         commented_block_nodes,
+        collapsible_approved_block_nodes,
         diff_block_sides,
         file_change_kinds,
         block_change_kinds,
@@ -2330,7 +2331,8 @@ fn build_review_state(
 
     let initial_root_cursor = tree.node(tree.root()).children.first().copied();
     let review_order = ReviewOrder::from_tree(&tree, &unreviewed_block_nodes);
-    let mut navigator = ReviewNavigator::new(tree, unreviewed_block_nodes)?;
+    let mut navigator = ReviewNavigator::new(tree, unreviewed_block_nodes)?
+        .with_collapsible_approved_blocks(collapsible_approved_block_nodes);
     let mut root_cursor = initial_root_cursor;
     let mut focus_block = None;
     let mut pending_focus_scroll = false;
@@ -5912,9 +5914,13 @@ fn apply_action_locally(
 
     let mut removed_reviewable = 0;
     if matches!(verdict, Verdict::Approved | Verdict::Rejected) {
+        let is_approved = matches!(verdict, Verdict::Approved);
         for &block_id in &block_ids {
             state.commented_nodes.remove(&block_id);
             state.skipped_nodes.remove(&block_id);
+            if is_approved {
+                state.navigator.mark_block_approved_by_session(block_id);
+            }
             if state.navigator.remove_visible_block(block_id)
                 && state.reviewable_nodes.remove(&block_id)
             {
@@ -10366,6 +10372,7 @@ mod diff_scope_tests {
                 diff_selection: crate::targets::ReviewDiffSelection::None,
                 unreviewed_block_nodes: base.reviewable_nodes,
                 commented_block_nodes: HashSet::from([ids[0]]),
+                collapsible_approved_block_nodes: HashSet::new(),
                 diff_block_sides: HashMap::new(),
                 file_change_kinds: HashMap::new(),
                 block_change_kinds: HashMap::new(),
@@ -13365,6 +13372,7 @@ mod diff_scope_tests {
             tree,
             unreviewed_block_nodes: HashSet::from([block_id]),
             commented_block_nodes: HashSet::from([block_id]),
+            collapsible_approved_block_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -13450,6 +13458,7 @@ mod diff_scope_tests {
             tree: builder.finalize(),
             unreviewed_block_nodes: HashSet::from([kept_id, gone_id]),
             commented_block_nodes: HashSet::new(),
+            collapsible_approved_block_nodes: HashSet::new(),
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::from([(gone_id, BlockChangeKind::Deleted)]),

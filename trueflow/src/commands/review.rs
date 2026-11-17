@@ -138,6 +138,7 @@ pub struct CollectedReview {
     pub tree: tree::Tree,
     pub unreviewed_block_nodes: HashSet<tree::TreeNodeId>,
     pub commented_block_nodes: HashSet<tree::TreeNodeId>,
+    pub collapsible_approved_block_nodes: HashSet<tree::TreeNodeId>,
     pub diff_block_sides: HashMap<tree::TreeNodeId, DiffBlockSides>,
     pub file_change_kinds: HashMap<tree::TreeNodeId, FileChangeKind>,
     pub block_change_kinds: HashMap<tree::TreeNodeId, BlockChangeKind>,
@@ -411,6 +412,8 @@ pub(crate) fn collect_review_with_database(
     let mut total_blocks = 0;
     let mut unreviewed_block_nodes = HashSet::new();
     let mut commented_block_nodes = HashSet::new();
+    let mut collapsible_approved_block_nodes = HashSet::new();
+    let current_identity = crate::commands::mark::structured_identity_from_workdir();
 
     for file in indexed_files {
         if !query.path_selection.includes(&file.path) {
@@ -427,9 +430,11 @@ pub(crate) fn collect_review_with_database(
                 continue;
             }
             if should_skip_whitespace_only_by_default(block, &query.filters) {
+                collapsible_approved_block_nodes.insert(node_id);
                 continue;
             }
             if should_skip_imports_by_default(file.path.as_str(), block, &query.filters) {
+                collapsible_approved_block_nodes.insert(node_id);
                 continue;
             }
             if should_skip_container_by_default(
@@ -437,6 +442,7 @@ pub(crate) fn collect_review_with_database(
                 block,
                 &query.filters,
             ) {
+                collapsible_approved_block_nodes.insert(node_id);
                 continue;
             }
             reviewable_blocks.push(node_id);
@@ -456,10 +462,16 @@ pub(crate) fn collect_review_with_database(
             let Some(block) = tree.node(node_id).block.as_ref() else {
                 continue;
             };
-            let effective_verdict = coverage
-                .node(node_id)
-                .effective_latest_verdict_for(&review_check);
+            let node_coverage = coverage.node(node_id);
+            let effective_verdict = node_coverage.effective_latest_verdict_for(&review_check);
             if effective_verdict == Some(&Verdict::Approved) {
+                if node_coverage.effective_records().iter().any(|record| {
+                    record.check == review_check
+                        && record.verdict == Verdict::Approved
+                        && record.identity == current_identity
+                }) {
+                    collapsible_approved_block_nodes.insert(node_id);
+                }
                 continue;
             }
 
@@ -496,6 +508,7 @@ pub(crate) fn collect_review_with_database(
             tree,
             unreviewed_block_nodes,
             commented_block_nodes,
+            collapsible_approved_block_nodes,
             diff_block_sides: HashMap::new(),
             file_change_kinds: HashMap::new(),
             block_change_kinds: HashMap::new(),
@@ -544,6 +557,7 @@ fn collect_diff_scoped_review(
         tree,
         unreviewed_block_nodes,
         commented_block_nodes,
+        collapsible_approved_block_nodes: HashSet::new(),
         diff_block_sides,
         file_change_kinds,
         block_change_kinds,
@@ -711,6 +725,7 @@ fn empty_collected_review() -> CollectedReview {
         tree: tree::TreeBuilder::new().finalize(),
         unreviewed_block_nodes: HashSet::new(),
         commented_block_nodes: HashSet::new(),
+        collapsible_approved_block_nodes: HashSet::new(),
         diff_block_sides: HashMap::new(),
         file_change_kinds: HashMap::new(),
         block_change_kinds: HashMap::new(),
@@ -3761,17 +3776,19 @@ mod tests {
         run_git(&repo_root, &["commit", "-m", "directory"]);
         let _guard = CurrentDirGuard::push(&repo_root);
 
-        let result = std::panic::catch_unwind(|| {
+        let collected = std::panic::catch_unwind(|| {
             collect_review_for_targets(vec![ReviewTarget::Revision(RevisionExpr::new("HEAD")?)])
-        });
+        })
+        .map_err(|_panic_payload| anyhow!("collect_review panicked"))??;
 
-        let error = result
-            .map_err(|_panic_payload| anyhow!("collect_review panicked"))?
-            .err()
-            .ok_or_else(|| anyhow!("expected a file/directory collision error"))?;
+        assert!(collected.tree.find_file_by_path("notes").is_some());
+        assert!(collected.tree.find_dir_by_path("notes").is_some());
         assert!(
-            format!("{error:#}").contains("`notes`"),
-            "error must name the colliding path: {error:#}"
+            collected
+                .summary
+                .files
+                .iter()
+                .any(|file| file.path.as_str() == "notes/today.md")
         );
         Ok(())
     }

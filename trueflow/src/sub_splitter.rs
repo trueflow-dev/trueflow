@@ -452,6 +452,7 @@ fn determine_split_plan(kind: BlockKind, lang: Language) -> SplitPlan {
 
 pub(crate) fn split_code_review_units(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
     let content = &block.content;
+    let mut tracker = code_comments::BlockCommentTracker::new();
     Ok(collect_valid_paragraph_blocks(
         content,
         |chunk, start, end, is_gap| {
@@ -459,7 +460,7 @@ pub(crate) fn split_code_review_units(block: &ParentBlock<'_>) -> Result<Vec<Blo
                 BlockKind::Gap
             } else {
                 // Language-agnostic default splitter: keep `#` comments.
-                classify_code_chunk(chunk, CommentSyntax::CStyleOrHash)
+                classify_code_chunk_tracked(chunk, CommentSyntax::CStyleOrHash, &mut tracker)
             };
             create_sub_block_with_kind(block, chunk, start, end, block_kind).ok()
         },
@@ -973,13 +974,14 @@ fn split_elisp_function(block: &ParentBlock<'_>) -> Result<Vec<Block>> {
         signature_end,
         BlockKind::FunctionSignature,
     )?];
+    let mut tracker = code_comments::BlockCommentTracker::new();
     blocks.extend(collect_valid_paragraph_blocks(
         &content[signature_end..],
         |chunk, start, end, is_gap| {
             let kind = if is_gap {
                 BlockKind::Gap
             } else {
-                classify_code_chunk(chunk, CommentSyntax::of(Language::Elisp))
+                classify_code_chunk_tracked(chunk, CommentSyntax::of(Language::Elisp), &mut tracker)
             };
             create_sub_block_with_kind(
                 block,
@@ -1837,25 +1839,7 @@ fn collect_csharp_type_items(body: tree_sitter::Node<'_>) -> Vec<MemberSpan> {
 }
 
 fn leading_comment_prefix_len(chunk: &str) -> Option<usize> {
-    let mut offset = 0;
-    let mut saw_comment = false;
-
-    for line in chunk.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.trim().is_empty() {
-            offset += line.len();
-            continue;
-        }
-        if code_comments::line_is_c_style_comment(trimmed) {
-            saw_comment = true;
-            offset += line.len();
-            continue;
-        }
-
-        return saw_comment.then_some(offset);
-    }
-
-    None
+    code_comments::leading_c_style_comment_prefix_len(chunk)
 }
 
 /// Direct members of a Ruby scope. A nested `class`/`module` is a single
@@ -1938,6 +1922,15 @@ fn gap_prefix_length(gap: &str) -> usize {
 }
 
 fn classify_code_chunk(chunk: &str, syntax: CommentSyntax) -> BlockKind {
+    let mut tracker = code_comments::BlockCommentTracker::new();
+    classify_code_chunk_tracked(chunk, syntax, &mut tracker)
+}
+
+fn classify_code_chunk_tracked(
+    chunk: &str,
+    syntax: CommentSyntax,
+    tracker: &mut code_comments::BlockCommentTracker,
+) -> BlockKind {
     let trimmed = chunk.trim();
     if trimmed.is_empty() {
         return BlockKind::Gap;
@@ -1947,7 +1940,7 @@ fn classify_code_chunk(chunk: &str, syntax: CommentSyntax) -> BlockKind {
         return BlockKind::Gap;
     }
 
-    if code_comments::chunk_is_comment_only(chunk, syntax) {
+    if tracker.chunk_is_comment_only(chunk, syntax) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph

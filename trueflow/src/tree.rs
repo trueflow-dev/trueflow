@@ -969,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tree node path must be unique")]
+    #[should_panic(expected = "tree file path must be unique")]
     fn builder_rejects_duplicate_indexed_paths() {
         let mut builder = TreeBuilder::new();
         let root = builder.root();

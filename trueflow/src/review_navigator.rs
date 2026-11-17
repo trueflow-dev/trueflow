@@ -6,6 +6,7 @@ pub struct ReviewNavigator {
     pub tree: Tree,
     visible_nodes: HashSet<TreeNodeId>,
     visible_block_nodes: HashSet<TreeNodeId>,
+    collapsible_approved_blocks: HashSet<TreeNodeId>,
     visible_block_descendant_counts: HashMap<TreeNodeId, usize>,
     current: TreeNodeId,
 }
@@ -17,10 +18,29 @@ impl ReviewNavigator {
         Ok(Self {
             visible_nodes: visible.nodes,
             visible_block_nodes: visible.block_nodes,
+            collapsible_approved_blocks: HashSet::new(),
             visible_block_descendant_counts: visible.block_descendant_counts,
             tree,
             current: root,
         })
+    }
+
+    pub fn with_collapsible_approved_blocks(
+        mut self,
+        collapsible_approved_blocks: HashSet<TreeNodeId>,
+    ) -> Self {
+        self.collapsible_approved_blocks = collapsible_approved_blocks;
+        self
+    }
+
+    pub fn mark_block_approved_by_session(&mut self, id: TreeNodeId) {
+        if matches!(self.tree.node(id).kind, TreeNodeKind::Block) {
+            self.collapsible_approved_blocks.insert(id);
+        }
+    }
+
+    pub fn is_collapsible_approved_block(&self, id: TreeNodeId) -> bool {
+        self.collapsible_approved_blocks.contains(&id)
     }
 
     pub fn current_id(&self) -> TreeNodeId {

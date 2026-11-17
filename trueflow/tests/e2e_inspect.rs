@@ -323,3 +323,36 @@ fn test_inspect_split_reports_absolute_byte_spans() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn inspect_split_expands_short_blocks_and_subdir_discovers_repo_root() -> Result<()> {
+    let repo = TestRepo::new("inspect_short_split_and_subdir_root")?;
+    repo.write(
+        "lib/service.rs",
+        "pub fn run() {\n    step_one();\n\n    step_two();\n}\n",
+    )?;
+    repo.write("cmd/main.rs", "fn main() {}\n")?;
+    repo.commit_all("initial")?;
+
+    let blocks = scan_blocks(&repo)?;
+    let service_file = blocks
+        .iter()
+        .find(|file| file["path"].as_str() == Some("lib/service.rs"))
+        .context("expected lib/service.rs")?;
+    let run_fn = service_file["blocks"]
+        .as_array()
+        .context("blocks")?
+        .iter()
+        .find(|block| block["kind"].as_str() == Some("function"))
+        .context("expected Rust function")?;
+    let hash = run_fn["hash"].as_str().context("hash")?;
+
+    let subdir = repo.path.join("cmd");
+    let output = repo.run_in(&["inspect", "--fingerprint", hash, "--split"], &subdir)?;
+    let sub_blocks: Vec<Value> = serde_json::from_str(&output)?;
+    assert!(
+        sub_blocks.len() >= 2,
+        "inspect --split from sibling subdir must find and split short function: {sub_blocks:#?}"
+    );
+    Ok(())
+}

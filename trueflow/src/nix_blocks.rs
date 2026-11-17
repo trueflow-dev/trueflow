@@ -1,4 +1,6 @@
+use crate::analysis::Language;
 use crate::block::BlockKind;
+use crate::code_comments::{BlockCommentTracker, CommentSyntax};
 use anyhow::Result;
 use tree_sitter::{Node, Tree};
 
@@ -27,7 +29,7 @@ pub(crate) fn split_structural_children(
         _ => None,
     };
 
-    Ok(spans.map(normalize_spans))
+    Ok(spans.map(|spans| complete_source_tiling(spans, source)))
 }
 
 fn split_binding_children(source: &str) -> Result<Option<Vec<NixSpan>>> {
@@ -369,6 +371,12 @@ fn collect_binding_set_children(
         );
         last_end = item.end_byte().saturating_sub(offset);
     }
+    push_interstitial(
+        spans,
+        source,
+        last_end,
+        binding_set.end_byte().saturating_sub(offset),
+    );
 }
 
 fn expression_child_span(node: Node<'_>, offset: usize) -> NixSpan {
@@ -448,6 +456,30 @@ fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         .find(|child| child.kind() == kind)
 }
 
+fn complete_source_tiling(spans: Vec<NixSpan>, source: &str) -> Vec<NixSpan> {
+    if spans.is_empty() {
+        let mut whole = Vec::new();
+        push_interstitial(&mut whole, source, 0, source.len());
+        return normalize_spans(whole);
+    }
+
+    let mut tiled = Vec::with_capacity(spans.len() + 2);
+    let mut cursor = 0;
+    for span in spans {
+        if cursor < span.start {
+            push_interstitial(&mut tiled, source, cursor, span.start);
+        }
+        if span.end > span.start {
+            tiled.push(span);
+            cursor = cursor.max(span.end);
+        }
+    }
+    if cursor < source.len() {
+        push_interstitial(&mut tiled, source, cursor, source.len());
+    }
+    normalize_spans(tiled)
+}
+
 fn normalize_spans(spans: Vec<NixSpan>) -> Vec<NixSpan> {
     let mut normalized: Vec<NixSpan> = Vec::with_capacity(spans.len());
     for span in spans {
@@ -487,6 +519,7 @@ fn push_interstitial(spans: &mut Vec<NixSpan>, source: &str, start: usize, end: 
     let mut segment_start = start;
     let mut line_start = start;
     let mut current_kind = None;
+    let mut comment_tracker = BlockCommentTracker::new();
 
     while line_start < end {
         let line_end = source[line_start..end]
@@ -494,7 +527,7 @@ fn push_interstitial(spans: &mut Vec<NixSpan>, source: &str, start: usize, end: 
             .map(|offset| line_start + offset + 1)
             .unwrap_or(end);
         let line = &source[line_start..line_end];
-        let kind = classify_interstitial_line(line);
+        let kind = classify_interstitial_line(line, &mut comment_tracker);
 
         if let Some(previous_kind) = current_kind {
             if previous_kind != kind {
@@ -513,12 +546,12 @@ fn push_interstitial(spans: &mut Vec<NixSpan>, source: &str, start: usize, end: 
     }
 }
 
-fn classify_interstitial_line(line: &str) -> BlockKind {
+fn classify_interstitial_line(line: &str, comment_tracker: &mut BlockCommentTracker) -> BlockKind {
     let trimmed = line.trim();
-    if trimmed.is_empty() || is_nix_structural_noise(line) {
-        BlockKind::Gap
-    } else if line_is_nix_comment(trimmed) {
+    if comment_tracker.chunk_is_comment_only(line, CommentSyntax::of(Language::Nix)) {
         BlockKind::Comment
+    } else if trimmed.is_empty() || is_nix_structural_noise(line) {
+        BlockKind::Gap
     } else {
         BlockKind::Preamble
     }
@@ -529,11 +562,7 @@ fn is_nix_structural_noise(chunk: &str) -> bool {
     !trimmed.is_empty()
         && trimmed
             .chars()
-            .all(|ch| matches!(ch, '{' | '}' | '[' | ']' | ';'))
-}
-
-fn line_is_nix_comment(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with('#') || trimmed_line.starts_with("/*")
+            .all(|ch| matches!(ch, '{' | '}' | '[' | ']' | '(' | ')' | ';'))
 }
 
 #[cfg(test)]
@@ -626,5 +655,42 @@ mod tests {
         );
         assert_eq!(&source[preambles[1].start..preambles[1].end], " else ");
         assert_eq!(merge_spans(source, &spans), source);
+    }
+
+    #[test]
+    fn split_structural_children_preserves_leading_comments_and_trailing_delimiters() {
+        let expr_source = "# module header\n(\n  {\n    retries = 3;\n  }\n)\n";
+        let expr_spans = split_structural_children(expr_source, BlockKind::Section)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected expression structural split"));
+        assert_eq!(merge_spans(expr_source, &expr_spans), expr_source);
+        assert!(
+            expr_spans.iter().any(|span| {
+                span.kind == BlockKind::Comment
+                    && expr_source[span.start..span.end].contains("# module header")
+            }),
+            "expected leading comment span: {expr_spans:#?}"
+        );
+
+        let binding_source =
+            "# binding doc\ndefaults = {\n  retries = 3;\n  # trailing inside attrset\n};\n";
+        let binding_spans = split_structural_children(binding_source, BlockKind::Variable)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected binding structural split"));
+        assert_eq!(merge_spans(binding_source, &binding_spans), binding_source);
+        assert!(
+            binding_spans.iter().any(|span| {
+                span.kind == BlockKind::Comment
+                    && binding_source[span.start..span.end].contains("# binding doc")
+            }),
+            "expected leading binding comment: {binding_spans:#?}"
+        );
+        assert!(
+            binding_spans.iter().any(|span| {
+                span.kind == BlockKind::Comment
+                    && binding_source[span.start..span.end].contains("# trailing inside attrset")
+            }),
+            "expected trailing binding_set comment: {binding_spans:#?}"
+        );
     }
 }

@@ -601,8 +601,10 @@ pub(crate) fn fallback_split_blocks(
     mode: FallbackMode,
     lang: Language,
 ) -> Vec<Block> {
+    let syntax = CommentSyntax::of(lang);
+    let mut tracker = code_comments::BlockCommentTracker::new();
     collect_valid_paragraph_blocks(content, |chunk, start, end, is_gap| {
-        let kind = classify_fallback_chunk(chunk, mode, is_gap, CommentSyntax::of(lang));
+        let kind = classify_fallback_chunk(chunk, mode, is_gap, syntax, &mut tracker);
         create_fallback_block(content, chunk, kind, start, end, lang)
     })
 }
@@ -612,24 +614,29 @@ fn classify_fallback_chunk(
     mode: FallbackMode,
     is_gap: bool,
     syntax: CommentSyntax,
+    tracker: &mut code_comments::BlockCommentTracker,
 ) -> BlockKind {
     if is_gap || chunk.trim().is_empty() {
         return BlockKind::Gap;
     }
 
     match mode {
-        FallbackMode::Code => classify_code_paragraph(chunk, syntax),
+        FallbackMode::Code => classify_code_paragraph(chunk, syntax, tracker),
         FallbackMode::Text => BlockKind::Paragraph,
     }
 }
 
-fn classify_code_paragraph(chunk: &str, syntax: CommentSyntax) -> BlockKind {
+fn classify_code_paragraph(
+    chunk: &str,
+    syntax: CommentSyntax,
+    tracker: &mut code_comments::BlockCommentTracker,
+) -> BlockKind {
     let trimmed = chunk.trim();
     if trimmed.is_empty() {
         return BlockKind::Gap;
     }
 
-    if code_comments::chunk_is_comment_only(chunk, syntax) {
+    if tracker.chunk_is_comment_only(chunk, syntax) {
         BlockKind::Comment
     } else {
         BlockKind::CodeParagraph
