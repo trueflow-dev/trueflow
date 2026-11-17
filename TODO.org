@@ -397,20 +397,24 @@
      bind to the old content approval. Deletions now have their own signed
      `block_deletion` review identity (`mark --deleted-in`).
      `--test bug_regressions deleting_approved_code moved_code deletion_feedback`
-   - [ ] A merged duplicate declaration records its review against the first
-     occurrence only; the other occurrence reappears next launch.
-   - [ ] Focus plans citing Git patch evidence become unopenable once eight
-     newer commits push the cited commit out of the history window.
+   - [X] A merged duplicate declaration records its review against the first
+     occurrence only; the other occurrence reappears next launch. Fixed to
+     emit exact locators for every merged occurrence (`--test e2e_declaration_tui_integration`).
+   - [X] Focus plans citing Git patch evidence become unopenable once eight
+     newer commits push the cited commit out of the history window. Fixed by
+     embedding `<commit_id>` in patch evidence IDs (`--test e2e_focus`).
    - [X] Focus generation checked for an LLM before reporting an empty scope;
      `onboard --candidates --path <typo>` silently returned zero candidates.
      `--test e2e_focus focus_reports_an_empty --test e2e_onboarding
      candidate_query_rejects`
-   - [ ] A diff where a file becomes a same-named directory cannot be reviewed
-     in one tree (it errors with a narrowing hint).
-   - [ ] The scripted TUI harness duplicates `run_app` key dispatch and has
-     already diverged (onboarding guards); share one dispatcher.
-   - [ ] Wrapped expressions continuing with `* x` are labelled comments; Nix
-     structural children drop leading comments and closing delimiters.
+   - [X] A diff where a file becomes a same-named directory cannot be reviewed
+     in one tree (it errors with a narrowing hint). Fixed by separating
+     `files_by_path` and `dirs_by_path` in `Tree` (`--test bug_regressions`).
+   - [X] The scripted TUI harness duplicates `run_app` key dispatch and has
+     already diverged (onboarding guards); share one dispatcher (`--test tui_vt100`).
+   - [X] Wrapped expressions continuing with `* x` are labelled comments; Nix
+     structural children drop leading comments and closing delimiters. Fixed
+     via stateful `BlockCommentTracker` and full `[0..source.len()]` Nix tiling.
    - [X] Emacs: approving a sub-block in the split view redrew the status view
      into `*trueflow-focus*`; it now refreshes the status buffer and re-splits
      the parent. `trueflow-focus-subblock-verdicts-refresh-status-not-focus`
@@ -418,26 +422,32 @@
      `mark --path` accepts from a subdirectory (scan paths were already
      repo-relative); both now share one resolver.
      `--test e2e_inspect inspect_path_from_subdirectory`
-   - [ ] The default scan cache lives in `~/.trueflow/cache`, the same folder
-     name as project stores.
+   - [X] The default scan cache lives in `~/.trueflow/cache`, the same folder
+     name as project stores. Moved to `dirs::cache_dir()/trueflow/scan`
+     (`TRUEFLOW_CACHE_DIR` override).
    - [X] Root-view cursor scrolling counted one row per line, so wrapped
      header lines left the last entries below the viewport; it now counts
      rendered rows. `--lib root_cursor_on_last_entry`
-   - [ ] Short status messages count as one row, and wrapping counts chars,
-     not graphemes.
-   - [ ] Emacs `trueflow-focus-subdivide` and `trueflow--fetch-subblocks` call
+   - [X] Short status messages count as one row, and wrapping counts chars,
+     not graphemes. Wrapped `content_message` rows and kept zero-width
+     combining marks attached on wrap (`--test tui_vt100`).
+   - [X] Emacs `trueflow-focus-subdivide` and `trueflow--fetch-subblocks` call
      `inspect --split` without `--path`/`--line`, so duplicated content fails
-     with "Multiple blocks matched".
-   - [ ] Approving a whole file in an all-files scope writes one record per
+     with "Multiple blocks matched". Fixed (`trueflow-split-passes-path-and-line-for-duplicate-blocks`).
+   - [X] Approving a whole file in an all-files scope writes one record per
      block whenever any block under it is already reviewed (correct, but each
-     record is signed separately).
-   - [ ] In a shallow clone with no merge base, `main` silently diffs from the
+     record is signed separately). Collapsed to one `File` record when non-shown
+     blocks are default-skipped or approved by the same reviewer.
+   - [X] In a shallow clone with no merge base, `main` silently diffs from the
      main tip; declaration capture has its own walk that may miss `[scan]`
-     ignores and tracked `.gitignore` matches.
-   - [ ] Dirty declaration capture still reads the head of a supported-to-
+     ignores and tracked `.gitignore` matches (`--test bug_regressions --test e2e_declaration_capture`).
+   - [X] Dirty declaration capture still reads the head of a supported-to-
      unsupported rename (an oversized head aborts); PR delivery puts comments
-     on deleted declarations in the review body.
-** TODO DEF_TODO [Medium] Bound the scan cache and keep tests out of $HOME
+     on deleted declarations in the review body (`--test e2e_declaration_capture`).
+** DONE DEF_TODO [Medium] Bound the scan cache and keep tests out of $HOME
+   - Fixed: isolated `TestRepo` cache/home dirs with `Drop` cleanup, moved
+     default scan cache to OS cache dir, and added oldest-first eviction
+     (`128` files / `256 MiB`).
    - Every scan root gets its own `~/.trueflow/cache/scan-<dir>-<hash>.json`
      and nothing ever evicts entries (IO-7). Tests that scan temporary repos
      without a `cache_dir` write into the developer's real home: the cache
@@ -464,7 +474,7 @@
 * Emacs Package (trueflow.el)
 ** TODO [High] Review Actions
    - [ ] Add a small "reviewed!" animation in review mode when approving/commenting.
-   - [ ] Show reviewed vs remaining counts in bottom-right (e.g., 5 / 15), with green reviewed and yellow remaining.
+   - [X] Show reviewed vs remaining counts in status and focus views (`trueflow-status-renders-1-based-lines-and-reviewed-vs-remaining-counts`).
 
 ** TODO [Medium] Iterative Review Mode
    - [ ] Implement side-by-side view (Diff vs New Content).
@@ -730,13 +740,19 @@ Two things:
      shape above; verified by
      `build_header_lines_show_block_path_named_hash_and_subblock_tree`.
 
-** TODO [READY] TUI UX: need a command to like batch approve a whole file (or module or dir, etc.)
-** TODO [READY] There should be a trueflow command to reset the review state for the
+** DONE [READY] TUI UX: need a command to like batch approve a whole file (or module or dir, etc.)
+   - Root, directory, file, and container-block batch approvals target the highlighted
+     node and prompt named `Batch Action` confirmation (`--test tui_vt100`).
+** DONE [READY] There should be a trueflow command to reset the review state for the
    current user for the current REV. i.e. delete all review records that point
    to the current rev. (without removing historical reviews, etc.)
-** TODO [READY] There should be a trueflow CLI command to just list records in
+   - Implemented `trueflow reset` (`--dry-run`, `--json`) with `.trueflow/feedback.cursor`
+     reconciliation (`--test e2e_reset`).
+** DONE [READY] There should be a trueflow CLI command to just list records in
    reverse-chronological order, like a trueflow log command, defaults to say the
    most recent 16 or something.
+   - Implemented `trueflow log` (`-n 16` default, `--all`, `--json`, `--verdict`,
+     `--check`, `--path`) (`--test e2e_log`).
 ** TODO [Medium] Diff vs new-content investigation
    - [ ] Define and verify how we present textual diff chunks versus reconstructed new content.
 ** TODO [Medium] jj integration
@@ -777,29 +793,29 @@ Two things:
      billiards (1602 files) cold -95.5%, warm -85%; rust-lang/rust sparse
      checkout warm -87%. With a populated database (2,433 exact-hint
      records), trueflow warm -68% and cold -43%, output still identical.
-   - [ ] Shrink the review units coverage keeps for reuse (`2555218`). Peak
-     memory on rust-lang/rust warm rose 769 -> 835 MB from base to HEAD, and
-     these units are the likely cause (alone they added 4 MB on trueflow and
-     18 MB on billiards). Review reads only each unit's kind, byte span,
-     hash, and whether it is blank.
+   - [X] Shrink the review units coverage keeps for reuse (`ReviewUnitSpan`). Peak
+     memory on billiards dropped 623 -> 228 MB warm and 622 -> 355 MB cold.
    - [X] Measured fat LTO + `codegen-units = 1`: -0.3% to -1.0%
      instructions for a 7-minute clean release build; not adopted.
    - [ ] Find the superlinear cold scan of rust-lang/rust sources: a
      2,481-file sparse checkout still takes ~1.7T instructions (~500 s) cold
      against 26G warm.
-   - [ ] Scan files in parallel (per-file scanning is a pure map; keep the
-     16 MiB worker stack the TUI already uses and sort results as today).
+   - [X] Scan files in parallel (per-file scanning is a pure map; keep the
+     16 MiB worker stack the TUI already uses and sort results as today) +
+     per-thread pooled `tree_sitter::Parser`s.
    - [ ] Persist review units in the scan cache so warm runs skip the
      remaining sub-split parses.
-   - [ ] Build `CoverageIndex` once per `focus` run (it is built in
-     `collect_review` and again in `FocusInventory::capture`).
-   - [ ] Open the repository once per `feedback` run instead of per record,
-     and per TUI mark instead of 4-5 times.
+   - [X] Build `CoverageIndex` / `ReviewDatabase` once per `focus` run (shared
+     across `collect_review` and `FocusInventory::capture` with single-pass diff walk).
+   - [X] Open the repository once per `feedback` run (`RepoFeedbackContextResolver`)
+     and per TUI mark batch (`ReviewStore::append_batch` + `BatchBlockStateResolver`).
    - [ ] Investigate whether salsa or another incremental engine can improve
      scanner/review cache invalidation without adding avoidable dependency
      weight.
-** TODO [Medium] Add mode in review for speed-reading word-by-word SPC -> pause;
+** DONE [Medium] Add mode in review for speed-reading word-by-word SPC -> pause;
    j back sentence; l forward sentence
+   - Speed-read mode supports `Space` play/pause, `j`/`l` phrase step (including key
+     repeat), and `J`/`L` (`{`/`}`, `Up`/`Down`) sentence navigation (`--test tui_vt100`).
 ** DONE [HIGH] please move the pgup/down, and [h]prev next down up to the right side of the navigation legend. parent and child can be in the middle. on the left, approve and comment, then mode. quit stays on furthest right. please confirm the order and layout with me.
 ** DONE [HIGH] off-by-1 in progress bar. seems to include summary page at end of review.
    - Verified by `footer_progress_uses_session_remaining_blocks_not_scope_total`

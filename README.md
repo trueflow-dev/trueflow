@@ -192,6 +192,17 @@ trueflow feedback --pr pr:11 --dry-run
 
 # Export recent feedback for one subtree
 trueflow feedback --format json --since 1h --target dir:trueflow/src
+
+# Inspect the 16 most recent review records in reverse-chronological order
+trueflow log
+
+# Filter review log by verdict, check, or path, or emit full JSON history
+trueflow log --verdict comment --path src
+trueflow log --all --json
+
+# Reset review records recorded by the current Git user at the current HEAD commit
+trueflow reset --dry-run
+trueflow reset
 ```
 
 ### Onboard a repository
@@ -731,6 +742,23 @@ rejection made after such an approval still keeps the block pending.
 Malformed or unsupported history records stop review loading with the offending
 line number. Trueflow does not silently discard records or repair truncated
 history: restore or correct the log before relying on its review coverage.
+
+### Inspecting and resetting review history
+
+`trueflow log` lists review records in reverse-chronological order (breaking
+same-second ties by append order), defaulting to the 16 most recent matching
+records (`-n`/`--limit`, or `--all` for full history). Pass `--verdict`,
+`--check`, or `--path` (resolved relative to the current directory when inside a
+subdirectory) to narrow the view, or `--json` for machine-readable `Record`
+objects.
+
+`trueflow reset` removes review records authored by the current Git user
+(`user.email`) whose effective reviewed revision matches the current `HEAD`
+commit (including `block_deletion` and `declaration_deletion` records targeting
+`HEAD`), while preserving historical reviews on earlier commits and records from
+other reviewers. Pass `--dry-run` (and optionally `--json`) to preview what
+would be removed; when `.trueflow/feedback.cursor` is present, `trueflow reset`
+reconciles the cursor checkpoint and pending IDs automatically.
 
 ### GitHub pull requests
 
